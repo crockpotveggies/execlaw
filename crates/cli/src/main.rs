@@ -160,12 +160,23 @@ enum HwOp {
 }
 
 fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init();
+    // Default to JSON logs (matching the architecture-doc §14 promise:
+    // JSONL to disk + SQLite) when the EXECLAW_LOG_FORMAT env var is set to
+    // "json", and to human-readable output otherwise. Either way, no OTEL,
+    // no Langfuse — per the 2026-04-23 locked decision.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let want_json = std::env::var("EXECLAW_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    let _ = if want_json {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .try_init()
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).try_init()
+    };
 }
 
 fn default_data_dir() -> PathBuf {

@@ -80,7 +80,7 @@ services:
       - no-new-privileges:true
     # (More seccomp/apparmor tightening follows once the runner-container
     #  wiring lands in Phase 1; the control plane itself has limited
-    #  syscall needs once bolling has been exercised.)
+    #  syscall needs once rollout has been exercised.)
 
     # Resource caps — the control plane is lean; runners and services
     # that do the heavy lifting spawn as separate containers.

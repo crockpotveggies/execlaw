@@ -497,17 +497,20 @@ This is CaMeL (DeepMind 2503.18813) restated for execlaw's trust classes. It doe
 
 ### 9.3 Capability tokens
 
-Every runner gets an Ed25519-signed JWT at spawn:
+Every runner gets an Ed25519-signed JWT at spawn. Exact field names match `crates/server/src/auth.rs`:
 
-```
-  {
-    "conversation_id": "conv_abc123",
-    "turn_seq": 47,
-    "principal": "pri_controller",
-    "capability_set": ["tools.*", "memory.read", "memory.write"],
-    "exp": 1714233600,
-    "nonce": "a3f91..."
-  }
+```json
+{
+  "sub": "pri_controller",
+  "principal_id": "pri_controller",
+  "conversation_id": "conv_abc123",
+  "turn_seq": 47,
+  "session_id": "sess_a3f91",
+  "capability_set": ["tools.*", "memory.read", "memory.write"],
+  "iat": 1714230000,
+  "exp": 1714233600,
+  "nonce": "a3f91..."
+}
 ```
 
 Bound to a specific conversation and a specific turn. Cross-conversation reads/writes are rejected by the policy engine. A runner compromised by prompt injection is bounded — it can only affect the conversation it's serving.
