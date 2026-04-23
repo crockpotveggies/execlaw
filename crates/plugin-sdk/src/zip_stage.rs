@@ -87,8 +87,8 @@ pub fn stage_zip<R: Read + Seek>(reader: R) -> Result<StagedPlugin, StageError> 
 mod tests {
     use super::*;
     use std::io::Cursor;
-    use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
 
     fn build_zip(files: &[(&str, &str)]) -> Vec<u8> {
         let mut buf = Cursor::new(Vec::new());
@@ -129,7 +129,13 @@ mod tests {
     #[test]
     fn zipslip_attempt_is_rejected() {
         // Library refuses path components like `..` outright.
-        let bytes = build_zip(&[("../evil", "no"), ("plugin.toml", "[plugin]\nid=\"x\"\nname=\"x\"\nversion=\"1\"\n")]);
+        let bytes = build_zip(&[
+            ("../evil", "no"),
+            (
+                "plugin.toml",
+                "[plugin]\nid=\"x\"\nname=\"x\"\nversion=\"1\"\n",
+            ),
+        ]);
         let err = stage_zip(Cursor::new(bytes)).unwrap_err();
         assert!(matches!(err, StageError::UnsafePath(_)));
     }

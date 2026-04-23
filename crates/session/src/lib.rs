@@ -7,8 +7,8 @@
 
 #![forbid(unsafe_code)]
 
-use execlaw_core::conversation::Modality;
 use execlaw_core::ConversationId;
+use execlaw_core::conversation::Modality;
 
 /// A handle to an in-flight conversation's plumbing.
 #[derive(Debug, Clone)]
@@ -19,7 +19,10 @@ pub struct Session {
 
 impl Session {
     pub fn new(conversation_id: ConversationId, modality: Modality) -> Self {
-        Self { conversation_id, modality }
+        Self {
+            conversation_id,
+            modality,
+        }
     }
 }
 

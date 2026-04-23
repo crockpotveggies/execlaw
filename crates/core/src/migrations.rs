@@ -26,13 +26,11 @@ pub struct Migration {
 ///
 /// Note: every migration is wrapped in its own transaction by
 /// `MigrationRunner::apply_all`.
-pub const MIGRATIONS: &[Migration] = &[
-    Migration {
-        id: 1,
-        name: "initial-schema",
-        sql: include_str!("../migrations/0001_initial_schema.sql"),
-    },
-];
+pub const MIGRATIONS: &[Migration] = &[Migration {
+    id: 1,
+    name: "initial-schema",
+    sql: include_str!("../migrations/0001_initial_schema.sql"),
+}];
 
 #[derive(Debug, Error)]
 pub enum MigrationError {
@@ -112,10 +110,7 @@ impl<'a> MigrationRunner<'a> {
             self.db
                 .transaction(|tx| {
                     tx.execute_batch(m.sql).map_err(|e| {
-                        DbError::Migration(format!(
-                            "migration {} ({}) failed: {e}",
-                            m.id, m.name
-                        ))
+                        DbError::Migration(format!("migration {} ({}) failed: {e}", m.id, m.name))
                     })?;
                     tx.execute(
                         "INSERT INTO schema_version(id, name, checksum, applied_at) VALUES \

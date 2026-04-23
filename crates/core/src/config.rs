@@ -72,6 +72,9 @@ mod tests {
         MigrationRunner::new(&db).apply_all().unwrap();
         let kv = ConfigKv::new(&db, ConfigTable::RuntimeSettings);
         kv.set("max_wakeups_per_hour", "12").unwrap();
-        assert_eq!(kv.get("max_wakeups_per_hour").unwrap().as_deref(), Some("12"));
+        assert_eq!(
+            kv.get("max_wakeups_per_hour").unwrap().as_deref(),
+            Some("12")
+        );
     }
 }

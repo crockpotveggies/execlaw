@@ -70,7 +70,8 @@ mod tests {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
         MigrationRunner::new(&db).apply_all().unwrap();
         let s = VaultRowStore::new(&db);
-        s.put(None, "admin_password_hash", b"argon2-thingy", 1).unwrap();
+        s.put(None, "admin_password_hash", b"argon2-thingy", 1)
+            .unwrap();
         assert_eq!(
             s.get(None, "admin_password_hash").unwrap().as_deref(),
             Some(&b"argon2-thingy"[..])

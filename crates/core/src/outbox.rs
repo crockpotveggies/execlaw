@@ -166,4 +166,3 @@ mod tests {
         assert!(!store.inbox_record_if_new(&key).unwrap());
     }
 }
-

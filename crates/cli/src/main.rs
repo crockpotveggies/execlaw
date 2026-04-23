@@ -8,7 +8,7 @@
 //! - `execlaw db migrate`       run pending migrations
 //! - `execlaw hw rescan`        (stub — §Phase 2)
 //! - `execlaw serve`            run the server directly (for dev; production
-//!                               uses the container)
+//!   uses the container)
 
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
@@ -295,9 +295,10 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     let signer = std::sync::Arc::new(execlaw_server::auth::JwtSigner::generate("execlaw".into()));
     let refresh_store = std::sync::Arc::new(execlaw_server::auth::RefreshStore::new());
 
-    let mut config = execlaw_server::ServerConfig::default();
-    config.bind_addr = bind.parse()?;
-    let config = std::sync::Arc::new(config);
+    let config = std::sync::Arc::new(execlaw_server::ServerConfig {
+        bind_addr: bind.parse()?,
+        ..Default::default()
+    });
 
     let state = execlaw_server::AppState {
         db,
@@ -315,36 +316,34 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
 fn main() -> ExitCode {
     init_tracing();
     let cli = Cli::parse();
-    let result: anyhow::Result<()> = (|| {
-        match cli.command {
-            Command::Up { compose_file } => cmd_up(compose_file),
-            Command::Down { compose_file } => cmd_down(compose_file),
-            Command::Doctor => cmd_doctor(),
-            Command::Db { op } => match op {
-                DbOp::Migrate { db, no_encrypt } => {
-                    cmd_db_migrate(db.unwrap_or_else(default_db_path), no_encrypt)
-                }
-                DbOp::Status { db, no_encrypt } => {
-                    cmd_db_status(db.unwrap_or_else(default_db_path), no_encrypt)
-                }
-            },
-            Command::Hw { op } => match op {
-                HwOp::Rescan => cmd_hw_rescan(),
-            },
-            Command::Serve {
-                bind,
-                db,
-                no_encrypt,
-            } => {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()?;
-                rt.block_on(cmd_serve(
-                    bind,
-                    db.unwrap_or_else(default_db_path),
-                    no_encrypt,
-                ))
+    let result: anyhow::Result<()> = (|| match cli.command {
+        Command::Up { compose_file } => cmd_up(compose_file),
+        Command::Down { compose_file } => cmd_down(compose_file),
+        Command::Doctor => cmd_doctor(),
+        Command::Db { op } => match op {
+            DbOp::Migrate { db, no_encrypt } => {
+                cmd_db_migrate(db.unwrap_or_else(default_db_path), no_encrypt)
             }
+            DbOp::Status { db, no_encrypt } => {
+                cmd_db_status(db.unwrap_or_else(default_db_path), no_encrypt)
+            }
+        },
+        Command::Hw { op } => match op {
+            HwOp::Rescan => cmd_hw_rescan(),
+        },
+        Command::Serve {
+            bind,
+            db,
+            no_encrypt,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_serve(
+                bind,
+                db.unwrap_or_else(default_db_path),
+                no_encrypt,
+            ))
         }
     })();
 

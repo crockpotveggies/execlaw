@@ -229,7 +229,9 @@ fn write_controller_principal(db: &Database, principal_id: &str) -> Result<(), A
     tag = "meta"
 )]
 pub async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok".into() })
+    Json(HealthResponse {
+        status: "ok".into(),
+    })
 }
 
 #[utoipa::path(
@@ -276,9 +278,11 @@ pub async fn setup(
         &session_id,
         state.config.access_token_ttl_secs,
     )?;
-    let refresh = state
-        .refresh_store
-        .issue(&principal_id, &session_id, state.config.refresh_token_ttl_secs);
+    let refresh = state.refresh_store.issue(
+        &principal_id,
+        &session_id,
+        state.config.refresh_token_ttl_secs,
+    );
 
     Ok(Json(SetupResponse {
         principal_id,
@@ -324,9 +328,11 @@ pub async fn login(
         &session_id,
         state.config.access_token_ttl_secs,
     )?;
-    let refresh = state
-        .refresh_store
-        .issue(&principal_id, &session_id, state.config.refresh_token_ttl_secs);
+    let refresh = state.refresh_store.issue(
+        &principal_id,
+        &session_id,
+        state.config.refresh_token_ttl_secs,
+    );
     Ok(Json(LoginResponse {
         access_token: access,
         refresh_token: refresh,
@@ -347,11 +353,14 @@ pub async fn refresh(
     State(state): State<AppState>,
     Json(req): Json<RefreshRequest>,
 ) -> Result<Json<RefreshResponse>, ApiError> {
-    let record = state.refresh_store.consume(&req.refresh_token).ok_or(ApiError {
-        status: StatusCode::UNAUTHORIZED,
-        code: "invalid_refresh_token",
-        message: "refresh token invalid, expired, or already used".into(),
-    })?;
+    let record = state
+        .refresh_store
+        .consume(&req.refresh_token)
+        .ok_or(ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            code: "invalid_refresh_token",
+            message: "refresh token invalid, expired, or already used".into(),
+        })?;
 
     let access = state.signer.issue_access_token(
         &record.principal_id,
@@ -422,7 +431,7 @@ pub fn test_app_state() -> AppState {
 mod tests {
     use super::*;
     use axum::body::{self, Body};
-    use axum::http::{header, HeaderValue, Method, Request};
+    use axum::http::{HeaderValue, Method, Request, header};
     use tower::ServiceExt;
 
     async fn send_json(
@@ -434,7 +443,10 @@ mod tests {
         let req = Request::builder()
             .method(method)
             .uri(uri)
-            .header(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )
             .body(Body::from(body.to_string()))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -565,7 +577,11 @@ mod tests {
             serde_json::json!({ "refresh_token": refresh1 }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "setup-session refresh survives login-session logout");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "setup-session refresh survives login-session logout"
+        );
         assert!(body["access_token"].is_string());
     }
 
@@ -595,4 +611,3 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
     }
 }
-

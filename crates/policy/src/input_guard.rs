@@ -8,10 +8,7 @@
 /// Strip zero-width and bidi-control characters that are a common vector
 /// for hiding "ignore previous instructions"-style payloads.
 pub fn strip_invisible(input: &str) -> String {
-    input
-        .chars()
-        .filter(|c| !is_invisible_bidi(*c))
-        .collect()
+    input.chars().filter(|c| !is_invisible_bidi(*c)).collect()
 }
 
 fn is_invisible_bidi(c: char) -> bool {

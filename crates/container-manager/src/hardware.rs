@@ -86,20 +86,22 @@ pub fn detect_sysfs(root: &Path) -> HardwareProfile {
 
     for entry in entries {
         let name_os = entry.file_name();
-        let Some(name) = name_os.to_str() else { continue };
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
 
         // Match "card0", "card1", etc. — but not "card0-eDP-1".
         if !name.starts_with("card") {
             continue;
         }
         let rest = &name[4..];
-        let Ok(kernel_idx) = rest.parse::<u32>() else { continue };
+        let Ok(kernel_idx) = rest.parse::<u32>() else {
+            continue;
+        };
 
         let device_dir = entry.path().join("device");
-        let vendor_hex =
-            std::fs::read_to_string(device_dir.join("vendor")).unwrap_or_default();
-        let device_hex =
-            std::fs::read_to_string(device_dir.join("device")).unwrap_or_default();
+        let vendor_hex = std::fs::read_to_string(device_dir.join("vendor")).unwrap_or_default();
+        let device_hex = std::fs::read_to_string(device_dir.join("device")).unwrap_or_default();
 
         let vendor_trimmed = vendor_hex.trim().to_owned();
         let device_trimmed = device_hex.trim().to_owned();
@@ -165,7 +167,12 @@ mod tests {
     fn detects_nvidia_and_intel_from_mock_sysfs() {
         let (_dir, root) = mk_mock_sysfs();
         let prof = detect_sysfs(&root);
-        assert_eq!(prof.gpus.len(), 2, "should find exactly 2 gpus, got {:?}", prof.gpus);
+        assert_eq!(
+            prof.gpus.len(),
+            2,
+            "should find exactly 2 gpus, got {:?}",
+            prof.gpus
+        );
         let vendors: Vec<GpuVendor> = prof.gpus.iter().map(|g| g.vendor).collect();
         assert!(vendors.contains(&GpuVendor::Nvidia));
         assert!(vendors.contains(&GpuVendor::Intel));

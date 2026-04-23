@@ -58,9 +58,10 @@ pub enum SqlCipherKey {
 impl std::fmt::Debug for SqlCipherKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SqlCipherKey::RawBytes(b) => {
-                f.debug_tuple("RawBytes").field(&format!("<{} bytes>", b.len())).finish()
-            }
+            SqlCipherKey::RawBytes(b) => f
+                .debug_tuple("RawBytes")
+                .field(&format!("<{} bytes>", b.len()))
+                .finish(),
             SqlCipherKey::Passphrase(_) => {
                 f.debug_tuple("Passphrase").field(&"<redacted>").finish()
             }
@@ -212,7 +213,9 @@ impl Database {
 
 impl std::fmt::Debug for Database {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Database").field("path", &self.path).finish()
+        f.debug_struct("Database")
+            .field("path", &self.path)
+            .finish()
     }
 }
 
@@ -266,11 +269,8 @@ mod tests {
         let db2 = Database::open(&cfg).unwrap();
         let label: String = db2
             .with_conn(|c| {
-                let v: String = c.query_row(
-                    "SELECT label FROM sanity WHERE id = 1",
-                    [],
-                    |r| r.get(0),
-                )?;
+                let v: String =
+                    c.query_row("SELECT label FROM sanity WHERE id = 1", [], |r| r.get(0))?;
                 Ok(v)
             })
             .unwrap();
@@ -284,7 +284,9 @@ mod tests {
         let path = dir.path().join("vault.db");
         let good = DbConfig {
             path: path.clone(),
-            key: Some(SqlCipherKey::Passphrase("correct horse battery staple".into())),
+            key: Some(SqlCipherKey::Passphrase(
+                "correct horse battery staple".into(),
+            )),
         };
         let db = Database::open(&good).unwrap();
         db.with_conn(|c| {

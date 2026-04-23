@@ -282,10 +282,7 @@ impl<'db> EventLog<'db> {
     }
 
     /// Current last_seq for a conversation (0 if none yet).
-    pub fn last_seq(
-        &self,
-        conversation_id: &ConversationId,
-    ) -> Result<EventSeq, DbError> {
+    pub fn last_seq(&self, conversation_id: &ConversationId) -> Result<EventSeq, DbError> {
         self.db.with_conn(|c| {
             let got: Option<i64> = c
                 .query_row(
@@ -355,7 +352,11 @@ impl PendingEvent {
     ) -> Result<Self, DbError> {
         let payload = rmps::to_vec_named(payload)
             .map_err(|e| DbError::Serde(format!("encoding event payload: {e}")))?;
-        Ok(Self { kind, payload, actor })
+        Ok(Self {
+            kind,
+            payload,
+            actor,
+        })
     }
 }
 
@@ -406,9 +407,8 @@ fn enforce_tool_pairing(
                         parsed.ordinal
                     )),
                 };
-                let payload = rmps::to_vec_named(&synthetic).map_err(|e| {
-                    DbError::Serde(format!("encoding synthetic tool_result: {e}"))
-                })?;
+                let payload = rmps::to_vec_named(&synthetic)
+                    .map_err(|e| DbError::Serde(format!("encoding synthetic tool_result: {e}")))?;
                 out.push(EventRecord {
                     conversation_id: conversation_id.clone(),
                     seq: next_seq,

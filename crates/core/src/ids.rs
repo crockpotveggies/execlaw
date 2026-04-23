@@ -93,9 +93,7 @@ string_id!(
 /// Monotonic per-conversation event sequence number.
 ///
 /// Starts at 1 for the first event in a conversation, not 0.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EventSeq(pub i64);
 
@@ -117,9 +115,7 @@ impl fmt::Display for EventSeq {
 ///
 /// A turn is a commit unit (§2.4) containing a user message or resume, plus
 /// the model turn that answered it, plus paired tool_use/tool_result blocks.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TurnSeq(pub i64);
 

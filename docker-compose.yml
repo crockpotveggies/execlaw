@@ -1,0 +1,100 @@
+# execlaw control-plane orchestration.
+#
+# This is the operator-facing deployment entrypoint, mirroring
+# selfhosted-claw's docker-compose.control-plane.yml pattern per
+# MIGRATION_PLAN.md §0 axiom #11. Start with:
+#
+#     docker compose up -d
+#
+# Then curl http://localhost:3030/api/health — expect {"status":"ok"}.
+#
+# The control-plane image is kept tiny (Rust binary + shared-lib deps +
+# CA certs + embedded PCI ID DB, §0 axiom #12). Host features the control
+# plane needs — Docker socket, sysfs, OS keyring — come via bind-mounts,
+# never by inflating the image.
+
+services:
+  control-plane:
+    image: execlaw-control-plane:dev
+    build:
+      context: .
+      dockerfile: Dockerfile.control-plane
+    container_name: execlaw-control-plane
+    restart: unless-stopped
+
+    # Bind loopback on the host; a reverse proxy in front of this is the
+    # operator's choice (not in scope for Phase 0).
+    ports:
+      - "127.0.0.1:3030:3030"
+
+    # Read-only root FS — the Rust binary doesn't need to write anywhere
+    # except the explicitly-declared volumes below.
+    read_only: true
+    tmpfs:
+      - /tmp:exec,mode=1777,size=64m
+
+    # Named volumes for persistent state (§6, §11 Phase 0).
+    volumes:
+      # Docker socket — the container manager needs read-write access to
+      # spawn runner / service / probe containers (§5, §Phase 2). The
+      # control plane is the ONLY component that talks to Docker (§0
+      # axiom #7).
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      # Tiered hardware detection (§5.3). /proc + /sys are read-only —
+      # the control plane only enumerates devices, never writes.
+      - /proc:/proc:ro
+      - /sys:/sys:ro
+
+      # Encrypted SQLCipher DB.
+      - execlaw-db:/var/lib/execlaw/db
+
+      # Installed plugins (ZIP-upload stage lands here, §4.5).
+      - execlaw-plugins:/var/lib/execlaw/plugins
+
+      # JSONL + SQLite log sink (§2.12).
+      - execlaw-logs:/var/lib/execlaw/logs
+
+      # Inbound attachment blobs + research artifacts (§2.9).
+      - execlaw-blobs:/var/lib/execlaw/blobs
+
+    # Writable mount overlay so the read-only root can still allow the
+    # per-volume writes declared above.
+    # (docker handles this implicitly — listing it for clarity.)
+
+    # No per-container environment for secrets (§6 "no .env"). Bootstrap
+    # values come from CLI flags; user-editable config goes in SQLite.
+    environment:
+      RUST_LOG: "execlaw=info,tower_http=info"
+      # No API_KEY / TOKEN / PASSWORD etc. — the vault lives in the DB.
+
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/execlaw", "doctor"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    # Security baseline.
+    security_opt:
+      - no-new-privileges:true
+    # (More seccomp/apparmor tightening follows once the runner-container
+    #  wiring lands in Phase 1; the control plane itself has limited
+    #  syscall needs once bolling has been exercised.)
+
+    # Resource caps — the control plane is lean; runners and services
+    # that do the heavy lifting spawn as separate containers.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+volumes:
+  execlaw-db:
+    driver: local
+  execlaw-plugins:
+    driver: local
+  execlaw-logs:
+    driver: local
+  execlaw-blobs:
+    driver: local

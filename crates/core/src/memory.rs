@@ -60,17 +60,25 @@ impl<'db> MemoryStore<'db> {
                     "SELECT value_blob, ttl_expires, updated_at FROM memory_entries \
                      WHERE scope = ?1 AND trust_class = ?2 AND key = ?3",
                     params![scope, trust_class, key],
-                    |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, i64>(2)?)),
+                    |r| {
+                        Ok((
+                            r.get::<_, Vec<u8>>(0)?,
+                            r.get::<_, Option<i64>>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    },
                 )
                 .ok();
-            Ok(got.map(|(value_blob, ttl_expires, updated_at)| MemoryEntry {
-                scope: scope.to_owned(),
-                trust_class: trust_class.to_owned(),
-                key: key.to_owned(),
-                value_blob,
-                ttl_expires,
-                updated_at,
-            }))
+            Ok(
+                got.map(|(value_blob, ttl_expires, updated_at)| MemoryEntry {
+                    scope: scope.to_owned(),
+                    trust_class: trust_class.to_owned(),
+                    key: key.to_owned(),
+                    value_blob,
+                    ttl_expires,
+                    updated_at,
+                }),
+            )
         })
     }
 }
@@ -95,7 +103,10 @@ mod tests {
             updated_at: 1,
         };
         store.upsert(&entry).unwrap();
-        let got = store.get("global", "Controller", "favorite_voice").unwrap().unwrap();
+        let got = store
+            .get("global", "Controller", "favorite_voice")
+            .unwrap()
+            .unwrap();
         assert_eq!(got.value_blob, entry.value_blob);
     }
 

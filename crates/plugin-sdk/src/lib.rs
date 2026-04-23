@@ -17,7 +17,6 @@ pub mod manifest;
 pub mod zip_stage;
 
 pub use manifest::{
-    HealthCheckProbe, OauthAccountDecl, PluginHeader, PluginManifest, ToolDecl,
-    UiPanelDecl,
+    HealthCheckProbe, OauthAccountDecl, PluginHeader, PluginManifest, ToolDecl, UiPanelDecl,
 };
-pub use zip_stage::{stage_zip, StageError, StagedPlugin};
+pub use zip_stage::{StageError, StagedPlugin, stage_zip};

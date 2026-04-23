@@ -5,9 +5,7 @@ use dashmap::DashMap;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use jsonwebtoken::{
-    decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
-};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -16,11 +14,11 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessClaims {
-    pub sub: String,            // principal_id
+    pub sub: String, // principal_id
     pub iss: String,
     pub exp: i64,
     pub iat: i64,
-    pub sid: String,            // session id — allows bulk-revoke on logout
+    pub sid: String, // session id — allows bulk-revoke on logout
     pub nonce: String,
 }
 
@@ -57,12 +55,7 @@ impl RefreshStore {
         Self::default()
     }
 
-    pub fn issue(
-        &self,
-        principal_id: &str,
-        session_id: &str,
-        ttl_secs: i64,
-    ) -> String {
+    pub fn issue(&self, principal_id: &str, session_id: &str, ttl_secs: i64) -> String {
         let token = Uuid::new_v4().to_string() + "-" + &Uuid::new_v4().to_string();
         self.by_token.insert(
             token.clone(),
@@ -115,11 +108,7 @@ impl JwtSigner {
         Self::from_keys(signing_key, verifying_key, issuer)
     }
 
-    pub fn from_keys(
-        signing_key: SigningKey,
-        verifying_key: VerifyingKey,
-        issuer: String,
-    ) -> Self {
+    pub fn from_keys(signing_key: SigningKey, verifying_key: VerifyingKey, issuer: String) -> Self {
         // Use PEM throughout — jsonwebtoken handles both PKCS#8-encoded
         // private and SubjectPublicKeyInfo public PEM for EdDSA.
         let priv_pem = signing_key
@@ -163,11 +152,10 @@ impl JwtSigner {
 
     pub fn verify_access_token(&self, token: &str) -> Result<AccessClaims, AuthError> {
         let mut validation = Validation::new(Algorithm::EdDSA);
-        validation.set_issuer(&[self.issuer.clone()]);
+        validation.set_issuer(std::slice::from_ref(&self.issuer));
         // Tighten leeway to 0 — a token marked "exp = now - 60" must fail.
         validation.leeway = 0;
-        let data =
-            decode::<AccessClaims>(token, &self.decoding_key, &validation)?;
+        let data = decode::<AccessClaims>(token, &self.decoding_key, &validation)?;
         Ok(data.claims)
     }
 
@@ -228,7 +216,10 @@ mod tests {
         let tok = store.issue("p", "s", 60);
         let rec = store.consume(&tok).unwrap();
         assert_eq!(rec.principal_id, "p");
-        assert!(store.consume(&tok).is_none(), "refresh token must be single-use");
+        assert!(
+            store.consume(&tok).is_none(),
+            "refresh token must be single-use"
+        );
     }
 
     #[test]

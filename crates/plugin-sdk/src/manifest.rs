@@ -120,8 +120,12 @@ pub struct IdentityProviderDecl {
     pub confidence_ceiling: f32,
 }
 
-fn default_trust_hint() -> String { "Contact".to_owned() }
-fn default_confidence_ceiling() -> f32 { 0.95 }
+fn default_trust_hint() -> String {
+    "Contact".to_owned()
+}
+fn default_confidence_ceiling() -> f32 {
+    0.95
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InferenceBackendDecl {
@@ -202,7 +206,9 @@ pub struct HealthCheckDecl {
     pub on_fail_severity: String,
 }
 
-fn default_severity() -> String { "Error".to_owned() }
+fn default_severity() -> String {
+    "Error".to_owned()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]

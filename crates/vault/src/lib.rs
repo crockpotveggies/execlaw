@@ -14,5 +14,5 @@
 pub mod keyring_key;
 pub mod password;
 
-pub use keyring_key::{load_or_create_master_key, KeyringLoadError};
-pub use password::{hash_password, verify_password, PasswordError};
+pub use keyring_key::{KeyringLoadError, load_or_create_master_key};
+pub use password::{PasswordError, hash_password, verify_password};

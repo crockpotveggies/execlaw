@@ -12,5 +12,5 @@ pub mod input_guard;
 pub mod rule_of_two;
 pub mod token;
 
-pub use rule_of_two::{rule_of_two_verdict, RuleOfTwoInput, RuleOfTwoVerdict};
+pub use rule_of_two::{RuleOfTwoInput, RuleOfTwoVerdict, rule_of_two_verdict};
 pub use token::{CapabilityTokenClaims, CapabilityTokenError};

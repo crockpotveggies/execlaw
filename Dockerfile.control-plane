@@ -1,0 +1,96 @@
+# execlaw control-plane image.
+#
+# Minimal per MIGRATION_PLAN.md §0 axiom #12: Rust binary + shared-lib deps
+# + CA certs + embedded PCI ID database, NOTHING else. No CUDA, no OpenVINO,
+# no Python, no nvidia-smi, no ffmpeg, no vendor SDKs.
+#
+# Build:   docker build -f Dockerfile.control-plane -t execlaw-control-plane:dev .
+# Run via: docker compose up   (preferred — see docker-compose.yml)
+#
+# -----------------------------------------------------------------------------
+# Stage 1 — build the Rust binary with SQLCipher + vendored OpenSSL.
+# -----------------------------------------------------------------------------
+FROM rust:1.85-bookworm AS builder
+
+# Dependencies needed to vendor OpenSSL (for SQLCipher) and to embed the PCI
+# ID database. perl-modules-5.xx pulls the Locale::Maketext modules the
+# openssl-src crate needs during its Configure step.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config \
+        perl \
+        perl-modules \
+        make \
+        gcc \
+        libc6-dev \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download the PCI ID database at build time so the control-plane binary can
+# map PCI vendor/device IDs to human-readable GPU names without invoking any
+# vendor tooling at runtime (§5.3 Tier 1, axiom #12).
+RUN mkdir -p /build/embed \
+ && curl -fsSL -o /build/embed/pci.ids https://pci-ids.ucw.cz/v2.2/pci.ids \
+ && wc -l /build/embed/pci.ids
+
+WORKDIR /build/src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY spec ./spec
+
+# Build the CLI binary with SQLCipher + vendored OpenSSL enabled.
+# `--no-default-features -F execlaw-core/sqlcipher` disables the
+# `bundled-sqlite-plain` default (dev-only fallback) and turns on the
+# SQLCipher path so the production image ships an encrypted DB by
+# default. No cloud SDKs in any feature — see `crates/*/Cargo.toml`
+# for the invariant.
+ENV CARGO_TERM_COLOR=always
+RUN cargo build --release --bin execlaw \
+        --no-default-features \
+        -F execlaw-core/sqlcipher
+
+# Strip is already on in the workspace release profile, but be defensive
+# against a future profile change.
+RUN strip /build/src/target/release/execlaw || true
+
+# -----------------------------------------------------------------------------
+# Stage 2 — runtime image.
+#
+# debian:bookworm-slim ships glibc + /lib64; we add only ca-certificates for
+# outbound HTTPS (to inference bridges and OAuth endpoints). No vendor
+# tooling ever lands in this image. Runs as `nobody` with a read-only root
+# FS — writable paths are bind-mounted by docker-compose.
+# -----------------------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy in the compiled Rust binary.
+COPY --from=builder /build/src/target/release/execlaw /usr/local/bin/execlaw
+# Copy in the PCI ID database. The control plane reads it from
+# /usr/share/hwdata/pci.ids (matching the standard `pciutils` install path)
+# so operator tooling can override it with their own.
+COPY --from=builder /build/embed/pci.ids /usr/share/hwdata/pci.ids
+
+# Create writable tree under /var/lib/execlaw for the DB + plugins + logs.
+# Compose bind-mounts named volumes onto these paths.
+RUN mkdir -p /var/lib/execlaw/db \
+             /var/lib/execlaw/plugins \
+             /var/lib/execlaw/logs \
+             /var/lib/execlaw/blobs \
+ && chown -R nobody:nogroup /var/lib/execlaw
+
+USER nobody:nogroup
+WORKDIR /var/lib/execlaw
+
+EXPOSE 3030
+
+# tini handles signal forwarding for the Rust binary.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/usr/local/bin/execlaw", \
+     "serve", \
+     "--bind", "0.0.0.0:3030", \
+     "--db", "/var/lib/execlaw/db/execlaw.db"]

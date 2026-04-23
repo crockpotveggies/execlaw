@@ -1,26 +1,25 @@
 //! API documentation endpoints.
 //!
-//! - `GET /api/openapi.json`   OpenAPI 3.x spec from `utoipa`-annotated
-//!                              handlers.
+//! - `GET /api/openapi.json`  OpenAPI 3.x spec from `utoipa`-annotated
+//!   handlers.
 //! - `GET /api/asyncapi.json`  Hand-authored AsyncAPI 3.x spec (the
-//!                              WebSocket event vocabulary).
-//! - `GET /api/docs`           A tiny HTML page that loads Swagger UI for
-//!                              the OpenAPI spec and a JSON pretty-print
-//!                              viewer for the AsyncAPI spec.
+//!   WebSocket event vocabulary).
+//! - `GET /api/docs`  A tiny HTML page that loads Swagger UI for the
+//!   OpenAPI spec and a JSON pretty-print viewer for the AsyncAPI spec.
 //!
 //! Per MIGRATION_PLAN §8.4: "Swagger/OpenAPI 3.x for REST (via utoipa
 //! annotations) and AsyncAPI 3.x for WebSocket event vocabulary (hand-
 //! authored). Both served at /api/docs."
 
-use axum::http::{header, StatusCode};
+use axum::Router;
+use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
 use utoipa::OpenApi;
 
 use crate::routes::{
-    GenericOk, HealthResponse, LoginRequest, LoginResponse, LogoutRequest,
-    RefreshRequest, RefreshResponse, SetupRequest, SetupResponse,
+    GenericOk, HealthResponse, LoginRequest, LoginResponse, LogoutRequest, RefreshRequest,
+    RefreshResponse, SetupRequest, SetupResponse,
 };
 
 #[derive(OpenApi)]
@@ -167,10 +166,8 @@ fn swagger_sub_router<S: Clone + Send + Sync + 'static>() -> Router<S> {
     use utoipa_swagger_ui::SwaggerUi;
     // Serves Swagger UI at /api/docs/swagger/* AND exposes the spec at
     // /api/openapi.json automatically.
-    Router::new().merge(
-        SwaggerUi::new("/api/docs/swagger")
-            .url("/api/openapi.json", ApiDoc::openapi()),
-    )
+    Router::new()
+        .merge(SwaggerUi::new("/api/docs/swagger").url("/api/openapi.json", ApiDoc::openapi()))
 }
 
 #[cfg(test)]

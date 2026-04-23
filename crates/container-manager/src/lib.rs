@@ -17,6 +17,4 @@
 
 pub mod hardware;
 
-pub use hardware::{
-    detect_sysfs, GpuDevice, GpuId, GpuVendor, HardwareProfile, SysfsSource,
-};
+pub use hardware::{GpuDevice, GpuId, GpuVendor, HardwareProfile, SysfsSource, detect_sysfs};
