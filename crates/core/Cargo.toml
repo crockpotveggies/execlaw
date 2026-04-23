@@ -1,0 +1,46 @@
+[package]
+name = "execlaw-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Event log, conversation FSM, turn commit, work queue. The durability heart of execlaw."
+
+[features]
+# Default is plaintext SQLite — for local-dev `cargo check/test` on hosts
+# that can't build OpenSSL (notably Windows without Strawberry Perl).
+#
+# Production release builds *must* enable `sqlcipher` (the Docker image
+# does this explicitly in `Dockerfile.control-plane`). CI fails the
+# release job if the binary reports it was built without SQLCipher.
+default = ["bundled-sqlite-plain"]
+bundled-sqlite-plain = ["rusqlite/bundled"]
+# Encrypted DB: SQLCipher + bundled, vendored OpenSSL. One binary, one
+# encrypted file, no system deps. Enabled by the production image build.
+sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rmp-serde.workspace = true
+rusqlite.workspace = true
+r2d2.workspace = true
+r2d2_sqlite.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+hex.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+schemars.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+pretty_assertions.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
