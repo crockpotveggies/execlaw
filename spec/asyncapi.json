@@ -1,0 +1,46 @@
+{
+  "asyncapi": "3.0.0",
+  "info": {
+    "title": "execlaw WebSocket event stream",
+    "version": "0.1.0",
+    "description": "Event vocabulary for /api/stream. Hand-authored per MIGRATION_PLAN.md \u00a78.4."
+  },
+  "servers": {
+    "local": {
+      "host": "127.0.0.1:3030",
+      "protocol": "ws",
+      "description": "Local control-plane WebSocket."
+    }
+  },
+  "channels": {
+    "stream": {
+      "address": "/api/stream",
+      "description": "Unified live event stream for UI + admin consumers.",
+      "messages": {
+        "chatMessageInbound": { "name": "chat.message_inbound" },
+        "chatMessageOutbound": { "name": "chat.message_outbound" },
+        "chatTokenDelta": { "name": "chat.token_delta" },
+        "agentThinking": { "name": "agent.thinking" },
+        "agentToolUse": { "name": "agent.tool_use" },
+        "agentToolResult": { "name": "agent.tool_result" },
+        "researchProgress": { "name": "research.progress" },
+        "alertFired": { "name": "alert.fired" },
+        "alertAcked": { "name": "alert.acked" },
+        "alertResolved": { "name": "alert.resolved" },
+        "pluginStatus": { "name": "plugin.status" },
+        "containerLifecycle": { "name": "container.lifecycle" },
+        "voiceUserUtterance": { "name": "voice.user_utterance" },
+        "voiceAgentUtterance": { "name": "voice.agent_utterance" },
+        "voiceInterrupt": { "name": "voice.interrupt" },
+        "voiceInterruptRescinded": { "name": "voice.interrupt_rescinded" }
+      }
+    }
+  },
+  "operations": {
+    "receiveStream": {
+      "action": "receive",
+      "channel": { "$ref": "#/channels/stream" },
+      "summary": "Subscribe to the unified event stream."
+    }
+  }
+}

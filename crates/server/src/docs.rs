@@ -1,0 +1,200 @@
+//! API documentation endpoints.
+//!
+//! - `GET /api/openapi.json`   OpenAPI 3.x spec from `utoipa`-annotated
+//!                              handlers.
+//! - `GET /api/asyncapi.json`  Hand-authored AsyncAPI 3.x spec (the
+//!                              WebSocket event vocabulary).
+//! - `GET /api/docs`           A tiny HTML page that loads Swagger UI for
+//!                              the OpenAPI spec and a JSON pretty-print
+//!                              viewer for the AsyncAPI spec.
+//!
+//! Per MIGRATION_PLAN §8.4: "Swagger/OpenAPI 3.x for REST (via utoipa
+//! annotations) and AsyncAPI 3.x for WebSocket event vocabulary (hand-
+//! authored). Both served at /api/docs."
+
+use axum::http::{header, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::get;
+use axum::Router;
+use utoipa::OpenApi;
+
+use crate::routes::{
+    GenericOk, HealthResponse, LoginRequest, LoginResponse, LogoutRequest,
+    RefreshRequest, RefreshResponse, SetupRequest, SetupResponse,
+};
+
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "execlaw",
+        version = "0.1.0",
+        description = "Self-hosted Rust agent framework. Phase 0 surface.",
+    ),
+    paths(
+        crate::routes::health,
+        crate::routes::setup,
+        crate::routes::login,
+        crate::routes::refresh,
+        crate::routes::logout,
+    ),
+    components(schemas(
+        HealthResponse,
+        SetupRequest,
+        SetupResponse,
+        LoginRequest,
+        LoginResponse,
+        RefreshRequest,
+        RefreshResponse,
+        LogoutRequest,
+        GenericOk,
+    )),
+    tags(
+        (name = "meta", description = "Liveness + introspection"),
+        (name = "auth", description = "First-run setup, login, token management"),
+    )
+)]
+pub struct ApiDoc;
+
+pub fn openapi_json_string() -> String {
+    ApiDoc::openapi()
+        .to_pretty_json()
+        .unwrap_or_else(|_| "{}".to_owned())
+}
+
+/// Hand-authored AsyncAPI 3 spec for `/api/stream`.
+///
+/// Embedded from `spec/asyncapi.yaml` at the repo root so operators can
+/// edit the YAML without recompiling... wait, no: we embed at compile
+/// time to keep the binary self-contained (§0 "minimal containers").
+/// Operators who want to tweak the published spec rebuild; the event
+/// vocabulary itself is code-defined anyway.
+pub const ASYNCAPI_YAML: &str = include_str!("../../../spec/asyncapi.yaml");
+
+fn asyncapi_json() -> String {
+    // Cheap YAML-to-JSON hop via serde_yaml... but we don't want that dep.
+    // Since we hand-maintain the YAML, ship a small JSON sidecar too.
+    include_str!("../../../spec/asyncapi.json").to_owned()
+}
+
+/// A minimal docs page: links to Swagger UI (served inline) and pretty-
+/// prints the AsyncAPI spec.
+async fn docs_html() -> Html<&'static str> {
+    Html(DOCS_HTML)
+}
+
+const DOCS_HTML: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>execlaw API docs</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+           margin: 0; padding: 0; background: #111; color: #eee; }
+    header { background: #222; padding: 1rem 2rem; border-bottom: 1px solid #333; }
+    header h1 { margin: 0; font-size: 1.25rem; }
+    nav { margin-top: 0.5rem; }
+    nav a { color: #9cf; margin-right: 1rem; text-decoration: none; }
+    main { padding: 1rem 2rem; }
+    iframe { border: 1px solid #333; background: #fff; width: 100%; min-height: 600px; }
+    pre { background: #1a1a1a; padding: 1rem; border-radius: 4px; overflow: auto; max-height: 400px; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>execlaw API docs</h1>
+  <nav>
+    <a href="#openapi">OpenAPI (REST)</a>
+    <a href="#asyncapi">AsyncAPI (WebSocket)</a>
+    <a href="/api/openapi.json">openapi.json</a>
+    <a href="/api/asyncapi.json">asyncapi.json</a>
+  </nav>
+</header>
+<main>
+  <section id="openapi">
+    <h2>REST API</h2>
+    <p>Swagger UI loads from a CDN-free, locally-bundled page.</p>
+    <iframe src="/api/docs/swagger/" title="Swagger UI"></iframe>
+  </section>
+  <section id="asyncapi">
+    <h2>WebSocket events</h2>
+    <p>AsyncAPI 3 spec for <code>/api/stream</code>.</p>
+    <pre id="asyncapi-json">Loading…</pre>
+    <script>
+      fetch('/api/asyncapi.json')
+        .then(r => r.json())
+        .then(j => { document.getElementById('asyncapi-json').textContent = JSON.stringify(j, null, 2); })
+        .catch(e => { document.getElementById('asyncapi-json').textContent = 'error: ' + e; });
+    </script>
+  </section>
+</main>
+</body>
+</html>"##;
+
+async fn serve_asyncapi() -> Response {
+    let body = asyncapi_json();
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
+}
+
+async fn serve_asyncapi_yaml() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/yaml")],
+        ASYNCAPI_YAML.to_owned(),
+    )
+        .into_response()
+}
+
+/// Build the docs sub-router. Merged by `routes::build_router`.
+///
+/// `utoipa-swagger-ui` owns `/api/openapi.json` because it also serves the
+/// Swagger UI at `/api/docs/swagger/` that reads from that URL. We add
+/// the AsyncAPI endpoints and the combined docs landing page on top.
+pub fn docs_router<S: Clone + Send + Sync + 'static>() -> Router<S> {
+    Router::new()
+        .route("/api/asyncapi.json", get(serve_asyncapi))
+        .route("/api/asyncapi.yaml", get(serve_asyncapi_yaml))
+        .route("/api/docs", get(docs_html))
+        .merge(swagger_sub_router::<S>())
+}
+
+fn swagger_sub_router<S: Clone + Send + Sync + 'static>() -> Router<S> {
+    use utoipa_swagger_ui::SwaggerUi;
+    // Serves Swagger UI at /api/docs/swagger/* AND exposes the spec at
+    // /api/openapi.json automatically.
+    Router::new().merge(
+        SwaggerUi::new("/api/docs/swagger")
+            .url("/api/openapi.json", ApiDoc::openapi()),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openapi_json_is_valid_json_and_lists_health() {
+        let s = openapi_json_string();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["info"]["title"], "execlaw");
+        assert!(v["paths"]["/api/health"].is_object());
+        assert!(v["paths"]["/api/setup"].is_object());
+        assert!(v["paths"]["/api/login"].is_object());
+        assert!(v["paths"]["/api/token/refresh"].is_object());
+        assert!(v["paths"]["/api/logout"].is_object());
+    }
+
+    #[test]
+    fn asyncapi_json_is_valid_json() {
+        let s = asyncapi_json();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        // AsyncAPI 3 uses the `asyncapi` top-level field.
+        assert!(v["asyncapi"].is_string());
+        assert!(v["channels"].is_object() || v["channels"].is_null());
+    }
+}
