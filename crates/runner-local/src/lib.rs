@@ -12,6 +12,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod memory_tool;
+pub mod turn;
+
 use execlaw_inference_api::InferenceClient;
 
 /// Minimal runner handle. Phase 1 turns this into a real trait that

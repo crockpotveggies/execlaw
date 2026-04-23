@@ -1,0 +1,567 @@
+//! Turn execution — the core loop that drives one agent turn.
+//!
+//! This is the Phase 1 implementation of the turn pattern described in
+//! MIGRATION_PLAN §2.4 "The turn as a transaction". A turn:
+//!
+//! 1. Pulls the conversation's event log to assemble prompt context.
+//! 2. Calls the inference backend via [`execlaw_inference_api`].
+//! 3. If the model emitted `tool_calls`, dispatches each via the
+//!    [`ToolDispatch`] trait, collecting `tool_result`s.
+//! 4. Commits the whole turn in ONE SQLite transaction via
+//!    [`execlaw_core::events::EventLog::commit_turn`], which enforces the
+//!    `tool_use`/`tool_result` pairing invariant.
+//!
+//! External side-effecting tools must enqueue outbox rows (not dispatch
+//! directly) so delivery happens out-of-band through the outbox relay.
+//!
+//! This skeleton wires the plumbing; richer features (sub-agent spawn,
+//! compaction, planner/executor split for untrusted turns, voice pipeline
+//! integration) land incrementally on top of this shape.
+
+use async_trait::async_trait;
+use execlaw_core::conversation::ConversationStore;
+use execlaw_core::db::Database;
+use execlaw_core::events::{
+    EventKind, EventLog, EventRecord, PendingEvent, ToolResultPayload, ToolUsePayload,
+};
+use execlaw_core::ids::{ConversationId, EventSeq};
+use execlaw_inference_api::{
+    ChatMessage, ChatRequest, InferenceClient, InferenceError, ModelId, Role, ToolCall,
+    ToolDeclaration,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use thiserror::Error;
+
+// ---------------------------------------------------------------------------
+// Tool dispatch trait
+// ---------------------------------------------------------------------------
+
+/// Handles one named tool. Returns either a success JSON value or a
+/// cancellation reason string. The caller wraps both into a
+/// [`ToolResultPayload`].
+#[async_trait]
+pub trait ToolDispatch: Send + Sync {
+    async fn call(
+        &self,
+        tool_name: &str,
+        args_json: &serde_json::Value,
+    ) -> Result<serde_json::Value, String>;
+}
+
+// ---------------------------------------------------------------------------
+// Per-turn input + output
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserMessagePayload {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_principal_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelTurnPayload {
+    pub model: String,
+    pub finish_reason: Option<String>,
+    /// The model's text reply (may be empty if the turn was tool-call only).
+    pub text: String,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+}
+
+/// Configuration for one turn.
+#[derive(Debug, Clone)]
+pub struct TurnConfig {
+    pub model: ModelId,
+    pub system_prompt: String,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+    /// Hard cap on tool-call rounds within a single turn, to prevent
+    /// runaway loops. Each model→tool→model→tool bounce counts as one.
+    pub max_tool_rounds: u32,
+    /// The tool set the model sees in the `tools` array.
+    pub tools: Vec<ToolDeclaration>,
+}
+
+#[derive(Debug, Error)]
+pub enum TurnError {
+    #[error("inference: {0}")]
+    Inference(#[from] InferenceError),
+    #[error("db: {0}")]
+    Db(#[from] execlaw_core::db::DbError),
+    #[error("turn exceeded max_tool_rounds ({0})")]
+    MaxRounds(u32),
+}
+
+#[derive(Debug, Clone)]
+pub struct TurnSummary {
+    pub events_written: Vec<EventRecord>,
+    pub assistant_text: String,
+    pub tool_rounds: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Turn executor
+// ---------------------------------------------------------------------------
+
+/// Runs a single turn on behalf of a conversation. Stateless; safe to
+/// construct per-turn.
+pub struct TurnExecutor {
+    pub inference: InferenceClient,
+    pub tool_dispatch: Arc<dyn ToolDispatch>,
+}
+
+impl TurnExecutor {
+    pub fn new(inference: InferenceClient, tool_dispatch: Arc<dyn ToolDispatch>) -> Self {
+        Self {
+            inference,
+            tool_dispatch,
+        }
+    }
+
+    /// Execute one turn:
+    ///   1. Append a `user_msg` event to the log.
+    ///   2. Assemble chat messages from the log.
+    ///   3. Call the model; loop on tool_calls.
+    ///   4. Commit everything via `EventLog::commit_turn`.
+    pub async fn run_turn(
+        &self,
+        db: &Database,
+        conversation_id: &ConversationId,
+        user_text: &str,
+        sender_principal_id: Option<String>,
+        cfg: &TurnConfig,
+    ) -> Result<TurnSummary, TurnError> {
+        // 1. Record the inbound user message as its own event so it's in
+        //    the log before we ask the model anything.
+        let log = EventLog::new(db);
+        let user_seq = log.last_seq(conversation_id)?.next();
+        let user_event = EventRecord::new(
+            conversation_id.clone(),
+            user_seq,
+            EventKind::UserMsg,
+            &UserMessagePayload {
+                text: user_text.to_owned(),
+                sender_principal_id: sender_principal_id.clone(),
+            },
+            sender_principal_id,
+        )?;
+        log.append(&user_event)?;
+
+        // 2. Assemble the chat messages from the event log.
+        let history = log.replay_since(conversation_id, EventSeq(0))?;
+        let mut messages: Vec<ChatMessage> = vec![ChatMessage::system(&cfg.system_prompt)];
+        messages.extend(hydrate_messages(&history));
+
+        // 3. Tool-call loop.
+        let mut pending: Vec<PendingEvent> = Vec::new();
+        let mut tool_ordinal: u32 = 0;
+        let mut rounds: u32 = 0;
+        let mut last_text: String = String::new();
+        let mut prompt_tokens: Option<u32> = None;
+        let mut completion_tokens: Option<u32> = None;
+
+        loop {
+            if rounds >= cfg.max_tool_rounds {
+                // Record a cancelled model turn with a clear reason so the
+                // transcript isn't a dangling prompt.
+                pending.push(PendingEvent::encode(
+                    EventKind::LlmCancelled,
+                    &serde_json::json!({
+                        "reason": "max_tool_rounds_exceeded",
+                        "rounds": rounds,
+                    }),
+                    Some("system".into()),
+                )?);
+                return Err(TurnError::MaxRounds(cfg.max_tool_rounds));
+            }
+
+            let req = ChatRequest {
+                model: cfg.model.clone(),
+                messages: messages.clone(),
+                tools: Some(cfg.tools.clone()),
+                stream: false,
+                temperature: cfg.temperature,
+                max_tokens: cfg.max_tokens,
+            };
+            let resp = self.inference.chat_completions(&req).await?;
+            let choice = match resp.choices.first() {
+                Some(c) => c.clone(),
+                None => {
+                    // Defensive: treat no-choices as a failed turn.
+                    break;
+                }
+            };
+
+            let finish_reason = choice.finish_reason.clone();
+            if let Some(u) = &resp.usage {
+                prompt_tokens = Some(u.prompt_tokens);
+                completion_tokens = Some(u.completion_tokens);
+            }
+
+            // Append the assistant message to our working transcript for
+            // any subsequent rounds.
+            let assistant_content = choice.message.content.clone().unwrap_or_default();
+            last_text = assistant_content.clone();
+            messages.push(ChatMessage {
+                role: Role::Assistant,
+                content: choice.message.content.clone(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: choice.message.tool_calls.clone(),
+            });
+
+            if choice.message.tool_calls.is_empty() {
+                // Terminal: record the model turn and exit the loop.
+                pending.push(PendingEvent::encode(
+                    EventKind::ModelTurn,
+                    &ModelTurnPayload {
+                        model: resp.model.clone(),
+                        finish_reason,
+                        text: assistant_content,
+                        prompt_tokens,
+                        completion_tokens,
+                    },
+                    Some("agent".into()),
+                )?);
+                break;
+            }
+
+            // Dispatch each tool call, producing paired use/result events.
+            for tc in &choice.message.tool_calls {
+                let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+
+                pending.push(PendingEvent::encode(
+                    EventKind::ToolUse,
+                    &ToolUsePayload {
+                        ordinal: tool_ordinal,
+                        tool_name: tc.function.name.clone(),
+                        args_json: args.clone(),
+                    },
+                    Some("agent".into()),
+                )?);
+
+                let outcome = self.tool_dispatch.call(&tc.function.name, &args).await;
+
+                let result_payload = ToolResultPayload {
+                    ordinal: tool_ordinal,
+                    outcome: match outcome {
+                        Ok(v) => Ok(v.clone()),
+                        Err(e) => Err(e),
+                    },
+                };
+                pending.push(PendingEvent::encode(
+                    EventKind::ToolResult,
+                    &result_payload,
+                    Some("system".into()),
+                )?);
+
+                // Feed the tool result back into the chat history for the
+                // next round.
+                let feedback = serde_json::to_string(&result_payload.outcome)
+                    .unwrap_or_else(|_| "{\"outcome\":\"encoding_failed\"}".into());
+                messages.push(ChatMessage::tool_result(&tc.id, feedback));
+
+                tool_ordinal += 1;
+            }
+
+            rounds += 1;
+        }
+
+        // 4. Commit the turn atomically. `commit_turn` enforces the
+        //    tool_use/tool_result pairing invariant for us.
+        let base_seq = log.last_seq(conversation_id)?;
+        let written = log.commit_turn(conversation_id, base_seq, pending)?;
+
+        // Kick the conversation row so UI observers see the new last_seq.
+        // (Phase 1 could also update phase → idle here.)
+        let store = ConversationStore::new(db);
+        if let Some(mut row) = store.get(conversation_id)? {
+            row.last_seq = log.last_seq(conversation_id)?;
+            store.upsert(&row)?;
+        }
+
+        Ok(TurnSummary {
+            events_written: written,
+            assistant_text: last_text,
+            tool_rounds: rounds,
+        })
+    }
+}
+
+/// Convert a span of event-log records into chat messages for the next
+/// model call. Phase 1 handles user_msg + model_turn + tool_use/tool_result
+/// pairs; richer event kinds (voice, etc.) are skipped over for text turns.
+fn hydrate_messages(events: &[EventRecord]) -> Vec<ChatMessage> {
+    let mut out: Vec<ChatMessage> = Vec::new();
+    let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
+
+    for ev in events {
+        match ev.kind {
+            EventKind::UserMsg => {
+                if let Ok(p) = ev.decode_payload::<UserMessagePayload>() {
+                    out.push(ChatMessage::user(p.text));
+                }
+            }
+            EventKind::ModelTurn => {
+                if let Ok(p) = ev.decode_payload::<ModelTurnPayload>() {
+                    let mut m = ChatMessage::assistant(p.text);
+                    // If there were tool calls in the same turn, we attach
+                    // them to the assistant message so the follow-up tool
+                    // messages align.
+                    std::mem::swap(&mut m.tool_calls, &mut pending_tool_calls);
+                    out.push(m);
+                }
+            }
+            EventKind::ToolUse => {
+                if let Ok(p) = ev.decode_payload::<ToolUsePayload>() {
+                    pending_tool_calls.push(ToolCall {
+                        id: format!("call_{}", p.ordinal),
+                        kind: "function".into(),
+                        function: execlaw_inference_api::ToolCallFunction {
+                            name: p.tool_name,
+                            arguments: p.args_json.to_string(),
+                        },
+                    });
+                }
+            }
+            EventKind::ToolResult => {
+                if let Ok(p) = ev.decode_payload::<ToolResultPayload>() {
+                    let body = match &p.outcome {
+                        Ok(v) => v.to_string(),
+                        Err(e) => serde_json::json!({"error": e}).to_string(),
+                    };
+                    out.push(ChatMessage::tool_result(
+                        format!("call_{}", p.ordinal),
+                        body,
+                    ));
+                }
+            }
+            _ => { /* other event kinds don't surface to the model */ }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use execlaw_core::db::{Database, DbConfig};
+    use execlaw_core::migrations::MigrationRunner;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn fresh_db() -> Database {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        db
+    }
+
+    struct NullTools;
+
+    #[async_trait]
+    impl ToolDispatch for NullTools {
+        async fn call(
+            &self,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Err("no tools wired".into())
+        }
+    }
+
+    struct ChainedMockServer {
+        responses: Vec<String>,
+        served: AtomicUsize,
+    }
+
+    async fn run_mock_server(server: Arc<ChainedMockServer>) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                let idx = server.served.fetch_add(1, Ordering::SeqCst);
+                let body = server
+                    .responses
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| server.responses.last().cloned().unwrap_or_default());
+                let mut buf = [0u8; 8192];
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(300),
+                    sock.read(&mut buf),
+                )
+                .await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn simple_text_turn_commits_user_and_model_events() {
+        let db = fresh_db();
+
+        let canned = r#"{
+            "id": "r1",
+            "model": "Qwen3.5-27B-AWQ",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi there"},
+                "finish_reason": "stop"
+            }]
+        }"#
+        .to_owned();
+        let server = Arc::new(ChainedMockServer {
+            responses: vec![canned],
+            served: AtomicUsize::new(0),
+        });
+        let addr = run_mock_server(server.clone()).await;
+
+        let exec = TurnExecutor::new(
+            InferenceClient::new(format!("http://{addr}/v1")),
+            Arc::new(NullTools),
+        );
+        let cid = ConversationId::from("conv-simple");
+        let cfg = TurnConfig {
+            model: ModelId("QuantTrio/Qwen3.5-27B-AWQ".to_owned()),
+            system_prompt: "test".into(),
+            temperature: None,
+            max_tokens: None,
+            max_tool_rounds: 3,
+            tools: vec![],
+        };
+
+        let summary = exec
+            .run_turn(&db, &cid, "hello", Some("pri-1".into()), &cfg)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.assistant_text, "hi there");
+        assert_eq!(summary.tool_rounds, 0);
+
+        let log = EventLog::new(&db);
+        let events = log.replay_since(&cid, EventSeq(0)).unwrap();
+        // user_msg + model_turn
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, EventKind::UserMsg);
+        assert_eq!(events[1].kind, EventKind::ModelTurn);
+    }
+
+    #[tokio::test]
+    async fn tool_call_turn_produces_paired_tool_events() {
+        let db = fresh_db();
+
+        // Response 1 asks to call a tool.
+        let r1 = r#"{
+            "id": "r1",
+            "model": "Qwen3.5-27B-AWQ",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "echo", "arguments": "{\"msg\":\"ping\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }"#
+        .to_owned();
+        // Response 2 is the final text after the tool result is provided.
+        let r2 = r#"{
+            "id": "r2",
+            "model": "Qwen3.5-27B-AWQ",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok got pong"},
+                "finish_reason": "stop"
+            }]
+        }"#
+        .to_owned();
+
+        let server = Arc::new(ChainedMockServer {
+            responses: vec![r1, r2],
+            served: AtomicUsize::new(0),
+        });
+        let addr = run_mock_server(server.clone()).await;
+
+        struct EchoTool;
+        #[async_trait]
+        impl ToolDispatch for EchoTool {
+            async fn call(
+                &self,
+                _name: &str,
+                args: &serde_json::Value,
+            ) -> Result<serde_json::Value, String> {
+                Ok(serde_json::json!({
+                    "echoed": args.get("msg").cloned().unwrap_or(serde_json::Value::Null)
+                }))
+            }
+        }
+
+        let exec = TurnExecutor::new(
+            InferenceClient::new(format!("http://{addr}/v1")),
+            Arc::new(EchoTool),
+        );
+        let cid = ConversationId::from("conv-tool");
+        let cfg = TurnConfig {
+            model: ModelId("QuantTrio/Qwen3.5-27B-AWQ".to_owned()),
+            system_prompt: "test".into(),
+            temperature: None,
+            max_tokens: None,
+            max_tool_rounds: 3,
+            tools: vec![ToolDeclaration::function(
+                "echo",
+                "echo the arg",
+                serde_json::json!({"type":"object"}),
+            )],
+        };
+
+        let summary = exec
+            .run_turn(&db, &cid, "do the thing", None, &cfg)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.tool_rounds, 1);
+        assert_eq!(summary.assistant_text, "ok got pong");
+
+        // Verify the event log: user_msg + tool_use + tool_result + model_turn
+        let log = EventLog::new(&db);
+        let events = log.replay_since(&cid, EventSeq(0)).unwrap();
+        let kinds: Vec<EventKind> = events.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::UserMsg,
+                EventKind::ToolUse,
+                EventKind::ToolResult,
+                EventKind::ModelTurn,
+            ]
+        );
+
+        // The pairing invariant should hold (same ordinal for use+result).
+        let use_ord: ToolUsePayload = events[1].decode_payload().unwrap();
+        let res_ord: ToolResultPayload = events[2].decode_payload().unwrap();
+        assert_eq!(use_ord.ordinal, res_ord.ordinal);
+        assert!(res_ord.outcome.is_ok());
+    }
+}
