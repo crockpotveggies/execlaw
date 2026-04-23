@@ -117,6 +117,128 @@ impl<'db> OutboxStore<'db> {
             Ok(changed > 0)
         })
     }
+
+    /// Fetch up to `limit` outbox rows that are ready to deliver — `pending`
+    /// status and either no `next_attempt_at` or `next_attempt_at <= now`.
+    /// Ordered by id (FIFO).
+    pub fn ready_pending(&self, now_ts: i64, limit: i64) -> Result<Vec<OutboxRow>, DbError> {
+        self.db.with_conn(|c| {
+            let mut stmt = c.prepare_cached(
+                "SELECT id, idempotency_key, conversation_id, effect_kind, payload, status, \
+                        attempts, next_attempt_at, last_error, enqueued_seq \
+                 FROM state_outbox \
+                 WHERE status = 'pending' \
+                   AND (next_attempt_at IS NULL OR next_attempt_at <= ?1) \
+                 ORDER BY id ASC \
+                 LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(params![now_ts, limit], row_to_outbox)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Atomically mark a row `in_flight` if and only if it is currently
+    /// `pending`. Returns true if the caller now owns dispatch.
+    ///
+    /// This is the leasing primitive that prevents two drain-loop
+    /// iterations from dispatching the same row.
+    pub fn claim(&self, id: i64) -> Result<bool, DbError> {
+        self.db.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE state_outbox SET status = 'in_flight' WHERE id = ?1 AND status = 'pending'",
+                params![id],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    /// Mark a claimed row as successfully delivered.
+    pub fn mark_delivered(&self, id: i64) -> Result<(), DbError> {
+        self.db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_outbox SET status = 'delivered', last_error = NULL \
+                 WHERE id = ?1",
+                params![id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record a failed attempt. Bumps `attempts`; if under the retry
+    /// budget, sets status back to `pending` with `next_attempt_at` for
+    /// the backoff schedule. If over budget, status → `dead_letter`.
+    pub fn record_failure(
+        &self,
+        id: i64,
+        error: &str,
+        retry_budget_max: u32,
+        backoff_secs: i64,
+    ) -> Result<bool, DbError> {
+        // Returns true if retrying, false if moved to dead_letter.
+        self.db.transaction(|tx| {
+            let attempts: i64 = tx.query_row(
+                "SELECT attempts FROM state_outbox WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )?;
+            let new_attempts = attempts + 1;
+            if (new_attempts as u32) >= retry_budget_max {
+                tx.execute(
+                    "UPDATE state_outbox SET status = 'dead_letter', last_error = ?1, \
+                         attempts = ?2 WHERE id = ?3",
+                    params![error, new_attempts, id],
+                )?;
+                Ok(false)
+            } else {
+                let next_attempt_at = chrono::Utc::now().timestamp() + backoff_secs;
+                tx.execute(
+                    "UPDATE state_outbox SET status = 'pending', last_error = ?1, \
+                         attempts = ?2, next_attempt_at = ?3 WHERE id = ?4",
+                    params![error, new_attempts, next_attempt_at, id],
+                )?;
+                Ok(true)
+            }
+        })
+    }
+
+    /// Count rows currently in dead_letter. Useful for alerting.
+    pub fn dead_letter_count(&self) -> Result<i64, DbError> {
+        self.db.with_conn(|c| {
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM state_outbox WHERE status = 'dead_letter'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(n)
+        })
+    }
+}
+
+fn row_to_outbox(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
+    let id: i64 = row.get(0)?;
+    let idempotency_key: String = row.get(1)?;
+    let conversation_id: String = row.get(2)?;
+    let effect_kind: String = row.get(3)?;
+    let payload: Vec<u8> = row.get(4)?;
+    let status: String = row.get(5)?;
+    let attempts: i64 = row.get(6)?;
+    let next_attempt_at: Option<i64> = row.get(7)?;
+    let last_error: Option<String> = row.get(8)?;
+    let enqueued_seq: i64 = row.get(9)?;
+    Ok(OutboxRow {
+        id: Some(id),
+        idempotency_key: IdempotencyKey::from_string(idempotency_key),
+        conversation_id: ConversationId::from(conversation_id),
+        effect_kind,
+        payload,
+        status: OutboxStatus::parse(&status).unwrap_or(OutboxStatus::Pending),
+        attempts,
+        next_attempt_at,
+        last_error,
+        enqueued_seq: EventSeq(enqueued_seq),
+    })
 }
 
 #[cfg(test)]
