@@ -336,6 +336,127 @@ impl<'db> EventLog<'db> {
     }
 }
 
+/// A materialized snapshot of a conversation's events up to a given seq.
+///
+/// The design philosophy for Phase 1: a snapshot is a pre-serialized blob
+/// of the events leading up to `up_to_seq`. Replay = load the snapshot +
+/// read events with `seq > up_to_seq`. This saves the `SELECT` cost on hot
+/// conversations; later phases can add actual summarization/compaction of
+/// older turns.
+///
+/// The snapshot is self-contained — no joins, no external references —
+/// so we can restore a conversation entirely from `snapshot_blob` +
+/// events-since-snapshot_seq.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub conversation_id: ConversationId,
+    pub up_to_seq: EventSeq,
+    pub events: Vec<EventRecord>,
+    pub built_at: i64,
+}
+
+impl Snapshot {
+    /// Encode to MessagePack for the `state_conversations.snapshot_blob` column.
+    pub fn encode(&self) -> Result<Vec<u8>, DbError> {
+        rmps::to_vec_named(self).map_err(|e| DbError::Serde(format!("encoding snapshot: {e}")))
+    }
+
+    /// Decode from MessagePack.
+    pub fn decode(bytes: &[u8]) -> Result<Self, DbError> {
+        rmps::from_slice(bytes).map_err(|e| DbError::Serde(format!("decoding snapshot: {e}")))
+    }
+}
+
+/// How often (in events) to materialize a snapshot. Tunable.
+pub const SNAPSHOT_INTERVAL: i64 = 50;
+
+impl<'db> EventLog<'db> {
+    /// Build a snapshot containing all events for this conversation with
+    /// `seq <= up_to_seq`. Encoded blob is ready to write into
+    /// `state_conversations.snapshot_blob`.
+    pub fn build_snapshot(
+        &self,
+        conversation_id: &ConversationId,
+        up_to_seq: EventSeq,
+    ) -> Result<Snapshot, DbError> {
+        let events = self.db.with_conn(|c| {
+            let mut stmt = c.prepare_cached(
+                "SELECT seq, kind, payload, committed_at, actor \
+                 FROM state_events \
+                 WHERE conversation_id = ?1 AND seq <= ?2 \
+                 ORDER BY seq ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![conversation_id.as_str(), up_to_seq.0], |row| {
+                    let seq: i64 = row.get(0)?;
+                    let kind: String = row.get(1)?;
+                    let payload: Vec<u8> = row.get(2)?;
+                    let committed_at: i64 = row.get(3)?;
+                    let actor: Option<String> = row.get(4)?;
+                    Ok(EventRecord {
+                        conversation_id: conversation_id.clone(),
+                        seq: EventSeq(seq),
+                        kind: EventKind::parse(&kind),
+                        payload,
+                        committed_at,
+                        actor,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, DbError>(rows)
+        })?;
+
+        Ok(Snapshot {
+            conversation_id: conversation_id.clone(),
+            up_to_seq,
+            events,
+            built_at: chrono::Utc::now().timestamp(),
+        })
+    }
+
+    /// Decide whether a new snapshot should be materialized. Cheap check —
+    /// intended to be called right after each `commit_turn`.
+    pub fn should_snapshot(
+        &self,
+        last_snapshot_seq: Option<EventSeq>,
+        current_last_seq: EventSeq,
+    ) -> bool {
+        let baseline = last_snapshot_seq.map(|s| s.0).unwrap_or(0);
+        (current_last_seq.0 - baseline) >= SNAPSHOT_INTERVAL
+    }
+
+    /// Hydrate a conversation's full event stream from snapshot (if any)
+    /// plus events written after the snapshot. Returned vec is in strict
+    /// `seq` order.
+    ///
+    /// If the snapshot decode fails for any reason (corrupt blob, stale
+    /// schema), we fall through to replaying the entire log — correctness
+    /// over convenience.
+    pub fn hydrate(
+        &self,
+        conversation_id: &ConversationId,
+        snapshot_blob: Option<&[u8]>,
+        snapshot_seq: Option<EventSeq>,
+    ) -> Result<Vec<EventRecord>, DbError> {
+        let (mut events, after) = match (snapshot_blob, snapshot_seq) {
+            (Some(blob), Some(seq)) => match Snapshot::decode(blob) {
+                Ok(snap) if snap.conversation_id == *conversation_id && snap.up_to_seq == seq => {
+                    (snap.events, seq)
+                }
+                _ => {
+                    // Corrupt or mismatched snapshot — replay from scratch.
+                    (Vec::new(), EventSeq(0))
+                }
+            },
+            _ => (Vec::new(), EventSeq(0)),
+        };
+
+        let tail = self.replay_since(conversation_id, after)?;
+        events.extend(tail);
+        Ok(events)
+    }
+}
+
 /// An event the caller wants to append. Seq is assigned by `commit_turn`.
 #[derive(Debug, Clone)]
 pub struct PendingEvent {
@@ -558,6 +679,96 @@ mod tests {
 
         let res: ToolResultPayload = written[1].decode_payload().unwrap();
         assert!(res.outcome.is_ok());
+    }
+
+    #[test]
+    fn snapshot_encode_decode_roundtrip() {
+        let db = fresh_db();
+        let log = EventLog::new(&db);
+        let cid = ConversationId::from("conv-snap");
+
+        for i in 1..=10 {
+            let ev = EventRecord::new(
+                cid.clone(),
+                EventSeq(i),
+                EventKind::UserMsg,
+                &serde_json::json!({"i": i}),
+                None,
+            )
+            .unwrap();
+            log.append(&ev).unwrap();
+        }
+
+        let snap = log.build_snapshot(&cid, EventSeq(7)).unwrap();
+        assert_eq!(snap.events.len(), 7);
+        assert_eq!(snap.up_to_seq, EventSeq(7));
+
+        let blob = snap.encode().unwrap();
+        let decoded = Snapshot::decode(&blob).unwrap();
+        assert_eq!(decoded.events.len(), 7);
+        assert_eq!(decoded.conversation_id, cid);
+    }
+
+    #[test]
+    fn hydrate_combines_snapshot_with_tail() {
+        let db = fresh_db();
+        let log = EventLog::new(&db);
+        let cid = ConversationId::from("conv-hyd");
+
+        for i in 1..=10 {
+            let ev = EventRecord::new(
+                cid.clone(),
+                EventSeq(i),
+                EventKind::UserMsg,
+                &serde_json::json!({"i": i}),
+                None,
+            )
+            .unwrap();
+            log.append(&ev).unwrap();
+        }
+
+        let snap = log.build_snapshot(&cid, EventSeq(6)).unwrap();
+        let blob = snap.encode().unwrap();
+
+        let hydrated = log.hydrate(&cid, Some(&blob), Some(EventSeq(6))).unwrap();
+        assert_eq!(hydrated.len(), 10);
+        assert_eq!(hydrated[0].seq, EventSeq(1));
+        assert_eq!(hydrated[9].seq, EventSeq(10));
+        // Verify ordering after the snapshot boundary.
+        assert_eq!(hydrated[6].seq, EventSeq(7));
+    }
+
+    #[test]
+    fn hydrate_falls_through_on_corrupt_snapshot() {
+        let db = fresh_db();
+        let log = EventLog::new(&db);
+        let cid = ConversationId::from("conv-corrupt");
+        let ev = EventRecord::new(
+            cid.clone(),
+            EventSeq::FIRST,
+            EventKind::UserMsg,
+            &serde_json::json!({}),
+            None,
+        )
+        .unwrap();
+        log.append(&ev).unwrap();
+
+        let garbage = vec![0xffu8; 64];
+        let hydrated = log
+            .hydrate(&cid, Some(&garbage), Some(EventSeq(99)))
+            .unwrap();
+        // Should fall through and replay from scratch.
+        assert_eq!(hydrated.len(), 1);
+    }
+
+    #[test]
+    fn should_snapshot_respects_interval() {
+        let db = fresh_db();
+        let log = EventLog::new(&db);
+        assert!(!log.should_snapshot(None, EventSeq(10)));
+        assert!(log.should_snapshot(None, EventSeq(SNAPSHOT_INTERVAL)));
+        assert!(log.should_snapshot(Some(EventSeq(100)), EventSeq(150)));
+        assert!(!log.should_snapshot(Some(EventSeq(100)), EventSeq(149)));
     }
 
     #[test]
