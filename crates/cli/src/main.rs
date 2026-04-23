@@ -1,14 +1,26 @@
 //! `execlaw` CLI.
 //!
-//! Phase 0 subcommands:
+//! Container lifecycle:
 //!
-//! - `execlaw up`               thin wrapper over `docker compose up -d`
-//! - `execlaw down`             `docker compose down`
+//! - `execlaw build`            build the docker image (`docker build ...`)
+//! - `execlaw install`          first-run install: migrate + build + start
+//! - `execlaw start` / `up`     `docker compose up -d`
+//! - `execlaw restart`          `docker compose restart`
+//! - `execlaw stop` / `down`    `docker compose down`
+//! - `execlaw status`           `docker compose ps`
+//! - `execlaw logs`             `docker compose logs` (add `--follow` for -f)
+//!
+//! Other:
+//!
 //! - `execlaw doctor`           checks docker + sqlcipher + keyring + bootstrap
 //! - `execlaw db migrate`       run pending migrations
 //! - `execlaw hw rescan`        (stub — §Phase 2)
 //! - `execlaw serve`            run the server directly (for dev; production
 //!   uses the container)
+//!
+//! These subcommands are also exposed as cargo aliases (`.cargo/config.toml`):
+//! `cargo start`, `cargo stop`, `cargo restart`, `cargo status`, `cargo logs`,
+//! `cargo image` (= build), `cargo bootstrap` (= install).
 
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
@@ -23,9 +35,50 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Build the control-plane docker image (`docker build -f Dockerfile.control-plane ...`).
+    Build {
+        /// Image tag. Defaults to `execlaw-control-plane:dev`.
+        #[arg(long, default_value = "execlaw-control-plane:dev")]
+        tag: String,
+        /// Dockerfile path. Defaults to `Dockerfile.control-plane`.
+        #[arg(long)]
+        dockerfile: Option<PathBuf>,
+        /// Pass `--no-cache` to the docker build.
+        #[arg(long, default_value_t = false)]
+        no_cache: bool,
+    },
+    /// First-run install: run migrations locally, build the image, start the stack.
+    ///
+    /// This is the one-command bootstrap for a fresh checkout. Equivalent to:
+    ///   execlaw db migrate && execlaw build && execlaw start
+    Install {
+        #[arg(long)]
+        compose_file: Option<PathBuf>,
+        #[arg(long)]
+        dockerfile: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        no_cache: bool,
+        /// Skip `db migrate` — useful if you're installing in a container
+        /// where migrations run on first `serve`.
+        #[arg(long, default_value_t = false)]
+        skip_migrate: bool,
+        /// Open the local DB plaintext during migrate (dev only).
+        #[arg(long, default_value_t = false)]
+        no_encrypt: bool,
+    },
     /// Start the control plane (wraps `docker compose up -d`).
     Up {
         /// Path to docker-compose.yml (defaults to the repo root one).
+        #[arg(long)]
+        compose_file: Option<PathBuf>,
+    },
+    /// Alias for `up` — start the control plane.
+    Start {
+        #[arg(long)]
+        compose_file: Option<PathBuf>,
+    },
+    /// Restart the control plane (`docker compose restart`).
+    Restart {
         #[arg(long)]
         compose_file: Option<PathBuf>,
     },
@@ -33,6 +86,27 @@ enum Command {
     Down {
         #[arg(long)]
         compose_file: Option<PathBuf>,
+    },
+    /// Alias for `down` — stop the control plane.
+    Stop {
+        #[arg(long)]
+        compose_file: Option<PathBuf>,
+    },
+    /// Show container status (`docker compose ps`).
+    Status {
+        #[arg(long)]
+        compose_file: Option<PathBuf>,
+    },
+    /// Show container logs (`docker compose logs`).
+    Logs {
+        #[arg(long)]
+        compose_file: Option<PathBuf>,
+        /// Follow log output (pass `-f` to docker compose).
+        #[arg(long, short, default_value_t = false)]
+        follow: bool,
+        /// Tail N lines before following.
+        #[arg(long, default_value_t = 200)]
+        tail: usize,
     },
     /// Run preflight environment checks.
     Doctor,
@@ -130,7 +204,8 @@ fn open_db(db_path: &Path, no_encrypt: bool) -> anyhow::Result<execlaw_core::Dat
     Ok(execlaw_core::Database::open(&cfg)?)
 }
 
-fn cmd_up(compose_file: Option<PathBuf>) -> anyhow::Result<()> {
+/// Run `docker compose -f <compose_path> <args...>` and verify it succeeded.
+fn run_compose(compose_file: Option<PathBuf>, args: &[&str]) -> anyhow::Result<()> {
     let compose_path = compose_file.unwrap_or_else(|| PathBuf::from("docker-compose.yml"));
     anyhow::ensure!(
         compose_path.exists(),
@@ -140,27 +215,98 @@ fn cmd_up(compose_file: Option<PathBuf>) -> anyhow::Result<()> {
     let status = std::process::Command::new("docker")
         .args(["compose", "-f"])
         .arg(&compose_path)
-        .args(["up", "-d"])
+        .args(args)
         .status()
         .map_err(|e| anyhow::anyhow!("failed to invoke docker: {e}"))?;
-    anyhow::ensure!(status.success(), "`docker compose up -d` failed");
+    anyhow::ensure!(
+        status.success(),
+        "`docker compose {}` failed",
+        args.join(" ")
+    );
     Ok(())
 }
 
-fn cmd_down(compose_file: Option<PathBuf>) -> anyhow::Result<()> {
-    let compose_path = compose_file.unwrap_or_else(|| PathBuf::from("docker-compose.yml"));
+fn cmd_build(tag: String, dockerfile: Option<PathBuf>, no_cache: bool) -> anyhow::Result<()> {
+    let dockerfile_path = dockerfile.unwrap_or_else(|| PathBuf::from("Dockerfile.control-plane"));
     anyhow::ensure!(
-        compose_path.exists(),
-        "docker-compose.yml not found at {}",
-        compose_path.display()
+        dockerfile_path.exists(),
+        "Dockerfile not found at {}",
+        dockerfile_path.display()
     );
-    let status = std::process::Command::new("docker")
-        .args(["compose", "-f"])
-        .arg(&compose_path)
-        .args(["down"])
+    let mut cmd = std::process::Command::new("docker");
+    cmd.args(["build", "-f"])
+        .arg(&dockerfile_path)
+        .args(["-t", &tag]);
+    if no_cache {
+        cmd.arg("--no-cache");
+    }
+    cmd.arg(".");
+    let status = cmd
         .status()
         .map_err(|e| anyhow::anyhow!("failed to invoke docker: {e}"))?;
-    anyhow::ensure!(status.success(), "`docker compose down` failed");
+    anyhow::ensure!(status.success(), "`docker build` failed");
+    println!("built image: {tag}");
+    Ok(())
+}
+
+fn cmd_up(compose_file: Option<PathBuf>) -> anyhow::Result<()> {
+    run_compose(compose_file, &["up", "-d"])
+}
+
+fn cmd_restart(compose_file: Option<PathBuf>) -> anyhow::Result<()> {
+    run_compose(compose_file, &["restart"])
+}
+
+fn cmd_down(compose_file: Option<PathBuf>) -> anyhow::Result<()> {
+    run_compose(compose_file, &["down"])
+}
+
+fn cmd_status(compose_file: Option<PathBuf>) -> anyhow::Result<()> {
+    run_compose(compose_file, &["ps"])
+}
+
+fn cmd_logs(compose_file: Option<PathBuf>, follow: bool, tail: usize) -> anyhow::Result<()> {
+    let tail_arg = tail.to_string();
+    let mut args: Vec<&str> = vec!["logs", "--tail", &tail_arg];
+    if follow {
+        args.push("-f");
+    }
+    run_compose(compose_file, &args)
+}
+
+fn cmd_install(
+    compose_file: Option<PathBuf>,
+    dockerfile: Option<PathBuf>,
+    no_cache: bool,
+    skip_migrate: bool,
+    no_encrypt: bool,
+) -> anyhow::Result<()> {
+    println!("==> execlaw install");
+
+    // 1. Migrate the local SQLite (if not skipped — inside the container,
+    //    migrations run on first serve).
+    if !skip_migrate {
+        println!("--> db migrate");
+        cmd_db_migrate(default_db_path(), no_encrypt)?;
+    } else {
+        println!("--  skipping db migrate (--skip-migrate)");
+    }
+
+    // 2. Build the image.
+    println!("--> build image");
+    cmd_build(
+        "execlaw-control-plane:dev".to_string(),
+        dockerfile,
+        no_cache,
+    )?;
+
+    // 3. Start the stack.
+    println!("--> start stack");
+    cmd_up(compose_file)?;
+
+    println!(
+        "==> install complete — verify with `execlaw status` or `curl http://localhost:3030/api/health`"
+    );
     Ok(())
 }
 
@@ -317,8 +463,27 @@ fn main() -> ExitCode {
     init_tracing();
     let cli = Cli::parse();
     let result: anyhow::Result<()> = (|| match cli.command {
-        Command::Up { compose_file } => cmd_up(compose_file),
-        Command::Down { compose_file } => cmd_down(compose_file),
+        Command::Build {
+            tag,
+            dockerfile,
+            no_cache,
+        } => cmd_build(tag, dockerfile, no_cache),
+        Command::Install {
+            compose_file,
+            dockerfile,
+            no_cache,
+            skip_migrate,
+            no_encrypt,
+        } => cmd_install(compose_file, dockerfile, no_cache, skip_migrate, no_encrypt),
+        Command::Up { compose_file } | Command::Start { compose_file } => cmd_up(compose_file),
+        Command::Restart { compose_file } => cmd_restart(compose_file),
+        Command::Down { compose_file } | Command::Stop { compose_file } => cmd_down(compose_file),
+        Command::Status { compose_file } => cmd_status(compose_file),
+        Command::Logs {
+            compose_file,
+            follow,
+            tail,
+        } => cmd_logs(compose_file, follow, tail),
         Command::Doctor => cmd_doctor(),
         Command::Db { op } => match op {
             DbOp::Migrate { db, no_encrypt } => {

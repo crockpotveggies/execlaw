@@ -1,0 +1,38 @@
+# Cargo aliases for the execlaw container lifecycle.
+#
+# These invoke the `execlaw` CLI (crates/cli) which wraps `docker compose`
+# for the actual container operations. Cargo caches the compiled binary
+# after the first run so subsequent invocations are near-instant.
+#
+# Available aliases:
+#
+#   cargo image        Build the Dockerfile.control-plane image.
+#   cargo bootstrap    First-run install: migrate + build image + start.
+#   cargo start        Start the stack (docker compose up -d).
+#   cargo restart      Restart the stack.
+#   cargo stop         Stop the stack (docker compose down).
+#   cargo ps           Show container status (docker compose ps).
+#   cargo logs         Show container logs (last 200 lines).
+#   cargo tail         Same as `logs` but follows (-f).
+#   cargo doctor       Preflight environment checks.
+#
+# Not aliased (intentional) because they collide with native cargo subcommands:
+#   - `cargo build`    — reserved for Rust compilation; use `cargo image` for the container image.
+#   - `cargo install`  — reserved for installing crates; use `cargo bootstrap` for first-run install.
+#   - `cargo test`, `cargo run`, `cargo clippy`, `cargo fmt` — unchanged.
+#
+# The aliases all accept `--` to forward extra args, e.g.:
+#   cargo image -- --no-cache
+#   cargo logs -- --tail 1000
+#   cargo tail -- --tail 50
+
+[alias]
+image     = "run --quiet -p execlaw --bin execlaw -- build"
+bootstrap = "run --quiet -p execlaw --bin execlaw -- install"
+start     = "run --quiet -p execlaw --bin execlaw -- start"
+restart   = "run --quiet -p execlaw --bin execlaw -- restart"
+stop      = "run --quiet -p execlaw --bin execlaw -- stop"
+ps        = "run --quiet -p execlaw --bin execlaw -- status"
+logs      = "run --quiet -p execlaw --bin execlaw -- logs"
+tail      = "run --quiet -p execlaw --bin execlaw -- logs --follow"
+doctor    = "run --quiet -p execlaw --bin execlaw -- doctor"

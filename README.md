@@ -20,22 +20,53 @@ agent model.
 - **[`STATUS.md`](STATUS.md)** — live progress log. Read this first if
   you want to see what works today.
 
-## Quick start (when ready)
+## Quick start
+
+### One-shot (via cargo aliases — recommended)
 
 ```bash
-# Build and start the control-plane container.
+cargo bootstrap          # migrate + build image + start stack
+cargo ps                 # verify container is running
+curl http://localhost:3030/api/health    # → {"status":"ok"}
+open http://localhost:3030/api/docs      # Swagger + AsyncAPI
+```
+
+### Container lifecycle
+
+Cargo aliases defined in `.cargo/config.toml` — each delegates to the
+`execlaw` CLI, which wraps `docker compose` for you:
+
+| Cargo command | What it does | Underlying call |
+|---|---|---|
+| `cargo image` | Build the control-plane docker image | `docker build -f Dockerfile.control-plane ...` |
+| `cargo bootstrap` | First-run install (migrate + image + start) | `db migrate` → `build` → `up -d` |
+| `cargo start` | Start the stack | `docker compose up -d` |
+| `cargo restart` | Restart the stack | `docker compose restart` |
+| `cargo stop` | Stop the stack | `docker compose down` |
+| `cargo ps` | Show container status | `docker compose ps` |
+| `cargo logs` | Tail logs (last 200 lines) | `docker compose logs --tail 200` |
+| `cargo tail` | Follow logs live (`-f`) | `docker compose logs --tail 200 -f` |
+| `cargo doctor` | Preflight env checks | docker + sqlcipher + keyring |
+
+Notes:
+
+- `cargo build` and `cargo install` retain their native Rust meanings
+  (Rust compilation and binary install). The container image is
+  `cargo image`; the first-run install is `cargo bootstrap`.
+- All aliases forward extra args — `cargo image -- --no-cache`,
+  `cargo logs -- --tail 1000`, `cargo start -- --compose-file other.yml`.
+- The equivalent direct invocations are `execlaw build`, `execlaw install`,
+  `execlaw start`, `execlaw restart`, `execlaw stop`, `execlaw status`,
+  `execlaw logs`. Run `execlaw --help` for the full list.
+
+### Manual (without cargo aliases)
+
+```bash
 docker compose up -d
-
-# Liveness probe.
-curl http://localhost:3030/api/health   # → {"status":"ok"}
-
-# First-run setup (admin password).
+curl http://localhost:3030/api/health
 curl -X POST http://localhost:3030/api/setup \
   -H 'content-type: application/json' \
   -d '{"admin_password":"pick-something-longer"}'
-
-# Browse the API docs (Swagger + AsyncAPI).
-open http://localhost:3030/api/docs
 ```
 
 ## Workspace layout
