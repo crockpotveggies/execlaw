@@ -1,0 +1,32 @@
+[package]
+name = "execlaw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "execlaw CLI: up, doctor, db migrate, hw rescan, vault rekey, plugin install."
+
+[[bin]]
+name = "execlaw"
+path = "src/main.rs"
+
+[dependencies]
+execlaw-core = { path = "../core" }
+execlaw-container-manager = { path = "../container-manager" }
+execlaw-plugin-sdk = { path = "../plugin-sdk" }
+execlaw-server = { path = "../server" }
+execlaw-vault = { path = "../vault" }
+
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+directories.workspace = true
+keyring.workspace = true
+axum.workspace = true
