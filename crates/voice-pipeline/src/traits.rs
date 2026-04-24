@@ -233,6 +233,67 @@ impl SttClient for MockStt {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Deep-runner escalation (§2.9 case 3)
+// ---------------------------------------------------------------------------
+
+/// A "deep runner" the voice path can escalate hard prompts to
+/// while the primary turn emits filler audio. The voice runner is
+/// optimized for low first-audio latency; some user requests
+/// genuinely need more reasoning depth than that budget allows.
+///
+/// The flow (verified against `MockDeepRunner` below):
+///
+/// 1. Voice runner detects a "needs deeper reasoning" hint in the
+///    transcript or LLM response (§2.9: explicit `i_need_to_think`
+///    tool call, or a heuristic on the transcript content).
+/// 2. Voice runner emits a short filler ("one sec, let me check").
+/// 3. Filler is synthesized + played WHILE the deep runner grinds.
+/// 4. When the deep runner finishes, its response gets synthesized
+///    into the next chunks.
+///
+/// Phase 4 ships the trait + a Mock; the production deep-runner is
+/// a chat-path turn against the Reasoning deployment (§5.4) on a
+/// nvidia GPU, plumbed through Phase 8 when the hybrid GPU runtime
+/// is configured.
+#[async_trait]
+pub trait DeepRunner: Send + Sync {
+    /// Run the prompt to completion. Latency is allowed to be many
+    /// seconds — the caller emits filler in parallel.
+    async fn answer(&mut self, prompt: &str) -> Result<String, String>;
+}
+
+/// In-memory mock that returns a pre-scripted answer after an
+/// optional simulated delay. Useful for testing the
+/// filler-while-grinds choreography without a live model.
+pub struct MockDeepRunner {
+    pub answer: String,
+    pub delay: std::time::Duration,
+}
+
+impl MockDeepRunner {
+    pub fn new(answer: impl Into<String>) -> Self {
+        Self {
+            answer: answer.into(),
+            delay: std::time::Duration::from_millis(0),
+        }
+    }
+    pub fn with_delay(mut self, delay: std::time::Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+}
+
+#[async_trait]
+impl DeepRunner for MockDeepRunner {
+    async fn answer(&mut self, _prompt: &str) -> Result<String, String> {
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
+        Ok(self.answer.clone())
+    }
+}
+
 /// Mock TTS that returns constant-length synthetic audio.
 pub struct MockTts {
     pub canceled: std::sync::atomic::AtomicUsize,

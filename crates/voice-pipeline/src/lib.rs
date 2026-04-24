@@ -25,8 +25,8 @@ pub use session::{
     chunk_at_sentence_boundaries, voice_turn_budget,
 };
 pub use traits::{
-    AudioChunk, AudioIn, AudioOut, MockAudioIn, MockAudioOut, MockStt, MockTts, MockVad,
-    SttClient, SttEvent, TtsAudio, TtsClient, Vad, VadDecision,
+    AudioChunk, AudioIn, AudioOut, DeepRunner, MockAudioIn, MockAudioOut, MockDeepRunner,
+    MockStt, MockTts, MockVad, SttClient, SttEvent, TtsAudio, TtsClient, Vad, VadDecision,
 };
 
 use serde::{Deserialize, Serialize};
