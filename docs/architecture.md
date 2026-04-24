@@ -821,11 +821,15 @@ Per [`STATUS.md`](../STATUS.md) as of 2026-04-24.
 
 **Phase 3 — Participants, trust, policy engine, Rule of Two.** Complete.
 - `PrincipalStore` persists the full rich `TrustLevel` variant via JSON
+- `ConversationKind::derive` derives the kind (ControllerDM / GroupWithControllerPresent / GroupWithControllerAbsent / ExternalWithOutsider / MixedTrust) from a slice of participant trust-class tags. Chat route refreshes the kind on every inbound message.
 - Identity resolution in the chat route: unknown senders → identity-provider dispatch → UnknownPending + cold-contact OR auto-admit as KnownTrusted when a provider vouches
 - `PluginHost::resolve_identity` iterates installed `identity_provider` hooks via JSON-RPC `identity.resolve`
+- In-tree reference plugin `identity-local-address-book` (in `plugins/identity-local-address-book/`) — JSON-file contact list, exposes the `identity_provider` hook
 - `classify_identity_matches` — pure decision function mapping provider matches (highest-confidence wins, `Unknown` hint rejected) to a `TrustLevel`
 - Cold-contact escalation: `ColdContactArrived` event + `AwaitingTrustDecision` phase + `AlertFired` sideband broadcast
+- **Signed approval-token JWT** (§2.11): cold-contact response includes a `approval_token` whose `jti` matches the `approval_id`. The respond endpoint verifies the JWT before honoring any verb so an attacker who guesses the id can't forge a response.
 - `POST /api/admin/approvals/:id/respond` with every `ApprovalVerb` branch
+- `POST /api/admin/principals/:id/revoke` for direct trust revocation
 - `TrustChanged` event committed on every transition (audit trail)
 - Spotlighting applied to prompt assembly when `policy.spotlighting` fires
 - **Planner/executor containment** — when `policy.planner_executor` is true (effective_trust < KnownTrusted), the tool-capable chat path is disabled. A prompt-injected executor can't exfiltrate via tool_use args because there are no tool_use slots. Full placeholder-passing choreography lands as a later refinement.
@@ -834,7 +838,7 @@ Per [`STATUS.md`](../STATUS.md) as of 2026-04-24.
 **Phase 3 deferrals** (land in Phase 6 / Phase 8):
 - `config_trust_policy` UI-editable defaults: SQLite table exists; UI surfacing lands with Phase 6.
 - Cross-transport sideband delivery (controller approves via Signal): waits on `plugin-signal` in Phase 8.
-- In-tree `identity-local-address-book` plugin: `PluginHost::resolve_identity` dispatch is ready; the plugin binary itself is Phase 8.
+- Rule-of-Two breach approval flow for non-cold-contact (currently 202 awaiting_approval; the ApprovalVerb::Approve / Edit / Reject path lands when there's a sensitive-tool-call to gate).
 
 **Phase 4 — Voice pipeline primitives.** Complete (internal, with mocks).
 - `traits.rs`: `AudioIn` / `AudioOut` / `Vad` / `SttClient` / `TtsClient` — the full contract between the pipeline and stage backends, plus `MockAudioIn` / `MockAudioOut` / `MockVad` / `MockStt` / `MockTts` for deterministic testing.
@@ -842,6 +846,10 @@ Per [`STATUS.md`](../STATUS.md) as of 2026-04-24.
 - Voice event schema wired to `state_events`: every stage transition commits a `voice.*` / `vad.*` / `stt.*` / `llm.*` / `tts.*` / `interrupt.*` row via `EventLog::append`. Timestamp (`t_ms`) stored on every row so EoS→first-audio latency can be reconstructed from the log.
 - Sentence splitter (`chunk_at_sentence_boundaries`) feeds TTS chunk-by-chunk so first-audio latency can be minimized.
 - Barge-in resolution: `resolve_bargein(user_still_speaking)` applies the existing `bargein::decide` rule table to the session state; on Confirm, cancels TTS + fires an `Interruption` on the system lane + commits `InterruptConfirmed`.
+- **HMAC-signed voice events** verified end-to-end: tampering with a committed voice row trips `DbError::TamperDetected` on next replay (just like text events).
+- **Crash invariant**: a mid-`speak` panic leaves a partially-committed log that still verifies under HMAC. No half-signed rows; the partial state faithfully records what happened without a misleading `TtsEnded`.
+- **STT-transcript spotlighting** verified: a delimiter-smuggling attempt in a simulated STT transcript produces a wrap with exactly one outer open + one outer close — no escape.
+- **Modality-adaptive helpers** (`VoiceTurnBudget`): voice turns get max_response_tokens=80, max_tool_rounds=1, low-latency-only tools, suppressed extended thinking. The chat route reads these values when running a voice turn.
 
 **Phase 4 deferrals → Phase 8 (real-audio acceptance):**
 - Silero VAD ONNX integration — `Vad` trait is ready; `MockVad` covers the decision logic; ONNX runtime binding lands as a feature-gated impl.

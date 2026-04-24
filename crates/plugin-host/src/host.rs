@@ -143,7 +143,9 @@ impl PluginHost {
         // Step 2 — spawn subprocess when the manifest needs one. If
         // spawn fails, we un-register the hooks so the registry
         // doesn't leak a plugin that can't actually serve calls.
-        let needs_subprocess = !manifest.tools.is_empty() || manifest.transport.is_some();
+        let needs_subprocess = !manifest.tools.is_empty()
+            || manifest.transport.is_some()
+            || manifest.identity_provider.is_some();
         if needs_subprocess {
             let runtime = manifest
                 .runtime
@@ -263,7 +265,9 @@ impl PluginHost {
             .enable(&manifest)
             .map_err(PluginHostError::HookConflict)?;
 
-        let needs_subprocess = !manifest.tools.is_empty() || manifest.transport.is_some();
+        let needs_subprocess = !manifest.tools.is_empty()
+            || manifest.transport.is_some()
+            || manifest.identity_provider.is_some();
         if needs_subprocess {
             let runtime = manifest
                 .runtime
@@ -310,7 +314,9 @@ impl PluginHost {
                 warn!(plugin_id = %row.plugin_id, error = %e, "skipping plugin with hook conflict on hydrate");
                 continue;
             }
-            let needs_subprocess = !manifest.tools.is_empty() || manifest.transport.is_some();
+            let needs_subprocess = !manifest.tools.is_empty()
+            || manifest.transport.is_some()
+            || manifest.identity_provider.is_some();
             if needs_subprocess {
                 if let Some(runtime) = &manifest.runtime {
                     let stage = PathBuf::from(&row.stage_path);

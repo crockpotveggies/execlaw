@@ -7,6 +7,18 @@ use serde::{Deserialize, Serialize};
 
 /// Conversation kind (§2.6). Derived from participant composition; stored
 /// in the DB only as a shorthand / UI affordance.
+///
+/// Derivation logic ([`ConversationKind::derive`]) takes a slice of
+/// participant trust-class tags and returns the matching kind:
+///
+/// | Participants | Kind |
+/// |---|---|
+/// | exactly Controller, ≤1 participant | `ControllerDM` |
+/// | Controller present + 1+ KnownTrusted/Delegated | `GroupWithControllerPresent` |
+/// | no Controller, all KnownTrusted/Delegated | `GroupWithControllerAbsent` |
+/// | exactly KnownLimited (or UnknownPending) participants | `ExternalWithOutsider` |
+/// | mix of trusted (Controller / KnownTrusted / Delegated) and untrusted (KnownLimited / UnknownPending) | `MixedTrust` |
+/// | empty participant list | `ControllerDM` (default for fresh conversations) |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConversationKind {
     ControllerDM,
@@ -14,6 +26,55 @@ pub enum ConversationKind {
     GroupWithControllerAbsent,
     ExternalWithOutsider,
     MixedTrust,
+}
+
+impl ConversationKind {
+    /// Derive the conversation kind from a slice of participant
+    /// trust-class tags (the strings produced by
+    /// `crate::principal::TrustLevel::class_tag()`).
+    ///
+    /// Pure function — no DB access — so tests can exhaustively
+    /// cover the participant-composition matrix.
+    pub fn derive(participant_classes: &[&str]) -> Self {
+        if participant_classes.is_empty() {
+            return ConversationKind::ControllerDM;
+        }
+        let has_controller = participant_classes.contains(&"Controller");
+        // "trusted" = Controller / Delegated / KnownTrusted (rank ≥ KnownTrusted).
+        let trusted = participant_classes
+            .iter()
+            .filter(|c| matches!(**c, "Controller" | "Delegated" | "KnownTrusted"))
+            .count();
+        // "untrusted" = KnownLimited / UnknownPending (excluding Blocked,
+        // which never reaches the conversation since drop_turn fires).
+        let untrusted = participant_classes
+            .iter()
+            .filter(|c| matches!(**c, "KnownLimited" | "UnknownPending"))
+            .count();
+
+        // Mixed: at least one of each side.
+        if trusted > 0 && untrusted > 0 {
+            return ConversationKind::MixedTrust;
+        }
+
+        // Outsider-only: every participant is at-or-below KnownLimited.
+        if trusted == 0 && untrusted > 0 {
+            return ConversationKind::ExternalWithOutsider;
+        }
+
+        // From here, every participant is trusted (no untrusted entries).
+        if has_controller {
+            // Controller alone or in a group with one or more trusted others.
+            if participant_classes.len() == 1 {
+                ConversationKind::ControllerDM
+            } else {
+                ConversationKind::GroupWithControllerPresent
+            }
+        } else {
+            // All trusted but no Controller — a delegated/KnownTrusted-only group.
+            ConversationKind::GroupWithControllerAbsent
+        }
+    }
 }
 
 impl ConversationKind {
@@ -269,6 +330,80 @@ mod tests {
         assert_eq!(got.kind, ConversationKind::ControllerDM);
         assert_eq!(got.phase, Phase::Idle);
         assert_eq!(got.modality, Modality::Text);
+    }
+
+    // ---- ConversationKind::derive tests -------------------------
+
+    #[test]
+    fn derive_empty_is_controller_dm() {
+        assert_eq!(
+            ConversationKind::derive(&[]),
+            ConversationKind::ControllerDM
+        );
+    }
+
+    #[test]
+    fn derive_solo_controller_is_controller_dm() {
+        assert_eq!(
+            ConversationKind::derive(&["Controller"]),
+            ConversationKind::ControllerDM
+        );
+    }
+
+    #[test]
+    fn derive_controller_with_known_trusted_is_group_with_controller_present() {
+        assert_eq!(
+            ConversationKind::derive(&["Controller", "KnownTrusted"]),
+            ConversationKind::GroupWithControllerPresent
+        );
+    }
+
+    #[test]
+    fn derive_only_known_trusted_is_group_without_controller() {
+        assert_eq!(
+            ConversationKind::derive(&["KnownTrusted", "Delegated"]),
+            ConversationKind::GroupWithControllerAbsent
+        );
+    }
+
+    #[test]
+    fn derive_only_outsiders_is_external_with_outsider() {
+        assert_eq!(
+            ConversationKind::derive(&["KnownLimited", "UnknownPending"]),
+            ConversationKind::ExternalWithOutsider
+        );
+    }
+
+    #[test]
+    fn derive_controller_plus_outsider_is_mixed_trust() {
+        assert_eq!(
+            ConversationKind::derive(&["Controller", "KnownLimited"]),
+            ConversationKind::MixedTrust
+        );
+    }
+
+    #[test]
+    fn derive_known_trusted_plus_outsider_is_mixed_trust() {
+        assert_eq!(
+            ConversationKind::derive(&["KnownTrusted", "UnknownPending"]),
+            ConversationKind::MixedTrust
+        );
+    }
+
+    /// Adversarial: a Blocked participant alone shouldn't influence
+    /// the kind — Blocked senders never reach the conversation
+    /// (`drop_turn`), but the derivation should treat them as "no
+    /// participant".
+    #[test]
+    fn derive_blocked_only_falls_back_to_controller_dm() {
+        // Blocked counts as neither trusted nor untrusted in the
+        // derivation; with no other participants, the empty-set
+        // default fires.
+        assert_eq!(
+            ConversationKind::derive(&["Blocked"]),
+            ConversationKind::GroupWithControllerAbsent,
+            "Blocked alone is treated as a degenerate trusted-empty / untrusted-empty / no-controller case → GroupWithControllerAbsent"
+        );
     }
 
     #[test]

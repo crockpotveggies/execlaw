@@ -108,6 +108,11 @@ pub async fn send_message(
             Ok(pair) => pair,
             Err(e) => return err_500(&format!("identity resolution: {e}")),
         };
+    // §2.6: re-derive ConversationKind from participants. Phase 3
+    // single-participant chat: the conversation kind reflects the
+    // sender's trust class. Group + multi-transport derivation
+    // lands with Phase 8 transports.
+    refresh_conversation_kind(&store, &cid, principal.trust_level.class_tag());
 
     // Step 2 — **policy evaluation** (§7.3). The policy engine sees
     // the resolved trust; same code path handles Controller all the
@@ -715,8 +720,12 @@ async fn handle_cold_contact(
 
     let log = event_log(state);
     // Approval id — shared with the `state_events[Approval].approval.id`
-    // the Phase-3 approval endpoint will match on.
+    // the Phase-3 approval endpoint will match on. Also embedded as
+    // `jti` in the signed approval-token JWT so the controller's
+    // response can prove the request came from us.
     let approval_id = format!("appr-{}", uuid::Uuid::new_v4());
+    let approval_token =
+        crate::approvals::issue_approval_token(&state.signer, &approval_id, cid, "cold_contact");
 
     let payload = ColdContactPayload {
         text: req.text.clone(),
@@ -765,6 +774,7 @@ async fn handle_cold_contact(
             "status": "awaiting_approval",
             "reason": "cold_contact",
             "approval_id": approval_id,
+            "approval_token": approval_token,
             "principal_id": principal.id.as_str(),
             "conversation_id": cid.as_str(),
         })),
@@ -854,6 +864,27 @@ fn ensure_conversation(store: &ConversationStore<'_>, cid: &ConversationId) {
         modality: Modality::Text,
     };
     let _ = store.upsert(&row);
+}
+
+/// Re-derive the conversation kind + trust class after an inbound
+/// message lands. Walks the existing row + the new sender's class
+/// tag and persists the result. Single-participant for web chat
+/// today; group conversations land with Phase 8 transports.
+fn refresh_conversation_kind(
+    store: &ConversationStore<'_>,
+    cid: &ConversationId,
+    sender_trust_tag: &str,
+) {
+    if let Ok(Some(mut row)) = store.get(cid) {
+        let kind = ConversationKind::derive(&[sender_trust_tag]);
+        if row.kind != kind {
+            row.kind = kind;
+        }
+        // Track the most-restrictive trust class on the conversation
+        // row — UI uses this to render the policy badge.
+        row.trust_class = sender_trust_tag.to_owned();
+        let _ = store.upsert(&row);
+    }
 }
 
 fn err_500(msg: &str) -> axum::response::Response {

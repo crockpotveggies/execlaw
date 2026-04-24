@@ -1029,7 +1029,9 @@ dependencies = [
  "chrono",
  "criterion",
  "execlaw-core",
+ "execlaw-policy",
  "execlaw-runner-local",
+ "rusqlite",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2027,6 +2029,14 @@ dependencies = [
 
 [[package]]
 name = "plugin-hello"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "plugin-identity-local-address-book"
 version = "0.1.0"
 dependencies = [
  "serde",

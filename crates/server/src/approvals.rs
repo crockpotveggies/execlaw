@@ -23,11 +23,72 @@ use execlaw_core::conversation::{ConversationStore, Phase};
 use execlaw_core::events::{EventKind, EventLog, PendingEvent};
 use execlaw_core::ids::{ConversationId, EventSeq, PrincipalId};
 use execlaw_core::principal::{PrincipalStore, TrustLevel as CoreTrustLevel};
-use execlaw_policy::sideband::ApprovalVerb;
+use execlaw_policy::sideband::{ApprovalClaims, ApprovalReason, ApprovalVerb};
 use serde::{Deserialize, Serialize};
 
+use crate::auth::JwtSigner;
 use crate::events::UiEvent;
 use crate::state::AppState;
+
+/// Mint a signed approval-token JWT (§2.11). The token's `jti` is
+/// the approval_id; verifying the token before honoring an approval
+/// response prevents an attacker from forging an `/approvals/X/respond`
+/// request with a guessed id.
+pub fn issue_approval_token(
+    signer: &JwtSigner,
+    approval_id: &str,
+    conversation_id: &ConversationId,
+    reason: &str,
+) -> String {
+    use jsonwebtoken::{Algorithm, Header, encode};
+
+    let now = chrono::Utc::now().timestamp();
+    let reason_enum = match reason {
+        "cold_contact" => ApprovalReason::ColdContact,
+        "rule_of_two_breach" => ApprovalReason::RuleOfTwoBreach,
+        "sensitive_tool_call" => ApprovalReason::SensitiveToolCall,
+        "ask_controller" => ApprovalReason::AskController,
+        "anomaly_tripwire" => ApprovalReason::AnomalyTripwire,
+        _ => ApprovalReason::ColdContact,
+    };
+    let claims = ApprovalClaims {
+        iss: signer.issuer().to_owned(),
+        jti: approval_id.to_owned(),
+        conversation_id: conversation_id.as_str().to_owned(),
+        reason: reason_enum,
+        tool_call_id: None,
+        iat: now,
+        exp: now + 24 * 3600, // 24h window for the controller to respond
+    };
+    let header = Header::new(Algorithm::EdDSA);
+    encode(&header, &claims, signer.encoding_key()).expect("JWT encode")
+}
+
+/// Verify a signed approval token. Returns the decoded claims if
+/// the token is valid AND its `jti` matches the path-param
+/// `approval_id`. Mismatch → caller can't authorize this approval.
+pub fn verify_approval_token(
+    signer: &JwtSigner,
+    token: &str,
+    expected_jti: &str,
+) -> Result<ApprovalClaims, String> {
+    use jsonwebtoken::{Algorithm, Validation, decode};
+
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.set_issuer(&[signer.issuer()]);
+    validation.leeway = 5;
+
+    let data = decode::<ApprovalClaims>(token, signer.decoding_key(), &validation)
+        .map_err(|e| format!("approval token verification failed: {e}"))?;
+
+    if data.claims.jti != expected_jti {
+        return Err(format!(
+            "approval token jti '{}' does not match path approval_id '{}'",
+            data.claims.jti, expected_jti
+        ));
+    }
+    Ok(data.claims)
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ApprovalRequest {
@@ -40,6 +101,14 @@ pub struct ApprovalRequest {
     /// Optional human-readable reason (saved on the principal for audit).
     #[serde(default)]
     pub reason: Option<String>,
+    /// Signed approval-token JWT minted by the cold-contact path.
+    /// Required when `EXECLAW_APPROVAL_TOKEN_REQUIRED` is set or
+    /// when the controller's UI is the only thing that should be
+    /// able to call this endpoint. Phase 3 accepts an empty token
+    /// (back-compat) but logs a warning; Phase 7 hardening flips
+    /// this to required.
+    #[serde(default)]
+    pub approval_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,6 +126,24 @@ pub async fn respond_handler(
     Path(approval_id): Path<String>,
     Json(req): Json<ApprovalRequest>,
 ) -> impl IntoResponse {
+    // Verify the signed approval token if one is supplied. An
+    // attacker who guesses the approval_id but doesn't have the
+    // server's signing key can't forge a matching token (§2.11).
+    if let Some(token) = &req.approval_token {
+        if let Err(e) = verify_approval_token(&state.signer, token, &approval_id) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "bad_approval_token",
+                        "message": e,
+                    }
+                })),
+            )
+                .into_response();
+        }
+    }
+
     // Look up the ColdContactArrived event that minted this
     // approval_id. Phase 3 scans state_events for the matching row;
     // a dedicated `state_approvals` index lands as a Phase-5
@@ -286,10 +373,72 @@ fn internal_error(msg: &str) -> axum::response::Response {
         .into_response()
 }
 
-/// Sub-router mounted at `/api/admin/approvals/...`.
-pub fn approvals_router() -> Router<AppState> {
-    Router::new().route(
-        "/api/admin/approvals/{approval_id}/respond",
-        post(respond_handler),
+/// `POST /api/admin/principals/:id/revoke` — controller-only path
+/// to revoke trust on an existing principal without going through
+/// the cold-contact flow. The principal's `TrustLevel` flips to
+/// `Blocked`; future messages from them get 403 sender_blocked.
+///
+/// This is the explicit operator action for "I no longer trust X" —
+/// distinct from `Block` via the approval flow (which targets a
+/// specific cold-contact request). Use this for an *already
+/// trusted* contact you want to remove.
+pub async fn revoke_handler(
+    State(state): State<AppState>,
+    Path(principal_id): Path<String>,
+    Json(req): Json<RevokeRequest>,
+) -> impl IntoResponse {
+    let principals = PrincipalStore::new(&state.db);
+    let pid = PrincipalId::from(principal_id.clone());
+    let Ok(Some(_existing)) = principals.get(&pid) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "principal_not_found",
+                    "message": format!("no principal with id '{principal_id}'"),
+                }
+            })),
+        )
+            .into_response();
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let new_level = CoreTrustLevel::Blocked {
+        blocked_by: PrincipalId::from("controller"),
+        blocked_at: now,
+        reason: req.reason.clone(),
+    };
+    if let Err(e) = principals.set_trust(&pid, new_level) {
+        return internal_error(&format!("set_trust: {e}"));
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "principal_id": principal_id,
+            "new_trust_class": "Blocked",
+            "outcome": "revoked",
+        })),
     )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RevokeRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Sub-router mounted at `/api/admin/approvals/...` and
+/// `/api/admin/principals/.../revoke`.
+pub fn approvals_router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/admin/approvals/{approval_id}/respond",
+            post(respond_handler),
+        )
+        .route(
+            "/api/admin/principals/{principal_id}/revoke",
+            post(revoke_handler),
+        )
 }

@@ -66,5 +66,42 @@ fn bench_sentence_splitter(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_endpointer, bench_bargein, bench_sentence_splitter);
+/// `ConversationKind::derive` runs on every chat-route turn (the
+/// chat path calls `refresh_conversation_kind` before policy
+/// evaluation). Budget ≤ 100 ns p99 — sub-microsecond is the bar
+/// for the per-turn pre-flight.
+fn bench_conversation_kind_derive(c: &mut Criterion) {
+    use execlaw_core::conversation::ConversationKind;
+    let mut group = c.benchmark_group("conversation_kind_derive");
+    group.bench_function("controller_dm", |b| {
+        b.iter(|| ConversationKind::derive(black_box(&["Controller"])))
+    });
+    group.bench_function("group_with_controller_present", |b| {
+        b.iter(|| {
+            ConversationKind::derive(black_box(&[
+                "Controller",
+                "KnownTrusted",
+                "KnownTrusted",
+            ]))
+        })
+    });
+    group.bench_function("mixed_trust", |b| {
+        b.iter(|| {
+            ConversationKind::derive(black_box(&[
+                "Controller",
+                "KnownLimited",
+                "KnownTrusted",
+            ]))
+        })
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_endpointer,
+    bench_bargein,
+    bench_sentence_splitter,
+    bench_conversation_kind_derive,
+);
 criterion_main!(benches);

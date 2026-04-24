@@ -1,0 +1,17 @@
+[plugin]
+id = "identity-local-address-book"
+name = "Local Address Book (identity provider)"
+version = "0.1.0"
+description = "In-tree reference identity provider. Resolves transport identifiers (web handles, phone numbers, emails) against a JSON contact list at ~/.execlaw/contacts.json so saved contacts auto-trust as KnownTrusted."
+author = "execlaw"
+license = "AGPL-3.0-or-later"
+
+[identity_provider]
+resolves = ["web", "phone", "email"]
+trust_hint_default = "Contact"
+confidence_ceiling = 0.95
+
+[runtime]
+tier = "subprocess"
+executable = "./identity-local-address-book"
+args = []

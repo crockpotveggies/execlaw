@@ -17,6 +17,7 @@ members = [
     "crates/server",
     "crates/cli",
     "plugins/hello",
+    "plugins/identity-local-address-book",
 ]
 
 [workspace.package]

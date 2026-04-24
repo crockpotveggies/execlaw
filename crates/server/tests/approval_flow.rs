@@ -241,32 +241,37 @@ async fn unsupported_verb_for_cold_contact_is_400() {
     assert_eq!(body["error"]["code"], "unsupported_verb");
 }
 
-/// Adversarial: revoke trust on an existing KnownTrusted contact.
-/// After revoke, future messages from them are dropped with 403.
+/// Adversarial: revoke trust on an existing KnownTrusted contact via
+/// the dedicated `POST /api/admin/principals/:id/revoke` route. After
+/// revoke, future messages from them are dropped with 403.
 #[tokio::test]
 async fn revoke_trust_drops_future_messages() {
     let tmp = tempfile::tempdir().unwrap();
-    let (app, state) = build_app(tmp.path().to_path_buf());
+    let (app, _state) = build_app(tmp.path().to_path_buf());
 
     // Trust first.
     let init = send_cold_contact(app.clone(), "flow-6", "friend", "hey").await;
     let approval_id = init["approval_id"].as_str().unwrap().to_owned();
     let (_, _) = respond(app.clone(), &approval_id, "trust").await;
 
-    // Principal is KnownTrusted now. Controller revokes by manually
-    // setting the principal's trust to Blocked (Phase 3 has the
-    // store API; a dedicated HTTP route lands with Phase 6 UI).
-    let store = PrincipalStore::new(&state.db);
-    store
-        .set_trust(
-            &PrincipalId::from("friend"),
-            CoreTrustLevel::Blocked {
-                blocked_by: PrincipalId::from("controller"),
-                blocked_at: chrono::Utc::now().timestamp(),
-                reason: Some("manual revoke".into()),
-            },
-        )
+    // Revoke via the HTTP route (the controller-action path).
+    let revoke_body = serde_json::to_vec(&serde_json::json!({
+        "reason": "manual revoke"
+    }))
+    .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/admin/principals/friend/revoke")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(revoke_body))
         .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&body::to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(body["new_trust_class"], "Blocked");
+    assert_eq!(body["outcome"], "revoked");
 
     // Their next message gets 403.
     let body = serde_json::to_vec(&serde_json::json!({
@@ -282,4 +287,91 @@ async fn revoke_trust_drops_future_messages() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// Revoke on a non-existent principal returns 404.
+#[tokio::test]
+async fn revoke_unknown_principal_is_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _) = build_app(tmp.path().to_path_buf());
+    let body = serde_json::to_vec(&serde_json::json!({})).unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/admin/principals/ghost/revoke")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// Cold-contact response now includes a signed `approval_token`
+/// (§2.11). The token's `jti` matches the approval_id.
+#[tokio::test]
+async fn cold_contact_emits_signed_approval_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _state) = build_app(tmp.path().to_path_buf());
+    let init = send_cold_contact(app, "flow-token", "stranger", "hi").await;
+    let token = init["approval_token"]
+        .as_str()
+        .expect("cold-contact response must include approval_token");
+    assert!(!token.is_empty());
+    // JWT shape: header.payload.signature.
+    assert_eq!(token.matches('.').count(), 2);
+}
+
+/// Bad approval_token (wrong jti) is rejected with 401.
+#[tokio::test]
+async fn approval_with_mismatched_token_jti_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _state) = build_app(tmp.path().to_path_buf());
+    let init = send_cold_contact(app.clone(), "flow-bad-jti", "x", "hi").await;
+    let approval_id = init["approval_id"].as_str().unwrap().to_owned();
+    let token = init["approval_token"].as_str().unwrap().to_owned();
+
+    // Hit the WRONG approval id with the right token. Server must
+    // reject because the token's jti doesn't match the path.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "verb": "trust",
+        "approval_token": token,
+    }))
+    .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/admin/approvals/appr-different-id/respond")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    // Either 401 (token jti mismatch) or 404 (approval id not found
+    // because it doesn't exist) — both are correct rejections.
+    let status = resp.status();
+    assert!(
+        status == StatusCode::UNAUTHORIZED || status == StatusCode::NOT_FOUND,
+        "expected 401 or 404, got {status}"
+    );
+    let _ = approval_id;
+}
+
+/// A garbage token is rejected with 401.
+#[tokio::test]
+async fn approval_with_garbage_token_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, _state) = build_app(tmp.path().to_path_buf());
+    let init = send_cold_contact(app.clone(), "flow-garbage", "y", "hi").await;
+    let approval_id = init["approval_id"].as_str().unwrap().to_owned();
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "verb": "trust",
+        "approval_token": "not.a.real.jwt.at.all",
+    }))
+    .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/admin/approvals/{approval_id}/respond"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

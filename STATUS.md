@@ -6,8 +6,8 @@ Last update: 2026-04-24, after Phase 3 closeout + Phase 4 voice primitives.
 
 - `cargo build --workspace` — **clean**
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **277 passing, 0 failing**
-- `cargo bench --workspace --no-run` — **clean** (32+ benches across 8 crates)
+- `cargo test --workspace --no-fail-fast` — **293 passing, 0 failing**
+- `cargo bench --workspace --no-run` — **clean** (35+ benches across 8 crates)
 - **Zero cloud-SDK dependencies** anywhere in the workspace
 - Phases 0–4 complete (internal); Phase 5 observability/replay next
 
@@ -122,7 +122,7 @@ execlaw-vault              3     Argon2id password verification
 execlaw-outbox             8     backoff, retry budget, drain
 execlaw-session            1     modality binding
 --------------------------------------------------------------------
-TOTAL                    277 passing, 0 failing
+TOTAL                    293 passing, 0 failing
 ```
 
 ## Benchmarks (cargo bench --workspace)

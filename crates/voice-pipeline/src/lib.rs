@@ -21,7 +21,8 @@ pub use endpointer::{
 };
 pub use graph::{DATA_LANE_CAPACITY, Pipeline, PipelineEnds, SYSTEM_LANE_CAPACITY};
 pub use session::{
-    SessionConfig, SessionState, VoiceEventPayload, VoiceSession, chunk_at_sentence_boundaries,
+    SessionConfig, SessionState, VoiceEventPayload, VoiceSession, VoiceTurnBudget,
+    chunk_at_sentence_boundaries, voice_turn_budget,
 };
 pub use traits::{
     AudioChunk, AudioIn, AudioOut, MockAudioIn, MockAudioOut, MockStt, MockTts, MockVad,
