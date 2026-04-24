@@ -22,3 +22,4 @@ chrono.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread", "time", "test-util"] }
+rusqlite.workspace = true

@@ -159,24 +159,76 @@ enum HwOp {
     Rescan,
 }
 
-fn init_tracing() {
-    // Default to JSON logs (matching the architecture-doc §14 promise:
-    // JSONL to disk + SQLite) when the EXECLAW_LOG_FORMAT env var is set to
-    // "json", and to human-readable output otherwise. Either way, no OTEL,
-    // no Langfuse — per the 2026-04-23 locked decision.
+/// Tracing subscriber init — stdout (JSON or human-readable) plus
+/// a daily-rotated JSONL file under `~/.execlaw/logs/` per §14.
+///
+/// File path is `<data_dir>/logs/execlaw.jsonl.YYYY-MM-DD`. The
+/// returned `WorkerGuard` must be held for the lifetime of the
+/// process — when it drops, the appender's background flush thread
+/// shuts down and any unflushed lines are lost.
+///
+/// Set `EXECLAW_LOG_FORMAT=json` to get JSON on stdout too;
+/// `EXECLAW_LOG_DIR` overrides the file directory; `EXECLAW_NO_FILE_LOG=1`
+/// disables the file appender (useful for tests + ephemeral CLI
+/// invocations like `execlaw doctor`).
+fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let want_json = std::env::var("EXECLAW_LOG_FORMAT")
         .map(|v| v.eq_ignore_ascii_case("json"))
         .unwrap_or(false);
-    let _ = if want_json {
-        tracing_subscriber::fmt()
+    let want_file = std::env::var("EXECLAW_NO_FILE_LOG")
+        .map(|v| !matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(true);
+
+    // Stdout layer.
+    let stdout_layer = if want_json {
+        tracing_subscriber::fmt::layer()
             .json()
-            .with_env_filter(filter)
-            .try_init()
+            .with_writer(std::io::stdout)
+            .boxed()
     } else {
-        tracing_subscriber::fmt().with_env_filter(filter).try_init()
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stdout)
+            .boxed()
     };
+
+    // File layer — daily-rotated JSONL.
+    let (file_layer, guard) = if want_file {
+        let log_dir = std::env::var("EXECLAW_LOG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| default_data_dir().join("logs"));
+        if let Err(e) = std::fs::create_dir_all(&log_dir) {
+            eprintln!("execlaw: failed to create log dir {log_dir:?}: {e}");
+            (None, None)
+        } else {
+            let file_appender =
+                tracing_appender::rolling::daily(&log_dir, "execlaw.jsonl");
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+            let layer = tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(non_blocking)
+                .with_ansi(false)
+                .boxed();
+            (Some(layer), Some(guard))
+        }
+    } else {
+        (None, None)
+    };
+
+    let registry = tracing_subscriber::registry()
+        .with(filter)
+        .with(stdout_layer);
+    let _ = match file_layer {
+        Some(fl) => registry.with(fl).try_init(),
+        None => registry.try_init(),
+    };
+
+    guard
 }
 
 fn default_data_dir() -> PathBuf {
@@ -512,7 +564,9 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
 }
 
 fn main() -> ExitCode {
-    init_tracing();
+    // Hold the tracing-appender guard for the whole process lifetime
+    // so the background flush thread sees every event before exit.
+    let _tracing_guard = init_tracing();
     let cli = Cli::parse();
     let result: anyhow::Result<()> = (|| match cli.command {
         Command::Build {

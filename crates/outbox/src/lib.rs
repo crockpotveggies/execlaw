@@ -16,6 +16,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod scheduler;
+pub use scheduler::WakeupScheduler;
+
 use async_trait::async_trait;
 use execlaw_core::db::Database;
 use execlaw_core::events::{EventKind, EventLog, EventRecord, PendingEvent, Snapshot};

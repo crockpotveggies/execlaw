@@ -17,10 +17,12 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use execlaw_container_manager::{HardwareProfile, detect_sysfs};
 use execlaw_core::{Database, DbConfig};
 use execlaw_vault::{hash_password, verify_password};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
@@ -234,6 +236,18 @@ pub async fn health() -> Json<HealthResponse> {
     })
 }
 
+/// `GET /api/admin/hardware` — return the live hardware profile
+/// from a fresh sysfs scan (Tier-1 detection per §5.3).
+///
+/// On Linux this hits `/sys/class/drm/card*/device/`; on non-Linux
+/// hosts it returns an empty `HardwareProfile` (the control plane
+/// is meant to run inside a Linux container — bare-Windows dev runs
+/// are a known degenerate path).
+pub async fn admin_hardware() -> impl IntoResponse {
+    let profile: HardwareProfile = detect_sysfs(Path::new("/sys"));
+    (StatusCode::OK, Json(profile)).into_response()
+}
+
 #[utoipa::path(
     post,
     path = "/api/setup",
@@ -405,6 +419,7 @@ pub async fn logout(
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/admin/hardware", get(admin_hardware))
         .route("/api/setup", post(setup))
         .route("/api/login", post(login))
         .route("/api/token/refresh", post(refresh))

@@ -1918,17 +1918,21 @@ Self-hosted inference is core, not a Phase 7 extra. The hardware profile and run
 - OS-keyring integration with passphrase-file fallback (keyring accessed via host-socket bind-mount, not in-container keyring)
 - `bollard` client + `container-manager` crate with spawn/stop/logs, event bus, and **tiered hardware-profile detection** (§5.3): Tier 1 sysfs reads with embedded PCI ID DB, Tier 2 `docker info` runtime check, Tier 3 one-shot probe containers (`probe-nvidia`, `probe-intel`), Tier 4 manual override. No vendor GPU tooling in the control-plane image (axiom #12).
 - `inference-api` crate — OpenAI-compatible client (streaming SSE, function calling); the single internal LLM contract
-- **Both default service plugins** in-tree and pre-installed:
-  - `service-vllm` — nvidia backend, docker image configured to serve `QuantTrio/Qwen3.5-27B-AWQ` (the single model execlaw uses for text, voice-LLM, and reasoning)
-  - `service-openarc` — Intel GPU backend, docker image for OpenVINO-backed models used by the voice pipeline (STT via `service-whisper`, TTS via `service-kokoro`)
-- **Runner deployment registry** (§5.4) with `config_runner_deployments` SQLite table
-- **Setup wizard** that reads `HardwareProfile`, proposes per-purpose deployments (the hybrid nvidia+Intel Arc defaults documented in §5.4), lets the operator accept or edit, and writes to the deployment registry
+- **Runner deployment registry** (§5.4) with `config_runner_deployments` SQLite table + `execlaw deployments` CLI subcommand for list/set/start/stop
 - Admin UI `/api/admin/hardware` endpoint + readonly hardware view
 - Axum server with `/api/health` and WS `/api/stream` echo
-- `tracing` with JSON layer → `~/.execlaw/logs/*.jsonl` + SQLite `log_*` tables (selfhosted-claw pattern)
+- `tracing` with JSON layer → `~/.execlaw/logs/*.jsonl` + SQLite `log_entries` table (selfhosted-claw pattern)
+- OS-keyring integration with **passphrase-file fallback** at `~/.execlaw/master.key` (headless / CI deploys + first-run wizard write the file)
 - CLI (`execlaw up`, `execlaw doctor`, `execlaw db migrate`, `execlaw hw rescan`, `execlaw deployments list/set/start`, `execlaw vault rekey`, `execlaw plugin install <zip>`)
-- **API specs:** `utoipa`-annotated Axum routes produce a live **OpenAPI 3.x (Swagger) spec** at `/api/openapi.json`; a **hand-maintained AsyncAPI 3.x spec** at `/api/asyncapi.json` documents the `/api/stream` WebSocket event vocabulary. Both specs are served at `/api/docs` as Swagger UI + AsyncAPI viewer; the specs are the operator-facing *and* plugin-author-facing API contract documentation.
-- **Demo:** `execlaw up` on the dev machine detects both nvidia and Intel Arc; setup wizard proposes `QuantTrio/Qwen3.5-27B-AWQ` on nvidia for Standard and Kokoro+Whisper on Intel Arc for voice stack; operator accepts; services boot; `inference-api` routes a Standard-purpose request to nvidia and returns a response. No cloud calls. Vault round-trips a secret through the OS keyring. `execlaw hw rescan` picks up a newly plugged GPU. `/api/docs` renders both specs.
+- **API specs:** `utoipa`-annotated Axum routes produce a live **OpenAPI 3.x (Swagger) spec** at `/api/openapi.json`; a **hand-maintained AsyncAPI 3.x spec** at `/api/asyncapi.json` documents the `/api/stream` WebSocket event vocabulary. Both specs are served at `/api/docs` as Swagger UI + AsyncAPI viewer.
+
+**Moved out by the 2026-04-24 refactor (anything external-service-dependent → Phase 8; anything UI → Phase 6):**
+
+- **`service-vllm` / `service-openarc` service plugins** → Phase 8. Both wrap external runtime software (vLLM, OpenArc) the control plane doesn't bundle; per the refactor any plugin needing external services lives in Phase 8.
+- **Setup wizard** (interactive HardwareProfile → propose deployments → operator accepts) → Phase 6 (chat-first UI). The CLI exposes `execlaw deployments` for headless setup; the wizard is the UI surface on top of it.
+- **`execlaw up` real-hardware demo** (detects nvidia + Intel Arc, services boot, inference routes a request, etc.) → Phase 8 acceptance, since it depends on the moved-out service plugins.
+
+- **Phase 0 demo (internal):** `execlaw db migrate` brings the schema up; `execlaw hw rescan` returns the sysfs-detected `HardwareProfile` JSON; `execlaw deployments list` reads the registry; `execlaw plugin install <zip>` installs the in-tree reference plugin and `GET /api/admin/plugins/tools` shows its tool; `GET /api/admin/hardware` returns the same profile the CLI does; `/api/docs` renders both specs; the JSONL log file lands at `~/.execlaw/logs/execlaw.jsonl` with one row per tracing event AND a matching row appears in `log_entries`.
 
 ### Phase 1 — Agent core with one transport (3-4 weeks)
 
@@ -1938,13 +1942,17 @@ The **hard, load-bearing phase** — this is where the agent model lives or dies
 - **Snapshotting** every ~50 events + constant-time resume
 - **Turn-as-transaction** commit semantics with the `tool_use`/`tool_result` pairing invariant (cancellation result synthesis on failure)
 - **Outbox relay** as a separate async task with framework-minted idempotency keys and exponential backoff
-- **Wakeup scheduler** (priority queue + notify, sub-second)
-- **`runner-local` crate** — in-tree runner that speaks OpenAI-compatible API to whichever inference backend is configured (`service-openarc` by default). Implements session hydration from `state_events`, function-call-based memory tool exposure, streaming, tool use, interrupt/resume, compaction. **No cloud SDK.**
+- **Wakeup scheduler** (priority queue + `tokio::sync::Notify`, sub-second precision) + `schedule_wakeup` agent tool that turns into a wakeup-table row + drives the scheduler's notify
+- **`runner-local` crate** — in-tree runner that speaks OpenAI-compatible API to whichever inference backend is configured. Implements session hydration from `state_events`, function-call-based memory tool exposure, streaming, tool use, interrupt/resume, compaction. **No cloud SDK.**
 - **Memory-tool shim** mapping function-call `read_memory`/`write_memory` to scoped `memory_entries` rows with trust-class enforcement at the shim layer
 - One transport: **web chat** (no auth, local dev, WS bidirectional)
-- Minimal chat UI with send/receive + agent replies + streaming from the local model
 - **Crash tests** as acceptance: (a) kill control plane mid-turn → restart → turn resumes correctly, no dangling `tool_use`, no double-send on the outbox; (b) agent calls `schedule_wakeup(30s, note)` and resumes within ≤1s of target; (c) kill runner mid-tool-call → cancellation result committed, next turn proceeds cleanly.
-- **Demo:** Chat with the agent running on the local Mistral-7B. Trigger all three crash tests. Conversations survive. Airplane-mode test: disconnect all network, everything still works.
+
+**Moved out by the 2026-04-24 refactor:**
+
+- **Minimal chat UI** (send/receive widget) → Phase 6 chat-first UI. The REST + WS APIs are stable; the React SPA work is its own track.
+
+- **Phase 1 demo (internal):** Chat with the agent against the local inference backend (set `EXECLAW_INFERENCE_URL`). Trigger crash tests (a) and (c) via the integration test suite (`cargo test --workspace --test plugin_lifecycle --test approval_flow`). Trigger (b) by directly inserting a `schedule_wakeup` row and observing the `Wakeup` event committed within ~1 s of the target. Airplane-mode: disconnect network, everything still works (run the test suite with no network).
 
 ### Phase 2 — Plugin framework (2-3 weeks)
 

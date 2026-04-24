@@ -6,10 +6,10 @@ Last update: 2026-04-24, after Phase 3 closeout + Phase 4 voice primitives.
 
 - `cargo build --workspace` — **clean**
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **293 passing, 0 failing**
+- `cargo test --workspace --no-fail-fast` — **302 passing, 0 failing**
 - `cargo bench --workspace --no-run` — **clean** (35+ benches across 8 crates)
 - **Zero cloud-SDK dependencies** anywhere in the workspace
-- Phases 0–4 complete (internal); Phase 5 observability/replay next
+- Phases 0–4 complete (internal — full audit closed earlier-phase gaps); Phase 5 observability/replay next
 
 ## Migration-plan phase structure (post-2026-04-24 refactor)
 
@@ -17,8 +17,8 @@ Phase 2 used to conflate "plugin framework" with "port every selfhosted-claw int
 
 | Phase | Scope | Status |
 |---|---|---|
-| 0 — Foundation + local inference + GPU-aware deployment | foundation primitives | ✅ done |
-| 1 — Agent core with one transport (web chat) | HMAC event log, TurnExecutor, policy+capability on turn path, streaming SSE, crash invariants | ✅ done |
+| 0 — Foundation + local inference + GPU-aware deployment | foundation primitives, GET /api/admin/hardware, tracing JSONL to `~/.execlaw/logs/`, vault passphrase-file fallback | ✅ done (service plugins moved to Phase 8; setup wizard moved to Phase 6) |
+| 1 — Agent core with one transport (web chat) | HMAC event log, TurnExecutor, policy+capability on turn path, streaming SSE, `WakeupScheduler` (priority queue + Notify, sub-second), crash invariants | ✅ done (chat UI moved to Phase 6) |
 | 2 — **Plugin framework** (framework only — ports moved to Phase 8) | hook registry, subprocess tier, install route, lifecycle, dispatch bridge, capability enforcement | ✅ done |
 | 3 — Participants, trust, policy engine, Rule of Two | `PrincipalStore`, identity resolution (+ plugin dispatch), cold-contact flow, approval endpoint with every verb, spotlighting, planner/executor tool-strip, trust-class memory scoping | ✅ done |
 | 4 — Voice pipeline primitives (pure Rust; real-audio demos move to Phase 8) | two-lane graph, Vad/Audio/Stt/Tts traits + mocks, `VoiceSession` orchestrator, voice event schema wired to state_events, endpointer, barge-in | ✅ done |
@@ -118,11 +118,11 @@ execlaw-plugin-host       15     hook registry, subprocess RPC
 execlaw-plugin-sdk         8     manifest parsing, ZIP staging + zipslip
 execlaw-inference-api      7     chat req/resp, streaming SSE parse
 execlaw-container-manager  3     mock sysfs detection, PCI vendor mapping
-execlaw-vault              3     Argon2id password verification
-execlaw-outbox             8     backoff, retry budget, drain
+execlaw-vault              9     Argon2id password verification, OS-keyring + passphrase-file fallback round-trip
+execlaw-outbox            11     backoff, retry budget, drain, WakeupScheduler (heap ordering, hydrate-from-outbox, sub-second fire)
 execlaw-session            1     modality binding
 --------------------------------------------------------------------
-TOTAL                    293 passing, 0 failing
+TOTAL                    302 passing, 0 failing
 ```
 
 ## Benchmarks (cargo bench --workspace)
