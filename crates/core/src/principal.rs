@@ -128,4 +128,97 @@ mod tests {
         let back: TrustLevel = serde_json::from_str(&s).unwrap();
         assert_eq!(back, t);
     }
+
+    /// Every TrustLevel variant must produce a distinct class tag. If
+    /// a future variant shadows an existing tag, the DB's trust_class
+    /// column becomes ambiguous.
+    #[test]
+    fn every_variant_has_a_unique_class_tag() {
+        let variants = [
+            TrustLevel::Controller,
+            TrustLevel::Delegated {
+                by: PrincipalId::from("c"),
+                scope: CapabilityScope {
+                    capabilities: vec![],
+                },
+                expires_at: None,
+            },
+            TrustLevel::KnownTrusted {
+                resolvers: vec![],
+                approved_by: PrincipalId::from("c"),
+                approved_at: 0,
+            },
+            TrustLevel::KnownLimited {
+                resolvers: vec![],
+                allowed_topics: vec![],
+                allowed_tools: None,
+            },
+            TrustLevel::UnknownPending {
+                first_seen: 0,
+                notification_event_seq: None,
+            },
+            TrustLevel::Blocked {
+                blocked_by: PrincipalId::from("c"),
+                blocked_at: 0,
+                reason: None,
+            },
+        ];
+        let tags: Vec<&'static str> = variants.iter().map(|v| v.class_tag()).collect();
+        let unique: std::collections::HashSet<_> = tags.iter().collect();
+        assert_eq!(unique.len(), variants.len(), "class tags collide: {tags:?}");
+        // Exact expected tags.
+        assert_eq!(
+            tags,
+            vec![
+                "Controller",
+                "Delegated",
+                "KnownTrusted",
+                "KnownLimited",
+                "UnknownPending",
+                "Blocked",
+            ]
+        );
+    }
+
+    /// TrustHint enum round-trips through JSON — important because it's
+    /// published by identity-provider plugins as untrusted input.
+    #[test]
+    fn trust_hint_roundtrips_all_variants() {
+        for h in [
+            TrustHint::Contact,
+            TrustHint::Colleague,
+            TrustHint::Family,
+            TrustHint::Organization,
+            TrustHint::Unknown,
+        ] {
+            let s = serde_json::to_string(&h).unwrap();
+            let back: TrustHint = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, h);
+        }
+    }
+
+    /// Identifier hash-equality — two Identifiers with the same
+    /// transport+handle must match; differing transport must not.
+    #[test]
+    fn identifier_equality_and_hash_are_value_based() {
+        use std::collections::HashSet;
+        let a = Identifier {
+            transport: "signal".into(),
+            handle: "+15551234567".into(),
+        };
+        let b = Identifier {
+            transport: "signal".into(),
+            handle: "+15551234567".into(),
+        };
+        let c = Identifier {
+            transport: "email".into(),
+            handle: "+15551234567".into(),
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        let mut set = HashSet::new();
+        set.insert(a);
+        assert!(set.contains(&b));
+        assert!(!set.contains(&c));
+    }
 }

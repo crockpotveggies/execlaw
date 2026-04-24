@@ -44,3 +44,8 @@ schemars.workspace = true
 tempfile.workspace = true
 pretty_assertions.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+criterion.workspace = true
+
+[[bench]]
+name = "core_hot_paths"
+harness = false

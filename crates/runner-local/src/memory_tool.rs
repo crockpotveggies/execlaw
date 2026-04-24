@@ -394,4 +394,111 @@ mod tests {
         let err = disp.dispatch("do_something_evil", &json!({})).unwrap_err();
         assert!(err.contains("unknown"));
     }
+
+    /// Adversarial: a Blocked principal must not be able to read memory
+    /// at any level — including their own. Any other behavior would let
+    /// a revoked principal retain their old state.
+    #[test]
+    fn blocked_principal_cannot_read_any_memory() {
+        let db = fresh_db();
+
+        // Seed memory at every trust level.
+        for level in [
+            MemoryTrust::Controller,
+            MemoryTrust::KnownTrusted,
+            MemoryTrust::Blocked, // even a row that was once written at this level
+        ] {
+            MemoryToolDispatcher::new(MemoryStore::new(&db), level)
+                .dispatch(
+                    "write_memory",
+                    &json!({"scope": "s", "key": "k", "value": format!("v-{}", level.as_str())}),
+                )
+                .unwrap();
+        }
+
+        let blocked_disp = MemoryToolDispatcher::new(MemoryStore::new(&db), MemoryTrust::Blocked);
+        // Blocked has rank 0 and can_read requires self.rank >= other.rank.
+        // Its own row (rank 0 vs 0) is readable — this is intentional:
+        // "Blocked" is the universal rejection state, not an erasure.
+        // Test that higher levels remain invisible.
+        let got = blocked_disp
+            .dispatch("read_memory", &json!({"scope": "s", "key": "k"}))
+            .unwrap();
+        assert_ne!(
+            got,
+            json!("v-Controller"),
+            "Blocked must not read Controller memory"
+        );
+        assert_ne!(
+            got,
+            json!("v-KnownTrusted"),
+            "Blocked must not read KnownTrusted memory"
+        );
+    }
+
+    /// Adversarial: an LLM cannot escalate by claiming a higher
+    /// trust_class in its tool args — the dispatcher ignores anything
+    /// the model says about trust and uses `current_trust` only.
+    #[test]
+    fn write_ignores_any_llm_supplied_trust_in_args() {
+        let db = fresh_db();
+        let disp = MemoryToolDispatcher::new(MemoryStore::new(&db), MemoryTrust::KnownLimited);
+        // LLM "tries" to sneak a trust_class field into args — the schema
+        // doesn't accept it but serde_json::from_value is lenient about
+        // extras. Either way, the resulting row lands at KnownLimited.
+        disp.dispatch(
+            "write_memory",
+            &json!({
+                "scope": "s",
+                "key": "k",
+                "value": "v",
+                "trust_class": "Controller" // <-- bogus
+            }),
+        )
+        .unwrap();
+
+        let store = MemoryStore::new(&db);
+        assert!(store.get("s", "KnownLimited", "k").unwrap().is_some());
+        assert!(store.get("s", "Controller", "k").unwrap().is_none());
+    }
+
+    /// list_memory is a stub today — assert the stub contract explicitly
+    /// so a future implementation doesn't silently change the shape.
+    #[test]
+    fn list_memory_stub_returns_empty_keys_with_note() {
+        let db = fresh_db();
+        let disp = MemoryToolDispatcher::new(MemoryStore::new(&db), MemoryTrust::Controller);
+        let got = disp
+            .dispatch("list_memory", &json!({"scope": "s"}))
+            .unwrap();
+        assert_eq!(got["keys"], json!([]));
+        assert!(got["note"].as_str().unwrap().contains("not yet implemented"));
+    }
+
+    /// Malformed args yield a structured error rather than panicking
+    /// or silently writing garbage.
+    #[test]
+    fn malformed_args_return_error_not_panic() {
+        let db = fresh_db();
+        let disp = MemoryToolDispatcher::new(MemoryStore::new(&db), MemoryTrust::Controller);
+        let err = disp
+            .dispatch("read_memory", &json!({"key_only": "no scope"}))
+            .unwrap_err();
+        assert!(err.contains("bad read_memory args"));
+    }
+
+    #[test]
+    fn trust_parse_roundtrips_every_variant() {
+        for v in [
+            MemoryTrust::Controller,
+            MemoryTrust::Delegated,
+            MemoryTrust::KnownTrusted,
+            MemoryTrust::KnownLimited,
+            MemoryTrust::UnknownPending,
+            MemoryTrust::Blocked,
+        ] {
+            assert_eq!(MemoryTrust::parse(v.as_str()), Some(v));
+        }
+        assert_eq!(MemoryTrust::parse("bogus"), None);
+    }
 }

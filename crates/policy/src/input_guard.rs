@@ -78,4 +78,43 @@ mod tests {
         assert_eq!(fold_common_homoglyphs(s), s);
         assert_eq!(strip_invisible(s), s);
     }
+
+    /// RLO (Right-to-Left Override, U+202E) is the canonical bidi
+    /// attack vector — `doc\u{202E}cod.exe` rendered as `doc exe.cod`.
+    /// Explicit test so a narrower strip can't silently regress.
+    #[test]
+    fn strips_rlo_override_specifically() {
+        let dirty = "doc\u{202E}cod.exe";
+        assert_eq!(strip_invisible(dirty), "doccod.exe");
+    }
+
+    /// Byte-order-mark (U+FEFF) is another common smuggle point.
+    #[test]
+    fn strips_byte_order_mark() {
+        assert_eq!(strip_invisible("\u{FEFF}hello"), "hello");
+    }
+
+    /// Invisible-math characters (U+2061..U+2064) must also be stripped.
+    #[test]
+    fn strips_invisible_math_operators() {
+        let dirty = "a\u{2061}b\u{2064}c";
+        assert_eq!(strip_invisible(dirty), "abc");
+    }
+
+    /// Capital-form Cyrillic homoglyphs are folded too.
+    #[test]
+    fn folds_capital_cyrillic_lookalikes() {
+        // "РАУPAL" uses Cyrillic Р, А, У before a Latin PAL.
+        assert_eq!(fold_common_homoglyphs("РАУPAL"), "PAYPAL");
+    }
+
+    /// A string mixing both zero-width joiners AND homoglyphs needs
+    /// BOTH passes applied to produce a clean result — ensure callers
+    /// can chain them cleanly without interference.
+    #[test]
+    fn strip_then_fold_composes() {
+        let dirty = "р\u{200B}аypal";
+        let cleaned = fold_common_homoglyphs(&strip_invisible(dirty));
+        assert_eq!(cleaned, "paypal");
+    }
 }

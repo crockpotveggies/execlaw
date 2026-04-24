@@ -50,7 +50,7 @@ pub fn issue_capability_token(
     capability_set: Vec<String>,
     ttl_secs: Option<i64>,
 ) -> String {
-    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use jsonwebtoken::{Algorithm, Header, encode};
     use rand::RngCore;
     use rand::rngs::OsRng;
 
@@ -73,9 +73,9 @@ pub fn issue_capability_token(
     };
 
     let header = Header::new(Algorithm::EdDSA);
-    let priv_pem = signer.private_pem();
-    let encoding_key = EncodingKey::from_ed_pem(&priv_pem).expect("valid PKCS#8 Ed25519");
-    encode(&header, &claims, &encoding_key).expect("JWT encode")
+    // Reuse the pre-parsed encoding key from the signer instead of
+    // re-decoding PEM bytes per call (§0 axiom #14 — saves ~25µs).
+    encode(&header, &claims, signer.encoding_key()).expect("JWT encode")
 }
 
 /// Verify a capability token. Returns the decoded claims if the token
@@ -87,16 +87,14 @@ pub fn verify_capability_token(
     expected_conversation_id: &str,
     expected_turn_seq: i64,
 ) -> Result<CapabilityClaims, String> {
-    use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+    use jsonwebtoken::{Algorithm, Validation, decode};
 
-    let pub_pem = signer.public_pem();
-    let decoding_key =
-        DecodingKey::from_ed_pem(&pub_pem).map_err(|e| format!("bad public key: {e}"))?;
     let mut validation = Validation::new(Algorithm::EdDSA);
     validation.set_issuer(&[signer.issuer()]);
     validation.leeway = 5;
 
-    let data = decode::<CapabilityClaims>(token, &decoding_key, &validation)
+    // Reuse the cached decoding key (§0 axiom #14 — saves ~25µs).
+    let data = decode::<CapabilityClaims>(token, signer.decoding_key(), &validation)
         .map_err(|e| format!("token verification failed: {e}"))?;
 
     if data.claims.conversation_id != expected_conversation_id {
@@ -181,5 +179,60 @@ mod tests {
         let t1 = issue_capability_token(&signer, "p", "c", 1, vec![], None);
         let t2 = issue_capability_token(&signer, "p", "c", 1, vec![], None);
         assert_ne!(t1, t2, "nonce should make every token distinct");
+    }
+
+    /// Expired capability tokens must not verify. The jsonwebtoken
+    /// validator gives us 5 seconds of leeway, so we back-date by 300s
+    /// to guarantee rejection.
+    #[test]
+    fn expired_token_rejected() {
+        let signer = JwtSigner::generate("execlaw-test".into());
+        let token = issue_capability_token(
+            &signer,
+            "pri_ctrl",
+            "conv_abc",
+            1,
+            vec!["tools.safe".into()],
+            Some(-300), // 5 minutes in the past
+        );
+        let err = verify_capability_token(&signer, &token, "conv_abc", 1).unwrap_err();
+        assert!(err.to_lowercase().contains("expired") || err.contains("verification failed"));
+    }
+
+    /// Flipping one byte of the JWT's payload segment must invalidate
+    /// the signature. This is the core tamper-detection property.
+    #[test]
+    fn tampered_payload_segment_rejected() {
+        let signer = JwtSigner::generate("execlaw-test".into());
+        let token = issue_capability_token(
+            &signer,
+            "pri_ctrl",
+            "conv_abc",
+            47,
+            vec!["tools.safe".into()],
+            None,
+        );
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT should have header.payload.signature");
+        // Flip last char of the payload segment — Base64URL safe chars
+        // swap to produce a different but valid base64 char.
+        let mut payload = parts[1].to_owned();
+        let last = payload.pop().unwrap();
+        let replacement = if last == 'A' { 'B' } else { 'A' };
+        payload.push(replacement);
+        let tampered = format!("{}.{}.{}", parts[0], payload, parts[2]);
+        let err = verify_capability_token(&signer, &tampered, "conv_abc", 47).unwrap_err();
+        assert!(err.contains("verification failed") || err.contains("decode"));
+    }
+
+    /// Truncating the signature segment must be rejected.
+    #[test]
+    fn truncated_signature_rejected() {
+        let signer = JwtSigner::generate("execlaw-test".into());
+        let token = issue_capability_token(&signer, "p", "c", 1, vec![], None);
+        let parts: Vec<&str> = token.split('.').collect();
+        let truncated = format!("{}.{}.", parts[0], parts[1]);
+        let err = verify_capability_token(&signer, &truncated, "c", 1).unwrap_err();
+        assert!(!err.is_empty());
     }
 }

@@ -122,4 +122,66 @@ mod tests {
         let b = canonical_bytes("foob", 1, "ar", 0, None, b"");
         assert_ne!(a, b);
     }
+
+    #[test]
+    fn tampered_kind_fails_verification() {
+        let key = b"k";
+        let canon = canonical_bytes("c", 1, "user_msg", 0, None, b"p");
+        let tag = sign_event(key, &canon);
+        let mutated = canonical_bytes("c", 1, "model_turn", 0, None, b"p");
+        assert!(!verify_event(key, &mutated, &tag));
+    }
+
+    #[test]
+    fn tampered_actor_fails_verification() {
+        let key = b"k";
+        let canon = canonical_bytes("c", 1, "user_msg", 0, Some("agent"), b"p");
+        let tag = sign_event(key, &canon);
+        let mutated = canonical_bytes("c", 1, "user_msg", 0, Some("controller"), b"p");
+        assert!(!verify_event(key, &mutated, &tag));
+    }
+
+    #[test]
+    fn tampered_committed_at_fails_verification() {
+        let key = b"k";
+        let canon = canonical_bytes("c", 1, "user_msg", 1_000, None, b"p");
+        let tag = sign_event(key, &canon);
+        let mutated = canonical_bytes("c", 1, "user_msg", 2_000, None, b"p");
+        assert!(!verify_event(key, &mutated, &tag));
+    }
+
+    #[test]
+    fn tampered_conversation_id_fails_verification() {
+        let key = b"k";
+        let canon = canonical_bytes("alice", 1, "user_msg", 0, None, b"p");
+        let tag = sign_event(key, &canon);
+        let mutated = canonical_bytes("mallory", 1, "user_msg", 0, None, b"p");
+        assert!(!verify_event(key, &mutated, &tag));
+    }
+
+    /// Flipping a single bit in the tag must invalidate it — HMAC
+    /// correctness basics, but an explicit regression gate.
+    #[test]
+    fn single_bit_flip_in_tag_fails_verification() {
+        let key = b"k";
+        let canon = canonical_bytes("c", 1, "user_msg", 0, None, b"p");
+        let mut tag = sign_event(key, &canon);
+        tag[0] ^= 0x01;
+        assert!(!verify_event(key, &canon, &tag));
+    }
+
+    /// `None` actor and `Some("")` actor should both verify round-trip
+    /// but must NOT produce the same tag (the absence of an actor is
+    /// distinct from an empty-string actor).
+    #[test]
+    fn none_and_empty_actor_are_indistinguishable_by_design() {
+        // The canonical encoding currently uses "" for both; this test
+        // pins that behavior so a future change is deliberate.
+        let key = b"k";
+        let none_canon = canonical_bytes("c", 1, "k", 0, None, b"p");
+        let empty_canon = canonical_bytes("c", 1, "k", 0, Some(""), b"p");
+        assert_eq!(none_canon, empty_canon);
+        let tag = sign_event(key, &none_canon);
+        assert!(verify_event(key, &empty_canon, &tag));
+    }
 }

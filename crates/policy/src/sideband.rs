@@ -156,4 +156,71 @@ mod tests {
         let back: ApprovalClaims = serde_json::from_str(&s).unwrap();
         assert_eq!(back.reason, ApprovalReason::ColdContact);
     }
+
+    /// Every ApprovalVerb must round-trip through snake_case JSON — a
+    /// regression here would silently break the sideband response path.
+    #[test]
+    fn approval_verb_round_trips_all_variants() {
+        for v in [
+            ApprovalVerb::Approve,
+            ApprovalVerb::Edit,
+            ApprovalVerb::Reject,
+            ApprovalVerb::Trust,
+            ApprovalVerb::TrustLimited,
+            ApprovalVerb::Block,
+            ApprovalVerb::IgnoreOnce,
+        ] {
+            let s = serde_json::to_string(&v).unwrap();
+            let back: ApprovalVerb = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, v);
+        }
+        // Specific snake_case contract for TrustLimited and IgnoreOnce.
+        assert_eq!(
+            serde_json::to_string(&ApprovalVerb::TrustLimited).unwrap(),
+            "\"trust_limited\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ApprovalVerb::IgnoreOnce).unwrap(),
+            "\"ignore_once\""
+        );
+    }
+
+    #[test]
+    fn approval_reason_round_trips_all_variants() {
+        for r in [
+            ApprovalReason::ColdContact,
+            ApprovalReason::RuleOfTwoBreach,
+            ApprovalReason::SensitiveToolCall,
+            ApprovalReason::AskController,
+            ApprovalReason::AnomalyTripwire,
+        ] {
+            let s = serde_json::to_string(&r).unwrap();
+            let back: ApprovalReason = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, r);
+        }
+    }
+
+    /// Empty enabled list => None. Degenerate deployment, but exercised.
+    #[test]
+    fn returns_none_when_no_transports_enabled() {
+        let pick = pick_sideband_transport(&[], "signal", &["signal", "email"]);
+        assert_eq!(pick, None);
+    }
+
+    #[test]
+    fn default_priority_order_is_signal_email_webui() {
+        let p = default_sideband_priority();
+        assert_eq!(p, vec!["signal", "email", "webui"]);
+    }
+
+    /// Sideband priority honors order: when both signal and email are
+    /// enabled and the origin is webui, signal wins over email because
+    /// it appears earlier in the priority list.
+    #[test]
+    fn priority_order_wins_over_enumeration_order() {
+        let enabled = ["email", "signal"]; // enumeration is email-first
+        let priority = ["signal", "email"]; // priority still says signal
+        let pick = pick_sideband_transport(&enabled, "webui", &priority);
+        assert_eq!(pick, Some("signal"));
+    }
 }

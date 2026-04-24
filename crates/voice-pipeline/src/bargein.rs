@@ -149,4 +149,50 @@ mod tests {
             BargeInDecision::Confirm
         );
     }
+
+    /// Defaults match the §2.13.3 spec numbers — drift guard.
+    #[test]
+    fn default_config_matches_spec_numbers() {
+        let cfg = BargeInConfig::default();
+        assert_eq!(cfg.rescind_delay_ms, 120);
+        assert_eq!(cfg.max_backchannel_ms, 400);
+    }
+
+    /// Even if a backchannel word arrives AFTER the cap, we must not
+    /// rescind — the speaker spoke too long for it to be a genuine
+    /// backchannel. Confirm the interrupt.
+    #[test]
+    fn backchannel_past_cap_still_confirms() {
+        let cfg = BargeInConfig::default();
+        // elapsed = 500ms, > max_backchannel_ms (400ms)
+        assert_eq!(
+            decide(&cfg, 500, "yeah", false),
+            BargeInDecision::Confirm
+        );
+    }
+
+    /// Empty transcript past the rescind delay with user still speaking
+    /// should keep waiting — we don't have enough signal yet.
+    #[test]
+    fn empty_transcript_after_rescind_delay_keeps_waiting() {
+        let cfg = BargeInConfig::default();
+        assert_eq!(decide(&cfg, 200, "", true), BargeInDecision::Wait);
+    }
+
+    /// Punctuation on a backchannel must not defeat detection.
+    #[test]
+    fn punctuated_backchannel_still_detected() {
+        assert!(is_backchannel("Okay."));
+        assert!(is_backchannel("Yeah,"));
+        assert!(is_backchannel("got it?"));
+    }
+
+    /// Empty / whitespace transcript must NOT be classified as a
+    /// backchannel — that would let any pause trigger a rescind.
+    #[test]
+    fn empty_or_whitespace_is_not_a_backchannel() {
+        assert!(!is_backchannel(""));
+        assert!(!is_backchannel("   "));
+        assert!(!is_backchannel("\n\t"));
+    }
 }

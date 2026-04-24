@@ -21,3 +21,8 @@ tempfile.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "plugin_sdk_hot_paths"
+harness = false

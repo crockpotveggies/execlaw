@@ -287,4 +287,135 @@ mod tests {
         assert!(store.inbox_record_if_new(&key).unwrap());
         assert!(!store.inbox_record_if_new(&key).unwrap());
     }
+
+    fn mk_row(cid: &ConversationId, ord: u32) -> OutboxRow {
+        OutboxRow {
+            id: None,
+            idempotency_key: IdempotencyKey::mint(cid, crate::ids::TurnSeq(1), ord),
+            conversation_id: cid.clone(),
+            effect_kind: "test.effect".into(),
+            payload: b"p".to_vec(),
+            status: OutboxStatus::Pending,
+            attempts: 0,
+            next_attempt_at: None,
+            last_error: None,
+            enqueued_seq: EventSeq(1),
+        }
+    }
+
+    /// `claim` is the leasing primitive — two concurrent drain loops
+    /// must not both win a claim on the same row.
+    #[test]
+    fn claim_is_mutually_exclusive() {
+        let db = fresh_db();
+        let store = OutboxStore::new(&db);
+        let id = store.enqueue(&mk_row(&ConversationId::from("c"), 0)).unwrap();
+        assert!(store.claim(id).unwrap(), "first claim should succeed");
+        assert!(!store.claim(id).unwrap(), "second claim must fail");
+    }
+
+    /// `record_failure` bumps attempts and sets next_attempt_at while
+    /// under budget, then transitions to dead_letter when over.
+    #[test]
+    fn record_failure_retries_under_budget_then_dead_letters() {
+        let db = fresh_db();
+        let store = OutboxStore::new(&db);
+        let id = store.enqueue(&mk_row(&ConversationId::from("c"), 0)).unwrap();
+
+        // Under budget: status returns to pending, row has next_attempt_at set.
+        let retrying = store.record_failure(id, "boom", 3, 60).unwrap();
+        assert!(retrying);
+        let (status, attempts, next): (String, i64, Option<i64>) = db
+            .with_conn(|c| {
+                let v = c
+                    .query_row(
+                        "SELECT status, attempts, next_attempt_at FROM state_outbox WHERE id = ?1",
+                        params![id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .unwrap();
+                Ok(v)
+            })
+            .unwrap();
+        assert_eq!(status, "pending");
+        assert_eq!(attempts, 1);
+        assert!(next.is_some() && next.unwrap() > 0);
+
+        // Two more failures push attempts past budget → dead_letter.
+        let _ = store.record_failure(id, "boom", 3, 60).unwrap();
+        let retrying3 = store.record_failure(id, "boom", 3, 60).unwrap();
+        assert!(!retrying3, "third failure past budget must dead-letter");
+        assert_eq!(store.dead_letter_count().unwrap(), 1);
+    }
+
+    /// `ready_pending` must skip rows whose `next_attempt_at` is in
+    /// the future — otherwise backoff would have no effect.
+    #[test]
+    fn ready_pending_skips_rows_with_future_next_attempt() {
+        let db = fresh_db();
+        let store = OutboxStore::new(&db);
+        let cid = ConversationId::from("c");
+
+        // Row 1: due now.
+        let _ = store.enqueue(&OutboxRow {
+            next_attempt_at: Some(100),
+            ..mk_row(&cid, 0)
+        }).unwrap();
+        // Row 2: due far in the future.
+        let _ = store.enqueue(&OutboxRow {
+            next_attempt_at: Some(10_000_000),
+            ..mk_row(&cid, 1)
+        }).unwrap();
+        // Row 3: no schedule — always ready.
+        let _ = store.enqueue(&mk_row(&cid, 2)).unwrap();
+
+        let ready = store.ready_pending(500, 100).unwrap();
+        assert_eq!(ready.len(), 2, "only rows 1 and 3 are due at ts=500");
+        for r in &ready {
+            assert!(r.next_attempt_at.is_none() || r.next_attempt_at.unwrap() <= 500);
+        }
+    }
+
+    /// `mark_delivered` clears `last_error` and sets status=delivered.
+    #[test]
+    fn mark_delivered_clears_error() {
+        let db = fresh_db();
+        let store = OutboxStore::new(&db);
+        let id = store.enqueue(&mk_row(&ConversationId::from("c"), 0)).unwrap();
+        // First record a failure so last_error is non-null.
+        let _ = store.record_failure(id, "transient", 5, 1).unwrap();
+        // Claim is required in production but the SQL works without; drive
+        // via mark_delivered directly.
+        store.mark_delivered(id).unwrap();
+
+        let (status, err): (String, Option<String>) = db
+            .with_conn(|c| {
+                let v = c
+                    .query_row(
+                        "SELECT status, last_error FROM state_outbox WHERE id = ?1",
+                        params![id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                Ok(v)
+            })
+            .unwrap();
+        assert_eq!(status, "delivered");
+        assert!(err.is_none(), "mark_delivered must clear last_error");
+    }
+
+    /// OutboxStatus parse covers every variant — forward-compat guard.
+    #[test]
+    fn outbox_status_parse_roundtrips_all_variants() {
+        for v in [
+            OutboxStatus::Pending,
+            OutboxStatus::InFlight,
+            OutboxStatus::Delivered,
+            OutboxStatus::Failed,
+            OutboxStatus::DeadLetter,
+        ] {
+            assert_eq!(OutboxStatus::parse(v.as_str()), Some(v));
+        }
+        assert_eq!(OutboxStatus::parse("bogus"), None);
+    }
 }

@@ -334,4 +334,180 @@ mod tests {
         reg.enable(&m).unwrap();
         assert!(reg.tool("a").is_some());
     }
+
+    /// All-or-nothing atomicity: if ONE tool from a manifest conflicts
+    /// with an existing registration, NONE of its siblings may land in
+    /// the registry. A leaked unique tool here would be a trust-class
+    /// bypass — a plugin whose install failed could still have tools
+    /// callable by the agent.
+    #[test]
+    fn partial_conflict_leaves_registry_clean() {
+        let reg = HookRegistry::new();
+        reg.enable(&manifest_with_tools("p1", &["shared"])).unwrap();
+
+        // p2 wants to register both "shared" (conflict) AND "unique"
+        // (fine). The whole enable must fail, and "unique" must not
+        // leak into the registry.
+        let err = reg
+            .enable(&manifest_with_tools("p2", &["unique", "shared"]))
+            .unwrap_err();
+        assert!(err.contains("shared"));
+        assert!(
+            reg.tool("unique").is_none(),
+            "partial-install left a leaked tool in the registry"
+        );
+        assert!(!reg.is_enabled("p2"));
+    }
+
+    /// Transport IDs are singleton across plugins — two plugins cannot
+    /// both claim `transport_id = "signal"`.
+    #[test]
+    fn transport_id_conflict_rejected() {
+        let m1 = r#"[plugin]
+id = "p1"
+name = "p1"
+version = "1.0.0"
+
+[transport]
+transport_id = "signal"
+supports_attachments = true
+supports_groups = false
+"#;
+        let m2 = r#"[plugin]
+id = "p2"
+name = "p2"
+version = "1.0.0"
+
+[transport]
+transport_id = "signal"
+supports_attachments = false
+supports_groups = false
+"#;
+        let reg = HookRegistry::new();
+        reg.enable(&PluginManifest::parse(m1).unwrap()).unwrap();
+        let err = reg
+            .enable(&PluginManifest::parse(m2).unwrap())
+            .unwrap_err();
+        assert!(err.contains("transport id 'signal'"));
+        assert!(
+            !reg.is_enabled("p2"),
+            "p2 must not be marked enabled when its transport clashed"
+        );
+        // p1's transport is still registered correctly.
+        assert_eq!(reg.transport("signal").unwrap().plugin_id, "p1");
+    }
+
+    /// UI-panel mount paths are also singleton — two plugins cannot
+    /// both claim `/plugins/whatever`.
+    #[test]
+    fn ui_panel_mount_conflict_rejected() {
+        let m1 = r#"[plugin]
+id = "p1"
+name = "p1"
+version = "1.0.0"
+
+[[ui_panels]]
+mount = "/plugins/thing"
+entry = "index.js"
+"#;
+        let m2 = r#"[plugin]
+id = "p2"
+name = "p2"
+version = "1.0.0"
+
+[[ui_panels]]
+mount = "/plugins/thing"
+entry = "other.js"
+"#;
+        let reg = HookRegistry::new();
+        reg.enable(&PluginManifest::parse(m1).unwrap()).unwrap();
+        let err = reg
+            .enable(&PluginManifest::parse(m2).unwrap())
+            .unwrap_err();
+        assert!(err.contains("ui_panel mount"));
+        assert_eq!(reg.ui_panels().len(), 1);
+    }
+
+    /// Event subscriptions from multiple plugins coexist, and
+    /// `subscribers_for` returns them all.
+    #[test]
+    fn multiple_plugins_can_subscribe_to_same_event_kind() {
+        let m1 = r#"[plugin]
+id = "p1"
+name = "p1"
+version = "1.0.0"
+
+[[event_subscriptions]]
+on = "conversation.message_inbound"
+handler = "handle_p1"
+"#;
+        let m2 = r#"[plugin]
+id = "p2"
+name = "p2"
+version = "1.0.0"
+
+[[event_subscriptions]]
+on = "conversation.message_inbound"
+handler = "handle_p2"
+"#;
+        let reg = HookRegistry::new();
+        reg.enable(&PluginManifest::parse(m1).unwrap()).unwrap();
+        reg.enable(&PluginManifest::parse(m2).unwrap()).unwrap();
+        let subs = reg.subscribers_for("conversation.message_inbound");
+        assert_eq!(subs.len(), 2);
+        let plugin_ids: Vec<&str> = subs.iter().map(|s| s.plugin_id.as_str()).collect();
+        assert!(plugin_ids.contains(&"p1"));
+        assert!(plugin_ids.contains(&"p2"));
+    }
+
+    /// Disabling one of two plugins that share an event kind must leave
+    /// the other's subscription intact.
+    #[test]
+    fn disable_preserves_other_plugins_subscriptions() {
+        let m1 = r#"[plugin]
+id = "p1"
+name = "p1"
+version = "1.0.0"
+
+[[event_subscriptions]]
+on = "x"
+handler = "h"
+"#;
+        let m2 = r#"[plugin]
+id = "p2"
+name = "p2"
+version = "1.0.0"
+
+[[event_subscriptions]]
+on = "x"
+handler = "h"
+"#;
+        let reg = HookRegistry::new();
+        reg.enable(&PluginManifest::parse(m1).unwrap()).unwrap();
+        reg.enable(&PluginManifest::parse(m2).unwrap()).unwrap();
+        reg.disable("p1");
+        let subs = reg.subscribers_for("x");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].plugin_id, "p2");
+    }
+
+    /// Identity providers are keyed by plugin — enable+disable is clean.
+    #[test]
+    fn identity_provider_registration_and_removal() {
+        let m = r#"[plugin]
+id = "idp-google"
+name = "idp"
+version = "1.0.0"
+
+[identity_provider]
+resolves = ["email", "phone"]
+trust_hint_default = "Contact"
+"#;
+        let reg = HookRegistry::new();
+        reg.enable(&PluginManifest::parse(m).unwrap()).unwrap();
+        assert_eq!(reg.identity_providers().len(), 1);
+        assert_eq!(reg.identity_providers()[0].resolves.len(), 2);
+        reg.disable("idp-google");
+        assert!(reg.identity_providers().is_empty());
+    }
 }

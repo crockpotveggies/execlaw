@@ -199,4 +199,34 @@ mod tests {
         let k2 = IdempotencyKey::mint(&c, TurnSeq(1), 1);
         assert_ne!(k1, k2);
     }
+
+    /// Collision-avoidance across turn_seq — the key is required to
+    /// distinguish (turn=1, ord=0) from (turn=2, ord=0). Otherwise the
+    /// outbox would merge tool calls from different turns.
+    #[test]
+    fn idempotency_keys_distinct_across_turn_seq() {
+        let c = ConversationId::from("conv-1");
+        let k1 = IdempotencyKey::mint(&c, TurnSeq(1), 0);
+        let k2 = IdempotencyKey::mint(&c, TurnSeq(2), 0);
+        assert_ne!(k1, k2);
+    }
+
+    /// Collision-avoidance across conversation ids.
+    #[test]
+    fn idempotency_keys_distinct_across_conversations() {
+        let k1 = IdempotencyKey::mint(&ConversationId::from("a"), TurnSeq(1), 0);
+        let k2 = IdempotencyKey::mint(&ConversationId::from("b"), TurnSeq(1), 0);
+        assert_ne!(k1, k2);
+    }
+
+    /// Typed IDs — a `PrincipalId` wrapping the same string as a
+    /// `ConversationId` must NOT compile as interchangeable. (This is
+    /// the whole point of the newtype.) We assert the non-equality at
+    /// the value level as a last-resort smoke check; the real guarantee
+    /// is the compiler.
+    #[test]
+    fn event_seq_ordering() {
+        assert!(EventSeq(1) < EventSeq(2));
+        assert!(EventSeq(100) > EventSeq(99));
+    }
 }

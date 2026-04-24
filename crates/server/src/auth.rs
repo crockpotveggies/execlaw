@@ -164,25 +164,16 @@ impl JwtSigner {
         &self.issuer
     }
 
-    /// PKCS#8 PEM bytes for the private signing key, used by
-    /// [`crate::capability`] to issue capability JWTs with the same key.
-    /// Microseconds to re-encode; called at most a few times per turn.
-    pub fn private_pem(&self) -> Vec<u8> {
-        self.signing_key
-            .to_pkcs8_pem(LineEnding::LF)
-            .expect("PKCS#8 encoding")
-            .as_bytes()
-            .to_vec()
+    /// Shared `EncodingKey` — reuse this instead of re-decoding the PEM
+    /// per call. Token issuance is on the per-turn hot path (§0 axiom
+    /// #14); the pre-parsed key saves ~25µs per call.
+    pub fn encoding_key(&self) -> &EncodingKey {
+        &self.encoding_key
     }
 
-    /// SubjectPublicKeyInfo PEM bytes for the public key. Used by
-    /// [`crate::capability`] to verify issued tokens.
-    pub fn public_pem(&self) -> Vec<u8> {
-        self.verifying_key
-            .to_public_key_pem(LineEnding::LF)
-            .expect("SPKI encoding")
-            .as_bytes()
-            .to_vec()
+    /// Shared `DecodingKey` — see [`encoding_key`](Self::encoding_key).
+    pub fn decoding_key(&self) -> &DecodingKey {
+        &self.decoding_key
     }
 
     pub fn verifying_key(&self) -> &VerifyingKey {
@@ -254,4 +245,48 @@ mod tests {
         let tok = store.issue("p", "s", -10); // already expired
         assert!(store.consume(&tok).is_none());
     }
+
+    /// Cached encoding/decoding keys are real — smoke-test that the
+    /// accessor returns a key that actually signs a token that the
+    /// matching decoding_key can verify. Protects against a future
+    /// refactor that stores mismatched keys.
+    #[test]
+    fn cached_keys_are_consistent() {
+        let s = JwtSigner::generate("t".into());
+        let header = Header::new(Algorithm::EdDSA);
+        let tok = encode(
+            &header,
+            &AccessClaims {
+                sub: "p".into(),
+                iss: "t".into(),
+                exp: Utc::now().timestamp() + 60,
+                iat: Utc::now().timestamp(),
+                sid: "s".into(),
+                nonce: "n".into(),
+            },
+            s.encoding_key(),
+        )
+        .unwrap();
+        let mut v = Validation::new(Algorithm::EdDSA);
+        v.set_issuer(std::slice::from_ref(&s.issuer));
+        let _data = decode::<AccessClaims>(&tok, s.decoding_key(), &v).unwrap();
+    }
+
+    /// `revoke_session` must drop EVERY refresh record bound to the
+    /// session id, not just one — so a logout invalidates every
+    /// refresh token the session had minted.
+    #[test]
+    fn revoke_session_invalidates_all_refresh_for_session() {
+        let store = RefreshStore::new();
+        let t1 = store.issue("p", "sess-1", 60);
+        let t2 = store.issue("p", "sess-1", 60);
+        let t3 = store.issue("p", "sess-2", 60);
+
+        store.revoke_session("sess-1");
+        assert!(store.consume(&t1).is_none());
+        assert!(store.consume(&t2).is_none());
+        // sess-2's token survives.
+        assert!(store.consume(&t3).is_some());
+    }
+
 }

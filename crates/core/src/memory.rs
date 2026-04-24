@@ -142,4 +142,68 @@ mod tests {
         assert_eq!(c.value_blob, b"c");
         assert_eq!(kt.value_blob, b"kt");
     }
+
+    /// Adversarial: querying at a trust_class that has no row must
+    /// return None even if a row exists under a DIFFERENT trust_class
+    /// with the same scope/key. This is the per-row isolation the
+    /// memory-tool shim relies on for trust scoping.
+    #[test]
+    fn get_does_not_spill_across_trust_classes() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let store = MemoryStore::new(&db);
+
+        // Only write a Controller-level row.
+        store
+            .upsert(&MemoryEntry {
+                scope: "s".into(),
+                trust_class: "Controller".into(),
+                key: "secret".into(),
+                value_blob: b"top".to_vec(),
+                ttl_expires: None,
+                updated_at: 1,
+            })
+            .unwrap();
+
+        // Every OTHER trust class must observe None.
+        for level in [
+            "Delegated",
+            "KnownTrusted",
+            "KnownLimited",
+            "UnknownPending",
+            "Blocked",
+        ] {
+            assert!(
+                store.get("s", level, "secret").unwrap().is_none(),
+                "trust class {} must not see Controller's secret",
+                level
+            );
+        }
+        // Controller still sees it.
+        assert!(store.get("s", "Controller", "secret").unwrap().is_some());
+    }
+
+    /// Upsert with a different value under the same PK overwrites in place.
+    #[test]
+    fn upsert_overwrites_same_pk() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let store = MemoryStore::new(&db);
+        let mut e = MemoryEntry {
+            scope: "s".into(),
+            trust_class: "Controller".into(),
+            key: "k".into(),
+            value_blob: b"v1".to_vec(),
+            ttl_expires: None,
+            updated_at: 1,
+        };
+        store.upsert(&e).unwrap();
+        e.value_blob = b"v2".to_vec();
+        e.updated_at = 2;
+        store.upsert(&e).unwrap();
+
+        let got = store.get("s", "Controller", "k").unwrap().unwrap();
+        assert_eq!(got.value_blob, b"v2");
+        assert_eq!(got.updated_at, 2);
+    }
 }
