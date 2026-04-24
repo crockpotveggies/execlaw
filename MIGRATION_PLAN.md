@@ -2075,11 +2075,59 @@ on simulated transcripts, and sub-agent escalation logic.
 
 New phase, promoted out of "Hardening" because it pays off immediately for debugging the earlier phases' issues in production.
 
-- Log viewer in the admin UI (filter by level/plugin/conversation, same as selfhosted-claw's `/admin/logs`)
-- `execlaw replay <conversation_id> --at <seq>` rebuilds exact prompt + capability set + policy decisions for a turn
-- `eval_flagged` table + CLI to tag event ranges
-- Nightly LLM-judge harness (pytest + judge call against the **local** Qwen; no cloud judge) with a rubric including trust-class compliance and Rule-of-Two violations
-- **Demo:** Replay a specific turn from a week-old conversation, show the exact prompt the model saw; flag a trace as regression; re-run the regression set before a prompt change.
+**Scope boundary (2026-04-24 refactor):** Phase 5 is **infrastructure
+only** — the data layer + HTTP routes + CLI commands that surface the
+observability and replay primitives. Every UI component (log viewer,
+trace viewer, eval dashboard, regression-flag chip) lands in Phase 6
+when the React SPA is built; Phase 5 stops at "the data is queryable
+through stable APIs."
+
+What lands in Phase 5:
+
+- **Tracing → SQLite `log_entries`** layer: a custom
+  `tracing_subscriber::Layer` impl that converts each event into a
+  `LogRow` and writes via `LogStore`. Closes the Phase-0 deferral
+  (file-only logging) so the admin UI in Phase 6 has a queryable
+  data source.
+- **`GET /api/admin/logs`** with `level` / `plugin_id` /
+  `conversation_id` / `since` query params + pagination. The data
+  surface the Phase-6 log viewer renders.
+- **`execlaw replay <conversation_id> --at <seq>`** CLI command:
+  hydrates the conversation up to the target seq, runs
+  `policy::evaluate_turn` with the recorded sender trust, prints
+  the exact prompt the model saw (system + history + user_msg),
+  the `TurnPolicyDecision` (capabilities, planner_executor,
+  spotlighting, latency_band), and the events `commit_turn`
+  produced for that turn.
+- **`eval_flagged` table** (migration 0004) + `EvalFlaggedStore` in
+  `execlaw-core` with insert/list/by_label.
+- **`execlaw eval flag <conv> --range <a..b> --label <name>`** CLI to
+  tag event ranges. Companion `execlaw eval list [--label X]`.
+- **`GET /api/admin/eval/flags`** for the Phase-6 eval-dashboard
+  data feed.
+- **LLM-judge harness scaffolding**: a small Rust binary that runs
+  rubric prompts against a local OpenAI-compatible endpoint (the
+  configured Qwen). Rubric files live in `evals/rubrics/`. The
+  harness is invoked manually or by a nightly job (no built-in
+  scheduler — that's the operator's `cron`). CI runs the harness
+  against a mock endpoint so we don't need a live model.
+
+What's out of scope for Phase 5:
+
+- Any React component, page, or chart — Phase 6.
+- Chat-route surfacing of replay results — Phase 6.
+- Eval-dashboard rendering — Phase 6.
+- Setup-wizard UI — Phase 6 (already moved out by the prior
+  refactor).
+
+- **Phase 5 demo (internal):** `execlaw replay <conv> --at 47` prints
+  the exact prompt the model saw at turn 47 + the policy decision +
+  the committed events; `execlaw eval flag <conv> --range 12..48
+  --label "regression-2026-04-22"` records the flag; `curl
+  /api/admin/logs?level=warn&since=...` returns paginated JSON;
+  `cargo run --bin eval-harness -- --rubric evals/rubrics/trust-class.toml`
+  runs the rubric against a mock-or-real OpenAI endpoint and prints
+  pass/fail per case. Operator-visible UI surfaces follow in Phase 6.
 
 ### Phase 6 — UI port, chat-first landing (3-4 weeks)
 
