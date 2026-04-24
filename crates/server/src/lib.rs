@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod approvals;
 pub mod auth;
 pub mod capability;
 pub mod chats;

@@ -495,7 +495,69 @@ For `ExternalWithOutsider` turns and any turn ingesting untrusted content:
 
 This is CaMeL (DeepMind 2503.18813) restated for execlaw's trust classes. It doesn't prevent injection; it contains blast radius.
 
-### 9.3 Capability tokens
+### 9.3 Cold-contact escalation (Phase 3)
+
+An inbound message from a sender the control plane has never seen
+before doesn't reach the model. Instead:
+
+```
+  POST /api/chats/:id/messages         controller's UI
+  sender_principal_id = "stranger-42"         ▲
+          │                                    │ sideband
+          ▼                                    │ notification
+  ┌───────────────────────────────────┐   ┌────┴───────┐
+  │  resolve_sender()                  │   │ AlertFired │
+  │  → PrincipalStore::find_by_identifier│  │ on WS bus  │
+  │  → not found                       │   │ (source =   │
+  │  → persist as UnknownPending       │   │  core.cold_ │
+  │  → return to chat route            │   │  contact)   │
+  └─────────┬─────────────────────────┘   └─────────────┘
+            │                                    ▲
+            ▼                                    │
+  ┌───────────────────────────────────┐           │
+  │  policy.evaluate_turn()            │           │
+  │  sender_trust = UnknownPending     │           │
+  │  → drop_turn = false               │           │
+  │  → require_approval = true         │           │
+  │  → spotlighting = true             │           │
+  └─────────┬─────────────────────────┘           │
+            │                                      │
+            ▼                                      │
+  ┌─────────────────────────────────────┐          │
+  │  handle_cold_contact()               │          │
+  │  1. commit ColdContactArrived event  │          │
+  │  2. phase → AwaitingTrustDecision    │──────────┘
+  │  3. publish UiEvent::AlertFired      │
+  │  4. return 202 { approval_id }       │
+  └─────────┬──────────────────────────┘
+            │
+            │  controller reads the alert,
+            │  decides a verb (Trust / TrustLimited /
+            │  Block / IgnoreOnce)
+            ▼
+  POST /api/admin/approvals/:id/respond
+  { "verb": "trust" }
+            │
+            ▼
+  ┌─────────────────────────────────────┐
+  │  PrincipalStore::set_trust(...)      │
+  │  commit TrustChanged event           │
+  │  replay original message on WS bus   │
+  │  phase → Idle                        │
+  └─────────────────────────────────────┘
+            │
+            ▼
+  Normal turn path resumes; original text is now
+  processed as a KnownTrusted/KnownLimited message.
+```
+
+Note that **the model sees nothing during the cold-contact window** —
+no prompt is assembled, no tool is called. An injection attempt hidden
+inside the first message from a stranger simply parks the conversation
+until the controller intervenes. This is the architectural containment
+for the "first contact" attack vector.
+
+### 9.4 Capability tokens
 
 Every runner gets an Ed25519-signed JWT at spawn. Exact field names match `crates/server/src/auth.rs`:
 
@@ -685,14 +747,34 @@ For the reader who wants to jump into code:
 | File | What's there |
 |---|---|
 | [`crates/core/migrations/0001_initial_schema.sql`](../crates/core/migrations/0001_initial_schema.sql) | All 22 tables |
-| [`crates/core/src/events.rs`](../crates/core/src/events.rs) | Event-log primitives, `commit_turn`, `enforce_tool_pairing` |
-| [`crates/core/src/principal.rs`](../crates/core/src/principal.rs) | Trust ladder including `Blocked` |
+| [`crates/core/migrations/0002_event_hmac_tag.sql`](../crates/core/migrations/0002_event_hmac_tag.sql) | HMAC `tag` + `key_id` on `state_events` |
+| [`crates/core/migrations/0003_state_plugins.sql`](../crates/core/migrations/0003_state_plugins.sql) | Plugin install persistence |
+| [`crates/core/src/events.rs`](../crates/core/src/events.rs) | Event-log primitives, `commit_turn`, `enforce_tool_pairing`, HMAC sign/verify |
+| [`crates/core/src/event_hmac.rs`](../crates/core/src/event_hmac.rs) | HMAC-SHA256 canonical bytes + constant-time verify |
+| [`crates/core/src/principal.rs`](../crates/core/src/principal.rs) | Trust ladder + `PrincipalStore` persistence (Phase 3) |
 | [`crates/core/src/outbox.rs`](../crates/core/src/outbox.rs) | Outbox enqueue / inbox dedup |
-| [`crates/policy/src/`](../crates/policy/src/) | Rule of Two, input-guard, capability checks |
-| [`crates/plugin-sdk/src/manifest.rs`](../crates/plugin-sdk/src/manifest.rs) | Hook-based plugin manifest parser |
+| [`crates/policy/src/trust.rs`](../crates/policy/src/trust.rs) | `evaluate_turn` + capability tiers + Rule of Two |
+| [`crates/policy/src/spotlighting.rs`](../crates/policy/src/spotlighting.rs) | Per-conversation random delimiters |
+| [`crates/policy/src/sideband.rs`](../crates/policy/src/sideband.rs) | Sideband transport picker + `ApprovalVerb` |
+| [`crates/policy/src/input_guard.rs`](../crates/policy/src/input_guard.rs) | Zero-width / bidi / homoglyph strip |
+| [`crates/plugin-sdk/src/manifest.rs`](../crates/plugin-sdk/src/manifest.rs) | Hook-based manifest parser + `[runtime]` |
+| [`crates/plugin-host/src/host.rs`](../crates/plugin-host/src/host.rs) | `PluginHost` lifecycle (Phase 2) |
+| [`crates/plugin-host/src/hook_registry.rs`](../crates/plugin-host/src/hook_registry.rs) | Tool/transport/identity-provider lookup maps |
+| [`crates/plugin-host/src/subprocess.rs`](../crates/plugin-host/src/subprocess.rs) | Subprocess plugin tier (JSON-RPC over stdio) |
 | [`crates/container-manager/src/hardware.rs`](../crates/container-manager/src/hardware.rs) | Tier-1 sysfs GPU detection |
 | [`crates/server/src/routes.rs`](../crates/server/src/routes.rs) | REST surface (auth, OpenAPI) |
+| [`crates/server/src/chats.rs`](../crates/server/src/chats.rs) | Chat surface — policy + capability + cold-contact + streaming |
+| [`crates/server/src/approvals.rs`](../crates/server/src/approvals.rs) | `POST /api/admin/approvals/:id/respond` (Phase 3) |
+| [`crates/server/src/plugins.rs`](../crates/server/src/plugins.rs) | `POST /api/admin/plugins/install` + lifecycle (Phase 2) |
+| [`crates/server/src/tool_dispatch.rs`](../crates/server/src/tool_dispatch.rs) | `ChainedToolDispatch` — built-ins → plugins with capability check |
+| [`crates/server/src/capability.rs`](../crates/server/src/capability.rs) | Per-turn capability token issue + verify |
+| [`crates/runner-local/src/turn.rs`](../crates/runner-local/src/turn.rs) | TurnExecutor — full tool-loop turn path |
+| [`crates/runner-local/src/memory_tool.rs`](../crates/runner-local/src/memory_tool.rs) | `read_memory` / `write_memory` with trust-class scoping |
+| [`crates/inference-api/src/lib.rs`](../crates/inference-api/src/lib.rs) | OpenAI-compatible client + streaming SSE |
+| [`crates/voice-pipeline/src/`](../crates/voice-pipeline/src/) | Two-lane graph, endpointer, bargein (Phase 4) |
 | [`spec/asyncapi.yaml`](../spec/asyncapi.yaml) | WebSocket event vocabulary |
+| [`plugins/hello/`](../plugins/hello/) | In-tree reference subprocess plugin |
+| [`docs/plugin-inventory.md`](./plugin-inventory.md) | Phase 8 port queue |
 | [`crates/cli/src/main.rs`](../crates/cli/src/main.rs) | `execlaw` CLI (+ lifecycle subcommands) |
 
 ---
@@ -713,25 +795,40 @@ These are *not* oversights — they are chosen constraints:
 
 ## 18. What's built vs. what's next
 
-Per [`STATUS.md`](../STATUS.md) as of the last overnight session:
+Per [`STATUS.md`](../STATUS.md) as of 2026-04-24.
 
-- ✅ 15 Rust crates, ~73 tests passing
-- ✅ Schema migrations for all 22 tables
-- ✅ Event-log primitives with pairing-invariant enforcement
-- ✅ Hook-based plugin manifest parser + ZIP staging
-- ✅ Axum server with JWT auth (setup / login / refresh / logout)
-- ✅ OpenAPI + AsyncAPI specs served at `/api/docs`
-- ✅ CLI with container-lifecycle subcommands + cargo aliases
-- ✅ Tier-1 sysfs GPU detection
-- ✅ SQLCipher feature-gated (enabled in Docker image)
-- ✅ Dockerfile.control-plane + docker-compose.yml (minimal image per axiom #12)
+**Phase 0 — Foundation + local inference + GPU-aware deployment.** Complete.
 
-Phase 1 next (from `MIGRATION_PLAN.md` §11):
+**Phase 1 — Agent core with one transport (web chat).** Complete.
+- Event-log primitives with pairing-invariant enforcement
+- HMAC-signed event log (§7.8): migration 0002 + sign-on-append + verify-on-replay
+- TurnExecutor wired into `POST /api/chats/:id/messages`
+- Policy + per-turn capability token on the turn path
+- Streaming SSE (`chat_completions_stream`) + `ChatTokenDelta` on the WS bus
+- Crash-safety tests (kill mid-turn, replay-after-restart, post-commit tamper)
 
-- Wakeup scheduler implementation
-- `runner-local` agent loop + per-conversation container spawn
-- Outbox drain loop
-- Memory-tool shim with trust-class enforcement
-- WebSocket `/api/stream` event bus
-- Minimal chat UI (web transport)
-- End-to-end crash tests against the durability guarantees
+**Phase 2 — Plugin framework.** Complete (ports moved to Phase 8).
+- `PluginHost` lifecycle (install/enable/disable/uninstall/hydrate) with SQLite persistence via migration 0003
+- `POST /api/admin/plugins/install` + list / enable / disable / uninstall / tools routes
+- Manifest `[runtime]` table for subprocess-tier entrypoint declaration
+- Capability-enforced `ChainedToolDispatch` — built-ins → plugins → error
+- In-tree reference plugin at `plugins/hello/`
+- Tool-capable chat path that lights up when tools are registered
+
+**Phase 3 — Participants, trust, policy engine, Rule of Two.** Complete (in-tree demos).
+- `PrincipalStore` persists the full rich `TrustLevel` variant via JSON
+- Identity resolution in the chat route: unknown senders → `UnknownPending` + cold-contact flow
+- Cold-contact escalation: `ColdContactArrived` event + `AwaitingTrustDecision` phase + `AlertFired` sideband broadcast
+- `POST /api/admin/approvals/:id/respond` with every `ApprovalVerb` branch: `Trust` → KnownTrusted, `TrustLimited` → KnownLimited with allowed_topics, `Block` → Blocked (future messages 403), `IgnoreOnce` → clear park without trust change
+- `TrustChanged` event committed on every transition (audit trail)
+- Original message replayed on the WS bus when the controller approves
+- Spotlighting applied to prompt assembly when `policy.spotlighting` fires (untrusted sender sees delimiter-wrapped content; the log still holds unwrapped text)
+- Trust-class-scoped memory reads (via `MemoryStore` + `memory_tool` shim from Phase 1)
+
+**Phase 3 deferrals** (land in Phase 8 or the next Phase 3 iteration):
+- Identity-provider plugin contract dispatch: the hook registry tracks `identity_providers`, but the chat route doesn't yet iterate them on inbound. Adding `PluginHost::resolve_identity` parallel to `call_tool` unblocks the reference `identity-local-address-book` plugin.
+- Planner/executor split in `TurnExecutor`: `policy.planner_executor` flag is plumbed through, but the executor itself still runs one model call per turn.
+- `config_trust_policy` UI-editable defaults: SQLite table exists; UI surfacing lands with Phase 6.
+- Cross-transport sideband delivery (controller approves via Signal): waits on `plugin-signal` in Phase 8.
+
+**What's next — Phase 4 (voice pipeline primitives):** See `MIGRATION_PLAN.md` §11.

@@ -415,6 +415,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/stream", get(crate::events::stream_handler))
         .merge(crate::plugins::plugins_router())
+        .merge(crate::approvals::approvals_router())
         .merge(crate::docs::docs_router())
         .with_state(state)
 }

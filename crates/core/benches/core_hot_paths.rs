@@ -370,6 +370,64 @@ fn bench_outbox(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// PrincipalStore — identity resolution path runs on every chat request
+// (§2.14). Budget ≤ 100 µs p99 for `get`; the per-turn cost is what
+// gates cold-contact detection latency.
+// ---------------------------------------------------------------------------
+
+fn bench_principal_store(c: &mut Criterion) {
+    use execlaw_core::ids::PluginId;
+    use execlaw_core::principal::{
+        Identifier, Principal, PrincipalStore, TrustLevel as CoreTrustLevel,
+    };
+
+    let db = fresh_db();
+    let store = PrincipalStore::new(&db);
+    // Seed ~100 principals so lookups are realistic (not empty-table fast).
+    for i in 0..100 {
+        let id_str = format!("pri-{i}");
+        store
+            .upsert(&Principal {
+                id: execlaw_core::ids::PrincipalId::from(id_str.clone()),
+                identifiers: vec![Identifier {
+                    transport: "web".into(),
+                    handle: format!("web:{id_str}"),
+                }],
+                trust_level: CoreTrustLevel::KnownTrusted {
+                    resolvers: vec![PluginId::from("identity-local")],
+                    approved_by: execlaw_core::ids::PrincipalId::from("controller"),
+                    approved_at: 1,
+                },
+                resolved_by: vec![],
+                metadata: serde_json::json!({}),
+                first_seen: i,
+                last_seen: Some(i),
+                controller_notes: None,
+            })
+            .unwrap();
+    }
+
+    let hit_id = execlaw_core::ids::PrincipalId::from("pri-42");
+    let miss_id = execlaw_core::ids::PrincipalId::from("does-not-exist");
+
+    let mut group = c.benchmark_group("principal_store");
+    group.bench_function("get_hit", |b| {
+        b.iter(|| store.get(black_box(&hit_id)).unwrap())
+    });
+    group.bench_function("get_miss", |b| {
+        b.iter(|| store.get(black_box(&miss_id)).unwrap())
+    });
+    let ident = Identifier {
+        transport: "web".into(),
+        handle: "web:pri-50".into(),
+    };
+    group.bench_function("find_by_identifier_hit", |b| {
+        b.iter(|| store.find_by_identifier(black_box(&ident)).unwrap())
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_hmac,
@@ -380,5 +438,6 @@ criterion_group!(
     bench_event_log_append,
     bench_event_log_replay_keyed,
     bench_outbox,
+    bench_principal_store,
 );
 criterion_main!(benches);

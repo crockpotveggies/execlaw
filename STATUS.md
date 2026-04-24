@@ -1,15 +1,15 @@
 # execlaw build STATUS
 
-Last update: 2026-04-24, after Phase 2 framework + plan refactor.
+Last update: 2026-04-24, after Phase 3 landing (trust ladder + cold-contact + approval flow + spotlighting).
 
 ## TL;DR
 
 - `cargo build --workspace` — **clean**
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **242 passing, 0 failing**
-- `cargo bench --workspace --no-run` — **clean** (26+ benches across 7 crates)
+- `cargo test --workspace --no-fail-fast` — **260 passing, 0 failing**
+- `cargo bench --workspace --no-run` — **clean** (30+ benches across 8 crates)
 - **Zero cloud-SDK dependencies** anywhere in the workspace
-- Phases 0–2 complete; Phase 3 next
+- Phases 0–3 complete (internal); Phase 4 voice-primitives next
 
 ## Migration-plan phase structure (post-2026-04-24 refactor)
 
@@ -20,7 +20,7 @@ Phase 2 used to conflate "plugin framework" with "port every selfhosted-claw int
 | 0 — Foundation + local inference + GPU-aware deployment | foundation primitives | ✅ done |
 | 1 — Agent core with one transport (web chat) | HMAC event log, TurnExecutor, policy+capability on turn path, streaming SSE, crash invariants | ✅ done |
 | 2 — **Plugin framework** (framework only — ports moved to Phase 8) | hook registry, subprocess tier, install route, lifecycle, dispatch bridge, capability enforcement | ✅ done |
-| 3 — Participants, trust, policy engine, Rule of Two | trust ladder persistence, cold-contact flow over internal transports, in-tree identity provider | ⏭️ next |
+| 3 — Participants, trust, policy engine, Rule of Two | `PrincipalStore`, cold-contact flow, approval endpoint with every verb, spotlighting, trust-class memory scoping | ✅ done (identity-provider plugin contract + planner/executor split deferred — see Phase 3 deferrals in architecture.md §18) |
 | 4 — Voice pipeline primitives (pure Rust; real-audio demos move to Phase 8) | two-lane graph, VAD wiring, event schema, endpointer, barge-in | partial (primitives shipped in Phase 1 foundation) |
 | 5 — Observability, evaluation, replay CLI | log viewer, `execlaw replay`, eval harness against local Qwen | pending |
 | 6 — UI port, chat-first landing | React SPA on the new APIs | pending |
@@ -95,35 +95,35 @@ EXECLAW_INFERENCE_URL=http://127.0.0.1:8000/v1 cargo start
 ## Test counts (per crate)
 
 ```
-execlaw-core              68     DB, events (+HMAC sign/verify + atomicity),
+execlaw-core              74     DB, events (+HMAC sign/verify + atomicity),
                                  outbox (+claim/record_failure/ready_pending),
-                                 alerts, memory, principals, idempotency keys,
-                                 snapshots, HMAC tamper-tests, migrations
-execlaw-server            37     auth, events (WS bus), capability tokens,
-                                 chat routes (streaming, policy, crash tests),
-                                 tool_dispatch chain
-execlaw-server (integ)    11     plugin_lifecycle: install, list, enable,
-                                 disable, uninstall, zip-slip, hook conflict,
-                                 persistence, capability enforcement
-execlaw-policy            43     rule_of_two, trust evaluator, spotlighting
-                                 (incl. smuggled-delimiter defense), sideband,
-                                 input_guard (RLO/BOM/zero-width strip +
-                                 homoglyph fold), JWT claims
+                                 alerts, memory, principals (+PrincipalStore
+                                 round-trip, find_by_identifier, set_trust),
+                                 idempotency keys, snapshots, HMAC
+                                 tamper-tests, migrations
+execlaw-server            42     auth, events (WS bus), capability tokens,
+                                 chat routes (streaming, policy, crash tests,
+                                 cold-contact adversarial), tool_dispatch
+execlaw-server (integ)    18     plugin_lifecycle (11): install/list/enable/
+                                 disable/uninstall/zip-slip/hook conflict/
+                                 persistence/capability enforcement;
+                                 approval_flow (7): trust/trust_limited/
+                                 block/ignore_once/bogus-id/unsupported-verb/
+                                 revoke
+execlaw-policy            43     rule_of_two, trust evaluator, spotlighting,
+                                 sideband, input_guard, JWT claims
 execlaw-voice-pipeline    22     frames, two-lane graph, endpointer, bargein
 execlaw-runner-local      16     memory_tool (trust scoping + adversarial),
-                                 turn executor (incl. max_tool_rounds + err
-                                 dispatch pairing)
-execlaw-plugin-host       15     hook registry (incl. all-or-nothing rollback,
-                                 transport/panel conflicts), subprocess RPC
+                                 turn executor
+execlaw-plugin-host       15     hook registry, subprocess RPC
 execlaw-plugin-sdk         8     manifest parsing, ZIP staging + zipslip
-execlaw-inference-api      7     chat req/resp, streaming SSE parse, error
-                                 passthrough, E2E mock HTTP server
+execlaw-inference-api      7     chat req/resp, streaming SSE parse
 execlaw-container-manager  3     mock sysfs detection, PCI vendor mapping
 execlaw-vault              3     Argon2id password verification
-execlaw-outbox             8     backoff, retry budget, drain, WakeupDispatcher
+execlaw-outbox             8     backoff, retry budget, drain
 execlaw-session            1     modality binding
 --------------------------------------------------------------------
-TOTAL                    242 passing, 0 failing
+TOTAL                    260 passing, 0 failing
 ```
 
 ## Benchmarks (cargo bench --workspace)
