@@ -26,11 +26,18 @@ pub struct Migration {
 ///
 /// Note: every migration is wrapped in its own transaction by
 /// `MigrationRunner::apply_all`.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    id: 1,
-    name: "initial-schema",
-    sql: include_str!("../migrations/0001_initial_schema.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        id: 1,
+        name: "initial-schema",
+        sql: include_str!("../migrations/0001_initial_schema.sql"),
+    },
+    Migration {
+        id: 2,
+        name: "event-hmac-tag",
+        sql: include_str!("../migrations/0002_event_hmac_tag.sql"),
+    },
+];
 
 #[derive(Debug, Error)]
 pub enum MigrationError {
@@ -161,7 +168,7 @@ mod tests {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
         let runner = MigrationRunner::new(&db);
         let applied = runner.apply_all().unwrap();
-        assert_eq!(applied, vec![1]);
+        assert_eq!(applied, vec![1, 2]);
 
         // Spot-check: every documented table exists.
         let tables = vec![
@@ -209,10 +216,36 @@ mod tests {
         let runner = MigrationRunner::new(&db);
         let first = runner.apply_all().unwrap();
         let second = runner.apply_all().unwrap();
-        assert_eq!(first, vec![1]);
+        assert_eq!(first, vec![1, 2]);
         assert!(
             second.is_empty(),
             "rerun must not re-apply already-applied migrations"
         );
+    }
+
+    #[test]
+    fn state_events_has_hmac_tag_column() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        db.with_conn(|c| {
+            let has_tag: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('state_events') WHERE name = 'tag'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(has_tag, 1, "state_events must have a tag column");
+            let has_key: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('state_events') WHERE name = 'key_id'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(has_key, 1, "state_events must have a key_id column");
+            Ok(())
+        })
+        .unwrap();
     }
 }

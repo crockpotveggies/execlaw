@@ -84,6 +84,8 @@ pub enum DbError {
     Invariant(String),
     #[error("serialization error: {0}")]
     Serde(String),
+    #[error("event log tamper detected: {0}")]
+    TamperDetected(String),
 }
 
 /// Thin wrapper around a single writer-thread SQLite connection.

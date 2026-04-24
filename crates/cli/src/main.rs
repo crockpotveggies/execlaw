@@ -452,10 +452,29 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     let signer = std::sync::Arc::new(execlaw_server::auth::JwtSigner::generate("execlaw".into()));
     let refresh_store = std::sync::Arc::new(execlaw_server::auth::RefreshStore::new());
 
+    // EXECLAW_INFERENCE_URL lets operators point dev servers at a local
+    // vLLM / Ollama / OpenArc without editing code. Production boots
+    // will read the active Standard deployment from
+    // `config_runner_deployments` once the registry API lands.
+    let inference_base_url = std::env::var("EXECLAW_INFERENCE_URL").ok();
+
     let config = std::sync::Arc::new(execlaw_server::ServerConfig {
         bind_addr: bind.parse()?,
+        inference_base_url: inference_base_url.clone(),
         ..Default::default()
     });
+
+    let inference = inference_base_url.map(|url| {
+        std::sync::Arc::new(execlaw_inference_api::InferenceClient::new(url))
+    });
+
+    // Load-or-create the event-log HMAC key. Phase 1 derives it from
+    // the same OS keyring entry as the SQLCipher master; a future
+    // migration adds a dedicated `event_log_hmac_key` vault row with
+    // key_id rotation. For now, reuse the keyring-backed bytes.
+    let hmac_key = execlaw_vault::load_or_create_master_key()
+        .map(|bytes| std::sync::Arc::new(bytes.to_vec()))
+        .ok();
 
     let state = execlaw_server::AppState {
         db,
@@ -463,6 +482,8 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         signer,
         refresh_store,
         events: execlaw_server::EventBus::new(),
+        event_log_hmac_key: hmac_key,
+        inference,
     };
     let app = execlaw_server::routes::build_router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

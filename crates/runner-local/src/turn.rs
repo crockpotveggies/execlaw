@@ -82,6 +82,10 @@ pub struct TurnConfig {
     pub max_tool_rounds: u32,
     /// The tool set the model sees in the `tools` array.
     pub tools: Vec<ToolDeclaration>,
+    /// HMAC key for event-log signing (§7.8). `None` during tests and
+    /// pre-setup; production always sets this from the server's shared
+    /// key so every row the executor writes is tamper-evident.
+    pub event_log_hmac_key: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Error)]
@@ -134,8 +138,13 @@ impl TurnExecutor {
         cfg: &TurnConfig,
     ) -> Result<TurnSummary, TurnError> {
         // 1. Record the inbound user message as its own event so it's in
-        //    the log before we ask the model anything.
-        let log = EventLog::new(db);
+        //    the log before we ask the model anything. The log is keyed
+        //    with the same HMAC as the server-side append path, so all
+        //    rows written in this turn are tamper-evident.
+        let log = match &cfg.event_log_hmac_key {
+            Some(k) => EventLog::new(db).with_hmac_key(k.clone()),
+            None => EventLog::new(db),
+        };
         let user_seq = log.last_seq(conversation_id)?.next();
         let user_event = EventRecord::new(
             conversation_id.clone(),
@@ -445,6 +454,7 @@ mod tests {
             max_tokens: None,
             max_tool_rounds: 3,
             tools: vec![],
+            event_log_hmac_key: None,
         };
 
         let summary = exec
@@ -534,6 +544,7 @@ mod tests {
                 "echo the arg",
                 serde_json::json!({"type":"object"}),
             )],
+            event_log_hmac_key: None,
         };
 
         let summary = exec
@@ -563,5 +574,148 @@ mod tests {
         let res_ord: ToolResultPayload = events[2].decode_payload().unwrap();
         assert_eq!(use_ord.ordinal, res_ord.ordinal);
         assert!(res_ord.outcome.is_ok());
+    }
+
+    /// Adversarial: a tool handler that returns `Err` must still produce
+    /// a paired `tool_result` event whose outcome is the Err message.
+    /// This is the tool_use/tool_result pairing invariant under failure.
+    #[tokio::test]
+    async fn tool_dispatch_error_is_paired_as_err_outcome() {
+        let db = fresh_db();
+
+        let r1 = r#"{
+            "id":"r1","model":"m","choices":[{
+                "index":0,
+                "message":{"role":"assistant","content":null,
+                    "tool_calls":[{"id":"tc1","type":"function",
+                        "function":{"name":"boom","arguments":"{}"}}]},
+                "finish_reason":"tool_calls"
+            }]
+        }"#
+        .to_owned();
+        let r2 = r#"{
+            "id":"r2","model":"m","choices":[{
+                "index":0,
+                "message":{"role":"assistant","content":"sorry failed"},
+                "finish_reason":"stop"
+            }]
+        }"#
+        .to_owned();
+        let server = Arc::new(ChainedMockServer {
+            responses: vec![r1, r2],
+            served: AtomicUsize::new(0),
+        });
+        let addr = run_mock_server(server.clone()).await;
+
+        struct FailingTool;
+        #[async_trait]
+        impl ToolDispatch for FailingTool {
+            async fn call(
+                &self,
+                _name: &str,
+                _args: &serde_json::Value,
+            ) -> Result<serde_json::Value, String> {
+                Err("planned failure".into())
+            }
+        }
+
+        let exec = TurnExecutor::new(
+            InferenceClient::new(format!("http://{addr}/v1")),
+            Arc::new(FailingTool),
+        );
+        let cid = ConversationId::from("conv-tool-err");
+        let cfg = TurnConfig {
+            model: ModelId("m".to_owned()),
+            system_prompt: "t".into(),
+            temperature: None,
+            max_tokens: None,
+            max_tool_rounds: 3,
+            tools: vec![ToolDeclaration::function(
+                "boom",
+                "always fails",
+                serde_json::json!({"type":"object"}),
+            )],
+            event_log_hmac_key: None,
+        };
+        let _ = exec
+            .run_turn(&db, &cid, "try it", None, &cfg)
+            .await
+            .unwrap();
+
+        let log = EventLog::new(&db);
+        let events = log.replay_since(&cid, EventSeq(0)).unwrap();
+        let result_ev = events
+            .iter()
+            .find(|e| e.kind == EventKind::ToolResult)
+            .expect("must have a tool_result");
+        let payload: ToolResultPayload = result_ev.decode_payload().unwrap();
+        match &payload.outcome {
+            Err(msg) => assert!(msg.contains("planned failure")),
+            Ok(_) => panic!("expected Err outcome, got Ok"),
+        }
+    }
+
+    /// Runaway-loop protection: if the model keeps emitting tool_calls
+    /// past `max_tool_rounds`, `run_turn` must return `TurnError::MaxRounds`.
+    #[tokio::test]
+    async fn turn_errors_when_max_tool_rounds_exceeded() {
+        let db = fresh_db();
+
+        // Always return a tool-call response — the loop will never
+        // reach a terminal assistant message.
+        let looping = r#"{
+            "id":"rN","model":"m","choices":[{
+                "index":0,
+                "message":{"role":"assistant","content":null,
+                    "tool_calls":[{"id":"tcx","type":"function",
+                        "function":{"name":"loop","arguments":"{}"}}]},
+                "finish_reason":"tool_calls"
+            }]
+        }"#
+        .to_owned();
+        let server = Arc::new(ChainedMockServer {
+            responses: vec![looping.clone(); 10],
+            served: AtomicUsize::new(0),
+        });
+        let addr = run_mock_server(server.clone()).await;
+
+        struct NoopTool;
+        #[async_trait]
+        impl ToolDispatch for NoopTool {
+            async fn call(
+                &self,
+                _name: &str,
+                _args: &serde_json::Value,
+            ) -> Result<serde_json::Value, String> {
+                Ok(serde_json::json!({}))
+            }
+        }
+
+        let exec = TurnExecutor::new(
+            InferenceClient::new(format!("http://{addr}/v1")),
+            Arc::new(NoopTool),
+        );
+        let cid = ConversationId::from("conv-runaway");
+        let cfg = TurnConfig {
+            model: ModelId("m".into()),
+            system_prompt: "t".into(),
+            temperature: None,
+            max_tokens: None,
+            max_tool_rounds: 2, // hard cap
+            tools: vec![ToolDeclaration::function(
+                "loop",
+                "infinite",
+                serde_json::json!({"type":"object"}),
+            )],
+            event_log_hmac_key: None,
+        };
+        let err = exec
+            .run_turn(&db, &cid, "go", None, &cfg)
+            .await
+            .expect_err("should exceed max_tool_rounds");
+        match err {
+            TurnError::MaxRounds(n) => assert_eq!(n, 2),
+            other => panic!("wrong error: {other:?}"),
+        }
     }
 }

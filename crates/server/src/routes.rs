@@ -430,6 +430,11 @@ pub fn test_app_state() -> AppState {
         signer: Arc::new(JwtSigner::generate("execlaw-test".into())),
         refresh_store: Arc::new(RefreshStore::new()),
         events: crate::events::EventBus::new(),
+        // Tests use a deterministic HMAC key so replay works end-to-end.
+        event_log_hmac_key: Some(Arc::new(
+            b"execlaw-test-hmac-key-32-bytes!!".to_vec(),
+        )),
+        inference: None,
     }
 }
 

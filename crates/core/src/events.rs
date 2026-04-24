@@ -216,23 +216,99 @@ pub struct ToolResultPayload {
 }
 
 /// The event log facade.
+///
+/// Every `state_events` INSERT is signed with an HMAC-SHA256 tag over
+/// the canonical bytes of the row (§7.8). When an HMAC key is attached
+/// via [`EventLog::with_hmac_key`], `append` / `commit_turn` populate
+/// the `tag` column and `replay_since` / `hydrate` verify every row on
+/// read — returning `DbError::TamperDetected` if any tag doesn't match.
+///
+/// When no key is attached (tests, first-run before vault is ready),
+/// rows are written with `tag = NULL` and verification is skipped.
+/// Production always attaches a key at server startup.
 pub struct EventLog<'db> {
     db: &'db Database,
+    hmac_key: Option<Vec<u8>>,
 }
 
 impl<'db> EventLog<'db> {
     pub fn new(db: &'db Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            hmac_key: None,
+        }
+    }
+
+    /// Attach an HMAC key. Every subsequent append signs the row;
+    /// every replay verifies.
+    pub fn with_hmac_key(mut self, key: Vec<u8>) -> Self {
+        self.hmac_key = Some(key);
+        self
+    }
+
+    /// Sign an event under the attached key, returning the tag bytes.
+    /// `None` when no key is attached (returns `None` → `tag` column
+    /// gets NULL).
+    fn sign(&self, ev: &EventRecord) -> Option<[u8; 32]> {
+        self.hmac_key.as_deref().map(|k| {
+            let canon = crate::event_hmac::canonical_bytes(
+                ev.conversation_id.as_str(),
+                ev.seq.0,
+                ev.kind.as_str(),
+                ev.committed_at,
+                ev.actor.as_deref(),
+                &ev.payload,
+            );
+            crate::event_hmac::sign_event(k, &canon)
+        })
+    }
+
+    /// Verify a loaded event row. No-op (returns Ok) when no key is
+    /// attached or when the stored tag is NULL (legacy rows).
+    fn verify(&self, ev: &EventRecord, tag: Option<Vec<u8>>) -> Result<(), DbError> {
+        let Some(key) = self.hmac_key.as_deref() else {
+            return Ok(());
+        };
+        let Some(tag_bytes) = tag else {
+            return Ok(());
+        };
+        if tag_bytes.len() != 32 {
+            return Err(DbError::TamperDetected(format!(
+                "event {}:{} has malformed tag (len {})",
+                ev.conversation_id.as_str(),
+                ev.seq.0,
+                tag_bytes.len()
+            )));
+        }
+        let mut fixed = [0u8; 32];
+        fixed.copy_from_slice(&tag_bytes);
+        let canon = crate::event_hmac::canonical_bytes(
+            ev.conversation_id.as_str(),
+            ev.seq.0,
+            ev.kind.as_str(),
+            ev.committed_at,
+            ev.actor.as_deref(),
+            &ev.payload,
+        );
+        if !crate::event_hmac::verify_event(key, &canon, &fixed) {
+            return Err(DbError::TamperDetected(format!(
+                "event {}:{} failed HMAC verification",
+                ev.conversation_id.as_str(),
+                ev.seq.0
+            )));
+        }
+        Ok(())
     }
 
     /// Append one event. Enforces `(conversation_id, seq)` uniqueness via
     /// the primary key — returns an error if the caller passed a stale seq.
     pub fn append(&self, ev: &EventRecord) -> Result<(), DbError> {
+        let tag = self.sign(ev).map(|t| t.to_vec());
         self.db.with_conn(|c| {
             c.execute(
                 "INSERT INTO state_events \
-                 (conversation_id, seq, kind, payload, committed_at, actor) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (conversation_id, seq, kind, payload, committed_at, actor, tag) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     ev.conversation_id.as_str(),
                     ev.seq.0,
@@ -240,6 +316,7 @@ impl<'db> EventLog<'db> {
                     ev.payload,
                     ev.committed_at,
                     ev.actor,
+                    tag,
                 ],
             )?;
             Ok(())
@@ -247,15 +324,16 @@ impl<'db> EventLog<'db> {
     }
 
     /// Read events for a conversation strictly greater than `after_seq`,
-    /// in ascending order.
+    /// in ascending order. Verifies every row's HMAC tag when a key is
+    /// attached — returning `DbError::TamperDetected` on first mismatch.
     pub fn replay_since(
         &self,
         conversation_id: &ConversationId,
         after_seq: EventSeq,
     ) -> Result<Vec<EventRecord>, DbError> {
-        self.db.with_conn(|c| {
+        let rows: Vec<(EventRecord, Option<Vec<u8>>)> = self.db.with_conn(|c| {
             let mut stmt = c.prepare_cached(
-                "SELECT seq, kind, payload, committed_at, actor \
+                "SELECT seq, kind, payload, committed_at, actor, tag \
                  FROM state_events \
                  WHERE conversation_id = ?1 AND seq > ?2 \
                  ORDER BY seq ASC",
@@ -267,18 +345,29 @@ impl<'db> EventLog<'db> {
                     let payload: Vec<u8> = row.get(2)?;
                     let committed_at: i64 = row.get(3)?;
                     let actor: Option<String> = row.get(4)?;
-                    Ok(EventRecord {
-                        conversation_id: conversation_id.clone(),
-                        seq: EventSeq(seq),
-                        kind: EventKind::parse(&kind),
-                        payload,
-                        committed_at,
-                        actor,
-                    })
+                    let tag: Option<Vec<u8>> = row.get(5)?;
+                    Ok((
+                        EventRecord {
+                            conversation_id: conversation_id.clone(),
+                            seq: EventSeq(seq),
+                            kind: EventKind::parse(&kind),
+                            payload,
+                            committed_at,
+                            actor,
+                        },
+                        tag,
+                    ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
-        })
+        })?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (ev, tag) in rows {
+            self.verify(&ev, tag)?;
+            out.push(ev);
+        }
+        Ok(out)
     }
 
     /// Current last_seq for a conversation (0 if none yet).
@@ -313,12 +402,18 @@ impl<'db> EventLog<'db> {
     ) -> Result<Vec<EventRecord>, DbError> {
         let materialized = enforce_tool_pairing(conversation_id, base_seq, events)?;
 
+        // Sign before the transaction so any HMAC-key absence fails fast.
+        let tags: Vec<Option<Vec<u8>>> = materialized
+            .iter()
+            .map(|ev| self.sign(ev).map(|t| t.to_vec()))
+            .collect();
+
         self.db.transaction(|tx| {
-            for ev in &materialized {
+            for (ev, tag) in materialized.iter().zip(tags.iter()) {
                 tx.execute(
                     "INSERT INTO state_events \
-                     (conversation_id, seq, kind, payload, committed_at, actor) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     (conversation_id, seq, kind, payload, committed_at, actor, tag) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         ev.conversation_id.as_str(),
                         ev.seq.0,
@@ -326,6 +421,7 @@ impl<'db> EventLog<'db> {
                         ev.payload,
                         ev.committed_at,
                         ev.actor,
+                        tag,
                     ],
                 )?;
             }
@@ -379,9 +475,12 @@ impl<'db> EventLog<'db> {
         conversation_id: &ConversationId,
         up_to_seq: EventSeq,
     ) -> Result<Snapshot, DbError> {
-        let events = self.db.with_conn(|c| {
+        // Pull rows + tags, then verify via the shared helper before
+        // materializing the snapshot. A snapshot built from tampered
+        // rows would propagate the tamper into every future hydrate.
+        let raw: Vec<(EventRecord, Option<Vec<u8>>)> = self.db.with_conn(|c| {
             let mut stmt = c.prepare_cached(
-                "SELECT seq, kind, payload, committed_at, actor \
+                "SELECT seq, kind, payload, committed_at, actor, tag \
                  FROM state_events \
                  WHERE conversation_id = ?1 AND seq <= ?2 \
                  ORDER BY seq ASC",
@@ -393,18 +492,28 @@ impl<'db> EventLog<'db> {
                     let payload: Vec<u8> = row.get(2)?;
                     let committed_at: i64 = row.get(3)?;
                     let actor: Option<String> = row.get(4)?;
-                    Ok(EventRecord {
-                        conversation_id: conversation_id.clone(),
-                        seq: EventSeq(seq),
-                        kind: EventKind::parse(&kind),
-                        payload,
-                        committed_at,
-                        actor,
-                    })
+                    let tag: Option<Vec<u8>> = row.get(5)?;
+                    Ok((
+                        EventRecord {
+                            conversation_id: conversation_id.clone(),
+                            seq: EventSeq(seq),
+                            kind: EventKind::parse(&kind),
+                            payload,
+                            committed_at,
+                            actor,
+                        },
+                        tag,
+                    ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok::<_, DbError>(rows)
         })?;
+
+        let mut events = Vec::with_capacity(raw.len());
+        for (ev, tag) in raw {
+            self.verify(&ev, tag)?;
+            events.push(ev);
+        }
 
         Ok(Snapshot {
             conversation_id: conversation_id.clone(),
@@ -769,6 +878,261 @@ mod tests {
         assert!(log.should_snapshot(None, EventSeq(SNAPSHOT_INTERVAL)));
         assert!(log.should_snapshot(Some(EventSeq(100)), EventSeq(150)));
         assert!(!log.should_snapshot(Some(EventSeq(100)), EventSeq(149)));
+    }
+
+    #[test]
+    fn event_kind_parse_unknown_maps_to_other() {
+        // Forward-compat contract: unknown kinds MUST map to `Other` so
+        // replay can continue.
+        assert_eq!(EventKind::parse("this_kind_does_not_exist"), EventKind::Other);
+        assert_eq!(EventKind::parse(""), EventKind::Other);
+    }
+
+    #[test]
+    fn event_kind_display_matches_as_str() {
+        assert_eq!(format!("{}", EventKind::UserMsg), "user_msg");
+        assert_eq!(format!("{}", EventKind::ToolResult), "tool_result");
+    }
+
+    /// `commit_turn` must be atomic: if one of the pending events
+    /// collides with an already-written seq, NONE of the batch should
+    /// land in the event log (all-or-nothing).
+    #[test]
+    fn commit_turn_is_atomic_on_seq_collision() {
+        let db = fresh_db();
+        let log = EventLog::new(&db);
+        let cid = ConversationId::from("conv-atomic");
+
+        // Pre-write an event at seq=2 so that the incoming batch,
+        // starting at base_seq=0 and containing 3 pendings, will
+        // collide on its 2nd insert.
+        let preexisting = EventRecord::new(
+            cid.clone(),
+            EventSeq(2),
+            EventKind::UserMsg,
+            &serde_json::json!({"note": "preexisting"}),
+            None,
+        )
+        .unwrap();
+        log.append(&preexisting).unwrap();
+
+        let pending = vec![
+            PendingEvent::encode(
+                EventKind::ModelTurn,
+                &serde_json::json!({"text": "p1"}),
+                Some("agent".into()),
+            )
+            .unwrap(),
+            PendingEvent::encode(
+                EventKind::ModelTurn,
+                &serde_json::json!({"text": "p2"}),
+                Some("agent".into()),
+            )
+            .unwrap(),
+            PendingEvent::encode(
+                EventKind::ModelTurn,
+                &serde_json::json!({"text": "p3"}),
+                Some("agent".into()),
+            )
+            .unwrap(),
+        ];
+
+        let err = log.commit_turn(&cid, EventSeq(0), pending).unwrap_err();
+        assert!(matches!(err, DbError::Sqlite(_)));
+
+        // The only event visible must be the pre-existing one — no
+        // partial batch leaked through.
+        let events = log.replay_since(&cid, EventSeq(0)).unwrap();
+        assert_eq!(events.len(), 1, "turn was not atomic");
+        assert_eq!(events[0].seq, EventSeq(2));
+    }
+
+    /// When an HMAC key is attached, the `tag` column is populated on
+    /// append and successfully verifies on replay.
+    #[test]
+    fn hmac_signed_append_roundtrips() {
+        let db = fresh_db();
+        let key = b"test-hmac-key-32-bytes-long!!!!!".to_vec();
+        let log = EventLog::new(&db).with_hmac_key(key);
+        let cid = ConversationId::from("conv-hmac");
+
+        let ev = EventRecord::new(
+            cid.clone(),
+            EventSeq::FIRST,
+            EventKind::UserMsg,
+            &serde_json::json!({"text": "hi"}),
+            Some("controller".into()),
+        )
+        .unwrap();
+        log.append(&ev).unwrap();
+
+        let got = log.replay_since(&cid, EventSeq(0)).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, EventKind::UserMsg);
+    }
+
+    /// Tampering with a committed row's payload must cause replay to
+    /// fail with `TamperDetected`. This is the load-bearing invariant
+    /// from §7.8.
+    #[test]
+    fn hmac_detects_post_insert_payload_tamper() {
+        let db = fresh_db();
+        let key = b"test-hmac-key-32-bytes-long!!!!!".to_vec();
+        let log = EventLog::new(&db).with_hmac_key(key.clone());
+        let cid = ConversationId::from("conv-tamper");
+
+        let ev = EventRecord::new(
+            cid.clone(),
+            EventSeq::FIRST,
+            EventKind::UserMsg,
+            &serde_json::json!({"text": "original"}),
+            None,
+        )
+        .unwrap();
+        log.append(&ev).unwrap();
+
+        // Simulate a post-insert tamper — direct SQL UPDATE.
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_events SET payload = ?1 WHERE conversation_id = ?2 AND seq = ?3",
+                params![b"evil".to_vec(), cid.as_str(), 1i64],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let err = log.replay_since(&cid, EventSeq(0)).unwrap_err();
+        match err {
+            DbError::TamperDetected(msg) => assert!(msg.contains("HMAC verification")),
+            other => panic!("expected TamperDetected, got {other:?}"),
+        }
+    }
+
+    /// Tampering with a row's actor (changing who committed an event)
+    /// also trips the detector — the actor is part of the canonical
+    /// encoding.
+    #[test]
+    fn hmac_detects_actor_tamper() {
+        let db = fresh_db();
+        let key = b"k".to_vec();
+        let log = EventLog::new(&db).with_hmac_key(key);
+        let cid = ConversationId::from("conv-actor-tamper");
+        let ev = EventRecord::new(
+            cid.clone(),
+            EventSeq::FIRST,
+            EventKind::Approval,
+            &serde_json::json!({"verb": "approve"}),
+            Some("controller".into()),
+        )
+        .unwrap();
+        log.append(&ev).unwrap();
+
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_events SET actor = 'attacker' WHERE conversation_id = ?1",
+                params![cid.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(matches!(
+            log.replay_since(&cid, EventSeq(0)).unwrap_err(),
+            DbError::TamperDetected(_)
+        ));
+    }
+
+    /// Rows with NULL tag (legacy rows written before migration 0002,
+    /// or by a keyless log) verify without error even when a key is
+    /// later attached. The background back-fill (Phase 2) flips this.
+    #[test]
+    fn null_tag_rows_are_accepted_for_backward_compat() {
+        let db = fresh_db();
+        let cid = ConversationId::from("conv-legacy");
+
+        // Write via a keyless log — rows land with tag = NULL.
+        let keyless = EventLog::new(&db);
+        let ev = EventRecord::new(
+            cid.clone(),
+            EventSeq::FIRST,
+            EventKind::UserMsg,
+            &serde_json::json!({}),
+            None,
+        )
+        .unwrap();
+        keyless.append(&ev).unwrap();
+
+        // Now read with a keyed log — must NOT reject the NULL-tagged row.
+        let keyed = EventLog::new(&db).with_hmac_key(b"k".to_vec());
+        let got = keyed.replay_since(&cid, EventSeq(0)).unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    /// Adversarial: a row signed under key-A must not verify under
+    /// key-B. Key rotation is Phase 2, but the correctness property is
+    /// testable now.
+    #[test]
+    fn hmac_rejects_row_signed_under_different_key() {
+        let db = fresh_db();
+        let cid = ConversationId::from("conv-keymismatch");
+        EventLog::new(&db)
+            .with_hmac_key(b"key-a".to_vec())
+            .append(
+                &EventRecord::new(
+                    cid.clone(),
+                    EventSeq::FIRST,
+                    EventKind::UserMsg,
+                    &serde_json::json!({}),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let keyed_b = EventLog::new(&db).with_hmac_key(b"key-b".to_vec());
+        assert!(matches!(
+            keyed_b.replay_since(&cid, EventSeq(0)).unwrap_err(),
+            DbError::TamperDetected(_)
+        ));
+    }
+
+    /// commit_turn writes all rows with tags populated; a mid-batch
+    /// tamper on any row trips replay.
+    #[test]
+    fn commit_turn_signs_every_row_in_batch() {
+        let db = fresh_db();
+        let log = EventLog::new(&db).with_hmac_key(b"k".to_vec());
+        let cid = ConversationId::from("conv-batch-sign");
+
+        let turn = vec![
+            PendingEvent::encode(
+                EventKind::ModelTurn,
+                &serde_json::json!({"text": "one"}),
+                Some("agent".into()),
+            )
+            .unwrap(),
+            PendingEvent::encode(
+                EventKind::ModelTurn,
+                &serde_json::json!({"text": "two"}),
+                Some("agent".into()),
+            )
+            .unwrap(),
+        ];
+        log.commit_turn(&cid, EventSeq(0), turn).unwrap();
+
+        // Tamper the SECOND row only. Replay still has to catch it.
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_events SET payload = ?1 WHERE conversation_id = ?2 AND seq = 2",
+                params![b"no".to_vec(), cid.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(
+            log.replay_since(&cid, EventSeq(0)).unwrap_err(),
+            DbError::TamperDetected(_)
+        ));
     }
 
     #[test]
