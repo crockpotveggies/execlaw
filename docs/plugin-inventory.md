@@ -1,8 +1,8 @@
-# Phase 2 Plugin Inventory
+# Plugin Inventory (Phase 8 queue)
 
-Kickoff deliverable from MIGRATION_PLAN §11 Phase 2: every `src/integrations/*.ts` (and sibling) in selfhosted-claw gets assigned to one of three buckets — **port** as a plugin, **fold** into core, or **retire**.
+Classification of every `src/integrations/*.ts` (and sibling) in selfhosted-claw into one of three buckets — **port** as a plugin, **fold** into core, or **retire**.
 
-This document is the checklist that drives the rest of Phase 2. As each plugin lands, mark it off here.
+Originally a Phase-2 kickoff deliverable; after the 2026-04-24 plan refactor, the actual ports moved to **Phase 8 — External plugin ports** (everything that depends on credentials, third-party services, or external SDKs). Phase 2 is now framework-only. This doc is Phase 8's queue — as each plugin lands, mark it off here.
 
 ## Status legend
 

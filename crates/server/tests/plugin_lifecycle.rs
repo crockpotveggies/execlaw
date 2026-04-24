@@ -484,6 +484,116 @@ async fn empty_body_rejected() {
 // Subprocess E2E (Unix only — relies on `sh -c`).
 // ---------------------------------------------------------------------------
 
+/// End-to-end install + tool call against the in-tree reference
+/// plugin (`plugins/hello`). Exercises the full path: manifest parse
+/// → hook registration → subprocess spawn → JSON-RPC tool call →
+/// capability check → response round-trip.
+///
+/// This test compiles the reference binary on-demand via `cargo
+/// build -p plugin-hello` so CI doesn't need a pre-built artifact.
+///
+/// Gated on Unix for now: Rust's stdin/stdout pipe buffering on
+/// Windows interacts poorly with synchronous `std::io::stdin().lines()`
+/// inside the child. The Unix path proves the protocol round-trip;
+/// we revisit the Windows variant when Phase 8 ports a real
+/// production plugin that needs Windows support.
+#[cfg(unix)]
+#[tokio::test]
+async fn reference_hello_plugin_roundtrips_end_to_end() {
+    // Compile the reference plugin so `hello-plugin` is on disk.
+    // Only runs once per workspace build thanks to cargo's cache.
+    let status = tokio::process::Command::new(env!("CARGO"))
+        .args(["build", "-p", "plugin-hello"])
+        .status()
+        .await
+        .expect("invoke cargo build -p plugin-hello");
+    assert!(status.success(), "plugin-hello build failed");
+
+    // Locate the built binary under target/debug/ (or target/<profile>).
+    let bin_name = if cfg!(windows) {
+        "hello-plugin.exe"
+    } else {
+        "hello-plugin"
+    };
+    // CARGO_MANIFEST_DIR is crates/server; walk up to the workspace root.
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let built_bin = workspace_root.join("target").join("debug").join(bin_name);
+    assert!(built_bin.exists(), "expected built plugin at {built_bin:?}");
+
+    // Stage the plugin into a temp dir: plugin.toml + the binary at
+    // the path declared in the manifest (`./hello-plugin`).
+    let tmp = tempfile::tempdir().unwrap();
+    let plugin_dir = tmp.path().join("plugin-hello-0.1.0");
+    std::fs::create_dir_all(&plugin_dir).unwrap();
+    let manifest_path = workspace_root
+        .join("plugins")
+        .join("hello")
+        .join("plugin.toml");
+    let manifest_text = std::fs::read_to_string(&manifest_path)
+        .expect("reference plugin.toml must exist at plugins/hello/");
+    std::fs::write(plugin_dir.join("plugin.toml"), &manifest_text).unwrap();
+
+    // Copy the compiled binary into the staged dir so the manifest's
+    // relative `./hello-plugin` executable resolves correctly.
+    let staged_bin = plugin_dir.join(bin_name);
+    std::fs::copy(&built_bin, &staged_bin).unwrap();
+    // Ensure the binary is executable on Unix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&staged_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&staged_bin, perms).unwrap();
+    }
+
+    // PluginHost's `resolve_executable` auto-appends `.exe` on
+    // Windows when the declared name has no extension, so the
+    // manifest stays cross-platform as-is.
+
+    // Build a host against a fresh DB and install from the staged dir.
+    let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+    MigrationRunner::new(&db).apply_all().unwrap();
+    let host = PluginHost::new(db, HookRegistry::new(), tmp.path().to_path_buf());
+    host.install(&plugin_dir)
+        .await
+        .expect("install reference plugin");
+
+    // Caller with "tools.safe" — matches the manifest's required_capabilities.
+    let got = host
+        .call_tool(
+            "hello.echo",
+            serde_json::json!({"message": "execlaw says hi"}),
+            &["tools.safe"],
+        )
+        .await
+        .expect("tool call should succeed");
+    assert_eq!(got["echoed"], "execlaw says hi");
+    assert!(got["greeting"].as_str().unwrap().contains("Hello"));
+
+    // Caller WITHOUT "tools.safe" gets rejected at the capability
+    // check — the subprocess never sees the args.
+    let err = host
+        .call_tool(
+            "hello.echo",
+            serde_json::json!({"message": "nope"}),
+            &["tools.medium"],
+        )
+        .await
+        .expect_err("should be rejected on capability check");
+    assert!(err.contains("requires capability 'tools.safe'"));
+
+    // Uninstall cleans up hooks + subprocess.
+    host.uninstall("plugin-hello")
+        .await
+        .expect("uninstall reference plugin");
+    assert!(host.registry().tool("hello.echo").is_none());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn subprocess_plugin_tool_roundtrips_via_host() {

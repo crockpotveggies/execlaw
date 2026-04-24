@@ -155,7 +155,7 @@ impl PluginHost {
             }
             let spec = SubprocessSpec {
                 plugin_id: plugin_id.clone(),
-                executable: runtime.executable.clone(),
+                executable: resolve_executable(stage_path, &runtime.executable),
                 args: runtime.args.clone(),
                 cwd: Some(stage_path.to_path_buf()),
             };
@@ -269,11 +269,12 @@ impl PluginHost {
                 .runtime
                 .as_ref()
                 .ok_or(PluginHostError::MissingRuntime)?;
+            let stage = PathBuf::from(&row.stage_path);
             let spec = SubprocessSpec {
                 plugin_id: plugin_id.to_owned(),
-                executable: runtime.executable.clone(),
+                executable: resolve_executable(&stage, &runtime.executable),
                 args: runtime.args.clone(),
-                cwd: Some(PathBuf::from(&row.stage_path)),
+                cwd: Some(stage),
             };
             let plugin = SubprocessPlugin::spawn(spec)
                 .await
@@ -312,11 +313,12 @@ impl PluginHost {
             let needs_subprocess = !manifest.tools.is_empty() || manifest.transport.is_some();
             if needs_subprocess {
                 if let Some(runtime) = &manifest.runtime {
+                    let stage = PathBuf::from(&row.stage_path);
                     let spec = SubprocessSpec {
                         plugin_id: row.plugin_id.clone(),
-                        executable: runtime.executable.clone(),
+                        executable: resolve_executable(&stage, &runtime.executable),
                         args: runtime.args.clone(),
-                        cwd: Some(PathBuf::from(&row.stage_path)),
+                        cwd: Some(stage),
                     };
                     match SubprocessPlugin::spawn(spec).await {
                         Ok(p) => {
@@ -485,6 +487,40 @@ impl PluginHost {
 // `BuiltinTools` impl into an `Arc<dyn ToolDispatch>` — keeping the
 // `runner_local` trait out of this crate avoids a dep cycle.
 // ---------------------------------------------------------------------------
+
+/// Resolve a manifest-declared executable against the staged plugin
+/// directory.
+///
+/// - `./foo` / `./foo.exe` → absolute path under the stage dir.
+/// - A bare name like `node` or `sh` → left as-is so the OS resolves
+///   it against `PATH` (the common case for Node-based plugins).
+/// - An already-absolute path → left as-is.
+///
+/// Windows's `Command::new` does not look in CWD for relative paths;
+/// this function normalizes that so plugin authors don't have to
+/// worry about platform differences.
+fn resolve_executable(stage: &Path, declared: &str) -> String {
+    let p = Path::new(declared);
+    // Absolute path — use as-is.
+    if p.is_absolute() {
+        return declared.to_owned();
+    }
+    // Explicitly plugin-relative (starts with `./` or `.\`).
+    let stripped = declared
+        .strip_prefix("./")
+        .or_else(|| declared.strip_prefix(".\\"));
+    if let Some(rel) = stripped {
+        // On Windows, prepend `.exe` if the target doesn't exist but a
+        // `.exe` variant does — lets manifests stay cross-platform.
+        let mut abs = stage.join(rel);
+        if cfg!(windows) && !abs.exists() && abs.extension().is_none() {
+            abs.set_extension("exe");
+        }
+        return abs.to_string_lossy().into_owned();
+    }
+    // Bare name — rely on PATH resolution.
+    declared.to_owned()
+}
 
 /// Trait the server implements for built-in tools (e.g. the memory
 /// shim) that don't live in a plugin. The adapter in the server

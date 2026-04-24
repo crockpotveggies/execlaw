@@ -152,8 +152,35 @@ pub async fn send_message(
     // Step 3 — run the turn (executor owns ALL event-log writes so
     // the user_msg + model_turn + tool pairs land in one atomic
     // `commit_turn`). Phase 0 stub fallback when no backend configured.
+    //
+    // Path selection:
+    // - No inference backend → stub echo.
+    // - Backend configured + NO plugin tools registered → streaming
+    //   path (fast first token, no tool loop).
+    // - Backend configured + plugin tools present → non-streaming
+    //   TurnExecutor path (supports multi-round tool_call loop with
+    //   ChainedToolDispatch routing to the plugin host).
     let text_for_broadcast = req.text.clone();
+    let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
+    let caller_caps: Vec<String> = policy
+        .capability_set
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
     let (user_msg_seq, assistant_text, assistant_seq) = match &state.inference {
+        Some(inference) if has_plugin_tools => match run_tool_capable_turn(
+            &state,
+            inference.clone(),
+            &cid,
+            &req.text,
+            req.sender_principal_id.clone(),
+            caller_caps.clone(),
+        )
+        .await
+        {
+            Ok(out) => out,
+            Err(e) => return err_500(&format!("tool-capable turn failed: {e}")),
+        },
         Some(inference) => {
             match run_real_turn(
                 &state,
@@ -406,6 +433,81 @@ async fn run_real_turn(
         .unwrap_or(latest.0 + 1);
 
     Ok((user_seq.0, assistant_text, assistant_seq))
+}
+
+/// Run a non-streaming, tool-capable turn: the registry's currently-
+/// installed plugin tools are exposed to the model, and any
+/// `tool_calls` the model emits are dispatched through
+/// [`crate::tool_dispatch::ChainedToolDispatch`] with capability
+/// enforcement. Used when `has_plugin_tools == true`.
+///
+/// Trades streaming token deltas for multi-round tool support. The
+/// event log still gets user_msg + tool_use + tool_result pairs +
+/// model_turn via commit_turn, so the pairing invariant and HMAC
+/// signing apply identically.
+async fn run_tool_capable_turn(
+    state: &AppState,
+    inference: Arc<execlaw_inference_api::InferenceClient>,
+    cid: &ConversationId,
+    user_text: &str,
+    sender_principal_id: Option<String>,
+    caller_caps: Vec<String>,
+) -> Result<(i64, String, i64), String> {
+    use execlaw_inference_api::ToolDeclaration;
+    use execlaw_runner_local::turn::{TurnConfig, TurnExecutor};
+
+    let tool_decls: Vec<ToolDeclaration> = state
+        .plugin_host
+        .registry()
+        .all_tools()
+        .iter()
+        .map(|t| {
+            ToolDeclaration::function(
+                t.tool_name.clone(),
+                format!("Plugin tool '{}' (latency: {})", t.tool_name, t.latency),
+                serde_json::json!({"type": "object"}),
+            )
+        })
+        .collect();
+
+    let dispatch = Arc::new(crate::tool_dispatch::ChainedToolDispatch::new(
+        state.plugin_host.clone(),
+        caller_caps,
+        crate::tool_dispatch::NoBuiltinTools,
+    ));
+    let exec = TurnExecutor::new((*inference).clone(), dispatch);
+    let cfg = TurnConfig {
+        model: ModelId(state.config.model_id.clone()),
+        system_prompt: state.config.system_prompt.clone(),
+        temperature: None,
+        max_tokens: None,
+        max_tool_rounds: state.config.max_tool_rounds,
+        tools: tool_decls,
+        event_log_hmac_key: state
+            .event_log_hmac_key
+            .as_ref()
+            .map(|k| (**k).clone()),
+    };
+    let summary = exec
+        .run_turn(&state.db, cid, user_text, sender_principal_id, &cfg)
+        .await
+        .map_err(|e| format!("executor: {e}"))?;
+
+    let log = event_log(state);
+    // TurnExecutor appends user_msg via `append` (not commit_turn) so
+    // it's NOT in events_written. Read last_seq back and subtract
+    // the committed count to find the user_msg seq.
+    let last = log.last_seq(cid).map_err(|e| format!("last_seq: {e}"))?.0;
+    let committed = summary.events_written.len() as i64;
+    let user_seq = last - committed;
+    let assistant_seq = summary
+        .events_written
+        .iter()
+        .rev()
+        .find(|e| e.kind == EventKind::ModelTurn)
+        .map(|e| e.seq.0)
+        .unwrap_or(last);
+    Ok((user_seq, summary.assistant_text, assistant_seq))
 }
 
 /// Build an `EventLog` with the server's HMAC key attached (when set).
@@ -830,6 +932,43 @@ mod tests {
     #[tokio::test]
     async fn policy_controller_sender_reaches_turn() {
         let (status, body) = send(build_app(), "hi").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body["assistant_text"].as_str().unwrap().is_empty());
+    }
+
+    /// When the plugin registry has tools, `send_message` takes the
+    /// tool-capable path instead of streaming. Without an inference
+    /// backend configured it falls back to the stub echo regardless,
+    /// so this test only asserts that the router doesn't error out
+    /// when tools are registered — the live tool dispatch is covered
+    /// by `tool_dispatch::tests` and the Unix-only reference-plugin
+    /// integration test.
+    #[tokio::test]
+    async fn chat_route_tolerates_registered_plugin_tools() {
+        let state = test_app_state();
+        // Register a manifest with a tool.
+        let m = r#"[plugin]
+id = "p-chat"
+name = "p-chat"
+version = "0.1.0"
+
+[[tools]]
+name = "introspect"
+schema = "s.json"
+latency = "low"
+required_capabilities = []
+"#;
+        state
+            .plugin_host
+            .registry()
+            .enable(&execlaw_plugin_sdk::PluginManifest::parse(m).unwrap())
+            .unwrap();
+
+        let app = crate::routes::build_router(state);
+        let (status, body) = send(app, "hello").await;
+        // Stub path fires because no inference backend is configured;
+        // the critical assertion is that the route didn't 500 when
+        // tools are in the registry.
         assert_eq!(status, StatusCode::OK);
         assert!(!body["assistant_text"].as_str().unwrap().is_empty());
     }

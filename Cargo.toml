@@ -16,6 +16,7 @@ members = [
     "crates/outbox",
     "crates/server",
     "crates/cli",
+    "plugins/hello",
 ]
 
 [workspace.package]

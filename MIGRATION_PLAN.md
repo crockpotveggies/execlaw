@@ -1946,44 +1946,75 @@ The **hard, load-bearing phase** — this is where the agent model lives or dies
 - **Crash tests** as acceptance: (a) kill control plane mid-turn → restart → turn resumes correctly, no dangling `tool_use`, no double-send on the outbox; (b) agent calls `schedule_wakeup(30s, note)` and resumes within ≤1s of target; (c) kill runner mid-tool-call → cancellation result committed, next turn proceeds cleanly.
 - **Demo:** Chat with the agent running on the local Mistral-7B. Trigger all three crash tests. Conversations survive. Airplane-mode test: disconnect all network, everything still works.
 
-### Phase 2 — Plugin host + port selfhosted-claw integrations (4-6 weeks)
+### Phase 2 — Plugin framework (2-3 weeks)
 
-- `plugin-sdk` Rust traits + codegen for manifest schemas (hook points per §4.2)
-- `plugin-host` supporting **subprocess (tier 2)** first — lowest barrier for porting Node integrations
+**Scope-pinning (2026-04-24 refactor):** Phase 2 is **framework only** — the
+machinery for installing, isolating, and invoking plugins. The actual
+plugin ports (`plugin-signal`, `plugin-google-calendar`, `plugin-voice`,
+all the research/search plugins, etc.) live in **Phase 8 — External
+integrations**, since every one of them needs credentials, external
+services, or third-party SDKs that can't be built against in an
+airplane-mode dev loop. Earlier drafts conflated the two and made Phase
+2 "done" depend on external-service work landing; that's fixed by
+separating them.
+
+What lands in Phase 2:
+
+- `plugin-sdk` Rust traits + manifest schema (hook points per §4.2) with
+  the `[runtime]` table declaring isolation tier + entrypoint.
+- `plugin-host`: `HookRegistry` (per-hook lookup maps, all-or-nothing
+  `enable` with conflict detection) + `SubprocessPlugin` tier (tier 2
+  per §4.4 — lowest barrier for porting Node integrations).
+- `PluginHost` lifecycle: install / enable / disable / uninstall /
+  hydrate, with SQLite persistence so installs survive restart.
 - ZIP-upload install flow end-to-end (`POST /api/admin/plugins/install`)
-- Native function-call tools exposed by plugins (not MCP — see §4.3)
-- Capability-token issuance for runners (per-turn-bound, EdDSA-signed); vault MVP
-- **HMAC-signed event log** (tamper evidence on audit trail)
+  with zip-slip defense + manifest validation.
+- Native function-call tools exposed by plugins (not MCP — see §4.3).
+- **Capability-enforced dispatch bridge**: the runner's `ToolDispatch`
+  chains built-ins → plugins, rejecting calls that lack the required
+  capability before the subprocess sees any args.
+- Capability-token issuance for runners (per-turn-bound, EdDSA-signed)
+  — ported up from Phase 1 (already lands there).
+- HMAC-signed event log (tamper evidence on audit trail) — also
+  shipped in Phase 1.
+- Plugin inventory enumeration document (`docs/plugin-inventory.md`):
+  every `src/integrations/*.ts` in selfhosted-claw classified into
+  bucket A (port as plugin in Phase 8), B (fold into core), or C
+  (retire). Drives Phase 8's queue.
 
-**Integrations ported from selfhosted-claw (all of them, as plugins):**
+What's **out of scope** for Phase 2:
 
-| selfhosted-claw source | execlaw plugin | Hook attachments |
-|---|---|---|
-| `src/channels/signal.ts` | `plugin-signal` | transport, identity_provider (Signal safety-numbers), alert_sources (Signal-daemon health) |
-| `src/integrations/phone-voice*.ts`, `src/voice-runner/` | `plugin-voice` (thin bridge; heavy work in `voice-pipeline` core + `service-whisper`/`service-kokoro`) | transport, chat_components (voice status in chat UI) |
-| `src/research/` + `src/integrations/deep-research.ts` | `plugin-search-exa`, `plugin-search-brave`, `plugin-search-duckduckgo`, `plugin-url-fetch`, `plugin-research-vision`, `plugin-research-pdf`, `plugin-research-orchestrator` | tools, services, alert_sources |
-| Google Calendar | `plugin-google-calendar` | tools, oauth_accounts, ui_panels, health_checks |
-| Google Contacts | `plugin-google-contacts` | identity_provider, tools, oauth_accounts |
-| `src/integrations/*.ts` (remainder) | enumerate at Phase 2 kickoff and port each as a plugin | various |
-| `src/tools/` core tool registry | ported to `runner-local` as built-in tools + `plugin-core-tools` for the rest | tools |
-| `src/control-actions.ts` | split per action into small plugins | tools, ui_panels, alert_sources |
-| `src/research/vision.ts` | rolled into `plugin-research-vision` | tools |
-| `src/mount-security.ts` + `config-examples/mount-allowlist.json` | carried into `container-manager` core (not a plugin — security baseline) | n/a |
-| `src/inbound-guard.ts` + `scripts/inbound-message-guard.mjs` | carried into core policy engine (§7.4, §7.8) with extension hook for custom guard | n/a |
+- Porting any real selfhosted-claw integration (moved to Phase 8).
+- Anything that requires a Signal CLI, Google OAuth creds, a search
+  API key, a cloud service, or a third-party SDK.
 
-**Plugin inventory enumeration as a Phase-2 kickoff task:** a first deliverable of Phase 2 is a one-day audit that lists every remaining `src/integrations/*.ts` file and assigns each to one of: (a) port as a plugin, (b) fold into core, (c) retire. Expected output: a spreadsheet / checklist in the repo that drives the rest of the phase.
-
-- **Demo:** Install `plugin-signal` via ZIP upload in the UI (no rebuild); agent works over both web chat and Signal. Install `plugin-google-calendar`; agent can list + create events; OAuth expiry triggers an alert with a one-click Reconnect. Install all ported plugins; the set feels feature-equivalent to selfhosted-claw.
+- **Demo:** Install an in-tree reference plugin via
+  `POST /api/admin/plugins/install`; the tool it declares shows up in
+  `GET /api/admin/plugins/tools`; a turn can call it; `disable` drops
+  it from the registry + kills the subprocess; server restart +
+  `PluginHost::hydrate` brings enabled plugins back automatically.
+  A plugin declaring a tool with `required_capabilities = ["admin"]`
+  is rejected at dispatch time when the caller lacks that capability.
 
 ### Phase 3 — Participants, trust, policy engine, Rule of Two (3-4 weeks)
 
 Where the participant-aware security model lands end-to-end.
 
+The security model itself is **internal**: it runs against whatever
+transports are installed. Phase 3 lands the full trust ladder + policy
+engine + cold-contact flow, verifying each invariant against the
+web-chat transport (always available) and an in-tree reference identity
+provider. The **cross-transport** demos (sideband approvals that hop
+from one transport to another, Signal cold-contacts, Google-Contacts
+auto-trust) prove themselves in Phase 8 once the real transport/identity
+plugins land — at which point the same policy engine from Phase 3 is
+exercised end-to-end without any code change.
+
 - **Trust ladder** (§2.6) in the `principals` table with the full enum (`Controller` / `Delegated` / `KnownTrusted` / `KnownLimited` / `UnknownPending` / `Blocked`)
-- **Derived conversation kinds** — including the new `MixedTrust` case
+- **Derived conversation kinds** — including the `MixedTrust` case
 - **Controller identity** bound to a cryptographic key; first-run key ceremony
-- **Identity-provider plugin contract** (§2.14) + reference plugin `identity-local-address-book` (UI-managed contact list) + `identity-signal-safety-numbers`
-- **Cold-contact escalation flow** (§2.14) end-to-end: holding auto-reply → sideband notification → controller verb (`Trust` / `TrustLimited` / `Deny` / `IgnoreOnce`) → persistence → conversation resumes
+- **Identity-provider plugin contract** (§2.14) + in-tree reference plugin `identity-local-address-book` (UI-managed contact list, no external deps). Third-party identity providers (`identity-signal-safety-numbers`, `identity-google-contacts`) ship in Phase 8.
+- **Cold-contact escalation flow** (§2.14) end-to-end: holding auto-reply → sideband notification → controller verb (`Trust` / `TrustLimited` / `Deny` / `IgnoreOnce`) → persistence → conversation resumes. Verified against web-chat + a second in-tree mock transport for the sideband hop; the Signal-over-email variant demonstrates in Phase 8.
 - **`config_trust_policy` table** with all documented defaults, UI-editable
 - **Policy engine** evaluates per-turn on `sender_trust` / `addressee_trust` / `effective_trust` / `broadcast_min_trust` / `conversation_kind`
 - **Rule of Two enforcement** per turn
@@ -1991,40 +2022,46 @@ Where the participant-aware security model lands end-to-end.
 - **Spotlighting** on ingress for all content from non-trusted senders
 - **`ask_controller` sideband flow** over a different transport than the originating one, signed approval tokens (shares mechanism with cold-contact approval)
 - **Trust-class-scoped long-term memory** (retrieval key includes trust class)
-- **Demos:**
-  - (a) New unknown number sends a Signal message. Holding auto-reply fires; controller gets a Signal DM asking whether to trust; controller approves; conversation resumes with the message the outsider originally sent.
-  - (b) Install `identity-local-address-book`, add a contact, have that contact message the agent — auto-trusted without prompting.
-  - (c) Add an outsider to a trusted group — kind becomes `MixedTrust`, broadcast replies gain planner/executor + approval gates.
-  - (d) Agent needs approval in a group-sans-controller — DMs controller over Signal from a web-chat group thread, controller approves, group conversation resumes.
-  - (e) Injection attempt in an outsider conversation fails to pull a Controller-scoped memory.
-  - (f) Revoke trust on an existing contact — mid-conversation turn finishes, conversation archives, future messages dropped.
+- **Demos (all internal, no external services required):**
+  - (a) A simulated "unknown sender" inbound via web chat triggers the holding auto-reply; the controller gets a sideband notification via the in-tree mock transport; controller approves; conversation resumes with the original message.
+  - (b) Install `identity-local-address-book`, add a contact, have that contact message the agent through web chat — auto-trusted without prompting.
+  - (c) Adversarial: injection attempt in an outsider conversation fails to pull a Controller-scoped memory (already tested at the unit level; Phase 3 runs it through the live HTTP + policy stack).
+  - (d) Revoke trust on an existing contact — mid-conversation turn finishes, conversation archives, future messages dropped.
+  - (e) Rule of Two breach triggers an approval request that the controller must resolve before the turn commits.
+  - Signal / cross-transport / group-conversation demos land in Phase 8 once `plugin-signal` ships.
 
-### Phase 4 — Voice pipeline (4-5 weeks)
+### Phase 4 — Voice pipeline primitives (3-4 weeks)
 
-One voice path: streaming STT → LLM → TTS with VAD-driven barge-in and backchannel rescind. Builds on the Phase 0 inference plumbing.
+Pure-Rust voice stack: the two-lane Tokio graph, punctuation-aware
+endpointer, barge-in rescind logic, and the streaming-frame vocabulary.
+These primitives are **internal** and already partially landed in the
+current foundation (§2.13 primitives + tests).
+
+Voice acceptance against a real mic/speaker — the ≤1.1s EoS-to-first-
+audio demo, Kokoro TTS on the actual GPU path — requires
+`service-whisper` and `service-kokoro` container images, which are
+external-integration work and ship in Phase 8. Phase 4 therefore
+verifies everything *up to* the I/O boundary: VAD decisions against
+recorded audio fixtures, endpointer classification, barge-in decision
+tables, two-lane preemption ordering, event-schema wiring, spotlighting
+on simulated transcripts, and sub-agent escalation logic.
 
 - **`voice-pipeline` crate** — two-lane Tokio graph (system + data lanes), Pipecat-style frame vocabulary, warm-pipeline pinning per active call
-- **Audio I/O: `transport-voice` plugin** — mic/speaker ↔ control plane; owns device access and the WebRTC AEC3 pre-processor
-- **VAD: Silero VAD ONNX** integrated in the pipeline (threshold 0.6, min_speech 150ms, min_silence 300-500ms)
-- **STT: `service-whisper`** — whisper-small.en int8; faster-whisper on CUDA and OpenVINO GenAI WhisperPipeline on Intel, behind one trait; streaming partials every ~300ms
-- **Turn detector: `service-turn-detector`** — LiveKit turn-detector ONNX (Qwen2.5-0.5B, Apache-2.0) on CPU; shortens silence wait when confident
-- **LLM stage** — `runner-local` against the configured voice-LLM deployment (Qwen on nvidia is the hybrid default); sentence-boundary buffering before TTS handoff
-- **TTS: `service-kokoro`** — Kokoro-82M primary, OpenVINO 2025.2 build on Intel Arc and ONNX on CUDA, Apache-2.0
-- **TTS fallback: `service-piper`** — CPU-only airbag
-- **Barge-in: system-lane `Interruption` frames** + 120ms backchannel-rescind window
-- **Echo cancellation: WebRTC AEC3** (libwebrtc audio-processing, BSD) on the mic path before VAD
+- **Silero VAD ONNX** integration wired into the pipeline (threshold 0.6, min_speech 150ms, min_silence 300-500ms). VAD runs in-process against the audio stream; no external service needed.
+- **Audio I/O trait** (`AudioIn` / `AudioOut`) with a mock implementation for tests. The real `transport-voice` plugin that owns device access lands in Phase 8.
+- **Endpointer** (punctuation-aware, shipped) + **barge-in decision logic** (shipped) + **backchannel rescind** (shipped)
 - **Voice event schema** (`voice.session_started`, `audio.in_chunk`, `vad.speech_started/ended`, `stt.partial/final`, `turn.user_ended`, `llm.token`, `llm.cancelled`, `tts.first_audio`, `tts.audio_chunk`, `tts.ended`, `interrupt.started/rescinded/confirmed`) wired to `state_events`; PCM blobs in separate `blobs` table
 - Modality-adaptive behavior: extended thinking off, response-length budget, tool-call budget (`latency: low` only), context slice
 - Planner/executor split preserved for `ExternalWithOutsider` voice (STT-transcript spotlighting)
-- Sub-agent escalation (§2.9 case 3) works identically — primary emits filler while deep runner grinds
-- **Acceptance:**
-  - ≤1.1s EoS → first audio on the warm hybrid-GPU path
-  - ≤200ms barge-in halt (VAD-fire to TTS-stop)
-  - Backchannel ("mm-hmm") does *not* interrupt the agent (rescind works)
-  - Pipeline survives runner crash mid-turn with cancellation-result invariant preserved
-  - Injection via STT transcript contained by planner/executor + Rule of Two
-  - Kokoro verified to run on both Intel Arc (OpenVINO 2025.2) and nvidia (ONNX) from the same plugin manifest
-- **Demo:** start a voice call on a ControllerDM. Real conversation: user speaks, agent answers within ~1s; interrupt the agent mid-sentence, it halts within ~150ms; say "mm-hmm" while the agent talks and it keeps going (rescind). Ask something hard → agent says "one sec" and escalates to the Reasoning deployment (Qwen/QwQ on nvidia) → returns with a thoughtful answer spoken via Kokoro. Mid-call, attempt a sensitive tool call → controller gets a Signal approval ping, approves, call resumes. Pull the network cable → call ends cleanly, transcript + tool history survive in the event log. **No cloud calls in any of this.**
+- Sub-agent escalation (§2.9 case 3) — primary emits filler while deep runner grinds — logic verified against mock runners
+- **Acceptance (internal):**
+  - Two-lane preemption: system-lane `Interruption` arrives at every stage before any queued data-lane frame, verified under data-lane backlog.
+  - Endpointer classifies terminal vs mid-thought tail punctuation correctly.
+  - Barge-in + backchannel decision table covers Wait / Rescind / Confirm.
+  - Event-schema round-trips through the log with HMAC signing intact.
+  - Spotlighting strips smuggled delimiters from simulated STT transcripts.
+  - Crash mid-turn still commits paired cancellation results.
+- Real-audio acceptance (≤1.1s EoS → first audio, Kokoro on Intel Arc + nvidia, WebRTC AEC3, live barge-in over a mic) lands in Phase 8 with `service-whisper` + `service-kokoro` + `transport-voice`.
 
 ### Phase 5 — Observability, evaluation, and the replay CLI (2 weeks)
 
@@ -2033,7 +2070,7 @@ New phase, promoted out of "Hardening" because it pays off immediately for debug
 - Log viewer in the admin UI (filter by level/plugin/conversation, same as selfhosted-claw's `/admin/logs`)
 - `execlaw replay <conversation_id> --at <seq>` rebuilds exact prompt + capability set + policy decisions for a turn
 - `eval_flagged` table + CLI to tag event ranges
-- Nightly LLM-judge harness (pytest + judge call, no bespoke framework) with a rubric including trust-class compliance and Rule-of-Two violations
+- Nightly LLM-judge harness (pytest + judge call against the **local** Qwen; no cloud judge) with a rubric including trust-class compliance and Rule-of-Two violations
 - **Demo:** Replay a specific turn from a week-old conversation, show the exact prompt the model saw; flag a trace as regression; re-run the regression set before a prompt change.
 
 ### Phase 6 — UI port, chat-first landing (3-4 weeks)
@@ -2047,12 +2084,87 @@ New phase, promoted out of "Hardening" because it pays off immediately for debug
 
 ### Phase 7 — Hardening (ongoing)
 
-- WASM plugin tier
+- WASM plugin tier (second isolation option after subprocess — §4.4 tier 3)
 - WebAuthn controller auth
 - Log retention + privacy controls (PII policies for OTEL spans)
 - Backup + restore, DR runbook
 - Multi-controller support (delegation of capabilities, time-bounded grants)
 - Advanced subagents (guardrails, research fan-out) — only after everything above is solid
+- Event-log HMAC key rotation (currently single-key per §7.8)
+- Background back-fill verifier for legacy NULL-tagged `state_events` rows → flip `tag` column to NOT NULL in migration 0004
+
+### Phase 8 — External plugin ports (open-ended; runs in parallel once Phase 2-7 foundations hold)
+
+Every remaining port of a selfhosted-claw integration lives here. This
+phase exists because each of these needs something execlaw's core
+doesn't provide on its own — a third-party service account, an OAuth
+client, a vendor SDK, a specific daemon — and bundling that work into
+the phase that built the *framework* (Phase 2) or the phases that
+built the *invariants* (Phase 3-4) blurred what "done" meant.
+
+Each port is its own small PR landing against a stable framework. The
+phase has no single end state; it's a queue drained in priority order,
+with each port unlocking the Phase-3/4 cross-transport demos that were
+deferred.
+
+**Bucket A — port as execlaw plugins** (full inventory + blockers
+tracked in [`docs/plugin-inventory.md`](docs/plugin-inventory.md)):
+
+| selfhosted-claw source | execlaw plugin | Hook attachments | External dep |
+|---|---|---|---|
+| `src/channels/signal.ts` | `plugin-signal` | transport, identity_provider, alert_sources, health_checks | `signal-cli` subprocess |
+| `src/integrations/phone-voice*.ts` + `src/voice-runner/` | `plugin-voice` + `service-whisper` + `service-kokoro` + `service-piper` containers | transport, chat_components | Whisper / Kokoro / Piper model weights + OpenVINO / ONNX runtimes |
+| `src/integrations/deep-research.ts` + `src/research/orchestrator.ts` | `plugin-research-orchestrator` | tools, services, alert_sources | depends on the search/vision/pdf plugins below |
+| `src/integrations/search-exa.ts` | `plugin-search-exa` | tools, oauth_accounts | Exa API key |
+| `src/integrations/search-brave.ts` | `plugin-search-brave` | tools, oauth_accounts | Brave Search API key |
+| `src/integrations/search-duckduckgo.ts` | `plugin-search-duckduckgo` | tools | none (keyless) |
+| `src/integrations/url-fetch.ts` | `plugin-url-fetch` | tools | none |
+| `src/research/vision.ts` | `plugin-research-vision` | tools | local vision model (`service-vision`) |
+| `src/research/pdf.ts` | `plugin-research-pdf` | tools | pdfium/MuPDF in a probe container |
+| `src/integrations/google-calendar.ts` | `plugin-google-calendar` | tools, oauth_accounts, ui_panels, health_checks | Google OAuth client creds |
+| `src/integrations/google-contacts.ts` | `plugin-google-contacts` | identity_provider, tools, oauth_accounts | Google OAuth client creds |
+| `src/control-actions.ts` (per-action) | `plugin-control-<action>` (one per action) | tools, ui_panels, alert_sources | none |
+| `src/tools/*.ts` (overflow beyond `runner-local` built-ins) | `plugin-core-tools` | tools | none |
+
+**Port priority order:**
+
+1. `plugin-url-fetch` + `plugin-search-duckduckgo` — no external creds; fastest smoke-test of the full install → tool-call path with real HTTP I/O.
+2. `plugin-signal` — unlocks the Phase-3 cross-transport sideband demos and Phase-4 voice approvals over Signal.
+3. `plugin-google-calendar` + `plugin-google-contacts` — the canonical `oauth_accounts` + `identity_provider` story.
+4. `plugin-voice` + `service-whisper` + `service-kokoro` — the Phase-4 real-audio acceptance demos (≤1.1s EoS → first audio on the hybrid-GPU path).
+5. `plugin-research-*` bundle — once the primitives work, the orchestrator composes them.
+6. `plugin-core-tools` + `plugin-control-*` — the long tail.
+
+**Per-port checklist** (every port follows this):
+
+- [ ] Manifest (`plugin.toml`) with `[runtime]` declaring tier + entrypoint.
+- [ ] Subprocess implementation speaking the plugin JSON-RPC protocol.
+- [ ] Tests that run the plugin against a sandboxed mock of the
+      external service (so CI doesn't need live creds).
+- [ ] One end-to-end manual test against the real service with creds
+      loaded from the vault.
+- [ ] `docs/plugin-inventory.md` checklist entry flipped to `[x]`.
+- [ ] Any Phase-3 or Phase-4 demo that depended on this port now
+      runs end-to-end; close the cross-reference.
+
+**Bucket B — fold into core** (already landed in Phase 2):
+
+| selfhosted-claw source | execlaw home |
+|---|---|
+| `src/mount-security.ts` + `config-examples/mount-allowlist.json` | `execlaw-container-manager` |
+| `src/inbound-guard.ts` + `scripts/inbound-message-guard.mjs` | `execlaw-policy::input_guard` |
+| `src/control-store.ts` HMAC primitives | `execlaw-core::event_hmac` |
+
+**Bucket C — retire** (see §12 "What We're Not Porting"): anything
+bound to cloud LLMs (violates axiom #1), MCP client shims (replaced by
+native OpenAI function-calling per §4.3), the `isMain` boolean auth
+(replaced by the trust ladder §2.6), and JID-shaped routing (replaced
+by the participant-aware model §2.6).
+
+- **Demo:** each port ships its own demo from the per-port checklist.
+  Phase 8 has no single "complete" state — it closes when the
+  inventory spreadsheet is fully green, and any post-launch
+  third-party integration lands here too.
 
 ---
 
