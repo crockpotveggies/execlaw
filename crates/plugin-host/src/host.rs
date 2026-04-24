@@ -340,6 +340,60 @@ impl PluginHost {
         Ok(())
     }
 
+    /// Query every registered identity-provider plugin to resolve a
+    /// transport identifier (`{transport, handle}`) into a set of
+    /// potential matches (§2.14).
+    ///
+    /// Each provider responds to the JSON-RPC `identity.resolve`
+    /// method with either `{match: {...IdentityMatch fields}}` or
+    /// `{match: null}` for no match. Providers that fail (timeout,
+    /// parse error, subprocess crashed) are skipped with a warning;
+    /// a single bad provider must not block identity resolution for
+    /// the rest.
+    ///
+    /// Returns every match; the caller decides how to rank (typically
+    /// highest-confidence wins, with tie-break on registration order).
+    pub async fn resolve_identity(
+        &self,
+        transport: &str,
+        handle: &str,
+    ) -> Vec<serde_json::Value> {
+        let providers = self.inner.registry.identity_providers();
+        if providers.is_empty() {
+            return Vec::new();
+        }
+        let subs = self.inner.subprocesses.read().await;
+        let mut matches = Vec::new();
+        let params = serde_json::json!({
+            "transport": transport,
+            "handle": handle,
+        });
+        for provider in &providers {
+            let Some(plugin) = subs.get(&provider.plugin_id) else {
+                // Provider is registered but its subprocess isn't
+                // running — likely because the plugin declares no
+                // runtime. Skip quietly.
+                continue;
+            };
+            match plugin.call("identity.resolve", params.clone()).await {
+                Ok(value) => {
+                    // Provider shape: {"match": {...}} or {"match": null}.
+                    if let Some(m) = value.get("match") {
+                        if !m.is_null() {
+                            matches.push(m.clone());
+                        }
+                    }
+                }
+                Err(e) => warn!(
+                    plugin_id = %provider.plugin_id,
+                    error = %e,
+                    "identity.resolve failed; skipping provider"
+                ),
+            }
+        }
+        matches
+    }
+
     /// Call a tool exposed by an installed plugin. Returns the JSON
     /// result on success or a structured error string the caller can
     /// encode into a `ToolResultPayload::outcome = Err(_)`.

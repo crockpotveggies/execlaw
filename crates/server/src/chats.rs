@@ -97,14 +97,17 @@ pub async fn send_message(
     ensure_conversation(&store, &cid);
 
     // Step 1 — **identity resolution** (§2.14). Look the sender up
-    // in the `principals` table; if they're new, persist them as
-    // UnknownPending so the cold-contact flow below can park the
-    // conversation.
+    // in the `principals` table; if they're new, query every
+    // installed identity-provider plugin; if any of them vouches for
+    // the sender we auto-admit as KnownTrusted (contact auto-trust
+    // per §2.14). Otherwise persist as UnknownPending so the
+    // cold-contact flow below can park the conversation.
     let principals = PrincipalStore::new(&state.db);
-    let (principal, sender_trust) = match resolve_sender(&principals, &req.sender_principal_id) {
-        Ok(pair) => pair,
-        Err(e) => return err_500(&format!("identity resolution: {e}")),
-    };
+    let (principal, sender_trust) =
+        match resolve_sender(&state, &principals, &req.sender_principal_id).await {
+            Ok(pair) => pair,
+            Err(e) => return err_500(&format!("identity resolution: {e}")),
+        };
 
     // Step 2 — **policy evaluation** (§7.3). The policy engine sees
     // the resolved trust; same code path handles Controller all the
@@ -196,8 +199,15 @@ pub async fn send_message(
         .map(|s| (*s).to_owned())
         .collect();
     let spotlight_content = policy.spotlighting;
+    // Planner/executor containment (§9.2): when `policy.planner_executor`
+    // fires — i.e. effective_trust < KnownTrusted — the model that sees
+    // the untrusted content gets NO tools. A prompt-injected executor
+    // can't exfiltrate via tool_use args because there are no tool_use
+    // slots available. The full placeholder-passing choreography is a
+    // later refinement; stripping tools is the load-bearing invariant.
+    let use_tool_path = has_plugin_tools && !policy.planner_executor;
     let (user_msg_seq, assistant_text, assistant_seq) = match &state.inference {
-        Some(inference) if has_plugin_tools => match run_tool_capable_turn(
+        Some(inference) if use_tool_path => match run_tool_capable_turn(
             &state,
             inference.clone(),
             &cid,
@@ -568,7 +578,8 @@ async fn run_tool_capable_turn(
 ///
 /// Returns the (possibly newly-persisted) `Principal` plus the flat
 /// `policy::TrustLevel` tag the policy engine consumes.
-fn resolve_sender(
+async fn resolve_sender(
+    state: &AppState,
     store: &PrincipalStore<'_>,
     sender_id: &Option<String>,
 ) -> Result<(Principal, TrustLevel), execlaw_core::db::DbError> {
@@ -597,27 +608,89 @@ fn resolve_sender(
         return Ok((existing, flat));
     }
 
-    // First-time sender. Persist as UnknownPending; cold-contact
-    // flow picks it up on the next line.
+    // First-time sender. Query every installed identity-provider
+    // plugin via PluginHost::resolve_identity (§2.14); if any
+    // vouches for the sender with a Contact-class trust hint, we
+    // auto-admit as KnownTrusted. Otherwise UnknownPending.
+    let matches = state
+        .plugin_host
+        .resolve_identity("web", raw)
+        .await;
     let now = chrono::Utc::now().timestamp();
+    // Pick the highest-confidence match whose trust_hint would admit
+    // the sender (Contact / Colleague / Family / Organization — not
+    // Unknown). Each match is a free-form JSON blob from the plugin;
+    // we pull out the shape documented in `execlaw-identity-api::IdentityMatch`.
+    let (trust_level, resolved_by, flat_trust) = classify_identity_matches(&matches, now);
+
     let principal = Principal {
         id: pid,
         identifiers: vec![Identifier {
             transport: "web".into(),
             handle: raw.to_owned(),
         }],
-        trust_level: CoreTrustLevel::UnknownPending {
-            first_seen: now,
-            notification_event_seq: None,
-        },
-        resolved_by: vec![],
+        trust_level,
+        resolved_by,
         metadata: serde_json::json!({}),
         first_seen: now,
         last_seen: Some(now),
         controller_notes: None,
     };
     store.upsert(&principal)?;
-    Ok((principal, TrustLevel::UnknownPending))
+    Ok((principal, flat_trust))
+}
+
+/// Collapse a set of identity-provider matches into a single
+/// `TrustLevel`. Pure function so the cold-contact path has a
+/// clearly-testable decision.
+fn classify_identity_matches(
+    matches: &[serde_json::Value],
+    now: i64,
+) -> (CoreTrustLevel, Vec<execlaw_core::ids::PluginId>, TrustLevel) {
+    // Find the single best match by confidence (highest wins).
+    // Ignore matches with `trust_hint == "Unknown"` — they're
+    // "the provider saw this identifier but has no opinion on trust".
+    let best = matches
+        .iter()
+        .filter(|m| {
+            m.get("trust_hint")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s != "Unknown")
+        })
+        .max_by(|a, b| {
+            let ac = a.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let bc = b.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            ac.partial_cmp(&bc).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+    match best {
+        Some(m) => {
+            let resolvers = m
+                .get("resolved_by")
+                .and_then(|v| v.as_str())
+                .map(|s| vec![execlaw_core::ids::PluginId::from(s)])
+                .unwrap_or_default();
+            (
+                CoreTrustLevel::KnownTrusted {
+                    resolvers: resolvers.clone(),
+                    approved_by: execlaw_core::ids::PrincipalId::from(
+                        "identity_provider_auto_trust",
+                    ),
+                    approved_at: now,
+                },
+                resolvers,
+                TrustLevel::KnownTrusted,
+            )
+        }
+        None => (
+            CoreTrustLevel::UnknownPending {
+                first_seen: now,
+                notification_event_seq: None,
+            },
+            vec![],
+            TrustLevel::UnknownPending,
+        ),
+    }
 }
 
 /// Cold-contact escalation (§2.14).
@@ -1130,6 +1203,92 @@ mod tests {
         let (status, body) = send(build_app(), "hi").await;
         assert_eq!(status, StatusCode::OK);
         assert!(!body["assistant_text"].as_str().unwrap().is_empty());
+    }
+
+    // ---- Phase 3 closeout: identity-match classifier ----------------------
+
+    use super::classify_identity_matches;
+
+    /// No matches from any provider → UnknownPending.
+    #[test]
+    fn classify_no_matches_is_unknown_pending() {
+        let (core_trust, resolvers, flat) = classify_identity_matches(&[], 100);
+        assert!(matches!(
+            core_trust,
+            execlaw_core::principal::TrustLevel::UnknownPending { .. }
+        ));
+        assert!(resolvers.is_empty());
+        assert_eq!(flat, TrustLevel::UnknownPending);
+    }
+
+    /// A single Contact-class match → KnownTrusted with the
+    /// provider id carried through as a resolver.
+    #[test]
+    fn classify_contact_match_is_known_trusted() {
+        let m = serde_json::json!({
+            "trust_hint": "Contact",
+            "confidence": 0.9,
+            "resolved_by": "identity-local-address-book",
+        });
+        let (core_trust, resolvers, flat) = classify_identity_matches(&[m], 100);
+        assert!(matches!(
+            core_trust,
+            execlaw_core::principal::TrustLevel::KnownTrusted { .. }
+        ));
+        assert_eq!(resolvers.len(), 1);
+        assert_eq!(resolvers[0].as_str(), "identity-local-address-book");
+        assert_eq!(flat, TrustLevel::KnownTrusted);
+    }
+
+    /// Highest-confidence wins when multiple providers answer.
+    #[test]
+    fn classify_picks_highest_confidence_match() {
+        let matches = vec![
+            serde_json::json!({
+                "trust_hint": "Contact",
+                "confidence": 0.6,
+                "resolved_by": "low-confidence-provider",
+            }),
+            serde_json::json!({
+                "trust_hint": "Colleague",
+                "confidence": 0.95,
+                "resolved_by": "high-confidence-provider",
+            }),
+        ];
+        let (_, resolvers, flat) = classify_identity_matches(&matches, 100);
+        assert_eq!(flat, TrustLevel::KnownTrusted);
+        assert_eq!(resolvers[0].as_str(), "high-confidence-provider");
+    }
+
+    /// A match with trust_hint "Unknown" must NOT admit the sender —
+    /// providers can say "I recognize this identifier but have no
+    /// opinion on trust" and we stay on the cold-contact path.
+    #[test]
+    fn classify_unknown_trust_hint_falls_through_to_pending() {
+        let m = serde_json::json!({
+            "trust_hint": "Unknown",
+            "confidence": 1.0,
+            "resolved_by": "any",
+        });
+        let (_, _, flat) = classify_identity_matches(&[m], 100);
+        assert_eq!(
+            flat,
+            TrustLevel::UnknownPending,
+            "Unknown trust_hint must not auto-admit"
+        );
+    }
+
+    /// A malformed match (missing trust_hint entirely) is treated as
+    /// no match — providers can't force auto-trust by sending an
+    /// incomplete payload.
+    #[test]
+    fn classify_malformed_match_is_rejected() {
+        let m = serde_json::json!({
+            "confidence": 1.0,
+            "resolved_by": "malformed",
+        });
+        let (_, _, flat) = classify_identity_matches(&[m], 100);
+        assert_eq!(flat, TrustLevel::UnknownPending);
     }
 
     // ---- Phase 3 cold-contact + approval tests ----------------------------

@@ -12,12 +12,21 @@
 pub mod bargein;
 pub mod endpointer;
 pub mod graph;
+pub mod session;
+pub mod traits;
 
 pub use bargein::{BargeInConfig, BargeInDecision, decide as decide_bargein, is_backchannel};
 pub use endpointer::{
     EndpointHint, EndpointerConfig, classify_and_window, classify_tail, silence_window_ms,
 };
 pub use graph::{DATA_LANE_CAPACITY, Pipeline, PipelineEnds, SYSTEM_LANE_CAPACITY};
+pub use session::{
+    SessionConfig, SessionState, VoiceEventPayload, VoiceSession, chunk_at_sentence_boundaries,
+};
+pub use traits::{
+    AudioChunk, AudioIn, AudioOut, MockAudioIn, MockAudioOut, MockStt, MockTts, MockVad,
+    SttClient, SttEvent, TtsAudio, TtsClient, Vad, VadDecision,
+};
 
 use serde::{Deserialize, Serialize};
 

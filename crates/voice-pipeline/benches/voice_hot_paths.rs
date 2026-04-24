@@ -47,5 +47,24 @@ fn bench_bargein(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_endpointer, bench_bargein);
+/// Sentence splitter runs every TTS handoff — budget ≤ 1 µs for
+/// typical agent reply lengths (few sentences).
+fn bench_sentence_splitter(c: &mut Criterion) {
+    use execlaw_voice_pipeline::chunk_at_sentence_boundaries;
+    let short = "Hello there. How are you? I am fine!";
+    let long = "The weather today is quite pleasant. \
+                I think we should go outside. Would you agree? \
+                Let me check the forecast. It says seventy-five \
+                degrees and partly cloudy. That sounds perfect.";
+    let mut group = c.benchmark_group("sentence_splitter");
+    group.bench_function("short_3_sentences", |b| {
+        b.iter(|| chunk_at_sentence_boundaries(black_box(short)))
+    });
+    group.bench_function("long_6_sentences", |b| {
+        b.iter(|| chunk_at_sentence_boundaries(black_box(long)))
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_endpointer, bench_bargein, bench_sentence_splitter);
 criterion_main!(benches);

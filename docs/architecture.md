@@ -771,7 +771,11 @@ For the reader who wants to jump into code:
 | [`crates/runner-local/src/turn.rs`](../crates/runner-local/src/turn.rs) | TurnExecutor — full tool-loop turn path |
 | [`crates/runner-local/src/memory_tool.rs`](../crates/runner-local/src/memory_tool.rs) | `read_memory` / `write_memory` with trust-class scoping |
 | [`crates/inference-api/src/lib.rs`](../crates/inference-api/src/lib.rs) | OpenAI-compatible client + streaming SSE |
-| [`crates/voice-pipeline/src/`](../crates/voice-pipeline/src/) | Two-lane graph, endpointer, bargein (Phase 4) |
+| [`crates/voice-pipeline/src/graph.rs`](../crates/voice-pipeline/src/graph.rs) | Two-lane Tokio graph (system lane preempts data lane) |
+| [`crates/voice-pipeline/src/traits.rs`](../crates/voice-pipeline/src/traits.rs) | `AudioIn`/`AudioOut`/`Vad`/`SttClient`/`TtsClient` + mocks |
+| [`crates/voice-pipeline/src/session.rs`](../crates/voice-pipeline/src/session.rs) | `VoiceSession` orchestrator + voice-event log wiring (Phase 4) |
+| [`crates/voice-pipeline/src/endpointer.rs`](../crates/voice-pipeline/src/endpointer.rs) | Punctuation-aware endpointer |
+| [`crates/voice-pipeline/src/bargein.rs`](../crates/voice-pipeline/src/bargein.rs) | Barge-in / backchannel-rescind decision |
 | [`spec/asyncapi.yaml`](../spec/asyncapi.yaml) | WebSocket event vocabulary |
 | [`plugins/hello/`](../plugins/hello/) | In-tree reference subprocess plugin |
 | [`docs/plugin-inventory.md`](./plugin-inventory.md) | Phase 8 port queue |
@@ -815,20 +819,34 @@ Per [`STATUS.md`](../STATUS.md) as of 2026-04-24.
 - In-tree reference plugin at `plugins/hello/`
 - Tool-capable chat path that lights up when tools are registered
 
-**Phase 3 — Participants, trust, policy engine, Rule of Two.** Complete (in-tree demos).
+**Phase 3 — Participants, trust, policy engine, Rule of Two.** Complete.
 - `PrincipalStore` persists the full rich `TrustLevel` variant via JSON
-- Identity resolution in the chat route: unknown senders → `UnknownPending` + cold-contact flow
+- Identity resolution in the chat route: unknown senders → identity-provider dispatch → UnknownPending + cold-contact OR auto-admit as KnownTrusted when a provider vouches
+- `PluginHost::resolve_identity` iterates installed `identity_provider` hooks via JSON-RPC `identity.resolve`
+- `classify_identity_matches` — pure decision function mapping provider matches (highest-confidence wins, `Unknown` hint rejected) to a `TrustLevel`
 - Cold-contact escalation: `ColdContactArrived` event + `AwaitingTrustDecision` phase + `AlertFired` sideband broadcast
-- `POST /api/admin/approvals/:id/respond` with every `ApprovalVerb` branch: `Trust` → KnownTrusted, `TrustLimited` → KnownLimited with allowed_topics, `Block` → Blocked (future messages 403), `IgnoreOnce` → clear park without trust change
+- `POST /api/admin/approvals/:id/respond` with every `ApprovalVerb` branch
 - `TrustChanged` event committed on every transition (audit trail)
-- Original message replayed on the WS bus when the controller approves
-- Spotlighting applied to prompt assembly when `policy.spotlighting` fires (untrusted sender sees delimiter-wrapped content; the log still holds unwrapped text)
-- Trust-class-scoped memory reads (via `MemoryStore` + `memory_tool` shim from Phase 1)
+- Spotlighting applied to prompt assembly when `policy.spotlighting` fires
+- **Planner/executor containment** — when `policy.planner_executor` is true (effective_trust < KnownTrusted), the tool-capable chat path is disabled. A prompt-injected executor can't exfiltrate via tool_use args because there are no tool_use slots. Full placeholder-passing choreography lands as a later refinement.
+- Trust-class-scoped memory reads (from Phase 1)
 
-**Phase 3 deferrals** (land in Phase 8 or the next Phase 3 iteration):
-- Identity-provider plugin contract dispatch: the hook registry tracks `identity_providers`, but the chat route doesn't yet iterate them on inbound. Adding `PluginHost::resolve_identity` parallel to `call_tool` unblocks the reference `identity-local-address-book` plugin.
-- Planner/executor split in `TurnExecutor`: `policy.planner_executor` flag is plumbed through, but the executor itself still runs one model call per turn.
+**Phase 3 deferrals** (land in Phase 6 / Phase 8):
 - `config_trust_policy` UI-editable defaults: SQLite table exists; UI surfacing lands with Phase 6.
 - Cross-transport sideband delivery (controller approves via Signal): waits on `plugin-signal` in Phase 8.
+- In-tree `identity-local-address-book` plugin: `PluginHost::resolve_identity` dispatch is ready; the plugin binary itself is Phase 8.
 
-**What's next — Phase 4 (voice pipeline primitives):** See `MIGRATION_PLAN.md` §11.
+**Phase 4 — Voice pipeline primitives.** Complete (internal, with mocks).
+- `traits.rs`: `AudioIn` / `AudioOut` / `Vad` / `SttClient` / `TtsClient` — the full contract between the pipeline and stage backends, plus `MockAudioIn` / `MockAudioOut` / `MockVad` / `MockStt` / `MockTts` for deterministic testing.
+- `session.rs::VoiceSession`: the orchestrator. Owns the two-lane `Pipeline`, the stage clients, and the event-log handle (with optional HMAC key). Drives the full state machine: `Listening → UserSpeaking → AwaitingLlm → AgentSpeaking ↔ BargeInDecision → …`.
+- Voice event schema wired to `state_events`: every stage transition commits a `voice.*` / `vad.*` / `stt.*` / `llm.*` / `tts.*` / `interrupt.*` row via `EventLog::append`. Timestamp (`t_ms`) stored on every row so EoS→first-audio latency can be reconstructed from the log.
+- Sentence splitter (`chunk_at_sentence_boundaries`) feeds TTS chunk-by-chunk so first-audio latency can be minimized.
+- Barge-in resolution: `resolve_bargein(user_still_speaking)` applies the existing `bargein::decide` rule table to the session state; on Confirm, cancels TTS + fires an `Interruption` on the system lane + commits `InterruptConfirmed`.
+
+**Phase 4 deferrals → Phase 8 (real-audio acceptance):**
+- Silero VAD ONNX integration — `Vad` trait is ready; `MockVad` covers the decision logic; ONNX runtime binding lands as a feature-gated impl.
+- `service-whisper` / `service-kokoro` / `service-piper` sidecar containers — `SttClient` / `TtsClient` traits are ready; the wrappers are subprocess plugins the plugin-host manages.
+- `transport-voice` plugin for mic/speaker I/O + WebRTC AEC3 — `AudioIn` / `AudioOut` traits are ready.
+- ≤1.1 s EoS → first-audio latency acceptance: can be measured once the real backends plug in (the `t_ms` field on every voice event exists precisely for this measurement).
+
+**What's next — Phase 5 (observability + replay CLI):** See `MIGRATION_PLAN.md` §11.
