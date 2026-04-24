@@ -401,7 +401,7 @@ pub async fn logout(
 // Router assembly
 // -----------------------------------------------------------------------
 
-/// Build the Axum `Router` for execlaw's Phase 0 surface.
+/// Build the Axum `Router` for execlaw.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
@@ -409,6 +409,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/login", post(login))
         .route("/api/token/refresh", post(refresh))
         .route("/api/logout", post(logout))
+        .route(
+            "/api/chats/{conversation_id}/messages",
+            post(crate::chats::send_message).get(crate::chats::list_messages),
+        )
+        .route("/api/stream", get(crate::events::stream_handler))
         .merge(crate::docs::docs_router())
         .with_state(state)
 }
@@ -424,6 +429,7 @@ pub fn test_app_state() -> AppState {
         config: Arc::new(ServerConfig::default()),
         signer: Arc::new(JwtSigner::generate("execlaw-test".into())),
         refresh_store: Arc::new(RefreshStore::new()),
+        events: crate::events::EventBus::new(),
     }
 }
 

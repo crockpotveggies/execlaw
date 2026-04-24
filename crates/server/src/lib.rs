@@ -16,9 +16,13 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod capability;
+pub mod chats;
 pub mod docs;
+pub mod events;
 pub mod routes;
 pub mod state;
 
 pub use auth::{JwtSigner, RefreshStore};
+pub use events::{EventBus, UiEvent};
 pub use state::{AppState, ServerConfig};

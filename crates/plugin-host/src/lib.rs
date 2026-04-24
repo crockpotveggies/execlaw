@@ -9,6 +9,15 @@
 
 #![forbid(unsafe_code)]
 
+pub mod hook_registry;
+pub mod subprocess;
+
+pub use hook_registry::{
+    HookRegistry, RegisteredAlertSource, RegisteredEventSubscription,
+    RegisteredIdentityProvider, RegisteredTool, RegisteredTransport, RegisteredUiPanel,
+};
+pub use subprocess::{RpcError, RpcRequest, RpcResponse, SubprocessPlugin, SubprocessSpec};
+
 use execlaw_plugin_sdk::PluginManifest;
 use std::collections::BTreeMap;
 

@@ -1,5 +1,6 @@
 //! Shared application state.
 
+use crate::events::EventBus;
 use execlaw_core::Database;
 use std::sync::Arc;
 
@@ -34,6 +35,8 @@ pub struct AppState {
     /// In-memory refresh-token store. SQLite-backed replacement lands
     /// before Phase 2 ships.
     pub refresh_store: Arc<crate::auth::RefreshStore>,
+    /// Live-event bus fanning events out to WebSocket subscribers.
+    pub events: EventBus,
 }
 
 impl std::fmt::Debug for AppState {

@@ -159,6 +159,32 @@ impl JwtSigner {
         Ok(data.claims)
     }
 
+    /// Accessor for the issuer string embedded in every JWT.
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// PKCS#8 PEM bytes for the private signing key, used by
+    /// [`crate::capability`] to issue capability JWTs with the same key.
+    /// Microseconds to re-encode; called at most a few times per turn.
+    pub fn private_pem(&self) -> Vec<u8> {
+        self.signing_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("PKCS#8 encoding")
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// SubjectPublicKeyInfo PEM bytes for the public key. Used by
+    /// [`crate::capability`] to verify issued tokens.
+    pub fn public_pem(&self) -> Vec<u8> {
+        self.verifying_key
+            .to_public_key_pem(LineEnding::LF)
+            .expect("SPKI encoding")
+            .as_bytes()
+            .to_vec()
+    }
+
     pub fn verifying_key(&self) -> &VerifyingKey {
         &self.verifying_key
     }

@@ -462,6 +462,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         config: config.clone(),
         signer,
         refresh_store,
+        events: execlaw_server::EventBus::new(),
     };
     let app = execlaw_server::routes::build_router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

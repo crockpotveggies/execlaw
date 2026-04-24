@@ -809,6 +809,7 @@ dependencies = [
  "execlaw-plugin-sdk",
  "execlaw-policy",
  "execlaw-vault",
+ "hex",
  "hyper",
  "jsonwebtoken",
  "rand 0.8.6",
