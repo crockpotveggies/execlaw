@@ -15,7 +15,9 @@ execlaw-policy = { path = "../policy" }
 execlaw-plugin-sdk = { path = "../plugin-sdk" }
 execlaw-inference-api = { path = "../inference-api" }
 execlaw-runner-local = { path = "../runner-local" }
+execlaw-plugin-host = { path = "../plugin-host" }
 futures.workspace = true
+tempfile.workspace = true
 
 axum = { workspace = true, features = ["ws"] }
 tower.workspace = true
@@ -50,6 +52,8 @@ reqwest = { workspace = true, default-features = false, features = ["json", "rus
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true, features = ["util"] }
 criterion.workspace = true
+zip = { workspace = true }
+execlaw-plugin-sdk = { path = "../plugin-sdk" }
 
 [[bench]]
 name = "server_hot_paths"

@@ -414,6 +414,7 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::chats::send_message).get(crate::chats::list_messages),
         )
         .route("/api/stream", get(crate::events::stream_handler))
+        .merge(crate::plugins::plugins_router())
         .merge(crate::docs::docs_router())
         .with_state(state)
 }
@@ -422,10 +423,18 @@ pub fn build_router(state: AppState) -> Router {
 /// migrated, zero-TTL nothing).
 pub fn test_app_state() -> AppState {
     use execlaw_core::MigrationRunner;
+    use execlaw_plugin_host::{HookRegistry, PluginHost};
     let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
     MigrationRunner::new(&db).apply_all().unwrap();
+    // Per-test temp dir for staged plugins. Tests that exercise the
+    // install path create a TempDir explicitly; the default one is
+    // just a unique path under std::env::temp_dir so this fn stays sync.
+    let stage_root = std::env::temp_dir().join(format!(
+        "execlaw-test-plugins-{}",
+        uuid::Uuid::new_v4()
+    ));
     AppState {
-        db,
+        db: db.clone(),
         config: Arc::new(ServerConfig::default()),
         signer: Arc::new(JwtSigner::generate("execlaw-test".into())),
         refresh_store: Arc::new(RefreshStore::new()),
@@ -435,6 +444,7 @@ pub fn test_app_state() -> AppState {
             b"execlaw-test-hmac-key-32-bytes!!".to_vec(),
         )),
         inference: None,
+        plugin_host: PluginHost::new(db, HookRegistry::new(), stage_root),
     }
 }
 

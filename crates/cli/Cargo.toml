@@ -19,6 +19,7 @@ execlaw-plugin-sdk = { path = "../plugin-sdk" }
 execlaw-server = { path = "../server" }
 execlaw-vault = { path = "../vault" }
 execlaw-inference-api = { path = "../inference-api" }
+execlaw-plugin-host = { path = "../plugin-host" }
 
 clap.workspace = true
 tokio.workspace = true

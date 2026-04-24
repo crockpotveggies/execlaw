@@ -3,6 +3,7 @@
 use crate::events::EventBus;
 use execlaw_core::Database;
 use execlaw_inference_api::InferenceClient;
+use execlaw_plugin_host::PluginHost;
 use std::sync::Arc;
 
 /// Configuration for the server process.
@@ -65,6 +66,9 @@ pub struct AppState {
     /// `None` when no backend is configured; chat route falls back to
     /// the Phase 0 stub reply.
     pub inference: Option<Arc<InferenceClient>>,
+    /// Plugin lifecycle manager + hook registry. Every route that
+    /// enumerates tools / transports / UI panels reads from here.
+    pub plugin_host: PluginHost,
 }
 
 impl std::fmt::Debug for AppState {

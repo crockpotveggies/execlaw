@@ -765,6 +765,7 @@ dependencies = [
  "execlaw-container-manager",
  "execlaw-core",
  "execlaw-inference-api",
+ "execlaw-plugin-host",
  "execlaw-plugin-sdk",
  "execlaw-server",
  "execlaw-vault",
@@ -870,10 +871,15 @@ name = "execlaw-plugin-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "chrono",
+ "criterion",
  "execlaw-core",
  "execlaw-plugin-sdk",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -945,6 +951,7 @@ dependencies = [
  "ed25519-dalek",
  "execlaw-core",
  "execlaw-inference-api",
+ "execlaw-plugin-host",
  "execlaw-plugin-sdk",
  "execlaw-policy",
  "execlaw-runner-local",
@@ -970,6 +977,7 @@ dependencies = [
  "utoipa-axum",
  "utoipa-swagger-ui",
  "uuid",
+ "zip 2.4.2",
 ]
 
 [[package]]

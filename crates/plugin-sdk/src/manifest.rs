@@ -51,6 +51,14 @@ pub struct PluginManifest {
 
     #[serde(default)]
     pub skills: Vec<SkillDecl>,
+
+    /// Runtime declaration — which isolation tier (§4.4) the plugin
+    /// runs in and how to spawn it. Optional because tool-only
+    /// plugins can sometimes be resolved in-process (Phase 3+
+    /// feature). For Phase 2 every plugin that declares tools or a
+    /// transport MUST set `[runtime]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDecl>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -231,6 +239,25 @@ pub enum HealthCheckProbe {
 pub struct SkillDecl {
     pub name: String,
     pub entry: String,
+}
+
+/// How the plugin's code actually runs (§4.4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuntimeDecl {
+    /// Which isolation tier — `"subprocess"` is the only one supported
+    /// in Phase 2. `"wasm"` and `"container"` land later.
+    pub tier: String,
+    /// Path to the executable, relative to the plugin's staged root.
+    /// Examples: `"node"` (resolved via PATH), `"./dist/plugin"`.
+    pub executable: String,
+    /// Arguments passed to the executable, in order.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables to set for the child. Secret references
+    /// (`secret://<plugin_id>/<name>`) are resolved by the host
+    /// against the vault before spawn.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Error)]

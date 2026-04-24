@@ -476,6 +476,24 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         .map(|bytes| std::sync::Arc::new(bytes.to_vec()))
         .ok();
 
+    // Stage root for installed plugins — defaults to
+    // `<db_parent>/plugins/`. Each install lands under
+    // `<stage_root>/<plugin_id>-<version>/`.
+    let stage_root = db_path
+        .parent()
+        .map(|p| p.join("plugins"))
+        .unwrap_or_else(|| PathBuf::from("./plugins"));
+    if let Err(e) = std::fs::create_dir_all(&stage_root) {
+        tracing::warn!(path = ?stage_root, error = %e, "failed to ensure plugin stage root");
+    }
+    let plugin_host = execlaw_plugin_host::PluginHost::new(
+        db.clone(),
+        execlaw_plugin_host::HookRegistry::new(),
+        stage_root,
+    );
+    // Re-hydrate installed plugins from the DB so they survive restart.
+    plugin_host.hydrate().await.map_err(|e| anyhow::anyhow!("plugin hydrate: {e}"))?;
+
     let state = execlaw_server::AppState {
         db,
         config: config.clone(),
@@ -484,6 +502,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         events: execlaw_server::EventBus::new(),
         event_log_hmac_key: hmac_key,
         inference,
+        plugin_host,
     };
     let app = execlaw_server::routes::build_router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
