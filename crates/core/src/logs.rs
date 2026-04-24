@@ -66,6 +66,88 @@ impl<'db> LogStore<'db> {
             Ok(())
         })
     }
+
+    /// Query rows with optional filters. `since_ms` is inclusive
+    /// (entries with `ts_ms >= since_ms` come back). Results are
+    /// ordered by `ts_ms` descending — newest first.
+    pub fn query(
+        &self,
+        level: Option<LogLevel>,
+        plugin_id: Option<&str>,
+        conversation_id: Option<&str>,
+        since_ms: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<LogRow>, DbError> {
+        let mut sql = String::from(
+            "SELECT ts_ms, level, target, conversation_id, plugin_id, message, fields_json \
+             FROM log_entries WHERE 1=1",
+        );
+        if level.is_some() {
+            sql.push_str(" AND level = ?");
+        }
+        if plugin_id.is_some() {
+            sql.push_str(" AND plugin_id = ?");
+        }
+        if conversation_id.is_some() {
+            sql.push_str(" AND conversation_id = ?");
+        }
+        if since_ms.is_some() {
+            sql.push_str(" AND ts_ms >= ?");
+        }
+        sql.push_str(" ORDER BY ts_ms DESC LIMIT ?");
+
+        self.db.with_conn(|c| {
+            // Build params list dynamically. rusqlite needs a fixed
+            // type so we go through the enum-typed params! macro.
+            let level_str = level.map(|l| l.as_str().to_owned());
+            let level_ref: Option<&str> = level_str.as_deref();
+
+            let mut stmt = c.prepare(&sql)?;
+            let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::new();
+            if let Some(l) = &level_ref {
+                binds.push(l);
+            }
+            if let Some(p) = &plugin_id {
+                binds.push(p);
+            }
+            if let Some(cv) = &conversation_id {
+                binds.push(cv);
+            }
+            if let Some(s) = &since_ms {
+                binds.push(s);
+            }
+            binds.push(&limit);
+
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(binds.iter().copied()), |r| {
+                    let ts_ms: i64 = r.get(0)?;
+                    let lvl_str: String = r.get(1)?;
+                    let target: String = r.get(2)?;
+                    let conv: Option<String> = r.get(3)?;
+                    let plugin: Option<String> = r.get(4)?;
+                    let message: String = r.get(5)?;
+                    let fields: Option<Vec<u8>> = r.get(6)?;
+                    let level = match lvl_str.as_str() {
+                        "TRACE" => LogLevel::Trace,
+                        "DEBUG" => LogLevel::Debug,
+                        "INFO" => LogLevel::Info,
+                        "WARN" => LogLevel::Warn,
+                        _ => LogLevel::Error,
+                    };
+                    Ok(LogRow {
+                        ts_ms,
+                        level,
+                        target,
+                        conversation_id: conv,
+                        plugin_id: plugin,
+                        message,
+                        fields_json: fields,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -73,6 +155,57 @@ mod tests {
     use super::*;
     use crate::db::{Database, DbConfig};
     use crate::migrations::MigrationRunner;
+
+    #[test]
+    fn query_filters_by_level_plugin_and_since() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let store = LogStore::new(&db);
+
+        // Three rows: different levels, different plugin scope, different times.
+        for (ts, level, plugin) in [
+            (100, LogLevel::Info, None),
+            (200, LogLevel::Warn, Some("plugin-signal".to_owned())),
+            (300, LogLevel::Error, Some("plugin-signal".to_owned())),
+        ] {
+            store
+                .insert(&LogRow {
+                    ts_ms: ts,
+                    level,
+                    target: "test".into(),
+                    conversation_id: None,
+                    plugin_id: plugin,
+                    message: format!("msg @ {ts}"),
+                    fields_json: None,
+                })
+                .unwrap();
+        }
+
+        // Filter by level → only the WARN.
+        let warns = store.query(Some(LogLevel::Warn), None, None, None, 100).unwrap();
+        assert_eq!(warns.len(), 1);
+        assert_eq!(warns[0].ts_ms, 200);
+
+        // Filter by plugin_id → 2 rows (warn + error).
+        let plugin_rows = store
+            .query(None, Some("plugin-signal"), None, None, 100)
+            .unwrap();
+        assert_eq!(plugin_rows.len(), 2);
+
+        // Filter by since_ms = 250 → only the error.
+        let recent = store.query(None, None, None, Some(250), 100).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].ts_ms, 300);
+
+        // Limit truncates.
+        let limited = store.query(None, None, None, None, 1).unwrap();
+        assert_eq!(limited.len(), 1);
+
+        // Default ordering: newest first.
+        let all = store.query(None, None, None, None, 100).unwrap();
+        assert_eq!(all[0].ts_ms, 300);
+        assert_eq!(all[2].ts_ms, 100);
+    }
 
     #[test]
     fn log_insert_and_fetch() {

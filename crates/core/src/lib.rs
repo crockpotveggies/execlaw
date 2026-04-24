@@ -20,6 +20,7 @@ pub mod attachments;
 pub mod config;
 pub mod conversation;
 pub mod db;
+pub mod eval;
 pub mod event_hmac;
 pub mod events;
 pub mod ids;

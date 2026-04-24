@@ -769,6 +769,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
  "clap",
  "directories",
  "execlaw-container-manager",
@@ -776,6 +777,7 @@ dependencies = [
  "execlaw-inference-api",
  "execlaw-plugin-host",
  "execlaw-plugin-sdk",
+ "execlaw-policy",
  "execlaw-server",
  "execlaw-vault",
  "keyring",
@@ -828,6 +830,20 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "execlaw-eval-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "execlaw-inference-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
 ]
 
 [[package]]

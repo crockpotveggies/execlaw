@@ -779,7 +779,12 @@ For the reader who wants to jump into code:
 | [`spec/asyncapi.yaml`](../spec/asyncapi.yaml) | WebSocket event vocabulary |
 | [`plugins/hello/`](../plugins/hello/) | In-tree reference subprocess plugin |
 | [`docs/plugin-inventory.md`](./plugin-inventory.md) | Phase 8 port queue |
-| [`crates/cli/src/main.rs`](../crates/cli/src/main.rs) | `execlaw` CLI (+ lifecycle subcommands) |
+| [`crates/core/src/eval.rs`](../crates/core/src/eval.rs) | `EvalFlaggedStore` for regression-target event ranges (Phase 5) |
+| [`crates/server/src/observability.rs`](../crates/server/src/observability.rs) | `GET /api/admin/logs` + `GET /api/admin/eval/flags` (Phase 5) |
+| [`crates/server/src/tracing_layer.rs`](../crates/server/src/tracing_layer.rs) | `SqliteLogLayer` — mirrors tracing events into `log_entries` (Phase 5) |
+| [`crates/eval-harness/src/main.rs`](../crates/eval-harness/src/main.rs) | LLM-judge harness against local Qwen (Phase 5) |
+| [`evals/rubrics/`](../evals/rubrics/) | Rubric TOML files |
+| [`crates/cli/src/main.rs`](../crates/cli/src/main.rs) | `execlaw` CLI (+ replay + eval flag/list subcommands) |
 
 ---
 
@@ -857,4 +862,20 @@ Per [`STATUS.md`](../STATUS.md) as of 2026-04-24.
 - `transport-voice` plugin for mic/speaker I/O + WebRTC AEC3 — `AudioIn` / `AudioOut` traits are ready.
 - ≤1.1 s EoS → first-audio latency acceptance: can be measured once the real backends plug in (the `t_ms` field on every voice event exists precisely for this measurement).
 
-**What's next — Phase 5 (observability + replay CLI):** See `MIGRATION_PLAN.md` §11.
+**Phase 5 — Observability, evaluation, replay CLI (infra only).** Complete.
+- Migration 0004: `eval_flagged` table for tagging regression-target event ranges
+- `EvalFlaggedStore` (insert / list_all / list_by_label) with adversarial test (inverted range rejected)
+- `LogStore::query` with level / plugin_id / conversation_id / since_ms filters + limit
+- `SqliteLogLayer` — `tracing_subscriber::Layer` impl that mirrors every tracing event into `log_entries`. Best-effort writes (DB lock failures don't break the process).
+- `GET /api/admin/logs` and `GET /api/admin/eval/flags` HTTP routes — pure data feeds for the Phase-6 React UI
+- `execlaw replay <conversation_id> --at <seq>` CLI — reconstructs the prompt history + sender trust + policy decision (capabilities / planner_executor / spotlighting / latency_band) + the events that turn committed
+- `execlaw eval flag <conv> --range a..b --label X --tags ... --notes ...` and `execlaw eval list [--label]` CLI commands
+- `execlaw-eval-harness` Rust binary — runs rubric TOML against a local OpenAI-compatible endpoint (the same Qwen the agent uses; no cloud judge). `--mock` mode skips the network call so CI exercises the orchestration without a live model.
+- Reference rubric at `evals/rubrics/trust-class.toml` covering: outsider can't pull Controller memory, Rule-of-Two breach blocked, tool_use/tool_result pairing.
+
+**Phase 5 deferrals → Phase 6 (UI):**
+- Log viewer React component
+- Eval-flag dashboard
+- Trace viewer embedded in the chat UI
+
+**What's next — Phase 6 (UI port + chat-first landing):** See `MIGRATION_PLAN.md` §11.

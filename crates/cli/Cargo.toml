@@ -20,8 +20,10 @@ execlaw-server = { path = "../server" }
 execlaw-vault = { path = "../vault" }
 execlaw-inference-api = { path = "../inference-api" }
 execlaw-plugin-host = { path = "../plugin-host" }
+execlaw-policy = { path = "../policy" }
 
 clap.workspace = true
+chrono.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

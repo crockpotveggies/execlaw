@@ -42,6 +42,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "state-plugins",
         sql: include_str!("../migrations/0003_state_plugins.sql"),
     },
+    Migration {
+        id: 4,
+        name: "eval-flagged",
+        sql: include_str!("../migrations/0004_eval_flagged.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -173,7 +178,7 @@ mod tests {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
         let runner = MigrationRunner::new(&db);
         let applied = runner.apply_all().unwrap();
-        assert_eq!(applied, vec![1, 2, 3]);
+        assert_eq!(applied, vec![1, 2, 3, 4]);
 
         // Spot-check: every documented table exists.
         let tables = vec![
@@ -187,6 +192,7 @@ mod tests {
             "state_attachments",
             "state_artifacts",
             "state_plugins",
+            "eval_flagged",
             "config_runner_deployments",
             "config_trust_policy",
             "config_alert_routing",
@@ -222,7 +228,7 @@ mod tests {
         let runner = MigrationRunner::new(&db);
         let first = runner.apply_all().unwrap();
         let second = runner.apply_all().unwrap();
-        assert_eq!(first, vec![1, 2, 3]);
+        assert_eq!(first, vec![1, 2, 3, 4]);
         assert!(
             second.is_empty(),
             "rerun must not re-apply already-applied migrations"

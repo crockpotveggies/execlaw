@@ -133,6 +133,30 @@ enum Command {
         #[arg(long, default_value_t = false)]
         no_encrypt: bool,
     },
+    /// Replay a turn — reconstructs the exact prompt the model saw,
+    /// the policy decision (capabilities, planner_executor, etc.),
+    /// and the events `commit_turn` produced for that turn.
+    ///
+    /// Used to debug "why did the model do that on turn 47?" without
+    /// re-running inference.
+    Replay {
+        /// Conversation id.
+        conversation_id: String,
+        /// Inclusive upper-bound seq. Replay reconstructs state up
+        /// to and including this seq.
+        #[arg(long)]
+        at: i64,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        no_encrypt: bool,
+    },
+    /// Eval-flag operations — tag event ranges as regression
+    /// targets for the LLM-judge harness.
+    Eval {
+        #[command(subcommand)]
+        op: EvalOp,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -157,6 +181,40 @@ enum DbOp {
 enum HwOp {
     /// Re-run tier-1 sysfs detection.
     Rescan,
+}
+
+#[derive(Debug, Subcommand)]
+enum EvalOp {
+    /// Tag a range of events on a conversation as a regression target.
+    Flag {
+        /// Conversation id.
+        conversation_id: String,
+        /// Inclusive event seq range, e.g. `12..48`.
+        #[arg(long)]
+        range: String,
+        /// Short human-readable label for the flag.
+        #[arg(long)]
+        label: String,
+        /// Optional comma-separated tags (`trust-class,rule-of-two`).
+        #[arg(long)]
+        tags: Option<String>,
+        /// Optional notes.
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        no_encrypt: bool,
+    },
+    /// List eval flags. Filter by label if provided.
+    List {
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        no_encrypt: bool,
+    },
 }
 
 /// Tracing subscriber init — stdout (JSON or human-readable) plus
@@ -497,6 +555,221 @@ fn cmd_hw_rescan() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `execlaw replay <conv_id> --at <seq>` — reconstruct the prompt
+/// the model saw, the policy decision, and the events that turn
+/// committed. Pure read-only operation against the SQLite log.
+fn cmd_replay(
+    conversation_id: String,
+    at: i64,
+    db_path: PathBuf,
+    no_encrypt: bool,
+) -> anyhow::Result<()> {
+    use execlaw_core::events::{EventKind, EventLog};
+    use execlaw_core::ids::{ConversationId, EventSeq};
+    use execlaw_core::principal::PrincipalStore;
+    use execlaw_core::principal::TrustLevel as CoreTrust;
+    use execlaw_policy::trust::{TrustLevel, TurnPolicyInput, evaluate_turn};
+
+    let db = open_db(&db_path, no_encrypt)?;
+    let cid = ConversationId::from(conversation_id.as_str());
+    let log = EventLog::new(&db);
+
+    let all_events = log
+        .replay_since(&cid, EventSeq(0))
+        .map_err(|e| anyhow::anyhow!("replay: {e}"))?;
+    if all_events.is_empty() {
+        anyhow::bail!("no events for conversation {conversation_id}");
+    }
+    let target_seq = at;
+    let target_idx = all_events
+        .iter()
+        .position(|e| e.seq.0 == target_seq)
+        .ok_or_else(|| anyhow::anyhow!("seq {target_seq} not in conversation {conversation_id}"))?;
+
+    // Walk backwards from target_seq to find the user_msg that
+    // started this turn — replay reconstructs the turn that
+    // CONTAINS the target seq.
+    let mut user_msg_idx = target_idx;
+    while user_msg_idx > 0
+        && all_events[user_msg_idx].kind != EventKind::UserMsg
+    {
+        user_msg_idx -= 1;
+    }
+
+    // Resolve sender trust at replay time. Prefer the persisted
+    // PrincipalStore row (post-trust-changes); fall back to the
+    // event's actor field for ephemeral senders.
+    let actor = all_events[user_msg_idx]
+        .actor
+        .as_deref()
+        .unwrap_or("controller");
+    let sender_trust = if actor == "controller" {
+        TrustLevel::Controller
+    } else {
+        let store = PrincipalStore::new(&db);
+        match store.get(&execlaw_core::ids::PrincipalId::from(actor)) {
+            Ok(Some(p)) => TrustLevel::parse(p.trust_level.class_tag())
+                .unwrap_or(TrustLevel::UnknownPending),
+            _ => {
+                // Stamp at replay time as if we were resolving fresh.
+                let _ = CoreTrust::Controller;
+                TrustLevel::UnknownPending
+            }
+        }
+    };
+
+    let policy = evaluate_turn(TurnPolicyInput {
+        effective_trust: sender_trust,
+        sender_trust,
+        voice: false,
+        accesses_sensitive_data: false,
+        produces_external_effect: false,
+    });
+
+    // Print the reconstructed turn.
+    println!("=== Replay {conversation_id} @ seq {target_seq} ===");
+    println!();
+    println!("Sender trust:        {:?}", sender_trust);
+    println!("Policy decision:");
+    println!("  drop_turn:         {}", policy.drop_turn);
+    println!("  require_approval:  {}", policy.require_approval);
+    println!("  planner_executor:  {}", policy.planner_executor);
+    println!("  spotlighting:      {}", policy.spotlighting);
+    println!("  latency_band:      {:?}", policy.latency_band);
+    println!("  capability_set:    {:?}", policy.capability_set);
+    println!();
+    println!("Reconstructed prompt history:");
+    for ev in &all_events[..=user_msg_idx] {
+        match ev.kind {
+            EventKind::UserMsg => {
+                let text = ev
+                    .decode_payload::<serde_json::Value>()
+                    .ok()
+                    .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|s| s.to_owned()))
+                    .unwrap_or_else(|| "<unparseable>".into());
+                println!("  user[{}]: {text}", ev.seq.0);
+            }
+            EventKind::ModelTurn => {
+                let text = ev
+                    .decode_payload::<serde_json::Value>()
+                    .ok()
+                    .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|s| s.to_owned()))
+                    .unwrap_or_else(|| "<unparseable>".into());
+                println!("  assistant[{}]: {text}", ev.seq.0);
+            }
+            _ => {}
+        }
+    }
+    println!();
+    println!("Events committed by/around the target turn (seq {} → {}):",
+        all_events[user_msg_idx].seq.0,
+        target_seq,
+    );
+    for ev in &all_events[user_msg_idx..=target_idx] {
+        println!(
+            "  seq={:>4}  kind={:<22}  actor={:?}",
+            ev.seq.0,
+            ev.kind.as_str(),
+            ev.actor
+        );
+    }
+    Ok(())
+}
+
+/// `execlaw eval flag <conv_id> --range a..b --label X` — record an
+/// eval-flag row.
+fn cmd_eval_flag(
+    conversation_id: String,
+    range: String,
+    label: String,
+    tags: Option<String>,
+    notes: Option<String>,
+    db_path: PathBuf,
+    no_encrypt: bool,
+) -> anyhow::Result<()> {
+    use execlaw_core::eval::{EvalFlagRow, EvalFlaggedStore};
+    use execlaw_core::ids::ConversationId;
+
+    let (from, to) = parse_range(&range)?;
+    let tags_vec: Vec<String> = tags
+        .map(|s| s.split(',').map(|t| t.trim().to_owned()).collect())
+        .unwrap_or_default();
+
+    let db = open_db(&db_path, no_encrypt)?;
+    let store = EvalFlaggedStore::new(&db);
+    let id = store
+        .insert(&EvalFlagRow {
+            id: None,
+            conversation_id: ConversationId::from(conversation_id.as_str()),
+            from_seq: from,
+            to_seq: to,
+            label: label.clone(),
+            tags: tags_vec,
+            flagged_by: "controller".into(),
+            flagged_at: chrono::Utc::now().timestamp(),
+            notes,
+        })
+        .map_err(|e| anyhow::anyhow!("insert: {e}"))?;
+    println!("flagged: id={id} conversation={conversation_id} range={from}..{to} label={label}");
+    Ok(())
+}
+
+/// `execlaw eval list [--label X]` — print every eval flag.
+fn cmd_eval_list(
+    label: Option<String>,
+    db_path: PathBuf,
+    no_encrypt: bool,
+) -> anyhow::Result<()> {
+    use execlaw_core::eval::EvalFlaggedStore;
+
+    let db = open_db(&db_path, no_encrypt)?;
+    let store = EvalFlaggedStore::new(&db);
+    let rows = match label.as_deref() {
+        Some(l) => store
+            .list_by_label(l)
+            .map_err(|e| anyhow::anyhow!("list: {e}"))?,
+        None => store.list_all().map_err(|e| anyhow::anyhow!("list: {e}"))?,
+    };
+    if rows.is_empty() {
+        println!("(no flags)");
+        return Ok(());
+    }
+    for r in rows {
+        println!(
+            "id={:<4} conv={:<24} range={:>4}..{:<4} label={:<24} tags={:?} flagged_at={}",
+            r.id.unwrap_or_default(),
+            r.conversation_id.as_str(),
+            r.from_seq,
+            r.to_seq,
+            r.label,
+            r.tags,
+            r.flagged_at,
+        );
+        if let Some(n) = r.notes {
+            println!("       notes: {n}");
+        }
+    }
+    Ok(())
+}
+
+/// Parse `12..48` (inclusive on both ends).
+fn parse_range(s: &str) -> anyhow::Result<(i64, i64)> {
+    let mut parts = s.splitn(2, "..");
+    let from: i64 = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("range '{s}' missing 'from'"))?
+        .trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("bad from in '{s}': {e}"))?;
+    let to: i64 = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("range '{s}' missing 'to' (use a..b)"))?
+        .trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("bad to in '{s}': {e}"))?;
+    Ok((from, to))
+}
+
 async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::Result<()> {
     let db = open_db(&db_path, no_encrypt)?;
     execlaw_core::MigrationRunner::new(&db).apply_all()?;
@@ -616,6 +889,41 @@ fn main() -> ExitCode {
                 no_encrypt,
             ))
         }
+        Command::Replay {
+            conversation_id,
+            at,
+            db,
+            no_encrypt,
+        } => cmd_replay(
+            conversation_id,
+            at,
+            db.unwrap_or_else(default_db_path),
+            no_encrypt,
+        ),
+        Command::Eval { op } => match op {
+            EvalOp::Flag {
+                conversation_id,
+                range,
+                label,
+                tags,
+                notes,
+                db,
+                no_encrypt,
+            } => cmd_eval_flag(
+                conversation_id,
+                range,
+                label,
+                tags,
+                notes,
+                db.unwrap_or_else(default_db_path),
+                no_encrypt,
+            ),
+            EvalOp::List {
+                label,
+                db,
+                no_encrypt,
+            } => cmd_eval_list(label, db.unwrap_or_else(default_db_path), no_encrypt),
+        },
     })();
 
     match result {
