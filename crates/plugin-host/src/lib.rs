@@ -13,8 +13,8 @@ pub mod hook_registry;
 pub mod subprocess;
 
 pub use hook_registry::{
-    HookRegistry, RegisteredAlertSource, RegisteredEventSubscription,
-    RegisteredIdentityProvider, RegisteredTool, RegisteredTransport, RegisteredUiPanel,
+    HookRegistry, RegisteredAlertSource, RegisteredEventSubscription, RegisteredIdentityProvider,
+    RegisteredTool, RegisteredTransport, RegisteredUiPanel,
 };
 pub use subprocess::{RpcError, RpcRequest, RpcResponse, SubprocessPlugin, SubprocessSpec};
 

@@ -19,3 +19,5 @@ thiserror.workspace = true
 ed25519-dalek.workspace = true
 jsonwebtoken.workspace = true
 rand.workspace = true
+rand_chacha.workspace = true
+hex.workspace = true

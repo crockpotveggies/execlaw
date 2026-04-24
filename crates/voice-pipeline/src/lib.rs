@@ -9,6 +9,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bargein;
+pub mod endpointer;
+pub mod graph;
+
+pub use bargein::{BargeInConfig, BargeInDecision, decide as decide_bargein, is_backchannel};
+pub use endpointer::{
+    EndpointHint, EndpointerConfig, classify_and_window, classify_tail, silence_window_ms,
+};
+pub use graph::{DATA_LANE_CAPACITY, Pipeline, PipelineEnds, SYSTEM_LANE_CAPACITY};
+
 use serde::{Deserialize, Serialize};
 
 /// Frames on the **system lane** pre-empt anything on the data lane.

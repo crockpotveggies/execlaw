@@ -14,8 +14,8 @@
 //!
 //! **No cloud dependencies.** `tokio::sync::broadcast` in-process only.
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -29,7 +29,9 @@ use crate::state::AppState;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiEvent {
     /// Heartbeat so the client can detect dead connections.
-    Ping { ts: i64 },
+    Ping {
+        ts: i64,
+    },
 
     /// User sent a message to a conversation.
     ChatMessageInbound {
@@ -138,7 +140,10 @@ pub async fn stream_handler(
 
 async fn handle_socket(mut socket: WebSocket, bus: EventBus) {
     let mut rx = bus.subscribe();
-    debug!("ws stream connected; subscribers now {}", bus.subscriber_count());
+    debug!(
+        "ws stream connected; subscribers now {}",
+        bus.subscriber_count()
+    );
 
     // Send an initial ping so the client knows the stream is live.
     let _ = socket

@@ -39,8 +39,7 @@ pub fn canonical_bytes(
     actor: Option<&str>,
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut buf =
-        Vec::with_capacity(conversation_id.len() + kind.len() + payload.len() + 32);
+    let mut buf = Vec::with_capacity(conversation_id.len() + kind.len() + payload.len() + 32);
     buf.extend_from_slice(conversation_id.as_bytes());
     buf.push(0);
     buf.extend_from_slice(&seq.to_le_bytes());

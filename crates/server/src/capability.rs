@@ -90,8 +90,8 @@ pub fn verify_capability_token(
     use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 
     let pub_pem = signer.public_pem();
-    let decoding_key = DecodingKey::from_ed_pem(&pub_pem)
-        .map_err(|e| format!("bad public key: {e}"))?;
+    let decoding_key =
+        DecodingKey::from_ed_pem(&pub_pem).map_err(|e| format!("bad public key: {e}"))?;
     let mut validation = Validation::new(Algorithm::EdDSA);
     validation.set_issuer(&[signer.issuer()]);
     validation.leeway = 5;
@@ -170,14 +170,7 @@ mod tests {
     fn different_signer_cannot_verify() {
         let signer_a = JwtSigner::generate("execlaw-test".into());
         let signer_b = JwtSigner::generate("execlaw-test".into());
-        let token = issue_capability_token(
-            &signer_a,
-            "pri_ctrl",
-            "conv_abc",
-            1,
-            vec![],
-            None,
-        );
+        let token = issue_capability_token(&signer_a, "pri_ctrl", "conv_abc", 1, vec![], None);
         let err = verify_capability_token(&signer_b, &token, "conv_abc", 1).unwrap_err();
         assert!(err.contains("verification failed"));
     }

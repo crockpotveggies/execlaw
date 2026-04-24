@@ -215,7 +215,11 @@ impl HookRegistry {
     }
 
     pub fn is_enabled(&self, plugin_id: &str) -> bool {
-        self.inner.read().unwrap().enabled_plugins.contains(plugin_id)
+        self.inner
+            .read()
+            .unwrap()
+            .enabled_plugins
+            .contains(plugin_id)
     }
 
     pub fn tool(&self, name: &str) -> Option<RegisteredTool> {
@@ -272,9 +276,7 @@ mod tests {
     use super::*;
 
     fn manifest_with_tools(id: &str, tool_names: &[&str]) -> PluginManifest {
-        let mut t = format!(
-            "[plugin]\nid = \"{id}\"\nname = \"{id}\"\nversion = \"1.0.0\"\n"
-        );
+        let mut t = format!("[plugin]\nid = \"{id}\"\nname = \"{id}\"\nversion = \"1.0.0\"\n");
         for name in tool_names {
             t.push_str(&format!(
                 "\n[[tools]]\nname = \"{name}\"\nschema = \"schemas/{name}.json\"\nlatency = \"low\"\nrequired_capabilities = []\n"

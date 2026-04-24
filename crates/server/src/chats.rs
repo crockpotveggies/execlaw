@@ -207,7 +207,10 @@ pub async fn list_messages(
         .filter(|e| {
             matches!(
                 e.kind,
-                EventKind::UserMsg | EventKind::ModelTurn | EventKind::ToolUse | EventKind::ToolResult
+                EventKind::UserMsg
+                    | EventKind::ModelTurn
+                    | EventKind::ToolUse
+                    | EventKind::ToolResult
             )
         })
         .take(limit as usize)
@@ -342,7 +345,12 @@ mod tests {
         let (status, body) = send(build_app(), "hello").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["user_msg_seq"].as_i64().unwrap(), 1);
-        assert!(body["assistant_text"].as_str().unwrap().contains("execlaw dev stub"));
+        assert!(
+            body["assistant_text"]
+                .as_str()
+                .unwrap()
+                .contains("execlaw dev stub")
+        );
     }
 
     #[tokio::test]
@@ -383,12 +391,7 @@ mod tests {
         let mut saw_inbound = false;
         let mut saw_outbound = false;
         for _ in 0..5 {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                rx.recv(),
-            )
-            .await
-            {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
                 Ok(Ok(UiEvent::ChatMessageInbound { .. })) => saw_inbound = true,
                 Ok(Ok(UiEvent::ChatMessageOutbound { .. })) => saw_outbound = true,
                 _ => break,

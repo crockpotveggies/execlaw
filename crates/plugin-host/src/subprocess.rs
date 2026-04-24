@@ -180,10 +180,7 @@ impl SubprocessPlugin {
                 .write_all(&line)
                 .await
                 .map_err(|e| format!("write rpc: {e}"))?;
-            stdin
-                .flush()
-                .await
-                .map_err(|e| format!("flush rpc: {e}"))?;
+            stdin.flush().await.map_err(|e| format!("flush rpc: {e}"))?;
         }
 
         let resp = rx
@@ -224,15 +221,13 @@ mod tests {
 
     #[test]
     fn rpc_response_decodes_success_and_error() {
-        let ok: RpcResponse =
-            serde_json::from_str(r#"{"id":1,"result":{"ok":true}}"#).unwrap();
+        let ok: RpcResponse = serde_json::from_str(r#"{"id":1,"result":{"ok":true}}"#).unwrap();
         assert_eq!(ok.id, 1);
         assert!(ok.result.is_some());
         assert!(ok.error.is_none());
 
         let err: RpcResponse =
-            serde_json::from_str(r#"{"id":2,"error":{"code":-1,"message":"boom"}}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"id":2,"error":{"code":-1,"message":"boom"}}"#).unwrap();
         assert_eq!(err.id, 2);
         assert!(err.result.is_none());
         assert_eq!(err.error.unwrap().message, "boom");
