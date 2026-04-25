@@ -33,6 +33,7 @@ pub mod memory;
 pub mod migrations;
 pub mod outbox;
 pub mod principal;
+pub mod refresh_tokens;
 pub mod research;
 pub mod transport_conversations;
 pub mod transport_cursor;

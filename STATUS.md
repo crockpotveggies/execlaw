@@ -1,16 +1,17 @@
 # execlaw build STATUS
 
-Last update: 2026-04-25, after Phase 7 sub-phase **7e** WebAuthn second-factor (data layer + relying-party + login branch + SPA Profile + Login flow).
+Last update: 2026-04-25, after Phase 7 hardening — **JWT plumbing**: persistent refresh-token store + logout-everywhere + SPA silent retry + background refresh.
 
 ## TL;DR
 
 - `cargo build --workspace` — **clean** (stub mode; webauthn-rs gated behind `--features webauthn` for the Linux/Docker production build)
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **441 passing, 0 failing** (+10 vs wave 2)
-- `cargo bench --workspace --no-run` — **clean** (48 benches across 9 crates; +3 webauthn_store benches)
-- `cd web && npm test` — **113 passing** (+6 vs wave 2: webauthn-helpers)
-- `cd web && npm run build` — **clean** (313 KB JS / 311 KB CSS, both well under budget)
+- `cargo test --workspace --no-fail-fast` — **454 passing, 0 failing** (+13 vs 7e: 8 refresh_tokens core + 2 logout-all routes + 3 RefreshStore wrapper invariants)
+- `cargo bench --workspace --no-run` — **clean** (54 benches across 9 crates; +6 refresh_token_store benches)
+- `cd web && npm test` — **117 passing** (+4 vs 7e: silent-retry-on-401 paths)
+- `cd web && npm run build` — **clean** (315 KB JS / 311 KB CSS, both well under budget)
 - **Zero cloud-SDK dependencies** anywhere in the workspace
+- **Phase 7 JWT hardening done.** Shipped: (a) **Migration 0008** + `state_refresh_tokens` table — refresh tokens now survive a server restart instead of silently signing every operator out; (b) **`RefreshTokenStore`** in core (issue / single-use consume / revoke_session / revoke_all_for_user / active_session_count / purge_expired + 8 unit tests including the persistence-survives-recreate invariant); (c) **`POST /api/logout/all`** endpoint + 2 server tests covering the multi-session revoke + the auth-required gate; (d) **SPA `apiFetch` silent auto-retry** — installs a `RefreshHook` on AuthContext mount that rotates tokens on a 401 and replays the original request once, with explicit guards against retry loops + caller-controlled tokens; (e) **Background refresh timer** — fires at 80% of the 15-min access-token TTL so the user never sees a 401-flash; (f) **"Sign out everywhere"** button on Settings → Profile that calls `/api/logout/all` + bounces to `/login`.
 - **Phase 7 sub-phase 7e (WebAuthn) done.** Shipped: (a) **Migration 0007** + `state_webauthn_credentials` table with per-user 10-credential cap + ON DELETE CASCADE on `users`; (b) **`WebauthnStore`** in core (insert / count_for_user / list_for_user / get / update_counter / delete_owned + 8 unit tests including ownership + cascade); (c) **`WebauthnSvc`** in server (relying-party config, register + authenticate ceremonies, 5-minute ceremony TTL with `prune_expired`, deterministic user-handle UUID); (d) **HTTP routes** for register begin/finish, list, delete, login finish — all audit-logged; (e) **/api/login second-factor branch** — when `count_for_user > 0`, returns the new `LoginOutcome::WebauthnChallenge` instead of tokens, fail-closed if the svc is missing; (f) **SPA**: `coerceCreationOptions`/`coerceRequestOptions`/`serializeCredential` browser helpers (base64url ↔ ArrayBuffer), Login screen handles the challenge (auto-prompts authenticator + retry button), Settings → Profile credential management.
 - **Build feature gate**: `webauthn-rs` pulls in `openssl-sys` which can't build out-of-the-box on Windows MSYS perl. The integration lives behind the `webauthn` feature on the server crate (default OFF) so the workspace `cargo build` works on every host. Production Docker build enables it explicitly. When the feature is OFF, every webauthn route returns 503 `webauthn_unconfigured`, registration is impossible, and the login branch never fires (because count_for_user always observes 0).
 - **Wave 3 remaining:** **7d** WASM plugin tier (largest — needs PluginRuntime trait extraction first), **7f** advanced subagents (greenfield, last per ordering).
@@ -100,24 +101,22 @@ EXECLAW_INFERENCE_URL=http://127.0.0.1:8000/v1 cargo start
 ## Test counts (per crate)
 
 ```
-execlaw-core             163     DB, events (+HMAC sign/verify + atomicity +
-                                 NULL-tag backfill happy-path/idempotent/
-                                 rejects-without-keyring/key-id stamping),
-                                 outbox (+claim/record_failure/ready_pending),
-                                 alerts, memory, principals (+PrincipalStore),
-                                 idempotency keys, snapshots, HMAC
-                                 tamper-tests, migrations (now 7), conv
-                                 kind derivation, eval_flagged store, log
-                                 query, UserStore (list_all ordering,
-                                 idempotent delete, count_by_role for
-                                 last-controller invariant), WebauthnStore
-                                 (insert/list/count/update_counter/delete_
-                                 owned + 10-cred cap + duplicate-id reject
-                                 + ownership-scoped delete + ON DELETE
-                                 CASCADE), thread metadata mutators,
-                                 ConversationResolver, EphemeralSweeper,
-                                 KeyRing rotation
-execlaw-server            92     auth, events (WS bus), capability tokens,
+execlaw-core             171     DB, events (+HMAC sign/verify + atomicity +
+                                 NULL-tag backfill), outbox, alerts,
+                                 memory, principals, idempotency keys,
+                                 snapshots, HMAC tamper-tests, migrations
+                                 (now 8), conv kind derivation, eval_flagged
+                                 store, log query, UserStore, WebauthnStore
+                                 (insert/list/count/update_counter/
+                                 delete_owned + 10-cred cap + ON DELETE
+                                 CASCADE), RefreshTokenStore (issue/
+                                 single-use consume/revoke_session/
+                                 revoke_all_for_user/active_session_count/
+                                 purge_expired + persistence-survives-
+                                 recreate invariant), thread metadata
+                                 mutators, ConversationResolver,
+                                 EphemeralSweeper, KeyRing rotation
+execlaw-server            95     auth, events (WS bus), capability tokens,
                                  chat routes (streaming, policy, crash tests,
                                  cold-contact adversarial, identity-match
                                  classifier), tool_dispatch, tracing_layer,
@@ -131,7 +130,8 @@ execlaw-server            92     auth, events (WS bus), capability tokens,
                                  bypasses → fail-closed invariant),
                                  OpenAPI coverage guard for every route,
                                  login leak-prevention, username
-                                 invalid-shape rejection
+                                 invalid-shape rejection, /api/logout/all
+                                 (multi-session revoke + auth-required)
 execlaw-server (integ)    22     plugin_lifecycle (11) + approval_flow (11)
 execlaw-policy            43     rule_of_two, trust evaluator, spotlighting,
                                  sideband, input_guard, JWT claims
@@ -152,9 +152,14 @@ execlaw-outbox            11     backoff, retry budget, drain, WakeupScheduler (
 execlaw-session            1     modality binding
 execlaw-eval-harness       2     rubric parse, mock-mode orchestration
 --------------------------------------------------------------------
-TOTAL                    441 passing, 0 failing
+TOTAL                    454 passing, 0 failing
 
-execlaw-web (vitest)     113     api/client + endpoints + tokens + auth boot,
+execlaw-web (vitest)     117     api/client (incl. silent-retry on 401:
+                                 hook called once + retried with new token,
+                                 hook null = no retry, no infinite loop on
+                                 retry-401, explicit accessToken disables
+                                 the retry) + endpoints + tokens + auth
+                                 boot,
                                  SetupWizard form validation (incl. username),
                                  ScreenTransition smoke, AppBoot routing,
                                  chat store (idempotent append, pinned/unread
@@ -219,6 +224,10 @@ execlaw-web (vitest)     113     api/client + endpoints + tokens + auth boot,
 | `webauthn_store/count_for_user/3` | 1.5 µs | ≤50 µs | linear w/ creds, dominated by SQLite COUNT |
 | `webauthn_store/list_for_user/1` | 3.6 µs | ≤200 µs | only on the assertion path |
 | `webauthn_store/list_for_user/10` | 8.0 µs | ≤200 µs | hard cap at MAX_CREDENTIALS_PER_USER |
+| `refresh_token_store/issue` | 4.9 µs | ≤200 µs | every login + every silent-retry rotation |
+| `refresh_token_store/consume_hit` | 5.6 µs | ≤200 µs | atomic DELETE … RETURNING |
+| `refresh_token_store/consume_miss` | 2.7 µs | ≤200 µs | replayed token fast-fails |
+| `refresh_token_store/revoke_all_for_user/64` | 58 µs | ≤5 ms | "sign out everywhere"; linear in session count |
 
 ## Grounding-rule compliance (re-audited this session)
 
@@ -271,6 +280,11 @@ execlaw-web (vitest)     113     api/client + endpoints + tokens + auth boot,
 | Login second-factor branch (fail-closed) | `crates/server/src/routes.rs::login` |
 | Login screen passkey flow | `web/src/routes/Login.tsx` + `web/src/auth/webauthn.ts` |
 | Settings → Profile passkey management | `web/src/settings/ProfilePage.tsx` |
+| Persistent refresh tokens (SQLite) | `crates/core/src/refresh_tokens.rs` |
+| RefreshStore wrapper (server) | `crates/server/src/auth.rs::RefreshStore` |
+| /api/logout/all (sign-out-everywhere) | `crates/server/src/routes.rs::logout_all` |
+| SPA silent retry hook | `web/src/api/client.ts::setRefreshHook` |
+| SPA background refresh + signOutEverywhere | `web/src/auth/AuthContext.tsx` |
 | Thread metadata route (PATCH) | `crates/server/src/chats.rs::patch_thread` |
 | UI-panel manifest route | `crates/server/src/plugins.rs::list_ui_panels_handler` |
 | Thread-name agent tool | `crates/runner-local/src/thread_tool.rs` |

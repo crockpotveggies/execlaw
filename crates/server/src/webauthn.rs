@@ -193,7 +193,7 @@ pub fn issue_login_tokens(
         user_id,
         &session_id,
         state.config.refresh_token_ttl_secs,
-    );
+    )?;
     Ok(Json(crate::routes::LoginResponse {
         access_token: access,
         refresh_token: refresh,
@@ -217,7 +217,7 @@ mod imp {
     use super::*;
     use axum::extract::{Path as AxumPath, State};
     use axum::routing::{delete, get, post};
-    use crate::auth_extract::AuthenticatedUser;
+    use crate::auth_extract::AuthedUser;
     use dashmap::DashMap;
     use execlaw_core::webauthn::{WebauthnCredentialRow, WebauthnStore};
     use webauthn_rs::prelude::{
@@ -398,7 +398,7 @@ mod imp {
 
     pub async fn register_begin_handler(
         State(state): State<AppState>,
-        user: AuthenticatedUser,
+        user: AuthedUser,
         Json(req): Json<RegisterBeginRequest>,
     ) -> Result<Json<RegisterBeginResponse>, ApiError> {
         let svc = state.webauthn.as_ref().ok_or_else(webauthn_unconfigured)?;
@@ -448,7 +448,7 @@ mod imp {
 
     pub async fn register_finish_handler(
         State(state): State<AppState>,
-        user: AuthenticatedUser,
+        user: AuthedUser,
         Json(req): Json<RegisterFinishRequest>,
     ) -> Result<Json<CredentialView>, ApiError> {
         let svc = state.webauthn.as_ref().ok_or_else(webauthn_unconfigured)?;
@@ -503,7 +503,7 @@ mod imp {
 
     pub async fn list_credentials_handler(
         State(state): State<AppState>,
-        user: AuthenticatedUser,
+        user: AuthedUser,
     ) -> Result<Json<CredentialListResponse>, ApiError> {
         let store = WebauthnStore::new(&state.db);
         let rows = store.list_for_user(&user.user_id).map_err(ApiError::from)?;
@@ -513,7 +513,7 @@ mod imp {
 
     pub async fn delete_credential_handler(
         State(state): State<AppState>,
-        user: AuthenticatedUser,
+        user: AuthedUser,
         AxumPath(credential_id): AxumPath<String>,
     ) -> Result<StatusCode, ApiError> {
         let store = WebauthnStore::new(&state.db);

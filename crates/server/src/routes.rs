@@ -133,6 +133,14 @@ pub struct GenericOk {
     pub ok: bool,
 }
 
+/// Response from `POST /api/logout/all`. Reports how many session
+/// rows were invalidated so the SPA can show a "signed out of N
+/// other sessions" toast.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LogoutAllResponse {
+    pub revoked_session_count: usize,
+}
+
 // -----------------------------------------------------------------------
 // Error mapping
 // -----------------------------------------------------------------------
@@ -413,7 +421,7 @@ pub async fn setup(
         &principal_id,
         &session_id,
         state.config.refresh_token_ttl_secs,
-    );
+    )?;
 
     Ok(Json(SetupResponse {
         principal_id,
@@ -506,7 +514,7 @@ pub async fn login(
         &user.user_id,
         &session_id,
         state.config.refresh_token_ttl_secs,
-    );
+    )?;
     Ok(Json(LoginOutcome::Tokens {
         webauthn_required: false,
         access_token: access,
@@ -530,7 +538,7 @@ pub async fn refresh(
 ) -> Result<Json<RefreshResponse>, ApiError> {
     let record = state
         .refresh_store
-        .consume(&req.refresh_token)
+        .consume(&req.refresh_token)?
         .ok_or(ApiError {
             status: StatusCode::UNAUTHORIZED,
             code: "invalid_refresh_token",
@@ -546,7 +554,7 @@ pub async fn refresh(
         &record.principal_id,
         &record.session_id,
         state.config.refresh_token_ttl_secs,
-    );
+    )?;
     Ok(Json(RefreshResponse {
         access_token: access,
         refresh_token: refresh,
@@ -565,11 +573,33 @@ pub async fn logout(
     Json(req): Json<LogoutRequest>,
 ) -> Result<Json<GenericOk>, ApiError> {
     if let Some(tok) = &req.refresh_token {
-        if let Some(record) = state.refresh_store.consume(tok) {
-            state.refresh_store.revoke_session(&record.session_id);
+        if let Some(record) = state.refresh_store.consume(tok)? {
+            state.refresh_store.revoke_session(&record.session_id)?;
         }
     }
     Ok(Json(GenericOk { ok: true }))
+}
+
+/// "Sign out everywhere" — revoke every refresh token bound to the
+/// caller's user_id. Auth is required (the operator must still be
+/// signed in); the caller is identified from the JWT, never from the
+/// request body, so a leaked refresh token alone can't trigger a
+/// global revoke for someone else.
+#[utoipa::path(
+    post,
+    path = "/api/logout/all",
+    responses((status = 200, description = "All sessions revoked", body = LogoutAllResponse)),
+    security(("bearer_jwt" = [])),
+    tag = "auth"
+)]
+pub async fn logout_all(
+    State(state): State<AppState>,
+    user: crate::auth_extract::AuthedUser,
+) -> Result<Json<LogoutAllResponse>, ApiError> {
+    let removed = state.refresh_store.revoke_all_for_user(&user.user_id)?;
+    Ok(Json(LogoutAllResponse {
+        revoked_session_count: removed,
+    }))
 }
 
 // -----------------------------------------------------------------------
@@ -587,6 +617,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/login", post(login))
         .route("/api/token/refresh", post(refresh))
         .route("/api/logout", post(logout))
+        .route("/api/logout/all", post(logout_all))
         .route(
             "/api/chats/{conversation_id}/messages",
             post(crate::chats::send_message).get(crate::chats::list_messages),
@@ -625,7 +656,7 @@ pub fn test_app_state() -> AppState {
         db: db.clone(),
         config: Arc::new(ServerConfig::default()),
         signer: Arc::new(JwtSigner::generate("execlaw-test".into())),
-        refresh_store: Arc::new(RefreshStore::new()),
+        refresh_store: Arc::new(RefreshStore::new(db.clone())),
         events: crate::events::EventBus::new(),
         // Tests use a deterministic HMAC key so replay works end-to-end.
         event_log_hmac_key: Some(Arc::new(
@@ -1040,6 +1071,91 @@ mod tests {
         assert_eq!(body["webauthn_required"], false);
         assert!(body["access_token"].as_str().is_some());
         assert!(body["refresh_token"].as_str().is_some());
+    }
+
+    /// `/api/logout/all` revokes every refresh token for the caller,
+    /// not just the one in the request body. Verified by issuing
+    /// multiple sessions for the same user, calling logout/all, and
+    /// asserting every refresh token is now dead.
+    #[tokio::test]
+    async fn logout_all_revokes_every_session_for_caller() {
+        let state = test_app_state();
+        let app = build_router(state.clone());
+        let (_, setup_body_json) = send_json(
+            &app,
+            Method::POST,
+            "/api/setup",
+            setup_body("hunter2-longer", "J"),
+        )
+        .await;
+        let access1 = setup_body_json["access_token"].as_str().unwrap().to_owned();
+        let refresh1 = setup_body_json["refresh_token"].as_str().unwrap().to_owned();
+
+        // Mint a SECOND session via /api/login (acts like the same
+        // user signing in from a different browser).
+        let (_, login_body_json) = send_json(
+            &app,
+            Method::POST,
+            "/api/login",
+            login_body("tester", "hunter2-longer"),
+        )
+        .await;
+        let refresh2 = login_body_json["refresh_token"].as_str().unwrap().to_owned();
+
+        // Caller is the first session. Both refresh tokens should
+        // get invalidated by the single logout/all call.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/logout/all")
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )
+            .header(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {access1}")).unwrap(),
+            )
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let j: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        // Two sessions × one refresh row each = 2 revoked.
+        assert_eq!(j["revoked_session_count"], 2);
+
+        // Both refresh tokens now fail to refresh.
+        for tok in [&refresh1, &refresh2] {
+            let (status, body) = send_json(
+                &app,
+                Method::POST,
+                "/api/token/refresh",
+                serde_json::json!({"refresh_token": tok}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "token {tok} still works after logout/all: {body}");
+            assert_eq!(body["error"]["code"], "invalid_refresh_token");
+        }
+    }
+
+    /// `/api/logout/all` requires a valid Bearer token — an
+    /// unauthenticated caller can't trigger a global revoke for
+    /// some user they happen to know the id of.
+    #[tokio::test]
+    async fn logout_all_requires_auth() {
+        let app = build_router(test_app_state());
+        let _ = send_json(&app, Method::POST, "/api/setup", setup_body("hunter2-longer", "J")).await;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/logout/all")
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// Phase 7e fail-closed invariant: if a user somehow has webauthn

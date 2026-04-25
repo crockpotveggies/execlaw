@@ -53,6 +53,26 @@ export async function postSetup(req: SetupRequest): Promise<SetupResponse> {
     });
 }
 
+// ---- /api/logout/all (Phase 7 hardening) ---------------------------
+
+export interface LogoutAllResponse {
+    revoked_session_count: number;
+}
+
+/// "Sign out everywhere" — revokes every refresh token bound to the
+/// caller's user_id on the server. The caller is identified from
+/// the Bearer token, never from the request body, so a stolen
+/// refresh token alone can't trigger this for someone else.
+export async function postLogoutAll(
+    tokenAccessor: () => string | null,
+): Promise<LogoutAllResponse> {
+    return apiFetch<LogoutAllResponse>(
+        "/api/logout/all",
+        { method: "POST", body: {} },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/login ----------------------------------------------------
 
 export interface LoginRequest {

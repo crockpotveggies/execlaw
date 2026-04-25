@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ApiError, apiFetch } from "../api/client";
+import { ApiError, apiFetch, setRefreshHook } from "../api/client";
 
 describe("apiFetch", () => {
     let fetchMock: ReturnType<typeof vi.fn>;
@@ -139,5 +139,111 @@ describe("apiFetch", () => {
         const init = fetchMock.mock.calls[0][1] as RequestInit;
         const headers = init.headers as Record<string, string>;
         expect(headers.authorization).toBe("Bearer explicit");
+    });
+
+    describe("silent retry on 401 (Phase 7 hardening)", () => {
+        afterEach(() => {
+            setRefreshHook(null);
+        });
+
+        it("calls the installed refresh hook on 401 + retries with the new token", async () => {
+            // First call: 401. Second call (the retry): 200.
+            const calls: Array<RequestInit | undefined> = [];
+            fetchMock.mockImplementation(async (_url, init) => {
+                calls.push(init as RequestInit);
+                if (calls.length === 1) {
+                    return new Response(
+                        JSON.stringify({
+                            error: { code: "invalid_token", message: "expired" },
+                        }),
+                        { status: 401 },
+                    );
+                }
+                return new Response(JSON.stringify({ ok: true }), {
+                    status: 200,
+                });
+            });
+            const hook = vi.fn(async () => "fresh-token");
+            setRefreshHook(hook);
+
+            const out = await apiFetch<{ ok: boolean }>(
+                "/api/x",
+                {},
+                () => "stale-token",
+            );
+            expect(out.ok).toBe(true);
+            expect(hook).toHaveBeenCalledTimes(1);
+            // First request used the stale token; the retry used the
+            // fresh one returned by the hook.
+            const stale = calls[0]?.headers as Record<string, string>;
+            const fresh = calls[1]?.headers as Record<string, string>;
+            expect(stale.authorization).toBe("Bearer stale-token");
+            expect(fresh.authorization).toBe("Bearer fresh-token");
+        });
+
+        it("does NOT retry when the hook returns null (refresh failed)", async () => {
+            fetchMock.mockImplementation(
+                async () =>
+                    new Response(
+                        JSON.stringify({
+                            error: { code: "invalid_token", message: "x" },
+                        }),
+                        { status: 401 },
+                    ),
+            );
+            const hook = vi.fn(async () => null);
+            setRefreshHook(hook);
+
+            await expect(
+                apiFetch("/api/x", {}, () => "stale"),
+            ).rejects.toBeInstanceOf(ApiError);
+            // Hook was tried once; original 401 propagates.
+            expect(hook).toHaveBeenCalledTimes(1);
+            // Only one fetch call — the retry path was skipped because
+            // the hook returned null.
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+        });
+
+        it("does not loop: a 401 on the retry surfaces normally", async () => {
+            fetchMock.mockImplementation(
+                async () =>
+                    new Response(
+                        JSON.stringify({
+                            error: { code: "invalid_token", message: "x" },
+                        }),
+                        { status: 401 },
+                    ),
+            );
+            const hook = vi.fn(async () => "fresh");
+            setRefreshHook(hook);
+
+            await expect(
+                apiFetch("/api/x", {}, () => "stale"),
+            ).rejects.toBeInstanceOf(ApiError);
+            // Hook called once, two fetches (original + retry), then
+            // we give up. No infinite loop.
+            expect(hook).toHaveBeenCalledTimes(1);
+            expect(fetchMock).toHaveBeenCalledTimes(2);
+        });
+
+        it("explicit accessToken disables the auto-retry", async () => {
+            // When the caller passed `accessToken` explicitly they're
+            // managing the credential themselves — we should not
+            // rotate it under them.
+            fetchMock.mockImplementation(
+                async () =>
+                    new Response(
+                        JSON.stringify({ error: { code: "x", message: "x" } }),
+                        { status: 401 },
+                    ),
+            );
+            const hook = vi.fn(async () => "fresh");
+            setRefreshHook(hook);
+
+            await expect(
+                apiFetch("/api/x", { accessToken: "caller-controlled" }),
+            ).rejects.toBeInstanceOf(ApiError);
+            expect(hook).not.toHaveBeenCalled();
+        });
     });
 });

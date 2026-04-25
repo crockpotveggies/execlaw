@@ -19,6 +19,7 @@
 // only the moment count_for_user reaches zero.
 
 import { useCallback, useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
 import {
@@ -36,12 +37,17 @@ import {
 
 export function ProfilePage() {
     const auth = useAuth();
+    const navigate = useNavigate();
     const getToken = useCallback(() => auth.getAccessToken(), [auth]);
 
     const [creds, setCreds] = useState<WebauthnCredentialView[] | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [busy, setBusy] = useState(false);
     const [label, setLabel] = useState("");
+    const [signOutAllBusy, setSignOutAllBusy] = useState(false);
+    const [signOutAllNotice, setSignOutAllNotice] = useState<string | null>(
+        null,
+    );
 
     const refresh = useCallback(async () => {
         try {
@@ -100,6 +106,30 @@ export function ProfilePage() {
             setBusy(false);
         }
     }, [getToken, label, refresh]);
+
+    const onSignOutEverywhere = useCallback(async () => {
+        if (
+            !confirm(
+                "Sign out of every other browser and device? You'll have to log back in everywhere else.",
+            )
+        )
+            return;
+        setSignOutAllBusy(true);
+        try {
+            const r = await auth.signOutEverywhere();
+            // signOutEverywhere also clears the local session, so
+            // we route to /login. Surface the count via a query
+            // param so the login screen can flash a toast (future
+            // enhancement) — for now the auth state machine handles
+            // the navigate via Navigate component.
+            setSignOutAllNotice(
+                `Signed out of ${r.revokedCount} session${r.revokedCount === 1 ? "" : "s"}.`,
+            );
+            navigate("/login", { replace: true });
+        } finally {
+            setSignOutAllBusy(false);
+        }
+    }, [auth, navigate]);
 
     const onDelete = useCallback(
         async (cred: WebauthnCredentialView) => {
@@ -202,6 +232,30 @@ export function ProfilePage() {
                         ))}
                     </ul>
                 )}
+            </div>
+
+            <div className="execlaw-card">
+                <div className="execlaw-card__title mb-2">
+                    <i className="bi bi-box-arrow-right me-2" aria-hidden />
+                    Sessions
+                </div>
+                <p className="execlaw-muted small mb-3">
+                    Sign yourself out of every other browser and device.
+                    Useful if a device is lost or you suspect a token leak.
+                </p>
+                {signOutAllNotice && (
+                    <div className="execlaw-muted small mb-2">
+                        {signOutAllNotice}
+                    </div>
+                )}
+                <Button
+                    variant="outline-danger"
+                    disabled={signOutAllBusy}
+                    onClick={() => void onSignOutEverywhere()}
+                    data-testid="profile-sign-out-everywhere"
+                >
+                    Sign out everywhere
+                </Button>
             </div>
         </div>
     );

@@ -43,12 +43,41 @@ export interface ApiFetchOptions {
     accessToken?: string | null;
     /** Skip JSON parsing — caller wants the raw text body (used by /api/ping). */
     rawText?: boolean;
+    /** Internal — set when this is the post-refresh retry, prevents infinite loops. */
+    _isRetry?: boolean;
 }
 
 const DEFAULT_HEADERS: Record<string, string> = {
     "content-type": "application/json",
     accept: "application/json",
 };
+
+/**
+ * Hook that performs a refresh-token rotation when an access token is
+ * rejected with 401. Returns the new access token on success, or
+ * `null` if refresh failed (token expired / revoked / network error).
+ *
+ * AuthContext installs this on boot via {@link setRefreshHook}; tests
+ * can install their own to assert the auto-retry behaviour without
+ * standing up a real auth context.
+ *
+ * Implementations MUST be idempotent under concurrent invocation —
+ * `apiFetch` may receive multiple parallel 401s before the first
+ * refresh resolves. The hook handles the dedup internally.
+ */
+export type RefreshHook = () => Promise<string | null>;
+
+let installedRefreshHook: RefreshHook | null = null;
+
+/** Install the refresh hook used by `apiFetch` for silent retries. */
+export function setRefreshHook(hook: RefreshHook | null): void {
+    installedRefreshHook = hook;
+}
+
+/** Test seam — peek at the currently-installed hook. */
+export function _getRefreshHook(): RefreshHook | null {
+    return installedRefreshHook;
+}
 
 /**
  * Make an authenticated REST call.
@@ -117,6 +146,32 @@ export async function apiFetch<T>(
     if (!resp.ok) {
         const serverCode = readServerCode(parsed);
         const message = readServerMessage(parsed) ?? resp.statusText;
+        // Phase 7 hardening: auto-retry on 401 once. AuthContext
+        // installs a `RefreshHook` that calls /api/token/refresh and
+        // updates the in-memory access-token ref. Skip the retry
+        // when:
+        //   - this call was already a retry (_isRetry guards the
+        //     base case so a double-401 surfaces normally),
+        //   - no hook is installed (e.g. boot-time before
+        //     AuthContext mounts, or unauth routes like /api/login),
+        //   - the caller explicitly passed `accessToken` — they
+        //     want to control the credential, not have it rotated
+        //     under them.
+        if (
+            resp.status === 401 &&
+            !opts._isRetry &&
+            opts.accessToken === undefined &&
+            installedRefreshHook !== null
+        ) {
+            const fresh = await installedRefreshHook();
+            if (fresh) {
+                return apiFetch<T>(
+                    path,
+                    { ...opts, _isRetry: true },
+                    () => fresh,
+                );
+            }
+        }
         throw mapStatus(resp.status, message, serverCode);
     }
     return parsed as T;

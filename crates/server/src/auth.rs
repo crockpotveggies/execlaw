@@ -1,10 +1,11 @@
 //! JWT + refresh-token machinery. EdDSA (Ed25519) signed.
 
 use chrono::Utc;
-use dashmap::DashMap;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use execlaw_core::refresh_tokens::RefreshTokenStore;
+use execlaw_core::{Database, DbError};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -36,13 +37,23 @@ pub enum AuthError {
     Base64(String),
 }
 
-/// Minimal dashmap-backed refresh token store. Good enough for Phase 0; a
-/// SQLCipher-backed version drops in later.
-#[derive(Debug, Default)]
+/// Persistent refresh token store. Thin wrapper over the SQLite-
+/// backed `RefreshTokenStore` in `execlaw-core` so AppState can keep
+/// holding it as an `Arc`. Behaviour matches the previous in-memory
+/// implementation: single-use consumption, session-scoped revoke,
+/// expired-on-read returns None.
+///
+/// Phase 7 hardening item: tokens used to live in a process-local
+/// DashMap, which meant a server restart silently signed everyone
+/// out. Now they survive restarts (encrypted at rest with the rest
+/// of the SQLCipher DB).
+#[derive(Debug, Clone)]
 pub struct RefreshStore {
-    by_token: DashMap<String, RefreshRecord>,
+    db: Database,
 }
 
+/// Minted from `consume` — same shape the in-memory store produced
+/// so the route layer doesn't have to know about the SQLite move.
 #[derive(Debug, Clone)]
 pub struct RefreshRecord {
     pub principal_id: String,
@@ -51,34 +62,58 @@ pub struct RefreshRecord {
 }
 
 impl RefreshStore {
-    pub fn new() -> Self {
-        Self::default()
+    /// Construct from a `Database`. The handle is cloned (it's a
+    /// pooled connection internally) so multiple `Arc<RefreshStore>`s
+    /// share one connection pool.
+    pub fn new(db: Database) -> Self {
+        Self { db }
     }
 
-    pub fn issue(&self, principal_id: &str, session_id: &str, ttl_secs: i64) -> String {
-        let token = Uuid::new_v4().to_string() + "-" + &Uuid::new_v4().to_string();
-        self.by_token.insert(
-            token.clone(),
-            RefreshRecord {
-                principal_id: principal_id.to_owned(),
-                session_id: session_id.to_owned(),
-                expires_at: Utc::now().timestamp() + ttl_secs,
-            },
-        );
-        token
+    /// Issue a fresh refresh token for the given (principal, session)
+    /// pair. Persisted before the string is returned so a crash
+    /// between issue and use doesn't leave the caller with a token
+    /// the server doesn't know about.
+    pub fn issue(
+        &self,
+        principal_id: &str,
+        session_id: &str,
+        ttl_secs: i64,
+    ) -> Result<String, DbError> {
+        RefreshTokenStore::new(&self.db).issue(principal_id, session_id, ttl_secs)
     }
 
-    pub fn consume(&self, token: &str) -> Option<RefreshRecord> {
-        let record = self.by_token.remove(token).map(|(_, v)| v)?;
-        if Utc::now().timestamp() > record.expires_at {
-            return None;
-        }
-        Some(record)
+    /// Single-use consume. The row is deleted on read; reuse and
+    /// expired tokens both return `None`.
+    pub fn consume(&self, token: &str) -> Result<Option<RefreshRecord>, DbError> {
+        let row = RefreshTokenStore::new(&self.db).consume(token)?;
+        Ok(row.map(|r| RefreshRecord {
+            principal_id: r.principal_id,
+            session_id: r.session_id,
+            expires_at: r.expires_at,
+        }))
     }
 
-    pub fn revoke_session(&self, session_id: &str) {
-        self.by_token
-            .retain(|_, record| record.session_id != session_id);
+    /// Drop every refresh token tied to a session. Returns the number
+    /// removed (mainly for telemetry / tests).
+    pub fn revoke_session(&self, session_id: &str) -> Result<usize, DbError> {
+        RefreshTokenStore::new(&self.db).revoke_session(session_id)
+    }
+
+    /// "Sign out everywhere": drop every refresh token for a user.
+    /// Returns the number removed.
+    pub fn revoke_all_for_user(&self, principal_id: &str) -> Result<usize, DbError> {
+        RefreshTokenStore::new(&self.db).revoke_all_for_user(principal_id)
+    }
+
+    /// Distinct active sessions for a user. Drives the
+    /// "you have N other sessions" surface.
+    pub fn active_session_count(&self, principal_id: &str) -> Result<usize, DbError> {
+        RefreshTokenStore::new(&self.db).active_session_count(principal_id)
+    }
+
+    /// Sweep expired rows. Cheap; safe to call on a periodic timer.
+    pub fn purge_expired(&self) -> Result<usize, DbError> {
+        RefreshTokenStore::new(&self.db).purge_expired()
     }
 }
 
@@ -190,6 +225,14 @@ pub type SharedSigner = Arc<JwtSigner>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use execlaw_core::db::{Database, DbConfig};
+    use execlaw_core::migrations::MigrationRunner;
+
+    fn fresh_store() -> RefreshStore {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        RefreshStore::new(db)
+    }
 
     #[test]
     fn issue_and_verify_roundtrip() {
@@ -229,21 +272,21 @@ mod tests {
 
     #[test]
     fn refresh_store_issues_and_consumes_once() {
-        let store = RefreshStore::new();
-        let tok = store.issue("p", "s", 60);
-        let rec = store.consume(&tok).unwrap();
+        let store = fresh_store();
+        let tok = store.issue("p", "s", 60).unwrap();
+        let rec = store.consume(&tok).unwrap().unwrap();
         assert_eq!(rec.principal_id, "p");
         assert!(
-            store.consume(&tok).is_none(),
+            store.consume(&tok).unwrap().is_none(),
             "refresh token must be single-use"
         );
     }
 
     #[test]
     fn refresh_store_expires_rotation() {
-        let store = RefreshStore::new();
-        let tok = store.issue("p", "s", -10); // already expired
-        assert!(store.consume(&tok).is_none());
+        let store = fresh_store();
+        let tok = store.issue("p", "s", -10).unwrap(); // already expired
+        assert!(store.consume(&tok).unwrap().is_none());
     }
 
     /// Cached encoding/decoding keys are real — smoke-test that the
@@ -277,16 +320,60 @@ mod tests {
     /// refresh token the session had minted.
     #[test]
     fn revoke_session_invalidates_all_refresh_for_session() {
-        let store = RefreshStore::new();
-        let t1 = store.issue("p", "sess-1", 60);
-        let t2 = store.issue("p", "sess-1", 60);
-        let t3 = store.issue("p", "sess-2", 60);
+        let store = fresh_store();
+        let t1 = store.issue("p", "sess-1", 60).unwrap();
+        let t2 = store.issue("p", "sess-1", 60).unwrap();
+        let t3 = store.issue("p", "sess-2", 60).unwrap();
 
-        store.revoke_session("sess-1");
-        assert!(store.consume(&t1).is_none());
-        assert!(store.consume(&t2).is_none());
+        let removed = store.revoke_session("sess-1").unwrap();
+        assert_eq!(removed, 2);
+        assert!(store.consume(&t1).unwrap().is_none());
+        assert!(store.consume(&t2).unwrap().is_none());
         // sess-2's token survives.
-        assert!(store.consume(&t3).is_some());
+        assert!(store.consume(&t3).unwrap().is_some());
     }
 
+    /// `revoke_all_for_user` is the "sign out everywhere" primitive:
+    /// it must drop tokens for the named principal regardless of
+    /// session AND must not touch any other principal's tokens.
+    #[test]
+    fn revoke_all_for_user_isolates_other_users() {
+        let store = fresh_store();
+        let _ = store.issue("alice", "sess-1", 60).unwrap();
+        let _ = store.issue("alice", "sess-2", 60).unwrap();
+        let bob = store.issue("bob", "sess-3", 60).unwrap();
+        let removed = store.revoke_all_for_user("alice").unwrap();
+        assert_eq!(removed, 2);
+        // Bob's token still consumes.
+        assert!(store.consume(&bob).unwrap().is_some());
+    }
+
+    /// Survives "process restart" — drop the wrapper, rebuild from
+    /// the same Database, and the previously-issued token still
+    /// works exactly once. Demonstrates the persistence guarantee
+    /// that the in-memory implementation could never give.
+    #[test]
+    fn refresh_token_survives_wrapper_recreate() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let tok = RefreshStore::new(db.clone())
+            .issue("u", "s", 60)
+            .unwrap();
+        // Drop the first wrapper, build a fresh one — same behaviour
+        // a server restart would see if it re-opened the same DB.
+        let restarted = RefreshStore::new(db);
+        let rec = restarted.consume(&tok).unwrap().unwrap();
+        assert_eq!(rec.principal_id, "u");
+    }
+
+    #[test]
+    fn active_session_count_distinct_per_session_id() {
+        let store = fresh_store();
+        let _ = store.issue("u", "sess-A", 60).unwrap();
+        let _ = store.issue("u", "sess-A", 60).unwrap();
+        let _ = store.issue("u", "sess-B", 60).unwrap();
+        // Two rotations within sess-A still count as 1; sess-B is a
+        // separate session.
+        assert_eq!(store.active_session_count("u").unwrap(), 2);
+    }
 }

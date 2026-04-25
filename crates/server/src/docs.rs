@@ -31,8 +31,8 @@ use crate::plugins::{
     UiPanelSummary,
 };
 use crate::routes::{
-    GenericOk, HealthResponse, LoginRequest, LoginResponse, LogoutRequest, MeResponse,
-    RefreshRequest, RefreshResponse, SetupRequest, SetupResponse,
+    GenericOk, HealthResponse, LoginRequest, LoginResponse, LogoutAllResponse, LogoutRequest,
+    MeResponse, RefreshRequest, RefreshResponse, SetupRequest, SetupResponse,
 };
 use utoipa::Modify;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
@@ -76,6 +76,7 @@ impl Modify for SecurityAddon {
         crate::routes::login,
         crate::routes::refresh,
         crate::routes::logout,
+        crate::routes::logout_all,
         crate::routes::admin_me,
         crate::routes::admin_hardware,
         // chats
@@ -119,6 +120,7 @@ impl Modify for SecurityAddon {
         RefreshRequest,
         RefreshResponse,
         LogoutRequest,
+        LogoutAllResponse,
         GenericOk,
         MeResponse,
         PluginSummary,
@@ -301,6 +303,7 @@ mod tests {
             ("/api/login", &["post"]),
             ("/api/token/refresh", &["post"]),
             ("/api/logout", &["post"]),
+            ("/api/logout/all", &["post"]),
             ("/api/admin/me", &["get"]),
             ("/api/admin/hardware", &["get"]),
             ("/api/chats", &["get"]),

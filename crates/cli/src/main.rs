@@ -991,7 +991,10 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     execlaw_core::MigrationRunner::new(&db).apply_all()?;
 
     let signer = std::sync::Arc::new(execlaw_server::auth::JwtSigner::generate("execlaw".into()));
-    let refresh_store = std::sync::Arc::new(execlaw_server::auth::RefreshStore::new());
+    // Phase-7 hardening: refresh tokens persist in SQLite so a
+    // server restart no longer signs every operator out.
+    let refresh_store =
+        std::sync::Arc::new(execlaw_server::auth::RefreshStore::new(db.clone()));
 
     // EXECLAW_INFERENCE_URL lets operators point dev servers at a local
     // vLLM / Ollama / OpenArc without editing code. Production boots

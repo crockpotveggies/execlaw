@@ -26,6 +26,7 @@ use execlaw_core::ephemeral_sweeper::sweep_once;
 use execlaw_core::events::EventRecord as CoreEventRecord;
 use execlaw_core::outbox::{OutboxRow, OutboxStatus, OutboxStore};
 use execlaw_core::transport_conversations::{ConversationResolver, ResolveInput};
+use execlaw_core::refresh_tokens::RefreshTokenStore;
 use execlaw_core::webauthn::{WebauthnCredentialRow, WebauthnStore};
 
 fn fresh_db() -> Database {
@@ -795,6 +796,80 @@ fn bench_webauthn_store(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// RefreshTokenStore — every /api/login + /api/token/refresh writes a
+// row, every /api/token/refresh + /api/logout consumes one. The
+// consume path is on the silent-retry hot path, so it's the most
+// latency-sensitive of the three. revoke_all_for_user only fires on
+// "sign out everywhere", but it's interesting to know it's not
+// accidentally O(n²).
+// ---------------------------------------------------------------------------
+
+fn bench_refresh_token_store(c: &mut Criterion) {
+    let mut group = c.benchmark_group("refresh_token_store");
+
+    group.bench_function("issue", |b| {
+        let db = fresh_db();
+        let store = RefreshTokenStore::new(&db);
+        b.iter(|| {
+            let tok = store
+                .issue(black_box("u"), black_box("s"), 3600)
+                .unwrap();
+            black_box(tok);
+        });
+    });
+
+    group.bench_function("consume_hit", |b| {
+        let db = fresh_db();
+        let store = RefreshTokenStore::new(&db);
+        // Pre-issue tokens so each consume has a row to delete.
+        // Issue one per iteration via a queue to avoid measuring the
+        // issue cost.
+        b.iter_batched(
+            || store.issue("u", "s", 3600).unwrap(),
+            |tok| {
+                let row = store.consume(black_box(&tok)).unwrap();
+                black_box(row);
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("consume_miss", |b| {
+        // Hot path when an attacker reuses a consumed token: the
+        // row is gone and we should fail-fast at the DELETE.
+        let db = fresh_db();
+        let store = RefreshTokenStore::new(&db);
+        b.iter(|| {
+            let row = store.consume(black_box("definitely-not-a-token")).unwrap();
+            black_box(row);
+        });
+    });
+
+    for n in [1usize, 16usize, 64usize].iter() {
+        group.bench_with_input(BenchmarkId::new("revoke_all_for_user", n), n, |b, &n| {
+            b.iter_batched(
+                || {
+                    let db = fresh_db();
+                    let store = RefreshTokenStore::new(&db);
+                    for _ in 0..n {
+                        store.issue("u", "s", 3600).unwrap();
+                    }
+                    db
+                },
+                |db| {
+                    let store = RefreshTokenStore::new(&db);
+                    let removed = store.revoke_all_for_user(black_box("u")).unwrap();
+                    black_box(removed);
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_hmac,
@@ -812,5 +887,6 @@ criterion_group!(
     bench_list_thread_summaries,
     bench_deployment_store,
     bench_webauthn_store,
+    bench_refresh_token_store,
 );
 criterion_main!(benches);

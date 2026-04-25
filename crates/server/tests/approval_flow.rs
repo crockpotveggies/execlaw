@@ -22,7 +22,7 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
         db: db.clone(),
         config: Arc::new(ServerConfig::default()),
         signer: Arc::new(JwtSigner::generate("execlaw-test".into())),
-        refresh_store: Arc::new(RefreshStore::new()),
+        refresh_store: Arc::new(RefreshStore::new(db.clone())),
         events: EventBus::new(),
         event_log_hmac_key: Some(Arc::new(b"execlaw-test-hmac-key-32-bytes!!".to_vec())),
         inference: None,
