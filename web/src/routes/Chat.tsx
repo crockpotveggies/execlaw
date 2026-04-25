@@ -23,6 +23,7 @@ import { ApprovalCard } from "../chat/ApprovalCard";
 import { Composer } from "../chat/Composer";
 import { MessageStream } from "../chat/MessageStream";
 import { Sidebar } from "../chat/Sidebar";
+import { WelcomeView } from "../chat/WelcomeView";
 import {
     appendMessage,
     appendStreamingToken,
@@ -47,7 +48,6 @@ function mintConversationId(): string {
 export function Chat() {
     const auth = useAuth();
     const activeId = useChatState((s) => s.activeId);
-    const threads = useChatState((s) => s.threads);
     const [topError, setTopError] = useState<string | null>(null);
     const wsRef = useRef<WsClient | null>(null);
 
@@ -118,19 +118,27 @@ export function Chat() {
     }, [auth.status, getToken]);
 
     const onNewThread = useCallback(() => {
-        const id = mintConversationId();
-        setActiveThread(id);
-        // The new thread doesn't exist on the server yet; it shows up
-        // in the sidebar after the first send_message → ensure_conversation
-        // → next listThreads tick.
+        // Resetting the active thread to null routes the main pane
+        // back to the welcome view. The actual mint happens lazily on
+        // first send so abandoned "new chat" clicks don't litter the
+        // server with empty threads.
+        setActiveThread(null);
     }, []);
 
     const onSend = useCallback(
         async (text: string) => {
-            if (!activeId) return;
+            // Lazy-mint a fresh ConversationId on first send when no
+            // thread is active. Welcome → first message lands on a
+            // brand-new thread, server-side ensure_conversation creates
+            // the row, listThreads picks it up.
+            const targetId = activeId ?? mintConversationId();
+            if (!activeId) {
+                setActiveThread(targetId);
+            }
+
             // Optimistic user_msg — the server will return the canonical
             // seq, which appendMessage de-duplicates on.
-            appendMessage(activeId, {
+            appendMessage(targetId, {
                 seq: Date.now(),
                 kind: "user_msg",
                 text,
@@ -138,15 +146,11 @@ export function Chat() {
                 committed_at: Math.floor(Date.now() / 1000),
             });
             try {
-                const resp = await postMessage(
-                    activeId,
-                    { text },
-                    getToken,
-                );
+                const resp = await postMessage(targetId, { text }, getToken);
                 // Reload the canonical history so seqs are correct.
-                const fresh = await listMessages(activeId, getToken);
-                setMessages(activeId, fresh.messages);
-                clearStreamingBuffer(activeId);
+                const fresh = await listMessages(targetId, getToken);
+                setMessages(targetId, fresh.messages);
+                clearStreamingBuffer(targetId);
                 // Refresh the thread list (last_seq + new threads land here).
                 listThreads(getToken)
                     .then((r) => setThreads(r.threads))
@@ -206,8 +210,6 @@ export function Chat() {
         return <Navigate to="/login" replace />;
     }
 
-    const hasThreads = threads.length > 0 || activeId !== null;
-
     return (
         <div className="execlaw-shell">
             <Sidebar onNewThread={onNewThread} />
@@ -221,17 +223,39 @@ export function Chat() {
                         {topError}
                     </div>
                 )}
-                {activeId ? (
-                    <ActiveThreadPane
-                        conversationId={activeId}
-                        onSend={onSend}
-                    />
-                ) : (
-                    <EmptyState hasThreads={hasThreads} onNewThread={onNewThread} />
-                )}
+                <ChatPane activeId={activeId} onSend={onSend} />
             </main>
         </div>
     );
+}
+
+/**
+ * The main right-hand pane. Shows the welcome view (centered model
+ * brand + composer + suggestions) until the active thread has at least
+ * one message; flips to the bottom-anchored stream + composer once a
+ * conversation is in progress.
+ */
+function ChatPane({
+    activeId,
+    onSend,
+}: {
+    activeId: string | null;
+    onSend: (text: string) => Promise<void> | void;
+}) {
+    const messages = useChatState((s) =>
+        activeId ? s.messages[activeId] ?? null : null,
+    );
+    const streaming = useChatState((s) =>
+        activeId ? s.streamingBuffer[activeId] ?? null : null,
+    );
+    const hasContent =
+        activeId !== null &&
+        ((messages?.length ?? 0) > 0 || (streaming?.length ?? 0) > 0);
+
+    if (!hasContent) {
+        return <WelcomeView onSend={onSend} />;
+    }
+    return <ActiveThreadPane conversationId={activeId!} onSend={onSend} />;
 }
 
 function ActiveThreadPane({
@@ -266,36 +290,6 @@ function ActiveThreadPane({
                 <Composer onSend={onSend} />
             </div>
         </>
-    );
-}
-
-function EmptyState({
-    hasThreads,
-    onNewThread,
-}: {
-    hasThreads: boolean;
-    onNewThread: () => void;
-}) {
-    return (
-        <div className="execlaw-empty-state">
-            <h2 className="h5 mb-2">
-                <i className="bi bi-chat-square-text me-2" aria-hidden />
-                {hasThreads ? "Pick a thread on the left." : "No threads yet."}
-            </h2>
-            <p className="small mb-3">
-                {hasThreads
-                    ? "Or start fresh."
-                    : "Start your first conversation with the agent."}
-            </p>
-            <button
-                type="button"
-                className="btn btn-primary"
-                onClick={onNewThread}
-            >
-                <i className="bi bi-pencil-square me-2" aria-hidden />
-                New chat
-            </button>
-        </div>
     );
 }
 

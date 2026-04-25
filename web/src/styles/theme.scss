@@ -309,3 +309,84 @@ body {
     text-align: center;
     padding: 2rem 1rem;
 }
+
+// ---- Welcome view (fresh / empty thread) -------------------------
+.execlaw-welcome {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1.5rem;
+    padding: 2rem 1.5rem;
+    min-height: 0;
+    overflow-y: auto;
+}
+
+.execlaw-welcome__brand {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: $text-primary;
+    letter-spacing: -0.015em;
+
+    i {
+        color: $accent;
+        font-size: 2rem;
+    }
+}
+
+.execlaw-welcome__composer {
+    width: 100%;
+    max-width: 720px;
+    background-color: $bg-elev;
+    border: 1px solid $border-subtle;
+    border-radius: 1.25rem;
+    padding: 0.85rem 1rem;
+}
+
+.execlaw-welcome__suggestions {
+    width: 100%;
+    max-width: 720px;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    color: $text-muted;
+}
+
+.execlaw-welcome__suggestions-label {
+    font-size: 0.85rem;
+    color: $text-muted;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.25rem;
+}
+
+.execlaw-welcome__suggestion {
+    text-align: left;
+    background: transparent;
+    border: 1px solid transparent;
+    color: $text-primary;
+    padding: 0.6rem 0.75rem;
+    border-radius: 0.5rem;
+    cursor: pointer;
+    line-height: 1.4;
+
+    &:hover {
+        background-color: $bg-surface;
+        border-color: $border-subtle;
+    }
+
+    .execlaw-welcome__suggestion-title {
+        font-weight: 500;
+    }
+
+    .execlaw-welcome__suggestion-sub {
+        color: $text-muted;
+        font-size: 0.85rem;
+        margin-left: 0.4rem;
+    }
+}
