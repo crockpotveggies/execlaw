@@ -1,15 +1,15 @@
 # execlaw build STATUS
 
-Last update: 2026-04-24, after Phase-6 pre-flight gap-closure (threads metadata, ConversationResolver, EphemeralSweeper).
+Last update: 2026-04-24, after Phase-6 backend hooks (PATCH /api/chats/:id, GET /api/admin/plugins/ui_panels, set_thread_name agent tool).
 
 ## TL;DR
 
 - `cargo build --workspace` — **clean**
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **345 passing, 0 failing**
-- `cargo bench --workspace --no-run` — **clean** (37+ benches across 8 crates)
+- `cargo test --workspace --no-fail-fast` — **360 passing, 0 failing**
+- `cargo bench --workspace --no-run` — **clean** (40+ benches across 9 crates)
 - **Zero cloud-SDK dependencies** anywhere in the workspace
-- Phases 0–5 complete; Phase-6 pre-flight closed (users table, threads/incognito metadata, ConversationResolver, EphemeralSweeper); UI scaffold next
+- Phases 0–5 complete; Phase-6 pre-flight closed; Phase-6 backend API surface ready (thread metadata route, panel manifest route, thread-name agent tool); SPA scaffold next
 
 ## Migration-plan phase structure (post-2026-04-24 refactor)
 
@@ -109,12 +109,15 @@ execlaw-core             113     DB, events (+HMAC sign/verify + atomicity),
                                  invariant, atomic transactions),
                                  EphemeralSweeper (purge + last_seq reset
                                  + idempotency + boundary + run-loop)
-execlaw-server            54     auth, events (WS bus), capability tokens,
+execlaw-server            61     auth, events (WS bus), capability tokens,
                                  chat routes (streaming, policy, crash tests,
                                  cold-contact adversarial, identity-match
                                  classifier), tool_dispatch, tracing_layer,
                                  /api/ping setup-detection, /api/admin/me
-                                 with JWT extractor
+                                 with JWT extractor, PATCH /api/chats/:id
+                                 (auth, three-valued display_name, incognito
+                                 toggle), GET /api/admin/plugins/ui_panels
+                                 (sorted, empty, exclude-non-panel-plugins)
 execlaw-server (integ)    18     plugin_lifecycle (11) + approval_flow (7)
 execlaw-policy            43     rule_of_two, trust evaluator, spotlighting,
                                  sideband, input_guard, JWT claims
@@ -122,8 +125,10 @@ execlaw-voice-pipeline    34     frames, two-lane graph, endpointer, bargein,
                                  traits (MockAudioIn/Out, MockVad, MockStt,
                                  MockTts), VoiceSession (speech→LLM→TTS,
                                  barge-in rescind/confirm, sentence splitter)
-execlaw-runner-local      16     memory_tool (trust scoping + adversarial),
-                                 turn executor
+execlaw-runner-local      24     memory_tool (trust scoping + adversarial),
+                                 turn executor, thread_tool (set_thread_name
+                                 with trim/length/multi-byte/idempotency
+                                 + bad-args adversarial)
 execlaw-plugin-host       15     hook registry, subprocess RPC
 execlaw-plugin-sdk         8     manifest parsing, ZIP staging + zipslip
 execlaw-inference-api      7     chat req/resp, streaming SSE parse
@@ -133,7 +138,7 @@ execlaw-outbox            11     backoff, retry budget, drain, WakeupScheduler (
 execlaw-session            1     modality binding
 execlaw-eval-harness       2     rubric parse, mock-mode orchestration
 --------------------------------------------------------------------
-TOTAL                    345 passing, 0 failing
+TOTAL                    360 passing, 0 failing
 ```
 
 ## Benchmarks (cargo bench --workspace)
@@ -163,6 +168,11 @@ TOTAL                    345 passing, 0 failing
 | `conversation_resolver/resolve_continue_within_idle` | 9 µs | ≤50 µs | one SELECT + one UPDATE in tx |
 | `ephemeral_sweeper/sweep_n_threads/10` | 288 µs | — | per-thread tx; ~13 µs/thread |
 | `ephemeral_sweeper/sweep_n_threads/100` | 1.36 ms | ≤1 s for 1k threads | linear; budget headroom > 70× |
+| `conversation_metadata/set_display_name` | 2.3 µs | ≤200 µs | one UPDATE behind PATCH route |
+| `conversation_metadata/set_pinned` | 3.6 µs | ≤200 µs | |
+| `conversation_metadata/mark_ephemeral_then_clear` | 3.9 µs | ≤200 µs | |
+| `thread_tool/dispatch_set_thread_name_ok` | 2.4 µs | ≤200 µs | agent tool happy path |
+| `thread_tool/dispatch_set_thread_name_too_long` | 126 ns | — | validation rejection, no DB |
 
 ## Grounding-rule compliance (re-audited this session)
 
@@ -206,6 +216,9 @@ TOTAL                    345 passing, 0 failing
 | Transport→thread routing + Controller short-circuit | `crates/core/src/transport_conversations.rs` |
 | Incognito-thread sweeper | `crates/core/src/ephemeral_sweeper.rs` |
 | Operator users + auth lookup | `crates/core/src/users.rs` |
+| Thread metadata route (PATCH) | `crates/server/src/chats.rs::patch_thread` |
+| UI-panel manifest route | `crates/server/src/plugins.rs::list_ui_panels_handler` |
+| Thread-name agent tool | `crates/runner-local/src/thread_tool.rs` |
 
 ## Recent commit history (foundation branch)
 

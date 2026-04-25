@@ -19,3 +19,10 @@ anyhow.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "runner_local_hot_paths"
+harness = false

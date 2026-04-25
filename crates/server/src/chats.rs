@@ -846,6 +846,101 @@ pub async fn list_messages(
         .into_response()
 }
 
+/// `PATCH /api/chats/:id` — update thread metadata.
+///
+/// Used by the SPA when the operator renames a thread, pins/unpins it,
+/// toggles incognito, or extends an incognito expiry. Three-valued logic
+/// per field: `null`/missing means "leave unchanged"; an explicit value
+/// is applied (an explicit `null` for `display_name` clears the name,
+/// matching the same shape on `ephemeral_expires_at`).
+///
+/// Auth-gated. The single-controller setup means we don't role-check
+/// further here — `AuthedUser` is sufficient.
+#[derive(Debug, Deserialize)]
+pub struct PatchThreadRequest {
+    /// `Some(Some(name))` to set, `Some(None)` to clear, `None` to skip.
+    /// Serde maps both `"display_name": null` and a missing field to
+    /// `None`; we distinguish via a custom `#[serde(default,
+    /// deserialize_with)]` shim so the operator can clear the name.
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub display_name: Option<Option<String>>,
+    pub is_pinned: Option<bool>,
+    /// When `Some(true)` AND `ephemeral_expires_at` is set, marks the
+    /// thread incognito with that expiry. When `Some(false)`, clears
+    /// the incognito flag (and clears the expiry implicitly).
+    pub is_ephemeral: Option<bool>,
+    /// Unix-seconds expiry for incognito threads. Only honored when
+    /// `is_ephemeral = Some(true)`. Ignored on `Some(false)`.
+    pub ephemeral_expires_at: Option<i64>,
+}
+
+/// Custom deserializer so `null` and missing are distinct: `None` =
+/// missing field (leave alone), `Some(None)` = explicit null (clear),
+/// `Some(Some(v))` = set.
+fn deserialize_optional_field<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Some(Option::deserialize(de)?))
+}
+
+#[derive(Debug, Serialize)]
+pub struct PatchThreadResponse {
+    pub conversation_id: String,
+    pub display_name: Option<String>,
+    pub is_pinned: bool,
+    pub is_ephemeral: bool,
+    pub ephemeral_expires_at: Option<i64>,
+}
+
+/// `PATCH /api/chats/{conversation_id}` handler.
+pub async fn patch_thread(
+    State(state): State<AppState>,
+    _user: crate::auth_extract::AuthedUser,
+    Path(conversation_id): Path<String>,
+    Json(req): Json<PatchThreadRequest>,
+) -> impl IntoResponse {
+    let cid = ConversationId::from(conversation_id.as_str());
+    let store = ConversationStore::new(&state.db);
+    ensure_conversation(&store, &cid);
+
+    if let Some(name_opt) = req.display_name.as_ref() {
+        if let Err(e) = store.set_display_name(&cid, name_opt.as_deref()) {
+            return err_500(&format!("set_display_name: {e}"));
+        }
+    }
+    if let Some(pinned) = req.is_pinned {
+        if let Err(e) = store.set_pinned(&cid, pinned) {
+            return err_500(&format!("set_pinned: {e}"));
+        }
+    }
+    if let Some(eph) = req.is_ephemeral {
+        let expires = if eph { req.ephemeral_expires_at } else { None };
+        if let Err(e) = store.mark_ephemeral(&cid, expires) {
+            return err_500(&format!("mark_ephemeral: {e}"));
+        }
+    }
+
+    let row = match store.get(&cid) {
+        Ok(Some(r)) => r,
+        Ok(None) => return err_500("conversation row vanished after upsert"),
+        Err(e) => return err_500(&format!("get: {e}")),
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(PatchThreadResponse {
+            conversation_id: cid.as_str().to_owned(),
+            display_name: row.display_name,
+            is_pinned: row.is_pinned,
+            is_ephemeral: row.is_ephemeral,
+            ephemeral_expires_at: row.ephemeral_expires_at,
+        })),
+    )
+        .into_response()
+}
+
 fn ensure_conversation(store: &ConversationStore<'_>, cid: &ConversationId) {
     if matches!(store.get(cid), Ok(Some(_))) {
         return;
@@ -1512,5 +1607,149 @@ required_capabilities = []
         // tools are in the registry.
         assert_eq!(status, StatusCode::OK);
         assert!(!body["assistant_text"].as_str().unwrap().is_empty());
+    }
+
+    // ---- PATCH /api/chats/:id (thread metadata) ----------------------
+
+    /// Run setup against the app and return a Bearer access token plus
+    /// the inserted controller's `principal_id`.
+    async fn setup_and_get_token(app: &axum::Router) -> String {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "admin_password": "hunter2-longer",
+            "display_name": "Tester",
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/setup")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let v: serde_json::Value = json_body(resp.into_body()).await;
+        v["access_token"].as_str().unwrap().to_owned()
+    }
+
+    async fn patch_thread(
+        app: &axum::Router,
+        token: Option<&str>,
+        cid: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder()
+            .method(Method::PATCH)
+            .uri(format!("/api/chats/{cid}"))
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(t) = token {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let req = req.body(Body::from(body.to_string())).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let value: serde_json::Value = json_body(resp.into_body()).await;
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn patch_thread_requires_auth() {
+        let app = build_app();
+        let (status, _) = patch_thread(&app, None, "any-conv", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn patch_thread_sets_display_name_and_pinned() {
+        let app = build_app();
+        let token = setup_and_get_token(&app).await;
+        let (status, body) = patch_thread(
+            &app,
+            Some(&token),
+            "conv-rename",
+            serde_json::json!({
+                "display_name": "Q4 plans",
+                "is_pinned": true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body was {body}");
+        assert_eq!(body["display_name"], "Q4 plans");
+        assert_eq!(body["is_pinned"], true);
+        assert_eq!(body["is_ephemeral"], false);
+        assert!(body["ephemeral_expires_at"].is_null());
+    }
+
+    /// Marking a thread incognito + setting an expiry round-trips.
+    /// Toggling it off clears the expiry.
+    #[tokio::test]
+    async fn patch_thread_toggle_incognito() {
+        let app = build_app();
+        let token = setup_and_get_token(&app).await;
+
+        // Mark incognito with expiry.
+        let (status, body) = patch_thread(
+            &app,
+            Some(&token),
+            "conv-secret",
+            serde_json::json!({
+                "is_ephemeral": true,
+                "ephemeral_expires_at": 1_700_000_000i64,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["is_ephemeral"], true);
+        assert_eq!(body["ephemeral_expires_at"], 1_700_000_000i64);
+
+        // Toggle off.
+        let (status, body) = patch_thread(
+            &app,
+            Some(&token),
+            "conv-secret",
+            serde_json::json!({"is_ephemeral": false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["is_ephemeral"], false);
+        assert!(body["ephemeral_expires_at"].is_null());
+    }
+
+    /// Three-valued logic for `display_name`:
+    /// - omitted: leave alone
+    /// - explicit `null`: clear
+    /// - explicit string: set
+    #[tokio::test]
+    async fn patch_thread_distinguishes_null_from_missing_for_display_name() {
+        let app = build_app();
+        let token = setup_and_get_token(&app).await;
+
+        // Set a name first.
+        let (_, body) = patch_thread(
+            &app,
+            Some(&token),
+            "conv-3val",
+            serde_json::json!({"display_name": "First"}),
+        )
+        .await;
+        assert_eq!(body["display_name"], "First");
+
+        // PATCH that omits the field — name must NOT change.
+        let (_, body) = patch_thread(
+            &app,
+            Some(&token),
+            "conv-3val",
+            serde_json::json!({"is_pinned": true}),
+        )
+        .await;
+        assert_eq!(body["display_name"], "First", "missing field must preserve");
+
+        // PATCH with explicit null — name MUST clear.
+        let (_, body) = patch_thread(
+            &app,
+            Some(&token),
+            "conv-3val",
+            serde_json::json!({"display_name": null}),
+        )
+        .await;
+        assert!(body["display_name"].is_null(), "explicit null must clear");
     }
 }

@@ -490,6 +490,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/chats/{conversation_id}/messages",
             post(crate::chats::send_message).get(crate::chats::list_messages),
         )
+        .route(
+            "/api/chats/{conversation_id}",
+            axum::routing::patch(crate::chats::patch_thread),
+        )
         .route("/api/stream", get(crate::events::stream_handler))
         .merge(crate::plugins::plugins_router())
         .merge(crate::approvals::approvals_router())

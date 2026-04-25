@@ -218,12 +218,57 @@ pub async fn list_tools_handler(State(state): State<AppState>) -> impl IntoRespo
         .into_response()
 }
 
+/// One sidebar-nav entry the SPA renders under `⋯ More`.
+#[derive(Debug, Serialize)]
+pub struct UiPanelSummary {
+    pub plugin_id: String,
+    /// URL path segment the SPA mounts the panel at, e.g.
+    /// `admin/plugins/google-calendar`. The SPA prepends its own
+    /// router base.
+    pub mount: String,
+    /// Path inside the plugin bundle to the panel's entry module
+    /// (relative to the plugin's static-asset root).
+    pub entry: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UiPanelListResponse {
+    pub panels: Vec<UiPanelSummary>,
+}
+
+/// `GET /api/admin/plugins/ui_panels` — list every installed plugin's
+/// declared UI panels, in deterministic order (by mount path) so the
+/// sidebar nav doesn't reshuffle on every refresh.
+///
+/// Trusted-plugin model: the SPA loads `entry` via dynamic ESM import
+/// with no sandboxing. Install was already gated by controller auth.
+pub async fn list_ui_panels_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let mut panels: Vec<UiPanelSummary> = state
+        .plugin_host
+        .registry()
+        .ui_panels()
+        .into_iter()
+        .map(|p| UiPanelSummary {
+            plugin_id: p.plugin_id,
+            mount: p.mount,
+            entry: p.entry,
+        })
+        .collect();
+    panels.sort_by(|a, b| a.mount.cmp(&b.mount));
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(UiPanelListResponse { panels })),
+    )
+        .into_response()
+}
+
 /// Sub-router mounted at `/api/admin/plugins/...`.
 pub fn plugins_router() -> Router<AppState> {
     Router::new()
         .route("/api/admin/plugins", get(list_handler))
         .route("/api/admin/plugins/install", post(install_handler))
         .route("/api/admin/plugins/tools", get(list_tools_handler))
+        .route("/api/admin/plugins/ui_panels", get(list_ui_panels_handler))
         .route(
             "/api/admin/plugins/{plugin_id}/enable",
             post(enable_handler),
@@ -279,4 +324,145 @@ fn plugin_error_response(e: PluginHostError) -> axum::response::Response {
         }
     };
     error_response(status, code, &e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{self, Body};
+    use axum::http::{Method, Request};
+    use tower::ServiceExt;
+
+    fn build_app() -> axum::Router {
+        crate::routes::build_router(crate::routes::test_app_state())
+    }
+
+    async fn read_json(resp: axum::response::Response) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, v)
+    }
+
+    /// With no plugins installed, the route returns an empty list (200,
+    /// not 404).
+    #[tokio::test]
+    async fn ui_panels_empty_when_no_plugins() {
+        let app = build_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/admin/plugins/ui_panels")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = read_json(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["panels"].is_array());
+        assert_eq!(body["panels"].as_array().unwrap().len(), 0);
+    }
+
+    /// Two plugins each declaring a panel show up sorted by mount path,
+    /// regardless of install order.
+    #[tokio::test]
+    async fn ui_panels_returns_all_registered_panels_sorted() {
+        let state = crate::routes::test_app_state();
+
+        // Install plugin "z-thing" FIRST so its panel would naturally
+        // appear earlier in registration order — sort by mount must
+        // override that.
+        let z = r#"
+[plugin]
+id = "z-thing"
+name = "Z thing"
+version = "1.0.0"
+
+[[ui_panels]]
+mount = "admin/plugins/z-thing"
+entry = "ui/z.js"
+"#;
+        let a = r#"
+[plugin]
+id = "a-thing"
+name = "A thing"
+version = "1.0.0"
+
+[[ui_panels]]
+mount = "admin/plugins/a-thing"
+entry = "ui/a.js"
+"#;
+        state
+            .plugin_host
+            .registry()
+            .enable(&execlaw_plugin_sdk::PluginManifest::parse(z).unwrap())
+            .unwrap();
+        state
+            .plugin_host
+            .registry()
+            .enable(&execlaw_plugin_sdk::PluginManifest::parse(a).unwrap())
+            .unwrap();
+
+        let app = crate::routes::build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/admin/plugins/ui_panels")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = read_json(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        let panels = body["panels"].as_array().unwrap();
+        assert_eq!(panels.len(), 2);
+        // Sorted by mount path → a-thing first, z-thing second.
+        assert_eq!(panels[0]["plugin_id"], "a-thing");
+        assert_eq!(panels[0]["mount"], "admin/plugins/a-thing");
+        assert_eq!(panels[0]["entry"], "ui/a.js");
+        assert_eq!(panels[1]["plugin_id"], "z-thing");
+    }
+
+    /// A plugin with no `[[ui_panels]]` blocks contributes nothing — the
+    /// presence of other plugin features must not leak into this route.
+    #[tokio::test]
+    async fn ui_panels_excludes_plugins_without_panels() {
+        let state = crate::routes::test_app_state();
+        let m = r#"
+[plugin]
+id = "tools-only"
+name = "Tools only"
+version = "1.0.0"
+
+[[tools]]
+name = "noop"
+schema = "s.json"
+latency = "low"
+required_capabilities = []
+"#;
+        state
+            .plugin_host
+            .registry()
+            .enable(&execlaw_plugin_sdk::PluginManifest::parse(m).unwrap())
+            .unwrap();
+        let app = crate::routes::build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/admin/plugins/ui_panels")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = read_json(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["panels"].as_array().unwrap().len(), 0);
+    }
 }

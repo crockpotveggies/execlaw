@@ -565,6 +565,55 @@ fn bench_ephemeral_sweeper(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Conversation metadata mutators — backing the PATCH /api/chats/:id route
+// and the set_thread_name agent tool. Each is one UPDATE; budget ≤ 200µs
+// each so the SPA can rapid-fire rename / pin / toggle without lag.
+// ---------------------------------------------------------------------------
+
+fn bench_conversation_metadata(c: &mut Criterion) {
+    let mut group = c.benchmark_group("conversation_metadata");
+
+    group.bench_function("set_display_name", |b| {
+        let db = fresh_db();
+        let store = ConversationStore::new(&db);
+        store.upsert(&fresh_conv_row("c-bench")).unwrap();
+        let cid = execlaw_core::ids::ConversationId::from("c-bench");
+        b.iter(|| {
+            store
+                .set_display_name(black_box(&cid), black_box(Some("Q4 plans")))
+                .unwrap();
+        });
+    });
+
+    group.bench_function("set_pinned", |b| {
+        let db = fresh_db();
+        let store = ConversationStore::new(&db);
+        store.upsert(&fresh_conv_row("c-bench")).unwrap();
+        let cid = execlaw_core::ids::ConversationId::from("c-bench");
+        let mut flag = false;
+        b.iter(|| {
+            flag = !flag;
+            store.set_pinned(black_box(&cid), black_box(flag)).unwrap();
+        });
+    });
+
+    group.bench_function("mark_ephemeral_then_clear", |b| {
+        let db = fresh_db();
+        let store = ConversationStore::new(&db);
+        store.upsert(&fresh_conv_row("c-bench")).unwrap();
+        let cid = execlaw_core::ids::ConversationId::from("c-bench");
+        let mut on = false;
+        b.iter(|| {
+            on = !on;
+            let expires = if on { Some(black_box(9_999i64)) } else { None };
+            store.mark_ephemeral(black_box(&cid), expires).unwrap();
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_hmac,
@@ -578,5 +627,6 @@ criterion_group!(
     bench_principal_store,
     bench_conversation_resolver,
     bench_ephemeral_sweeper,
+    bench_conversation_metadata,
 );
 criterion_main!(benches);

@@ -955,6 +955,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "criterion",
  "execlaw-core",
  "execlaw-inference-api",
  "serde",

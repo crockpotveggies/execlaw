@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod memory_tool;
+pub mod thread_tool;
 pub mod turn;
 
 use execlaw_inference_api::InferenceClient;
