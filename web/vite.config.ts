@@ -77,6 +77,11 @@ export default defineConfig({
     // react-native-web reads these at module load.
     __DEV__: JSON.stringify(process.env.NODE_ENV !== "production"),
     "process.env.NODE_ENV": JSON.stringify(process.env.NODE_ENV ?? "development"),
+    // RN-ecosystem code references the Node-only `global`. In the
+    // browser there's no `global` binding; map every reference to
+    // the standard `globalThis`. Without this, RN-web throws
+    // `ReferenceError: global is not defined` at module load.
+    global: "globalThis",
   },
   server: {
     // Bind explicitly to IPv4 loopback. Vite's default `localhost`
