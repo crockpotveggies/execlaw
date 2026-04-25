@@ -20,6 +20,7 @@
 //!    `commit_turn`'s enforce_tool_pairing, so the log stays
 //!    well-formed even when the model hallucinates a tool name.
 
+use crate::mcp_host::{McpHost, MCP_TOOL_PREFIX};
 use async_trait::async_trait;
 use execlaw_core::tool_access::ToolAccessStore;
 use execlaw_core::Database;
@@ -40,6 +41,10 @@ pub struct ChainedToolDispatch<B: BuiltinTools> {
     /// keep working without seeding the gate; `None` means "skip the
     /// trust-class allowlist check," which is the legacy behaviour.
     pub access_db: Option<Database>,
+    /// Phase-8d MCP dispatch tier. When present, tool names with the
+    /// `mcp:<server>:<tool>` prefix route to the connection manager
+    /// instead of the builtin/plugin layer.
+    pub mcp_host: Option<McpHost>,
 }
 
 impl<B: BuiltinTools> ChainedToolDispatch<B> {
@@ -53,6 +58,7 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             caller_trust: TrustLevel::Controller,
             builtins,
             access_db: None,
+            mcp_host: None,
         }
     }
 
@@ -72,7 +78,15 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             caller_trust,
             builtins,
             access_db: Some(access_db),
+            mcp_host: None,
         }
+    }
+
+    /// Attach the Phase-8d MCP dispatch tier. Builder-style so the
+    /// existing test ctors don't have to grow another argument.
+    pub fn with_mcp(mut self, mcp_host: McpHost) -> Self {
+        self.mcp_host = Some(mcp_host);
+        self
     }
 
     pub fn into_arc(self) -> Arc<dyn ToolDispatch>
@@ -129,6 +143,19 @@ impl<B: BuiltinTools + 'static> ToolDispatch for ChainedToolDispatch<B> {
         // reaches a builtin's side-effect, a plugin subprocess, or an
         // MCP server.
         self.check_access(tool_name)?;
+
+        // Phase-8d: prefix-route MCP-sourced tools to the connection
+        // manager. Falling back to builtins/plugins for an
+        // `mcp:`-prefixed name is wrong — those tiers don't speak
+        // the prefix.
+        if tool_name.starts_with(MCP_TOOL_PREFIX) {
+            return match &self.mcp_host {
+                Some(host) => host.call_tool(tool_name, args_json.clone()).await,
+                None => Err(format!(
+                    "no MCP host configured to dispatch '{tool_name}'"
+                )),
+            };
+        }
 
         if let Some(r) = self.builtins.call(tool_name, args_json).await {
             return r;
@@ -373,6 +400,74 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("disabled"), "got: {err}");
+    }
+
+    /// Phase-8d routing: a tool name with the `mcp:` prefix routes
+    /// to the McpHost dispatcher. With no actor connected for the
+    /// named server, we expect a "not connected" error rather than
+    /// fall-through to builtins/plugins.
+    #[tokio::test]
+    async fn mcp_prefixed_name_routes_to_mcp_host() {
+        struct NoneBuiltin;
+        #[async_trait]
+        impl BuiltinTools for NoneBuiltin {
+            async fn call(
+                &self,
+                _: &str,
+                _: &serde_json::Value,
+            ) -> Option<Result<serde_json::Value, String>> {
+                None
+            }
+        }
+        let host = test_host();
+        let db = host.db().clone();
+        let mcp = crate::mcp_host::McpHost::new(db.clone());
+        let disp = ChainedToolDispatch::with_access_gate(
+            host,
+            vec!["*".into()],
+            TrustLevel::Controller,
+            NoneBuiltin,
+            db,
+        )
+        .with_mcp(mcp);
+        let err = disp
+            .call("mcp:github:create_pr", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        // Two acceptable wordings depending on whether the access
+        // gate fired first (no row → allow → routes to mcp_host →
+        // not connected) or another error path.
+        assert!(
+            err.contains("not connected") || err.contains("not authorized"),
+            "expected MCP routing error, got: {err}",
+        );
+    }
+
+    /// Phase-8d safety: when no McpHost is wired into the dispatch,
+    /// an `mcp:`-prefixed tool name returns a structured error
+    /// rather than falling through and confusing the runner.
+    #[tokio::test]
+    async fn mcp_prefixed_without_host_returns_structured_error() {
+        struct NoneBuiltin;
+        #[async_trait]
+        impl BuiltinTools for NoneBuiltin {
+            async fn call(
+                &self,
+                _: &str,
+                _: &serde_json::Value,
+            ) -> Option<Result<serde_json::Value, String>> {
+                None
+            }
+        }
+        let disp = ChainedToolDispatch::new(test_host(), vec!["*".into()], NoneBuiltin);
+        let err = disp
+            .call("mcp:github:create_pr", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("no MCP host configured"),
+            "expected structured no-host error, got: {err}",
+        );
     }
 
     /// Phase-8a gate: with NO policy row at all (the test default),

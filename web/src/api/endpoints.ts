@@ -756,6 +756,96 @@ export async function updateToolPolicy(
     );
 }
 
+// ---- /api/admin/mcp/servers (Phase 8c MCP integration) ------------
+
+export type McpTransport = "stdio" | "streamable_http";
+
+export type McpServerStatus =
+    | "idle"
+    | "connected"
+    | "disconnected"
+    | "error";
+
+export interface McpServerView {
+    id: string;
+    display_name: string;
+    transport: McpTransport;
+    command: string | null;
+    args: string[];
+    env: Record<string, string>;
+    cwd: string | null;
+    url: string | null;
+    auth_secret_ref: string | null;
+    enabled: boolean;
+    default_allowed_classes: string[];
+    status: McpServerStatus;
+    last_error: string | null;
+    created_at: number;
+    updated_at: number;
+}
+
+export interface McpServerListResponse {
+    servers: McpServerView[];
+}
+
+export interface McpServerWriteRequest {
+    id: string;
+    display_name: string;
+    transport: McpTransport;
+    command?: string | null;
+    args?: string[];
+    env?: Record<string, string>;
+    cwd?: string | null;
+    url?: string | null;
+    auth_secret_ref?: string | null;
+    enabled?: boolean;
+    default_allowed_classes?: string[];
+}
+
+export async function listMcpServers(
+    tokenAccessor: () => string | null,
+): Promise<McpServerListResponse> {
+    return apiFetch<McpServerListResponse>(
+        "/api/admin/mcp/servers",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function createMcpServer(
+    body: McpServerWriteRequest,
+    tokenAccessor: () => string | null,
+): Promise<McpServerView> {
+    return apiFetch<McpServerView>(
+        "/api/admin/mcp/servers",
+        { method: "POST", body },
+        tokenAccessor,
+    );
+}
+
+export async function updateMcpServer(
+    id: string,
+    body: McpServerWriteRequest,
+    tokenAccessor: () => string | null,
+): Promise<McpServerView> {
+    return apiFetch<McpServerView>(
+        `/api/admin/mcp/servers/${encodeURIComponent(id)}`,
+        { method: "POST", body },
+        tokenAccessor,
+    );
+}
+
+export async function deleteMcpServer(
+    id: string,
+    tokenAccessor: () => string | null,
+): Promise<unknown> {
+    return apiFetch(
+        `/api/admin/mcp/servers/${encodeURIComponent(id)}/delete`,
+        { method: "POST", body: {} },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/audit ---------------------------------------------
 
 export interface AuditEntry {

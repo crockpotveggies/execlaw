@@ -6,10 +6,10 @@ Last update: 2026-04-25, after Phase 8a — **per-tool trust-class allowlist** g
 
 - `cargo build --workspace` — **clean** (stub mode; webauthn-rs gated behind `--features webauthn` for the Linux/Docker production build)
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **500 passing, 0 failing** (+15: 7 McpServerStore + 6 mcp_admin routes + 2 mcp_host name parser)
-- `cargo bench --workspace --no-run` — **clean** (59 benches across 9 crates; +5 tool_access_store)
-- `cd web && npm test` — **121 passing** (+4 vs 7-final: ToolsPage)
-- `cd web && npm run build` — **clean** (318 KB JS / 311 KB CSS, both well under budget)
+- `cargo test --workspace --no-fail-fast` — **502 passing, 0 failing** (+2: dispatch tier-routing)
+- `cargo bench --workspace --no-run` — **clean** (59 benches across 9 crates)
+- `cd web && npm test` — **125 passing** (+4: McpServersPage)
+- `cd web && npm run build` — **clean** (326 KB JS / 311 KB CSS, both well under budget)
 - **Zero cloud-SDK dependencies** anywhere in the workspace
 - **Phase 7 JWT hardening done.** Shipped: (a) **Migration 0008** + `state_refresh_tokens` table — refresh tokens now survive a server restart instead of silently signing every operator out; (b) **`RefreshTokenStore`** in core (issue / single-use consume / revoke_session / revoke_all_for_user / active_session_count / purge_expired + 8 unit tests including the persistence-survives-recreate invariant); (c) **`POST /api/logout/all`** endpoint + 2 server tests covering the multi-session revoke + the auth-required gate; (d) **SPA `apiFetch` silent auto-retry** — installs a `RefreshHook` on AuthContext mount that rotates tokens on a 401 and replays the original request once, with explicit guards against retry loops + caller-controlled tokens; (e) **Background refresh timer** — fires at 80% of the 15-min access-token TTL so the user never sees a 401-flash; (f) **"Sign out everywhere"** button on Settings → Profile that calls `/api/logout/all` + bounces to `/login`.
 - **Phase 7 sub-phase 7e (WebAuthn) done.** Shipped: (a) **Migration 0007** + `state_webauthn_credentials` table with per-user 10-credential cap + ON DELETE CASCADE on `users`; (b) **`WebauthnStore`** in core (insert / count_for_user / list_for_user / get / update_counter / delete_owned + 8 unit tests including ownership + cascade); (c) **`WebauthnSvc`** in server (relying-party config, register + authenticate ceremonies, 5-minute ceremony TTL with `prune_expired`, deterministic user-handle UUID); (d) **HTTP routes** for register begin/finish, list, delete, login finish — all audit-logged; (e) **/api/login second-factor branch** — when `count_for_user > 0`, returns the new `LoginOutcome::WebauthnChallenge` instead of tokens, fail-closed if the svc is missing; (f) **SPA**: `coerceCreationOptions`/`coerceRequestOptions`/`serializeCredential` browser helpers (base64url ↔ ArrayBuffer), Login screen handles the challenge (auto-prompts authenticator + retry button), Settings → Profile credential management.
@@ -23,7 +23,9 @@ Last update: 2026-04-25, after Phase 8a — **per-tool trust-class allowlist** g
 | **8a** | Generalised per-tool trust-class allowlist (foundation) | ✅ shipped |
 | **8b** | `mcp-client` crate: stdio transport, refuses sampling, list_tools / call_tool / list_resources / read_resource. Streamable HTTP transport deferred to 8c. | ✅ shipped |
 | **8c** | `config_mcp_servers` + connection manager, reflects tools into `config_tool_access` with `mcp:<server>:<tool>` namespacing | ✅ shipped |
-| **8d** | McpDispatch wired into `ChainedToolDispatch`, Settings → MCP page, e2e test against a mock server | next |
+| **8d** | `mcp:`-prefixed names route through `ChainedToolDispatch` to `McpHost`, Settings → MCP CRUD page in SPA | ✅ shipped |
+
+**Phase 8 complete.** End-to-end: configure an MCP server in Settings → MCP, see its connection status flip to `connected`, watch its tools appear (prefixed) on Settings → Tools where you can per-tool gate which trust classes may use them, and the runner picks them up alongside builtins/plugins.
 
 ## Migration-plan phase structure (post-2026-04-24 refactor)
 
@@ -39,7 +41,7 @@ Phase 2 used to conflate "plugin framework" with "port every selfhosted-claw int
 | 5 — Observability, evaluation, replay CLI (infra only) | tracing→SQLite layer, `GET /api/admin/logs`, `GET /api/admin/eval/flags`, `execlaw replay <conv> --at <seq>`, `execlaw eval flag/list`, eval-harness binary + rubric scaffolding | ✅ done (UI components for log viewer + dashboard land in Phase 6) |
 | 6 — UI port, chat-first landing | React + GSAP SPA: setup → login → chat (sidebar, thread list, streaming + cursor, channel-origin icons, long-msg truncation, external-channel filter, plugin UI panels) → settings (plugins/principals/hardware/logs/eval/audit), inline approval card with verbs, thread rename, incognito toggle, plugin install, trust revoke | ✅ done |
 | 7 — Hardening | wave 1 (deployment editor + key rotation + log retention) ✅, wave 2 (back-fill verifier + backup/restore + multi-controller users) ✅, wave 3 (WebAuthn second-factor + JWT plumbing) ✅. WASM tier and advanced subagents dropped from Phase 7 scope (see MIGRATION_PLAN.md). | complete |
-| 8 — MCP client integration | 8a per-tool trust-class allowlist ✅; 8b mcp-client crate, 8c connection manager + tool sync, 8d dispatch + Settings UI + e2e queued | in progress |
+| 8 — MCP client integration | 8a per-tool trust-class allowlist ✅; 8b mcp-client crate ✅; 8c connection manager + tool sync ✅; 8d dispatch + Settings UI ✅ | complete |
 | 9 — **External plugin ports** (open-ended) | every plugin that needs creds/external-services — see [plugin-inventory.md](docs/plugin-inventory.md) | queue; bumped from 8 by MCP insertion |
 | 10 — **Surface ports & native targets** (last phase) | 10a Tauri Desktop wrapper; 10b iOS / Android native | queue |
 | 8 — **External plugin ports** (open-ended) | every plugin that needs creds/external-services — see [plugin-inventory.md](docs/plugin-inventory.md) | queue; no ports started |

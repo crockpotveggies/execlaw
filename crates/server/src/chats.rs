@@ -556,13 +556,17 @@ async fn run_tool_capable_turn(
     // ctor with no trust-class + no DB stays available for tests
     // that don't seed the gate; production goes through
     // `with_access_gate`.
-    let dispatch = Arc::new(crate::tool_dispatch::ChainedToolDispatch::with_access_gate(
-        state.plugin_host.clone(),
-        caller_caps,
-        caller_trust,
-        crate::tool_dispatch::NoBuiltinTools,
-        state.db.clone(),
-    ));
+    let dispatch = Arc::new(
+        crate::tool_dispatch::ChainedToolDispatch::with_access_gate(
+            state.plugin_host.clone(),
+            caller_caps,
+            caller_trust,
+            crate::tool_dispatch::NoBuiltinTools,
+            state.db.clone(),
+        )
+        // Phase-8d: prefix-routed MCP tools land here.
+        .with_mcp(state.mcp_host.clone()),
+    );
     let exec = TurnExecutor::new((*inference).clone(), dispatch);
     let cfg = TurnConfig {
         model: ModelId(state.config.model_id.clone()),
