@@ -133,11 +133,15 @@ export function Chat() {
         };
     }, [activeId, auth, getToken]);
 
-    // Live event stream.
+    // Live event stream. The accessor is read on every reconnect
+    // so a token rotation (silent retry / background refresh)
+    // propagates to the next WS handshake — without that, a
+    // backend restart leaves the WS stuck retrying with the stale
+    // pre-restart token forever.
     useEffect(() => {
         if (auth.status !== "authenticated") return;
         const client = new WsClient({
-            accessToken: getToken(),
+            accessToken: getToken,
             onEvent: (ev) => handleWsEvent(ev),
         });
         client.open();

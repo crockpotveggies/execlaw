@@ -5,7 +5,7 @@ describe("WsClient", () => {
     it("dispatches valid JSON events to the listener", () => {
         const seen: unknown[] = [];
         const client = new WsClient({
-            accessToken: null,
+            accessToken: () => null,
             onEvent: (ev) => seen.push(ev),
             urlOverride: "ws://localhost:1/ignore",
         });
@@ -24,7 +24,7 @@ describe("WsClient", () => {
     it("ignores non-string payloads silently", () => {
         const onEvent = vi.fn();
         const client = new WsClient({
-            accessToken: null,
+            accessToken: () => null,
             onEvent,
             urlOverride: "ws://localhost:1/ignore",
         });
@@ -37,7 +37,7 @@ describe("WsClient", () => {
     it("ignores malformed JSON without throwing", () => {
         const onEvent = vi.fn();
         const client = new WsClient({
-            accessToken: null,
+            accessToken: () => null,
             onEvent,
             urlOverride: "ws://localhost:1/ignore",
         });
@@ -49,7 +49,7 @@ describe("WsClient", () => {
     it("ignores parsed payloads without a `kind` string", () => {
         const onEvent = vi.fn();
         const client = new WsClient({
-            accessToken: null,
+            accessToken: () => null,
             onEvent,
             urlOverride: "ws://localhost:1/ignore",
         });

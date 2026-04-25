@@ -26,7 +26,13 @@ export interface WsEvent {
 export type WsListener = (event: WsEvent) => void;
 
 interface ConnectionOpts {
-    accessToken: string | null;
+    /// Live accessor that returns the current access token. Called
+    /// on every reconnect so a token-rotation by AuthContext (silent
+    /// retry / background refresh / manual signIn) propagates to
+    /// the next WS handshake. Pre-Phase-8.7 the constructor took a
+    /// static snapshot, which left stale tokens stuck against a
+    /// restarted backend — every reconnect failed with 401 forever.
+    accessToken: () => string | null;
     onEvent: WsListener;
     /** Override the WS URL (mostly for tests). */
     urlOverride?: string;
@@ -38,14 +44,14 @@ const MAX_BACKOFF_MS = 30_000;
 export class WsClient {
     private socket: WebSocket | null = null;
     private listener: WsListener;
-    private accessToken: string | null;
+    private tokenAccessor: () => string | null;
     private urlOverride: string | undefined;
     private backoffMs = MIN_BACKOFF_MS;
     private closed = false;
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     constructor(opts: ConnectionOpts) {
-        this.accessToken = opts.accessToken;
+        this.tokenAccessor = opts.accessToken;
         this.listener = opts.onEvent;
         this.urlOverride = opts.urlOverride;
     }
@@ -120,9 +126,10 @@ export class WsClient {
         if (this.urlOverride) return this.urlOverride;
         const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
         const base = `${proto}//${window.location.host}/api/stream`;
-        if (this.accessToken) {
+        const token = this.tokenAccessor();
+        if (token) {
             const qs = new URLSearchParams();
-            qs.set("token", this.accessToken);
+            qs.set("token", token);
             return `${base}?${qs.toString()}`;
         }
         return base;

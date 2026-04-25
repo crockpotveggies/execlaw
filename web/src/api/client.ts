@@ -156,12 +156,21 @@ export async function apiFetch<T>(
         //     AuthContext mounts, or unauth routes like /api/login),
         //   - the caller explicitly passed `accessToken` — they
         //     want to control the credential, not have it rotated
-        //     under them.
+        //     under them,
+        //   - the request IS the refresh call itself. Letting the
+        //     hook re-enter on a /api/token/refresh failure causes
+        //     a deadlock: performRefresh's in-flight promise is
+        //     awaiting THIS apiFetch, and silent-retry would await
+        //     the same in-flight promise → both pending forever.
+        //     This is the root cause of Firefox tabs OOM-ing during
+        //     a backend restart when the persisted refresh token
+        //     happens to be invalid.
         if (
             resp.status === 401 &&
             !opts._isRetry &&
             opts.accessToken === undefined &&
-            installedRefreshHook !== null
+            installedRefreshHook !== null &&
+            !isAuthRefreshPath(path)
         ) {
             const fresh = await installedRefreshHook();
             if (fresh) {
@@ -175,6 +184,17 @@ export async function apiFetch<T>(
         throw mapStatus(resp.status, message, serverCode);
     }
     return parsed as T;
+}
+
+/// Auth endpoints whose 401 must NOT trigger silent-retry. Any call
+/// that the refresh hook itself depends on belongs here.
+function isAuthRefreshPath(path: string): boolean {
+    return (
+        path === "/api/token/refresh" ||
+        path === "/api/login" ||
+        path === "/api/login/webauthn/finish" ||
+        path === "/api/setup"
+    );
 }
 
 function mapStatus(

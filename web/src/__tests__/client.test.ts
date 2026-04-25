@@ -226,6 +226,40 @@ describe("apiFetch", () => {
             expect(fetchMock).toHaveBeenCalledTimes(2);
         });
 
+        it("does NOT silent-retry the refresh call itself (deadlock guard)", async () => {
+            // Reproduces the deadlock that caused Firefox tabs to
+            // OOM during a backend restart. If apiFetch is allowed
+            // to silent-retry on a 401 from /api/token/refresh,
+            // performRefresh's in-flight promise awaits THIS call,
+            // and silent-retry awaits the same in-flight promise —
+            // both pending forever. Each subsequent poll spawns
+            // another permanently-pending chain that retains React
+            // closures.
+            fetchMock.mockImplementation(
+                async () =>
+                    new Response(
+                        JSON.stringify({
+                            error: { code: "invalid_refresh_token", message: "x" },
+                        }),
+                        { status: 401 },
+                    ),
+            );
+            const hook = vi.fn(async () => "fresh");
+            setRefreshHook(hook);
+
+            await expect(
+                apiFetch("/api/token/refresh", {
+                    method: "POST",
+                    body: { refresh_token: "consumed" },
+                }),
+            ).rejects.toBeInstanceOf(ApiError);
+            // Hook was NOT called — the refresh path is excluded
+            // from silent-retry.
+            expect(hook).not.toHaveBeenCalled();
+            // Only one fetch — no retry attempt.
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+        });
+
         it("explicit accessToken disables the auto-retry", async () => {
             // When the caller passed `accessToken` explicitly they're
             // managing the credential themselves — we should not
