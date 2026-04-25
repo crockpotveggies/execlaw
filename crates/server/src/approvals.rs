@@ -18,7 +18,10 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::{Router, routing::post};
+use axum::{
+    Router,
+    routing::{get, post},
+};
 use execlaw_core::conversation::{ConversationStore, Phase};
 use execlaw_core::events::{EventKind, EventLog, PendingEvent};
 use execlaw_core::ids::{ConversationId, EventSeq, PrincipalId};
@@ -455,10 +458,187 @@ pub struct RevokeRequest {
     pub reason: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// List endpoints — read-only feeds for the SPA's settings pages.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct PrincipalSummary {
+    pub id: String,
+    pub trust_class: String,
+    pub display_name: Option<String>,
+    pub first_seen: i64,
+    pub last_seen: Option<i64>,
+    pub identifiers: Vec<IdentifierSummary>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct IdentifierSummary {
+    pub transport: String,
+    pub handle: String,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct PrincipalListResponse {
+    pub principals: Vec<PrincipalSummary>,
+}
+
+/// `GET /api/admin/principals` — every principal the system has seen,
+/// ordered by first_seen ascending (Controller first since it was
+/// minted at setup time).
+#[utoipa::path(
+    get,
+    path = "/api/admin/principals",
+    responses(
+        (status = 200, description = "Principal summaries", body = PrincipalListResponse),
+        (status = 401, description = "Missing or invalid Authorization header"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "approvals"
+)]
+pub async fn list_principals_handler(
+    State(state): State<AppState>,
+    _user: crate::auth_extract::AuthedUser,
+) -> impl IntoResponse {
+    let store = PrincipalStore::new(&state.db);
+    let principals = match store.list_all() {
+        Ok(p) => p,
+        Err(e) => return internal_error(&format!("list_all: {e}")),
+    };
+    let summaries: Vec<PrincipalSummary> = principals
+        .into_iter()
+        .map(|p| PrincipalSummary {
+            id: p.id.as_str().to_owned(),
+            trust_class: p.trust_level.class_tag().to_owned(),
+            display_name: p
+                .metadata
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned()),
+            first_seen: p.first_seen,
+            last_seen: p.last_seen,
+            identifiers: p
+                .identifiers
+                .into_iter()
+                .map(|i| IdentifierSummary {
+                    transport: i.transport,
+                    handle: i.handle,
+                })
+                .collect(),
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(PrincipalListResponse {
+            principals: summaries
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct PendingApprovalSummary {
+    pub approval_id: String,
+    pub conversation_id: String,
+    pub sender_principal_id: String,
+    pub original_text: String,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct PendingApprovalsResponse {
+    pub approvals: Vec<PendingApprovalSummary>,
+}
+
+/// `GET /api/admin/approvals` — every cold-contact arrival whose
+/// sender is still `UnknownPending`. Linear scan via state_events;
+/// acceptable while approval volume is low (Phase-3 scope).
+#[utoipa::path(
+    get,
+    path = "/api/admin/approvals",
+    responses(
+        (status = 200, description = "Pending approvals", body = PendingApprovalsResponse),
+        (status = 401, description = "Missing or invalid Authorization header"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "approvals"
+)]
+pub async fn list_pending_approvals_handler(
+    State(state): State<AppState>,
+    _user: crate::auth_extract::AuthedUser,
+) -> impl IntoResponse {
+    let principals = PrincipalStore::new(&state.db);
+
+    // Pull every distinct conversation that has at least one
+    // cold_contact_arrived event.
+    let conv_ids: Vec<String> = match state.db.with_conn(|c| {
+        let mut stmt = c
+            .prepare(
+                "SELECT DISTINCT conversation_id FROM state_events \
+                 WHERE kind = 'cold_contact_arrived'",
+            )
+            .map_err(execlaw_core::db::DbError::from)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(execlaw_core::db::DbError::from)?;
+        let out: Result<Vec<_>, _> = rows.collect();
+        Ok(out?)
+    }) {
+        Ok(v) => v,
+        Err(e) => return internal_error(&format!("conv scan: {e}")),
+    };
+
+    let log = event_log(&state);
+    let mut approvals: Vec<PendingApprovalSummary> = Vec::new();
+    for cid_str in conv_ids {
+        let cid = ConversationId::from(cid_str.clone());
+        let events = match log.replay_since(&cid, EventSeq(0)) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for ev in events {
+            if ev.kind != EventKind::ColdContactArrived {
+                continue;
+            }
+            let Ok(p) = ev.decode_payload::<ColdContactReplayPayload>() else {
+                continue;
+            };
+            // Filter out approvals whose principal has already been
+            // resolved (not UnknownPending anymore).
+            let still_pending = principals
+                .get(&PrincipalId::from(p.sender_principal_id.clone()))
+                .ok()
+                .flatten()
+                .map(|principal| {
+                    matches!(
+                        principal.trust_level,
+                        CoreTrustLevel::UnknownPending { .. }
+                    )
+                })
+                .unwrap_or(true);
+            if !still_pending {
+                continue;
+            }
+            approvals.push(PendingApprovalSummary {
+                approval_id: p.approval_id,
+                conversation_id: cid_str.clone(),
+                sender_principal_id: p.sender_principal_id,
+                original_text: p.text,
+            });
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(PendingApprovalsResponse { approvals })),
+    )
+        .into_response()
+}
+
 /// Sub-router mounted at `/api/admin/approvals/...` and
 /// `/api/admin/principals/.../revoke`.
 pub fn approvals_router() -> Router<AppState> {
     Router::new()
+        .route("/api/admin/approvals", get(list_pending_approvals_handler))
+        .route("/api/admin/principals", get(list_principals_handler))
         .route(
             "/api/admin/approvals/{approval_id}/respond",
             post(respond_handler),
@@ -467,4 +647,88 @@ pub fn approvals_router() -> Router<AppState> {
             "/api/admin/principals/{principal_id}/revoke",
             post(revoke_handler),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routes::{build_router, test_app_state};
+    use axum::body::{self, Body};
+    use axum::http::{Method, Request, header};
+    use tower::ServiceExt;
+
+    async fn setup_get_token(app: &axum::Router) -> String {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "username": "tester",
+            "admin_password": "hunter2-longer",
+            "display_name": "Tester",
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/setup")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        v["access_token"].as_str().unwrap().to_owned()
+    }
+
+    async fn read_json(
+        app: &axum::Router,
+        token: Option<&str>,
+        uri: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder().method(Method::GET).uri(uri);
+        if let Some(t) = token {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, v)
+    }
+
+    #[tokio::test]
+    async fn list_principals_requires_auth() {
+        let app = build_router(test_app_state());
+        let (status, _) = read_json(&app, None, "/api/admin/principals").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn list_principals_returns_empty_on_fresh_db() {
+        let app = build_router(test_app_state());
+        let token = setup_get_token(&app).await;
+        let (status, body) =
+            read_json(&app, Some(&token), "/api/admin/principals").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["principals"].is_array());
+        assert_eq!(body["principals"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_pending_approvals_requires_auth() {
+        let app = build_router(test_app_state());
+        let (status, _) = read_json(&app, None, "/api/admin/approvals").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn list_pending_approvals_returns_empty_on_fresh_db() {
+        let app = build_router(test_app_state());
+        let token = setup_get_token(&app).await;
+        let (status, body) =
+            read_json(&app, Some(&token), "/api/admin/approvals").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["approvals"].as_array().unwrap().len(), 0);
+    }
 }

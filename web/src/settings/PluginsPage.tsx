@@ -1,0 +1,214 @@
+// Plugins page — list installed plugins with enable/disable + a ZIP
+// upload form. Phase-2 backend accepts raw application/zip POSTs;
+// switching to multipart lands when the upload-progress UI is needed.
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import Button from "react-bootstrap/Button";
+import Form from "react-bootstrap/Form";
+import Spinner from "react-bootstrap/Spinner";
+import {
+    disablePlugin,
+    enablePlugin,
+    installPlugin,
+    listPlugins,
+    uninstallPlugin,
+    type PluginSummary,
+} from "../api/endpoints";
+import { useAuth } from "../auth/AuthContext";
+
+export function PluginsPage() {
+    const auth = useAuth();
+    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const [plugins, setPlugins] = useState<PluginSummary[] | null>(null);
+    const [error, setError] = useState<string | null>(null);
+    const [busyId, setBusyId] = useState<string | null>(null);
+
+    const fetchList = useCallback(async () => {
+        try {
+            const r = await listPlugins(getToken);
+            setPlugins(r.plugins);
+            setError(null);
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+        }
+    }, [getToken]);
+
+    useEffect(() => {
+        void fetchList();
+    }, [fetchList]);
+
+    const onToggle = useCallback(
+        async (p: PluginSummary) => {
+            setBusyId(p.plugin_id);
+            try {
+                if (p.enabled) await disablePlugin(p.plugin_id, getToken);
+                else await enablePlugin(p.plugin_id, getToken);
+                await fetchList();
+            } catch (e) {
+                setError(e instanceof Error ? e.message : String(e));
+            } finally {
+                setBusyId(null);
+            }
+        },
+        [fetchList, getToken],
+    );
+
+    const onUninstall = useCallback(
+        async (p: PluginSummary) => {
+            if (!confirm(`Uninstall plugin "${p.plugin_id}"? This is permanent.`))
+                return;
+            setBusyId(p.plugin_id);
+            try {
+                await uninstallPlugin(p.plugin_id, getToken);
+                await fetchList();
+            } catch (e) {
+                setError(e instanceof Error ? e.message : String(e));
+            } finally {
+                setBusyId(null);
+            }
+        },
+        [fetchList, getToken],
+    );
+
+    return (
+        <div data-testid="settings-plugins">
+            <h3 className="h6 mb-3">Plugins</h3>
+
+            <InstallCard onInstalled={fetchList} />
+
+            {error && (
+                <div className="execlaw-error-banner mb-3" role="alert">
+                    {error}
+                </div>
+            )}
+
+            {plugins === null ? (
+                <div className="execlaw-muted small">Loading plugins…</div>
+            ) : plugins.length === 0 ? (
+                <div className="execlaw-muted small">
+                    No plugins installed yet. Drop a ZIP above to get started.
+                </div>
+            ) : (
+                plugins.map((p) => (
+                    <div className="execlaw-card" key={p.plugin_id}>
+                        <div className="d-flex align-items-center gap-2 mb-2">
+                            <i className="bi bi-plug" aria-hidden />
+                            <span className="execlaw-card__title flex-grow-1">
+                                {p.plugin_id}
+                            </span>
+                            <span className="execlaw-muted small">
+                                v{p.version}
+                            </span>
+                            <span
+                                className={
+                                    "execlaw-trust-badge ms-2" +
+                                    (p.enabled ? " is-known" : "")
+                                }
+                            >
+                                {p.enabled ? "enabled" : "disabled"}
+                            </span>
+                        </div>
+                        <div className="d-flex gap-2">
+                            <Button
+                                size="sm"
+                                variant={p.enabled ? "outline-secondary" : "outline-primary"}
+                                disabled={busyId === p.plugin_id}
+                                onClick={() => void onToggle(p)}
+                                data-testid="plugin-toggle"
+                            >
+                                {p.enabled ? "Disable" : "Enable"}
+                            </Button>
+                            <Button
+                                size="sm"
+                                variant="outline-danger"
+                                disabled={busyId === p.plugin_id}
+                                onClick={() => void onUninstall(p)}
+                                data-testid="plugin-uninstall"
+                            >
+                                Uninstall
+                            </Button>
+                        </div>
+                    </div>
+                ))
+            )}
+        </div>
+    );
+}
+
+function InstallCard({ onInstalled }: { onInstalled: () => Promise<void> }) {
+    const auth = useAuth();
+    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const fileRef = useRef<HTMLInputElement | null>(null);
+    const [installing, setInstalling] = useState(false);
+    const [installError, setInstallError] = useState<string | null>(null);
+    const [lastInstalled, setLastInstalled] = useState<string | null>(null);
+
+    const onSubmit = useCallback(
+        async (e: React.FormEvent<HTMLFormElement>) => {
+            e.preventDefault();
+            const file = fileRef.current?.files?.[0];
+            if (!file) {
+                setInstallError("Choose a ZIP file first.");
+                return;
+            }
+            setInstalling(true);
+            setInstallError(null);
+            try {
+                const r = await installPlugin(file, getToken);
+                setLastInstalled(`${r.plugin_id} v${r.version}`);
+                if (fileRef.current) fileRef.current.value = "";
+                await onInstalled();
+            } catch (e) {
+                setInstallError(e instanceof Error ? e.message : String(e));
+            } finally {
+                setInstalling(false);
+            }
+        },
+        [getToken, onInstalled],
+    );
+
+    return (
+        <div className="execlaw-card mb-3">
+            <div className="execlaw-card__title">Install a plugin</div>
+            <Form onSubmit={onSubmit} className="d-flex gap-2 align-items-end">
+                <Form.Group className="flex-grow-1">
+                    <Form.Label className="execlaw-muted small mb-1">
+                        ZIP archive
+                    </Form.Label>
+                    <Form.Control
+                        ref={fileRef}
+                        type="file"
+                        accept=".zip,application/zip"
+                        disabled={installing}
+                        data-testid="plugin-install-file"
+                    />
+                </Form.Group>
+                <Button
+                    type="submit"
+                    variant="primary"
+                    disabled={installing}
+                    data-testid="plugin-install-submit"
+                >
+                    {installing ? (
+                        <Spinner size="sm" animation="border" />
+                    ) : (
+                        <>
+                            <i className="bi bi-upload me-2" aria-hidden />
+                            Install
+                        </>
+                    )}
+                </Button>
+            </Form>
+            {installError && (
+                <div className="execlaw-error-banner mt-2" role="alert">
+                    {installError}
+                </div>
+            )}
+            {lastInstalled && !installError && (
+                <div className="execlaw-muted small mt-2">
+                    Installed {lastInstalled}.
+                </div>
+            )}
+        </div>
+    );
+}

@@ -322,6 +322,140 @@ body {
     padding: 2rem 1rem;
 }
 
+// ---- Settings shell ----------------------------------------------
+.execlaw-settings {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 1.5rem 2rem 3rem;
+}
+
+.execlaw-settings__head {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+}
+
+.execlaw-settings__tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    border-bottom: 1px solid $border-subtle;
+    padding-bottom: 0.5rem;
+    margin-bottom: 1.5rem;
+}
+
+.execlaw-settings__tab {
+    background: transparent;
+    border: 1px solid transparent;
+    color: $text-muted;
+    padding: 0.4rem 0.85rem;
+    border-radius: 0.4rem;
+    font-size: 0.9rem;
+    cursor: pointer;
+    text-decoration: none;
+
+    &:hover {
+        background-color: $bg-surface;
+        color: $text-primary;
+    }
+
+    &.is-active {
+        background-color: rgba($accent, 0.15);
+        color: color.adjust($accent, $lightness: 18%);
+        border-color: rgba($accent, 0.4);
+    }
+}
+
+.execlaw-card {
+    background-color: $bg-surface;
+    border: 1px solid $border-subtle;
+    border-radius: 0.5rem;
+    padding: 1rem 1.1rem;
+    margin-bottom: 0.75rem;
+}
+
+.execlaw-card__title {
+    font-weight: 600;
+    margin-bottom: 0.4rem;
+}
+
+.execlaw-card__row {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.45rem 0;
+    border-top: 1px solid $border-subtle;
+
+    &:first-child {
+        border-top: 0;
+        padding-top: 0;
+    }
+}
+
+.execlaw-trust-badge {
+    display: inline-block;
+    font-size: 0.75rem;
+    padding: 0.15rem 0.5rem;
+    border-radius: 999px;
+    background-color: $bg-elev;
+    color: $text-muted;
+    border: 1px solid $border-subtle;
+
+    &.is-controller { color: color.adjust($accent, $lightness: 18%); border-color: rgba($accent, 0.45); }
+    &.is-known { color: color.adjust($success, $lightness: 8%); border-color: rgba($success, 0.4); }
+    &.is-limited { color: color.adjust($warning, $lightness: 8%); border-color: rgba($warning, 0.4); }
+    &.is-pending { color: color.adjust($warning, $lightness: 12%); border-color: rgba($warning, 0.4); }
+    &.is-blocked { color: color.adjust($danger, $lightness: 8%); border-color: rgba($danger, 0.4); }
+}
+
+.execlaw-log-row {
+    display: grid;
+    grid-template-columns: 7rem 4.5rem 9rem 1fr;
+    gap: 0.5rem;
+    padding: 0.35rem 0.5rem;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    border-top: 1px solid $border-subtle;
+    color: $text-primary;
+
+    &:first-child {
+        border-top: 0;
+    }
+
+    .execlaw-log-row__ts { color: $text-muted; }
+    .execlaw-log-row__level { font-weight: 600; }
+    .execlaw-log-row__level.is-error { color: $danger; }
+    .execlaw-log-row__level.is-warn  { color: $warning; }
+    .execlaw-log-row__level.is-info  { color: $accent; }
+    .execlaw-log-row__level.is-debug { color: $text-muted; }
+    .execlaw-log-row__target { color: $text-muted; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .execlaw-log-row__msg { white-space: pre-wrap; word-break: break-word; }
+}
+
+.execlaw-thread-rename {
+    background: transparent;
+    border: none;
+    border-bottom: 1px dashed transparent;
+    color: $text-primary;
+    font-size: 1rem;
+    font-weight: 600;
+    padding: 0.05rem 0.15rem;
+    min-width: 6rem;
+
+    &:hover {
+        border-bottom-color: $border-subtle;
+    }
+
+    &:focus {
+        outline: none;
+        border-bottom-color: $accent;
+    }
+}
+
 // ---- Welcome view (fresh / empty thread) -------------------------
 .execlaw-welcome {
     flex: 1 1 auto;

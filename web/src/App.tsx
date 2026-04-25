@@ -4,6 +4,7 @@ import { AppBoot } from "./routes/AppBoot";
 import { Chat } from "./routes/Chat";
 import { Login } from "./routes/Login";
 import { SetupWizard } from "./routes/SetupWizard";
+import { Settings } from "./settings/Settings";
 
 export function App() {
     return (
@@ -14,6 +15,7 @@ export function App() {
                     <Route path="/setup" element={<SetupWizard />} />
                     <Route path="/login" element={<Login />} />
                     <Route path="/chat" element={<Chat />} />
+                    <Route path="/settings/*" element={<Settings />} />
                     <Route path="*" element={<AppBoot />} />
                 </Routes>
             </BrowserRouter>

@@ -1,17 +1,17 @@
 # execlaw build STATUS
 
-Last update: 2026-04-25, after Phase-6a chat shell (sidebar + thread list + WS bus + composer + Reanimated 4 transitions).
+Last update: 2026-04-25, after Phase 6a-c closeout (React+GSAP swap, settings shell with admin pages, approval verbs, thread rename, incognito toggle, plugin install, trust revoke).
 
 ## TL;DR
 
 - `cargo build --workspace` — **clean**
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **376 passing, 0 failing**
+- `cargo test --workspace --no-fail-fast` — **380 passing, 0 failing**
 - `cargo bench --workspace --no-run` — **clean** (43 benches across 9 crates)
-- `cd web && npm test` — **56 passing** (jsdom + react-testing-library)
-- `cd web && npm run build` — **clean** (380 KB JS / 306 KB CSS, both well under budget)
+- `cd web && npm test` — **70 passing** (jsdom + react-testing-library)
+- `cd web && npm run build` — **clean** (289 KB JS / 310 KB CSS, both well under budget)
 - **Zero cloud-SDK dependencies** anywhere in the workspace
-- Phases 0–5 complete; Phase-6a SPA wraps setup → login → live chat shell with sidebar / thread list / streaming / Reanimated 4 transitions. Hands-on test ready: see [web/README.md](web/README.md).
+- Phases 0–6c complete (only **6d Tauri Desktop wrapper** remains in Phase 6). SPA on plain React + GSAP covers: setup → login → chat (sidebar / thread list / streaming / inline approval card with verbs / thread rename / incognito toggle) → settings (plugins / principals / hardware / logs / eval-flags) with plugin install + trust revoke writes.
 
 ## Migration-plan phase structure (post-2026-04-24 refactor)
 

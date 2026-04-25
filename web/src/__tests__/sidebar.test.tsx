@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { Sidebar } from "../chat/Sidebar";
 import {
     __resetChatStore,
@@ -13,7 +14,13 @@ import { AuthProvider } from "../auth/AuthContext";
 afterEach(() => __resetChatStore());
 
 function rerender(ui: React.ReactElement) {
-    return render(<AuthProvider>{ui}</AuthProvider>);
+    // Sidebar uses react-router's <Link> for the settings gear, so
+    // tests must mount within a MemoryRouter.
+    return render(
+        <AuthProvider>
+            <MemoryRouter>{ui}</MemoryRouter>
+        </AuthProvider>,
+    );
 }
 
 describe("Sidebar", () => {

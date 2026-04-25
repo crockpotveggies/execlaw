@@ -9,14 +9,17 @@
 //     events (created/replied) refresh the list,
 //   - Composer → POST /api/chats/:id/messages → optimistic local push.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Navigate } from "react-router-dom";
 import { useScreenTransition } from "../anim/useScreenTransition";
 import { ApiError } from "../api/client";
 import {
     listMessages,
+    listPendingApprovals,
     listThreads,
+    patchThread,
     postMessage,
+    respondApproval,
 } from "../api/endpoints";
 import { WsClient, type WsEvent } from "../api/ws";
 import { useAuth } from "../auth/AuthContext";
@@ -28,10 +31,12 @@ import { WelcomeView } from "../chat/WelcomeView";
 import {
     appendMessage,
     appendStreamingToken,
+    clearPendingApproval,
     clearStreamingBuffer,
     markUnread,
     setActiveThread,
     setMessages,
+    setPendingApprovals,
     setThreads,
     useChatState,
 } from "../chat/store";
@@ -69,14 +74,20 @@ export function Chat() {
     // Stable accessor used by everything that needs the live access token.
     const getToken = useCallback(() => auth.getAccessToken(), [auth]);
 
-    // Initial + live thread list.
+    // Initial + live thread list + pending approvals.
     useEffect(() => {
         if (auth.status !== "authenticated") return;
         let cancelled = false;
         (async () => {
             try {
-                const resp = await listThreads(getToken);
-                if (!cancelled) setThreads(resp.threads);
+                const [threadsResp, approvalsResp] = await Promise.all([
+                    listThreads(getToken),
+                    listPendingApprovals(getToken),
+                ]);
+                if (!cancelled) {
+                    setThreads(threadsResp.threads);
+                    setPendingApprovals(approvalsResp.approvals);
+                }
             } catch (e) {
                 if (!cancelled)
                     setTopError(
@@ -280,28 +291,179 @@ function ActiveThreadPane({
     conversationId: string;
     onSend: (text: string) => Promise<void> | void;
 }) {
+    const auth = useAuth();
+    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+
     const thread = useChatState((s) =>
         s.threads.find((t) => t.conversation_id === conversationId),
     );
-    const headerLabel = useMemo(() => {
-        if (thread?.display_name) return thread.display_name;
-        if (conversationId.startsWith("controller-thread:")) return "Control thread";
-        return `New chat · ${conversationId.slice(0, 6)}`;
-    }, [thread, conversationId]);
+    const approval = useChatState(
+        (s) => s.pendingApprovals[conversationId] ?? null,
+    );
+    const isControl = conversationId.startsWith("controller-thread:");
+    const fallbackLabel = isControl
+        ? "Control thread"
+        : `New chat · ${conversationId.slice(0, 6)}`;
+    const headerLabel = thread?.display_name ?? fallbackLabel;
+
+    const [editing, setEditing] = useState(false);
+    const [editValue, setEditValue] = useState(headerLabel);
+    const [approvalBusy, setApprovalBusy] = useState(false);
+
+    // Reset edit buffer whenever the active thread / its label changes.
+    useEffect(() => {
+        setEditValue(headerLabel);
+        setEditing(false);
+    }, [conversationId, headerLabel]);
+
+    const commitRename = useCallback(async () => {
+        const trimmed = editValue.trim();
+        setEditing(false);
+        if (!trimmed || trimmed === headerLabel) return;
+        try {
+            await patchThread(
+                conversationId,
+                { display_name: trimmed },
+                getToken,
+            );
+            // Refresh the thread list so the sidebar picks up the new name.
+            const r = await listThreads(getToken);
+            setThreads(r.threads);
+        } catch {
+            /* swallow — surfaced via the chat error banner if it's persistent */
+        }
+    }, [conversationId, editValue, getToken, headerLabel]);
+
+    const toggleIncognito = useCallback(async () => {
+        if (!thread) return;
+        try {
+            if (thread.is_ephemeral) {
+                await patchThread(
+                    conversationId,
+                    { is_ephemeral: false },
+                    getToken,
+                );
+            } else {
+                // Default 1-hour expiry — matches MIGRATION_PLAN §2.6.
+                const expiresAt =
+                    Math.floor(Date.now() / 1000) + 60 * 60;
+                await patchThread(
+                    conversationId,
+                    {
+                        is_ephemeral: true,
+                        ephemeral_expires_at: expiresAt,
+                    },
+                    getToken,
+                );
+            }
+            const r = await listThreads(getToken);
+            setThreads(r.threads);
+        } catch {
+            /* swallow */
+        }
+    }, [conversationId, getToken, thread]);
+
+    const onApprovalRespond = useCallback(
+        async (
+            approvalId: string,
+            verb: "Trust" | "TrustLimited" | "Block" | "TrustOnce",
+        ) => {
+            setApprovalBusy(true);
+            try {
+                await respondApproval(approvalId, { verb }, getToken);
+                clearPendingApproval(conversationId);
+                // Refresh threads so kind/trust_class on the sidebar
+                // updates immediately.
+                const r = await listThreads(getToken);
+                setThreads(r.threads);
+            } catch {
+                /* swallow — operator can retry */
+            } finally {
+                setApprovalBusy(false);
+            }
+        },
+        [conversationId, getToken],
+    );
 
     return (
         <>
             <header className="execlaw-main__head">
-                <h2 className="h6 mb-0">{headerLabel}</h2>
+                {editing ? (
+                    <input
+                        autoFocus
+                        className="execlaw-thread-rename"
+                        value={editValue}
+                        onChange={(e) => setEditValue(e.target.value)}
+                        onBlur={() => void commitRename()}
+                        onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                                e.preventDefault();
+                                void commitRename();
+                            }
+                            if (e.key === "Escape") {
+                                setEditing(false);
+                                setEditValue(headerLabel);
+                            }
+                        }}
+                        data-testid="thread-rename-input"
+                    />
+                ) : (
+                    <h2
+                        className="h6 mb-0 execlaw-thread-rename"
+                        onClick={() => !isControl && setEditing(true)}
+                        role={!isControl ? "button" : undefined}
+                        tabIndex={isControl ? -1 : 0}
+                        title={
+                            isControl
+                                ? "Control thread title is fixed"
+                                : "Click to rename"
+                        }
+                        data-testid="thread-rename-trigger"
+                    >
+                        {headerLabel}
+                    </h2>
+                )}
                 {thread?.is_ephemeral && (
                     <span className="badge bg-secondary ms-2">incognito</span>
+                )}
+                {!isControl && (
+                    <button
+                        type="button"
+                        className="btn btn-link btn-sm p-1 ms-auto execlaw-muted"
+                        onClick={() => void toggleIncognito()}
+                        aria-label={
+                            thread?.is_ephemeral
+                                ? "Disable incognito"
+                                : "Make incognito"
+                        }
+                        title={
+                            thread?.is_ephemeral
+                                ? "Disable incognito"
+                                : "Make incognito (purges in ~1h)"
+                        }
+                        data-testid="thread-incognito-toggle"
+                    >
+                        <i
+                            className={
+                                "bi " +
+                                (thread?.is_ephemeral
+                                    ? "bi-incognito"
+                                    : "bi-eye-slash")
+                            }
+                            aria-hidden
+                        />
+                    </button>
                 )}
             </header>
 
             <MessageStream conversationId={conversationId} />
 
             <div className="execlaw-composer">
-                <ApprovalCard approval={null} />
+                <ApprovalCard
+                    approval={approval}
+                    busy={approvalBusy}
+                    onRespond={(id, verb) => void onApprovalRespond(id, verb)}
+                />
                 <Composer onSend={onSend} />
             </div>
         </>

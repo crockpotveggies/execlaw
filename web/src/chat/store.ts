@@ -8,7 +8,11 @@
 // the typed hooks below.
 
 import { useSyncExternalStore } from "react";
-import type { MessageView, ThreadSummary } from "../api/endpoints";
+import type {
+    MessageView,
+    PendingApprovalSummary,
+    ThreadSummary,
+} from "../api/endpoints";
 
 interface ThreadView extends ThreadSummary {
     /** Local-only flag: agent has replied since the user last opened this thread. */
@@ -25,6 +29,8 @@ export interface ChatState {
     /** Token-stream buffer for the active thread (the SSE/WS feed
      *  appends; flushed when the final assistant message lands). */
     streamingBuffer: Record<string, string>;
+    /** Pending cold-contact approvals keyed by conversation id. */
+    pendingApprovals: Record<string, PendingApprovalSummary>;
 }
 
 type Listener = () => void;
@@ -35,6 +41,7 @@ let state: ChatState = {
     activeId: null,
     messages: {},
     streamingBuffer: {},
+    pendingApprovals: {},
 };
 
 function emit() {
@@ -174,6 +181,30 @@ export function markUnread(conversationId: string) {
     }));
 }
 
+/**
+ * Replace the pending-approvals map. Server is the source of truth on
+ * each fetch; we key by conversation_id so the chat shell can show
+ * the inline approval card without a per-thread query.
+ */
+export function setPendingApprovals(items: PendingApprovalSummary[]) {
+    setState((prev) => {
+        const next: Record<string, PendingApprovalSummary> = {};
+        for (const a of items) {
+            next[a.conversation_id] = a;
+        }
+        return { ...prev, pendingApprovals: next };
+    });
+}
+
+export function clearPendingApproval(conversationId: string) {
+    setState((prev) => {
+        if (!(conversationId in prev.pendingApprovals)) return prev;
+        const { [conversationId]: _drop, ...rest } = prev.pendingApprovals;
+        void _drop;
+        return { ...prev, pendingApprovals: rest };
+    });
+}
+
 /** Test seam: reset the entire store. Production code never calls this. */
 export function __resetChatStore() {
     state = {
@@ -181,6 +212,7 @@ export function __resetChatStore() {
         activeId: null,
         messages: {},
         streamingBuffer: {},
+        pendingApprovals: {},
     };
     emit();
 }

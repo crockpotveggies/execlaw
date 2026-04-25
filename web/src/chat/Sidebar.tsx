@@ -5,6 +5,7 @@
 // wired: list comes from the chat store, click sets the active thread.
 
 import { type ReactNode } from "react";
+import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { setActiveThread, useChatState } from "./store";
 
@@ -98,7 +99,14 @@ export function Sidebar({ onNewThread, onSignOut }: SidebarProps) {
             </div>
 
             <div className="execlaw-sidebar__foot">
-                <i className="bi bi-gear" aria-hidden />
+                <Link
+                    to="/settings"
+                    className="btn btn-link btn-sm p-0 execlaw-muted"
+                    data-testid="sidebar-settings"
+                    aria-label="Settings"
+                >
+                    <i className="bi bi-gear" aria-hidden />
+                </Link>
                 <span className="execlaw-thread-item__name">
                     {auth.user
                         ? `${auth.user.display_name} @${auth.user.username}`

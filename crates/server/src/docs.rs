@@ -17,6 +17,10 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use utoipa::OpenApi;
 
+use crate::approvals::{
+    IdentifierSummary, PendingApprovalSummary, PendingApprovalsResponse,
+    PrincipalListResponse, PrincipalSummary,
+};
 use crate::plugins::{
     InstallResponse, PluginListResponse, PluginSummary, ToolSummary, UiPanelListResponse,
     UiPanelSummary,
@@ -88,6 +92,8 @@ impl Modify for SecurityAddon {
         // approvals
         crate::approvals::respond_handler,
         crate::approvals::revoke_handler,
+        crate::approvals::list_principals_handler,
+        crate::approvals::list_pending_approvals_handler,
     ),
     components(schemas(
         HealthResponse,
@@ -106,6 +112,11 @@ impl Modify for SecurityAddon {
         ToolSummary,
         UiPanelSummary,
         UiPanelListResponse,
+        PrincipalSummary,
+        PrincipalListResponse,
+        IdentifierSummary,
+        PendingApprovalSummary,
+        PendingApprovalsResponse,
     )),
     tags(
         (name = "meta", description = "Liveness + introspection"),
@@ -282,7 +293,9 @@ mod tests {
             ("/api/admin/plugins/{plugin_id}", &["delete"]),
             ("/api/admin/logs", &["get"]),
             ("/api/admin/eval/flags", &["get"]),
+            ("/api/admin/approvals", &["get"]),
             ("/api/admin/approvals/{approval_id}/respond", &["post"]),
+            ("/api/admin/principals", &["get"]),
             ("/api/admin/principals/{principal_id}/revoke", &["post"]),
         ];
         for (path, methods) in expected {
