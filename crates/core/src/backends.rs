@@ -22,13 +22,14 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Logical purpose served by a backend. Mirrors the comment in
-/// migration 0001 and the locked decisions in §2.13.
+/// Logical purpose served by a backend. Post-Phase-8.8 reshape:
+/// Guardrail (unused; one-model world) and Reasoning (capability,
+/// not a deployment) are gone. Reasoning is now a flag on Standard.
+/// Small was added for voice mode and any latency-sensitive route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum BackendPurpose {
     Standard,
-    Reasoning,
-    Guardrail,
+    Small,
     VoiceStt,
     VoiceTts,
 }
@@ -37,8 +38,7 @@ impl BackendPurpose {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Standard => "Standard",
-            Self::Reasoning => "Reasoning",
-            Self::Guardrail => "Guardrail",
+            Self::Small => "Small",
             Self::VoiceStt => "VoiceSTT",
             Self::VoiceTts => "VoiceTTS",
         }
@@ -47,8 +47,7 @@ impl BackendPurpose {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "Standard" => Some(Self::Standard),
-            "Reasoning" => Some(Self::Reasoning),
-            "Guardrail" => Some(Self::Guardrail),
+            "Small" => Some(Self::Small),
             "VoiceSTT" => Some(Self::VoiceStt),
             "VoiceTTS" => Some(Self::VoiceTts),
             _ => None,
@@ -59,13 +58,15 @@ impl BackendPurpose {
     /// this so a missing row renders as "not configured" instead of
     /// silently disappearing.
     pub fn all() -> &'static [BackendPurpose] {
-        &[
-            Self::Standard,
-            Self::Reasoning,
-            Self::Guardrail,
-            Self::VoiceStt,
-            Self::VoiceTts,
-        ]
+        &[Self::Standard, Self::Small, Self::VoiceStt, Self::VoiceTts]
+    }
+
+    /// `reasoning_enabled` only applies to the Standard purpose —
+    /// other purposes don't expose a reasoning toggle. Small is
+    /// always non-reasoning by design (it's the fast path); voice
+    /// purposes don't run an LLM in the reasoning sense.
+    pub fn supports_reasoning_toggle(self) -> bool {
+        matches!(self, Self::Standard)
     }
 }
 
@@ -79,6 +80,11 @@ pub struct BackendRow {
     pub gpu_id: Option<String>,
     pub endpoint: Option<String>,
     pub notes: Option<String>,
+    /// Phase-8.8: whether the runner should engage the model's
+    /// native reasoning mode (Qwen3.5 `<think>` blocks etc.) on this
+    /// backend. Only meaningful for Standard. Persisted so the
+    /// runner doesn't have to look up a separate config.
+    pub reasoning_enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -93,6 +99,7 @@ pub struct BackendUpsert {
     pub gpu_id: Option<String>,
     pub endpoint: Option<String>,
     pub notes: Option<String>,
+    pub reasoning_enabled: bool,
 }
 
 #[derive(Debug, Error)]
@@ -118,22 +125,28 @@ impl<'db> BackendStore<'db> {
 
     /// Upsert by purpose. Insert on first sight, update on
     /// subsequent calls. The operator never adds or deletes a
-    /// backend — purposes are a fixed enum.
+    /// backend — purposes are a fixed enum. `reasoning_enabled`
+    /// is silently zeroed for purposes that don't support the
+    /// toggle (Small / VoiceSTT / VoiceTTS) so a stale boolean
+    /// doesn't end up in the runner's config.
     pub fn upsert(&self, payload: &BackendUpsert, now: i64) -> Result<BackendRow, BackendError> {
         let model_blob = serde_json::to_vec(&payload.model_spec_json)
             .map_err(|e| BackendError::Invalid(format!("model_spec_json: {e}")))?;
+        let reasoning = payload.reasoning_enabled
+            && payload.purpose.supports_reasoning_toggle();
         self.db.with_conn(|c| {
             c.execute(
                 "INSERT INTO config_backends \
                    (purpose, inference_backend, model_spec_json, gpu_id, endpoint, notes, \
-                    created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) \
+                    reasoning_enabled, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8) \
                  ON CONFLICT(purpose) DO UPDATE SET \
                     inference_backend = excluded.inference_backend, \
                     model_spec_json   = excluded.model_spec_json, \
                     gpu_id            = excluded.gpu_id, \
                     endpoint          = excluded.endpoint, \
                     notes             = excluded.notes, \
+                    reasoning_enabled = excluded.reasoning_enabled, \
                     updated_at        = excluded.updated_at",
                 params![
                     payload.purpose.as_str(),
@@ -142,6 +155,7 @@ impl<'db> BackendStore<'db> {
                     payload.gpu_id,
                     payload.endpoint,
                     payload.notes,
+                    reasoning as i64,
                     now,
                 ],
             )?;
@@ -156,7 +170,7 @@ impl<'db> BackendStore<'db> {
             let got = c
                 .query_row(
                     "SELECT purpose, inference_backend, model_spec_json, gpu_id, endpoint, \
-                            notes, created_at, updated_at \
+                            notes, reasoning_enabled, created_at, updated_at \
                      FROM config_backends WHERE purpose = ?1",
                     params![purpose.as_str()],
                     row_to_backend,
@@ -174,7 +188,7 @@ impl<'db> BackendStore<'db> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT purpose, inference_backend, model_spec_json, gpu_id, endpoint, \
-                        notes, created_at, updated_at \
+                        notes, reasoning_enabled, created_at, updated_at \
                  FROM config_backends \
                  ORDER BY purpose ASC",
             )?;
@@ -224,8 +238,9 @@ fn row_to_backend(row: &rusqlite::Row<'_>) -> rusqlite::Result<BackendRow> {
         gpu_id: row.get(3)?,
         endpoint: row.get(4)?,
         notes: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
+        reasoning_enabled: row.get::<_, i64>(6)? != 0,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
     })
 }
 
@@ -249,6 +264,7 @@ mod tests {
             gpu_id: Some("0".into()),
             endpoint: Some("http://127.0.0.1:8000/v1".into()),
             notes: None,
+            reasoning_enabled: false,
         }
     }
 
@@ -278,7 +294,7 @@ mod tests {
             .upsert(&upsert_payload(BackendPurpose::Standard), 100)
             .unwrap();
         store
-            .upsert(&upsert_payload(BackendPurpose::Reasoning), 100)
+            .upsert(&upsert_payload(BackendPurpose::Small), 100)
             .unwrap();
         let purposes: Vec<_> = store
             .list_all()
@@ -287,7 +303,7 @@ mod tests {
             .map(|r| r.purpose.as_str())
             .collect();
         // Alphabetical by string, which is the SQLite ORDER BY.
-        assert_eq!(purposes, vec!["Reasoning", "Standard", "VoiceTTS"]);
+        assert_eq!(purposes, vec!["Small", "Standard", "VoiceTTS"]);
     }
 
     #[test]
@@ -295,10 +311,10 @@ mod tests {
         let db = fresh_db();
         let store = BackendStore::new(&db);
         store.upsert(&upsert_payload(BackendPurpose::Standard), 0).unwrap();
-        store.upsert(&upsert_payload(BackendPurpose::Reasoning), 0).unwrap();
+        store.upsert(&upsert_payload(BackendPurpose::Small), 0).unwrap();
         assert!(store.clear(BackendPurpose::Standard).unwrap());
         assert!(store.get(BackendPurpose::Standard).unwrap().is_none());
-        assert!(store.get(BackendPurpose::Reasoning).unwrap().is_some());
+        assert!(store.get(BackendPurpose::Small).unwrap().is_some());
         // Re-clearing returns false.
         assert!(!store.clear(BackendPurpose::Standard).unwrap());
     }
@@ -306,12 +322,46 @@ mod tests {
     #[test]
     fn purpose_all_lists_every_enum_value() {
         let names: Vec<_> = BackendPurpose::all().iter().map(|p| p.as_str()).collect();
-        assert!(names.contains(&"Standard"));
-        assert!(names.contains(&"Reasoning"));
-        assert!(names.contains(&"Guardrail"));
-        assert!(names.contains(&"VoiceSTT"));
-        assert!(names.contains(&"VoiceTTS"));
-        assert_eq!(names.len(), 5);
+        assert_eq!(names, vec!["Standard", "Small", "VoiceSTT", "VoiceTTS"]);
+    }
+
+    #[test]
+    fn reasoning_enabled_only_persists_for_standard() {
+        let db = fresh_db();
+        let store = BackendStore::new(&db);
+
+        // Standard: reasoning toggle round-trips.
+        let mut std_payload = upsert_payload(BackendPurpose::Standard);
+        std_payload.reasoning_enabled = true;
+        let r = store.upsert(&std_payload, 100).unwrap();
+        assert!(r.reasoning_enabled, "Standard preserves reasoning flag");
+
+        // Small: reasoning is silently zeroed regardless of input.
+        let mut small_payload = upsert_payload(BackendPurpose::Small);
+        small_payload.reasoning_enabled = true;
+        let r = store.upsert(&small_payload, 100).unwrap();
+        assert!(
+            !r.reasoning_enabled,
+            "Small must not retain a reasoning flag — it's the fast path",
+        );
+
+        // Voice purposes likewise zero the flag.
+        let mut stt_payload = upsert_payload(BackendPurpose::VoiceStt);
+        stt_payload.reasoning_enabled = true;
+        let r = store.upsert(&stt_payload, 100).unwrap();
+        assert!(!r.reasoning_enabled);
+    }
+
+    #[test]
+    fn supports_reasoning_toggle_only_for_standard() {
+        assert!(BackendPurpose::Standard.supports_reasoning_toggle());
+        for p in [
+            BackendPurpose::Small,
+            BackendPurpose::VoiceStt,
+            BackendPurpose::VoiceTts,
+        ] {
+            assert!(!p.supports_reasoning_toggle(), "{} must NOT toggle", p.as_str());
+        }
     }
 
     #[test]

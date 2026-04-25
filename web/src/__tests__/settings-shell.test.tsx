@@ -61,8 +61,7 @@ beforeEach(() => {
                 JSON.stringify({
                     backends: [
                         "Standard",
-                        "Reasoning",
-                        "Guardrail",
+                        "Small",
                         "VoiceSTT",
                         "VoiceTTS",
                     ].map((purpose) => ({ purpose, configured: false, backend: null })),

@@ -82,6 +82,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "backends",
         sql: include_str!("../migrations/0011_backends.sql"),
     },
+    Migration {
+        id: 12,
+        name: "backend-reshape",
+        sql: include_str!("../migrations/0012_backend_reshape.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -213,7 +218,7 @@ mod tests {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
         let runner = MigrationRunner::new(&db);
         let applied = runner.apply_all().unwrap();
-        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
 
         // Spot-check: every documented table exists.
         let tables = vec![
@@ -269,7 +274,7 @@ mod tests {
         let runner = MigrationRunner::new(&db);
         let first = runner.apply_all().unwrap();
         let second = runner.apply_all().unwrap();
-        assert_eq!(first, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(first, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         assert!(
             second.is_empty(),
             "rerun must not re-apply already-applied migrations"

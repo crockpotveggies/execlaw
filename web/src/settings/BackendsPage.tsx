@@ -9,7 +9,7 @@
 //     the form blank.
 //
 // There is NO "+ New" affordance: the set of purposes is fixed by
-// the runner architecture (Standard / Reasoning / Guardrail /
+// the runner architecture (Standard / Small /
 // VoiceSTT / VoiceTTS). See docs/runner-design.md for why.
 
 import { useCallback, useEffect, useState } from "react";
@@ -30,11 +30,9 @@ import { useAuth } from "../auth/AuthContext";
 
 const PURPOSE_HINT: Record<BackendPurpose, string> = {
     Standard:
-        "Default inference for chat turns. The runner picks this when no other purpose applies.",
-    Reasoning:
-        "Heavier model used when the runner needs deeper reasoning (research orchestrator, hard tool-calls).",
-    Guardrail:
-        "Lightweight model that screens runner output before it leaves the conversation.",
+        "Default inference for chat turns. Engages reasoning mode (e.g. Qwen3.5 <think> blocks) when the toggle below is on.",
+    Small:
+        "Fast-path model for voice mode and any latency-sensitive route. The runner falls back to Standard when Small isn't configured.",
     VoiceSTT:
         "Speech-to-text — transcribes inbound audio for the voice pipeline.",
     VoiceTTS:
@@ -47,6 +45,7 @@ interface FormState {
     gpu_id: string;
     endpoint: string;
     notes: string;
+    reasoning_enabled: boolean;
 }
 
 const EMPTY_FORM: FormState = {
@@ -55,6 +54,7 @@ const EMPTY_FORM: FormState = {
     gpu_id: "",
     endpoint: "",
     notes: "",
+    reasoning_enabled: false,
 };
 
 function fromBackend(b: BackendView): FormState {
@@ -64,6 +64,7 @@ function fromBackend(b: BackendView): FormState {
         gpu_id: b.gpu_id ?? "",
         endpoint: b.endpoint ?? "",
         notes: b.notes ?? "",
+        reasoning_enabled: b.reasoning_enabled,
     };
 }
 
@@ -128,6 +129,9 @@ export function BackendsPage() {
                     endpoint:
                         form.endpoint.trim().length > 0 ? form.endpoint.trim() : null,
                     notes: form.notes.trim().length > 0 ? form.notes.trim() : null,
+                    // Server zeroes this for non-Standard purposes;
+                    // we still pass the form value through.
+                    reasoning_enabled: form.reasoning_enabled,
                 },
                 getToken,
             );
@@ -223,6 +227,14 @@ export function BackendsPage() {
                                     {entry.configured && (
                                         <span className="execlaw-trust-badge ms-2 is-controller">
                                             configured
+                                        </span>
+                                    )}
+                                    {entry.backend?.reasoning_enabled && (
+                                        <span
+                                            className="execlaw-trust-badge ms-2 is-known"
+                                            data-testid="backend-reasoning-badge"
+                                        >
+                                            reasoning on
                                         </span>
                                     )}
                                 </span>
@@ -356,6 +368,28 @@ export function BackendsPage() {
                                             data-testid="backend-form-notes"
                                         />
                                     </Form.Group>
+                                    {/* Reasoning toggle is Standard-only.
+                                        Other purposes don't expose a
+                                        reasoning concept; the server
+                                        silently zeroes the value if the
+                                        SPA somehow sends it. */}
+                                    {purpose === "Standard" && (
+                                        <Form.Check
+                                            type="switch"
+                                            id="backend-form-reasoning"
+                                            label="Engage reasoning mode (e.g. Qwen3.5 <think> blocks)"
+                                            checked={form.reasoning_enabled}
+                                            onChange={(e) =>
+                                                setForm({
+                                                    ...form,
+                                                    reasoning_enabled:
+                                                        e.target.checked,
+                                                })
+                                            }
+                                            className="mb-3"
+                                            data-testid="backend-form-reasoning"
+                                        />
+                                    )}
                                     <div className="d-flex gap-2">
                                         <Button
                                             variant="primary"

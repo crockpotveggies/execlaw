@@ -20,12 +20,12 @@ const meResponse = (role: "controller" | "operator" = "controller") =>
         { status: 200 },
     );
 
-const fivePurposes = ["Standard", "Reasoning", "Guardrail", "VoiceSTT", "VoiceTTS"];
+const FOUR_PURPOSES = ["Standard", "Small", "VoiceSTT", "VoiceTTS"];
 
 function emptyListResponse() {
     return new Response(
         JSON.stringify({
-            backends: fivePurposes.map((purpose) => ({
+            backends: FOUR_PURPOSES.map((purpose) => ({
                 purpose,
                 configured: false,
                 backend: null,
@@ -86,13 +86,13 @@ describe("BackendsPage", () => {
         });
         mountPage();
         await waitFor(() => {
-            expect(screen.getAllByTestId("backend-row")).toHaveLength(5);
+            expect(screen.getAllByTestId("backend-row")).toHaveLength(4);
         });
-        for (const p of fivePurposes) {
+        for (const p of FOUR_PURPOSES) {
             expect(screen.getByText(p)).toBeInTheDocument();
         }
-        // All five start as "not configured".
-        expect(screen.getAllByText(/not configured/i)).toHaveLength(5);
+        // All four start as "not configured".
+        expect(screen.getAllByText(/not configured/i)).toHaveLength(4);
     });
 
     it("does NOT render a + New affordance — purposes are fixed", async () => {
@@ -104,7 +104,7 @@ describe("BackendsPage", () => {
         });
         mountPage();
         await waitFor(() => {
-            expect(screen.getAllByTestId("backend-row")).toHaveLength(5);
+            expect(screen.getAllByTestId("backend-row")).toHaveLength(4);
         });
         // No "+ New" or "Add backend" outside of a row's edit affordance.
         // We assert there's no global +New button by inspecting the page-
@@ -142,7 +142,7 @@ describe("BackendsPage", () => {
         });
         mountPage();
         await waitFor(() => {
-            expect(screen.getAllByTestId("backend-row")).toHaveLength(5);
+            expect(screen.getAllByTestId("backend-row")).toHaveLength(4);
         });
         // Click the Standard row's "Add backend" button (first edit btn).
         const editButtons = screen.getAllByTestId("backend-edit");
@@ -197,7 +197,7 @@ describe("BackendsPage", () => {
         });
         mountPage();
         await waitFor(() => {
-            expect(screen.getAllByTestId("backend-row")).toHaveLength(5);
+            expect(screen.getAllByTestId("backend-row")).toHaveLength(4);
         });
         const editButtons = screen.getAllByTestId("backend-edit");
         fireEvent.click(editButtons[0]);
@@ -228,7 +228,7 @@ describe("BackendsPage", () => {
             if (url === "/api/admin/backends")
                 return new Response(
                     JSON.stringify({
-                        backends: fivePurposes.map((purpose) => ({
+                        backends: FOUR_PURPOSES.map((purpose) => ({
                             purpose,
                             configured: purpose === "Standard",
                             backend:

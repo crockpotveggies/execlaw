@@ -1266,38 +1266,35 @@ The result is a small, portable control-plane image that still knows everything 
 
 ### 5.4 Runner deployment registry
 
-execlaw does not hardcode which model runs which runner on which GPU. The operator configures **runner deployments** — mappings of (runner purpose → inference backend plugin → model → GPU) — stored in SQLite and editable in the UI. The container manager starts and manages the services accordingly.
+execlaw does not hardcode which model runs which runner on which GPU. The operator configures **backends** — mappings of (purpose → inference backend plugin → model → GPU) — stored in SQLite and editable in the UI. The container manager starts and manages the services accordingly.
 
 ```rust
-enum RunnerPurpose {
-    Standard,    // Text conversations, voice LLM stage
-    Reasoning,   // Deep sub-agent escalation (§2.9 case 3)
-    Guardrail,   // Input/output classification (§2.9 case 1)
-    VoiceSTT,    // Whisper backend for the voice pipeline
-    VoiceTTS,    // Kokoro (or fallback) backend for the voice pipeline
+enum BackendPurpose {
+    Standard,    // Default text-conversation inference + voice LLM stage; reasoning_enabled toggles native <think> mode
+    Small,       // Fast-path model for voice mode and other latency-sensitive routes
+    VoiceStt,    // Whisper backend for the voice pipeline
+    VoiceTts,    // Kokoro (or fallback) backend for the voice pipeline
 }
 
-struct RunnerDeployment {
-    id: DeploymentId,
-    purpose: RunnerPurpose,
-    inference_backend: PluginId,    // service-vllm | service-openarc | service-whisper | service-kokoro | other local backend
-    model: ModelSpec,                // repo, quantization, revision
-    gpu: Option<GpuId>,              // None = CPU
-    endpoint: Option<Url>,           // Usually unset (local service manages endpoint); present only for user-pointed local endpoints like an existing Ollama install
-    is_default_for_purpose: bool,
-    active: bool,
+struct BackendRow {
+    purpose: BackendPurpose,            // PK
+    inference_backend: PluginId,        // service-vllm | service-openarc | service-whisper | service-kokoro | other local backend
+    model_spec_json: Value,             // repo, quantization, revision
+    gpu_id: Option<String>,             // None = CPU
+    endpoint: Option<Url>,              // Usually unset (local service manages endpoint); present only for user-pointed local endpoints like an existing Ollama install
     notes: Option<String>,
+    reasoning_enabled: bool,            // Standard-only: opt into Qwen3.5 <think> blocks etc. Server zeroes for other purposes.
 }
 ```
 
-Stored in `config_runner_deployments`. Changes are audit events.
+Stored in `config_backends` (renamed from the original `config_runner_deployments`; Phase 8.5/8.8 reshape). Changes are audit events. Phase-7f advanced-subagent work — including separate Guardrail-classifier deployments and Reasoning-escalation paths — was de-scoped from Phase 7 and lives in its own roadmap; until then, Standard with `reasoning_enabled = true` is the only reasoning surface.
 
 **Default recommendations** are computed from the detected `HardwareProfile` at first run and presented in the setup wizard; the operator accepts or overrides. For the hybrid nvidia + Intel Arc development setup this plan targets:
 
 | Purpose | Inference backend | Model | GPU |
 |---|---|---|---|
-| Standard (text + voice LLM + reasoning) | `service-vllm` | `QuantTrio/Qwen3.5-27B-AWQ` | nvidia |
-| Guardrail | `service-vllm` or `service-openarc` | Small classifier model (e.g. Qwen2.5-3B) | whichever GPU has headroom |
+| Standard (text + voice LLM; reasoning toggle on) | `service-vllm` | `QuantTrio/Qwen3.5-27B-AWQ` | nvidia |
+| Small (voice mode, fast path) | `service-vllm` or `service-openarc` | small Qwen variant (e.g. Qwen2.5-3B) | whichever GPU has headroom |
 | VoiceSTT | `service-whisper` (OpenVINO GenAI backend on Intel; faster-whisper on CUDA) | whisper-small.en int8 | Intel Arc |
 | VoiceTTS | `service-kokoro` (OpenVINO on Intel; ONNX on CUDA) | Kokoro-82M v1.0 | Intel Arc |
 

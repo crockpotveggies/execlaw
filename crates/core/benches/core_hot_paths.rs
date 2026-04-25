@@ -695,6 +695,7 @@ fn bench_backend_store(c: &mut Criterion) {
                         gpu_id: None,
                         endpoint: Some("http://127.0.0.1:8000/v1".into()),
                         notes: None,
+                        reasoning_enabled: false,
                     },
                     0,
                 )
@@ -719,6 +720,7 @@ fn bench_backend_store(c: &mut Criterion) {
                         gpu_id: None,
                         endpoint: None,
                         notes: None,
+                        reasoning_enabled: false,
                     },
                     0,
                 )

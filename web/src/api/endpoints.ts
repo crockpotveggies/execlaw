@@ -484,20 +484,14 @@ export async function restartRunner(
 
 // ---- /api/admin/backends (Phase 8.5; replaces "deployments" CRUD) -
 
-export type BackendPurpose =
-    | "Standard"
-    | "Reasoning"
-    | "Guardrail"
-    | "VoiceSTT"
-    | "VoiceTTS";
+export type BackendPurpose = "Standard" | "Small" | "VoiceSTT" | "VoiceTTS";
 
 /// Every purpose execlaw recognises. The Settings UI iterates this
 /// so a missing slot renders as "not configured" instead of silently
 /// disappearing.
 export const BACKEND_PURPOSES: ReadonlyArray<BackendPurpose> = [
     "Standard",
-    "Reasoning",
-    "Guardrail",
+    "Small",
     "VoiceSTT",
     "VoiceTTS",
 ];
@@ -509,6 +503,14 @@ export interface BackendView {
     gpu_id: string | null;
     endpoint: string | null;
     notes: string | null;
+    /// Phase-8.8: whether reasoning mode is engaged on this
+    /// backend. Server-controlled — only the Standard purpose
+    /// retains a true value; Small / Voice* always come back as
+    /// false.
+    reasoning_enabled: boolean;
+    /// True when this purpose accepts a reasoning_enabled value.
+    /// The SPA shows the toggle only when this is true.
+    supports_reasoning_toggle: boolean;
     created_at: number;
     updated_at: number;
 }
@@ -533,6 +535,10 @@ export interface UpsertBackendRequest {
     gpu_id?: string | null;
     endpoint?: string | null;
     notes?: string | null;
+    /// Phase-8.8: ignored by the server for purposes that don't
+    /// support reasoning (the field is silently zeroed). Send
+    /// freely; let the server enforce the Standard-only rule.
+    reasoning_enabled?: boolean;
 }
 
 export async function listBackends(

@@ -1,10 +1,12 @@
 //! Settings → Backends — inference-backend-per-purpose admin
-//! routes (Phase 8.5; replaces the legacy `deployments.rs` module).
+//! routes (Phase 8.5; reshaped in 8.8).
 //!
 //! There is no create or delete affordance: the set of purposes is
-//! a fixed enum (Standard / Reasoning / Guardrail / VoiceSTT /
-//! VoiceTTS), and the operator's job is to configure which model +
-//! GPU + endpoint serves each one. A purpose without a configured
+//! a fixed enum (Standard / Small / VoiceSTT / VoiceTTS) and the
+//! operator's job is to configure which model + GPU + endpoint
+//! serves each one. Standard additionally exposes a
+//! `reasoning_enabled` flag that opts the runner into the model's
+//! native reasoning mode for that backend. A purpose without a configured
 //! backend is rendered as "not configured" by the SPA — the operator
 //! fills it in via PUT.
 //!
@@ -39,6 +41,14 @@ pub struct BackendView {
     pub gpu_id: Option<String>,
     pub endpoint: Option<String>,
     pub notes: Option<String>,
+    /// Phase-8.8: whether reasoning mode is engaged on this
+    /// backend. Only meaningful for Standard; the SPA hides the
+    /// checkbox for the other purposes.
+    pub reasoning_enabled: bool,
+    /// True when this purpose accepts a reasoning_enabled value.
+    /// Lets the SPA decide whether to render the checkbox without
+    /// duplicating the enum locally.
+    pub supports_reasoning_toggle: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -52,6 +62,8 @@ impl From<&BackendRow> for BackendView {
             gpu_id: r.gpu_id.clone(),
             endpoint: r.endpoint.clone(),
             notes: r.notes.clone(),
+            reasoning_enabled: r.reasoning_enabled,
+            supports_reasoning_toggle: r.purpose.supports_reasoning_toggle(),
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -87,6 +99,11 @@ pub struct UpsertBackendRequest {
     pub endpoint: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
+    /// Phase-8.8: optional reasoning toggle. Server zeroes it for
+    /// purposes that don't support reasoning, so the SPA can pass
+    /// it freely without per-purpose branching.
+    #[serde(default)]
+    pub reasoning_enabled: bool,
 }
 
 impl From<BackendError> for ApiError {
@@ -150,7 +167,7 @@ pub async fn list_handler(
     put,
     path = "/api/admin/backends/{purpose}",
     request_body = UpsertBackendRequest,
-    params(("purpose" = String, Path, description = "Backend purpose: Standard | Reasoning | Guardrail | VoiceSTT | VoiceTTS")),
+    params(("purpose" = String, Path, description = "Backend purpose: Standard | Small | VoiceSTT | VoiceTTS")),
     responses(
         (status = 200, description = "Upserted", body = BackendView),
         (status = 400, description = "Unknown purpose / malformed model_spec"),
@@ -190,6 +207,7 @@ pub async fn upsert_handler(
                 gpu_id: req.gpu_id.clone(),
                 endpoint: req.endpoint.clone(),
                 notes: req.notes.clone(),
+                reasoning_enabled: req.reasoning_enabled,
             },
             now,
         )
@@ -347,8 +365,8 @@ mod tests {
         let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let arr = v["backends"].as_array().unwrap();
-        // Always five purposes regardless of how many are filled in.
-        assert_eq!(arr.len(), 5);
+        // Always four purposes regardless of how many are filled in.
+        assert_eq!(arr.len(), 4);
         for entry in arr {
             assert_eq!(entry["configured"], false);
             assert!(entry["backend"].is_null());
@@ -424,7 +442,7 @@ mod tests {
         let tok = setup_controller_token(&app).await;
         let req = Request::builder()
             .method(Method::DELETE)
-            .uri("/api/admin/backends/Reasoning")
+            .uri("/api/admin/backends/Small")
             .header(header::AUTHORIZATION, format!("Bearer {tok}"))
             .body(Body::empty())
             .unwrap();
@@ -462,5 +480,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn reasoning_flag_is_zeroed_for_non_standard_purposes() {
+        let app = build_router(test_app_state());
+        let tok = setup_controller_token(&app).await;
+        // Send reasoning_enabled = true on a Small backend; server
+        // must zero it because Small doesn't expose the toggle.
+        let mut body = upsert_body();
+        body["reasoning_enabled"] = serde_json::Value::Bool(true);
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/admin/backends/Small")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["reasoning_enabled"], false);
+        assert_eq!(v["supports_reasoning_toggle"], false);
+
+        // Standard with reasoning_enabled = true round-trips truthy.
+        let mut body2 = upsert_body();
+        body2["reasoning_enabled"] = serde_json::Value::Bool(true);
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/admin/backends/Standard")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body2.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["reasoning_enabled"], true);
+        assert_eq!(v["supports_reasoning_toggle"], true);
     }
 }
