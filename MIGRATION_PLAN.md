@@ -300,6 +300,61 @@ Rules match on these directly. The `ConversationKind` tag is a useful shorthand 
 
 Per turn: `untrusted_input_in_turn + accesses_sensitive_data + produces_external_effect ≤ 2`. "Untrusted input" is any message from `UnknownPending`, `Blocked`, or (configurably) `KnownLimited` when the topic is outside the allowed set. The third property forces HITL.
 
+#### Threads, the controller-thread merge, and inbound conversation resolution
+
+A **thread** is execlaw's user-facing name for a `ConversationId` — one append-only event log, one chat context. (The word *session* is reserved for JWT auth state; chat context is always *thread*.)
+
+UI channels (web SPA, eventual mobile app) mint a fresh `ConversationId` whenever the user clicks "new chat." Non-UI channels (Signal, email, voice) have no such affordance — a new message just continues the existing thread. Plugin-side code must therefore resolve every inbound message to a `ConversationId` deterministically.
+
+**`transport_conversations` table** persists the mapping:
+
+```sql
+CREATE TABLE transport_conversations (
+    plugin_id          TEXT    NOT NULL,
+    transport_handle   TEXT    NOT NULL,
+    principal_id       TEXT    NOT NULL,
+    conversation_id    TEXT    NOT NULL,
+    is_current         INTEGER NOT NULL DEFAULT 1,
+    last_message_at    INTEGER NOT NULL,
+    PRIMARY KEY (plugin_id, transport_handle, principal_id, conversation_id)
+);
+```
+
+**`ConversationResolver::resolve_or_mint(plugin_id, transport_handle, principal_id, idle_timeout_ms)`** is the helper every transport plugin calls on inbound:
+
+1. **Controller short-circuit** — if the resolved principal is the Controller, ALWAYS return the fixed `controller-thread:<controller_principal_id>` ConversationId regardless of the originating channel. The controller has exactly one DM with the agent.
+2. Otherwise look up the `is_current = 1` row for the triple. If found and `now - last_message_at < idle_timeout_ms`, return its `conversation_id`.
+3. Else mark the old row's `is_current = 0`, mint a new `ConversationId`, insert a fresh row, return the new id.
+
+Default `idle_timeout_ms` per transport tier:
+
+| Transport | Default | Rationale |
+|---|---|---|
+| Web / mobile UI | n/a (resolver not called — UI mints explicitly) | |
+| Signal-like long-thread | 24 h | Continuous chat stays one thread; a 24-hour gap rotates |
+| Email | none (every reply continues the thread) | Threading-by-subject is the user's responsibility |
+| Voice | ~5 min | Call ends → next call is a new thread |
+| SMS | 4 h | Same as Signal but tighter (SMS volume is bursty) |
+
+Old conversation rows stay linked to their `principal_id` so the UI can show "previous threads with Aunt Marge" without losing history.
+
+**Controller-thread merge** is the load-bearing UX consequence: every event payload carries a `channel_origin` field (`"web"` / `"signal"` / `"email"` / `"voice"` …). The SPA renders one pinned **Control thread** that aggregates every Controller message regardless of channel; per-message channel icons let the controller see at a glance which transport delivered each line.
+
+**Conversation metadata extensions** (migration 0005, lands before Phase 6):
+
+```sql
+ALTER TABLE state_conversations ADD COLUMN display_name TEXT;
+ALTER TABLE state_conversations ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE state_conversations ADD COLUMN is_ephemeral INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE state_conversations ADD COLUMN ephemeral_expires_at INTEGER;
+```
+
+- `display_name` — the LLM-generated 3-word thread title, written via the agent tool `set_thread_name(name)`. For external groups, set to the transport-supplied group name. For the controller thread, hard-coded to "Control thread."
+- `is_pinned` — surfaces the Control thread at the top of the SPA's thread list.
+- `is_ephemeral` — incognito threads. Events ARE persisted during the conversation (so crash recovery still works) but get DELETEd by the **`EphemeralSweeper`** task once `now > ephemeral_expires_at`. Audit posture: the conversation row stays with `last_seq = 0` after purge so reports can still show "N incognito threads existed but their content was purged." `execlaw replay` skips ephemeral conversations after expiry.
+
+The sweeper runs every ~5 min in the same tokio task pool as the outbox drain. Default new-thread incognito expiry is 1 h; the UI's incognito toggle accepts an override.
+
 ### 2.7 Four memory layers
 
 Every surveyed production system converged on this stack. execlaw ships it thin:
@@ -2129,14 +2184,139 @@ What's out of scope for Phase 5:
   runs the rubric against a mock-or-real OpenAI endpoint and prints
   pass/fail per case. Operator-visible UI surfaces follow in Phase 6.
 
-### Phase 6 — UI port, chat-first landing (3-4 weeks)
+### Phase 6 — UI port, chat-first landing (3-4 weeks per sub-phase)
 
-- Port the admin pages behind the new Admin dropdown
-- Rebuild dashboard, tasks, personality, policy editor, tools, skills, audit, logs on the new APIs
-- Approvals surfaced inline in chat + top bar
-- Setup wizard as first-run modal; per-plugin setup via plugin UI panels
-- Trace viewer embedded for the current conversation (uses Phase 5 data)
-- **Demo:** Feature-complete with selfhosted-claw's admin surface, but the front door is chat.
+The UI is built once as an **encapsulated SPA** and ships across multiple
+compile targets so the operator can use it from a browser today, a
+desktop app shortly after, and a mobile app later. The SPA only ever
+talks to the Rust server over **JWT-authenticated REST + WebSocket** —
+no shared state, no shared filesystem, no native API surface — so the
+same bundle ships everywhere.
+
+#### Stack
+
+- **React Native** + **react-native-web** as the cross-platform component
+  layer.
+- **react-bootstrap** + **Bootstrap CSS** for visuals + responsive
+  breakpoints (works on react-native-web's DOM output and Tauri's
+  webview; iOS / Android need a parallel native layer when those
+  targets land — flagged for the Phase 6e+ port).
+- **Bootstrap Icons** (https://icons.getbootstrap.com/) for the icon
+  set. Subtle weight, monochrome, theme-color tinted.
+- **Vite** (web) / **Metro** (native) bundler.
+- **TanStack Query** for REST state, **Zustand** for the WS-driven
+  event store.
+- **Plugins are trusted** — UI panels load via dynamic ESM `import()`
+  with no sandboxing per the 2026-04-25 decision. The plugin-install
+  flow is gated by the controller's auth so anything that lands has
+  been opted-in.
+- **Dark mode by default**; light/dark/system toggle in settings.
+
+#### Compile targets (this phase ships the first two)
+
+| Target | Path | Phase |
+|---|---|---|
+| Web SPA | react-native-web bundle served by the Rust server (rust-embed) | 6a — first |
+| Tauri Desktop | same react-native-web bundle in a Tauri webview | 6d — sub-phase |
+| iOS / Android native | react-native + native UI layer (parallel component lib) | post-Phase-6 |
+
+#### UX decisions (locked in 2026-04-25)
+
+- **Chat-first landing**: the conversation is the front door. Admin
+  pages live behind sidebar nav.
+- **Sidebar layout** (OpenWebUI-shaped):
+  ```
+    ✏  New chat
+   ───────────────
+    📋 Tasks
+    👥 Contacts
+    ⋯  More       ← Tools / Skills / plugin UI panels
+   ───────────────
+    🧵 Threads     [⏷ external]   ← toggle filters non-controller threads
+    📌 Control thread             ← always pinned, always visible
+    📨 Marge — Q4 plans  ✉
+    💬 Standup           web
+    ...
+   ───────────────
+    ⚙ justin@example.com
+  ```
+- **Controller thread merge**: every message the controller sends or
+  receives — across web, voice, Signal, email, etc. — collapses into
+  ONE pinned thread named "Control thread". Each message renders a
+  subtle channel-origin icon (web, signal, email, voice…). The
+  controller has exactly one DM with the agent regardless of channel.
+- **Thread-list status icon** (left of each thread name):
+  - **empty grey dot** — default / read state
+  - **blue filled dot** — agent has replied since the user last viewed
+  - **animated loader** — agent currently processing this thread
+  - For external (group / outsider) threads the channel icon
+    (Signal / email / voice) replaces the dot — origin matters more
+    than read-state for those.
+- **Thread names**:
+  - "Control thread" — the pinned controller thread (hard-coded)
+  - For external groups — the truncated transport-supplied group name
+    + channel icon
+  - For internal new threads — a 3-word LLM-generated summary written
+    via the agent tool `set_thread_name(name)` after enough context
+    accumulates. Persisted to `state_conversations.display_name`.
+- **External-channel filter toggle**: a switch above the thread list
+  hides every external thread except the pinned Control thread, so the
+  controller can focus on personal chat threads.
+- **Approvals UX**: a ChatGPT-style card slides in from above the main
+  text input when an approval is pending in the active thread. Cards
+  for cold-contact, Rule-of-Two breach, and sensitive-tool-call
+  approvals share the same shape. Top-bar pending-approvals chip is a
+  later iteration.
+- **Streaming tokens**: rendered as they arrive (typing-cursor
+  effect). Sentence buffering can land later if the flicker becomes
+  bothersome.
+- **Truncation**: long inbound messages (long emails, copy-pasted
+  documents) render with a fixed-height clamp and a "Read more…"
+  affordance. Outbound (agent) messages do the same when they're
+  longer than ~12 lines.
+- **Setup detection**: on UI boot the SPA hits `GET /api/ping` which
+  returns plain text `pong` (admin password set, normal mode) or
+  `setup` (first-run; SPA routes to the wizard).
+- **Incognito threads**: a toggle in the new-thread modal marks the
+  thread `is_ephemeral = 1` with a default 1-hour expiry. Events ARE
+  persisted during the conversation (so crash recovery works) but
+  the `EphemeralSweeper` task DELETEs every event row whose parent
+  conversation has `is_ephemeral = 1` and has passed
+  `ephemeral_expires_at`. Audit posture: the conversation row stays
+  with `last_seq = 0` after purge, so reports can show "N incognito
+  threads existed but their content was purged".
+
+#### New API routes
+
+| Route | Purpose |
+|---|---|
+| `GET /api/ping` | Plain-text `pong` or `setup`. UI's first request. |
+| `GET /api/admin/plugins/ui_panels` | List installed UI panel manifests (mount path, entry, icon, label) for sidebar nav. |
+| `PATCH /api/chats/:id` | Update thread metadata (`display_name`, `is_ephemeral`, `is_pinned`). |
+| Agent tool `set_thread_name(name)` | Lets the agent set the 3-word thread summary. Writes `state_conversations.display_name`. |
+
+#### Sub-phasing
+
+| Sub-phase | Scope | Estimated time |
+|---|---|---|
+| **6a** | Vite scaffold + react-native-web + react-bootstrap + Bootstrap Icons + JWT auth + WS event bus + chat view + inline approval card + Control-thread merge + setup-wizard route | 1-2 wk |
+| **6b** | Admin read-views: plugins, principals, hardware, deployments, eval flags, logs, audit | 1-2 wk |
+| **6c** | Writes: setup wizard, plugin install upload, approval verbs, trust revoke, deployment editor, incognito toggle, thread rename | 1-2 wk |
+| **6d** | Tauri Desktop wrapper (same bundle, Tauri webview, OS notifications for cold-contact alerts) | 1 wk |
+| **6e+** | iOS / Android native — parallel component layer (Tamagui or similar); voice UI deferred to Phase 8 | post-Phase-6 |
+
+#### Out of scope for Phase 6
+
+- Voice UI (push-to-talk recorder + audio playback) — Phase 8 with the real audio plugins.
+- Native iOS / Android — Phase 6e+, after the cross-platform layer settles.
+
+- **Phase 6 demo (web + Tauri):** First-run hits `/api/ping → setup`,
+  routes to the wizard, controller sets a password + sees the hardware
+  profile, lands on the chat view. Sends a message; tokens stream in.
+  Opens a new incognito thread, has a conversation, closes it; events
+  purged within ~5 min. An external sender (simulated cold contact)
+  triggers the approval card; controller approves, original message
+  appears in the Control thread tagged with the channel icon.
 
 ### Phase 7 — Hardening (ongoing)
 
@@ -2195,13 +2375,13 @@ tracked in [`docs/plugin-inventory.md`](docs/plugin-inventory.md)):
 
 - [ ] Manifest (`plugin.toml`) with `[runtime]` declaring tier + entrypoint.
 - [ ] Subprocess implementation speaking the plugin JSON-RPC protocol.
-- [ ] Tests that run the plugin against a sandboxed mock of the
-      external service (so CI doesn't need live creds).
-- [ ] One end-to-end manual test against the real service with creds
-      loaded from the vault.
+- [ ] Transport-tier plugins call `ConversationResolver::resolve_or_mint(plugin_id, transport_handle, principal_id, idle_timeout_ms)` on every inbound message (see §2.6). The Controller-thread short-circuit collapses every controller-origin message into the pinned Control thread regardless of channel.
+- [ ] Transport-tier plugins set `idle_timeout_ms` in their `plugin.toml` per the table in §2.6 (Signal 24h, email none, voice ~5min, SMS ~4h).
+- [ ] Every event payload the plugin commits includes a `channel_origin` field (e.g. `"signal"`, `"email"`) so the SPA can render the per-message channel icon in the Control thread.
+- [ ] Tests that run the plugin against a sandboxed mock of the external service (so CI doesn't need live creds).
+- [ ] One end-to-end manual test against the real service with creds loaded from the vault.
 - [ ] `docs/plugin-inventory.md` checklist entry flipped to `[x]`.
-- [ ] Any Phase-3 or Phase-4 demo that depended on this port now
-      runs end-to-end; close the cross-reference.
+- [ ] Any Phase-3 or Phase-4 demo that depended on this port now runs end-to-end; close the cross-reference.
 
 **Bucket B — fold into core** (already landed in Phase 2):
 

@@ -266,6 +266,25 @@ CREATE TABLE memory_entries (
 - `vault_secrets` — SQLCipher-encrypted secret store; references are opaque to plugins.
 - `log_entries` — SQLite half of the JSONL+SQLite dual log sink.
 - `transport_cursors` — per-transport resume point (what `source_event_id` was last processed).
+- `transport_conversations` (Phase 6 / migration 0005) — `(plugin_id, transport_handle, principal_id) → conversation_id` mapping that the `ConversationResolver` uses on inbound to decide whether a new message continues an existing thread or rotates to a new one. The Controller principal short-circuits: every controller message — across web, voice, Signal, email — collapses into one fixed `controller-thread` ConversationId so the SPA can render a single pinned **Control thread**.
+- `eval_flagged` — operator-tagged regression-target event ranges (Phase 5).
+- `state_plugins` — persisted plugin installs (Phase 2 migration 0003).
+
+### 5.7 Threads, controller-thread merge, and incognito
+
+A **thread** is the user-facing name for a `ConversationId`. The word *session* is reserved for JWT auth state.
+
+UI channels mint a fresh thread on "new chat" — explicit. Non-UI channels (Signal, email, voice) call `ConversationResolver::resolve_or_mint(plugin_id, transport_handle, principal_id, idle_timeout_ms)` on every inbound message. The resolver:
+
+1. **Controller short-circuit** — if the resolved principal is Controller, ALWAYS return `controller-thread:<controller_principal_id>`. One DM, every channel.
+2. Otherwise: look up the `is_current = 1` row for the triple. If present and `now - last_message_at < idle_timeout_ms`, return its `conversation_id`.
+3. Else: mark old as `is_current = 0`, mint new, insert, return new.
+
+Default `idle_timeout_ms` per transport: web/UI = explicit (resolver not called), Signal = 24 h, email = none (every reply continues), voice = 5 min, SMS = 4 h.
+
+**Per-message `channel_origin`** field on event payloads lets the SPA render channel icons in the Control thread without losing the unified-DM UX.
+
+**Incognito threads** (`is_ephemeral = 1` on `state_conversations`) persist events during the conversation (so crash recovery works) but the `EphemeralSweeper` task DELETEs every event row whose parent is past `ephemeral_expires_at`. The conversation row stays with `last_seq = 0` after purge so audit reports can show "N incognito threads existed but their content was purged." `execlaw replay` skips purged ephemerals.
 
 ---
 
@@ -877,5 +896,32 @@ Per [`STATUS.md`](../STATUS.md) as of 2026-04-24.
 - Log viewer React component
 - Eval-flag dashboard
 - Trace viewer embedded in the chat UI
+
+**Phase 6 — UI port (chat-first SPA + Tauri Desktop).** Pending.
+
+Stack (locked in 2026-04-25):
+- **React Native** + **react-native-web** as the cross-platform component layer.
+- **react-bootstrap** + **Bootstrap CSS** + **Bootstrap Icons** (subtle, monochrome, theme-tinted) — works on react-native-web's DOM output and Tauri's webview; iOS/Android need a parallel native layer when those targets land.
+- **Vite** (web) / **Metro** (native).
+- **TanStack Query** for REST, **Zustand** for the WS event store.
+- **Plugins are trusted** — UI panels load via dynamic ESM `import()`; no sandboxing.
+- Built static assets embedded in the Rust binary via `rust-embed` so the production artifact stays a single Docker image.
+
+UX (locked):
+- Chat-first landing; OpenWebUI-shaped sidebar with `New chat`, nav (Tasks / Contacts / More → Tools, Skills, plugin panels), thread list, settings + user at the bottom.
+- **Pinned Control thread** at the top of the thread list — every controller message regardless of channel collapses here, with subtle per-message channel icons.
+- **Thread-list status icons**: empty grey dot (default), blue filled dot (agent replied unseen), animated loader (agent processing). External threads show their channel icon instead of the dot.
+- **Thread names**: "Control thread" for the pinned controller thread; truncated transport-supplied name for external groups; LLM-generated 3-word summary (via `set_thread_name(name)` agent tool) for new internal threads.
+- External-channel filter toggle above the thread list (Control thread always visible).
+- ChatGPT-style approval card slides in from above the input.
+- Tokens render as they arrive.
+- Long messages truncate with "Read more…".
+- `GET /api/ping` returns `pong` or `setup`; SPA routes to wizard on `setup`.
+- **Incognito threads** — toggle in the new-thread modal; default 1h expiry; `EphemeralSweeper` purges events.
+- Dark default with light/dark/system toggle.
+- Voice UI deferred to Phase 8 with the real audio plugins.
+- Native iOS / Android deferred to post-Phase-6.
+
+Sub-phases: **6a** (scaffold + chat view + auth + WS bus + approval card + Control-thread merge), **6b** (admin read-views), **6c** (writes — setup wizard, plugin upload, approval verbs, trust revoke, incognito toggle, thread rename), **6d** (Tauri Desktop wrapper).
 
 **What's next — Phase 6 (UI port + chat-first landing):** See `MIGRATION_PLAN.md` §11.
