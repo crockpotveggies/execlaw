@@ -6,10 +6,10 @@ Last update: 2026-04-25, after Phase 8a — **per-tool trust-class allowlist** g
 
 - `cargo build --workspace` — **clean** (stub mode; webauthn-rs gated behind `--features webauthn` for the Linux/Docker production build)
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **502 passing, 0 failing** (+2: dispatch tier-routing)
-- `cargo bench --workspace --no-run` — **clean** (59 benches across 9 crates)
-- `cd web && npm test` — **125 passing** (+4: McpServersPage)
-- `cd web && npm run build` — **clean** (326 KB JS / 311 KB CSS, both well under budget)
+- `cargo test --workspace --no-fail-fast` — **509 passing, 0 failing** (+7 net after Deployments → Backends rename: -10 old deployment tests, +5 BackendStore, +5 backends admin, +7 RunnerRegistry, +4 runners admin)
+- `cargo bench --workspace --no-run` — **clean** (60 benches across 9 crates; deployment_store bench replaced with backend_store)
+- `cd web && npm test` — **129 passing** (+4 net: -4 deployments page, +5 backends page, +4 runners page)
+- `cd web && npm run build` — **clean** (329 KB JS / 311 KB CSS, both well under budget)
 - **Zero cloud-SDK dependencies** anywhere in the workspace
 - **Phase 7 JWT hardening done.** Shipped: (a) **Migration 0008** + `state_refresh_tokens` table — refresh tokens now survive a server restart instead of silently signing every operator out; (b) **`RefreshTokenStore`** in core (issue / single-use consume / revoke_session / revoke_all_for_user / active_session_count / purge_expired + 8 unit tests including the persistence-survives-recreate invariant); (c) **`POST /api/logout/all`** endpoint + 2 server tests covering the multi-session revoke + the auth-required gate; (d) **SPA `apiFetch` silent auto-retry** — installs a `RefreshHook` on AuthContext mount that rotates tokens on a 401 and replays the original request once, with explicit guards against retry loops + caller-controlled tokens; (e) **Background refresh timer** — fires at 80% of the 15-min access-token TTL so the user never sees a 401-flash; (f) **"Sign out everywhere"** button on Settings → Profile that calls `/api/logout/all` + bounces to `/login`.
 - **Phase 7 sub-phase 7e (WebAuthn) done.** Shipped: (a) **Migration 0007** + `state_webauthn_credentials` table with per-user 10-credential cap + ON DELETE CASCADE on `users`; (b) **`WebauthnStore`** in core (insert / count_for_user / list_for_user / get / update_counter / delete_owned + 8 unit tests including ownership + cascade); (c) **`WebauthnSvc`** in server (relying-party config, register + authenticate ceremonies, 5-minute ceremony TTL with `prune_expired`, deterministic user-handle UUID); (d) **HTTP routes** for register begin/finish, list, delete, login finish — all audit-logged; (e) **/api/login second-factor branch** — when `count_for_user > 0`, returns the new `LoginOutcome::WebauthnChallenge` instead of tokens, fail-closed if the svc is missing; (f) **SPA**: `coerceCreationOptions`/`coerceRequestOptions`/`serializeCredential` browser helpers (base64url ↔ ArrayBuffer), Login screen handles the challenge (auto-prompts authenticator + retry button), Settings → Profile credential management.
@@ -26,6 +26,44 @@ Last update: 2026-04-25, after Phase 8a — **per-tool trust-class allowlist** g
 | **8d** | `mcp:`-prefixed names route through `ChainedToolDispatch` to `McpHost`, Settings → MCP CRUD page in SPA | ✅ shipped |
 
 **Phase 8 complete.** End-to-end: configure an MCP server in Settings → MCP, see its connection status flip to `connected`, watch its tools appear (prefixed) on Settings → Tools where you can per-tool gate which trust classes may use them, and the runner picks them up alongside builtins/plugins.
+
+## Phase 8.5 — Runner architecture surface (in progress)
+
+Audit caught that the legacy "Deployments" CRUD page conflated two
+distinct concepts:
+
+1. **Backends** (model + GPU + endpoint per runner-purpose) — fixed
+   set of five purposes (Standard / Reasoning / Guardrail / VoiceSTT
+   / VoiceTTS); operator edits per slot, never adds/removes.
+2. **Runners** (per-conversation hot containers the control plane
+   spawns automatically) — view-only, controller's runner stays hot
+   indefinitely, others reaped after 10 min idle.
+
+Wave 8.5 ships the corrected vocabulary + the runner observability
+surface. Container-managed runners themselves (real per-conversation
+processes vs. today's in-process model) are tracked in
+[`docs/runner-design.md`](docs/runner-design.md), which captures the
+selfhosted-claw `HotRunnerPool` optimisations to preserve in the
+Rust port.
+
+* **Backends** — migration 0011 renames `config_runner_deployments`
+  → `config_backends`, collapses to one row per purpose
+  (`purpose TEXT PRIMARY KEY`, no synthetic id, no is_default
+  toggle). New `BackendStore` (5 tests) + admin routes
+  `GET /api/admin/backends`, `PUT /api/admin/backends/{purpose}`,
+  `DELETE /api/admin/backends/{purpose}` (5 tests). SPA Settings →
+  Backends page renders the five purposes as fixed rows; "+ New" is
+  gone (5 SPA tests).
+* **Runners** — new in-memory `RunnerRegistry` (7 tests) tracks
+  one entry per conversation that has emitted a turn this process,
+  with controller-always-hot policy: `register_turn_start` /
+  `register_turn_end` lifecycle hooks called from the chat path,
+  background reaper (60s cadence) drops idle non-controller entries
+  after 10 min. Admin routes `GET /api/admin/runners`,
+  `POST /api/admin/runners/{conversation_id}/restart` (4 tests).
+  SPA Settings → Runners page polls every 5s, shows status badges
+  (controller / in-flight / restart pending / modality), live idle
+  countdown, role-gated Restart button (4 SPA tests).
 
 ## Migration-plan phase structure (post-2026-04-24 refactor)
 

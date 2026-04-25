@@ -19,9 +19,7 @@ use execlaw_core::migrations::MigrationRunner;
 use execlaw_core::conversation::{
     ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
 };
-use execlaw_core::deployments::{
-    DeploymentPurpose, DeploymentRow, DeploymentStore,
-};
+use execlaw_core::backends::{BackendPurpose, BackendStore, BackendUpsert};
 use execlaw_core::ephemeral_sweeper::sweep_once;
 use execlaw_core::events::EventRecord as CoreEventRecord;
 use execlaw_core::outbox::{OutboxRow, OutboxStatus, OutboxStore};
@@ -677,44 +675,58 @@ fn bench_list_thread_summaries(c: &mut Criterion) {
 // upper bound: one row per (purpose × backend × variant)).
 // ---------------------------------------------------------------------------
 
-fn bench_deployment_store(c: &mut Criterion) {
-    let mut group = c.benchmark_group("deployment_store");
+fn bench_backend_store(c: &mut Criterion) {
+    // Phase 8.5 — `config_backends` has at most 5 rows (one per
+    // purpose), so we don't sweep across sizes. We bench
+    // list_all (the SPA's hot read) at the actual upper bound and
+    // upsert (the operator's edit, off the dispatch path).
+    let mut group = c.benchmark_group("backend_store");
 
-    for n in [4usize, 16usize, 64usize].iter() {
-        group.bench_with_input(BenchmarkId::new("list", n), n, |b, &n| {
-            let db = fresh_db();
-            let store = DeploymentStore::new(&db);
-            for i in 0..n {
-                let id = format!("dep-{i}");
-                let purpose = match i % 5 {
-                    0 => DeploymentPurpose::Standard,
-                    1 => DeploymentPurpose::Reasoning,
-                    2 => DeploymentPurpose::Guardrail,
-                    3 => DeploymentPurpose::VoiceStt,
-                    _ => DeploymentPurpose::VoiceTts,
-                };
-                store
-                    .insert(&DeploymentRow {
-                        id: execlaw_core::ids::DeploymentId::from(id.as_str()),
-                        purpose,
+    group.bench_function("list_all/full", |b| {
+        let db = fresh_db();
+        let store = BackendStore::new(&db);
+        for p in BackendPurpose::all() {
+            store
+                .upsert(
+                    &BackendUpsert {
+                        purpose: *p,
                         inference_backend: "service-vllm".into(),
-                        model_spec: serde_json::json!({"model": "Qwen3.5-27B-AWQ"}),
+                        model_spec_json: serde_json::json!({"model": "Qwen3.5-27B-AWQ"}),
                         gpu_id: None,
                         endpoint: Some("http://127.0.0.1:8000/v1".into()),
-                        is_default: i == 0,
-                        active: true,
                         notes: None,
-                        created_at: i as i64,
-                        updated_at: i as i64,
-                    })
-                    .unwrap();
-            }
-            b.iter(|| {
-                let rows = store.list().unwrap();
-                black_box(rows);
-            });
+                    },
+                    0,
+                )
+                .unwrap();
+        }
+        b.iter(|| {
+            let rows = store.list_all().unwrap();
+            black_box(rows);
         });
-    }
+    });
+
+    group.bench_function("upsert", |b| {
+        let db = fresh_db();
+        let store = BackendStore::new(&db);
+        b.iter(|| {
+            let row = store
+                .upsert(
+                    &BackendUpsert {
+                        purpose: BackendPurpose::Standard,
+                        inference_backend: "service-vllm".into(),
+                        model_spec_json: serde_json::json!({"m": "x"}),
+                        gpu_id: None,
+                        endpoint: None,
+                        notes: None,
+                    },
+                    0,
+                )
+                .unwrap();
+            black_box(row);
+        });
+    });
+
     group.finish();
 }
 
@@ -958,7 +970,7 @@ criterion_group!(
     bench_ephemeral_sweeper,
     bench_conversation_metadata,
     bench_list_thread_summaries,
-    bench_deployment_store,
+    bench_backend_store,
     bench_webauthn_store,
     bench_refresh_token_store,
     bench_tool_access_store,

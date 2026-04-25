@@ -18,10 +18,10 @@
 pub mod alerts;
 pub mod attachments;
 pub mod audit;
+pub mod backends;
 pub mod config;
 pub mod conversation;
 pub mod db;
-pub mod deployments;
 pub mod ephemeral_sweeper;
 pub mod eval;
 pub mod event_hmac;
@@ -46,7 +46,7 @@ pub mod webauthn;
 pub use db::{Database, DbConfig, DbError};
 pub use events::{EventKind, EventLog, EventRecord};
 pub use ids::{
-    AlertId, AttachmentId, ConversationId, DeploymentId, EventSeq, IdempotencyKey, IncidentId,
+    AlertId, AttachmentId, ConversationId, EventSeq, IdempotencyKey, IncidentId,
     PluginId, PrincipalId, ResearchJobId, TurnSeq,
 };
 pub use migrations::{MigrationError, MigrationRunner};

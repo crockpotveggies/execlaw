@@ -85,11 +85,6 @@ string_id!(
     /// Identifier for an attachment blob.
     AttachmentId
 );
-string_id!(
-    /// Identifier for a runner deployment row.
-    DeploymentId
-);
-
 /// Monotonic per-conversation event sequence number.
 ///
 /// Starts at 1 for the first event in a conversation, not 0.

@@ -226,6 +226,31 @@ pub async fn send_message(
     // slots available. The full placeholder-passing choreography is a
     // later refinement; stripping tools is the load-bearing invariant.
     let use_tool_path = has_plugin_tools && !policy.planner_executor;
+
+    // Phase 8.5 runner-registry hookup: every turn entering this code
+    // path gets a corresponding `register_turn_start`. The Settings →
+    // Runners page reads from this. Controller-trust callers get the
+    // `controller_runner = true` flag so the idle reaper never drops
+    // their entry.
+    {
+        // Operator-friendly label: the principal's first identifier
+        // handle when present (e.g. their Signal number / email),
+        // else the bare PrincipalId. Lives only in the registry —
+        // the runner itself never sees this string.
+        let principal_label = principal
+            .identifiers
+            .first()
+            .map(|id| format!("{}:{}", id.transport, id.handle))
+            .or_else(|| Some(principal.id.as_str().to_owned()));
+        let modality = crate::runner_registry::RunnerModality::Text;
+        let controller_runner = sender_trust == TrustLevel::Controller;
+        state.runner_registry.register_turn_start(
+            cid.as_str(),
+            principal_label,
+            modality,
+            controller_runner,
+        );
+    }
     let (user_msg_seq, assistant_text, assistant_seq) = match &state.inference {
         Some(inference) if use_tool_path => match run_tool_capable_turn(
             &state,
@@ -261,6 +286,12 @@ pub async fn send_message(
             Err(e) => return err_500(&format!("stub turn failed: {e}")),
         },
     };
+    // Phase 8.5: turn lifecycle finishes here on every success path
+    // (the early `return err_500(...)` arms register the start but
+    // not the end — that's intentional, the registry will leave
+    // `in_flight = true` until the next turn or restart, which gives
+    // the operator visibility into stuck runners).
+    state.runner_registry.register_turn_end(cid.as_str());
 
     // Step 4 — broadcast both user and assistant events on the bus
     // AFTER the commit lands, so subscribers never see an outbound

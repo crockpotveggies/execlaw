@@ -435,96 +435,134 @@ export async function getEvalFlags(
     return apiFetch<EvalFlagsResponse>(path, {}, tokenAccessor);
 }
 
-// ---- /api/admin/deployments ---------------------------------------
+// ---- /api/admin/runners (Phase 8.5 view-only + restart) ------------
 
-export type DeploymentPurpose =
+export type RunnerModality = "Text" | "Voice";
+
+export interface RunnerView {
+    conversation_id: string;
+    principal_label: string | null;
+    modality: RunnerModality;
+    controller_runner: boolean;
+    started_at: number;
+    last_active_at: number;
+    in_flight: boolean;
+    turn_count: number;
+    restart_pending: boolean;
+    /// Seconds until the idle reaper drops this entry; null for the
+    /// controller runner and any in-flight runner.
+    idle_secs_remaining: number | null;
+}
+
+export interface RunnerListResponse {
+    runners: RunnerView[];
+    /// Idle TTL the reaper applies to non-controller runners. Surfaced
+    /// so the SPA can label the row's countdown.
+    idle_ttl_secs: number;
+}
+
+export async function listRunners(
+    tokenAccessor: () => string | null,
+): Promise<RunnerListResponse> {
+    return apiFetch<RunnerListResponse>(
+        "/api/admin/runners",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function restartRunner(
+    conversationId: string,
+    tokenAccessor: () => string | null,
+): Promise<unknown> {
+    return apiFetch(
+        `/api/admin/runners/${encodeURIComponent(conversationId)}/restart`,
+        { method: "POST", body: {} },
+        tokenAccessor,
+    );
+}
+
+// ---- /api/admin/backends (Phase 8.5; replaces "deployments" CRUD) -
+
+export type BackendPurpose =
     | "Standard"
     | "Reasoning"
     | "Guardrail"
     | "VoiceSTT"
     | "VoiceTTS";
 
-export interface DeploymentView {
-    id: string;
-    purpose: DeploymentPurpose;
+/// Every purpose execlaw recognises. The Settings UI iterates this
+/// so a missing slot renders as "not configured" instead of silently
+/// disappearing.
+export const BACKEND_PURPOSES: ReadonlyArray<BackendPurpose> = [
+    "Standard",
+    "Reasoning",
+    "Guardrail",
+    "VoiceSTT",
+    "VoiceTTS",
+];
+
+export interface BackendView {
+    purpose: BackendPurpose;
     inference_backend: string;
     model_spec: Record<string, unknown>;
     gpu_id: string | null;
     endpoint: string | null;
-    is_default: boolean;
-    active: boolean;
     notes: string | null;
     created_at: number;
     updated_at: number;
 }
 
-export interface DeploymentListResponse {
-    deployments: DeploymentView[];
+/// One entry per purpose, regardless of whether the operator has
+/// configured a backend yet. `configured = false` means
+/// `backend = null` and the SPA should render an "Add backend"
+/// affordance for that slot.
+export interface BackendListEntry {
+    purpose: BackendPurpose;
+    configured: boolean;
+    backend: BackendView | null;
 }
 
-export interface CreateDeploymentRequest {
-    id?: string;
-    purpose: DeploymentPurpose;
+export interface BackendListResponse {
+    backends: BackendListEntry[];
+}
+
+export interface UpsertBackendRequest {
     inference_backend: string;
     model_spec: unknown;
     gpu_id?: string | null;
     endpoint?: string | null;
-    is_default?: boolean;
-    active?: boolean;
     notes?: string | null;
 }
 
-export interface UpdateDeploymentRequest {
-    purpose?: DeploymentPurpose;
-    inference_backend?: string;
-    model_spec?: unknown;
-    /** Three-valued: missing / null / value. */
-    gpu_id?: string | null;
-    endpoint?: string | null;
-    is_default?: boolean;
-    active?: boolean;
-    notes?: string | null;
-}
-
-export async function listDeployments(
+export async function listBackends(
     tokenAccessor: () => string | null,
-): Promise<DeploymentListResponse> {
-    return apiFetch<DeploymentListResponse>(
-        "/api/admin/deployments",
+): Promise<BackendListResponse> {
+    return apiFetch<BackendListResponse>(
+        "/api/admin/backends",
         {},
         tokenAccessor,
     );
 }
 
-export async function createDeployment(
-    body: CreateDeploymentRequest,
+export async function upsertBackend(
+    purpose: BackendPurpose,
+    body: UpsertBackendRequest,
     tokenAccessor: () => string | null,
-): Promise<DeploymentView> {
-    return apiFetch<DeploymentView>(
-        "/api/admin/deployments",
-        { method: "POST", body },
+): Promise<BackendView> {
+    return apiFetch<BackendView>(
+        `/api/admin/backends/${encodeURIComponent(purpose)}`,
+        { method: "PUT", body },
         tokenAccessor,
     );
 }
 
-export async function updateDeployment(
-    id: string,
-    body: UpdateDeploymentRequest,
-    tokenAccessor: () => string | null,
-): Promise<DeploymentView> {
-    return apiFetch<DeploymentView>(
-        `/api/admin/deployments/${encodeURIComponent(id)}`,
-        { method: "PATCH", body },
-        tokenAccessor,
-    );
-}
-
-export async function deleteDeployment(
-    id: string,
+export async function clearBackend(
+    purpose: BackendPurpose,
     tokenAccessor: () => string | null,
 ): Promise<unknown> {
     return apiFetch(
-        `/api/admin/deployments/${encodeURIComponent(id)}`,
+        `/api/admin/backends/${encodeURIComponent(purpose)}`,
         { method: "DELETE" },
         tokenAccessor,
     );

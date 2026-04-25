@@ -631,7 +631,8 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::plugins::plugins_router())
         .merge(crate::approvals::approvals_router())
         .merge(crate::observability::observability_router())
-        .merge(crate::deployments::deployments_router())
+        .merge(crate::backends::backends_router())
+        .merge(crate::runners_admin::runners_admin_router())
         .merge(crate::users::users_router())
         .merge(crate::webauthn::webauthn_router())
         .merge(crate::tools_admin::tools_admin_router())
@@ -672,6 +673,7 @@ pub fn test_app_state() -> AppState {
         // returns 0 and the password-only login path is exercised.
         webauthn: None,
         mcp_host: crate::mcp_host::McpHost::new(db),
+        runner_registry: crate::runner_registry::RunnerRegistry::new(),
     }
 }
 

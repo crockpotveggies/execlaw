@@ -79,6 +79,13 @@ pub struct AppState {
     /// `config_tool_access` and dispatches tool calls when the
     /// runner picks an `mcp:<id>:<name>` tool.
     pub mcp_host: crate::mcp_host::McpHost,
+    /// Phase 8.5 in-memory runner registry: tracks one entry per
+    /// active per-conversation runner so the Settings → Runners page
+    /// can show live state and the operator can force-restart a
+    /// stuck runner. Controller's runner stays hot indefinitely;
+    /// others reap after 10 minutes idle (see
+    /// `crate::runner_registry::IDLE_TTL`).
+    pub runner_registry: crate::runner_registry::RunnerRegistry,
 }
 
 impl std::fmt::Debug for AppState {

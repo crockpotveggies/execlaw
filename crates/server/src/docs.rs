@@ -21,10 +21,10 @@ use crate::approvals::{
     IdentifierSummary, PendingApprovalSummary, PendingApprovalsResponse,
     PrincipalListResponse, PrincipalSummary,
 };
-use crate::deployments::{
-    CreateDeploymentRequest, DeploymentListResponse, DeploymentView,
-    UpdateDeploymentRequest,
+use crate::backends::{
+    BackendListEntry, BackendListResponse, BackendView, UpsertBackendRequest,
 };
+use crate::runners_admin::{RunnerListResponse, RunnerView};
 use crate::mcp_admin::{
     McpServerListResponse, McpServerView, McpServerWriteRequest,
 };
@@ -105,11 +105,13 @@ impl Modify for SecurityAddon {
         crate::approvals::revoke_handler,
         crate::approvals::list_principals_handler,
         crate::approvals::list_pending_approvals_handler,
-        // deployments
-        crate::deployments::list_handler,
-        crate::deployments::create_handler,
-        crate::deployments::update_handler,
-        crate::deployments::delete_handler,
+        // backends (Phase 8.5 — replaces "deployments" CRUD)
+        crate::backends::list_handler,
+        crate::backends::upsert_handler,
+        crate::backends::clear_handler,
+        // runners (Phase 8.5 — view-only + restart)
+        crate::runners_admin::list_handler,
+        crate::runners_admin::restart_handler,
         // users (multi-controller)
         crate::users::list_handler,
         crate::users::invite_handler,
@@ -146,10 +148,12 @@ impl Modify for SecurityAddon {
         IdentifierSummary,
         PendingApprovalSummary,
         PendingApprovalsResponse,
-        DeploymentView,
-        DeploymentListResponse,
-        CreateDeploymentRequest,
-        UpdateDeploymentRequest,
+        BackendView,
+        BackendListResponse,
+        BackendListEntry,
+        UpsertBackendRequest,
+        RunnerView,
+        RunnerListResponse,
         UserView,
         UserListResponse,
         InviteUserRequest,
@@ -337,8 +341,10 @@ mod tests {
             ("/api/admin/logs", &["get"]),
             ("/api/admin/eval/flags", &["get"]),
             ("/api/admin/audit", &["get"]),
-            ("/api/admin/deployments", &["get", "post"]),
-            ("/api/admin/deployments/{id}", &["patch", "delete"]),
+            ("/api/admin/backends", &["get"]),
+            ("/api/admin/backends/{purpose}", &["put", "delete"]),
+            ("/api/admin/runners", &["get"]),
+            ("/api/admin/runners/{conversation_id}/restart", &["post"]),
             ("/api/admin/users", &["get"]),
             ("/api/admin/users/invite", &["post"]),
             ("/api/admin/users/{user_id}", &["delete"]),

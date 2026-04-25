@@ -20,17 +20,19 @@ import { LogsPage } from "./LogsPage";
 import { EvalFlagsPage } from "./EvalFlagsPage";
 import { PrincipalsPage } from "./PrincipalsPage";
 import { AuditPage } from "./AuditPage";
-import { DeploymentsPage } from "./DeploymentsPage";
+import { BackendsPage } from "./BackendsPage";
 import { UsersPage } from "./UsersPage";
 import { ProfilePage } from "./ProfilePage";
 import { ToolsPage } from "./ToolsPage";
 import { McpServersPage } from "./McpServersPage";
+import { RunnersPage } from "./RunnersPage";
 
 const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     { to: "/settings/plugins", icon: "bi-plug", label: "Plugins" },
     { to: "/settings/tools", icon: "bi-wrench-adjustable", label: "Tools" },
     { to: "/settings/mcp", icon: "bi-broadcast", label: "MCP" },
-    { to: "/settings/deployments", icon: "bi-server", label: "Deployments" },
+    { to: "/settings/backends", icon: "bi-cpu-fill", label: "Backends" },
+    { to: "/settings/runners", icon: "bi-fire", label: "Runners" },
     { to: "/settings/users", icon: "bi-person-gear", label: "Users" },
     { to: "/settings/profile", icon: "bi-person-badge", label: "Profile" },
     { to: "/settings/principals", icon: "bi-people", label: "Principals" },
@@ -132,7 +134,8 @@ export function Settings() {
                         <Route path="plugins" element={<PluginsPage />} />
                         <Route path="tools" element={<ToolsPage />} />
                         <Route path="mcp" element={<McpServersPage />} />
-                        <Route path="deployments" element={<DeploymentsPage />} />
+                        <Route path="backends" element={<BackendsPage />} />
+                        <Route path="runners" element={<RunnersPage />} />
                         <Route path="users" element={<UsersPage />} />
                         <Route path="profile" element={<ProfilePage />} />
                         <Route path="principals" element={<PrincipalsPage />} />
