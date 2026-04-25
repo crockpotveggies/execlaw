@@ -198,7 +198,7 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                 </Link>
                 <span className="execlaw-thread-item__name">
                     {auth.user
-                        ? `${auth.user.display_name} @${auth.user.username}`
+                        ? auth.user.display_name
                         : "—"}
                 </span>
                 <button
