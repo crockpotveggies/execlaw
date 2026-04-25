@@ -21,6 +21,10 @@ use crate::approvals::{
     IdentifierSummary, PendingApprovalSummary, PendingApprovalsResponse,
     PrincipalListResponse, PrincipalSummary,
 };
+use crate::deployments::{
+    CreateDeploymentRequest, DeploymentListResponse, DeploymentView,
+    UpdateDeploymentRequest,
+};
 use crate::plugins::{
     InstallResponse, PluginListResponse, PluginSummary, ToolSummary, UiPanelListResponse,
     UiPanelSummary,
@@ -95,6 +99,11 @@ impl Modify for SecurityAddon {
         crate::approvals::revoke_handler,
         crate::approvals::list_principals_handler,
         crate::approvals::list_pending_approvals_handler,
+        // deployments
+        crate::deployments::list_handler,
+        crate::deployments::create_handler,
+        crate::deployments::update_handler,
+        crate::deployments::delete_handler,
     ),
     components(schemas(
         HealthResponse,
@@ -118,6 +127,10 @@ impl Modify for SecurityAddon {
         IdentifierSummary,
         PendingApprovalSummary,
         PendingApprovalsResponse,
+        DeploymentView,
+        DeploymentListResponse,
+        CreateDeploymentRequest,
+        UpdateDeploymentRequest,
     )),
     tags(
         (name = "meta", description = "Liveness + introspection"),
@@ -295,6 +308,8 @@ mod tests {
             ("/api/admin/logs", &["get"]),
             ("/api/admin/eval/flags", &["get"]),
             ("/api/admin/audit", &["get"]),
+            ("/api/admin/deployments", &["get", "post"]),
+            ("/api/admin/deployments/{id}", &["patch", "delete"]),
             ("/api/admin/approvals", &["get"]),
             ("/api/admin/approvals/{approval_id}/respond", &["post"]),
             ("/api/admin/principals", &["get"]),

@@ -559,6 +559,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::plugins::plugins_router())
         .merge(crate::approvals::approvals_router())
         .merge(crate::observability::observability_router())
+        .merge(crate::deployments::deployments_router())
         .merge(crate::docs::docs_router())
         .with_state(state)
 }

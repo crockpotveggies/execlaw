@@ -820,7 +820,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     plugin_host.hydrate().await.map_err(|e| anyhow::anyhow!("plugin hydrate: {e}"))?;
 
     let state = execlaw_server::AppState {
-        db,
+        db: db.clone(),
         config: config.clone(),
         signer,
         refresh_store,
@@ -829,10 +829,29 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         inference,
         plugin_host,
     };
+
+    // Phase-7 background workers — run for the lifetime of the
+    // process. The sweepers carry their own intervals; the server
+    // owns the stop signal so a SIGTERM can drain everything.
+    let sweep_stop = std::sync::Arc::new(tokio::sync::Notify::new());
+    let log_sweeper =
+        execlaw_core::log_retention::LogRetentionSweeper::new(db.clone());
+    {
+        let stop = sweep_stop.clone();
+        tokio::spawn(async move { log_sweeper.run(stop).await });
+    }
+    let ephemeral_sweeper =
+        execlaw_core::ephemeral_sweeper::EphemeralSweeper::new(db.clone());
+    {
+        let stop = sweep_stop.clone();
+        tokio::spawn(async move { ephemeral_sweeper.run(stop).await });
+    }
+
     let app = execlaw_server::routes::build_router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "execlaw server listening");
     axum::serve(listener, app).await?;
+    sweep_stop.notify_waiters();
     Ok(())
 }
 

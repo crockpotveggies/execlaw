@@ -148,6 +148,18 @@ impl<'db> LogStore<'db> {
             Ok(rows)
         })
     }
+
+    /// Delete every row whose `ts_ms < cutoff_ms`. Returns the number
+    /// of rows removed. Powers the Phase-7 retention sweeper.
+    pub fn purge_older_than(&self, cutoff_ms: i64) -> Result<usize, DbError> {
+        self.db.with_conn(|c| {
+            let n = c.execute(
+                "DELETE FROM log_entries WHERE ts_ms < ?1",
+                params![cutoff_ms],
+            )?;
+            Ok(n)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -231,5 +243,53 @@ mod tests {
             })
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    fn count_rows(db: &Database) -> i64 {
+        db.with_conn(|c| {
+            let v: i64 = c.query_row("SELECT COUNT(*) FROM log_entries", [], |r| r.get(0))?;
+            Ok(v)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn purge_removes_old_rows_only_and_reports_count() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let store = LogStore::new(&db);
+        for ts in [100, 200, 300, 400] {
+            store
+                .insert(&LogRow {
+                    ts_ms: ts,
+                    level: LogLevel::Info,
+                    target: "t".into(),
+                    conversation_id: None,
+                    plugin_id: None,
+                    message: format!("@{ts}"),
+                    fields_json: None,
+                })
+                .unwrap();
+        }
+        // Cutoff < first ts → nothing dropped.
+        assert_eq!(store.purge_older_than(50).unwrap(), 0);
+        assert_eq!(count_rows(&db), 4);
+        // Cutoff = 250 drops 100 and 200 (strictly less than).
+        assert_eq!(store.purge_older_than(250).unwrap(), 2);
+        assert_eq!(count_rows(&db), 2);
+        // Re-running with same cutoff is a no-op (idempotent).
+        assert_eq!(store.purge_older_than(250).unwrap(), 0);
+        // Boundary: cutoff equal to a row's ts_ms preserves that row.
+        assert_eq!(store.purge_older_than(300).unwrap(), 0);
+        assert_eq!(count_rows(&db), 2);
+    }
+
+    #[test]
+    fn purge_on_empty_table_returns_zero() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let store = LogStore::new(&db);
+        assert_eq!(store.purge_older_than(0).unwrap(), 0);
+        assert_eq!(store.purge_older_than(i64::MAX).unwrap(), 0);
     }
 }

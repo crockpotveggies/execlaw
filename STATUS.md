@@ -1,17 +1,17 @@
 # execlaw build STATUS
 
-Last update: 2026-04-25, after Phase 5/6 audit + gap closure (Tauri pushed to new Phase 9, four Phase-6 spec gaps closed, Phase-5 logs/eval auth fixed).
+Last update: 2026-04-25, after Phase 7 first wave (deployment editor end-to-end + event-log HMAC key-rotation + log retention sweeper).
 
 ## TL;DR
 
 - `cargo build --workspace` — **clean**
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **390 passing, 0 failing**
-- `cargo bench --workspace --no-run` — **clean** (44 benches across 9 crates)
-- `cd web && npm test` — **97 passing** (jsdom + react-testing-library)
-- `cd web && npm run build` — **clean** (287 KB JS / 307 KB CSS, both well under budget)
+- `cargo test --workspace --no-fail-fast` — **417 passing, 0 failing**
+- `cargo bench --workspace --no-run` — **clean** (45 benches across 9 crates)
+- `cd web && npm test` — **102 passing** (jsdom + react-testing-library)
+- `cd web && npm run build` — **clean** (294 KB JS / 307 KB CSS, both well under budget)
 - **Zero cloud-SDK dependencies** anywhere in the workspace
-- **Phase 6 complete and audited.** SPA on plain React + GSAP covers: setup → login → chat (sidebar with thread-list status icons, **external-channel filter toggle**, **plugin UI panels under "More"**, **channel-origin icon per message**, **long-message truncation with Read more**, **streaming-token typing cursor**, inline approval card with verbs, thread rename, incognito toggle) → settings (plugins / principals / hardware / logs / eval flags / audit) with plugin install + trust revoke writes. Tauri + native targets are queued in **Phase 9** (last phase).
+- **Phase 7 in progress.** First wave shipped: (a) **runner-deployment editor** — backend CRUD on `config_runner_deployments` + audit-logged + SPA Settings → Deployments page; (b) **event-log HMAC key rotation** — `KeyRing` primitive lets old rows verify under their original `key_id` while new rows pick up the rotated current key; (c) **log retention sweeper** — `LogRetentionSweeper` purges `log_entries` past 30d, runs alongside the existing `EphemeralSweeper` in the server's tokio runtime.
 
 ## Migration-plan phase structure (post-2026-04-24 refactor)
 
@@ -194,6 +194,9 @@ execlaw-web (vitest)      56     api/client + endpoints + tokens + auth boot,
 | `list_thread_summaries/threads/100` | 95 µs | ≤5 ms for 1k | linear |
 | `list_thread_summaries/threads/1000` | 963 µs | ≤5 ms for 1k | ~1 µs/thread, comfortably under budget |
 | `principal_store/list_all_100` | 117 µs | ≤5 ms for 1k | powers /api/admin/principals settings page |
+| `deployment_store/list/4` | 2.7 µs | ≤1 ms for 64 rows | powers /api/admin/deployments settings page |
+| `deployment_store/list/16` | 10.2 µs | ≤1 ms | linear |
+| `deployment_store/list/64` | 40.8 µs | ≤1 ms | comfortably under budget |
 
 ## Grounding-rule compliance (re-audited this session)
 

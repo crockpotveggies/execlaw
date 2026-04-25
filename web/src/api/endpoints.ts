@@ -400,6 +400,101 @@ export async function getEvalFlags(
     return apiFetch<EvalFlagsResponse>(path, {}, tokenAccessor);
 }
 
+// ---- /api/admin/deployments ---------------------------------------
+
+export type DeploymentPurpose =
+    | "Standard"
+    | "Reasoning"
+    | "Guardrail"
+    | "VoiceSTT"
+    | "VoiceTTS";
+
+export interface DeploymentView {
+    id: string;
+    purpose: DeploymentPurpose;
+    inference_backend: string;
+    model_spec: Record<string, unknown>;
+    gpu_id: string | null;
+    endpoint: string | null;
+    is_default: boolean;
+    active: boolean;
+    notes: string | null;
+    created_at: number;
+    updated_at: number;
+}
+
+export interface DeploymentListResponse {
+    deployments: DeploymentView[];
+}
+
+export interface CreateDeploymentRequest {
+    id?: string;
+    purpose: DeploymentPurpose;
+    inference_backend: string;
+    model_spec: unknown;
+    gpu_id?: string | null;
+    endpoint?: string | null;
+    is_default?: boolean;
+    active?: boolean;
+    notes?: string | null;
+}
+
+export interface UpdateDeploymentRequest {
+    purpose?: DeploymentPurpose;
+    inference_backend?: string;
+    model_spec?: unknown;
+    /** Three-valued: missing / null / value. */
+    gpu_id?: string | null;
+    endpoint?: string | null;
+    is_default?: boolean;
+    active?: boolean;
+    notes?: string | null;
+}
+
+export async function listDeployments(
+    tokenAccessor: () => string | null,
+): Promise<DeploymentListResponse> {
+    return apiFetch<DeploymentListResponse>(
+        "/api/admin/deployments",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function createDeployment(
+    body: CreateDeploymentRequest,
+    tokenAccessor: () => string | null,
+): Promise<DeploymentView> {
+    return apiFetch<DeploymentView>(
+        "/api/admin/deployments",
+        { method: "POST", body },
+        tokenAccessor,
+    );
+}
+
+export async function updateDeployment(
+    id: string,
+    body: UpdateDeploymentRequest,
+    tokenAccessor: () => string | null,
+): Promise<DeploymentView> {
+    return apiFetch<DeploymentView>(
+        `/api/admin/deployments/${encodeURIComponent(id)}`,
+        { method: "PATCH", body },
+        tokenAccessor,
+    );
+}
+
+export async function deleteDeployment(
+    id: string,
+    tokenAccessor: () => string | null,
+): Promise<unknown> {
+    return apiFetch(
+        `/api/admin/deployments/${encodeURIComponent(id)}`,
+        { method: "DELETE" },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/plugins/ui_panels ---------------------------------
 
 export interface UiPanelSummary {

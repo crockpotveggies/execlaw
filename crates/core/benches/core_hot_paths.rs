@@ -19,6 +19,9 @@ use execlaw_core::migrations::MigrationRunner;
 use execlaw_core::conversation::{
     ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
 };
+use execlaw_core::deployments::{
+    DeploymentPurpose, DeploymentRow, DeploymentStore,
+};
 use execlaw_core::ephemeral_sweeper::sweep_once;
 use execlaw_core::events::EventRecord as CoreEventRecord;
 use execlaw_core::outbox::{OutboxRow, OutboxStatus, OutboxStore};
@@ -665,6 +668,53 @@ fn bench_list_thread_summaries(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Deployment registry — Settings → Deployments page calls list every
+// time it mounts. Budget ≤ 1ms even with 64 deployments (the realistic
+// upper bound: one row per (purpose × backend × variant)).
+// ---------------------------------------------------------------------------
+
+fn bench_deployment_store(c: &mut Criterion) {
+    let mut group = c.benchmark_group("deployment_store");
+
+    for n in [4usize, 16usize, 64usize].iter() {
+        group.bench_with_input(BenchmarkId::new("list", n), n, |b, &n| {
+            let db = fresh_db();
+            let store = DeploymentStore::new(&db);
+            for i in 0..n {
+                let id = format!("dep-{i}");
+                let purpose = match i % 5 {
+                    0 => DeploymentPurpose::Standard,
+                    1 => DeploymentPurpose::Reasoning,
+                    2 => DeploymentPurpose::Guardrail,
+                    3 => DeploymentPurpose::VoiceStt,
+                    _ => DeploymentPurpose::VoiceTts,
+                };
+                store
+                    .insert(&DeploymentRow {
+                        id: execlaw_core::ids::DeploymentId::from(id.as_str()),
+                        purpose,
+                        inference_backend: "service-vllm".into(),
+                        model_spec: serde_json::json!({"model": "Qwen3.5-27B-AWQ"}),
+                        gpu_id: None,
+                        endpoint: Some("http://127.0.0.1:8000/v1".into()),
+                        is_default: i == 0,
+                        active: true,
+                        notes: None,
+                        created_at: i as i64,
+                        updated_at: i as i64,
+                    })
+                    .unwrap();
+            }
+            b.iter(|| {
+                let rows = store.list().unwrap();
+                black_box(rows);
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_hmac,
@@ -680,5 +730,6 @@ criterion_group!(
     bench_ephemeral_sweeper,
     bench_conversation_metadata,
     bench_list_thread_summaries,
+    bench_deployment_store,
 );
 criterion_main!(benches);

@@ -229,51 +229,143 @@ pub struct ToolResultPayload {
 /// When no key is attached (tests, first-run before vault is ready),
 /// rows are written with `tag = NULL` and verification is skipped.
 /// Production always attaches a key at server startup.
+///
+/// **Key rotation (Phase 7).** `EventLog` accepts a [`KeyRing`] of
+/// `(key_id, bytes)` pairs. Append writes the ring's `current_id` into
+/// the `state_events.key_id` column; replay reads that id and verifies
+/// each row under the corresponding key. To rotate, register the new
+/// key with `KeyRing::add` and call `KeyRing::set_current` — old rows
+/// continue to verify under their original key, new rows pick up the
+/// new one. The single-key `with_hmac_key(k)` helper is retained as a
+/// thin wrapper that builds a one-entry ring.
 pub struct EventLog<'db> {
     db: &'db Database,
-    hmac_key: Option<Vec<u8>>,
+    key_ring: Option<KeyRing>,
+}
+
+/// Multi-key HMAC ring used by `EventLog` for signing + verifying.
+///
+/// `current_id` is what every new append signs under. Verification
+/// looks up each row's `key_id` column to fish out the right key.
+#[derive(Debug, Clone, Default)]
+pub struct KeyRing {
+    keys: std::collections::HashMap<i64, Vec<u8>>,
+    current_id: i64,
+}
+
+impl KeyRing {
+    /// Build a ring starting with one key. The id is the operator's
+    /// choice; Phase-1 single-key deployments used `0`.
+    pub fn single(id: i64, key: Vec<u8>) -> Self {
+        let mut keys = std::collections::HashMap::new();
+        keys.insert(id, key);
+        Self { keys, current_id: id }
+    }
+
+    /// Register an additional key without changing `current_id`. Used
+    /// when bringing an old key forward for verification only.
+    pub fn add(&mut self, id: i64, key: Vec<u8>) {
+        self.keys.insert(id, key);
+    }
+
+    /// Promote `id` to the current signing key. Errors if the id was
+    /// never registered.
+    pub fn set_current(&mut self, id: i64) -> Result<(), DbError> {
+        if !self.keys.contains_key(&id) {
+            return Err(DbError::Config(format!(
+                "key_ring: key_id {id} is not registered"
+            )));
+        }
+        self.current_id = id;
+        Ok(())
+    }
+
+    /// Convenience: register a new key AND set it as current. Returns
+    /// the previous `current_id` so the caller can persist it.
+    pub fn rotate(&mut self, new_id: i64, new_key: Vec<u8>) -> i64 {
+        let prev = self.current_id;
+        self.keys.insert(new_id, new_key);
+        self.current_id = new_id;
+        prev
+    }
+
+    pub fn current_id(&self) -> i64 {
+        self.current_id
+    }
+
+    pub fn registered_ids(&self) -> Vec<i64> {
+        let mut ids: Vec<i64> = self.keys.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn current_key(&self) -> Option<&[u8]> {
+        self.keys.get(&self.current_id).map(|v| v.as_slice())
+    }
+
+    fn key_for(&self, id: i64) -> Option<&[u8]> {
+        self.keys.get(&id).map(|v| v.as_slice())
+    }
 }
 
 impl<'db> EventLog<'db> {
     pub fn new(db: &'db Database) -> Self {
         Self {
             db,
-            hmac_key: None,
+            key_ring: None,
         }
     }
 
-    /// Attach an HMAC key. Every subsequent append signs the row;
-    /// every replay verifies.
-    pub fn with_hmac_key(mut self, key: Vec<u8>) -> Self {
-        self.hmac_key = Some(key);
+    /// Attach a single HMAC key — convenience wrapper that builds a
+    /// one-entry [`KeyRing`] under id `0`. Phase-1 single-key callers
+    /// keep working unchanged.
+    pub fn with_hmac_key(self, key: Vec<u8>) -> Self {
+        self.with_key_ring(KeyRing::single(0, key))
+    }
+
+    /// Attach a [`KeyRing`]. Append signs with `ring.current_id`;
+    /// replay verifies each row against `ring[row.key_id]`.
+    pub fn with_key_ring(mut self, ring: KeyRing) -> Self {
+        self.key_ring = Some(ring);
         self
     }
 
-    /// Sign an event under the attached key, returning the tag bytes.
-    /// `None` when no key is attached (returns `None` → `tag` column
-    /// gets NULL).
-    fn sign(&self, ev: &EventRecord) -> Option<[u8; 32]> {
-        self.hmac_key.as_deref().map(|k| {
-            let canon = crate::event_hmac::canonical_bytes(
-                ev.conversation_id.as_str(),
-                ev.seq.0,
-                ev.kind.as_str(),
-                ev.committed_at,
-                ev.actor.as_deref(),
-                &ev.payload,
-            );
-            crate::event_hmac::sign_event(k, &canon)
-        })
+    /// Sign an event under the current ring key, returning
+    /// `(tag, key_id)`. `None` when no ring is attached (→ NULL tag).
+    fn sign(&self, ev: &EventRecord) -> Option<([u8; 32], i64)> {
+        let ring = self.key_ring.as_ref()?;
+        let key = ring.current_key()?;
+        let canon = crate::event_hmac::canonical_bytes(
+            ev.conversation_id.as_str(),
+            ev.seq.0,
+            ev.kind.as_str(),
+            ev.committed_at,
+            ev.actor.as_deref(),
+            &ev.payload,
+        );
+        Some((crate::event_hmac::sign_event(key, &canon), ring.current_id))
     }
 
-    /// Verify a loaded event row. No-op (returns Ok) when no key is
+    /// Verify a loaded event row. No-op (returns Ok) when no ring is
     /// attached or when the stored tag is NULL (legacy rows).
-    fn verify(&self, ev: &EventRecord, tag: Option<Vec<u8>>) -> Result<(), DbError> {
-        let Some(key) = self.hmac_key.as_deref() else {
+    fn verify(
+        &self,
+        ev: &EventRecord,
+        tag: Option<Vec<u8>>,
+        key_id: i64,
+    ) -> Result<(), DbError> {
+        let Some(ring) = self.key_ring.as_ref() else {
             return Ok(());
         };
         let Some(tag_bytes) = tag else {
             return Ok(());
+        };
+        let Some(key) = ring.key_for(key_id) else {
+            return Err(DbError::TamperDetected(format!(
+                "event {}:{} signed with key_id {key_id} that isn't in the ring",
+                ev.conversation_id.as_str(),
+                ev.seq.0,
+            )));
         };
         if tag_bytes.len() != 32 {
             return Err(DbError::TamperDetected(format!(
@@ -306,12 +398,14 @@ impl<'db> EventLog<'db> {
     /// Append one event. Enforces `(conversation_id, seq)` uniqueness via
     /// the primary key — returns an error if the caller passed a stale seq.
     pub fn append(&self, ev: &EventRecord) -> Result<(), DbError> {
-        let tag = self.sign(ev).map(|t| t.to_vec());
+        let signed = self.sign(ev);
+        let tag: Option<Vec<u8>> = signed.as_ref().map(|(t, _)| t.to_vec());
+        let key_id: i64 = signed.as_ref().map(|(_, id)| *id).unwrap_or(0);
         self.db.with_conn(|c| {
             c.execute(
                 "INSERT INTO state_events \
-                 (conversation_id, seq, kind, payload, committed_at, actor, tag) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (conversation_id, seq, kind, payload, committed_at, actor, tag, key_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     ev.conversation_id.as_str(),
                     ev.seq.0,
@@ -320,6 +414,7 @@ impl<'db> EventLog<'db> {
                     ev.committed_at,
                     ev.actor,
                     tag,
+                    key_id,
                 ],
             )?;
             Ok(())
@@ -334,9 +429,9 @@ impl<'db> EventLog<'db> {
         conversation_id: &ConversationId,
         after_seq: EventSeq,
     ) -> Result<Vec<EventRecord>, DbError> {
-        let rows: Vec<(EventRecord, Option<Vec<u8>>)> = self.db.with_conn(|c| {
+        let rows: Vec<(EventRecord, Option<Vec<u8>>, i64)> = self.db.with_conn(|c| {
             let mut stmt = c.prepare_cached(
-                "SELECT seq, kind, payload, committed_at, actor, tag \
+                "SELECT seq, kind, payload, committed_at, actor, tag, key_id \
                  FROM state_events \
                  WHERE conversation_id = ?1 AND seq > ?2 \
                  ORDER BY seq ASC",
@@ -349,6 +444,7 @@ impl<'db> EventLog<'db> {
                     let committed_at: i64 = row.get(3)?;
                     let actor: Option<String> = row.get(4)?;
                     let tag: Option<Vec<u8>> = row.get(5)?;
+                    let key_id: i64 = row.get(6)?;
                     Ok((
                         EventRecord {
                             conversation_id: conversation_id.clone(),
@@ -359,6 +455,7 @@ impl<'db> EventLog<'db> {
                             actor,
                         },
                         tag,
+                        key_id,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -366,8 +463,8 @@ impl<'db> EventLog<'db> {
         })?;
 
         let mut out = Vec::with_capacity(rows.len());
-        for (ev, tag) in rows {
-            self.verify(&ev, tag)?;
+        for (ev, tag, key_id) in rows {
+            self.verify(&ev, tag, key_id)?;
             out.push(ev);
         }
         Ok(out)
@@ -406,17 +503,22 @@ impl<'db> EventLog<'db> {
         let materialized = enforce_tool_pairing(conversation_id, base_seq, events)?;
 
         // Sign before the transaction so any HMAC-key absence fails fast.
-        let tags: Vec<Option<Vec<u8>>> = materialized
+        // We capture both the tag bytes AND the key_id used so each row's
+        // `state_events.key_id` column reflects the key we actually signed under.
+        let signed: Vec<(Option<Vec<u8>>, i64)> = materialized
             .iter()
-            .map(|ev| self.sign(ev).map(|t| t.to_vec()))
+            .map(|ev| match self.sign(ev) {
+                Some((t, id)) => (Some(t.to_vec()), id),
+                None => (None, 0),
+            })
             .collect();
 
         self.db.transaction(|tx| {
-            for (ev, tag) in materialized.iter().zip(tags.iter()) {
+            for (ev, (tag, key_id)) in materialized.iter().zip(signed.iter()) {
                 tx.execute(
                     "INSERT INTO state_events \
-                     (conversation_id, seq, kind, payload, committed_at, actor, tag) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     (conversation_id, seq, kind, payload, committed_at, actor, tag, key_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         ev.conversation_id.as_str(),
                         ev.seq.0,
@@ -425,6 +527,7 @@ impl<'db> EventLog<'db> {
                         ev.committed_at,
                         ev.actor,
                         tag,
+                        key_id,
                     ],
                 )?;
             }
@@ -481,9 +584,9 @@ impl<'db> EventLog<'db> {
         // Pull rows + tags, then verify via the shared helper before
         // materializing the snapshot. A snapshot built from tampered
         // rows would propagate the tamper into every future hydrate.
-        let raw: Vec<(EventRecord, Option<Vec<u8>>)> = self.db.with_conn(|c| {
+        let raw: Vec<(EventRecord, Option<Vec<u8>>, i64)> = self.db.with_conn(|c| {
             let mut stmt = c.prepare_cached(
-                "SELECT seq, kind, payload, committed_at, actor, tag \
+                "SELECT seq, kind, payload, committed_at, actor, tag, key_id \
                  FROM state_events \
                  WHERE conversation_id = ?1 AND seq <= ?2 \
                  ORDER BY seq ASC",
@@ -496,6 +599,7 @@ impl<'db> EventLog<'db> {
                     let committed_at: i64 = row.get(3)?;
                     let actor: Option<String> = row.get(4)?;
                     let tag: Option<Vec<u8>> = row.get(5)?;
+                    let key_id: i64 = row.get(6)?;
                     Ok((
                         EventRecord {
                             conversation_id: conversation_id.clone(),
@@ -506,6 +610,7 @@ impl<'db> EventLog<'db> {
                             actor,
                         },
                         tag,
+                        key_id,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -513,8 +618,8 @@ impl<'db> EventLog<'db> {
         })?;
 
         let mut events = Vec::with_capacity(raw.len());
-        for (ev, tag) in raw {
-            self.verify(&ev, tag)?;
+        for (ev, tag, key_id) in raw {
+            self.verify(&ev, tag, key_id)?;
             events.push(ev);
         }
 
@@ -1137,6 +1242,144 @@ mod tests {
             DbError::TamperDetected(_)
         ));
     }
+
+    // ---- Phase 7: KeyRing rotation -----------------------------------
+
+    /// After rotating the ring's current key, NEW events sign under
+    /// the new key while OLD events keep verifying under the old one.
+    #[test]
+    fn key_ring_rotation_keeps_old_events_verifiable() {
+        let db = fresh_db();
+        let cid = ConversationId::from("conv-rotate");
+
+        // 1. Sign event A under key id=1.
+        let mut ring = KeyRing::single(1, b"key-one-32-bytes-long!!!!!!!!!!!".to_vec());
+        let log = EventLog::new(&db).with_key_ring(ring.clone());
+        let ev_a = EventRecord::new(
+            cid.clone(),
+            EventSeq::FIRST,
+            EventKind::UserMsg,
+            &serde_json::json!({"msg": "a"}),
+            None,
+        )
+        .unwrap();
+        log.append(&ev_a).unwrap();
+
+        // 2. Rotate to key id=2.
+        let prev = ring.rotate(2, b"key-two-32-bytes-long!!!!!!!!!!!".to_vec());
+        assert_eq!(prev, 1);
+        assert_eq!(ring.current_id(), 2);
+        assert_eq!(ring.registered_ids(), vec![1, 2]);
+
+        // 3. Sign event B under the new ring's current key id=2.
+        let log = EventLog::new(&db).with_key_ring(ring.clone());
+        let ev_b = EventRecord::new(
+            cid.clone(),
+            EventSeq(2),
+            EventKind::UserMsg,
+            &serde_json::json!({"msg": "b"}),
+            None,
+        )
+        .unwrap();
+        log.append(&ev_b).unwrap();
+
+        // 4. Replay verifies BOTH events.
+        let got = log.replay_since(&cid, EventSeq(0)).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].seq, EventSeq::FIRST);
+        assert_eq!(got[1].seq, EventSeq(2));
+    }
+
+    /// Adversarial: a row whose stored key_id isn't registered in the
+    /// ring fails verification with TamperDetected — operators
+    /// cannot "lose" a key and silently accept rows that would have
+    /// required it.
+    #[test]
+    fn replay_with_unknown_key_id_is_tamper_detected() {
+        let db = fresh_db();
+        let cid = ConversationId::from("conv-missing-key");
+
+        let mut ring = KeyRing::single(7, b"key-seven-32-bytes-long!!!!!!!!".to_vec());
+        EventLog::new(&db)
+            .with_key_ring(ring.clone())
+            .append(
+                &EventRecord::new(
+                    cid.clone(),
+                    EventSeq::FIRST,
+                    EventKind::UserMsg,
+                    &serde_json::json!({}),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // Operator restarts with a ring that doesn't contain key id 7.
+        ring = KeyRing::single(99, b"different-32-bytes-long!!!!!!!!!".to_vec());
+        let log = EventLog::new(&db).with_key_ring(ring);
+        let err = log.replay_since(&cid, EventSeq(0)).unwrap_err();
+        assert!(
+            matches!(err, DbError::TamperDetected(msg) if msg.contains("isn't in the ring")),
+        );
+    }
+
+    /// set_current() refuses an id that hasn't been registered first —
+    /// avoids a footgun where rotate() is forgotten and current_id
+    /// silently points at nothing.
+    #[test]
+    fn key_ring_set_current_rejects_unregistered_id() {
+        let mut ring = KeyRing::single(1, vec![0u8; 32]);
+        assert!(ring.set_current(2).is_err());
+        ring.add(2, vec![1u8; 32]);
+        assert!(ring.set_current(2).is_ok());
+        assert_eq!(ring.current_id(), 2);
+    }
+
+    /// rotate() returns the previous current_id so the operator can
+    /// persist the bookkeeping.
+    #[test]
+    fn key_ring_rotate_returns_previous_current_id() {
+        let mut ring = KeyRing::single(5, vec![0u8; 32]);
+        let prev = ring.rotate(8, vec![1u8; 32]);
+        assert_eq!(prev, 5);
+        assert_eq!(ring.current_id(), 8);
+    }
+
+    /// `with_hmac_key` is back-compat: it builds a single-key ring at
+    /// id=0 so existing call sites keep working.
+    #[test]
+    fn with_hmac_key_back_compat_uses_id_zero() {
+        let db = fresh_db();
+        let cid = ConversationId::from("conv-bc");
+        let log = EventLog::new(&db).with_hmac_key(b"k".to_vec());
+        log.append(
+            &EventRecord::new(
+                cid.clone(),
+                EventSeq::FIRST,
+                EventKind::UserMsg,
+                &serde_json::json!({}),
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // The persisted key_id is 0.
+        let stored: i64 = db
+            .with_conn(|c| {
+                let id: i64 = c
+                    .query_row(
+                        "SELECT key_id FROM state_events WHERE conversation_id = ?1",
+                        params![cid.as_str()],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                Ok(id)
+            })
+            .unwrap();
+        assert_eq!(stored, 0);
+    }
+
+    // ---- end Phase 7 -----------------------------------------------
 
     #[test]
     fn append_refuses_duplicate_seq() {

@@ -20,6 +20,7 @@ pub mod auth;
 pub mod auth_extract;
 pub mod capability;
 pub mod chats;
+pub mod deployments;
 pub mod docs;
 pub mod events;
 pub mod observability;
