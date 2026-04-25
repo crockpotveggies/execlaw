@@ -72,6 +72,84 @@ export async function postLogin(req: LoginRequest): Promise<LoginResponse> {
     });
 }
 
+// ---- /api/chats ----------------------------------------------------
+
+export interface ThreadSummary {
+    conversation_id: string;
+    kind: string;
+    phase: string;
+    trust_class: string;
+    modality: string;
+    display_name: string | null;
+    is_pinned: boolean;
+    is_ephemeral: boolean;
+    ephemeral_expires_at: number | null;
+    last_seq: number;
+}
+
+export interface ThreadListResponse {
+    threads: ThreadSummary[];
+}
+
+export async function listThreads(
+    tokenAccessor: () => string | null,
+): Promise<ThreadListResponse> {
+    return apiFetch<ThreadListResponse>("/api/chats", {}, tokenAccessor);
+}
+
+// ---- /api/chats/:id/messages ---------------------------------------
+
+export interface MessageView {
+    seq: number;
+    kind: string;
+    text: string | null;
+    actor: string | null;
+    committed_at: number;
+}
+
+export interface MessagesListResponse {
+    conversation_id: string;
+    messages: MessageView[];
+}
+
+export async function listMessages(
+    conversationId: string,
+    tokenAccessor: () => string | null,
+    opts: { before?: number; limit?: number } = {},
+): Promise<MessagesListResponse> {
+    const qs = new URLSearchParams();
+    if (opts.before !== undefined) qs.set("before", String(opts.before));
+    if (opts.limit !== undefined) qs.set("limit", String(opts.limit));
+    const path = `/api/chats/${encodeURIComponent(conversationId)}/messages${
+        qs.toString() ? "?" + qs.toString() : ""
+    }`;
+    return apiFetch<MessagesListResponse>(path, {}, tokenAccessor);
+}
+
+export interface SendMessageRequest {
+    text: string;
+    sender_principal_id?: string;
+}
+
+export interface SendMessageResponse {
+    user_msg_seq?: number;
+    assistant_text?: string;
+    assistant_msg_seq?: number;
+    [extra: string]: unknown;
+}
+
+export async function postMessage(
+    conversationId: string,
+    body: SendMessageRequest,
+    tokenAccessor: () => string | null,
+): Promise<SendMessageResponse> {
+    return apiFetch<SendMessageResponse>(
+        `/api/chats/${encodeURIComponent(conversationId)}/messages`,
+        { method: "POST", body },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/me -------------------------------------------------
 
 export interface MeResponse {

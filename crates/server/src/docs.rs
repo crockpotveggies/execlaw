@@ -73,6 +73,7 @@ impl Modify for SecurityAddon {
         crate::chats::send_message,
         crate::chats::list_messages,
         crate::chats::patch_thread,
+        crate::chats::list_threads,
         // plugins
         crate::plugins::list_handler,
         crate::plugins::install_handler,
@@ -269,6 +270,7 @@ mod tests {
             ("/api/logout", &["post"]),
             ("/api/admin/me", &["get"]),
             ("/api/admin/hardware", &["get"]),
+            ("/api/chats", &["get"]),
             ("/api/chats/{conversation_id}/messages", &["get", "post"]),
             ("/api/chats/{conversation_id}", &["patch"]),
             ("/api/admin/plugins", &["get"]),

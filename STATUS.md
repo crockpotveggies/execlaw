@@ -1,17 +1,17 @@
 # execlaw build STATUS
 
-Last update: 2026-04-24, after Phase-6a SPA scaffold (Vite + react-bootstrap + setup wizard + auth context + chat placeholder).
+Last update: 2026-04-25, after Phase-6a chat shell (sidebar + thread list + WS bus + composer + Reanimated 4 transitions).
 
 ## TL;DR
 
 - `cargo build --workspace` — **clean**
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **360 passing, 0 failing**
-- `cargo bench --workspace --no-run` — **clean** (40+ benches across 9 crates)
-- `cd web && npm test` — **28 passing** (jsdom + react-testing-library)
-- `cd web && npm run build` — **clean** (176 KB JS / 300 KB CSS, both well under budget)
+- `cargo test --workspace --no-fail-fast` — **376 passing, 0 failing**
+- `cargo bench --workspace --no-run` — **clean** (43 benches across 9 crates)
+- `cd web && npm test` — **56 passing** (jsdom + react-testing-library)
+- `cd web && npm run build` — **clean** (380 KB JS / 306 KB CSS, both well under budget)
 - **Zero cloud-SDK dependencies** anywhere in the workspace
-- Phases 0–5 complete; Phase-6a scaffold lands setup wizard + login + JWT auth + chat placeholder. Hands-on test ready: see [web/README.md](web/README.md).
+- Phases 0–5 complete; Phase-6a SPA wraps setup → login → live chat shell with sidebar / thread list / streaming / Reanimated 4 transitions. Hands-on test ready: see [web/README.md](web/README.md).
 
 ## Migration-plan phase structure (post-2026-04-24 refactor)
 
@@ -111,7 +111,7 @@ execlaw-core             113     DB, events (+HMAC sign/verify + atomicity),
                                  invariant, atomic transactions),
                                  EphemeralSweeper (purge + last_seq reset
                                  + idempotency + boundary + run-loop)
-execlaw-server            61     auth, events (WS bus), capability tokens,
+execlaw-server            71     auth, events (WS bus), capability tokens,
                                  chat routes (streaming, policy, crash tests,
                                  cold-contact adversarial, identity-match
                                  classifier), tool_dispatch, tracing_layer,
@@ -119,7 +119,11 @@ execlaw-server            61     auth, events (WS bus), capability tokens,
                                  with JWT extractor, PATCH /api/chats/:id
                                  (auth, three-valued display_name, incognito
                                  toggle), GET /api/admin/plugins/ui_panels
-                                 (sorted, empty, exclude-non-panel-plugins)
+                                 (sorted, empty, exclude-non-panel-plugins),
+                                 GET /api/chats (auth, empty, pinned-first
+                                 ordering), OpenAPI coverage guard for all
+                                 22 routes, login leak-prevention,
+                                 username invalid-shape rejection
 execlaw-server (integ)    18     plugin_lifecycle (11) + approval_flow (7)
 execlaw-policy            43     rule_of_two, trust evaluator, spotlighting,
                                  sideband, input_guard, JWT claims
@@ -140,7 +144,17 @@ execlaw-outbox            11     backoff, retry budget, drain, WakeupScheduler (
 execlaw-session            1     modality binding
 execlaw-eval-harness       2     rubric parse, mock-mode orchestration
 --------------------------------------------------------------------
-TOTAL                    360 passing, 0 failing
+TOTAL                    376 passing, 0 failing
+
+execlaw-web (vitest)      56     api/client + endpoints + tokens + auth boot,
+                                 SetupWizard form validation (incl. username),
+                                 ScreenTransition smoke, AppBoot routing,
+                                 chat store (idempotent append, pinned/unread
+                                 flag preservation, streaming buffer toggles),
+                                 WsClient dispatch + malformed-payload guards,
+                                 Composer (Enter / Shift+Enter / disabled),
+                                 Sidebar (empty, ordering, click activates,
+                                 unread + thinking icon swap)
 ```
 
 ## Benchmarks (cargo bench --workspace)
@@ -175,6 +189,9 @@ TOTAL                    360 passing, 0 failing
 | `conversation_metadata/mark_ephemeral_then_clear` | 3.9 µs | ≤200 µs | |
 | `thread_tool/dispatch_set_thread_name_ok` | 2.4 µs | ≤200 µs | agent tool happy path |
 | `thread_tool/dispatch_set_thread_name_too_long` | 126 ns | — | validation rejection, no DB |
+| `list_thread_summaries/threads/10` | 6.6 µs | ≤5 ms for 1k | sidebar mount + state.changed event |
+| `list_thread_summaries/threads/100` | 95 µs | ≤5 ms for 1k | linear |
+| `list_thread_summaries/threads/1000` | 963 µs | ≤5 ms for 1k | ~1 µs/thread, comfortably under budget |
 
 ## Grounding-rule compliance (re-audited this session)
 
@@ -226,6 +243,10 @@ TOTAL                    360 passing, 0 failing
 | Setup wizard form | `web/src/routes/SetupWizard.tsx` |
 | SPA auth context + token store | `web/src/auth/` |
 | SPA API client | `web/src/api/` |
+| Chat shell (sidebar + main + composer) | `web/src/routes/Chat.tsx` + `web/src/chat/` |
+| WS event bus client | `web/src/api/ws.ts` |
+| Chat state store | `web/src/chat/store.ts` |
+| Reanimated 4 + RN-web shim | `web/src/anim/`, `web/src/shims/` |
 
 ## Recent commit history (foundation branch)
 

@@ -614,6 +614,47 @@ fn bench_conversation_metadata(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Sidebar thread-list query — runs on SPA mount + every state.changed
+// WS event. Budget: ≤ 5ms for 1k threads so the SPA never blocks on it.
+// ---------------------------------------------------------------------------
+
+fn bench_list_thread_summaries(c: &mut Criterion) {
+    let mut group = c.benchmark_group("list_thread_summaries");
+    group.sample_size(20);
+    for n in [10usize, 100usize, 1000usize].iter() {
+        group.bench_with_input(
+            BenchmarkId::new("threads", n),
+            n,
+            |b, &n| {
+                let db = fresh_db();
+                let store = ConversationStore::new(&db);
+                for i in 0..n {
+                    let id = format!("conv-{i}");
+                    let mut row = fresh_conv_row(&id);
+                    row.last_seq = EventSeq(i as i64);
+                    store.upsert(&row).unwrap();
+                    if i % 50 == 0 {
+                        store
+                            .set_pinned(
+                                &execlaw_core::ids::ConversationId::from(
+                                    id.as_str(),
+                                ),
+                                true,
+                            )
+                            .unwrap();
+                    }
+                }
+                b.iter(|| {
+                    let summaries = store.list_thread_summaries().unwrap();
+                    black_box(summaries);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_hmac,
@@ -628,5 +669,6 @@ criterion_group!(
     bench_conversation_resolver,
     bench_ephemeral_sweeper,
     bench_conversation_metadata,
+    bench_list_thread_summaries,
 );
 criterion_main!(benches);

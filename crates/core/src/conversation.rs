@@ -190,6 +190,23 @@ pub struct ConversationRow {
     pub ephemeral_expires_at: Option<i64>,
 }
 
+/// Trimmed projection of a `state_conversations` row used by the SPA
+/// sidebar listing. Mirrors the shape the React thread list actually
+/// reads — no snapshot blob, no lease internals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadSummary {
+    pub conversation_id: ConversationId,
+    pub kind: ConversationKind,
+    pub phase: Phase,
+    pub trust_class: String,
+    pub modality: Modality,
+    pub display_name: Option<String>,
+    pub is_pinned: bool,
+    pub is_ephemeral: bool,
+    pub ephemeral_expires_at: Option<i64>,
+    pub last_seq: EventSeq,
+}
+
 /// Simple repository for `state_conversations`.
 pub struct ConversationStore<'db> {
     db: &'db Database,
@@ -296,6 +313,49 @@ impl<'db> ConversationStore<'db> {
                 params![is_ephemeral, expires_at, conversation_id.as_str()],
             )?;
             Ok(())
+        })
+    }
+
+    /// Lightweight summary of every conversation row — enough to render
+    /// the SPA sidebar without a roundtrip per thread. Pinned threads
+    /// come first, then everything else by most-recent activity (we use
+    /// `last_seq` as a coarse stand-in until we wire a per-row
+    /// `last_activity_at` column).
+    pub fn list_thread_summaries(&self) -> Result<Vec<ThreadSummary>, DbError> {
+        self.db.with_conn(|c| {
+            let mut stmt = c.prepare_cached(
+                "SELECT conversation_id, kind, phase, trust_class, modality, \
+                        display_name, is_pinned, is_ephemeral, ephemeral_expires_at, \
+                        last_seq \
+                 FROM state_conversations \
+                 ORDER BY is_pinned DESC, last_seq DESC, conversation_id ASC",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    let kind_str: String = r.get(1)?;
+                    let phase_str: String = r.get(2)?;
+                    let modality_str: String = r.get(4)?;
+                    let is_pinned: i64 = r.get(6)?;
+                    let is_ephemeral: i64 = r.get(7)?;
+                    Ok(ThreadSummary {
+                        conversation_id: ConversationId::from(
+                            r.get::<_, String>(0)?,
+                        ),
+                        kind: ConversationKind::parse(&kind_str)
+                            .unwrap_or(ConversationKind::ControllerDM),
+                        phase: Phase::parse(&phase_str).unwrap_or(Phase::Idle),
+                        trust_class: r.get(3)?,
+                        modality: Modality::parse(&modality_str)
+                            .unwrap_or(Modality::Text),
+                        display_name: r.get(5)?,
+                        is_pinned: is_pinned != 0,
+                        is_ephemeral: is_ephemeral != 0,
+                        ephemeral_expires_at: r.get(8)?,
+                        last_seq: EventSeq(r.get::<_, i64>(9)?),
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
         })
     }
 
@@ -558,6 +618,44 @@ mod tests {
         let got = store.get(&row.conversation_id).unwrap().unwrap();
         assert!(!got.is_ephemeral);
         assert_eq!(got.ephemeral_expires_at, None);
+    }
+
+    #[test]
+    fn list_thread_summaries_orders_pinned_first_then_recent() {
+        let db = fresh_db();
+        let store = ConversationStore::new(&db);
+
+        // Three conversations: one pinned, two regular with different last_seq.
+        let mut a = fresh_row("conv-a"); // pinned
+        a.last_seq = EventSeq(5);
+        let mut b = fresh_row("conv-b"); // newest non-pinned
+        b.last_seq = EventSeq(20);
+        let mut c = fresh_row("conv-c"); // older non-pinned
+        c.last_seq = EventSeq(10);
+        store.upsert(&a).unwrap();
+        store.upsert(&b).unwrap();
+        store.upsert(&c).unwrap();
+        store.set_pinned(&a.conversation_id, true).unwrap();
+        store
+            .set_display_name(&a.conversation_id, Some("Control thread"))
+            .unwrap();
+
+        let summaries = store.list_thread_summaries().unwrap();
+        assert_eq!(summaries.len(), 3);
+        // Pinned first.
+        assert_eq!(summaries[0].conversation_id.as_str(), "conv-a");
+        assert!(summaries[0].is_pinned);
+        assert_eq!(summaries[0].display_name.as_deref(), Some("Control thread"));
+        // Then by last_seq DESC.
+        assert_eq!(summaries[1].conversation_id.as_str(), "conv-b");
+        assert_eq!(summaries[2].conversation_id.as_str(), "conv-c");
+    }
+
+    #[test]
+    fn list_thread_summaries_returns_empty_when_no_rows() {
+        let db = fresh_db();
+        let summaries = ConversationStore::new(&db).list_thread_summaries().unwrap();
+        assert!(summaries.is_empty());
     }
 
     #[test]

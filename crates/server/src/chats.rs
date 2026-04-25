@@ -19,6 +19,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use execlaw_core::conversation::{
     ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
+    ThreadSummary,
 };
 use execlaw_core::events::{EventKind, EventLog, EventRecord, PendingEvent};
 use execlaw_core::ids::{ConversationId, EventSeq};
@@ -922,6 +923,73 @@ pub struct PatchThreadResponse {
     pub ephemeral_expires_at: Option<i64>,
 }
 
+/// One thread row in `GET /api/chats`.
+#[derive(Debug, Serialize)]
+pub struct ThreadSummaryView {
+    pub conversation_id: String,
+    pub kind: String,
+    pub phase: String,
+    pub trust_class: String,
+    pub modality: String,
+    pub display_name: Option<String>,
+    pub is_pinned: bool,
+    pub is_ephemeral: bool,
+    pub ephemeral_expires_at: Option<i64>,
+    pub last_seq: i64,
+}
+
+impl From<ThreadSummary> for ThreadSummaryView {
+    fn from(s: ThreadSummary) -> Self {
+        Self {
+            conversation_id: s.conversation_id.as_str().to_owned(),
+            kind: s.kind.as_str().to_owned(),
+            phase: s.phase.as_str().to_owned(),
+            trust_class: s.trust_class,
+            modality: s.modality.as_str().to_owned(),
+            display_name: s.display_name,
+            is_pinned: s.is_pinned,
+            is_ephemeral: s.is_ephemeral,
+            ephemeral_expires_at: s.ephemeral_expires_at,
+            last_seq: s.last_seq.0,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ThreadListResponse {
+    pub threads: Vec<ThreadSummaryView>,
+}
+
+/// `GET /api/chats` — every thread in the store, pinned first then by
+/// recent activity. Auth-gated; the SPA's sidebar polls this on mount
+/// and on the `state.changed` WS event.
+#[utoipa::path(
+    get,
+    path = "/api/chats",
+    responses(
+        (status = 200, description = "Threads, pinned first then by recency"),
+        (status = 401, description = "Missing or invalid Authorization header"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "chats"
+)]
+pub async fn list_threads(
+    State(state): State<AppState>,
+    _user: crate::auth_extract::AuthedUser,
+) -> impl IntoResponse {
+    let store = ConversationStore::new(&state.db);
+    let summaries = match store.list_thread_summaries() {
+        Ok(s) => s,
+        Err(e) => return err_500(&format!("list_thread_summaries: {e}")),
+    };
+    let threads: Vec<ThreadSummaryView> = summaries.into_iter().map(Into::into).collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(ThreadListResponse { threads })),
+    )
+        .into_response()
+}
+
 /// `PATCH /api/chats/{conversation_id}` handler.
 #[utoipa::path(
     patch,
@@ -1753,6 +1821,89 @@ required_capabilities = []
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["is_ephemeral"], false);
         assert!(body["ephemeral_expires_at"].is_null());
+    }
+
+    // ---- GET /api/chats (thread list) -------------------------------
+
+    async fn list_threads(
+        app: &axum::Router,
+        token: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/chats");
+        if let Some(t) = token {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let value: serde_json::Value = json_body(resp.into_body()).await;
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn list_threads_requires_auth() {
+        let app = build_app();
+        let (status, _) = list_threads(&app, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn list_threads_returns_empty_on_fresh_db() {
+        let app = build_app();
+        let token = setup_and_get_token(&app).await;
+        let (status, body) = list_threads(&app, Some(&token)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["threads"].is_array());
+        assert_eq!(body["threads"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_threads_orders_pinned_first_then_by_recency() {
+        let app = build_app();
+        let token = setup_and_get_token(&app).await;
+
+        // Create three threads via send_message (which calls
+        // ensure_conversation), then pin the first via PATCH.
+        let _ = send(app.clone(), "first").await; // -> conv1, last_seq grows
+        // Send a message to a different conv id (the test helper hardcodes "conv1",
+        // so use the chat-thread URL directly).
+        for (cid, text) in [("conv-bbb", "bbb1"), ("conv-ccc", "ccc1")] {
+            let body = serde_json::to_vec(&serde_json::json!({"text": text})).unwrap();
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/chats/{cid}/messages"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            app.clone().oneshot(req).await.unwrap();
+        }
+
+        // Pin conv-bbb.
+        let _ = patch_thread(
+            &app,
+            Some(&token),
+            "conv-bbb",
+            serde_json::json!({"is_pinned": true, "display_name": "Pinned"}),
+        )
+        .await;
+
+        let (status, body) = list_threads(&app, Some(&token)).await;
+        assert_eq!(status, StatusCode::OK);
+        let threads = body["threads"].as_array().unwrap();
+        assert_eq!(threads.len(), 3);
+        // Pinned first.
+        assert_eq!(threads[0]["conversation_id"], "conv-bbb");
+        assert_eq!(threads[0]["is_pinned"], true);
+        assert_eq!(threads[0]["display_name"], "Pinned");
+        // Other two have higher last_seq than 0 (real conversation flowed).
+        for t in &threads[1..] {
+            assert!(t["last_seq"].as_i64().unwrap() > 0);
+        }
     }
 
     /// Three-valued logic for `display_name`:
