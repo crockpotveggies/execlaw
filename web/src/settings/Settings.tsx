@@ -9,9 +9,10 @@ import { Navigate, NavLink, Route, Routes } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { Sidebar } from "../chat/Sidebar";
 import { useScreenTransition } from "../anim/useScreenTransition";
-import { useCallback } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { setActiveThread } from "../chat/store";
 import { useNavigate } from "react-router-dom";
+import { listUiPanels, type UiPanelSummary } from "../api/endpoints";
 
 import { PluginsPage } from "./PluginsPage";
 import { HardwarePage } from "./HardwarePage";
@@ -37,6 +38,23 @@ export function Settings() {
         exitScale: 1,
         durationMs: 220,
     });
+    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const [uiPanels, setUiPanels] = useState<UiPanelSummary[] | null>(null);
+    useEffect(() => {
+        if (auth.status !== "authenticated") return;
+        let cancelled = false;
+        (async () => {
+            try {
+                const r = await listUiPanels(getToken);
+                if (!cancelled) setUiPanels(r.panels);
+            } catch {
+                if (!cancelled) setUiPanels([]);
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [auth.status, getToken]);
 
     const handleSignOut = useCallback(() => {
         dismiss(() => {
@@ -64,7 +82,11 @@ export function Settings() {
 
     return (
         <div ref={shellRef} className="execlaw-shell">
-            <Sidebar onNewThread={onNewThread} onSignOut={handleSignOut} />
+            <Sidebar
+                onNewThread={onNewThread}
+                onSignOut={handleSignOut}
+                uiPanels={uiPanels}
+            />
             <main className="execlaw-main">
                 <header className="execlaw-main__head">
                     <h2 className="h6 mb-0">

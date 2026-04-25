@@ -1,17 +1,17 @@
 # execlaw build STATUS
 
-Last update: 2026-04-25, after Phase 6 closeout (Tauri moved to Phase 7; audit page + endpoint added; per-page SPA tests).
+Last update: 2026-04-25, after Phase 5/6 audit + gap closure (Tauri pushed to new Phase 9, four Phase-6 spec gaps closed, Phase-5 logs/eval auth fixed).
 
 ## TL;DR
 
 - `cargo build --workspace` — **clean**
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **388 passing, 0 failing**
+- `cargo test --workspace --no-fail-fast` — **390 passing, 0 failing**
 - `cargo bench --workspace --no-run` — **clean** (44 benches across 9 crates)
-- `cd web && npm test` — **87 passing** (jsdom + react-testing-library)
-- `cd web && npm run build` — **clean** (284 KB JS / 307 KB CSS, both well under budget)
+- `cd web && npm test` — **97 passing** (jsdom + react-testing-library)
+- `cd web && npm run build` — **clean** (287 KB JS / 307 KB CSS, both well under budget)
 - **Zero cloud-SDK dependencies** anywhere in the workspace
-- **Phase 6 complete.** Tauri Desktop wrapper moved to Phase 7 hardening. SPA on plain React + GSAP covers: setup → login → chat (sidebar / thread list / streaming / inline approval card with verbs / thread rename / incognito toggle) → settings (plugins / principals / hardware / logs / eval flags / **audit**) with plugin install + trust revoke writes. Each settings page has component tests; chat surface has store / WS / composer / sidebar / approval-card specs.
+- **Phase 6 complete and audited.** SPA on plain React + GSAP covers: setup → login → chat (sidebar with thread-list status icons, **external-channel filter toggle**, **plugin UI panels under "More"**, **channel-origin icon per message**, **long-message truncation with Read more**, **streaming-token typing cursor**, inline approval card with verbs, thread rename, incognito toggle) → settings (plugins / principals / hardware / logs / eval flags / audit) with plugin install + trust revoke writes. Tauri + native targets are queued in **Phase 9** (last phase).
 
 ## Migration-plan phase structure (post-2026-04-24 refactor)
 
@@ -25,9 +25,10 @@ Phase 2 used to conflate "plugin framework" with "port every selfhosted-claw int
 | 3 — Participants, trust, policy engine, Rule of Two | `PrincipalStore`, identity resolution (+ plugin dispatch), cold-contact flow, approval endpoint with every verb, spotlighting, planner/executor tool-strip, trust-class memory scoping | ✅ done |
 | 4 — Voice pipeline primitives (pure Rust; real-audio demos move to Phase 8) | two-lane graph, Vad/Audio/Stt/Tts traits + mocks, `VoiceSession` orchestrator, voice event schema wired to state_events, endpointer, barge-in | ✅ done |
 | 5 — Observability, evaluation, replay CLI (infra only) | tracing→SQLite layer, `GET /api/admin/logs`, `GET /api/admin/eval/flags`, `execlaw replay <conv> --at <seq>`, `execlaw eval flag/list`, eval-harness binary + rubric scaffolding | ✅ done (UI components for log viewer + dashboard land in Phase 6) |
-| 6 — UI port, chat-first landing | React SPA on the new APIs | pending |
-| 7 — Hardening | WASM tier, WebAuthn, key rotation, multi-controller | ongoing |
-| 8 — **External plugin ports** (new, open-ended) | every plugin that needs creds/external-services — see [plugin-inventory.md](docs/plugin-inventory.md) | queue; no ports started |
+| 6 — UI port, chat-first landing | React + GSAP SPA: setup → login → chat (sidebar, thread list, streaming + cursor, channel-origin icons, long-msg truncation, external-channel filter, plugin UI panels) → settings (plugins/principals/hardware/logs/eval/audit), inline approval card with verbs, thread rename, incognito toggle, plugin install, trust revoke | ✅ done |
+| 7 — Hardening | deployment editor + backend, WASM tier, WebAuthn, key rotation, multi-controller, log retention | ongoing |
+| 8 — **External plugin ports** (open-ended) | every plugin that needs creds/external-services — see [plugin-inventory.md](docs/plugin-inventory.md) | queue; no ports started |
+| 9 — **Surface ports & native targets** (last phase) | 9a Tauri Desktop wrapper (same React bundle in a webview + OS notifications); 9b iOS / Android native (parallel component layer, Tamagui or similar) | queue |
 
 ## How to run what works today
 

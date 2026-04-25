@@ -400,6 +400,28 @@ export async function getEvalFlags(
     return apiFetch<EvalFlagsResponse>(path, {}, tokenAccessor);
 }
 
+// ---- /api/admin/plugins/ui_panels ---------------------------------
+
+export interface UiPanelSummary {
+    plugin_id: string;
+    mount: string;
+    entry: string;
+}
+
+export interface UiPanelListResponse {
+    panels: UiPanelSummary[];
+}
+
+export async function listUiPanels(
+    tokenAccessor: () => string | null,
+): Promise<UiPanelListResponse> {
+    return apiFetch<UiPanelListResponse>(
+        "/api/admin/plugins/ui_panels",
+        {},
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/audit ---------------------------------------------
 
 export interface AuditEntry {

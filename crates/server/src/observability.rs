@@ -62,11 +62,14 @@ pub struct LogsResponse {
     ),
     responses(
         (status = 200, description = "Filtered log entries"),
+        (status = 401, description = "Missing or invalid Authorization header"),
     ),
+    security(("bearer_jwt" = [])),
     tag = "observability"
 )]
 pub async fn logs_handler(
     State(state): State<AppState>,
+    _user: crate::auth_extract::AuthedUser,
     Query(q): Query<LogsQuery>,
 ) -> impl IntoResponse {
     let level = q.level.as_deref().and_then(|s| match s.to_ascii_lowercase().as_str() {
@@ -148,11 +151,14 @@ pub struct FlagsResponse {
     ),
     responses(
         (status = 200, description = "Eval-flag rows"),
+        (status = 401, description = "Missing or invalid Authorization header"),
     ),
+    security(("bearer_jwt" = [])),
     tag = "observability"
 )]
 pub async fn eval_flags_handler(
     State(state): State<AppState>,
+    _user: crate::auth_extract::AuthedUser,
     Query(q): Query<FlagsQuery>,
 ) -> impl IntoResponse {
     let store = EvalFlaggedStore::new(&state.db);
@@ -301,6 +307,71 @@ mod tests {
         let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         v["access_token"].as_str().unwrap().to_owned()
+    }
+
+    async fn read_json(
+        app: &axum::Router,
+        token: Option<&str>,
+        uri: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder().method(Method::GET).uri(uri);
+        if let Some(t) = token {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, v)
+    }
+
+    #[tokio::test]
+    async fn logs_endpoint_authn_then_empty_then_filtered() {
+        let app = build_router(test_app_state());
+        // 1. Auth gate.
+        let (status, _) = read_json(&app, None, "/api/admin/logs").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let token = setup_get_token(&app).await;
+        // 2. Fresh DB → empty entries.
+        let (status, body) =
+            read_json(&app, Some(&token), "/api/admin/logs").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["entries"].is_array());
+        assert_eq!(body["entries"].as_array().unwrap().len(), 0);
+        // 3. With a level filter, still 200, still empty.
+        let (status, body) =
+            read_json(&app, Some(&token), "/api/admin/logs?level=warn").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["entries"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn eval_flags_endpoint_authn_then_empty_then_filtered() {
+        let app = build_router(test_app_state());
+        let (status, _) = read_json(&app, None, "/api/admin/eval/flags").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let token = setup_get_token(&app).await;
+        let (status, body) =
+            read_json(&app, Some(&token), "/api/admin/eval/flags").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["flags"].is_array());
+        assert_eq!(body["flags"].as_array().unwrap().len(), 0);
+        // Label filter accepted; empty result.
+        let (status, body) = read_json(
+            &app,
+            Some(&token),
+            "/api/admin/eval/flags?label=regression",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["flags"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]

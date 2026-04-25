@@ -17,9 +17,11 @@ import {
     listMessages,
     listPendingApprovals,
     listThreads,
+    listUiPanels,
     patchThread,
     postMessage,
     respondApproval,
+    type UiPanelSummary,
 } from "../api/endpoints";
 import { WsClient, type WsEvent } from "../api/ws";
 import { useAuth } from "../auth/AuthContext";
@@ -55,6 +57,7 @@ export function Chat() {
     const auth = useAuth();
     const activeId = useChatState((s) => s.activeId);
     const [topError, setTopError] = useState<string | null>(null);
+    const [uiPanels, setUiPanels] = useState<UiPanelSummary[] | null>(null);
     const wsRef = useRef<WsClient | null>(null);
 
     // Chat shell fade: opacity-only on both ends. Login screen's
@@ -74,19 +77,21 @@ export function Chat() {
     // Stable accessor used by everything that needs the live access token.
     const getToken = useCallback(() => auth.getAccessToken(), [auth]);
 
-    // Initial + live thread list + pending approvals.
+    // Initial + live thread list + pending approvals + plugin UI panels.
     useEffect(() => {
         if (auth.status !== "authenticated") return;
         let cancelled = false;
         (async () => {
             try {
-                const [threadsResp, approvalsResp] = await Promise.all([
+                const [threadsResp, approvalsResp, panelsResp] = await Promise.all([
                     listThreads(getToken),
                     listPendingApprovals(getToken),
+                    listUiPanels(getToken),
                 ]);
                 if (!cancelled) {
                     setThreads(threadsResp.threads);
                     setPendingApprovals(approvalsResp.approvals);
+                    setUiPanels(panelsResp.panels);
                 }
             } catch (e) {
                 if (!cancelled)
@@ -238,7 +243,11 @@ export function Chat() {
 
     return (
         <div ref={shellRef} className="execlaw-shell">
-            <Sidebar onNewThread={onNewThread} onSignOut={handleSignOut} />
+            <Sidebar
+                    onNewThread={onNewThread}
+                    onSignOut={handleSignOut}
+                    uiPanels={uiPanels}
+                />
             <main className="execlaw-main">
                 {topError && (
                     <div

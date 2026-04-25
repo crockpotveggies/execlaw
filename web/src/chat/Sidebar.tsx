@@ -1,12 +1,16 @@
-// Sidebar: nav stubs + thread list + bottom user affordance.
+// Sidebar: brand + new-chat + nav (Tasks / Contacts / plugin UI panels)
+// + thread list with external-channel filter + bottom user affordance.
 //
-// Today the nav stubs (Tasks, Contacts, More) are visual placeholders;
-// each becomes a real route in Phase 6b/6c. The thread list is fully
-// wired: list comes from the chat store, click sets the active thread.
+// Per the locked Phase-6 layout (MIGRATION_PLAN §6/§8.2): controller
+// thread always shows pinned at top; an external-channel toggle
+// hides non-controller-DM threads when the user wants to focus on
+// personal chats; plugin-declared UI panels show under the "More"
+// section.
 
-import { type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
+import type { UiPanelSummary } from "../api/endpoints";
 import { setActiveThread, useChatState } from "./store";
 
 const CONTROLLER_THREAD_PREFIX = "controller-thread:";
@@ -19,12 +23,35 @@ interface SidebarProps {
      * a fade-out animation before dropping auth state.
      */
     onSignOut?: () => void;
+    /**
+     * Plugin-declared UI panels rendered under "More". Empty array
+     * when no plugins are installed; `null` while loading.
+     */
+    uiPanels?: UiPanelSummary[] | null;
 }
 
-export function Sidebar({ onNewThread, onSignOut }: SidebarProps) {
+export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
     const auth = useAuth();
     const threads = useChatState((s) => s.threads);
     const activeId = useChatState((s) => s.activeId);
+
+    const [hideExternal, setHideExternal] = useState(false);
+    const [moreExpanded, setMoreExpanded] = useState(false);
+
+    const visibleThreads = threads.filter((t) => {
+        // Always show pinned (Control thread).
+        if (t.is_pinned) return true;
+        // Always show the active one so it doesn't vanish on toggle.
+        if (t.conversation_id === activeId) return true;
+        if (!hideExternal) return true;
+        // hideExternal=true → show only ControllerDM-shaped threads.
+        return t.kind === "ControllerDM";
+    });
+    const externalCount = threads.filter(
+        (t) => !t.is_pinned && t.kind !== "ControllerDM",
+    ).length;
+
+    const panels = uiPanels ?? [];
 
     return (
         <aside className="execlaw-sidebar">
@@ -44,16 +71,78 @@ export function Sidebar({ onNewThread, onSignOut }: SidebarProps) {
             <nav className="execlaw-sidebar__nav">
                 <NavStub icon="bi-clipboard-check" label="Tasks" />
                 <NavStub icon="bi-people" label="Contacts" />
-                <NavStub icon="bi-three-dots" label="More" />
+                <button
+                    type="button"
+                    className="execlaw-thread-item w-100"
+                    onClick={() => setMoreExpanded((v) => !v)}
+                    aria-expanded={moreExpanded}
+                    data-testid="sidebar-more-toggle"
+                >
+                    <i
+                        className={
+                            "bi execlaw-muted execlaw-thread-item__icon " +
+                            (moreExpanded ? "bi-chevron-down" : "bi-three-dots")
+                        }
+                        aria-hidden
+                    />
+                    <span className="execlaw-thread-item__name">More</span>
+                    {panels.length > 0 && (
+                        <span className="execlaw-muted small">{panels.length}</span>
+                    )}
+                </button>
+                {moreExpanded && (
+                    <div className="ps-3" data-testid="sidebar-more-panels">
+                        {panels.length === 0 ? (
+                            <div className="execlaw-muted small px-2 py-1">
+                                No plugin panels installed.
+                            </div>
+                        ) : (
+                            panels.map((p) => (
+                                <Link
+                                    key={p.mount}
+                                    to={`/${p.mount}`}
+                                    className="execlaw-thread-item"
+                                    data-testid="sidebar-panel"
+                                >
+                                    <i
+                                        className="bi bi-puzzle execlaw-muted execlaw-thread-item__icon"
+                                        aria-hidden
+                                    />
+                                    <span className="execlaw-thread-item__name">
+                                        {p.plugin_id}
+                                    </span>
+                                </Link>
+                            ))
+                        )}
+                    </div>
+                )}
             </nav>
 
+            {externalCount > 0 && (
+                <div
+                    className="d-flex align-items-center gap-2 px-3 py-1 execlaw-muted small"
+                    data-testid="sidebar-external-toggle-row"
+                >
+                    <span className="flex-grow-1">Threads</span>
+                    <label className="d-flex align-items-center gap-1">
+                        <input
+                            type="checkbox"
+                            checked={hideExternal}
+                            onChange={(e) => setHideExternal(e.target.checked)}
+                            data-testid="sidebar-hide-external"
+                        />
+                        <span>Hide external ({externalCount})</span>
+                    </label>
+                </div>
+            )}
+
             <div className="execlaw-sidebar__threads" data-testid="sidebar-threads">
-                {threads.length === 0 ? (
+                {visibleThreads.length === 0 ? (
                     <div className="execlaw-muted small px-2 pt-2">
                         No threads yet. Start a new chat to begin.
                     </div>
                 ) : (
-                    threads.map((t) => {
+                    visibleThreads.map((t) => {
                         const isControl = t.conversation_id.startsWith(
                             CONTROLLER_THREAD_PREFIX,
                         );

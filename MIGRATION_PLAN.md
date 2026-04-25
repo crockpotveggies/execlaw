@@ -2193,32 +2193,30 @@ talks to the Rust server over **JWT-authenticated REST + WebSocket** —
 no shared state, no shared filesystem, no native API surface — so the
 same bundle ships everywhere.
 
-#### Stack
+#### Stack (as shipped)
 
-- **React Native** + **react-native-web** as the cross-platform component
-  layer.
-- **react-bootstrap** + **Bootstrap CSS** for visuals + responsive
-  breakpoints (works on react-native-web's DOM output and Tauri's
-  webview; iOS / Android need a parallel native layer when those
-  targets land — flagged for the Phase 6e+ port).
-- **Bootstrap Icons** (https://icons.getbootstrap.com/) for the icon
-  set. Subtle weight, monochrome, theme-color tinted.
-- **Vite** (web) / **Metro** (native) bundler.
-- **TanStack Query** for REST state, **Zustand** for the WS-driven
-  event store.
+- **React** (plain DOM, no react-native-web — see audit note below).
+- **react-bootstrap** + **Bootstrap CSS** + **Bootstrap Icons** for the
+  visual layer + responsive breakpoints. iOS / Android native targets
+  swap this for a parallel component layer (Phase 9b).
+- **Vite** bundler.
+- **GSAP** (`gsap` + `@gsap/react`) for screen transitions
+  (login → chat handoff, sign-out fade, etc.). Replaced an earlier
+  Reanimated 4 attempt that didn't composite cleanly with Vite +
+  react-native-web.
 - **Plugins are trusted** — UI panels load via dynamic ESM `import()`
   with no sandboxing per the 2026-04-25 decision. The plugin-install
   flow is gated by the controller's auth so anything that lands has
   been opted-in.
 - **Dark mode by default**; light/dark/system toggle in settings.
 
-#### Compile targets (this phase ships the first two)
+#### Compile targets (this phase ships the web SPA only)
 
 | Target | Path | Phase |
 |---|---|---|
-| Web SPA | react-native-web bundle served by the Rust server (rust-embed) | 6a — first |
-| Tauri Desktop | same react-native-web bundle in a Tauri webview | 6d — sub-phase |
-| iOS / Android native | react-native + native UI layer (parallel component lib) | post-Phase-6 |
+| Web SPA | React + Vite bundle served by the Rust server (rust-embed planned for 9a wrapper) | 6a — done |
+| Tauri Desktop | same React bundle in a Tauri webview + OS notifications | 9a — last phase |
+| iOS / Android native | React Native + parallel component layer (Tamagui or similar) | 9b — last phase |
 
 #### UX decisions (locked in 2026-04-25)
 
@@ -2320,9 +2318,9 @@ Note: the original Phase-6 stack called for `react-native-web` + Reanimated to s
 
 #### Out of scope for Phase 6
 
-- Voice UI (push-to-talk recorder + audio playback) — Phase 8 with the real audio plugins.
-- Tauri Desktop wrapper — moved to Phase 7 (hardening). The web bundle ships first; Tauri is one webview around it.
-- Native iOS / Android — post Phase 8, after a parallel component layer is chosen.
+- Voice UI (push-to-talk recorder + audio playback) — Phase 8 with the real audio plugins, plus the native-target half in Phase 9b.
+- Tauri Desktop wrapper — moved to **Phase 9a** (final-phase surface port). The web bundle ships first; Tauri is one webview around it.
+- Native iOS / Android — Phase 9b, requires a parallel component layer (Tamagui or similar) to replace react-bootstrap.
 
 - **Phase 6 demo (web only):** First-run hits `/api/ping → setup`,
   routes to the wizard, controller sets a password + sees the hardware
@@ -2334,10 +2332,6 @@ Note: the original Phase-6 stack called for `react-native-web` + Reanimated to s
 
 ### Phase 7 — Hardening (ongoing)
 
-- **Tauri Desktop wrapper** (formerly Phase 6d) — wraps the existing
-  React bundle in a Tauri webview, adds OS notifications for cold-
-  contact alerts. Same SPA, no parallel component layer; just a
-  packaged shell.
 - **Deployment editor** (UI + backend) — `config_runner_deployments`
   CRUD, GPU pinning, model-spec validation. Backend doesn't currently
   expose CRUD routes; Phase 7 lands them and the SPA editor together.
@@ -2422,6 +2416,22 @@ by the participant-aware model §2.6).
   Phase 8 has no single "complete" state — it closes when the
   inventory spreadsheet is fully green, and any post-launch
   third-party integration lands here too.
+
+### Phase 9 — Surface ports & native targets (last phase, open-ended)
+
+The shipping surface today is the React SPA served by the Rust
+control plane. Phase 9 wraps that same SPA in alternative shells +
+ports it to native UI runtimes. Each surface is independent and can
+land out of order.
+
+| Sub-phase | Scope | Notes |
+|---|---|---|
+| **9a** | **Tauri Desktop wrapper** — wrap the existing React + GSAP bundle in a Tauri webview, add OS notifications for cold-contact alerts + critical alert pop-ups. Same SPA, no parallel component layer. | Needs the Rust `tauri` toolchain installed and a `src-tauri/` crate; otherwise it just packages the existing `web/dist/` output. |
+| **9b** | **iOS / Android native** — the React SPA is web-only; native targets need a parallel component layer (Tamagui or similar) to replace react-bootstrap. Voice UI lives here too once the Phase-8 audio plugins are stable. | Largest scope of the phase. Requires choosing the cross-platform component lib + porting every chat / settings / approval-card view. |
+
+Phase 9 has no single end state; each surface ships when it's ready
+and the previous-phase backend / SPA work continues to drive every
+target.
 
 ---
 

@@ -136,4 +136,77 @@ describe("Sidebar", () => {
         fireEvent.click(screen.getByTestId("sidebar-new-thread"));
         expect(count).toBe(1);
     });
+
+    // ---- external-channel filter --------------------------------------
+
+    it("hide-external toggle filters out non-controller-DM threads", () => {
+        setThreads([
+            // ControllerDM — stays visible.
+            {
+                conversation_id: "ctrl",
+                kind: "ControllerDM",
+                phase: "idle",
+                trust_class: "Controller",
+                modality: "Text",
+                display_name: "Solo chat",
+                is_pinned: false,
+                is_ephemeral: false,
+                ephemeral_expires_at: null,
+                last_seq: 5,
+            },
+            // External — should be filtered when hide-external is on.
+            {
+                conversation_id: "ext-1",
+                kind: "ExternalWithOutsider",
+                phase: "idle",
+                trust_class: "KnownLimited",
+                modality: "Text",
+                display_name: "Outsider",
+                is_pinned: false,
+                is_ephemeral: false,
+                ephemeral_expires_at: null,
+                last_seq: 3,
+            },
+        ]);
+        rerender(<Sidebar onNewThread={() => {}} />);
+        // Toggle row only renders when at least one external thread exists.
+        expect(
+            screen.getByTestId("sidebar-external-toggle-row"),
+        ).toBeInTheDocument();
+        // Both threads visible by default.
+        expect(screen.getAllByTestId("sidebar-thread")).toHaveLength(2);
+
+        const toggle = screen.getByTestId(
+            "sidebar-hide-external",
+        ) as HTMLInputElement;
+        fireEvent.click(toggle);
+        expect(toggle.checked).toBe(true);
+        const after = screen.getAllByTestId("sidebar-thread");
+        expect(after).toHaveLength(1);
+        expect(after[0]).toHaveAttribute("data-thread-id", "ctrl");
+    });
+
+    // ---- plugin UI panels under "More" --------------------------------
+
+    it("expanding More reveals plugin UI panels when supplied", () => {
+        const panels = [
+            { plugin_id: "calendar", mount: "panels/calendar", entry: "ui.js" },
+            { plugin_id: "search", mount: "panels/search", entry: "ui.js" },
+        ];
+        rerender(<Sidebar onNewThread={() => {}} uiPanels={panels} />);
+        // Panels collapsed by default.
+        expect(screen.queryAllByTestId("sidebar-panel")).toHaveLength(0);
+        fireEvent.click(screen.getByTestId("sidebar-more-toggle"));
+        const links = screen.getAllByTestId("sidebar-panel");
+        expect(links).toHaveLength(2);
+        expect(links[0]).toHaveAttribute("href", "/panels/calendar");
+    });
+
+    it("More section shows the empty hint when no panels are installed", () => {
+        rerender(<Sidebar onNewThread={() => {}} uiPanels={[]} />);
+        fireEvent.click(screen.getByTestId("sidebar-more-toggle"));
+        expect(
+            screen.getByText(/no plugin panels installed/i),
+        ).toBeInTheDocument();
+    });
 });

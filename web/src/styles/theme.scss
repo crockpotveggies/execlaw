@@ -253,6 +253,33 @@ body {
         color: $text-muted;
         background-color: $bg-elev;
     }
+
+    &.is-clamped {
+        position: relative;
+        // Soft fade at the bottom of clamped messages cues that
+        // there's more content under the "Read more…" button.
+        mask-image: linear-gradient(
+            to bottom,
+            #000 60%,
+            rgba(0, 0, 0, 0.65) 100%
+        );
+        -webkit-mask-image: linear-gradient(
+            to bottom,
+            #000 60%,
+            rgba(0, 0, 0, 0.65) 100%
+        );
+    }
+}
+
+.execlaw-streaming-cursor {
+    display: inline-block;
+    margin-left: 0.25rem;
+    color: $accent;
+    animation: execlaw-cursor-blink 1.1s steps(2, end) infinite;
+}
+
+@keyframes execlaw-cursor-blink {
+    to { opacity: 0; }
 }
 
 // ---- Composer + approval card -------------------------------------
