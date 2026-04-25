@@ -8,8 +8,47 @@
 // mirrors the real Storage API closely enough for our auth tests.
 
 import "@testing-library/jest-dom/vitest";
-import { afterEach } from "vitest";
+import { afterEach, vi } from "vitest";
 import { cleanup } from "@testing-library/react";
+
+// Reanimated's native specs touch the TurboModule registry at import
+// time, which doesn't exist under jsdom. Stub the surface we use: the
+// `Animated.View` component, an `entering` prop pass-through, and the
+// `FadeInUp` builder. Real animation behavior is exercised in the
+// browser; tests only need the components to render their children.
+vi.mock("react-native-reanimated", () => {
+    const React = require("react") as typeof import("react");
+
+    const passthrough = (
+        tag: string,
+    ) =>
+        React.forwardRef<HTMLElement, Record<string, unknown>>(
+            ({ children, style: _style, entering: _e, ...rest }, ref) =>
+                React.createElement(tag, { ...rest, ref }, children as React.ReactNode),
+        );
+
+    const Animated = {
+        View: passthrough("div"),
+        Text: passthrough("span"),
+    };
+
+    const builder = () => ({
+        duration: () => builder(),
+        delay: () => builder(),
+        easing: () => builder(),
+    });
+
+    return {
+        default: Animated,
+        Easing: {
+            out: () => undefined,
+            cubic: undefined,
+        },
+        FadeInUp: builder(),
+        FadeIn: builder(),
+        FadeOut: builder(),
+    };
+});
 
 class MapStorage implements Storage {
     private map = new Map<string, string>();
