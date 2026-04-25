@@ -2217,9 +2217,9 @@ same bundle ships everywhere.
 
 | Target | Path | Phase |
 |---|---|---|
-| Web SPA | React + Vite bundle served by the Rust server (rust-embed planned for 9a wrapper) | 6a — done |
-| Tauri Desktop | same React bundle in a Tauri webview + OS notifications | 9a — last phase |
-| iOS / Android native | React Native + parallel component layer (Tamagui or similar) | 9b — last phase |
+| Web SPA | React + Vite bundle served by the Rust server (rust-embed planned for 10a wrapper) | 6a — done |
+| Tauri Desktop | same React bundle in a Tauri webview + OS notifications | 10a — last phase |
+| iOS / Android native | React Native + parallel component layer (Tamagui or similar) | 10b — last phase |
 
 #### UX decisions (locked in 2026-04-25)
 
@@ -2321,9 +2321,9 @@ Note: the original Phase-6 stack called for `react-native-web` + Reanimated to s
 
 #### Out of scope for Phase 6
 
-- Voice UI (push-to-talk recorder + audio playback) — Phase 8 with the real audio plugins, plus the native-target half in Phase 9b.
-- Tauri Desktop wrapper — moved to **Phase 9a** (final-phase surface port). The web bundle ships first; Tauri is one webview around it.
-- Native iOS / Android — Phase 9b, requires a parallel component layer (Tamagui or similar) to replace react-bootstrap.
+- Voice UI (push-to-talk recorder + audio playback) — Phase 9 with the real audio plugins, plus the native-target half in Phase 10b.
+- Tauri Desktop wrapper — moved to **Phase 10a** (final-phase surface port). The web bundle ships first; Tauri is one webview around it.
+- Native iOS / Android — Phase 10b, requires a parallel component layer (Tamagui or similar) to replace react-bootstrap.
 
 - **Phase 6 demo (web only):** First-run hits `/api/ping → setup`,
   routes to the wizard, controller sets a password + sees the hardware
@@ -2366,7 +2366,44 @@ deliberate planning.
 
 **Phase 7 is functionally complete** with 7e + JWT plumbing shipped. Remaining items are either dropped (above) or correctly classified as fluff / not warranted for a self-hosted single-operator appliance: rate-limiting on `/api/login` + `/api/token/refresh` (not internet-facing), HttpOnly cookies + CSRF tokens (same-origin SPA, no third-party JS), DR runbook doc (CLI + tests cover the actual work), PII redaction on log entries (retention sweeper IS the privacy control), and an active-sessions UI (the `count_for_user` primitive exists; surfacing it is Phase 8+ polish).
 
-### Phase 8 — External plugin ports (open-ended; runs in parallel once Phase 2-7 foundations hold)
+### Phase 8 — MCP client integration (in progress; inserted 2026-04-25)
+
+Lets the operator point execlaw at one or more existing MCP servers
+(github-mcp, slack-mcp, anything they already run) and have those
+tools surface in the runner's tool array alongside builtins + plugin
+tools. Unblocks several Phase-9 plugin ports because anything with an
+existing MCP server in the wild no longer needs a custom execlaw
+plugin.
+
+**Locked decisions (2026-04-25):**
+- Sampling (`sampling/createMessage`): refuse all. Treated as a
+  capability execlaw never grants. Reconsidered if a real use case
+  appears.
+- Resources + Prompts: tools + resources in scope. Resources surface
+  through the existing `memory` machinery so the runner can read
+  them as ordinary context. Prompts deferred.
+- Stdio sandboxing: trust the operator. Adding an stdio MCP server
+  is `execve` on operator-supplied input — same trust model as
+  installing a plugin.
+- HTTP auth: bearer + custom header, value resolved from the vault.
+  OAuth deferred until a port needs it.
+- Tool naming: prefix `mcp:<server_id>:<tool_name>` in the registry
+  AND in what the model sees. Disambiguates collisions across servers.
+- New tool default: inherits the server-level `default_allowed_classes`
+  policy on first appearance; per-tool overrides via Settings → Tools.
+- Trust-class semantics: the per-tool allowlist applies to ALL tools
+  in the registry, not just MCP. Generalised in Phase 8a.
+
+**Sub-phases:**
+
+| Sub-phase | Scope | Notes |
+|---|---|---|
+| **8a** | **Per-tool trust-class allowlist (foundation)** — `config_tool_access` table + `ToolAccessStore` + `ChainedToolDispatch` access gate + Settings → Tools page. | ✅ shipped 2026-04-25. |
+| **8b** | **`crates/mcp-client`** — minimal MCP client speaking JSON-RPC 2.0 over stdio + Streamable HTTP. Implements `initialize`, `tools/list`, `tools/call`, `resources/list`, `resources/read`, and the `notifications/tools/list_changed` handler. Refuses every `sampling/createMessage` request. | next |
+| **8c** | **`config_mcp_servers` + connection manager.** Migration adds the table; per-server tokio actor maintains a persistent connection with exponential-backoff reconnect; `tools/list` results reflected into `config_tool_access` rows with `mcp:<server>:<tool>` names; per-server `default_allowed_classes` honoured on first-sight. Vault-resolved auth secrets. | queued |
+| **8d** | **`McpDispatch` + Settings UI + e2e.** Third tier in `ChainedToolDispatch` routes prefixed tool names to the connection manager; Settings → MCP page CRUD-s servers with status indicator + test-connection; resources surface as memory-readable entries. End-to-end test against a mock MCP server. | queued |
+
+### Phase 9 — External plugin ports (open-ended; runs in parallel once Phase 2-8 foundations hold)
 
 Every remaining port of a selfhosted-claw integration lives here. This
 phase exists because each of these needs something execlaw's core
@@ -2439,7 +2476,7 @@ by the participant-aware model §2.6).
   inventory spreadsheet is fully green, and any post-launch
   third-party integration lands here too.
 
-### Phase 9 — Surface ports & native targets (last phase, open-ended)
+### Phase 10 — Surface ports & native targets (last phase, open-ended)
 
 The shipping surface today is the React SPA served by the Rust
 control plane. Phase 9 wraps that same SPA in alternative shells +
@@ -2448,10 +2485,10 @@ land out of order.
 
 | Sub-phase | Scope | Notes |
 |---|---|---|
-| **9a** | **Tauri Desktop wrapper** — wrap the existing React + GSAP bundle in a Tauri webview, add OS notifications for cold-contact alerts + critical alert pop-ups. Same SPA, no parallel component layer. | Needs the Rust `tauri` toolchain installed and a `src-tauri/` crate; otherwise it just packages the existing `web/dist/` output. |
-| **9b** | **iOS / Android native** — the React SPA is web-only; native targets need a parallel component layer (Tamagui or similar) to replace react-bootstrap. Voice UI lives here too once the Phase-8 audio plugins are stable. | Largest scope of the phase. Requires choosing the cross-platform component lib + porting every chat / settings / approval-card view. |
+| **10a** | **Tauri Desktop wrapper** — wrap the existing React + GSAP bundle in a Tauri webview, add OS notifications for cold-contact alerts + critical alert pop-ups. Same SPA, no parallel component layer. | Needs the Rust `tauri` toolchain installed and a `src-tauri/` crate; otherwise it just packages the existing `web/dist/` output. |
+| **10b** | **iOS / Android native** — the React SPA is web-only; native targets need a parallel component layer (Tamagui or similar) to replace react-bootstrap. Voice UI lives here too once the Phase-8 audio plugins are stable. | Largest scope of the phase. Requires choosing the cross-platform component lib + porting every chat / settings / approval-card view. |
 
-Phase 9 has no single end state; each surface ships when it's ready
+Phase 10 has no single end state; each surface ships when it's ready
 and the previous-phase backend / SPA work continues to drive every
 target.
 

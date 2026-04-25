@@ -1038,6 +1038,19 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     // Re-hydrate installed plugins from the DB so they survive restart.
     plugin_host.hydrate().await.map_err(|e| anyhow::anyhow!("plugin hydrate: {e}"))?;
 
+    // Phase 8a: reflect every built-in + persisted plugin tool into
+    // `config_tool_access` so the per-tool trust-class allowlist gate
+    // has a row for everything. Idempotent — operator policy from
+    // previous boots is preserved; only first-sight tools get the
+    // open default.
+    {
+        let now = chrono::Utc::now().timestamp();
+        match execlaw_server::tool_sync::sync_tool_access(&db, &plugin_host, now) {
+            Ok(n) => tracing::info!(rows_synced = n, "tool_access sync complete"),
+            Err(e) => tracing::warn!(error = %e, "tool_access sync failed; dispatch gate will fall back to allow until next sync"),
+        }
+    }
+
     // Phase 7e: build the WebAuthn relying-party from EXECLAW_WEBAUTHN_*
     // env vars. Falling back to localhost:3030 keeps local-dev working
     // out of the box; production must set these to the real public

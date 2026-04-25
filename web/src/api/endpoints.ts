@@ -712,6 +712,50 @@ export async function finishWebauthnLogin(
     );
 }
 
+// ---- /api/admin/tools (Phase 8a per-tool trust-class allowlist) ---
+
+export type ToolSource = "builtin" | "plugin" | "mcp";
+
+export interface ToolView {
+    tool_name: string;
+    source: ToolSource;
+    source_id: string | null;
+    enabled: boolean;
+    allowed_classes: string[];
+    description: string | null;
+    first_seen_at: number;
+    last_seen_at: number;
+    removed_at: number | null;
+}
+
+export interface ToolListResponse {
+    tools: ToolView[];
+}
+
+export interface UpdateToolPolicyRequest {
+    enabled: boolean;
+    /// Trust-class allowlist. Server rejects unknown strings with 400.
+    allowed_classes: string[];
+}
+
+export async function listTools(
+    tokenAccessor: () => string | null,
+): Promise<ToolListResponse> {
+    return apiFetch<ToolListResponse>("/api/admin/tools", {}, tokenAccessor);
+}
+
+export async function updateToolPolicy(
+    toolName: string,
+    body: UpdateToolPolicyRequest,
+    tokenAccessor: () => string | null,
+): Promise<ToolView> {
+    return apiFetch<ToolView>(
+        `/api/admin/tools/${encodeURIComponent(toolName)}`,
+        { method: "PATCH", body },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/audit ---------------------------------------------
 
 export interface AuditEntry {

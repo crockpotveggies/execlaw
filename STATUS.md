@@ -1,20 +1,29 @@
 # execlaw build STATUS
 
-Last update: 2026-04-25, after Phase 7 hardening — **JWT plumbing**: persistent refresh-token store + logout-everywhere + SPA silent retry + background refresh.
+Last update: 2026-04-25, after Phase 8a — **per-tool trust-class allowlist** generalized for builtin / plugin / MCP tools (foundation for 8b–d MCP integration).
 
 ## TL;DR
 
 - `cargo build --workspace` — **clean** (stub mode; webauthn-rs gated behind `--features webauthn` for the Linux/Docker production build)
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **455 passing, 0 failing** (+1: refresh-token sweeper run-loop)
-- `cargo bench --workspace --no-run` — **clean** (54 benches across 9 crates; +6 refresh_token_store benches)
-- `cd web && npm test` — **117 passing** (+4 vs 7e: silent-retry-on-401 paths)
-- `cd web && npm run build` — **clean** (315 KB JS / 311 KB CSS, both well under budget)
+- `cargo test --workspace --no-fail-fast` — **473 passing, 0 failing** (+18: 7 ToolAccessStore + 4 dispatch gate + 2 sync + 5 admin routes)
+- `cargo bench --workspace --no-run` — **clean** (59 benches across 9 crates; +5 tool_access_store)
+- `cd web && npm test` — **121 passing** (+4 vs 7-final: ToolsPage)
+- `cd web && npm run build` — **clean** (318 KB JS / 311 KB CSS, both well under budget)
 - **Zero cloud-SDK dependencies** anywhere in the workspace
 - **Phase 7 JWT hardening done.** Shipped: (a) **Migration 0008** + `state_refresh_tokens` table — refresh tokens now survive a server restart instead of silently signing every operator out; (b) **`RefreshTokenStore`** in core (issue / single-use consume / revoke_session / revoke_all_for_user / active_session_count / purge_expired + 8 unit tests including the persistence-survives-recreate invariant); (c) **`POST /api/logout/all`** endpoint + 2 server tests covering the multi-session revoke + the auth-required gate; (d) **SPA `apiFetch` silent auto-retry** — installs a `RefreshHook` on AuthContext mount that rotates tokens on a 401 and replays the original request once, with explicit guards against retry loops + caller-controlled tokens; (e) **Background refresh timer** — fires at 80% of the 15-min access-token TTL so the user never sees a 401-flash; (f) **"Sign out everywhere"** button on Settings → Profile that calls `/api/logout/all` + bounces to `/login`.
 - **Phase 7 sub-phase 7e (WebAuthn) done.** Shipped: (a) **Migration 0007** + `state_webauthn_credentials` table with per-user 10-credential cap + ON DELETE CASCADE on `users`; (b) **`WebauthnStore`** in core (insert / count_for_user / list_for_user / get / update_counter / delete_owned + 8 unit tests including ownership + cascade); (c) **`WebauthnSvc`** in server (relying-party config, register + authenticate ceremonies, 5-minute ceremony TTL with `prune_expired`, deterministic user-handle UUID); (d) **HTTP routes** for register begin/finish, list, delete, login finish — all audit-logged; (e) **/api/login second-factor branch** — when `count_for_user > 0`, returns the new `LoginOutcome::WebauthnChallenge` instead of tokens, fail-closed if the svc is missing; (f) **SPA**: `coerceCreationOptions`/`coerceRequestOptions`/`serializeCredential` browser helpers (base64url ↔ ArrayBuffer), Login screen handles the challenge (auto-prompts authenticator + retry button), Settings → Profile credential management.
 - **Build feature gate**: `webauthn-rs` pulls in `openssl-sys` which can't build out-of-the-box on Windows MSYS perl. The integration lives behind the `webauthn` feature on the server crate (default OFF) so the workspace `cargo build` works on every host. Production Docker build enables it explicitly. When the feature is OFF, every webauthn route returns 503 `webauthn_unconfigured`, registration is impossible, and the login branch never fires (because count_for_user always observes 0).
-- **Phase 7 functionally complete.** Wave 3 sub-phases 7d (WASM tier) and 7f (advanced subagents) explicitly dropped from Phase 7 scope on 2026-04-25 — see MIGRATION_PLAN.md §Phase 7 wave 3 for the rationale. WASM has no consumer in `docs/plugin-inventory.md` and the threat model doesn't justify the `wasmtime` weight; subagents are a feature, not hardening, and stay default-on in their current shape.
+- **Phase 7 complete; Phase 8a (per-tool trust-class allowlist) shipped.** New `config_tool_access` table holds one row per tool the runner might dispatch — builtins, plugin-supplied, and (Phase 8b+) MCP-server tools. The dispatch chain consults the row before any source handles the call: tools with the caller's `TrustLevel` not in `allowed_classes`, or `enabled = false`, or `removed_at != NULL`, are denied with a structured error. Operator policy is durable across server restarts and survives source resyncs (re-install / reconnect). Settings → Tools page lists every registered tool with per-row `enabled` toggle + per-class checkboxes; PATCH `/api/admin/tools/{tool_name}` is Controller-only and audit-logged.
+
+## Phase 8 — MCP client integration (in progress)
+
+| Sub-phase | Scope | Status |
+|---|---|---|
+| **8a** | Generalised per-tool trust-class allowlist (foundation) | ✅ shipped |
+| **8b** | `mcp-client` crate: stdio + Streamable HTTP transports, refuses sampling, list_tools / call_tool / list_resources / read_resource | next |
+| **8c** | `config_mcp_servers` + connection manager, reflects tools into `config_tool_access` with `mcp:<server>:<tool>` namespacing | queued |
+| **8d** | McpDispatch wired into `ChainedToolDispatch`, Settings → MCP page, e2e test against a mock server | queued |
 
 ## Migration-plan phase structure (post-2026-04-24 refactor)
 
@@ -24,12 +33,15 @@ Phase 2 used to conflate "plugin framework" with "port every selfhosted-claw int
 |---|---|---|
 | 0 — Foundation + local inference + GPU-aware deployment | foundation primitives, GET /api/admin/hardware, tracing JSONL to `~/.execlaw/logs/`, vault passphrase-file fallback | ✅ done (service plugins moved to Phase 8; setup wizard moved to Phase 6) |
 | 1 — Agent core with one transport (web chat) | HMAC event log, TurnExecutor, policy+capability on turn path, streaming SSE, `WakeupScheduler` (priority queue + Notify, sub-second), crash invariants | ✅ done (chat UI moved to Phase 6) |
-| 2 — **Plugin framework** (framework only — ports moved to Phase 8) | hook registry, subprocess tier, install route, lifecycle, dispatch bridge, capability enforcement | ✅ done |
+| 2 — **Plugin framework** (framework only — ports moved to Phase 9) | hook registry, subprocess tier, install route, lifecycle, dispatch bridge, capability enforcement | ✅ done |
 | 3 — Participants, trust, policy engine, Rule of Two | `PrincipalStore`, identity resolution (+ plugin dispatch), cold-contact flow, approval endpoint with every verb, spotlighting, planner/executor tool-strip, trust-class memory scoping | ✅ done |
-| 4 — Voice pipeline primitives (pure Rust; real-audio demos move to Phase 8) | two-lane graph, Vad/Audio/Stt/Tts traits + mocks, `VoiceSession` orchestrator, voice event schema wired to state_events, endpointer, barge-in | ✅ done |
+| 4 — Voice pipeline primitives (pure Rust; real-audio demos move to Phase 9) | two-lane graph, Vad/Audio/Stt/Tts traits + mocks, `VoiceSession` orchestrator, voice event schema wired to state_events, endpointer, barge-in | ✅ done |
 | 5 — Observability, evaluation, replay CLI (infra only) | tracing→SQLite layer, `GET /api/admin/logs`, `GET /api/admin/eval/flags`, `execlaw replay <conv> --at <seq>`, `execlaw eval flag/list`, eval-harness binary + rubric scaffolding | ✅ done (UI components for log viewer + dashboard land in Phase 6) |
 | 6 — UI port, chat-first landing | React + GSAP SPA: setup → login → chat (sidebar, thread list, streaming + cursor, channel-origin icons, long-msg truncation, external-channel filter, plugin UI panels) → settings (plugins/principals/hardware/logs/eval/audit), inline approval card with verbs, thread rename, incognito toggle, plugin install, trust revoke | ✅ done |
-| 7 — Hardening | wave 1 (deployment editor + key rotation + log retention) ✅, wave 2 (back-fill verifier + backup/restore + multi-controller users) ✅, wave 3 (WebAuthn second-factor + JWT plumbing) ✅. WASM tier and advanced subagents dropped from Phase 7 scope (see MIGRATION_PLAN.md). | functionally complete |
+| 7 — Hardening | wave 1 (deployment editor + key rotation + log retention) ✅, wave 2 (back-fill verifier + backup/restore + multi-controller users) ✅, wave 3 (WebAuthn second-factor + JWT plumbing) ✅. WASM tier and advanced subagents dropped from Phase 7 scope (see MIGRATION_PLAN.md). | complete |
+| 8 — MCP client integration | 8a per-tool trust-class allowlist ✅; 8b mcp-client crate, 8c connection manager + tool sync, 8d dispatch + Settings UI + e2e queued | in progress |
+| 9 — **External plugin ports** (open-ended) | every plugin that needs creds/external-services — see [plugin-inventory.md](docs/plugin-inventory.md) | queue; bumped from 8 by MCP insertion |
+| 10 — **Surface ports & native targets** (last phase) | 10a Tauri Desktop wrapper; 10b iOS / Android native | queue |
 | 8 — **External plugin ports** (open-ended) | every plugin that needs creds/external-services — see [plugin-inventory.md](docs/plugin-inventory.md) | queue; no ports started |
 | 9 — **Surface ports & native targets** (last phase) | 9a Tauri Desktop wrapper (same React bundle in a webview + OS notifications); 9b iOS / Android native (parallel component layer, Tamagui or similar) | queue |
 

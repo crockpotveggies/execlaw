@@ -28,6 +28,8 @@ pub mod plugins;
 pub mod routes;
 pub mod state;
 pub mod tool_dispatch;
+pub mod tool_sync;
+pub mod tools_admin;
 pub mod tracing_layer;
 pub mod users;
 pub mod webauthn;

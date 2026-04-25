@@ -105,6 +105,13 @@ impl PluginHost {
         &self.inner.stage_root
     }
 
+    /// Database handle the host was constructed with. Used by Phase-8a
+    /// callers (the `ChainedToolDispatch` access gate) that need to
+    /// read `config_tool_access` rows alongside dispatching tools.
+    pub fn db(&self) -> &Database {
+        &self.inner.db
+    }
+
     /// Install a plugin from an already-staged directory.
     ///
     /// The caller is expected to have staged the ZIP via

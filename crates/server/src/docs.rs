@@ -25,6 +25,7 @@ use crate::deployments::{
     CreateDeploymentRequest, DeploymentListResponse, DeploymentView,
     UpdateDeploymentRequest,
 };
+use crate::tools_admin::{ToolListResponse, ToolView, UpdateToolPolicyRequest};
 use crate::users::{InviteUserRequest, UserListResponse, UserView};
 use crate::plugins::{
     InstallResponse, PluginListResponse, PluginSummary, ToolSummary, UiPanelListResponse,
@@ -110,6 +111,9 @@ impl Modify for SecurityAddon {
         crate::users::list_handler,
         crate::users::invite_handler,
         crate::users::delete_handler,
+        // tools (Phase 8a per-tool trust-class allowlist)
+        crate::tools_admin::list_handler,
+        crate::tools_admin::update_handler,
     ),
     components(schemas(
         HealthResponse,
@@ -141,6 +145,9 @@ impl Modify for SecurityAddon {
         UserView,
         UserListResponse,
         InviteUserRequest,
+        ToolView,
+        ToolListResponse,
+        UpdateToolPolicyRequest,
     )),
     tags(
         (name = "meta", description = "Liveness + introspection"),
@@ -324,6 +331,8 @@ mod tests {
             ("/api/admin/users", &["get"]),
             ("/api/admin/users/invite", &["post"]),
             ("/api/admin/users/{user_id}", &["delete"]),
+            ("/api/admin/tools", &["get"]),
+            ("/api/admin/tools/{tool_name}", &["patch"]),
             ("/api/admin/approvals", &["get"]),
             ("/api/admin/approvals/{approval_id}/respond", &["post"]),
             ("/api/admin/principals", &["get"]),

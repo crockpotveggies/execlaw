@@ -234,6 +234,7 @@ pub async fn send_message(
             &req.text,
             req.sender_principal_id.clone(),
             caller_caps.clone(),
+            sender_trust,
         )
         .await
         {
@@ -529,6 +530,7 @@ async fn run_tool_capable_turn(
     user_text: &str,
     sender_principal_id: Option<String>,
     caller_caps: Vec<String>,
+    caller_trust: TrustLevel,
 ) -> Result<(i64, String, i64), String> {
     use execlaw_inference_api::ToolDeclaration;
     use execlaw_runner_local::turn::{TurnConfig, TurnExecutor};
@@ -547,10 +549,19 @@ async fn run_tool_capable_turn(
         })
         .collect();
 
-    let dispatch = Arc::new(crate::tool_dispatch::ChainedToolDispatch::new(
+    // Phase-8a: dispatch consults `config_tool_access` for every
+    // call, so a tool the operator has restricted to (say)
+    // Controller-only is denied for KnownTrusted callers BEFORE the
+    // builtin / plugin / MCP layer sees the args. The legacy `new`
+    // ctor with no trust-class + no DB stays available for tests
+    // that don't seed the gate; production goes through
+    // `with_access_gate`.
+    let dispatch = Arc::new(crate::tool_dispatch::ChainedToolDispatch::with_access_gate(
         state.plugin_host.clone(),
         caller_caps,
+        caller_trust,
         crate::tool_dispatch::NoBuiltinTools,
+        state.db.clone(),
     ));
     let exec = TurnExecutor::new((*inference).clone(), dispatch);
     let cfg = TurnConfig {

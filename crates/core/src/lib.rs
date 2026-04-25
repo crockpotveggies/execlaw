@@ -35,6 +35,7 @@ pub mod outbox;
 pub mod principal;
 pub mod refresh_tokens;
 pub mod research;
+pub mod tool_access;
 pub mod transport_conversations;
 pub mod transport_cursor;
 pub mod users;

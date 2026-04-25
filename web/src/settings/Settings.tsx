@@ -23,9 +23,11 @@ import { AuditPage } from "./AuditPage";
 import { DeploymentsPage } from "./DeploymentsPage";
 import { UsersPage } from "./UsersPage";
 import { ProfilePage } from "./ProfilePage";
+import { ToolsPage } from "./ToolsPage";
 
 const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     { to: "/settings/plugins", icon: "bi-plug", label: "Plugins" },
+    { to: "/settings/tools", icon: "bi-wrench-adjustable", label: "Tools" },
     { to: "/settings/deployments", icon: "bi-server", label: "Deployments" },
     { to: "/settings/users", icon: "bi-person-gear", label: "Users" },
     { to: "/settings/profile", icon: "bi-person-badge", label: "Profile" },
@@ -126,6 +128,7 @@ export function Settings() {
                             element={<Navigate to="plugins" replace />}
                         />
                         <Route path="plugins" element={<PluginsPage />} />
+                        <Route path="tools" element={<ToolsPage />} />
                         <Route path="deployments" element={<DeploymentsPage />} />
                         <Route path="users" element={<UsersPage />} />
                         <Route path="profile" element={<ProfilePage />} />

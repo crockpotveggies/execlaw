@@ -27,6 +27,7 @@ use execlaw_core::events::EventRecord as CoreEventRecord;
 use execlaw_core::outbox::{OutboxRow, OutboxStatus, OutboxStore};
 use execlaw_core::transport_conversations::{ConversationResolver, ResolveInput};
 use execlaw_core::refresh_tokens::RefreshTokenStore;
+use execlaw_core::tool_access::{ToolAccessSeed, ToolAccessStore, ToolSource};
 use execlaw_core::webauthn::{WebauthnCredentialRow, WebauthnStore};
 
 fn fresh_db() -> Database {
@@ -870,6 +871,78 @@ fn bench_refresh_token_store(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// ToolAccessStore — runs on EVERY tool dispatch via the chained
+// dispatch's pre-gate. Has to be tiny because the runner can issue
+// dozens of tool calls per turn.
+// ---------------------------------------------------------------------------
+
+fn bench_tool_access_store(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tool_access_store");
+
+    group.bench_function("get_hit", |b| {
+        let db = fresh_db();
+        let store = ToolAccessStore::new(&db);
+        store
+            .upsert_seen(
+                &ToolAccessSeed {
+                    tool_name: "read_memory".into(),
+                    source: ToolSource::Builtin,
+                    source_id: None,
+                    description: None,
+                    input_schema: None,
+                    default_allowed_classes: vec![
+                        "Controller".into(),
+                        "KnownTrusted".into(),
+                    ],
+                },
+                100,
+            )
+            .unwrap();
+        b.iter(|| {
+            let row = store.get(black_box("read_memory")).unwrap();
+            black_box(row);
+        });
+    });
+
+    group.bench_function("get_miss", |b| {
+        let db = fresh_db();
+        let store = ToolAccessStore::new(&db);
+        b.iter(|| {
+            let row = store.get(black_box("never_seen_tool")).unwrap();
+            black_box(row);
+        });
+    });
+
+    for n in [4usize, 32usize, 128usize].iter() {
+        group.bench_with_input(BenchmarkId::new("list_all", n), n, |b, &n| {
+            let db = fresh_db();
+            let store = ToolAccessStore::new(&db);
+            for i in 0..n {
+                store
+                    .upsert_seen(
+                        &ToolAccessSeed {
+                            tool_name: format!("tool-{i}"),
+                            source: ToolSource::Plugin,
+                            source_id: Some(format!("plugin-{}", i % 4)),
+                            description: None,
+                            input_schema: None,
+                            default_allowed_classes: vec!["Controller".into()],
+                        },
+                        100,
+                    )
+                    .unwrap();
+            }
+            b.iter(|| {
+                let rows = store.list_all().unwrap();
+                black_box(rows);
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_hmac,
@@ -888,5 +961,6 @@ criterion_group!(
     bench_deployment_store,
     bench_webauthn_store,
     bench_refresh_token_store,
+    bench_tool_access_store,
 );
 criterion_main!(benches);
