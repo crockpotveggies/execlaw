@@ -1073,6 +1073,15 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         let stop = sweep_stop.clone();
         tokio::spawn(async move { ephemeral_sweeper.run(stop).await });
     }
+    // Phase 7 hardening — keeps `state_refresh_tokens` from growing
+    // without bound. Expired rows are already rejected at consume
+    // time; this just trims the table on an hourly cadence.
+    let refresh_sweeper =
+        execlaw_core::refresh_tokens::RefreshTokenSweeper::new(db.clone());
+    {
+        let stop = sweep_stop.clone();
+        tokio::spawn(async move { refresh_sweeper.run(stop).await });
+    }
 
     let app = execlaw_server::routes::build_router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

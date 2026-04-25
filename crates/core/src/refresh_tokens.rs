@@ -20,6 +20,10 @@
 use crate::db::{Database, DbError};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Notify;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Minted from `consume` — the same shape the in-memory store
@@ -159,6 +163,77 @@ impl<'db> RefreshTokenStore<'db> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Periodic sweeper — drives `purge_expired` on a tokio interval.
+// Mirrors `LogRetentionSweeper` so operators reason about every
+// background sweeper with the same mental model.
+// ---------------------------------------------------------------------------
+
+/// Default sweep cadence. Hourly is plenty — refresh tokens are
+/// already rejected at consume time when expired, so the sweeper's
+/// only job is keeping `state_refresh_tokens` from growing without
+/// bound across many issue/expire cycles.
+pub const REFRESH_TOKEN_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Clone)]
+pub struct RefreshTokenSweeper {
+    db: Database,
+    interval: Duration,
+    kick: Arc<Notify>,
+}
+
+impl RefreshTokenSweeper {
+    pub fn new(db: Database) -> Self {
+        Self::with_interval(db, REFRESH_TOKEN_SWEEP_INTERVAL)
+    }
+
+    pub fn with_interval(db: Database, interval: Duration) -> Self {
+        Self {
+            db,
+            interval,
+            kick: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Force the run loop to sweep now. Coalesces — multiple kicks
+    /// while the loop is busy collapse into one extra sweep.
+    pub fn kick(&self) {
+        self.kick.notify_one();
+    }
+
+    /// Drive the sweep loop until `stop` is notified. Mirrors
+    /// `LogRetentionSweeper::run` for consistency.
+    pub async fn run(&self, stop: Arc<Notify>) {
+        info!(
+            interval_secs = self.interval.as_secs(),
+            "refresh-token sweeper running"
+        );
+        loop {
+            let tick = tokio::time::sleep(self.interval);
+            tokio::select! {
+                _ = tick => {}
+                _ = self.kick.notified() => {}
+                _ = stop.notified() => {
+                    info!("refresh-token sweeper stop received; draining once and exiting");
+                    let _ = self.sweep_now();
+                    return;
+                }
+            }
+            if let Err(e) = self.sweep_now() {
+                warn!(error = %e, "refresh-token sweep failed; will retry next tick");
+            }
+        }
+    }
+
+    fn sweep_now(&self) -> Result<usize, DbError> {
+        let n = RefreshTokenStore::new(&self.db).purge_expired()?;
+        if n > 0 {
+            debug!(rows = n, "refresh-token sweep");
+        }
+        Ok(n)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +339,33 @@ mod tests {
         let db = fresh_db();
         let store = RefreshTokenStore::new(&db);
         assert!(store.consume("not-a-real-token").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sweeper_run_loop_purges_then_stops_on_signal() {
+        let db = fresh_db();
+        let store = RefreshTokenStore::new(&db);
+        let _expired = store.issue("u", "s", -10).unwrap();
+        let live = store.issue("u", "s", 3600).unwrap();
+
+        let sweeper = RefreshTokenSweeper::with_interval(
+            db.clone(),
+            Duration::from_millis(20),
+        );
+        let stop = Arc::new(Notify::new());
+        let stop_clone = stop.clone();
+        let sweeper_clone = sweeper.clone();
+        let handle = tokio::spawn(async move { sweeper_clone.run(stop_clone).await });
+
+        sweeper.kick();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        stop.notify_one();
+        handle.await.unwrap();
+
+        // The expired row is gone; the live token still consumes.
+        assert!(
+            store.consume(&live).unwrap().is_some(),
+            "live token must survive the sweeper",
+        );
     }
 }

@@ -1405,7 +1405,7 @@ The Controller is a single principal with a single `PrincipalId` that can have *
 1. Operator opens the web UI for the first time; it presents a **setup screen** before anything else.
 2. Operator sets an **admin password** (Argon2id hashed, stored in `vault_*`).
 3. Control plane generates the Controller's `PrincipalId` + an Ed25519 signing keypair (private key stored in the vault).
-4. A first JWT session is issued; SPA stores the access token in memory + a refresh token in an `HttpOnly` + `Secure` + `SameSite=Strict` cookie.
+4. A first JWT session is issued. SPA stores both tokens in `localStorage` and mirrors the access token in an in-memory ref for the apiFetch hot path. Cookie-based + CSRF-token storage was considered and explicitly dropped: the SPA is same-origin (rust-embed serves the bundle), there's no third-party JS in the page, the threat model doesn't include a cooperating XSS vector that localStorage solves but in-memory doesn't, and the extra moving parts aren't worth the complexity.
 
 **Authentication (ongoing):**
 - **Login** = admin-password POST → control plane verifies Argon2 hash → issues short-lived **JWT access token** (~15 min, signed with Ed25519) + **refresh token** (~7 days, rotated on use).
@@ -1600,8 +1600,8 @@ The primary interface is a **single-page application** whose **look and feel is 
 
 - **First time the UI opens** → setup screen: operator enters an admin password (Argon2id hashed, stored in vault).
 - Control plane generates the Controller `PrincipalId` + Ed25519 signing keypair (§7.1).
-- Login returns a **short-lived JWT access token** (~15m) stored in SPA memory + a **refresh token** (~7d) in `HttpOnly` + `Secure` + `SameSite=Strict` cookie.
-- SPA calls `/api/token/refresh` on near-expiry, single-flight.
+- Login returns a **short-lived JWT access token** (~15m) + a **refresh token** (~7d, single-use rotation, persisted server-side in `state_refresh_tokens`). SPA holds both in `localStorage`; access token is mirrored in an in-memory ref for the hot path. No HttpOnly cookies, no CSRF tokens — same-origin SPA, no third-party JS, not worth the extra moving parts.
+- SPA calls `/api/token/refresh` on near-expiry (background timer at 80% of TTL) AND silently retries once on a mid-action 401, both coalesced behind one in-flight promise.
 - Subsequent visits: login form; successful login → chat landing.
 - **Additional Controller identifiers** (Signal / email / phone) registered from Admin → Settings → My Identities with per-channel verification (§7.1).
 

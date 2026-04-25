@@ -38,16 +38,27 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY spec ./spec
 
-# Build the CLI binary with SQLCipher + vendored OpenSSL enabled.
-# `--no-default-features -F execlaw-core/sqlcipher` disables the
-# `bundled-sqlite-plain` default (dev-only fallback) and turns on the
-# SQLCipher path so the production image ships an encrypted DB by
-# default. No cloud SDKs in any feature — see `crates/*/Cargo.toml`
-# for the invariant.
+# Build the CLI binary with SQLCipher + vendored OpenSSL enabled,
+# plus WebAuthn second-factor support compiled in (Phase 7e).
+#
+# * `--no-default-features` drops the `bundled-sqlite-plain` dev
+#   fallback so the production image ships SQLCipher.
+# * `-F execlaw-core/sqlcipher` turns on the encrypted-DB path.
+# * `-F execlaw-server/webauthn` wires the `webauthn-rs` relying
+#   party into the server (off by default because `openssl-sys`
+#   doesn't build out of the box on Windows-host dev machines, but
+#   the production Linux image always has perl + libssl-dev). With
+#   this off, every `/api/admin/webauthn/*` and `/api/login/webauthn/*`
+#   route returns 503; turning it on is what makes Phase 7e land in
+#   production.
+#
+# No cloud SDKs in any feature — see `crates/*/Cargo.toml` for the
+# invariant.
 ENV CARGO_TERM_COLOR=always
 RUN cargo build --release --bin execlaw \
         --no-default-features \
-        -F execlaw-core/sqlcipher
+        -F execlaw-core/sqlcipher \
+        -F execlaw-server/webauthn
 
 # Strip is already on in the workspace release profile, but be defensive
 # against a future profile change.

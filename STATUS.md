@@ -6,7 +6,7 @@ Last update: 2026-04-25, after Phase 7 hardening — **JWT plumbing**: persisten
 
 - `cargo build --workspace` — **clean** (stub mode; webauthn-rs gated behind `--features webauthn` for the Linux/Docker production build)
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **454 passing, 0 failing** (+13 vs 7e: 8 refresh_tokens core + 2 logout-all routes + 3 RefreshStore wrapper invariants)
+- `cargo test --workspace --no-fail-fast` — **455 passing, 0 failing** (+1: refresh-token sweeper run-loop)
 - `cargo bench --workspace --no-run` — **clean** (54 benches across 9 crates; +6 refresh_token_store benches)
 - `cd web && npm test` — **117 passing** (+4 vs 7e: silent-retry-on-401 paths)
 - `cd web && npm run build` — **clean** (315 KB JS / 311 KB CSS, both well under budget)
@@ -280,7 +280,7 @@ execlaw-web (vitest)     117     api/client (incl. silent-retry on 401:
 | Login second-factor branch (fail-closed) | `crates/server/src/routes.rs::login` |
 | Login screen passkey flow | `web/src/routes/Login.tsx` + `web/src/auth/webauthn.ts` |
 | Settings → Profile passkey management | `web/src/settings/ProfilePage.tsx` |
-| Persistent refresh tokens (SQLite) | `crates/core/src/refresh_tokens.rs` |
+| Persistent refresh tokens (SQLite) + sweeper | `crates/core/src/refresh_tokens.rs` |
 | RefreshStore wrapper (server) | `crates/server/src/auth.rs::RefreshStore` |
 | /api/logout/all (sign-out-everywhere) | `crates/server/src/routes.rs::logout_all` |
 | SPA silent retry hook | `web/src/api/client.ts::setRefreshHook` |
