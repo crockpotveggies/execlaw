@@ -1,27 +1,25 @@
-// Settings → Login (Phase 8.6).
+// Settings → User (Phase 8.7 rename + section reorder).
 //
-// Consolidated security/auth page that replaces the previous
-// "Profile" + "Users" tabs. Sections, top-to-bottom:
+// Consolidated security / auth / account page. Sections,
+// top-to-bottom:
 //
-//   1. **Your password** — change-password form. Requires the
+//   1. **Operator accounts** — Controllers see the multi-user list
+//      with invite / delete + per-row password reset. Non-
+//      Controllers see a read-only view.
+//   2. **Your password** — change-password form. Requires the
 //      current password as proof of identity; rejected by the
 //      server if the new one is < 8 chars.
-//   2. **Passkeys** — list / add / remove WebAuthn credentials.
-//      Same machinery as the old Profile page; the login route
-//      falls back to password-only when count_for_user = 0.
-//   3. **Sessions** — Sign out everywhere. Revokes every refresh
+//   3. **Passkeys** — list / add / remove WebAuthn credentials.
+//      Stub-mode notice when the server build doesn't include the
+//      `webauthn` feature (Windows-host dev binary, etc.).
+//   4. **Sessions** — Sign out everywhere. Revokes every refresh
 //      token bound to the caller's user_id.
-//   4. **Operator accounts** — Controllers see the multi-user list
-//      with invite / delete + per-row password reset. Non-
-//      Controllers see a read-only view of the list.
-//
-// The page deliberately bundles every "how do I sign in" knob in
-// one place so the operator doesn't have to hunt across tabs.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
+import { ApiError } from "../api/client";
 import {
     beginWebauthnRegistration,
     changeMyPassword,
@@ -59,7 +57,7 @@ const EMPTY_INVITE: InviteFormState = {
     email: "",
 };
 
-export function LoginPage() {
+export function UserPage() {
     const auth = useAuth();
     const navigate = useNavigate();
     const getToken = useCallback(() => auth.getAccessToken(), [auth]);
@@ -69,26 +67,26 @@ export function LoginPage() {
     const canMutate = meRole === "controller";
 
     return (
-        <div data-testid="settings-login">
+        <div data-testid="settings-user">
             <div className="d-flex align-items-center mb-3">
-                <h3 className="h6 mb-0 flex-grow-1">Login</h3>
+                <h3 className="h6 mb-0 flex-grow-1">User</h3>
             </div>
             <p className="execlaw-muted small mb-3">
-                Everything that controls how you (and other operators)
-                sign in: your password, your passkeys, active sessions,
-                and the operator-account roster.
+                Operator accounts, your password, your passkeys, and
+                active sessions — everything that controls how you (and
+                other operators) sign in.
             </p>
 
+            <OperatorsCard
+                getToken={getToken}
+                canMutate={canMutate}
+                meId={meId}
+            />
             <ChangePasswordCard getToken={getToken} />
             <PasskeysCard getToken={getToken} />
             <SessionsCard
                 signOutEverywhere={auth.signOutEverywhere}
                 navigate={navigate}
-            />
-            <OperatorsCard
-                getToken={getToken}
-                canMutate={canMutate}
-                meId={meId}
             />
         </div>
     );
@@ -139,7 +137,7 @@ function ChangePasswordCard({ getToken }: { getToken: () => string | null }) {
     );
 
     return (
-        <div className="execlaw-card mb-3" data-testid="login-password-card">
+        <div className="execlaw-card mb-3" data-testid="user-password-card">
             <div className="execlaw-card__title mb-2">
                 <i className="bi bi-shield-lock me-2" aria-hidden />
                 Your password
@@ -171,7 +169,7 @@ function ChangePasswordCard({ getToken }: { getToken: () => string | null }) {
                             autoComplete="current-password"
                             onChange={(e) => setCurrent(e.target.value)}
                             disabled={busy}
-                            data-testid="login-password-current"
+                            data-testid="user-password-current"
                         />
                     </Form.Group>
                 </div>
@@ -186,7 +184,7 @@ function ChangePasswordCard({ getToken }: { getToken: () => string | null }) {
                             autoComplete="new-password"
                             onChange={(e) => setNext(e.target.value)}
                             disabled={busy}
-                            data-testid="login-password-new"
+                            data-testid="user-password-new"
                         />
                     </Form.Group>
                     <Form.Group className="col-sm-6">
@@ -199,7 +197,7 @@ function ChangePasswordCard({ getToken }: { getToken: () => string | null }) {
                             autoComplete="new-password"
                             onChange={(e) => setConfirm(e.target.value)}
                             disabled={busy}
-                            data-testid="login-password-confirm"
+                            data-testid="user-password-confirm"
                         />
                     </Form.Group>
                 </div>
@@ -213,7 +211,7 @@ function ChangePasswordCard({ getToken }: { getToken: () => string | null }) {
                             next.length === 0 ||
                             confirm.length === 0
                         }
-                        data-testid="login-password-submit"
+                        data-testid="user-password-submit"
                     >
                         Update password
                     </Button>
@@ -227,9 +225,22 @@ function ChangePasswordCard({ getToken }: { getToken: () => string | null }) {
 // 2. Passkeys
 // ---------------------------------------------------------------------------
 
+// Detect "the server build doesn't include webauthn" via the
+// structured server code that the stub-mode router emits. Looking at
+// the message text was fragile — the message is "the server was built
+// without webauthn support," which doesn't contain the literal token
+// "webauthn_unconfigured". Use ApiError.serverCode instead.
+function isWebauthnUnconfigured(e: unknown): boolean {
+    return (
+        e instanceof ApiError &&
+        (e.serverCode === "webauthn_unconfigured" || e.status === 503)
+    );
+}
+
 function PasskeysCard({ getToken }: { getToken: () => string | null }) {
     const [creds, setCreds] = useState<WebauthnCredentialView[] | null>(null);
     const [error, setError] = useState<string | null>(null);
+    const [unsupported, setUnsupported] = useState(false);
     const [busy, setBusy] = useState(false);
     const [label, setLabel] = useState("");
 
@@ -237,15 +248,12 @@ function PasskeysCard({ getToken }: { getToken: () => string | null }) {
         try {
             const r = await listWebauthnCredentials(getToken);
             setCreds(r.credentials);
+            setUnsupported(false);
             setError(null);
         } catch (e) {
-            // Server built without the webauthn feature surfaces 503;
-            // that's an empty list with a hint, not a hard error.
-            if (
-                e instanceof Error &&
-                /webauthn[_ ]unconfigured/i.test(e.message)
-            ) {
+            if (isWebauthnUnconfigured(e)) {
                 setCreds([]);
+                setUnsupported(true);
                 setError(null);
                 return;
             }
@@ -285,7 +293,12 @@ function PasskeysCard({ getToken }: { getToken: () => string | null }) {
             setLabel("");
             await refresh();
         } catch (e) {
-            setError(e instanceof Error ? e.message : String(e));
+            if (isWebauthnUnconfigured(e)) {
+                setUnsupported(true);
+                setError(null);
+            } else {
+                setError(e instanceof Error ? e.message : String(e));
+            }
         } finally {
             setBusy(false);
         }
@@ -310,7 +323,7 @@ function PasskeysCard({ getToken }: { getToken: () => string | null }) {
     );
 
     return (
-        <div className="execlaw-card mb-3" data-testid="login-passkeys-card">
+        <div className="execlaw-card mb-3" data-testid="user-passkeys-card">
             <div className="execlaw-card__title mb-2">
                 <i className="bi bi-key me-2" aria-hidden />
                 Passkeys (WebAuthn)
@@ -320,6 +333,27 @@ function PasskeysCard({ getToken }: { getToken: () => string | null }) {
                 second factor. Sign-in still requires your password —
                 the passkey is checked after.
             </p>
+            {unsupported && (
+                <div
+                    className="execlaw-card mb-3"
+                    role="status"
+                    data-testid="user-passkeys-unsupported"
+                    style={{ background: "rgba(255,193,7,0.07)" }}
+                >
+                    <strong>Passkeys aren't enabled in this build.</strong>
+                    <div className="execlaw-muted small mt-1">
+                        The server you're connected to was built without the{" "}
+                        <code>webauthn</code> Cargo feature — usually because
+                        this is a Windows-host dev binary where{" "}
+                        <code>openssl-sys</code> can't compile out of the
+                        box. The production Docker image (Linux) builds with
+                        the feature on. Test the passkey flow there, or
+                        rebuild the dev binary with{" "}
+                        <code>--features webauthn</code> on a host with
+                        OpenSSL headers available.
+                    </div>
+                </div>
+            )}
             {error && (
                 <div className="execlaw-error-banner mb-3" role="alert">
                     {error}
@@ -330,14 +364,14 @@ function PasskeysCard({ getToken }: { getToken: () => string | null }) {
                     value={label}
                     onChange={(e) => setLabel(e.target.value)}
                     placeholder="Label this passkey (e.g. YubiKey 5C)"
-                    disabled={busy}
-                    data-testid="login-passkey-label"
+                    disabled={busy || unsupported}
+                    data-testid="user-passkey-label"
                 />
                 <Button
                     variant="primary"
-                    disabled={busy || label.trim().length === 0}
+                    disabled={busy || unsupported || label.trim().length === 0}
                     onClick={() => void onAdd()}
-                    data-testid="login-passkey-add"
+                    data-testid="user-passkey-add"
                 >
                     Add passkey
                 </Button>
@@ -355,7 +389,7 @@ function PasskeysCard({ getToken }: { getToken: () => string | null }) {
                         <li
                             key={c.credential_id}
                             className="d-flex align-items-center py-2 border-top"
-                            data-testid="login-passkey-row"
+                            data-testid="user-passkey-row"
                             data-credential-id={c.credential_id}
                         >
                             <div className="flex-grow-1">
@@ -376,7 +410,7 @@ function PasskeysCard({ getToken }: { getToken: () => string | null }) {
                                 size="sm"
                                 variant="outline-danger"
                                 onClick={() => void onDelete(c)}
-                                data-testid="login-passkey-remove"
+                                data-testid="user-passkey-remove"
                             >
                                 Remove
                             </Button>
@@ -422,7 +456,7 @@ function SessionsCard({
     }, [signOutEverywhere, navigate]);
 
     return (
-        <div className="execlaw-card mb-3" data-testid="login-sessions-card">
+        <div className="execlaw-card mb-3" data-testid="user-sessions-card">
             <div className="execlaw-card__title mb-2">
                 <i className="bi bi-box-arrow-right me-2" aria-hidden />
                 Sessions
@@ -438,7 +472,7 @@ function SessionsCard({
                 variant="outline-danger"
                 disabled={busy}
                 onClick={() => void onSignOutAll()}
-                data-testid="login-sign-out-everywhere"
+                data-testid="user-sign-out-everywhere"
             >
                 Sign out everywhere
             </Button>
@@ -558,7 +592,7 @@ function OperatorsCard({
     const roles = useMemo(() => ROLES, []);
 
     return (
-        <div className="execlaw-card mb-3" data-testid="login-operators-card">
+        <div className="execlaw-card mb-3" data-testid="user-operators-card">
             <div className="d-flex align-items-center mb-2">
                 <div className="execlaw-card__title flex-grow-1">
                     <i className="bi bi-person-gear me-2" aria-hidden />
@@ -573,7 +607,7 @@ function OperatorsCard({
                             setInviteError(null);
                             setInviteForm(EMPTY_INVITE);
                         }}
-                        data-testid="login-invite"
+                        data-testid="user-invite"
                     >
                         <i className="bi bi-person-plus me-2" aria-hidden />
                         Invite user
@@ -597,7 +631,7 @@ function OperatorsCard({
                 <Form
                     className="mb-3"
                     onSubmit={onInvite}
-                    data-testid="login-invite-form"
+                    data-testid="user-invite-form"
                 >
                     {inviteError && (
                         <div className="execlaw-error-banner mb-2" role="alert">
@@ -619,7 +653,7 @@ function OperatorsCard({
                                 }
                                 spellCheck={false}
                                 autoCapitalize="none"
-                                data-testid="login-invite-username"
+                                data-testid="user-invite-username"
                             />
                         </Form.Group>
                         <Form.Group className="col-sm-4">
@@ -648,7 +682,7 @@ function OperatorsCard({
                                         role: e.target.value as UserRole,
                                     })
                                 }
-                                data-testid="login-invite-role"
+                                data-testid="user-invite-role"
                             >
                                 {roles.map((r) => (
                                     <option key={r} value={r}>
@@ -670,7 +704,7 @@ function OperatorsCard({
                                         initial_password: e.target.value,
                                     })
                                 }
-                                data-testid="login-invite-password"
+                                data-testid="user-invite-password"
                             />
                             <Form.Text className="execlaw-muted">
                                 At least 8 characters. They can rotate it from
@@ -697,7 +731,7 @@ function OperatorsCard({
                         <Button
                             type="submit"
                             variant="primary"
-                            data-testid="login-invite-submit"
+                            data-testid="user-invite-submit"
                         >
                             Invite
                         </Button>
@@ -720,7 +754,7 @@ function OperatorsCard({
                         <div
                             key={u.user_id}
                             className="d-flex align-items-center py-2 border-top"
-                            data-testid="login-user-row"
+                            data-testid="user-user-row"
                             data-user-id={u.user_id}
                         >
                             <div className="flex-grow-1">
@@ -763,7 +797,7 @@ function OperatorsCard({
                                             setResetPassword("");
                                             setResetError(null);
                                         }}
-                                        data-testid="login-reset-password"
+                                        data-testid="user-reset-password"
                                     >
                                         Reset password
                                     </Button>
@@ -772,7 +806,7 @@ function OperatorsCard({
                                         variant="outline-danger"
                                         disabled={busyId === u.user_id}
                                         onClick={() => void onDelete(u)}
-                                        data-testid="login-user-delete"
+                                        data-testid="user-user-delete"
                                     >
                                         Remove
                                     </Button>
@@ -787,7 +821,7 @@ function OperatorsCard({
                 <Form
                     className="mt-3 pt-2 border-top"
                     onSubmit={onSubmitReset}
-                    data-testid="login-reset-form"
+                    data-testid="user-reset-form"
                 >
                     <div className="execlaw-muted small mb-2">
                         Resetting password for{" "}
@@ -810,7 +844,7 @@ function OperatorsCard({
                                 value={resetPassword}
                                 onChange={(e) => setResetPassword(e.target.value)}
                                 autoComplete="new-password"
-                                data-testid="login-reset-password-input"
+                                data-testid="user-reset-password-input"
                             />
                         </Form.Group>
                     </div>
@@ -818,7 +852,7 @@ function OperatorsCard({
                         <Button
                             type="submit"
                             variant="primary"
-                            data-testid="login-reset-submit"
+                            data-testid="user-reset-submit"
                         >
                             Set new password
                         </Button>

@@ -20,15 +20,17 @@ import { EvalFlagsPage } from "./EvalFlagsPage";
 import { PrincipalsPage } from "./PrincipalsPage";
 import { AuditPage } from "./AuditPage";
 import { BackendsPage } from "./BackendsPage";
-import { LoginPage } from "./LoginPage";
+import { UserPage } from "./UserPage";
 import { ToolsPage } from "./ToolsPage";
 import { McpServersPage } from "./McpServersPage";
 import { RunnersPage } from "./RunnersPage";
 
 const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
-    // Login first — combines password / passkeys / sessions / operator
-    // accounts into one place. Replaces the old Profile + Users tabs.
-    { to: "/settings/login", icon: "bi-shield-lock", label: "Login" },
+    // User first — operator accounts, password, passkeys, sessions.
+    // Singular "User" because it's the page about *your* account
+    // (other operators are listed inside it for Controllers). Was
+    // briefly called "Login" but that read as the sign-in screen.
+    { to: "/settings/user", icon: "bi-person-circle", label: "User" },
     { to: "/settings/plugins", icon: "bi-plug", label: "Plugins" },
     { to: "/settings/tools", icon: "bi-wrench-adjustable", label: "Tools" },
     { to: "/settings/mcp", icon: "bi-broadcast", label: "MCP" },
@@ -128,9 +130,9 @@ export function Settings() {
                     <Routes>
                         <Route
                             index
-                            element={<Navigate to="login" replace />}
+                            element={<Navigate to="user" replace />}
                         />
-                        <Route path="login" element={<LoginPage />} />
+                        <Route path="user" element={<UserPage />} />
                         <Route path="plugins" element={<PluginsPage />} />
                         <Route path="tools" element={<ToolsPage />} />
                         <Route path="mcp" element={<McpServersPage />} />
@@ -140,14 +142,18 @@ export function Settings() {
                         <Route path="logs" element={<LogsPage />} />
                         <Route path="eval" element={<EvalFlagsPage />} />
                         <Route path="audit" element={<AuditPage />} />
-                        {/* Legacy paths fall back to /settings/login. */}
+                        {/* Legacy paths fall back to /settings/user. */}
+                        <Route
+                            path="login"
+                            element={<Navigate to="../user" replace />}
+                        />
                         <Route
                             path="profile"
-                            element={<Navigate to="../login" replace />}
+                            element={<Navigate to="../user" replace />}
                         />
                         <Route
                             path="users"
-                            element={<Navigate to="../login" replace />}
+                            element={<Navigate to="../user" replace />}
                         />
                         <Route
                             path="hardware"

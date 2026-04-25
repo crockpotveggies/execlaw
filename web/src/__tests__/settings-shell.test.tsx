@@ -96,23 +96,23 @@ afterEach(() => {
 });
 
 describe("Settings shell", () => {
-    it("/settings redirects to login (the new index)", async () => {
-        // Login section makes calls to /api/admin/users +
+    it("/settings redirects to user (the new index)", async () => {
+        // User page makes calls to /api/admin/users +
         // /api/admin/webauthn/credentials; the default mock returns
         // empty lists for both via the catch-all branch.
         mountAt("/settings");
         await waitFor(() => {
-            expect(screen.getByTestId("settings-login")).toBeInTheDocument();
+            expect(screen.getByTestId("settings-user")).toBeInTheDocument();
         });
     });
 
-    it("renders the post-Phase-8.6 tab set", async () => {
+    it("renders the post-Phase-8.7 tab set", async () => {
         mountAt("/settings/plugins");
         await waitFor(() => {
             expect(screen.getByTestId("settings-plugins")).toBeInTheDocument();
         });
         for (const label of [
-            "Login",
+            "User",
             "Plugins",
             "Backends",
             "Principals",
@@ -130,9 +130,16 @@ describe("Settings shell", () => {
         expect(
             screen.queryByRole("link", { name: /Profile/i }),
         ).toBeNull();
-        expect(
-            screen.queryByRole("link", { name: /Users/i }),
-        ).toBeNull();
+        // "Login" used to be the consolidated tab name; ensure it's
+        // not lingering after the Phase-8.7 rename. We can't simply
+        // queryByRole({ name: /Login/ }) — that would match the
+        // "Login" subdir of /settings/login if the legacy redirect
+        // is configured as a Route. The redirect is via Navigate so
+        // there's no link with that label in the rendered tab bar.
+        const tabLinks = screen.getAllByRole("link");
+        const labels = tabLinks.map((a) => a.textContent?.trim() ?? "");
+        expect(labels).not.toContain("Login");
+        expect(labels).not.toContain("Users");
     });
 
     it("clicking Backends loads the Backends pane (with the inline Hardware section)", async () => {

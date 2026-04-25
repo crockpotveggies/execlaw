@@ -1,12 +1,13 @@
-// Tests for the consolidated Settings → Login page (Phase 8.6).
+// Tests for Settings → User (Phase 8.7 rename of the consolidated
+// Login page).
 //
-// Covers the four sections: change password, passkeys, sessions,
-// operator accounts.
+// Covers the four sections: operator accounts, change password,
+// passkeys, sessions.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { LoginPage } from "../settings/LoginPage";
+import { UserPage } from "../settings/UserPage";
 import { AuthProvider } from "../auth/AuthContext";
 
 let fetchMock: ReturnType<typeof vi.fn>;
@@ -28,7 +29,7 @@ function mountPage() {
     return render(
         <MemoryRouter>
             <AuthProvider>
-                <LoginPage />
+                <UserPage />
             </AuthProvider>
         </MemoryRouter>,
     );
@@ -46,7 +47,7 @@ afterEach(() => {
     vi.restoreAllMocks();
 });
 
-describe("LoginPage — change password section", () => {
+describe("UserPage — change password section", () => {
     it("rejects mismatched confirmation locally without calling the API", async () => {
         const calls: Array<{ url: string; init?: RequestInit }> = [];
         fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
@@ -65,19 +66,19 @@ describe("LoginPage — change password section", () => {
         mountPage();
         await waitFor(() => {
             expect(
-                screen.getByTestId("login-password-card"),
+                screen.getByTestId("user-password-card"),
             ).toBeInTheDocument();
         });
-        fireEvent.change(screen.getByTestId("login-password-current"), {
+        fireEvent.change(screen.getByTestId("user-password-current"), {
             target: { value: "current" },
         });
-        fireEvent.change(screen.getByTestId("login-password-new"), {
+        fireEvent.change(screen.getByTestId("user-password-new"), {
             target: { value: "longer-than-8" },
         });
-        fireEvent.change(screen.getByTestId("login-password-confirm"), {
+        fireEvent.change(screen.getByTestId("user-password-confirm"), {
             target: { value: "different" },
         });
-        fireEvent.click(screen.getByTestId("login-password-submit"));
+        fireEvent.click(screen.getByTestId("user-password-submit"));
         await waitFor(() => {
             expect(
                 screen.getByText(/don't match/i),
@@ -112,19 +113,19 @@ describe("LoginPage — change password section", () => {
         mountPage();
         await waitFor(() => {
             expect(
-                screen.getByTestId("login-password-card"),
+                screen.getByTestId("user-password-card"),
             ).toBeInTheDocument();
         });
-        fireEvent.change(screen.getByTestId("login-password-current"), {
+        fireEvent.change(screen.getByTestId("user-password-current"), {
             target: { value: "hunter2-longer" },
         });
-        fireEvent.change(screen.getByTestId("login-password-new"), {
+        fireEvent.change(screen.getByTestId("user-password-new"), {
             target: { value: "newer-passphrase-1" },
         });
-        fireEvent.change(screen.getByTestId("login-password-confirm"), {
+        fireEvent.change(screen.getByTestId("user-password-confirm"), {
             target: { value: "newer-passphrase-1" },
         });
-        fireEvent.click(screen.getByTestId("login-password-submit"));
+        fireEvent.click(screen.getByTestId("user-password-submit"));
         await waitFor(() => {
             expect(
                 calls.some(
@@ -145,7 +146,7 @@ describe("LoginPage — change password section", () => {
     });
 });
 
-describe("LoginPage — operator accounts section", () => {
+describe("UserPage — operator accounts section", () => {
     it("renders the user list with a 'you' marker on the current user", async () => {
         fetchMock.mockImplementation(async (url: string) => {
             if (url === "/api/admin/me") return meResponse();
@@ -183,7 +184,7 @@ describe("LoginPage — operator accounts section", () => {
         });
         mountPage();
         await waitFor(() => {
-            expect(screen.getAllByTestId("login-user-row")).toHaveLength(2);
+            expect(screen.getAllByTestId("user-user-row")).toHaveLength(2);
         });
         expect(screen.getByText("you")).toBeInTheDocument();
     });
@@ -239,14 +240,14 @@ describe("LoginPage — operator accounts section", () => {
         });
         mountPage();
         await waitFor(() => {
-            expect(screen.getAllByTestId("login-user-row")).toHaveLength(2);
+            expect(screen.getAllByTestId("user-user-row")).toHaveLength(2);
         });
         // Click the operator row's Reset password button.
-        fireEvent.click(screen.getByTestId("login-reset-password"));
-        fireEvent.change(screen.getByTestId("login-reset-password-input"), {
+        fireEvent.click(screen.getByTestId("user-reset-password"));
+        fireEvent.change(screen.getByTestId("user-reset-password-input"), {
             target: { value: "operator-pass-2" },
         });
-        fireEvent.click(screen.getByTestId("login-reset-submit"));
+        fireEvent.click(screen.getByTestId("user-reset-submit"));
         await waitFor(() => {
             expect(
                 calls.some(
@@ -293,15 +294,15 @@ describe("LoginPage — operator accounts section", () => {
         });
         mountPage();
         await waitFor(() => {
-            expect(screen.getAllByTestId("login-user-row")).toHaveLength(1);
+            expect(screen.getAllByTestId("user-user-row")).toHaveLength(1);
         });
-        expect(screen.queryByTestId("login-invite")).toBeNull();
-        expect(screen.queryByTestId("login-user-delete")).toBeNull();
-        expect(screen.queryByTestId("login-reset-password")).toBeNull();
+        expect(screen.queryByTestId("user-invite")).toBeNull();
+        expect(screen.queryByTestId("user-user-delete")).toBeNull();
+        expect(screen.queryByTestId("user-reset-password")).toBeNull();
     });
 });
 
-describe("LoginPage — sessions section", () => {
+describe("UserPage — sessions section", () => {
     it("renders a Sign-out-everywhere button", async () => {
         fetchMock.mockImplementation(async (url: string) => {
             if (url === "/api/admin/me") return meResponse();
@@ -318,7 +319,7 @@ describe("LoginPage — sessions section", () => {
         mountPage();
         await waitFor(() => {
             expect(
-                screen.getByTestId("login-sign-out-everywhere"),
+                screen.getByTestId("user-sign-out-everywhere"),
             ).toBeInTheDocument();
         });
     });

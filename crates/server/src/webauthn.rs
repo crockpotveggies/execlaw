@@ -712,12 +712,43 @@ mod imp {
         Err(webauthn_unconfigured())
     }
 
+    /// Stub handler that returns the structured 503 every webauthn
+    /// route emits when the feature is off. Lets the SPA detect the
+    /// state by `serverCode === "webauthn_unconfigured"` instead of
+    /// hitting a generic 404 from "this URL doesn't exist."
+    async fn unconfigured_handler() -> ApiError {
+        webauthn_unconfigured()
+    }
+
     pub fn webauthn_router() -> Router<AppState> {
-        // Empty router — no webauthn routes registered when the
-        // feature is off. The login route's branch never fires
-        // because count_for_user always returns 0 (registration is
-        // impossible without /register/begin).
+        // Even with the `webauthn` feature off we register the SAME
+        // paths so the SPA gets a structured 503 it can recognise
+        // (rather than a 404 that's indistinguishable from a typo).
+        // The login route's branch never fires anyway because
+        // count_for_user always returns 0 — registration is
+        // impossible without these handlers actually doing anything.
+        use axum::routing::{delete, get, post};
         Router::new()
+            .route(
+                "/api/admin/webauthn/register/begin",
+                post(unconfigured_handler),
+            )
+            .route(
+                "/api/admin/webauthn/register/finish",
+                post(unconfigured_handler),
+            )
+            .route(
+                "/api/admin/webauthn/credentials",
+                get(unconfigured_handler),
+            )
+            .route(
+                "/api/admin/webauthn/credentials/{credential_id}",
+                delete(unconfigured_handler),
+            )
+            .route(
+                "/api/login/webauthn/finish",
+                post(unconfigured_handler),
+            )
     }
 }
 
