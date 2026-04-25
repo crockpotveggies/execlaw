@@ -34,7 +34,7 @@ use crate::capability::issue_capability_token;
 use crate::events::UiEvent;
 use crate::state::AppState;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct SendMessageRequest {
     pub text: String,
     /// Optional override — defaults to the controller's principal id.
@@ -76,6 +76,20 @@ pub struct ListQuery {
 }
 
 /// `POST /api/chats/:id/messages`
+#[utoipa::path(
+    post,
+    path = "/api/chats/{conversation_id}/messages",
+    params(
+        ("conversation_id" = String, Path, description = "Target conversation id"),
+    ),
+    responses(
+        (status = 200, description = "Turn committed; assistant reply attached"),
+        (status = 202, description = "Cold-contact path: awaiting controller approval"),
+        (status = 400, description = "Empty text"),
+        (status = 403, description = "Sender is Blocked"),
+    ),
+    tag = "chats"
+)]
 pub async fn send_message(
     State(state): State<AppState>,
     Path(conversation_id): Path<String>,
@@ -799,6 +813,19 @@ fn event_log(state: &AppState) -> EventLog<'_> {
 }
 
 /// `GET /api/chats/:id/messages?before=0&limit=200`
+#[utoipa::path(
+    get,
+    path = "/api/chats/{conversation_id}/messages",
+    params(
+        ("conversation_id" = String, Path, description = "Target conversation id"),
+        ("before" = Option<i64>, Query, description = "Return events with seq > this value (default 0)"),
+        ("limit" = Option<i64>, Query, description = "Max messages to return (1..=1000, default 200)"),
+    ),
+    responses(
+        (status = 200, description = "Ordered list of messages"),
+    ),
+    tag = "chats"
+)]
 pub async fn list_messages(
     State(state): State<AppState>,
     Path(conversation_id): Path<String>,
@@ -856,13 +883,14 @@ pub async fn list_messages(
 ///
 /// Auth-gated. The single-controller setup means we don't role-check
 /// further here — `AuthedUser` is sufficient.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct PatchThreadRequest {
     /// `Some(Some(name))` to set, `Some(None)` to clear, `None` to skip.
     /// Serde maps both `"display_name": null` and a missing field to
     /// `None`; we distinguish via a custom `#[serde(default,
     /// deserialize_with)]` shim so the operator can clear the name.
     #[serde(default, deserialize_with = "deserialize_optional_field")]
+    #[schema(value_type = Option<String>)]
     pub display_name: Option<Option<String>>,
     pub is_pinned: Option<bool>,
     /// When `Some(true)` AND `ephemeral_expires_at` is set, marks the
@@ -895,6 +923,19 @@ pub struct PatchThreadResponse {
 }
 
 /// `PATCH /api/chats/{conversation_id}` handler.
+#[utoipa::path(
+    patch,
+    path = "/api/chats/{conversation_id}",
+    params(
+        ("conversation_id" = String, Path, description = "Target conversation id"),
+    ),
+    responses(
+        (status = 200, description = "Updated thread metadata snapshot"),
+        (status = 401, description = "Missing or invalid Authorization header"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "chats"
+)]
 pub async fn patch_thread(
     State(state): State<AppState>,
     _user: crate::auth_extract::AuthedUser,
@@ -1615,6 +1656,7 @@ required_capabilities = []
     /// the inserted controller's `principal_id`.
     async fn setup_and_get_token(app: &axum::Router) -> String {
         let body = serde_json::to_vec(&serde_json::json!({
+            "username": "tester",
             "admin_password": "hunter2-longer",
             "display_name": "Tester",
         }))

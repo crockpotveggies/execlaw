@@ -26,7 +26,7 @@ use serde::Serialize;
 use std::io::Cursor;
 use std::path::PathBuf;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct PluginSummary {
     pub plugin_id: String,
     pub version: String,
@@ -35,18 +35,18 @@ pub struct PluginSummary {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct PluginListResponse {
     pub plugins: Vec<PluginSummary>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct InstallResponse {
     pub plugin_id: String,
     pub version: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ToolSummary {
     pub name: String,
     pub plugin_id: String,
@@ -57,6 +57,17 @@ pub struct ToolSummary {
 /// `POST /api/admin/plugins/install` — accepts a ZIP file in the
 /// request body. Phase 2 uses raw `application/zip` bytes; switching
 /// to multipart lands when the React upload form does.
+#[utoipa::path(
+    post,
+    path = "/api/admin/plugins/install",
+    request_body(content_type = "application/zip", description = "Plugin ZIP archive"),
+    responses(
+        (status = 200, description = "Installed", body = InstallResponse),
+        (status = 400, description = "Invalid ZIP / manifest"),
+        (status = 409, description = "Plugin already installed"),
+    ),
+    tag = "plugins"
+)]
 pub async fn install_handler(
     State(state): State<AppState>,
     body: Bytes,
@@ -141,6 +152,14 @@ pub async fn install_handler(
 }
 
 /// `GET /api/admin/plugins`
+#[utoipa::path(
+    get,
+    path = "/api/admin/plugins",
+    responses(
+        (status = 200, description = "Installed plugin list", body = PluginListResponse),
+    ),
+    tag = "plugins"
+)]
 pub async fn list_handler(State(state): State<AppState>) -> impl IntoResponse {
     match state.plugin_host.list_rows() {
         Ok(rows) => {
@@ -165,6 +184,18 @@ pub async fn list_handler(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// `POST /api/admin/plugins/:id/enable`
+#[utoipa::path(
+    post,
+    path = "/api/admin/plugins/{plugin_id}/enable",
+    params(
+        ("plugin_id" = String, Path, description = "Installed plugin id"),
+    ),
+    responses(
+        (status = 200, description = "Plugin re-enabled"),
+        (status = 404, description = "Plugin not installed"),
+    ),
+    tag = "plugins"
+)]
 pub async fn enable_handler(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
@@ -176,6 +207,18 @@ pub async fn enable_handler(
 }
 
 /// `POST /api/admin/plugins/:id/disable`
+#[utoipa::path(
+    post,
+    path = "/api/admin/plugins/{plugin_id}/disable",
+    params(
+        ("plugin_id" = String, Path, description = "Installed plugin id"),
+    ),
+    responses(
+        (status = 200, description = "Plugin disabled"),
+        (status = 404, description = "Plugin not installed"),
+    ),
+    tag = "plugins"
+)]
 pub async fn disable_handler(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
@@ -187,6 +230,18 @@ pub async fn disable_handler(
 }
 
 /// `DELETE /api/admin/plugins/:id`
+#[utoipa::path(
+    delete,
+    path = "/api/admin/plugins/{plugin_id}",
+    params(
+        ("plugin_id" = String, Path, description = "Installed plugin id"),
+    ),
+    responses(
+        (status = 200, description = "Plugin uninstalled"),
+        (status = 404, description = "Plugin not installed"),
+    ),
+    tag = "plugins"
+)]
 pub async fn uninstall_handler(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
@@ -198,6 +253,14 @@ pub async fn uninstall_handler(
 }
 
 /// `GET /api/admin/plugins/tools` — union of all live plugin tools.
+#[utoipa::path(
+    get,
+    path = "/api/admin/plugins/tools",
+    responses(
+        (status = 200, description = "Every plugin-contributed tool the agent can call"),
+    ),
+    tag = "plugins"
+)]
 pub async fn list_tools_handler(State(state): State<AppState>) -> impl IntoResponse {
     let tools: Vec<ToolSummary> = state
         .plugin_host
@@ -219,7 +282,7 @@ pub async fn list_tools_handler(State(state): State<AppState>) -> impl IntoRespo
 }
 
 /// One sidebar-nav entry the SPA renders under `⋯ More`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct UiPanelSummary {
     pub plugin_id: String,
     /// URL path segment the SPA mounts the panel at, e.g.
@@ -231,7 +294,7 @@ pub struct UiPanelSummary {
     pub entry: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct UiPanelListResponse {
     pub panels: Vec<UiPanelSummary>,
 }
@@ -242,6 +305,14 @@ pub struct UiPanelListResponse {
 ///
 /// Trusted-plugin model: the SPA loads `entry` via dynamic ESM import
 /// with no sandboxing. Install was already gated by controller auth.
+#[utoipa::path(
+    get,
+    path = "/api/admin/plugins/ui_panels",
+    responses(
+        (status = 200, description = "Sidebar panel manifests, sorted by mount path", body = UiPanelListResponse),
+    ),
+    tag = "plugins"
+)]
 pub async fn list_ui_panels_handler(State(state): State<AppState>) -> impl IntoResponse {
     let mut panels: Vec<UiPanelSummary> = state
         .plugin_host

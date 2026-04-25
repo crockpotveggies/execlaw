@@ -17,24 +17,76 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use utoipa::OpenApi;
 
-use crate::routes::{
-    GenericOk, HealthResponse, LoginRequest, LoginResponse, LogoutRequest, RefreshRequest,
-    RefreshResponse, SetupRequest, SetupResponse,
+use crate::plugins::{
+    InstallResponse, PluginListResponse, PluginSummary, ToolSummary, UiPanelListResponse,
+    UiPanelSummary,
 };
+use crate::routes::{
+    GenericOk, HealthResponse, LoginRequest, LoginResponse, LogoutRequest, MeResponse,
+    RefreshRequest, RefreshResponse, SetupRequest, SetupResponse,
+};
+use utoipa::Modify;
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+
+/// Adds the Bearer-JWT security scheme used by `[security(("bearer_jwt" = []))]`
+/// annotations on auth-gated routes.
+struct SecurityAddon;
+
+impl Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi.components.as_mut().expect("components present");
+        components.add_security_scheme(
+            "bearer_jwt",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .bearer_format("JWT")
+                    .description(Some(
+                        "Access token obtained from /api/login or /api/setup. \
+                         Header: `Authorization: Bearer <token>`.",
+                    ))
+                    .build(),
+            ),
+        );
+    }
+}
 
 #[derive(OpenApi)]
 #[openapi(
     info(
         title = "execlaw",
         version = "0.1.0",
-        description = "Self-hosted Rust agent framework. Phase 0 surface.",
+        description = "Self-hosted Rust agent framework. Phase 6a surface.",
     ),
+    modifiers(&SecurityAddon),
     paths(
+        // meta + auth
         crate::routes::health,
+        crate::routes::ping,
         crate::routes::setup,
         crate::routes::login,
         crate::routes::refresh,
         crate::routes::logout,
+        crate::routes::admin_me,
+        crate::routes::admin_hardware,
+        // chats
+        crate::chats::send_message,
+        crate::chats::list_messages,
+        crate::chats::patch_thread,
+        // plugins
+        crate::plugins::list_handler,
+        crate::plugins::install_handler,
+        crate::plugins::list_tools_handler,
+        crate::plugins::list_ui_panels_handler,
+        crate::plugins::enable_handler,
+        crate::plugins::disable_handler,
+        crate::plugins::uninstall_handler,
+        // observability
+        crate::observability::logs_handler,
+        crate::observability::eval_flags_handler,
+        // approvals
+        crate::approvals::respond_handler,
+        crate::approvals::revoke_handler,
     ),
     components(schemas(
         HealthResponse,
@@ -46,10 +98,22 @@ use crate::routes::{
         RefreshResponse,
         LogoutRequest,
         GenericOk,
+        MeResponse,
+        PluginSummary,
+        PluginListResponse,
+        InstallResponse,
+        ToolSummary,
+        UiPanelSummary,
+        UiPanelListResponse,
     )),
     tags(
         (name = "meta", description = "Liveness + introspection"),
-        (name = "auth", description = "First-run setup, login, token management"),
+        (name = "auth", description = "First-run setup, login, token management, current-user profile"),
+        (name = "admin", description = "Hardware + runtime introspection"),
+        (name = "chats", description = "Conversations + thread metadata"),
+        (name = "plugins", description = "Install, enable/disable, uninstall, tool + panel listings"),
+        (name = "observability", description = "Logs + eval flags"),
+        (name = "approvals", description = "Approval verbs + trust revocation"),
     )
 )]
 pub struct ApiDoc;
@@ -184,6 +248,68 @@ mod tests {
         assert!(v["paths"]["/api/login"].is_object());
         assert!(v["paths"]["/api/token/refresh"].is_object());
         assert!(v["paths"]["/api/logout"].is_object());
+    }
+
+    /// Coverage guard: every REST route the SPA depends on (and every
+    /// route the controller may need to introspect) MUST appear in the
+    /// OpenAPI spec. Adding a route without a `#[utoipa::path]` is now
+    /// a test failure — keeps the spec in sync without code review.
+    ///
+    /// `/api/stream` is intentionally excluded: it's a WebSocket
+    /// endpoint and lives in the AsyncAPI spec instead.
+    #[test]
+    fn openapi_covers_every_rest_route() {
+        let v: serde_json::Value = serde_json::from_str(&openapi_json_string()).unwrap();
+        let expected: &[(&str, &[&str])] = &[
+            ("/api/health", &["get"]),
+            ("/api/ping", &["get"]),
+            ("/api/setup", &["post"]),
+            ("/api/login", &["post"]),
+            ("/api/token/refresh", &["post"]),
+            ("/api/logout", &["post"]),
+            ("/api/admin/me", &["get"]),
+            ("/api/admin/hardware", &["get"]),
+            ("/api/chats/{conversation_id}/messages", &["get", "post"]),
+            ("/api/chats/{conversation_id}", &["patch"]),
+            ("/api/admin/plugins", &["get"]),
+            ("/api/admin/plugins/install", &["post"]),
+            ("/api/admin/plugins/tools", &["get"]),
+            ("/api/admin/plugins/ui_panels", &["get"]),
+            ("/api/admin/plugins/{plugin_id}/enable", &["post"]),
+            ("/api/admin/plugins/{plugin_id}/disable", &["post"]),
+            ("/api/admin/plugins/{plugin_id}", &["delete"]),
+            ("/api/admin/logs", &["get"]),
+            ("/api/admin/eval/flags", &["get"]),
+            ("/api/admin/approvals/{approval_id}/respond", &["post"]),
+            ("/api/admin/principals/{principal_id}/revoke", &["post"]),
+        ];
+        for (path, methods) in expected {
+            let entry = &v["paths"][path];
+            assert!(
+                entry.is_object(),
+                "OpenAPI spec missing path {path}; remember to add #[utoipa::path] + register in ApiDoc"
+            );
+            for m in *methods {
+                assert!(
+                    entry[m].is_object(),
+                    "OpenAPI spec missing {} on {path}",
+                    m.to_uppercase()
+                );
+            }
+        }
+    }
+
+    /// The Bearer-JWT security scheme must be defined so Swagger UI
+    /// renders the "Authorize" button. Drift here would silently
+    /// break the docs page even when individual paths look fine.
+    #[test]
+    fn openapi_declares_bearer_jwt_security_scheme() {
+        let v: serde_json::Value = serde_json::from_str(&openapi_json_string()).unwrap();
+        let bearer = &v["components"]["securitySchemes"]["bearer_jwt"];
+        assert!(bearer.is_object(), "bearer_jwt scheme not declared");
+        assert_eq!(bearer["type"], "http");
+        assert_eq!(bearer["scheme"], "bearer");
+        assert_eq!(bearer["bearerFormat"], "JWT");
     }
 
     #[test]

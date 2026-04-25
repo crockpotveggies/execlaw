@@ -20,19 +20,36 @@ import { postSetup } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
 
 interface FieldErrors {
+    username?: string;
     display_name?: string;
     admin_password?: string;
     email?: string;
 }
 
 const PASSWORD_MIN_LEN = 8;
+const USERNAME_MIN_LEN = 3;
+const USERNAME_MAX_LEN = 32;
+const USERNAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
 
 export function validateSetupForm(input: {
+    username: string;
     display_name: string;
     admin_password: string;
     email: string;
 }): FieldErrors {
     const errors: FieldErrors = {};
+
+    const trimmedUsername = input.username.trim();
+    if (trimmedUsername.length === 0) {
+        errors.username = "Required.";
+    } else if (trimmedUsername.length < USERNAME_MIN_LEN) {
+        errors.username = `Must be at least ${USERNAME_MIN_LEN} characters.`;
+    } else if (trimmedUsername.length > USERNAME_MAX_LEN) {
+        errors.username = `Must be at most ${USERNAME_MAX_LEN} characters.`;
+    } else if (!USERNAME_PATTERN.test(trimmedUsername)) {
+        errors.username = "Letters, digits, underscore, hyphen only.";
+    }
+
     if (input.display_name.trim().length === 0) {
         errors.display_name = "Required.";
     }
@@ -54,6 +71,7 @@ export function SetupWizard() {
     const auth = useAuth();
     const navigate = useNavigate();
 
+    const [username, setUsername] = useState("");
     const [displayName, setDisplayName] = useState("");
     const [password, setPassword] = useState("");
     const [email, setEmail] = useState("");
@@ -70,6 +88,7 @@ export function SetupWizard() {
         e.preventDefault();
         setSubmitError(null);
         const fieldErrs = validateSetupForm({
+            username,
             display_name: displayName,
             admin_password: password,
             email,
@@ -81,6 +100,7 @@ export function SetupWizard() {
         try {
             const trimmedEmail = email.trim();
             const resp = await postSetup({
+                username: username.trim(),
                 admin_password: password,
                 display_name: displayName.trim(),
                 ...(trimmedEmail.length > 0 ? { email: trimmedEmail } : {}),
@@ -122,6 +142,27 @@ export function SetupWizard() {
                 )}
 
                 <Form noValidate onSubmit={onSubmit}>
+                    <Form.Group className="mb-3" controlId="setup-username">
+                        <Form.Label>Username</Form.Label>
+                        <Form.Control
+                            type="text"
+                            autoComplete="username"
+                            value={username}
+                            onChange={(e) => setUsername(e.target.value)}
+                            isInvalid={!!errors.username}
+                            disabled={submitting}
+                            autoFocus
+                            spellCheck={false}
+                            autoCapitalize="none"
+                        />
+                        <Form.Control.Feedback type="invalid">
+                            {errors.username}
+                        </Form.Control.Feedback>
+                        <Form.Text className="execlaw-muted">
+                            Used to sign in. Letters, digits, underscore, hyphen.
+                        </Form.Text>
+                    </Form.Group>
+
                     <Form.Group className="mb-3" controlId="setup-display-name">
                         <Form.Label>Display name</Form.Label>
                         <Form.Control
@@ -131,7 +172,6 @@ export function SetupWizard() {
                             onChange={(e) => setDisplayName(e.target.value)}
                             isInvalid={!!errors.display_name}
                             disabled={submitting}
-                            autoFocus
                         />
                         <Form.Control.Feedback type="invalid">
                             {errors.display_name}

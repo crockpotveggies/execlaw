@@ -40,7 +40,7 @@ describe("endpoints", () => {
     });
 
     describe("postSetup", () => {
-        it("POSTs JSON and returns the token pair", async () => {
+        it("POSTs JSON with username + display_name + password and returns the token pair", async () => {
             fetchMock.mockResolvedValueOnce(
                 new Response(
                     JSON.stringify({
@@ -52,6 +52,7 @@ describe("endpoints", () => {
                 ),
             );
             const out = await postSetup({
+                username: "jlong",
                 admin_password: "hunter2-longer",
                 display_name: "Justin",
             });
@@ -60,6 +61,7 @@ describe("endpoints", () => {
             expect(url).toBe("/api/setup");
             expect((init as RequestInit).method).toBe("POST");
             expect(JSON.parse((init as RequestInit).body as string)).toEqual({
+                username: "jlong",
                 admin_password: "hunter2-longer",
                 display_name: "Justin",
             });
@@ -67,22 +69,40 @@ describe("endpoints", () => {
     });
 
     describe("postLogin", () => {
-        it("surfaces 401 as ApiError(unauthorized)", async () => {
+        it("posts username + password", async () => {
+            fetchMock.mockResolvedValueOnce(
+                new Response(
+                    JSON.stringify({ access_token: "a", refresh_token: "r" }),
+                    { status: 200 },
+                ),
+            );
+            await postLogin({
+                username: "jlong",
+                admin_password: "hunter2-longer",
+            });
+            const [, init] = fetchMock.mock.calls[0];
+            expect(JSON.parse((init as RequestInit).body as string)).toEqual({
+                username: "jlong",
+                admin_password: "hunter2-longer",
+            });
+        });
+
+        it("surfaces 401 as ApiError(unauthorized) with bad_credentials code", async () => {
             fetchMock.mockResolvedValueOnce(
                 new Response(
                     JSON.stringify({
-                        error: { code: "bad_password", message: "nope" },
+                        error: { code: "bad_credentials", message: "nope" },
                     }),
                     { status: 401 },
                 ),
             );
             try {
-                await postLogin({ admin_password: "wrong" });
+                await postLogin({ username: "jlong", admin_password: "wrong" });
                 throw new Error("should have thrown");
             } catch (e) {
                 const err = e as ApiError;
                 expect(err.code).toBe("unauthorized");
-                expect(err.serverCode).toBe("bad_password");
+                expect(err.serverCode).toBe("bad_credentials");
             }
         });
     });

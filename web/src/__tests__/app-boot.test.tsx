@@ -78,6 +78,7 @@ describe("AppBoot routing", () => {
                 return new Response(
                     JSON.stringify({
                         user_id: "controller-1",
+                        username: "jlong",
                         display_name: "J",
                         email: null,
                         role: "controller",

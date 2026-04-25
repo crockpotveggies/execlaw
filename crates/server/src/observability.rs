@@ -49,6 +49,21 @@ pub struct LogsResponse {
 }
 
 /// `GET /api/admin/logs`
+#[utoipa::path(
+    get,
+    path = "/api/admin/logs",
+    params(
+        ("level" = Option<String>, Query, description = "trace|debug|info|warn|error"),
+        ("plugin_id" = Option<String>, Query, description = "Filter to one plugin"),
+        ("conversation_id" = Option<String>, Query, description = "Filter to one conversation"),
+        ("since_ms" = Option<i64>, Query, description = "Inclusive lower bound on ts_ms"),
+        ("limit" = Option<i64>, Query, description = "1..=1000, default 200"),
+    ),
+    responses(
+        (status = 200, description = "Filtered log entries"),
+    ),
+    tag = "observability"
+)]
 pub async fn logs_handler(
     State(state): State<AppState>,
     Query(q): Query<LogsQuery>,
@@ -123,6 +138,18 @@ pub struct FlagsResponse {
 }
 
 /// `GET /api/admin/eval/flags`
+#[utoipa::path(
+    get,
+    path = "/api/admin/eval/flags",
+    params(
+        ("label" = Option<String>, Query, description = "Filter to one eval label"),
+        ("limit" = Option<i64>, Query, description = "1..=1000, default 200"),
+    ),
+    responses(
+        (status = 200, description = "Eval-flag rows"),
+    ),
+    tag = "observability"
+)]
 pub async fn eval_flags_handler(
     State(state): State<AppState>,
     Query(q): Query<FlagsQuery>,

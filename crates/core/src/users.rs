@@ -49,9 +49,49 @@ impl UserRole {
     }
 }
 
+/// Minimum username length. Three lets a controller pick a short
+/// handle ("jl", "ops") while keeping accidental empty/garbage submissions
+/// out.
+pub const USERNAME_MIN_LEN: usize = 3;
+/// Maximum username length — generous; the login form is a single field.
+pub const USERNAME_MAX_LEN: usize = 32;
+
+/// Validate a raw username (post-trim). Returns the canonical
+/// (lowercased) form on success.
+///
+/// Allowed: ASCII lowercase letters, digits, underscore, hyphen.
+/// Length: [USERNAME_MIN_LEN, USERNAME_MAX_LEN].
+///
+/// We require an explicit username so the controller's login handle
+/// is decoupled from the agent-facing display name. The display name
+/// is "Justin Long"; the username is something like "jlong".
+pub fn normalize_username(raw: &str) -> Result<String, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("username is required");
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let chars = lower.chars().count();
+    if chars < USERNAME_MIN_LEN {
+        return Err("username must be at least 3 characters");
+    }
+    if chars > USERNAME_MAX_LEN {
+        return Err("username must be at most 32 characters");
+    }
+    if !lower
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("username may only contain letters, digits, underscore, hyphen");
+    }
+    Ok(lower)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserRow {
     pub user_id: String,
+    /// Login handle. Always lowercased + validated; see [`normalize_username`].
+    pub username: String,
     pub display_name: String,
     pub email: Option<String>,
     pub password_hash: String,
@@ -69,17 +109,20 @@ impl<'db> UserStore<'db> {
         Self { db }
     }
 
-    /// Insert a new user row. Returns `DbError::Invariant` if a row
-    /// with the same `user_id` already exists — setup is supposed
-    /// to be a one-shot operation.
+    /// Insert a new user row. Returns `DbError::Sqlite` if a row
+    /// with the same `user_id` or `username` already exists — setup
+    /// is supposed to be a one-shot operation, and usernames must
+    /// be unique.
     pub fn insert(&self, row: &UserRow) -> Result<(), DbError> {
         self.db.with_conn(|c| {
             c.execute(
                 "INSERT INTO users \
-                 (user_id, display_name, email, password_hash, role, created_at, last_login_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (user_id, username, display_name, email, password_hash, role, \
+                  created_at, last_login_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     row.user_id,
+                    row.username,
                     row.display_name,
                     row.email,
                     row.password_hash,
@@ -96,10 +139,28 @@ impl<'db> UserStore<'db> {
         self.db.with_conn(|c| {
             let got = c
                 .query_row(
-                    "SELECT user_id, display_name, email, password_hash, role, \
+                    "SELECT user_id, username, display_name, email, password_hash, role, \
                             created_at, last_login_at \
                      FROM users WHERE user_id = ?1",
                     params![user_id],
+                    row_to_user,
+                )
+                .ok();
+            Ok(got)
+        })
+    }
+
+    /// Look up a user by their (already-normalized, lowercased) username.
+    /// Returns None on miss — login routes turn that into "bad credentials"
+    /// rather than 404 to avoid leaking which usernames exist.
+    pub fn get_by_username(&self, username: &str) -> Result<Option<UserRow>, DbError> {
+        self.db.with_conn(|c| {
+            let got = c
+                .query_row(
+                    "SELECT user_id, username, display_name, email, password_hash, role, \
+                            created_at, last_login_at \
+                     FROM users WHERE username = ?1",
+                    params![username],
                     row_to_user,
                 )
                 .ok();
@@ -114,7 +175,7 @@ impl<'db> UserStore<'db> {
         self.db.with_conn(|c| {
             let got = c
                 .query_row(
-                    "SELECT user_id, display_name, email, password_hash, role, \
+                    "SELECT user_id, username, display_name, email, password_hash, role, \
                             created_at, last_login_at \
                      FROM users ORDER BY created_at ASC LIMIT 1",
                     [],
@@ -148,15 +209,16 @@ impl<'db> UserStore<'db> {
 }
 
 fn row_to_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
-    let role_str: String = r.get(4)?;
+    let role_str: String = r.get(5)?;
     Ok(UserRow {
         user_id: r.get(0)?,
-        display_name: r.get(1)?,
-        email: r.get(2)?,
-        password_hash: r.get(3)?,
+        username: r.get(1)?,
+        display_name: r.get(2)?,
+        email: r.get(3)?,
+        password_hash: r.get(4)?,
         role: UserRole::parse(&role_str).unwrap_or(UserRole::Controller),
-        created_at: r.get(5)?,
-        last_login_at: r.get(6)?,
+        created_at: r.get(6)?,
+        last_login_at: r.get(7)?,
     })
 }
 
@@ -175,6 +237,7 @@ mod tests {
     fn mk_user(id: &str, role: UserRole) -> UserRow {
         UserRow {
             user_id: id.into(),
+            username: id.replace(['-', '_'], "").to_lowercase(),
             display_name: "Test User".into(),
             email: Some(format!("{id}@example.com")),
             password_hash: "argon2-hash-here".into(),
@@ -250,5 +313,98 @@ mod tests {
             assert_eq!(UserRole::parse(role.as_str()), Some(role));
         }
         assert_eq!(UserRole::parse("admin"), None);
+    }
+
+    // ---- normalize_username -------------------------------------------
+
+    #[test]
+    fn normalize_username_lowercases_and_trims() {
+        assert_eq!(normalize_username("  JLong  ").unwrap(), "jlong");
+        assert_eq!(normalize_username("Justin").unwrap(), "justin");
+    }
+
+    #[test]
+    fn normalize_username_rejects_empty_and_too_short() {
+        assert!(normalize_username("").is_err());
+        assert!(normalize_username("   ").is_err());
+        assert!(normalize_username("ab").is_err());
+        // 3 chars is the boundary — must succeed.
+        assert_eq!(normalize_username("abc").unwrap(), "abc");
+    }
+
+    #[test]
+    fn normalize_username_rejects_too_long() {
+        let max_ok = "a".repeat(USERNAME_MAX_LEN);
+        assert!(normalize_username(&max_ok).is_ok());
+        let too_long = "a".repeat(USERNAME_MAX_LEN + 1);
+        assert!(normalize_username(&too_long).is_err());
+    }
+
+    #[test]
+    fn normalize_username_rejects_disallowed_characters() {
+        for bad in ["has space", "j@l", "with.dot", "ümlaut", "with/slash", "emo😀ji"] {
+            assert!(
+                normalize_username(bad).is_err(),
+                "should reject '{bad}'"
+            );
+        }
+        // Allowed forms.
+        for ok in ["jlong", "j_long", "j-long", "user42"] {
+            assert!(
+                normalize_username(ok).is_ok(),
+                "should accept '{ok}'"
+            );
+        }
+    }
+
+    // ---- username persistence + lookup -------------------------------
+
+    #[test]
+    fn get_by_username_returns_inserted_row() {
+        let db = fresh_db();
+        let store = UserStore::new(&db);
+        let mut u = mk_user("controller-1", UserRole::Controller);
+        u.username = "jlong".into();
+        store.insert(&u).unwrap();
+        let got = store.get_by_username("jlong").unwrap().unwrap();
+        assert_eq!(got.user_id, "controller-1");
+        assert_eq!(got.username, "jlong");
+        // Miss returns None.
+        assert!(store.get_by_username("nobody").unwrap().is_none());
+    }
+
+    /// Adversarial: two rows with the same username trip the unique
+    /// index — even if user_id differs. Phase-7 multi-user adds the
+    /// invite flow on top of this guarantee.
+    #[test]
+    fn duplicate_username_is_rejected_by_unique_index() {
+        let db = fresh_db();
+        let store = UserStore::new(&db);
+        let mut a = mk_user("c1", UserRole::Controller);
+        a.username = "shared".into();
+        let mut b = mk_user("c2", UserRole::Operator);
+        b.username = "shared".into();
+        store.insert(&a).unwrap();
+        let err = store.insert(&b).unwrap_err();
+        // SQLite raises a UNIQUE constraint violation; we just need
+        // the insert to fail.
+        assert!(matches!(err, DbError::Sqlite(_)), "got {err:?}");
+    }
+
+    /// Round-trip: insert with mixed-case raw input → read back →
+    /// must be the lowercased form (the caller is responsible for
+    /// running normalize_username before insert; we don't do it here
+    /// to keep the store layer thin, but this test documents the
+    /// expectation that both write paths use the helper).
+    #[test]
+    fn username_roundtrips_lowercased() {
+        let lowered = normalize_username("JLong").unwrap();
+        let db = fresh_db();
+        let store = UserStore::new(&db);
+        let mut u = mk_user("c1", UserRole::Controller);
+        u.username = lowered.clone();
+        store.insert(&u).unwrap();
+        let got = store.get_by_username(&lowered).unwrap().unwrap();
+        assert_eq!(got.username, "jlong");
     }
 }

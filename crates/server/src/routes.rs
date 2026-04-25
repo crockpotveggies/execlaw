@@ -41,6 +41,9 @@ pub struct HealthResponse {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetupRequest {
+    /// Login handle — required, normalized to lowercase server-side
+    /// before insert (3-32 chars, [a-z0-9_-]).
+    pub username: String,
     pub admin_password: String,
     /// Operator's display name — surfaces in the SPA's bottom-of-
     /// sidebar affordance and in the controller-thread's "logged in
@@ -61,6 +64,8 @@ pub struct SetupResponse {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct LoginRequest {
+    /// Login handle — case-insensitive; normalized server-side.
+    pub username: String,
     pub admin_password: String,
 }
 
@@ -76,6 +81,7 @@ pub struct LoginResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeResponse {
     pub user_id: String,
+    pub username: String,
     pub display_name: String,
     pub email: Option<String>,
     pub role: String,
@@ -236,6 +242,14 @@ pub async fn health() -> Json<HealthResponse> {
 ///
 /// Deliberately NOT JSON — the SPA wants a single byte-string check
 /// without parsing.
+#[utoipa::path(
+    get,
+    path = "/api/ping",
+    responses(
+        (status = 200, description = "Plain-text 'setup' (uninitialized) or 'pong' (initialized)", content_type = "text/plain"),
+    ),
+    tag = "meta"
+)]
 pub async fn ping(State(state): State<AppState>) -> impl IntoResponse {
     use execlaw_core::users::UserStore;
     let body = match UserStore::new(&state.db).any_exist() {
@@ -254,11 +268,22 @@ pub async fn ping(State(state): State<AppState>) -> impl IntoResponse {
 /// profile. Used by the SPA to render the bottom-of-sidebar
 /// affordance ("⚙ user@email") and to know the role for any
 /// role-gated UI (Phase 7+).
+#[utoipa::path(
+    get,
+    path = "/api/admin/me",
+    responses(
+        (status = 200, description = "Logged-in user profile", body = MeResponse),
+        (status = 401, description = "Missing or invalid Authorization header"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "auth"
+)]
 pub async fn admin_me(
     user: crate::auth_extract::AuthedUser,
 ) -> Json<MeResponse> {
     Json(MeResponse {
         user_id: user.user_id,
+        username: user.username,
         display_name: user.display_name,
         email: user.email,
         role: user.role.as_str().to_owned(),
@@ -273,6 +298,14 @@ pub async fn admin_me(
 /// hosts it returns an empty `HardwareProfile` (the control plane
 /// is meant to run inside a Linux container — bare-Windows dev runs
 /// are a known degenerate path).
+#[utoipa::path(
+    get,
+    path = "/api/admin/hardware",
+    responses(
+        (status = 200, description = "Detected GPU + CPU + memory profile (sysfs Tier-1)"),
+    ),
+    tag = "admin"
+)]
 pub async fn admin_hardware() -> impl IntoResponse {
     let profile: HardwareProfile = detect_sysfs(Path::new("/sys"));
     (StatusCode::OK, Json(profile)).into_response()
@@ -292,7 +325,7 @@ pub async fn setup(
     State(state): State<AppState>,
     Json(req): Json<SetupRequest>,
 ) -> Result<Json<SetupResponse>, ApiError> {
-    use execlaw_core::users::{UserRole, UserRow, UserStore};
+    use execlaw_core::users::{UserRole, UserRow, UserStore, normalize_username};
 
     if req.admin_password.len() < 8 {
         return Err(ApiError {
@@ -308,6 +341,11 @@ pub async fn setup(
             message: "display_name must not be empty".into(),
         });
     }
+    let username = normalize_username(&req.username).map_err(|msg| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        code: "username_invalid",
+        message: msg.into(),
+    })?;
 
     let users = UserStore::new(&state.db);
     if users.any_exist().map_err(ApiError::from)? {
@@ -324,6 +362,7 @@ pub async fn setup(
     users
         .insert(&UserRow {
             user_id: principal_id.clone(),
+            username,
             display_name: req.display_name.trim().to_owned(),
             email: req.email.clone().filter(|s| !s.trim().is_empty()),
             password_hash: hash.clone(),
@@ -374,22 +413,43 @@ pub async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, ApiError> {
-    use execlaw_core::users::UserStore;
+    use execlaw_core::users::{UserStore, normalize_username};
 
     let users = UserStore::new(&state.db);
-    let user = users
-        .get_first()
-        .map_err(ApiError::from)?
-        .ok_or(ApiError {
+
+    // Short-circuit "no users yet" → 409 not_initialized so the SPA
+    // can route to /setup.
+    if !users.any_exist().map_err(ApiError::from)? {
+        return Err(ApiError {
             status: StatusCode::CONFLICT,
             code: "not_initialized",
             message: "no controller user exists yet; run /api/setup".into(),
-        })?;
+        });
+    }
+
+    // Validate the username shape *before* lookup so a garbage payload
+    // can't probe the DB. Validation failures collapse into the same
+    // 401 as a wrong username/password — never leak which half failed.
+    let normalized = normalize_username(&req.username).ok();
+    let user = match normalized {
+        Some(name) => users.get_by_username(&name).map_err(ApiError::from)?,
+        None => None,
+    };
+    let user = match user {
+        Some(u) => u,
+        None => {
+            return Err(ApiError {
+                status: StatusCode::UNAUTHORIZED,
+                code: "bad_credentials",
+                message: "incorrect username or password".into(),
+            });
+        }
+    };
     if !verify_password(&req.admin_password, &user.password_hash)? {
         return Err(ApiError {
             status: StatusCode::UNAUTHORIZED,
-            code: "bad_password",
-            message: "incorrect admin password".into(),
+            code: "bad_credentials",
+            message: "incorrect username or password".into(),
         });
     }
 
@@ -561,11 +621,21 @@ mod tests {
         (status, body_json)
     }
 
-    /// Helper for tests: full setup payload with the now-required display_name.
+    /// Helper for tests: full setup payload with the now-required
+    /// username + display_name.
     fn setup_body(password: &str, display_name: &str) -> serde_json::Value {
         serde_json::json!({
+            "username": "tester",
             "admin_password": password,
             "display_name": display_name,
+        })
+    }
+
+    /// Login payload — paired with the canonical setup_body username.
+    fn login_body(username: &str, password: &str) -> serde_json::Value {
+        serde_json::json!({
+            "username": username,
+            "admin_password": password,
         })
     }
 
@@ -621,17 +691,29 @@ mod tests {
             &app,
             Method::POST,
             "/api/login",
-            serde_json::json!({ "admin_password": "nope" }),
+            login_body("tester", "nope"),
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-        // Login with right password: 200.
+        // Login with wrong username: 401.
         let (status, body) = send_json(
             &app,
             Method::POST,
             "/api/login",
-            serde_json::json!({ "admin_password": "hunter2-longer" }),
+            login_body("nobody", "hunter2-longer"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "bad_credentials");
+
+        // Login with right username + password: 200. Also verifies
+        // username case-insensitivity (input "TESTER" → matches stored "tester").
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/api/login",
+            login_body("TESTER", "hunter2-longer"),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -717,7 +799,11 @@ mod tests {
             &app,
             Method::POST,
             "/api/setup",
-            serde_json::json!({"admin_password": "hunter2-longer", "display_name": "  "}),
+            serde_json::json!({
+                "username": "tester",
+                "admin_password": "hunter2-longer",
+                "display_name": "  ",
+            }),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -780,6 +866,7 @@ mod tests {
             Method::POST,
             "/api/setup",
             serde_json::json!({
+                "username": "JLong",
                 "admin_password": "hunter2-longer",
                 "display_name": "Justin Long",
                 "email": "justin@example.com"
@@ -801,6 +888,8 @@ mod tests {
         assert_eq!(me["display_name"], "Justin Long");
         assert_eq!(me["email"], "justin@example.com");
         assert_eq!(me["role"], "controller");
+        // username is stored lowercased even though "JLong" was sent.
+        assert_eq!(me["username"], "jlong");
         assert!(me["user_id"].as_str().unwrap().starts_with("controller-"));
     }
 
@@ -811,9 +900,73 @@ mod tests {
             &app,
             Method::POST,
             "/api/login",
-            serde_json::json!({ "admin_password": "hunter2-longer" }),
+            login_body("tester", "hunter2-longer"),
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// Setup must reject empty / malformed usernames before writing
+    /// anything. Pairs with the core-side `normalize_username` tests.
+    #[tokio::test]
+    async fn setup_rejects_invalid_username() {
+        let app = build_router(test_app_state());
+        for bad in ["", "  ", "ab", "has space", "with.dot"] {
+            let (status, body) = send_json(
+                &app,
+                Method::POST,
+                "/api/setup",
+                serde_json::json!({
+                    "username": bad,
+                    "admin_password": "hunter2-longer",
+                    "display_name": "J",
+                }),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "username '{bad}' should be rejected; body was {body}"
+            );
+            assert_eq!(body["error"]["code"], "username_invalid");
+        }
+    }
+
+    /// /api/login must NOT distinguish "wrong username" from "wrong
+    /// password" — both routes must collapse to the same 401 +
+    /// `bad_credentials` so an attacker can't enumerate usernames.
+    #[tokio::test]
+    async fn login_does_not_leak_username_existence() {
+        let app = build_router(test_app_state());
+        // Establish a known user.
+        let (_, _) = send_json(
+            &app,
+            Method::POST,
+            "/api/setup",
+            serde_json::json!({
+                "username": "tester",
+                "admin_password": "hunter2-longer",
+                "display_name": "J",
+            }),
+        )
+        .await;
+
+        let (s1, b1) = send_json(
+            &app,
+            Method::POST,
+            "/api/login",
+            login_body("tester", "wrong-password"),
+        )
+        .await;
+        let (s2, b2) = send_json(
+            &app,
+            Method::POST,
+            "/api/login",
+            login_body("does-not-exist", "anything"),
+        )
+        .await;
+        assert_eq!(s1, s2);
+        assert_eq!(b1["error"]["code"], b2["error"]["code"]);
+        assert_eq!(b1["error"]["code"], "bad_credentials");
     }
 }

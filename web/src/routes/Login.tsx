@@ -17,6 +17,7 @@ export function Login() {
     const auth = useAuth();
     const navigate = useNavigate();
 
+    const [username, setUsername] = useState("");
     const [password, setPassword] = useState("");
     const [submitError, setSubmitError] = useState<string | null>(null);
     const [submitting, setSubmitting] = useState(false);
@@ -28,19 +29,25 @@ export function Login() {
     const onSubmit = async (e: FormEvent<HTMLFormElement>) => {
         e.preventDefault();
         setSubmitError(null);
-        if (password.length === 0) {
-            setSubmitError("Enter your admin password.");
+        if (username.trim().length === 0 || password.length === 0) {
+            setSubmitError("Enter both username and password.");
             return;
         }
         setSubmitting(true);
         try {
-            const tokens = await postLogin({ admin_password: password });
+            const tokens = await postLogin({
+                username: username.trim(),
+                admin_password: password,
+            });
             await auth.signIn(tokens);
             navigate("/chat", { replace: true });
         } catch (e) {
             if (e instanceof ApiError) {
+                // Server returns the same `bad_credentials` for both
+                // wrong-username and wrong-password — surface a single
+                // generic message so the SPA doesn't re-leak it.
                 if (e.code === "unauthorized") {
-                    setSubmitError("Incorrect password.");
+                    setSubmitError("Incorrect username or password.");
                 } else if (e.serverCode === "not_initialized") {
                     navigate("/setup", { replace: true });
                     return;
@@ -74,15 +81,28 @@ export function Login() {
                 )}
 
                 <Form noValidate onSubmit={onSubmit}>
+                    <Form.Group className="mb-3" controlId="login-username">
+                        <Form.Label>Username</Form.Label>
+                        <Form.Control
+                            type="text"
+                            autoComplete="username"
+                            value={username}
+                            onChange={(e) => setUsername(e.target.value)}
+                            disabled={submitting}
+                            autoFocus
+                            spellCheck={false}
+                            autoCapitalize="none"
+                        />
+                    </Form.Group>
+
                     <Form.Group className="mb-4" controlId="login-password">
-                        <Form.Label>Admin password</Form.Label>
+                        <Form.Label>Password</Form.Label>
                         <Form.Control
                             type="password"
                             autoComplete="current-password"
                             value={password}
                             onChange={(e) => setPassword(e.target.value)}
                             disabled={submitting}
-                            autoFocus
                         />
                     </Form.Group>
 

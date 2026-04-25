@@ -33,6 +33,8 @@ export async function ping(): Promise<PingState> {
 // ---- /api/setup ----------------------------------------------------
 
 export interface SetupRequest {
+    /** Login handle. Server-side normalized to lowercase; 3-32 chars, [a-z0-9_-]. */
+    username: string;
     admin_password: string;
     display_name: string;
     email?: string;
@@ -54,6 +56,7 @@ export async function postSetup(req: SetupRequest): Promise<SetupResponse> {
 // ---- /api/login ----------------------------------------------------
 
 export interface LoginRequest {
+    username: string;
     admin_password: string;
 }
 
@@ -73,6 +76,7 @@ export async function postLogin(req: LoginRequest): Promise<LoginResponse> {
 
 export interface MeResponse {
     user_id: string;
+    username: string;
     display_name: string;
     email: string | null;
     role: string;

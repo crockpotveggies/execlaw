@@ -21,6 +21,7 @@ use execlaw_core::users::{UserRole, UserRow, UserStore};
 #[derive(Debug, Clone)]
 pub struct AuthedUser {
     pub user_id: String,
+    pub username: String,
     pub display_name: String,
     pub email: Option<String>,
     pub role: UserRole,
@@ -31,6 +32,7 @@ impl From<UserRow> for AuthedUser {
     fn from(u: UserRow) -> Self {
         Self {
             user_id: u.user_id,
+            username: u.username,
             display_name: u.display_name,
             email: u.email,
             role: u.role,

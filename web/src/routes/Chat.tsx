@@ -33,7 +33,8 @@ export function Chat() {
             <div className="execlaw-auth-card">
                 <h1 className="execlaw-brand h4 mb-3">execlaw</h1>
                 <p className="mb-1">
-                    Signed in as <strong>{user.display_name}</strong>
+                    Signed in as <strong>{user.display_name}</strong>{" "}
+                    <span className="execlaw-muted">@{user.username}</span>
                 </p>
                 {user.email && (
                     <p className="execlaw-muted small mb-1">{user.email}</p>

@@ -15,7 +15,8 @@
 -- are unified.
 CREATE TABLE IF NOT EXISTS users (
     user_id        TEXT    PRIMARY KEY,
-    display_name   TEXT    NOT NULL,
+    username       TEXT    NOT NULL,        -- login handle; stored lowercased (3+ chars, [a-z0-9_-])
+    display_name   TEXT    NOT NULL,        -- shown in UI ("Justin Long")
     email          TEXT,
     password_hash  TEXT    NOT NULL,        -- Argon2id (§7.1)
     role           TEXT    NOT NULL,        -- "controller" | "operator" | "viewer" (Phase 7+)
@@ -23,4 +24,5 @@ CREATE TABLE IF NOT EXISTS users (
     last_login_at  INTEGER
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username);
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);

@@ -90,10 +90,11 @@ pub fn verify_approval_token(
     Ok(data.claims)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ApprovalRequest {
     /// The verb the controller is responding with. See
     /// [`ApprovalVerb`] in `execlaw-policy::sideband`.
+    #[schema(value_type = String)]
     pub verb: ApprovalVerb,
     /// Optional topic scopes for `TrustLimited`.
     #[serde(default)]
@@ -121,6 +122,19 @@ pub struct ApprovalResponse {
 }
 
 /// `POST /api/admin/approvals/:id/respond`
+#[utoipa::path(
+    post,
+    path = "/api/admin/approvals/{approval_id}/respond",
+    params(
+        ("approval_id" = String, Path, description = "Pending approval id"),
+    ),
+    responses(
+        (status = 200, description = "Approval recorded; original action resumed (or dropped)"),
+        (status = 401, description = "Missing or invalid signed approval token"),
+        (status = 404, description = "Unknown approval id"),
+    ),
+    tag = "approvals"
+)]
 pub async fn respond_handler(
     State(state): State<AppState>,
     Path(approval_id): Path<String>,
@@ -382,6 +396,18 @@ fn internal_error(msg: &str) -> axum::response::Response {
 /// distinct from `Block` via the approval flow (which targets a
 /// specific cold-contact request). Use this for an *already
 /// trusted* contact you want to remove.
+#[utoipa::path(
+    post,
+    path = "/api/admin/principals/{principal_id}/revoke",
+    params(
+        ("principal_id" = String, Path, description = "Principal to flip to Blocked"),
+    ),
+    responses(
+        (status = 200, description = "Trust revoked; principal now Blocked"),
+        (status = 404, description = "Unknown principal id"),
+    ),
+    tag = "approvals"
+)]
 pub async fn revoke_handler(
     State(state): State<AppState>,
     Path(principal_id): Path<String>,
@@ -423,7 +449,7 @@ pub async fn revoke_handler(
         .into_response()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct RevokeRequest {
     #[serde(default)]
     pub reason: Option<String>,
