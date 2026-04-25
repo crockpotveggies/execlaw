@@ -6,16 +6,19 @@
 
 import { useState, type FormEvent } from "react";
 import { Navigate, useNavigate } from "react-router-dom";
+import Animated from "react-native-reanimated";
 import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
 import Spinner from "react-bootstrap/Spinner";
 import { ApiError } from "../api/client";
 import { postLogin } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { useDismissAnimation } from "../anim/useDismissAnimation";
 
 export function Login() {
     const auth = useAuth();
     const navigate = useNavigate();
+    const { style: dismissStyle, dismiss } = useDismissAnimation();
 
     const [username, setUsername] = useState("");
     const [password, setPassword] = useState("");
@@ -40,7 +43,11 @@ export function Login() {
                 admin_password: password,
             });
             await auth.signIn(tokens);
-            navigate("/chat", { replace: true });
+            // Successful sign-in: shrink + fade the form, THEN navigate.
+            // The /chat route's FadeIn entry animation picks up where
+            // this leaves off so the eye reads it as a single hand-off.
+            dismiss(() => navigate("/chat", { replace: true }));
+            return;
         } catch (e) {
             if (e instanceof ApiError) {
                 // Server returns the same `bad_credentials` for both
@@ -66,9 +73,10 @@ export function Login() {
 
     return (
         <div className="execlaw-auth-shell">
-            <div className="execlaw-auth-card">
-                <h1 className="execlaw-brand h4 mb-1">execlaw</h1>
-                <p className="execlaw-muted small mb-4">Sign in to continue.</p>
+            <Animated.View style={dismissStyle}>
+                <div className="execlaw-auth-card">
+                    <h1 className="execlaw-brand h4 mb-1">execlaw</h1>
+                    <p className="execlaw-muted small mb-4">Sign in to continue.</p>
 
                 {submitError && (
                     <div
@@ -122,7 +130,8 @@ export function Login() {
                         )}
                     </Button>
                 </Form>
-            </div>
+                </div>
+            </Animated.View>
         </div>
     );
 }

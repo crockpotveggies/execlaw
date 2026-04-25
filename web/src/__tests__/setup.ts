@@ -23,7 +23,10 @@ vi.mock("react-native-reanimated", () => {
         tag: string,
     ) =>
         React.forwardRef<HTMLElement, Record<string, unknown>>(
-            ({ children, style: _style, entering: _e, ...rest }, ref) =>
+            (
+                { children, style: _style, entering: _e, exiting: _x, ...rest },
+                ref,
+            ) =>
                 React.createElement(tag, { ...rest, ref }, children as React.ReactNode),
         );
 
@@ -38,6 +41,39 @@ vi.mock("react-native-reanimated", () => {
         easing: () => builder(),
     });
 
+    // useSharedValue returns a mutable holder. Setting `.value` is a
+    // no-op visually but lets state machinery in the hook read back.
+    function useSharedValue<T>(initial: T) {
+        const ref = React.useRef({ value: initial });
+        return ref.current;
+    }
+
+    // useAnimatedStyle returns whatever the worklet returns —
+    // tests don't render visual changes, but the hook must not throw.
+    function useAnimatedStyle<T>(worklet: () => T) {
+        try {
+            return worklet();
+        } catch {
+            return {} as T;
+        }
+    }
+
+    // withTiming runs the callback synchronously with `finished = true`
+    // so any "after the animation" navigation in tests doesn't hang.
+    function withTiming(
+        toValue: unknown,
+        _opts: unknown,
+        cb?: (finished: boolean) => void,
+    ) {
+        if (cb) cb(true);
+        return toValue;
+    }
+
+    // runOnJS in tests is a no-op wrapper — the inner fn is already on JS.
+    function runOnJS<F extends (...args: unknown[]) => unknown>(fn: F): F {
+        return fn;
+    }
+
     return {
         default: Animated,
         Easing: {
@@ -47,6 +83,12 @@ vi.mock("react-native-reanimated", () => {
         FadeInUp: builder(),
         FadeIn: builder(),
         FadeOut: builder(),
+        ZoomIn: builder(),
+        ZoomOut: builder(),
+        useSharedValue,
+        useAnimatedStyle,
+        withTiming,
+        runOnJS,
     };
 });
 

@@ -12,9 +12,15 @@ const CONTROLLER_THREAD_PREFIX = "controller-thread:";
 
 interface SidebarProps {
     onNewThread: () => void;
+    /**
+     * Optional sign-out handler. Defaults to the AuthContext's
+     * `signOut` directly; the chat route overrides this to choreograph
+     * a fade-out animation before dropping auth state.
+     */
+    onSignOut?: () => void;
 }
 
-export function Sidebar({ onNewThread }: SidebarProps) {
+export function Sidebar({ onNewThread, onSignOut }: SidebarProps) {
     const auth = useAuth();
     const threads = useChatState((s) => s.threads);
     const activeId = useChatState((s) => s.activeId);
@@ -101,7 +107,7 @@ export function Sidebar({ onNewThread }: SidebarProps) {
                 <button
                     type="button"
                     className="btn btn-link btn-sm p-0 ms-auto execlaw-muted"
-                    onClick={auth.signOut}
+                    onClick={onSignOut ?? auth.signOut}
                     data-testid="sidebar-signout"
                     aria-label="Sign out"
                 >

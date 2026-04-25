@@ -19,21 +19,37 @@ import { type ReactNode } from "react";
 import Animated, {
     Easing,
     FadeInUp,
+    ZoomIn,
 } from "react-native-reanimated";
+
+/**
+ * Visual character of the entry animation.
+ *
+ *   - "fade" (default): subtle fade-up. Used for the chat shell —
+ *     content scrolls in feeling like it appeared.
+ *   - "zoom": scale 0.85 → 1.0 + opacity 0 → 1. Used for auth screens
+ *     so the login card feels like it grows into place; pairs with
+ *     the dismiss animation that shrinks it back on a successful sign-in.
+ */
+export type ScreenTransitionKind = "fade" | "zoom";
 
 interface Props {
     children: ReactNode;
     /** Delay before the animation begins, in ms. */
     delayMs?: number;
+    kind?: ScreenTransitionKind;
 }
 
-export function ScreenTransition({ children, delayMs = 0 }: Props) {
-    // 220ms feels snappy on a 60Hz monitor without looking instant.
-    // 8px lift gives the eye something to anchor on without
-    // crossing into "stagey" territory.
-    const animation = FadeInUp.duration(220)
-        .delay(delayMs)
-        .easing(Easing.out(Easing.cubic));
+export function ScreenTransition({
+    children,
+    delayMs = 0,
+    kind = "fade",
+}: Props) {
+    const easing = Easing.out(Easing.cubic);
+    const animation =
+        kind === "zoom"
+            ? ZoomIn.duration(280).delay(delayMs).easing(easing)
+            : FadeInUp.duration(220).delay(delayMs).easing(easing);
 
     return (
         <Animated.View

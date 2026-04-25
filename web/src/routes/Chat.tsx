@@ -11,6 +11,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Navigate } from "react-router-dom";
+import Animated from "react-native-reanimated";
+import { useDismissAnimation } from "../anim/useDismissAnimation";
 import { ApiError } from "../api/client";
 import {
     listMessages,
@@ -50,6 +52,21 @@ export function Chat() {
     const activeId = useChatState((s) => s.activeId);
     const [topError, setTopError] = useState<string | null>(null);
     const wsRef = useRef<WsClient | null>(null);
+
+    // Sign-out fade-out: keep the chat shell mounted while it fades to
+    // 0 opacity, THEN drop the auth tokens. The /login route's ZoomIn
+    // entry then plays for the un-shrink-and-fade-in handoff.
+    // toScale=1 keeps the shell at full size — only opacity changes.
+    const { style: dismissStyle, dismiss } = useDismissAnimation({
+        toScale: 1,
+        durationMs: 240,
+    });
+
+    const handleSignOut = useCallback(() => {
+        dismiss(() => {
+            void auth.signOut();
+        });
+    }, [auth, dismiss]);
 
     // Stable accessor used by everything that needs the live access token.
     const getToken = useCallback(() => auth.getAccessToken(), [auth]);
@@ -211,21 +228,25 @@ export function Chat() {
     }
 
     return (
-        <div className="execlaw-shell">
-            <Sidebar onNewThread={onNewThread} />
-            <main className="execlaw-main">
-                {topError && (
-                    <div
-                        className="execlaw-error-banner mx-3 mt-3"
-                        role="alert"
-                        data-testid="chat-error-banner"
-                    >
-                        {topError}
-                    </div>
-                )}
-                <ChatPane activeId={activeId} onSend={onSend} />
-            </main>
-        </div>
+        <Animated.View
+            style={[dismissStyle, { width: "100%", height: "100%" }]}
+        >
+            <div className="execlaw-shell">
+                <Sidebar onNewThread={onNewThread} onSignOut={handleSignOut} />
+                <main className="execlaw-main">
+                    {topError && (
+                        <div
+                            className="execlaw-error-banner mx-3 mt-3"
+                            role="alert"
+                            data-testid="chat-error-banner"
+                        >
+                            {topError}
+                        </div>
+                    )}
+                    <ChatPane activeId={activeId} onSend={onSend} />
+                </main>
+            </div>
+        </Animated.View>
     );
 }
 

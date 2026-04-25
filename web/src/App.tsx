@@ -15,7 +15,7 @@ export function App() {
                     <Route
                         path="/setup"
                         element={
-                            <ScreenTransition>
+                            <ScreenTransition kind="zoom">
                                 <SetupWizard />
                             </ScreenTransition>
                         }
@@ -23,7 +23,7 @@ export function App() {
                     <Route
                         path="/login"
                         element={
-                            <ScreenTransition>
+                            <ScreenTransition kind="zoom">
                                 <Login />
                             </ScreenTransition>
                         }
@@ -31,7 +31,7 @@ export function App() {
                     <Route
                         path="/chat"
                         element={
-                            <ScreenTransition>
+                            <ScreenTransition kind="fade">
                                 <Chat />
                             </ScreenTransition>
                         }

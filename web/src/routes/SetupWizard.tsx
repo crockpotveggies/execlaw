@@ -12,12 +12,14 @@
 
 import { useState, type FormEvent } from "react";
 import { Navigate, useNavigate } from "react-router-dom";
+import Animated from "react-native-reanimated";
 import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
 import Spinner from "react-bootstrap/Spinner";
 import { ApiError } from "../api/client";
 import { postSetup } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { useDismissAnimation } from "../anim/useDismissAnimation";
 
 interface FieldErrors {
     username?: string;
@@ -70,6 +72,7 @@ export function validateSetupForm(input: {
 export function SetupWizard() {
     const auth = useAuth();
     const navigate = useNavigate();
+    const { style: dismissStyle, dismiss } = useDismissAnimation();
 
     const [username, setUsername] = useState("");
     const [displayName, setDisplayName] = useState("");
@@ -109,7 +112,10 @@ export function SetupWizard() {
                 access_token: resp.access_token,
                 refresh_token: resp.refresh_token,
             });
-            navigate("/chat", { replace: true });
+            // Mirror Login: shrink + fade the form before handing off
+            // to the chat shell's FadeIn entry.
+            dismiss(() => navigate("/chat", { replace: true }));
+            return;
         } catch (e) {
             if (e instanceof ApiError && e.serverCode === "already_initialized") {
                 navigate("/login", { replace: true });
@@ -125,11 +131,12 @@ export function SetupWizard() {
 
     return (
         <div className="execlaw-auth-shell">
-            <div className="execlaw-auth-card">
-                <h1 className="execlaw-brand h4 mb-1">execlaw</h1>
-                <p className="execlaw-muted small mb-4">
-                    Welcome — let&rsquo;s create your controller account.
-                </p>
+            <Animated.View style={dismissStyle}>
+                <div className="execlaw-auth-card">
+                    <h1 className="execlaw-brand h4 mb-1">execlaw</h1>
+                    <p className="execlaw-muted small mb-4">
+                        Welcome — let&rsquo;s create your controller account.
+                    </p>
 
                 {submitError && (
                     <div
@@ -229,7 +236,8 @@ export function SetupWizard() {
                         )}
                     </Button>
                 </Form>
-            </div>
+                </div>
+            </Animated.View>
         </div>
     );
 }
