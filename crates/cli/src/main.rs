@@ -157,6 +157,44 @@ enum Command {
         #[command(subcommand)]
         op: EvalOp,
     },
+    /// Phase-7 hardening: scan `state_events` for rows with NULL
+    /// `tag` and sign them under the current HMAC key. Idempotent.
+    /// Run once per fleet before flipping the column to NOT NULL.
+    BackfillEvents {
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        no_encrypt: bool,
+    },
+    /// Phase-7 hardening: snapshot the SQLCipher DB to a destination
+    /// path using `VACUUM INTO`. The destination is a self-contained
+    /// SQLite file with the same encryption posture as the source.
+    Backup {
+        /// Output path. Parent directory must exist.
+        #[arg(long)]
+        to: PathBuf,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        no_encrypt: bool,
+    },
+    /// Phase-7 hardening: validate a snapshot file (must be openable
+    /// with the same key + carry the migrations table) and atomically
+    /// swap it into place. Refuses to overwrite a live DB without
+    /// `--force`.
+    Restore {
+        /// Snapshot path produced by `execlaw backup`.
+        #[arg(long)]
+        from: PathBuf,
+        /// Live DB path to replace.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Allow overwriting a non-empty target file.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        #[arg(long, default_value_t = false)]
+        no_encrypt: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -752,6 +790,154 @@ fn cmd_eval_list(
     Ok(())
 }
 
+// ----- Phase 7 hardening commands -------------------------------------
+
+fn cmd_backfill_events(db_path: PathBuf, no_encrypt: bool) -> anyhow::Result<()> {
+    use execlaw_core::events::{EventLog, KeyRing};
+
+    let db = open_db(&db_path, no_encrypt)?;
+    // Use the operator's keyring-backed master key so back-fill
+    // produces tags that match what `serve` would have produced
+    // had a key been attached at append time.
+    let key = execlaw_vault::load_or_create_master_key()
+        .map_err(|e| anyhow::anyhow!("master key: {e}"))?;
+    let log = EventLog::new(&db).with_key_ring(KeyRing::single(0, key.to_vec()));
+    let report = log
+        .backfill_null_tags()
+        .map_err(|e| anyhow::anyhow!("back-fill: {e}"))?;
+    println!(
+        "backfill: signed={} skipped={} null_remaining={}",
+        report.signed, report.skipped, report.null_remaining,
+    );
+    Ok(())
+}
+
+fn cmd_backup(to: PathBuf, db_path: PathBuf, no_encrypt: bool) -> anyhow::Result<()> {
+    if !db_path.exists() {
+        anyhow::bail!("source db not found: {}", db_path.display());
+    }
+    if let Some(parent) = to.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            anyhow::bail!(
+                "parent directory of --to does not exist: {}",
+                parent.display()
+            );
+        }
+    }
+    if to.exists() {
+        anyhow::bail!(
+            "--to path already exists; remove it first: {}",
+            to.display()
+        );
+    }
+
+    let db = open_db(&db_path, no_encrypt)?;
+    let to_str = to
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-utf8 path: {}", to.display()))?
+        .to_owned();
+
+    // VACUUM INTO writes a fresh, fully-defragmented copy at the
+    // target path. With SQLCipher in play it inherits the same
+    // encryption posture by default, so a snapshot can be restored
+    // by any process holding the master key.
+    db.with_conn(|c| {
+        c.execute_batch(&format!(
+            "VACUUM INTO '{}'",
+            to_str.replace('\'', "''")
+        ))?;
+        Ok(())
+    })
+    .map_err(|e| anyhow::anyhow!("VACUUM INTO: {e}"))?;
+
+    println!(
+        "backup: {} -> {} ({} bytes)",
+        db_path.display(),
+        to.display(),
+        std::fs::metadata(&to)
+            .map(|m| m.len())
+            .unwrap_or_default()
+    );
+    Ok(())
+}
+
+fn cmd_restore(
+    from: PathBuf,
+    db_path: PathBuf,
+    force: bool,
+    no_encrypt: bool,
+) -> anyhow::Result<()> {
+    if !from.exists() {
+        anyhow::bail!("snapshot file not found: {}", from.display());
+    }
+
+    // Validate the snapshot first: it must open with the operator's
+    // master key AND carry the schema_version table. Otherwise
+    // restoring would silently swap in a useless DB.
+    {
+        let snap = open_db(&from, no_encrypt)?;
+        let has_version: bool = snap
+            .with_conn(|c| {
+                let n: i64 = c
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master \
+                         WHERE type='table' AND name='schema_version'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                Ok(n > 0)
+            })
+            .unwrap_or(false);
+        if !has_version {
+            anyhow::bail!(
+                "snapshot at {} doesn't look like an execlaw DB (missing schema_version table)",
+                from.display()
+            );
+        }
+    }
+
+    if db_path.exists() && !force {
+        let size = std::fs::metadata(&db_path)
+            .map(|m| m.len())
+            .unwrap_or_default();
+        if size > 0 {
+            anyhow::bail!(
+                "target {} is non-empty ({} bytes); pass --force to overwrite",
+                db_path.display(),
+                size,
+            );
+        }
+    }
+
+    if let Some(parent) = db_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    // Atomic-ish: write to a sibling tempfile, then rename. Rename
+    // on the same filesystem is atomic on every supported OS.
+    let tmp = db_path.with_extension("restore.tmp");
+    if tmp.exists() {
+        std::fs::remove_file(&tmp)?;
+    }
+    std::fs::copy(&from, &tmp)?;
+    if db_path.exists() {
+        std::fs::remove_file(&db_path)?;
+    }
+    std::fs::rename(&tmp, &db_path)?;
+
+    println!(
+        "restore: {} -> {} ({} bytes)",
+        from.display(),
+        db_path.display(),
+        std::fs::metadata(&db_path)
+            .map(|m| m.len())
+            .unwrap_or_default()
+    );
+    Ok(())
+}
+
 /// Parse `12..48` (inclusive on both ends).
 fn parse_range(s: &str) -> anyhow::Result<(i64, i64)> {
     let mut parts = s.splitn(2, "..");
@@ -943,6 +1129,23 @@ fn main() -> ExitCode {
                 no_encrypt,
             } => cmd_eval_list(label, db.unwrap_or_else(default_db_path), no_encrypt),
         },
+        Command::BackfillEvents { db, no_encrypt } => {
+            cmd_backfill_events(db.unwrap_or_else(default_db_path), no_encrypt)
+        }
+        Command::Backup { to, db, no_encrypt } => {
+            cmd_backup(to, db.unwrap_or_else(default_db_path), no_encrypt)
+        }
+        Command::Restore {
+            from,
+            db,
+            force,
+            no_encrypt,
+        } => cmd_restore(
+            from,
+            db.unwrap_or_else(default_db_path),
+            force,
+            no_encrypt,
+        ),
     })();
 
     match result {

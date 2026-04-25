@@ -1,17 +1,18 @@
 # execlaw build STATUS
 
-Last update: 2026-04-25, after Phase 7 first wave (deployment editor end-to-end + event-log HMAC key-rotation + log retention sweeper).
+Last update: 2026-04-25, after Phase 7 second wave (NULL-tag back-fill verifier + backup/restore + multi-controller users) + sub-phase carve-out.
 
 ## TL;DR
 
 - `cargo build --workspace` — **clean**
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **417 passing, 0 failing**
+- `cargo test --workspace --no-fail-fast` — **431 passing, 0 failing** (+14 vs wave 1)
 - `cargo bench --workspace --no-run` — **clean** (45 benches across 9 crates)
-- `cd web && npm test` — **102 passing** (jsdom + react-testing-library)
-- `cd web && npm run build` — **clean** (294 KB JS / 307 KB CSS, both well under budget)
+- `cd web && npm test` — **107 passing** (+5 vs wave 1: UsersPage)
+- `cd web && npm run build` — **clean** (306 KB JS / 311 KB CSS, both well under budget)
 - **Zero cloud-SDK dependencies** anywhere in the workspace
-- **Phase 7 in progress.** First wave shipped: (a) **runner-deployment editor** — backend CRUD on `config_runner_deployments` + audit-logged + SPA Settings → Deployments page; (b) **event-log HMAC key rotation** — `KeyRing` primitive lets old rows verify under their original `key_id` while new rows pick up the rotated current key; (c) **log retention sweeper** — `LogRetentionSweeper` purges `log_entries` past 30d, runs alongside the existing `EphemeralSweeper` in the server's tokio runtime.
+- **Phase 7 wave 2 done.** Shipped: (a) **NULL-tag back-fill verifier** — `EventLog::backfill_null_tags()` requires a `KeyRing`, signs every NULL-tag row under the current key, idempotent; CLI `execlaw backfill-events`; (b) **Backup + restore** — atomic `VACUUM INTO` snapshot, validation-on-restore, CLI `execlaw backup --to <path>` / `execlaw restore --from <path>`, inherits SQLCipher posture; (c) **Multi-controller users** — list / invite / delete with last-controller + cannot-self-delete invariants, audit-logged, SPA Settings → Users page (role-gated UI, role badges, confirm-delete).
+- **Phase 7 wave 3** carved into named sub-phases in MIGRATION_PLAN.md: **7d** WASM plugin tier, **7e** WebAuthn controller auth, **7f** advanced subagents — each large enough to deserve its own design pass.
 
 ## Migration-plan phase structure (post-2026-04-24 refactor)
 
@@ -26,7 +27,7 @@ Phase 2 used to conflate "plugin framework" with "port every selfhosted-claw int
 | 4 — Voice pipeline primitives (pure Rust; real-audio demos move to Phase 8) | two-lane graph, Vad/Audio/Stt/Tts traits + mocks, `VoiceSession` orchestrator, voice event schema wired to state_events, endpointer, barge-in | ✅ done |
 | 5 — Observability, evaluation, replay CLI (infra only) | tracing→SQLite layer, `GET /api/admin/logs`, `GET /api/admin/eval/flags`, `execlaw replay <conv> --at <seq>`, `execlaw eval flag/list`, eval-harness binary + rubric scaffolding | ✅ done (UI components for log viewer + dashboard land in Phase 6) |
 | 6 — UI port, chat-first landing | React + GSAP SPA: setup → login → chat (sidebar, thread list, streaming + cursor, channel-origin icons, long-msg truncation, external-channel filter, plugin UI panels) → settings (plugins/principals/hardware/logs/eval/audit), inline approval card with verbs, thread rename, incognito toggle, plugin install, trust revoke | ✅ done |
-| 7 — Hardening | deployment editor + backend, WASM tier, WebAuthn, key rotation, multi-controller, log retention | ongoing |
+| 7 — Hardening | wave 1 (deployment editor + key rotation + log retention) ✅, wave 2 (back-fill verifier + backup/restore + multi-controller users) ✅, wave 3 carved into 7d (WASM tier), 7e (WebAuthn), 7f (advanced subagents) | ongoing |
 | 8 — **External plugin ports** (open-ended) | every plugin that needs creds/external-services — see [plugin-inventory.md](docs/plugin-inventory.md) | queue; no ports started |
 | 9 — **Surface ports & native targets** (last phase) | 9a Tauri Desktop wrapper (same React bundle in a webview + OS notifications); 9b iOS / Android native (parallel component layer, Tamagui or similar) | queue |
 
@@ -98,37 +99,41 @@ EXECLAW_INFERENCE_URL=http://127.0.0.1:8000/v1 cargo start
 ## Test counts (per crate)
 
 ```
-execlaw-core             113     DB, events (+HMAC sign/verify + atomicity),
+execlaw-core             155     DB, events (+HMAC sign/verify + atomicity +
+                                 NULL-tag backfill happy-path/idempotent/
+                                 rejects-without-keyring/key-id stamping),
                                  outbox (+claim/record_failure/ready_pending),
                                  alerts, memory, principals (+PrincipalStore),
                                  idempotency keys, snapshots, HMAC
                                  tamper-tests, migrations, conversation kind
                                  derivation, eval_flagged store, log query,
-                                 UserStore (Phase-6 prep), thread metadata
+                                 UserStore (list_all ordering, idempotent
+                                 delete, count_by_role for last-controller
+                                 invariant), thread metadata
                                  (display_name/pinned/ephemeral mutators
                                  with upsert-preservation invariant),
                                  ConversationResolver (controller short-
                                  circuit, idle rotation, single-current-row
                                  invariant, atomic transactions),
-                                 EphemeralSweeper (purge + last_seq reset
-                                 + idempotency + boundary + run-loop)
-execlaw-server            71     auth, events (WS bus), capability tokens,
+                                 EphemeralSweeper, KeyRing rotation
+execlaw-server            90     auth, events (WS bus), capability tokens,
                                  chat routes (streaming, policy, crash tests,
                                  cold-contact adversarial, identity-match
                                  classifier), tool_dispatch, tracing_layer,
                                  /api/ping setup-detection, /api/admin/me
-                                 with JWT extractor, PATCH /api/chats/:id
-                                 (auth, three-valued display_name, incognito
-                                 toggle), GET /api/admin/plugins/ui_panels
-                                 (sorted, empty, exclude-non-panel-plugins),
-                                 GET /api/chats (auth, empty, pinned-first
-                                 ordering), OpenAPI coverage guard for all
-                                 22 routes, login leak-prevention,
-                                 username invalid-shape rejection
-execlaw-server (integ)    18     plugin_lifecycle (11) + approval_flow (7)
+                                 with JWT extractor, PATCH /api/chats/:id,
+                                 GET /api/admin/plugins/ui_panels,
+                                 GET /api/chats, deployments CRUD,
+                                 multi-controller users (list/invite/delete
+                                 + cannot-self-delete + last-controller-
+                                 invariant + operator-cannot-mutate),
+                                 OpenAPI coverage guard for every route,
+                                 login leak-prevention, username
+                                 invalid-shape rejection
+execlaw-server (integ)    22     plugin_lifecycle (11) + approval_flow (11)
 execlaw-policy            43     rule_of_two, trust evaluator, spotlighting,
                                  sideband, input_guard, JWT claims
-execlaw-voice-pipeline    34     frames, two-lane graph, endpointer, bargein,
+execlaw-voice-pipeline    41     frames, two-lane graph, endpointer, bargein,
                                  traits (MockAudioIn/Out, MockVad, MockStt,
                                  MockTts), VoiceSession (speech→LLM→TTS,
                                  barge-in rescind/confirm, sentence splitter)
@@ -145,9 +150,9 @@ execlaw-outbox            11     backoff, retry budget, drain, WakeupScheduler (
 execlaw-session            1     modality binding
 execlaw-eval-harness       2     rubric parse, mock-mode orchestration
 --------------------------------------------------------------------
-TOTAL                    376 passing, 0 failing
+TOTAL                    431 passing, 0 failing
 
-execlaw-web (vitest)      56     api/client + endpoints + tokens + auth boot,
+execlaw-web (vitest)     107     api/client + endpoints + tokens + auth boot,
                                  SetupWizard form validation (incl. username),
                                  ScreenTransition smoke, AppBoot routing,
                                  chat store (idempotent append, pinned/unread
@@ -155,7 +160,14 @@ execlaw-web (vitest)      56     api/client + endpoints + tokens + auth boot,
                                  WsClient dispatch + malformed-payload guards,
                                  Composer (Enter / Shift+Enter / disabled),
                                  Sidebar (empty, ordering, click activates,
-                                 unread + thinking icon swap)
+                                 unread + thinking icon swap), settings shell
+                                 (tabs route, active marker), admin pages
+                                 (hardware/logs/eval/principals/audit),
+                                 plugins page, deployments page (CRUD form +
+                                 model_spec JSON validation), UsersPage
+                                 (list, role badge + 'you' marker, invite
+                                 form POST body, delete confirm flow,
+                                 operator read-only view)
 ```
 
 ## Benchmarks (cargo bench --workspace)
@@ -240,6 +252,10 @@ execlaw-web (vitest)      56     api/client + endpoints + tokens + auth boot,
 | Transport→thread routing + Controller short-circuit | `crates/core/src/transport_conversations.rs` |
 | Incognito-thread sweeper | `crates/core/src/ephemeral_sweeper.rs` |
 | Operator users + auth lookup | `crates/core/src/users.rs` |
+| Multi-controller HTTP routes (list/invite/delete) | `crates/server/src/users.rs` |
+| Event-log key ring + back-fill verifier | `crates/core/src/events.rs::backfill_null_tags` |
+| Backup / restore CLI | `crates/cli/src/main.rs::cmd_backup` + `cmd_restore` |
+| Settings → Users SPA page | `web/src/settings/UsersPage.tsx` |
 | Thread metadata route (PATCH) | `crates/server/src/chats.rs::patch_thread` |
 | UI-panel manifest route | `crates/server/src/plugins.rs::list_ui_panels_handler` |
 | Thread-name agent tool | `crates/runner-local/src/thread_tool.rs` |

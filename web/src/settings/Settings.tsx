@@ -21,10 +21,12 @@ import { EvalFlagsPage } from "./EvalFlagsPage";
 import { PrincipalsPage } from "./PrincipalsPage";
 import { AuditPage } from "./AuditPage";
 import { DeploymentsPage } from "./DeploymentsPage";
+import { UsersPage } from "./UsersPage";
 
 const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     { to: "/settings/plugins", icon: "bi-plug", label: "Plugins" },
     { to: "/settings/deployments", icon: "bi-server", label: "Deployments" },
+    { to: "/settings/users", icon: "bi-person-gear", label: "Users" },
     { to: "/settings/principals", icon: "bi-people", label: "Principals" },
     { to: "/settings/hardware", icon: "bi-cpu", label: "Hardware" },
     { to: "/settings/logs", icon: "bi-list-columns", label: "Logs" },
@@ -123,6 +125,7 @@ export function Settings() {
                         />
                         <Route path="plugins" element={<PluginsPage />} />
                         <Route path="deployments" element={<DeploymentsPage />} />
+                        <Route path="users" element={<UsersPage />} />
                         <Route path="principals" element={<PrincipalsPage />} />
                         <Route path="hardware" element={<HardwarePage />} />
                         <Route path="logs" element={<LogsPage />} />

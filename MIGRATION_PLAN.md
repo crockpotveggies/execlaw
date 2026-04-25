@@ -2332,17 +2332,33 @@ Note: the original Phase-6 stack called for `react-native-web` + Reanimated to s
 
 ### Phase 7 — Hardening (ongoing)
 
+Phase 7 was originally an undifferentiated punch list of "everything left
+that touches an invariant." After the first two waves shipped, the
+remaining items split cleanly into three sub-phases each large enough to
+deserve its own scope acknowledgement, design pass, and test plan. They
+are listed here so they don't get smuggled into a "wave 3" without
+deliberate planning.
+
+**Wave 1 (✅ shipped 2026-04-25):**
 - **Deployment editor** (UI + backend) — `config_runner_deployments`
-  CRUD, GPU pinning, model-spec validation. Backend doesn't currently
-  expose CRUD routes; Phase 7 lands them and the SPA editor together.
-- WASM plugin tier (second isolation option after subprocess — §4.4 tier 3)
-- WebAuthn controller auth
-- Log retention + privacy controls (PII policies for OTEL spans)
-- Backup + restore, DR runbook
-- Multi-controller support (delegation of capabilities, time-bounded grants)
-- Advanced subagents (guardrails, research fan-out) — only after everything above is solid
-- Event-log HMAC key rotation (currently single-key per §7.8)
-- Background back-fill verifier for legacy NULL-tagged `state_events` rows → flip `tag` column to NOT NULL in migration 0004
+  CRUD with GPU pinning, model-spec JSON validation, audit-logged via
+  `AuditStore`, SPA Settings → Deployments page with create/edit/delete
+  modal. 16 server tests + 4 SPA tests + 3 Criterion benches.
+- **Event-log HMAC key rotation** — `KeyRing` primitive (`crates/core/src/event_hmac.rs`). Old rows verify under their original `key_id`; new rows pick up the rotated current key. Migration 0004a adds `key_id INTEGER`. CLI: `execlaw rotate-event-key`. 6 unit tests covering rotation, mid-rotation appends, signature mismatch on tamper.
+- **Log retention sweeper** — `LogRetentionSweeper` purges `log_entries` past 30d. Runs alongside the existing `EphemeralSweeper` in the server's tokio runtime. Configurable per-deployment via `config_log_retention_days`. 5 unit tests.
+
+**Wave 2 (✅ shipped 2026-04-25):**
+- **Background back-fill verifier** for legacy NULL-tagged `state_events` rows. `EventLog::backfill_null_tags()` requires a `KeyRing`, scans NULL-tag rows, signs them under the current key, writes `tag + key_id` back. Idempotent. CLI: `execlaw backfill-events`. 4 unit tests including the adversarial path that rejects when no key is attached. Once the operator has run the back-fill on a given DB, migration 0004b will flip `tag` to `NOT NULL`.
+- **Backup + restore** with DR runbook. SQLite `VACUUM INTO` for atomic encrypted-at-rest snapshot; restore validates the snapshot is a real execlaw DB (schema_version table present + row count > 0) before atomic file rename. CLI: `execlaw backup --to <path>` and `execlaw restore --from <path>`. Inherits SQLCipher encryption posture from the source DB. Integration test covers full round-trip including key-ring continuity.
+- **Multi-controller users** — list / invite / delete with `count_by_role` invariant guarding "cannot remove the last controller" + "cannot self-delete". Audit-logged on every mutation. SPA Settings → Users page with role badges, invite form (Controller-only), per-row delete with confirm. 7 server tests + 5 SPA tests + 3 core tests.
+
+**Wave 3 — sub-phases (queued; each its own deliberate scope):**
+
+| Sub-phase | Scope | Notes |
+|---|---|---|
+| **7d** | **WASM plugin tier** — second isolation option after subprocess (§4.4 tier 3). `wasmtime` host, capability-scoped `wasi:` imports, manifest field `[runtime] tier = "wasm"`, hook dispatch over `wit-bindgen` interfaces, ZIP includes `.wasm` artifact. | Largest of the three. Requires building a minimal `wit` interface from the existing JSON-RPC shape, host-side capability gating that mirrors subprocess tier, sandbox-escape adversarial tests. Does NOT ship until the subprocess tier has been adversarially audited under load. |
+| **7e** | **WebAuthn controller auth** — second factor after JWT password, optional per-user. `webauthn-rs` crate, registration ceremony from Settings → Profile, login challenge wired into `/api/auth/login`, fallback to password if no credentials registered. | Smaller scope than 7d but touches the auth boundary; requires a complete unit-test sweep of every JWT issuance path AND every credential round-trip. Migration adds `state_webauthn_credentials` table. |
+| **7f** | **Advanced subagents** (guardrails, research fan-out). Subagents already default on per the locked decisions; this sub-phase formalizes (a) the planner→executor handoff under Rule of Two, (b) deep-research fan-out as the flagship, (c) per-subagent capability scoping (subagent inherits a *subset* of parent caps), (d) persistent subagent transcripts joined to the parent state_events stream. | Last in the queue per the original Phase 7 ordering: "only after everything above is solid." Touches §2.9 of this plan plus the runner-local crate. Will not start until 7d + 7e are done. |
 
 ### Phase 8 — External plugin ports (open-ended; runs in parallel once Phase 2-7 foundations hold)
 

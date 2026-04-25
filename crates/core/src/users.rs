@@ -206,6 +206,48 @@ impl<'db> UserStore<'db> {
             Ok(())
         })
     }
+
+    /// Every user row, oldest first (matches the SPA's expectation:
+    /// the controller is row 0 + invitees follow). Phase-7 multi-
+    /// controller surface: `GET /api/admin/users`.
+    pub fn list_all(&self) -> Result<Vec<UserRow>, DbError> {
+        self.db.with_conn(|c| {
+            let mut stmt = c.prepare_cached(
+                "SELECT user_id, username, display_name, email, password_hash, role, \
+                        created_at, last_login_at \
+                 FROM users ORDER BY created_at ASC, user_id ASC",
+            )?;
+            let rows = stmt
+                .query_map([], row_to_user)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Delete a user by id. Returns `true` if a row was removed,
+    /// `false` if the id was unknown.
+    pub fn delete(&self, user_id: &str) -> Result<bool, DbError> {
+        self.db.with_conn(|c| {
+            let n = c.execute("DELETE FROM users WHERE user_id = ?1", params![user_id])?;
+            Ok(n > 0)
+        })
+    }
+
+    /// Count rows with the given role. Used by the Phase-7 invite
+    /// route to enforce "at least one controller must remain" on
+    /// delete.
+    pub fn count_by_role(&self, role: UserRole) -> Result<usize, DbError> {
+        self.db.with_conn(|c| {
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM users WHERE role = ?1",
+                    params![role.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            Ok(n as usize)
+        })
+    }
 }
 
 fn row_to_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
@@ -313,6 +355,53 @@ mod tests {
             assert_eq!(UserRole::parse(role.as_str()), Some(role));
         }
         assert_eq!(UserRole::parse("admin"), None);
+    }
+
+    // ---- list_all + delete + count_by_role (Phase 7 multi-user) -----
+
+    #[test]
+    fn list_all_orders_oldest_first() {
+        let db = fresh_db();
+        let store = UserStore::new(&db);
+        let mut early = mk_user("c1", UserRole::Controller);
+        early.created_at = 100;
+        let mut mid = mk_user("op1", UserRole::Operator);
+        mid.created_at = 200;
+        let mut late = mk_user("v1", UserRole::Viewer);
+        late.created_at = 300;
+        // Insert out of order.
+        store.insert(&late).unwrap();
+        store.insert(&early).unwrap();
+        store.insert(&mid).unwrap();
+        let all = store.list_all().unwrap();
+        assert_eq!(
+            all.iter().map(|u| u.user_id.as_str()).collect::<Vec<_>>(),
+            vec!["c1", "op1", "v1"],
+        );
+    }
+
+    #[test]
+    fn delete_returns_false_for_unknown_id() {
+        let db = fresh_db();
+        let store = UserStore::new(&db);
+        assert!(!store.delete("missing").unwrap());
+        store.insert(&mk_user("c1", UserRole::Controller)).unwrap();
+        assert!(store.delete("c1").unwrap());
+        // Repeating returns false (idempotent observability).
+        assert!(!store.delete("c1").unwrap());
+        assert!(store.list_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn count_by_role_reflects_population() {
+        let db = fresh_db();
+        let store = UserStore::new(&db);
+        store.insert(&mk_user("c1", UserRole::Controller)).unwrap();
+        store.insert(&mk_user("c2", UserRole::Controller)).unwrap();
+        store.insert(&mk_user("o1", UserRole::Operator)).unwrap();
+        assert_eq!(store.count_by_role(UserRole::Controller).unwrap(), 2);
+        assert_eq!(store.count_by_role(UserRole::Operator).unwrap(), 1);
+        assert_eq!(store.count_by_role(UserRole::Viewer).unwrap(), 0);
     }
 
     // ---- normalize_username -------------------------------------------

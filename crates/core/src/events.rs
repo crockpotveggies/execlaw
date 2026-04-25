@@ -243,6 +243,26 @@ pub struct EventLog<'db> {
     key_ring: Option<KeyRing>,
 }
 
+/// Outcome of [`EventLog::backfill_null_tags`].
+///
+/// `signed` is the count of rows whose `tag` was NULL and that we
+/// successfully filled in under the ring's current key.
+/// `null_remaining` is what's left after the pass — should be `0` on
+/// success. Once that holds across the fleet, the operator can flip
+/// `state_events.tag` to NOT NULL via a follow-up migration.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackfillReport {
+    pub signed: usize,
+    pub skipped: usize,
+    pub null_remaining: usize,
+}
+
+/// Row shape pulled from `state_events` during back-fill: the six
+/// columns that feed canonical-bytes signing (conv_id, seq, kind,
+/// payload, committed_at, actor). Aliased so clippy doesn't trip on
+/// the tuple width and so the SELECT + the destructure stay in sync.
+type NullTagRow = (String, i64, String, Vec<u8>, i64, Option<String>);
+
 /// Multi-key HMAC ring used by `EventLog` for signing + verifying.
 ///
 /// `current_id` is what every new append signs under. Verification
@@ -393,6 +413,102 @@ impl<'db> EventLog<'db> {
             )));
         }
         Ok(())
+    }
+
+    /// Walk every `state_events` row and sign any whose `tag` is NULL
+    /// under the ring's current key. Phase-7 Hardening item: lets us
+    /// flip `state_events.tag` to NOT NULL once every row carries a
+    /// signature.
+    ///
+    /// Idempotent: re-running after the first pass returns
+    /// `signed = 0`. Requires a key ring to be attached — without
+    /// one, returns `Err(Config)` since blindly leaving `tag = NULL`
+    /// across a back-fill would defeat the purpose.
+    pub fn backfill_null_tags(&self) -> Result<BackfillReport, DbError> {
+        let ring = self.key_ring.as_ref().ok_or_else(|| {
+            DbError::Config(
+                "backfill_null_tags requires a KeyRing — attach via with_key_ring or with_hmac_key"
+                    .into(),
+            )
+        })?;
+        let key = ring.current_key().ok_or_else(|| {
+            DbError::Config("KeyRing has no key registered for current_id".into())
+        })?;
+        let key_id = ring.current_id;
+
+        // Pull the rows that still need signatures. Linear scan is
+        // fine — back-fill runs at most once per fleet, before the
+        // operator flips the column constraint.
+        let null_rows: Vec<NullTagRow> =
+            self.db.with_conn(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT conversation_id, seq, kind, payload, committed_at, actor \
+                     FROM state_events \
+                     WHERE tag IS NULL",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Vec<u8>>(3)?,
+                            r.get::<_, i64>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })?;
+
+        let mut signed = 0usize;
+        for (conv_id, seq, kind_str, payload, committed_at, actor) in null_rows {
+            let canon = crate::event_hmac::canonical_bytes(
+                &conv_id,
+                seq,
+                &kind_str,
+                committed_at,
+                actor.as_deref(),
+                &payload,
+            );
+            let tag = crate::event_hmac::sign_event(key, &canon).to_vec();
+            self.db.with_conn(|c| {
+                c.execute(
+                    "UPDATE state_events SET tag = ?1, key_id = ?2 \
+                     WHERE conversation_id = ?3 AND seq = ?4",
+                    params![tag, key_id, conv_id, seq],
+                )?;
+                Ok(())
+            })?;
+            signed += 1;
+        }
+
+        // Quick stats for the report.
+        let null_remaining: i64 = self.db.with_conn(|c| {
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM state_events WHERE tag IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            Ok(n)
+        })?;
+        let signed_total: i64 = self.db.with_conn(|c| {
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM state_events WHERE tag IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            Ok(n)
+        })?;
+        Ok(BackfillReport {
+            signed,
+            skipped: (signed_total as usize).saturating_sub(signed),
+            null_remaining: null_remaining as usize,
+        })
     }
 
     /// Append one event. Enforces `(conversation_id, seq)` uniqueness via
@@ -1377,6 +1493,143 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stored, 0);
+    }
+
+    // ---- Phase 7: NULL-tag back-fill verifier ----------------------
+
+    #[test]
+    fn backfill_signs_null_tag_rows_under_current_key() {
+        let db = fresh_db();
+        let cid = ConversationId::from("conv-bf");
+        // Step 1: keyless append → row lands with tag = NULL.
+        let keyless = EventLog::new(&db);
+        keyless
+            .append(
+                &EventRecord::new(
+                    cid.clone(),
+                    EventSeq::FIRST,
+                    EventKind::UserMsg,
+                    &serde_json::json!({"x": 1}),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        keyless
+            .append(
+                &EventRecord::new(
+                    cid.clone(),
+                    EventSeq(2),
+                    EventKind::UserMsg,
+                    &serde_json::json!({"x": 2}),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // Step 2: attach a key ring + run back-fill.
+        let ring = KeyRing::single(7, b"backfill-key-32-bytes-long!!!!!!".to_vec());
+        let log = EventLog::new(&db).with_key_ring(ring);
+        let report = log.backfill_null_tags().unwrap();
+        assert_eq!(report.signed, 2);
+        assert_eq!(report.null_remaining, 0);
+
+        // Step 3: replay verifies the now-signed rows.
+        let got = log.replay_since(&cid, EventSeq(0)).unwrap();
+        assert_eq!(got.len(), 2);
+
+        // Step 4: idempotent — second run signs nothing.
+        let again = log.backfill_null_tags().unwrap();
+        assert_eq!(again.signed, 0);
+        assert_eq!(again.null_remaining, 0);
+    }
+
+    #[test]
+    fn backfill_writes_current_key_id() {
+        let db = fresh_db();
+        let cid = ConversationId::from("conv-bf-id");
+        EventLog::new(&db)
+            .append(
+                &EventRecord::new(
+                    cid.clone(),
+                    EventSeq::FIRST,
+                    EventKind::UserMsg,
+                    &serde_json::json!({}),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let ring = KeyRing::single(42, b"some-key-32-bytes-long!!!!!!!!!!".to_vec());
+        EventLog::new(&db).with_key_ring(ring).backfill_null_tags().unwrap();
+        let stored: i64 = db
+            .with_conn(|c| {
+                let id: i64 = c
+                    .query_row(
+                        "SELECT key_id FROM state_events WHERE conversation_id = ?1",
+                        params![cid.as_str()],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                Ok(id)
+            })
+            .unwrap();
+        assert_eq!(stored, 42);
+    }
+
+    /// Without a ring attached, back-fill refuses to run rather than
+    /// leaving rows unsigned. Adversarial guard so a misconfigured
+    /// operator can't accidentally produce a no-op.
+    #[test]
+    fn backfill_without_keyring_is_rejected() {
+        let db = fresh_db();
+        let log = EventLog::new(&db);
+        let err = log.backfill_null_tags().unwrap_err();
+        assert!(matches!(err, DbError::Config(msg) if msg.contains("KeyRing")));
+    }
+
+    /// Already-signed rows are left alone — `signed` only counts
+    /// rows that were NULL at the start of the pass.
+    #[test]
+    fn backfill_skips_rows_that_already_have_tag() {
+        let db = fresh_db();
+        let cid = ConversationId::from("conv-bf-skip");
+        let ring = KeyRing::single(1, b"k1-32-bytes-long!!!!!!!!!!!!!!!!".to_vec());
+        // Sign one row immediately.
+        EventLog::new(&db)
+            .with_key_ring(ring.clone())
+            .append(
+                &EventRecord::new(
+                    cid.clone(),
+                    EventSeq::FIRST,
+                    EventKind::UserMsg,
+                    &serde_json::json!({}),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        // Append another one keyless (NULL tag).
+        EventLog::new(&db)
+            .append(
+                &EventRecord::new(
+                    cid.clone(),
+                    EventSeq(2),
+                    EventKind::UserMsg,
+                    &serde_json::json!({}),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let report = EventLog::new(&db)
+            .with_key_ring(ring)
+            .backfill_null_tags()
+            .unwrap();
+        assert_eq!(report.signed, 1);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.null_remaining, 0);
     }
 
     // ---- end Phase 7 -----------------------------------------------

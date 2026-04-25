@@ -517,6 +517,60 @@ export async function listUiPanels(
     );
 }
 
+// ---- /api/admin/users (multi-controller) --------------------------
+
+export type UserRole = "controller" | "operator" | "viewer";
+
+export interface UserView {
+    user_id: string;
+    username: string;
+    display_name: string;
+    email: string | null;
+    role: UserRole;
+    created_at: number;
+    last_login_at: number | null;
+}
+
+export interface UserListResponse {
+    users: UserView[];
+}
+
+export interface InviteUserRequest {
+    username: string;
+    display_name: string;
+    initial_password: string;
+    role: UserRole;
+    email?: string;
+}
+
+export async function listUsers(
+    tokenAccessor: () => string | null,
+): Promise<UserListResponse> {
+    return apiFetch<UserListResponse>("/api/admin/users", {}, tokenAccessor);
+}
+
+export async function inviteUser(
+    body: InviteUserRequest,
+    tokenAccessor: () => string | null,
+): Promise<UserView> {
+    return apiFetch<UserView>(
+        "/api/admin/users/invite",
+        { method: "POST", body },
+        tokenAccessor,
+    );
+}
+
+export async function deleteUser(
+    userId: string,
+    tokenAccessor: () => string | null,
+): Promise<unknown> {
+    return apiFetch(
+        `/api/admin/users/${encodeURIComponent(userId)}`,
+        { method: "DELETE" },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/audit ---------------------------------------------
 
 export interface AuditEntry {

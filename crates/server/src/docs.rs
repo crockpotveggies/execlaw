@@ -25,6 +25,7 @@ use crate::deployments::{
     CreateDeploymentRequest, DeploymentListResponse, DeploymentView,
     UpdateDeploymentRequest,
 };
+use crate::users::{InviteUserRequest, UserListResponse, UserView};
 use crate::plugins::{
     InstallResponse, PluginListResponse, PluginSummary, ToolSummary, UiPanelListResponse,
     UiPanelSummary,
@@ -104,6 +105,10 @@ impl Modify for SecurityAddon {
         crate::deployments::create_handler,
         crate::deployments::update_handler,
         crate::deployments::delete_handler,
+        // users (multi-controller)
+        crate::users::list_handler,
+        crate::users::invite_handler,
+        crate::users::delete_handler,
     ),
     components(schemas(
         HealthResponse,
@@ -131,6 +136,9 @@ impl Modify for SecurityAddon {
         DeploymentListResponse,
         CreateDeploymentRequest,
         UpdateDeploymentRequest,
+        UserView,
+        UserListResponse,
+        InviteUserRequest,
     )),
     tags(
         (name = "meta", description = "Liveness + introspection"),
@@ -310,6 +318,9 @@ mod tests {
             ("/api/admin/audit", &["get"]),
             ("/api/admin/deployments", &["get", "post"]),
             ("/api/admin/deployments/{id}", &["patch", "delete"]),
+            ("/api/admin/users", &["get"]),
+            ("/api/admin/users/invite", &["post"]),
+            ("/api/admin/users/{user_id}", &["delete"]),
             ("/api/admin/approvals", &["get"]),
             ("/api/admin/approvals/{approval_id}/respond", &["post"]),
             ("/api/admin/principals", &["get"]),
