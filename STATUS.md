@@ -1,17 +1,17 @@
 # execlaw build STATUS
 
-Last update: 2026-04-25, after Phase 6a-c closeout (React+GSAP swap, settings shell with admin pages, approval verbs, thread rename, incognito toggle, plugin install, trust revoke).
+Last update: 2026-04-25, after Phase 6 closeout (Tauri moved to Phase 7; audit page + endpoint added; per-page SPA tests).
 
 ## TL;DR
 
 - `cargo build --workspace` — **clean**
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **380 passing, 0 failing**
-- `cargo bench --workspace --no-run` — **clean** (43 benches across 9 crates)
-- `cd web && npm test` — **70 passing** (jsdom + react-testing-library)
-- `cd web && npm run build` — **clean** (289 KB JS / 310 KB CSS, both well under budget)
+- `cargo test --workspace --no-fail-fast` — **388 passing, 0 failing**
+- `cargo bench --workspace --no-run` — **clean** (44 benches across 9 crates)
+- `cd web && npm test` — **87 passing** (jsdom + react-testing-library)
+- `cd web && npm run build` — **clean** (284 KB JS / 307 KB CSS, both well under budget)
 - **Zero cloud-SDK dependencies** anywhere in the workspace
-- Phases 0–6c complete (only **6d Tauri Desktop wrapper** remains in Phase 6). SPA on plain React + GSAP covers: setup → login → chat (sidebar / thread list / streaming / inline approval card with verbs / thread rename / incognito toggle) → settings (plugins / principals / hardware / logs / eval-flags) with plugin install + trust revoke writes.
+- **Phase 6 complete.** Tauri Desktop wrapper moved to Phase 7 hardening. SPA on plain React + GSAP covers: setup → login → chat (sidebar / thread list / streaming / inline approval card with verbs / thread rename / incognito toggle) → settings (plugins / principals / hardware / logs / eval flags / **audit**) with plugin install + trust revoke writes. Each settings page has component tests; chat surface has store / WS / composer / sidebar / approval-card specs.
 
 ## Migration-plan phase structure (post-2026-04-24 refactor)
 
@@ -192,6 +192,7 @@ execlaw-web (vitest)      56     api/client + endpoints + tokens + auth boot,
 | `list_thread_summaries/threads/10` | 6.6 µs | ≤5 ms for 1k | sidebar mount + state.changed event |
 | `list_thread_summaries/threads/100` | 95 µs | ≤5 ms for 1k | linear |
 | `list_thread_summaries/threads/1000` | 963 µs | ≤5 ms for 1k | ~1 µs/thread, comfortably under budget |
+| `principal_store/list_all_100` | 117 µs | ≤5 ms for 1k | powers /api/admin/principals settings page |
 
 ## Grounding-rule compliance (re-audited this session)
 

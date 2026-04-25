@@ -400,6 +400,36 @@ export async function getEvalFlags(
     return apiFetch<EvalFlagsResponse>(path, {}, tokenAccessor);
 }
 
+// ---- /api/admin/audit ---------------------------------------------
+
+export interface AuditEntry {
+    id: number;
+    ts: number;
+    actor: string;
+    table_name: string;
+    row_id: string;
+    old_json: unknown;
+    new_json: unknown;
+}
+
+export interface AuditResponse {
+    entries: AuditEntry[];
+}
+
+export async function getAuditEntries(
+    sinceTs: number | undefined,
+    limit: number | undefined,
+    tokenAccessor: () => string | null,
+): Promise<AuditResponse> {
+    const qs = new URLSearchParams();
+    if (sinceTs !== undefined) qs.set("since_ts", String(sinceTs));
+    if (limit !== undefined) qs.set("limit", String(limit));
+    const path = qs.toString()
+        ? `/api/admin/audit?${qs.toString()}`
+        : "/api/admin/audit";
+    return apiFetch<AuditResponse>(path, {}, tokenAccessor);
+}
+
 // ---- /api/admin/principals + /api/admin/approvals -----------------
 
 export interface PrincipalIdentifier {

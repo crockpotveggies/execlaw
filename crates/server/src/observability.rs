@@ -15,6 +15,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{Router, routing::get};
+use execlaw_core::audit::AuditStore;
 use execlaw_core::eval::EvalFlaggedStore;
 use execlaw_core::logs::{LogLevel, LogStore};
 use serde::{Deserialize, Serialize};
@@ -189,8 +190,191 @@ pub async fn eval_flags_handler(
         .into_response()
 }
 
+// ---------------------------------------------------------------------------
+// Config-audit feed
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Default)]
+pub struct AuditQuery {
+    /// Inclusive lower bound on `ts` (unix seconds).
+    pub since_ts: Option<i64>,
+    /// Hard cap; default 200, max 1000.
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuditEntryView {
+    pub id: i64,
+    pub ts: i64,
+    pub actor: String,
+    pub table_name: String,
+    pub row_id: String,
+    pub old_json: Option<serde_json::Value>,
+    pub new_json: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuditResponse {
+    pub entries: Vec<AuditEntryView>,
+}
+
+/// `GET /api/admin/audit` — recent rows from `config_audit`, newest
+/// first. Empty until config-write routes start writing entries
+/// (Phase 7 deployment editor onward).
+#[utoipa::path(
+    get,
+    path = "/api/admin/audit",
+    params(
+        ("since_ts" = Option<i64>, Query, description = "Inclusive lower bound on ts (unix seconds)"),
+        ("limit" = Option<i64>, Query, description = "1..=1000, default 200"),
+    ),
+    responses(
+        (status = 200, description = "Config-mutation audit entries"),
+        (status = 401, description = "Missing or invalid Authorization header"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "observability"
+)]
+pub async fn audit_handler(
+    State(state): State<AppState>,
+    _user: crate::auth_extract::AuthedUser,
+    Query(q): Query<AuditQuery>,
+) -> impl IntoResponse {
+    let store = AuditStore::new(&state.db);
+    let limit = q.limit.unwrap_or(200);
+    let rows = match store.list(q.since_ts, limit) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("audit list: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "audit query failed"})),
+            )
+                .into_response();
+        }
+    };
+    let entries: Vec<AuditEntryView> = rows
+        .into_iter()
+        .map(|r| AuditEntryView {
+            id: r.id,
+            ts: r.ts,
+            actor: r.actor,
+            table_name: r.table_name,
+            row_id: r.row_id,
+            old_json: r.old_json,
+            new_json: r.new_json,
+        })
+        .collect();
+    (StatusCode::OK, Json(serde_json::json!(AuditResponse { entries })))
+        .into_response()
+}
+
 pub fn observability_router() -> Router<AppState> {
     Router::new()
         .route("/api/admin/logs", get(logs_handler))
         .route("/api/admin/eval/flags", get(eval_flags_handler))
+        .route("/api/admin/audit", get(audit_handler))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routes::{build_router, test_app_state};
+    use axum::body::{self, Body};
+    use axum::http::{Method, Request, header};
+    use tower::ServiceExt;
+
+    async fn setup_get_token(app: &axum::Router) -> String {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "username": "tester",
+            "admin_password": "hunter2-longer",
+            "display_name": "Tester",
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/setup")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        v["access_token"].as_str().unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    async fn audit_requires_auth() {
+        let app = build_router(test_app_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/admin/audit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn audit_returns_empty_on_fresh_db() {
+        let app = build_router(test_app_state());
+        let token = setup_get_token(&app).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/admin/audit")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["entries"].is_array());
+        assert_eq!(v["entries"].as_array().unwrap().len(), 0);
+    }
+
+    /// Inserted rows surface in the GET feed.
+    #[tokio::test]
+    async fn audit_lists_inserted_rows() {
+        let state = test_app_state();
+        // Pre-populate via the store directly; the feed hits the same DB.
+        AuditStore::new(&state.db)
+            .insert(
+                "controller-1",
+                "config_alert_routing",
+                "row-x",
+                None,
+                Some(&serde_json::json!({"k": "v"})),
+            )
+            .unwrap();
+        let app = build_router(state);
+        let token = setup_get_token(&app).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/admin/audit")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = v["entries"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["actor"], "controller-1");
+        assert_eq!(arr[0]["table_name"], "config_alert_routing");
+        assert_eq!(arr[0]["new_json"]["k"], "v");
+    }
 }

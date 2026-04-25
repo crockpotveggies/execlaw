@@ -2310,20 +2310,21 @@ same bundle ships everywhere.
 
 #### Sub-phasing
 
-| Sub-phase | Scope | Estimated time |
-|---|---|---|
-| **6a** | Vite scaffold + react-native-web + react-bootstrap + Bootstrap Icons + JWT auth + WS event bus + chat view + inline approval card + Control-thread merge + setup-wizard route | 1-2 wk |
-| **6b** | Admin read-views: plugins, principals, hardware, deployments, eval flags, logs, audit | 1-2 wk |
-| **6c** | Writes: setup wizard, plugin install upload, approval verbs, trust revoke, deployment editor, incognito toggle, thread rename | 1-2 wk |
-| **6d** | Tauri Desktop wrapper (same bundle, Tauri webview, OS notifications for cold-contact alerts) | 1 wk |
-| **6e+** | iOS / Android native — parallel component layer (Tamagui or similar); voice UI deferred to Phase 8 | post-Phase-6 |
+| Sub-phase | Scope | Estimated time | Status |
+|---|---|---|---|
+| **6a** | Vite scaffold + React + react-bootstrap + Bootstrap Icons + JWT auth + WS event bus + chat view + inline approval card + Control-thread merge + setup-wizard route | 1-2 wk | ✅ done |
+| **6b** | Admin read-views: plugins, principals, hardware, eval flags, logs, audit (deployment editor moves to Phase 7 once the deployments backend lands) | 1-2 wk | ✅ done |
+| **6c** | Writes: plugin install upload, approval verbs, trust revoke, incognito toggle, thread rename (deployment editor → Phase 7) | 1-2 wk | ✅ done |
+
+Note: the original Phase-6 stack called for `react-native-web` + Reanimated to share a codebase with iOS/Android. Phase 6a tried that and the RN-on-Vite plumbing produced a stream of CJS/ESM and runtime crashes; the SPA was rebuilt on plain React + GSAP. Native iOS / Android targets are **deferred** to a Phase 9+ port that will add a parallel component layer (Tamagui / similar) — they're not blocking 6.
 
 #### Out of scope for Phase 6
 
 - Voice UI (push-to-talk recorder + audio playback) — Phase 8 with the real audio plugins.
-- Native iOS / Android — Phase 6e+, after the cross-platform layer settles.
+- Tauri Desktop wrapper — moved to Phase 7 (hardening). The web bundle ships first; Tauri is one webview around it.
+- Native iOS / Android — post Phase 8, after a parallel component layer is chosen.
 
-- **Phase 6 demo (web + Tauri):** First-run hits `/api/ping → setup`,
+- **Phase 6 demo (web only):** First-run hits `/api/ping → setup`,
   routes to the wizard, controller sets a password + sees the hardware
   profile, lands on the chat view. Sends a message; tokens stream in.
   Opens a new incognito thread, has a conversation, closes it; events
@@ -2333,6 +2334,13 @@ same bundle ships everywhere.
 
 ### Phase 7 — Hardening (ongoing)
 
+- **Tauri Desktop wrapper** (formerly Phase 6d) — wraps the existing
+  React bundle in a Tauri webview, adds OS notifications for cold-
+  contact alerts. Same SPA, no parallel component layer; just a
+  packaged shell.
+- **Deployment editor** (UI + backend) — `config_runner_deployments`
+  CRUD, GPU pinning, model-spec validation. Backend doesn't currently
+  expose CRUD routes; Phase 7 lands them and the SPA editor together.
 - WASM plugin tier (second isolation option after subprocess — §4.4 tier 3)
 - WebAuthn controller auth
 - Log retention + privacy controls (PII policies for OTEL spans)

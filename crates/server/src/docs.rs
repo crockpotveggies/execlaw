@@ -89,6 +89,7 @@ impl Modify for SecurityAddon {
         // observability
         crate::observability::logs_handler,
         crate::observability::eval_flags_handler,
+        crate::observability::audit_handler,
         // approvals
         crate::approvals::respond_handler,
         crate::approvals::revoke_handler,
@@ -293,6 +294,7 @@ mod tests {
             ("/api/admin/plugins/{plugin_id}", &["delete"]),
             ("/api/admin/logs", &["get"]),
             ("/api/admin/eval/flags", &["get"]),
+            ("/api/admin/audit", &["get"]),
             ("/api/admin/approvals", &["get"]),
             ("/api/admin/approvals/{approval_id}/respond", &["post"]),
             ("/api/admin/principals", &["get"]),

@@ -431,6 +431,16 @@ fn bench_principal_store(c: &mut Criterion) {
     group.bench_function("find_by_identifier_hit", |b| {
         b.iter(|| store.find_by_identifier(black_box(&ident)).unwrap())
     });
+
+    // list_all powers GET /api/admin/principals. Bench at scale so the
+    // Settings → Principals page stays snappy when the population
+    // grows. Reuses the 100-row population from above.
+    group.bench_function("list_all_100", |b| {
+        b.iter(|| {
+            let all = store.list_all().unwrap();
+            black_box(all);
+        })
+    });
     group.finish();
 }
 

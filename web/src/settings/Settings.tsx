@@ -18,6 +18,7 @@ import { HardwarePage } from "./HardwarePage";
 import { LogsPage } from "./LogsPage";
 import { EvalFlagsPage } from "./EvalFlagsPage";
 import { PrincipalsPage } from "./PrincipalsPage";
+import { AuditPage } from "./AuditPage";
 
 const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     { to: "/settings/plugins", icon: "bi-plug", label: "Plugins" },
@@ -25,6 +26,7 @@ const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     { to: "/settings/hardware", icon: "bi-cpu", label: "Hardware" },
     { to: "/settings/logs", icon: "bi-list-columns", label: "Logs" },
     { to: "/settings/eval", icon: "bi-bar-chart", label: "Eval flags" },
+    { to: "/settings/audit", icon: "bi-journal-text", label: "Audit" },
 ];
 
 export function Settings() {
@@ -100,6 +102,7 @@ export function Settings() {
                         <Route path="hardware" element={<HardwarePage />} />
                         <Route path="logs" element={<LogsPage />} />
                         <Route path="eval" element={<EvalFlagsPage />} />
+                        <Route path="audit" element={<AuditPage />} />
                     </Routes>
                 </div>
             </main>
