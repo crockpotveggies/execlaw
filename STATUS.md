@@ -6,7 +6,7 @@ Last update: 2026-04-25, after Phase 8a — **per-tool trust-class allowlist** g
 
 - `cargo build --workspace` — **clean** (stub mode; webauthn-rs gated behind `--features webauthn` for the Linux/Docker production build)
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **473 passing, 0 failing** (+18: 7 ToolAccessStore + 4 dispatch gate + 2 sync + 5 admin routes)
+- `cargo test --workspace --no-fail-fast` — **485 passing, 0 failing** (+12: 8 mcp-client unit + 4 stdio integration)
 - `cargo bench --workspace --no-run` — **clean** (59 benches across 9 crates; +5 tool_access_store)
 - `cd web && npm test` — **121 passing** (+4 vs 7-final: ToolsPage)
 - `cd web && npm run build` — **clean** (318 KB JS / 311 KB CSS, both well under budget)
@@ -21,7 +21,7 @@ Last update: 2026-04-25, after Phase 8a — **per-tool trust-class allowlist** g
 | Sub-phase | Scope | Status |
 |---|---|---|
 | **8a** | Generalised per-tool trust-class allowlist (foundation) | ✅ shipped |
-| **8b** | `mcp-client` crate: stdio + Streamable HTTP transports, refuses sampling, list_tools / call_tool / list_resources / read_resource | next |
+| **8b** | `mcp-client` crate: stdio transport, refuses sampling, list_tools / call_tool / list_resources / read_resource. Streamable HTTP transport deferred to 8c. | ✅ shipped |
 | **8c** | `config_mcp_servers` + connection manager, reflects tools into `config_tool_access` with `mcp:<server>:<tool>` namespacing | queued |
 | **8d** | McpDispatch wired into `ChainedToolDispatch`, Settings → MCP page, e2e test against a mock server | queued |
 

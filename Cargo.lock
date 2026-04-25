@@ -947,6 +947,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "execlaw-mcp-client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "execlaw-outbox"
 version = "0.1.0"
 dependencies = [

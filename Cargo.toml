@@ -16,6 +16,7 @@ members = [
     "crates/outbox",
     "crates/server",
     "crates/cli",
+    "crates/mcp-client",
     "plugins/hello",
     "plugins/identity-local-address-book",
     "crates/eval-harness",
