@@ -25,6 +25,9 @@ use crate::deployments::{
     CreateDeploymentRequest, DeploymentListResponse, DeploymentView,
     UpdateDeploymentRequest,
 };
+use crate::mcp_admin::{
+    McpServerListResponse, McpServerView, McpServerWriteRequest,
+};
 use crate::tools_admin::{ToolListResponse, ToolView, UpdateToolPolicyRequest};
 use crate::users::{InviteUserRequest, UserListResponse, UserView};
 use crate::plugins::{
@@ -114,6 +117,11 @@ impl Modify for SecurityAddon {
         // tools (Phase 8a per-tool trust-class allowlist)
         crate::tools_admin::list_handler,
         crate::tools_admin::update_handler,
+        // mcp (Phase 8c MCP server CRUD)
+        crate::mcp_admin::list_handler,
+        crate::mcp_admin::create_handler,
+        crate::mcp_admin::update_handler,
+        crate::mcp_admin::delete_handler,
     ),
     components(schemas(
         HealthResponse,
@@ -148,6 +156,9 @@ impl Modify for SecurityAddon {
         ToolView,
         ToolListResponse,
         UpdateToolPolicyRequest,
+        McpServerView,
+        McpServerListResponse,
+        McpServerWriteRequest,
     )),
     tags(
         (name = "meta", description = "Liveness + introspection"),
@@ -333,6 +344,9 @@ mod tests {
             ("/api/admin/users/{user_id}", &["delete"]),
             ("/api/admin/tools", &["get"]),
             ("/api/admin/tools/{tool_name}", &["patch"]),
+            ("/api/admin/mcp/servers", &["get", "post"]),
+            ("/api/admin/mcp/servers/{id}", &["post"]),
+            ("/api/admin/mcp/servers/{id}/delete", &["post"]),
             ("/api/admin/approvals", &["get"]),
             ("/api/admin/approvals/{approval_id}/respond", &["post"]),
             ("/api/admin/principals", &["get"]),

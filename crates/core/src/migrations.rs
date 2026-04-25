@@ -72,6 +72,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "tool-access",
         sql: include_str!("../migrations/0009_tool_access.sql"),
     },
+    Migration {
+        id: 10,
+        name: "mcp-servers",
+        sql: include_str!("../migrations/0010_mcp_servers.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -203,7 +208,7 @@ mod tests {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
         let runner = MigrationRunner::new(&db);
         let applied = runner.apply_all().unwrap();
-        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
         // Spot-check: every documented table exists.
         let tables = vec![
@@ -235,6 +240,7 @@ mod tests {
             "state_webauthn_credentials",
             "state_refresh_tokens",
             "config_tool_access",
+            "config_mcp_servers",
         ];
         db.with_conn(|c| {
             for t in &tables {
@@ -258,7 +264,7 @@ mod tests {
         let runner = MigrationRunner::new(&db);
         let first = runner.apply_all().unwrap();
         let second = runner.apply_all().unwrap();
-        assert_eq!(first, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(first, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         assert!(
             second.is_empty(),
             "rerun must not re-apply already-applied migrations"

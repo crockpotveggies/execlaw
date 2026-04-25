@@ -1065,6 +1065,7 @@ dependencies = [
  "execlaw-container-manager",
  "execlaw-core",
  "execlaw-inference-api",
+ "execlaw-mcp-client",
  "execlaw-plugin-host",
  "execlaw-plugin-sdk",
  "execlaw-policy",

@@ -1058,6 +1058,17 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     // of `localhost`).
     let webauthn = build_webauthn_from_env(&config.bind_addr).map(std::sync::Arc::new);
 
+    // Phase 8c: MCP connection manager. `reconcile()` spins up one
+    // tokio actor per `enabled = true, transport = stdio` row in
+    // `config_mcp_servers`, opens the connection, runs the
+    // initialise handshake, and reflects every discovered tool
+    // into `config_tool_access`.
+    let mcp_host = execlaw_server::mcp_host::McpHost::new(db.clone());
+    {
+        let mh = mcp_host.clone();
+        tokio::spawn(async move { mh.reconcile().await });
+    }
+
     let state = execlaw_server::AppState {
         db: db.clone(),
         config: config.clone(),
@@ -1068,6 +1079,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         inference,
         plugin_host,
         webauthn,
+        mcp_host,
     };
 
     // Phase-7 background workers — run for the lifetime of the

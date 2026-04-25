@@ -635,6 +635,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::users::users_router())
         .merge(crate::webauthn::webauthn_router())
         .merge(crate::tools_admin::tools_admin_router())
+        .merge(crate::mcp_admin::mcp_admin_router())
         .merge(crate::docs::docs_router())
         .with_state(state)
 }
@@ -664,12 +665,13 @@ pub fn test_app_state() -> AppState {
             b"execlaw-test-hmac-key-32-bytes!!".to_vec(),
         )),
         inference: None,
-        plugin_host: PluginHost::new(db, HookRegistry::new(), stage_root),
+        plugin_host: PluginHost::new(db.clone(), HookRegistry::new(), stage_root),
         // Test fixtures don't run the WebAuthn ceremony directly —
         // the second-factor route tests build their own AppState
         // when needed. Leaving this `None` means count_for_user
         // returns 0 and the password-only login path is exercised.
         webauthn: None,
+        mcp_host: crate::mcp_host::McpHost::new(db),
     }
 }
 

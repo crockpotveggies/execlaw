@@ -17,6 +17,7 @@ execlaw-inference-api = { path = "../inference-api" }
 execlaw-runner-local = { path = "../runner-local" }
 execlaw-plugin-host = { path = "../plugin-host" }
 execlaw-container-manager = { path = "../container-manager" }
+execlaw-mcp-client = { path = "../mcp-client" }
 futures.workspace = true
 tempfile.workspace = true
 

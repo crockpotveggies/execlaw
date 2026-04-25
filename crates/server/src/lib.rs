@@ -23,6 +23,8 @@ pub mod chats;
 pub mod deployments;
 pub mod docs;
 pub mod events;
+pub mod mcp_admin;
+pub mod mcp_host;
 pub mod observability;
 pub mod plugins;
 pub mod routes;

@@ -14,6 +14,7 @@
 //! defaults on first insert and never overwrites the operator's
 //! `enabled` / `allowed_classes` choices.
 
+use execlaw_core::mcp_servers::McpServerRow;
 use execlaw_core::tool_access::{ToolAccessSeed, ToolAccessStore, ToolSource};
 use execlaw_core::Database;
 use execlaw_plugin_host::PluginHost;
@@ -37,6 +38,19 @@ fn default_builtin_classes() -> Vec<String> {
 /// any existing flow. Operators tighten per-tool via Settings.
 fn default_plugin_classes() -> Vec<String> {
     default_builtin_classes()
+}
+
+/// Default allowlist for MCP-sourced tools. Per the locked decision
+/// (6c), new tools inherit the server's `default_allowed_classes`
+/// column. Falls back to Controller-only when the column is empty
+/// — fail-closed for any operator who hasn't explicitly broadened
+/// the allowlist.
+pub fn default_mcp_classes_for(row: &McpServerRow) -> Vec<String> {
+    if row.default_allowed_classes.is_empty() {
+        vec!["Controller".into()]
+    } else {
+        row.default_allowed_classes.clone()
+    }
 }
 
 /// Bare-name list of every built-in tool the runner crate registers.

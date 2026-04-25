@@ -29,6 +29,7 @@ pub mod events;
 pub mod ids;
 pub mod log_retention;
 pub mod logs;
+pub mod mcp_servers;
 pub mod memory;
 pub mod migrations;
 pub mod outbox;

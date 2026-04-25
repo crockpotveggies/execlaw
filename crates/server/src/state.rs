@@ -74,6 +74,11 @@ pub struct AppState {
     /// "Add WebAuthn" affordance and the login route skips the
     /// second-factor branch in that mode).
     pub webauthn: Option<crate::webauthn::SharedWebauthn>,
+    /// Phase 8c MCP connection manager. Owns one tokio actor per
+    /// configured MCP server; reflects their tools into
+    /// `config_tool_access` and dispatches tool calls when the
+    /// runner picks an `mcp:<id>:<name>` tool.
+    pub mcp_host: crate::mcp_host::McpHost,
 }
 
 impl std::fmt::Debug for AppState {
