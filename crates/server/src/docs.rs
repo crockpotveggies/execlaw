@@ -29,7 +29,9 @@ use crate::mcp_admin::{
     McpServerListResponse, McpServerView, McpServerWriteRequest,
 };
 use crate::tools_admin::{ToolListResponse, ToolView, UpdateToolPolicyRequest};
-use crate::users::{InviteUserRequest, UserListResponse, UserView};
+use crate::users::{
+    ChangePasswordRequest, InviteUserRequest, ResetPasswordRequest, UserListResponse, UserView,
+};
 use crate::plugins::{
     InstallResponse, PluginListResponse, PluginSummary, ToolSummary, UiPanelListResponse,
     UiPanelSummary,
@@ -112,10 +114,12 @@ impl Modify for SecurityAddon {
         // runners (Phase 8.5 — view-only + restart)
         crate::runners_admin::list_handler,
         crate::runners_admin::restart_handler,
-        // users (multi-controller)
+        // users (multi-controller) + Phase-8.6 password rotation
         crate::users::list_handler,
         crate::users::invite_handler,
         crate::users::delete_handler,
+        crate::users::change_my_password_handler,
+        crate::users::reset_user_password_handler,
         // tools (Phase 8a per-tool trust-class allowlist)
         crate::tools_admin::list_handler,
         crate::tools_admin::update_handler,
@@ -157,6 +161,8 @@ impl Modify for SecurityAddon {
         UserView,
         UserListResponse,
         InviteUserRequest,
+        ChangePasswordRequest,
+        ResetPasswordRequest,
         ToolView,
         ToolListResponse,
         UpdateToolPolicyRequest,
@@ -348,6 +354,8 @@ mod tests {
             ("/api/admin/users", &["get"]),
             ("/api/admin/users/invite", &["post"]),
             ("/api/admin/users/{user_id}", &["delete"]),
+            ("/api/admin/me/password", &["post"]),
+            ("/api/admin/users/{user_id}/password", &["post"]),
             ("/api/admin/tools", &["get"]),
             ("/api/admin/tools/{tool_name}", &["patch"]),
             ("/api/admin/mcp/servers", &["get", "post"]),

@@ -1,13 +1,15 @@
-// Combined smoke tests for the smaller settings pages: hardware,
-// logs, eval flags, principals, audit. Each verifies:
+// Combined smoke tests for the smaller settings pages: logs, eval
+// flags, principals, audit. Each verifies:
 //   - the empty-state renders when the API returns nothing,
 //   - rendered rows reflect the API payload,
 //   - filters update the request URL.
+//
+// (The Hardware section was inlined into BackendsPage in Phase 8.6
+// — see backends-page.test.tsx for its coverage.)
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { AuthProvider } from "../auth/AuthContext";
-import { HardwarePage } from "../settings/HardwarePage";
 import { LogsPage } from "../settings/LogsPage";
 import { EvalFlagsPage } from "../settings/EvalFlagsPage";
 import { PrincipalsPage } from "../settings/PrincipalsPage";
@@ -41,47 +43,6 @@ const meResponse = () =>
 function mountWithAuth(ui: React.ReactElement) {
     return render(<AuthProvider>{ui}</AuthProvider>);
 }
-
-// ---- HardwarePage --------------------------------------------------
-
-describe("HardwarePage", () => {
-    it("shows the no-GPU notice when the profile has none", async () => {
-        fetchMock.mockImplementation(async (url: string) => {
-            if (url === "/api/admin/me") return meResponse();
-            return new Response(JSON.stringify({ gpus: [] }), { status: 200 });
-        });
-        mountWithAuth(<HardwarePage />);
-        await waitFor(() => {
-            expect(screen.getByText(/no gpus detected/i)).toBeInTheDocument();
-        });
-    });
-
-    it("lists each GPU returned by the server", async () => {
-        fetchMock.mockImplementation(async (url: string) => {
-            if (url === "/api/admin/me") return meResponse();
-            return new Response(
-                JSON.stringify({
-                    gpus: [
-                        {
-                            vendor: "NVIDIA",
-                            model: "RTX 4090",
-                            pci_vendor_id: "10de",
-                            pci_device_id: "2684",
-                        },
-                    ],
-                }),
-                { status: 200 },
-            );
-        });
-        mountWithAuth(<HardwarePage />);
-        await waitFor(() => {
-            expect(screen.getByText(/GPUs \(1\)/)).toBeInTheDocument();
-        });
-        // The model name shows in both the friendly row + the raw JSON
-        // dump; either occurrence proves the data made it through.
-        expect(screen.getAllByText(/RTX 4090/).length).toBeGreaterThan(0);
-    });
-});
 
 // ---- LogsPage ------------------------------------------------------
 

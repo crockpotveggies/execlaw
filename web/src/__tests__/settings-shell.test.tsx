@@ -56,6 +56,29 @@ beforeEach(() => {
         if (url === "/api/admin/hardware") {
             return new Response(JSON.stringify({ gpus: [] }), { status: 200 });
         }
+        if (url === "/api/admin/backends") {
+            return new Response(
+                JSON.stringify({
+                    backends: [
+                        "Standard",
+                        "Reasoning",
+                        "Guardrail",
+                        "VoiceSTT",
+                        "VoiceTTS",
+                    ].map((purpose) => ({ purpose, configured: false, backend: null })),
+                }),
+                { status: 200 },
+            );
+        }
+        if (url === "/api/admin/users") {
+            return new Response(JSON.stringify({ users: [] }), { status: 200 });
+        }
+        if (url === "/api/admin/webauthn/credentials") {
+            return new Response(
+                JSON.stringify({ credentials: [] }),
+                { status: 200 },
+            );
+        }
         if (url.startsWith("/api/admin/logs")) {
             return new Response(JSON.stringify({ entries: [] }), { status: 200 });
         }
@@ -73,24 +96,26 @@ afterEach(() => {
 });
 
 describe("Settings shell", () => {
-    it("/settings redirects to plugins by default", async () => {
+    it("/settings redirects to login (the new index)", async () => {
+        // Login section makes calls to /api/admin/users +
+        // /api/admin/webauthn/credentials; the default mock returns
+        // empty lists for both via the catch-all branch.
         mountAt("/settings");
         await waitFor(() => {
-            expect(screen.getByTestId("settings-plugins")).toBeInTheDocument();
+            expect(screen.getByTestId("settings-login")).toBeInTheDocument();
         });
     });
 
-    it("renders the five tab links", async () => {
+    it("renders the post-Phase-8.6 tab set", async () => {
         mountAt("/settings/plugins");
-        // Wait for the auth-bootstrap /me probe + plugin list to complete
-        // so the settings shell is mounted before we query tab labels.
         await waitFor(() => {
             expect(screen.getByTestId("settings-plugins")).toBeInTheDocument();
         });
         for (const label of [
+            "Login",
             "Plugins",
+            "Backends",
             "Principals",
-            "Hardware",
             "Logs",
             "Eval flags",
         ]) {
@@ -98,16 +123,30 @@ describe("Settings shell", () => {
                 screen.getByRole("link", { name: new RegExp(label, "i") }),
             ).toBeInTheDocument();
         }
+        // Old tabs that have been merged elsewhere should be gone.
+        expect(
+            screen.queryByRole("link", { name: /Hardware/i }),
+        ).toBeNull();
+        expect(
+            screen.queryByRole("link", { name: /Profile/i }),
+        ).toBeNull();
+        expect(
+            screen.queryByRole("link", { name: /Users/i }),
+        ).toBeNull();
     });
 
-    it("clicking the Hardware tab swaps the active page", async () => {
+    it("clicking Backends loads the Backends pane (with the inline Hardware section)", async () => {
         mountAt("/settings/plugins");
         await waitFor(() => {
             expect(screen.getByTestId("settings-plugins")).toBeInTheDocument();
         });
         fireEvent.click(
-            screen.getByRole("link", { name: /Hardware/i }),
+            screen.getByRole("link", { name: /Backends/i }),
         );
+        await waitFor(() => {
+            expect(screen.getByTestId("settings-backends")).toBeInTheDocument();
+        });
+        // Hardware section now lives inside Backends.
         await waitFor(() => {
             expect(screen.getByTestId("settings-hardware")).toBeInTheDocument();
         });

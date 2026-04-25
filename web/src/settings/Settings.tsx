@@ -15,28 +15,27 @@ import { useNavigate } from "react-router-dom";
 import { listUiPanels, type UiPanelSummary } from "../api/endpoints";
 
 import { PluginsPage } from "./PluginsPage";
-import { HardwarePage } from "./HardwarePage";
 import { LogsPage } from "./LogsPage";
 import { EvalFlagsPage } from "./EvalFlagsPage";
 import { PrincipalsPage } from "./PrincipalsPage";
 import { AuditPage } from "./AuditPage";
 import { BackendsPage } from "./BackendsPage";
-import { UsersPage } from "./UsersPage";
-import { ProfilePage } from "./ProfilePage";
+import { LoginPage } from "./LoginPage";
 import { ToolsPage } from "./ToolsPage";
 import { McpServersPage } from "./McpServersPage";
 import { RunnersPage } from "./RunnersPage";
 
 const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
+    // Login first — combines password / passkeys / sessions / operator
+    // accounts into one place. Replaces the old Profile + Users tabs.
+    { to: "/settings/login", icon: "bi-shield-lock", label: "Login" },
     { to: "/settings/plugins", icon: "bi-plug", label: "Plugins" },
     { to: "/settings/tools", icon: "bi-wrench-adjustable", label: "Tools" },
     { to: "/settings/mcp", icon: "bi-broadcast", label: "MCP" },
+    // Hardware now lives at the bottom of the Backends page.
     { to: "/settings/backends", icon: "bi-cpu-fill", label: "Backends" },
     { to: "/settings/runners", icon: "bi-fire", label: "Runners" },
-    { to: "/settings/users", icon: "bi-person-gear", label: "Users" },
-    { to: "/settings/profile", icon: "bi-person-badge", label: "Profile" },
     { to: "/settings/principals", icon: "bi-people", label: "Principals" },
-    { to: "/settings/hardware", icon: "bi-cpu", label: "Hardware" },
     { to: "/settings/logs", icon: "bi-list-columns", label: "Logs" },
     { to: "/settings/eval", icon: "bi-bar-chart", label: "Eval flags" },
     { to: "/settings/audit", icon: "bi-journal-text", label: "Audit" },
@@ -129,20 +128,31 @@ export function Settings() {
                     <Routes>
                         <Route
                             index
-                            element={<Navigate to="plugins" replace />}
+                            element={<Navigate to="login" replace />}
                         />
+                        <Route path="login" element={<LoginPage />} />
                         <Route path="plugins" element={<PluginsPage />} />
                         <Route path="tools" element={<ToolsPage />} />
                         <Route path="mcp" element={<McpServersPage />} />
                         <Route path="backends" element={<BackendsPage />} />
                         <Route path="runners" element={<RunnersPage />} />
-                        <Route path="users" element={<UsersPage />} />
-                        <Route path="profile" element={<ProfilePage />} />
                         <Route path="principals" element={<PrincipalsPage />} />
-                        <Route path="hardware" element={<HardwarePage />} />
                         <Route path="logs" element={<LogsPage />} />
                         <Route path="eval" element={<EvalFlagsPage />} />
                         <Route path="audit" element={<AuditPage />} />
+                        {/* Legacy paths fall back to /settings/login. */}
+                        <Route
+                            path="profile"
+                            element={<Navigate to="../login" replace />}
+                        />
+                        <Route
+                            path="users"
+                            element={<Navigate to="../login" replace />}
+                        />
+                        <Route
+                            path="hardware"
+                            element={<Navigate to="../backends" replace />}
+                        />
                     </Routes>
                 </div>
             </main>

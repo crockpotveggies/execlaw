@@ -287,6 +287,183 @@ pub async fn delete_handler(
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
 
+// ---------------------------------------------------------------------------
+// Password management — Phase 8.6 Settings → Login surface.
+//
+// Two routes:
+//   * `POST /api/admin/me/password` — self-change. Caller must
+//     present their CURRENT password before the new one is accepted.
+//     Standard "rotate password" flow.
+//   * `POST /api/admin/users/{user_id}/password` — Controller-only
+//     reset for another user. Doesn't require the target's current
+//     password (the operator is doing this on their behalf, like a
+//     forgotten-password reset). Audited; refuses to operate on
+//     yourself so a Controller can't bypass the current-password
+//     check on themselves by hitting the admin route.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct ResetPasswordRequest {
+    pub new_password: String,
+}
+
+const MIN_NEW_PASSWORD_LEN: usize = 8;
+
+#[utoipa::path(
+    post,
+    path = "/api/admin/me/password",
+    request_body = ChangePasswordRequest,
+    responses(
+        (status = 200, description = "Password rotated"),
+        (status = 400, description = "New password too short"),
+        (status = 401, description = "Current password incorrect"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "auth"
+)]
+pub async fn change_my_password_handler(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Json(req): Json<ChangePasswordRequest>,
+) -> impl IntoResponse {
+    if req.new_password.len() < MIN_NEW_PASSWORD_LEN {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "weak_password",
+            &format!("new password must be at least {MIN_NEW_PASSWORD_LEN} characters"),
+        );
+    }
+    let users = UserStore::new(&state.db);
+    let row = match users.get_by_id(&user.user_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return error(
+                StatusCode::UNAUTHORIZED,
+                "user_missing",
+                "authenticated user not found",
+            );
+        }
+        Err(e) => return internal(&format!("user lookup: {e}")),
+    };
+    let ok = match execlaw_vault::verify_password(&req.current_password, &row.password_hash) {
+        Ok(v) => v,
+        Err(e) => return internal(&format!("password verify: {e}")),
+    };
+    if !ok {
+        return error(
+            StatusCode::UNAUTHORIZED,
+            "bad_credentials",
+            "current password is incorrect",
+        );
+    }
+    let new_hash = match hash_password(&req.new_password) {
+        Ok(h) => h,
+        Err(e) => return internal(&format!("password hash: {e}")),
+    };
+    if let Err(e) = users.set_password_hash(&user.user_id, &new_hash) {
+        return internal(&format!("password update: {e}"));
+    }
+    let _ = AuditStore::new(&state.db).insert(
+        &user.user_id,
+        "users",
+        &user.user_id,
+        Some(&serde_json::json!({"password_rotated": false})),
+        Some(&serde_json::json!({"password_rotated": true, "by": "self"})),
+    );
+    (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/admin/users/{user_id}/password",
+    request_body = ResetPasswordRequest,
+    params(("user_id" = String, Path, description = "Target user")),
+    responses(
+        (status = 200, description = "Password reset"),
+        (status = 400, description = "New password too short / target is self"),
+        (status = 403, description = "Caller is not a Controller"),
+        (status = 404, description = "Target user not found"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "auth"
+)]
+pub async fn reset_user_password_handler(
+    State(state): State<AppState>,
+    caller: AuthedUser,
+    Path(target_id): Path<String>,
+    Json(req): Json<ResetPasswordRequest>,
+) -> impl IntoResponse {
+    if req.new_password.len() < MIN_NEW_PASSWORD_LEN {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "weak_password",
+            &format!("new password must be at least {MIN_NEW_PASSWORD_LEN} characters"),
+        );
+    }
+    if target_id == caller.user_id {
+        // Self-reset must go through the current-password flow so
+        // we don't accidentally hand a controller a "rotate my own
+        // password without proving I know the current one" path.
+        return error(
+            StatusCode::BAD_REQUEST,
+            "use_self_change",
+            "use POST /api/admin/me/password to change your own password",
+        );
+    }
+    let users = UserStore::new(&state.db);
+    // Caller must be a Controller.
+    match users.get_by_id(&caller.user_id) {
+        Ok(Some(c)) if c.role == UserRole::Controller => {}
+        Ok(Some(_)) => {
+            return error(
+                StatusCode::FORBIDDEN,
+                "controller_only",
+                "only a Controller can reset another user's password",
+            );
+        }
+        Ok(None) => {
+            return error(
+                StatusCode::UNAUTHORIZED,
+                "user_missing",
+                "authenticated user not found",
+            );
+        }
+        Err(e) => return internal(&format!("caller lookup: {e}")),
+    }
+    let target = match users.get_by_id(&target_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return error(
+                StatusCode::NOT_FOUND,
+                "user_not_found",
+                &format!("no user with id '{target_id}'"),
+            );
+        }
+        Err(e) => return internal(&format!("target lookup: {e}")),
+    };
+    let new_hash = match hash_password(&req.new_password) {
+        Ok(h) => h,
+        Err(e) => return internal(&format!("password hash: {e}")),
+    };
+    if let Err(e) = users.set_password_hash(&target.user_id, &new_hash) {
+        return internal(&format!("password update: {e}"));
+    }
+    let _ = AuditStore::new(&state.db).insert(
+        &caller.user_id,
+        "users",
+        &target.user_id,
+        Some(&serde_json::json!({"password_rotated": false})),
+        Some(&serde_json::json!({"password_rotated": true, "by": caller.user_id})),
+    );
+    (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+}
+
 pub fn users_router() -> Router<AppState> {
     Router::new()
         .route("/api/admin/users", get(list_handler))
@@ -294,6 +471,14 @@ pub fn users_router() -> Router<AppState> {
         .route(
             "/api/admin/users/{user_id}",
             axum::routing::delete(delete_handler),
+        )
+        .route(
+            "/api/admin/me/password",
+            axum::routing::post(change_my_password_handler),
+        )
+        .route(
+            "/api/admin/users/{user_id}/password",
+            axum::routing::post(reset_user_password_handler),
         )
 }
 
@@ -671,5 +856,202 @@ mod tests {
         // We document the property holds via the count + the
         // dedicated invariant in `count_by_role` covered in the
         // core unit tests.
+    }
+
+    // ---- Password rotation ------------------------------------------------
+
+    #[tokio::test]
+    async fn change_my_password_round_trip() {
+        let app = build_router(test_app_state());
+        let token = setup_controller(&app).await;
+
+        let (status, body) = json_request(
+            &app,
+            Method::POST,
+            "/api/admin/me/password",
+            Some(&token),
+            Some(serde_json::json!({
+                "current_password": "hunter2-longer",
+                "new_password": "newer-passphrase-1",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body was {body}");
+
+        // Old password no longer logs us in; new one does.
+        let (s_old, _) = json_request(
+            &app,
+            Method::POST,
+            "/api/login",
+            None,
+            Some(serde_json::json!({
+                "username": "ctrl",
+                "admin_password": "hunter2-longer",
+            })),
+        )
+        .await;
+        assert_eq!(s_old, StatusCode::UNAUTHORIZED);
+        let (s_new, _) = json_request(
+            &app,
+            Method::POST,
+            "/api/login",
+            None,
+            Some(serde_json::json!({
+                "username": "ctrl",
+                "admin_password": "newer-passphrase-1",
+            })),
+        )
+        .await;
+        assert_eq!(s_new, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn change_my_password_rejects_wrong_current() {
+        let app = build_router(test_app_state());
+        let token = setup_controller(&app).await;
+        let (status, body) = json_request(
+            &app,
+            Method::POST,
+            "/api/admin/me/password",
+            Some(&token),
+            Some(serde_json::json!({
+                "current_password": "wrong",
+                "new_password": "newer-passphrase-1",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "bad_credentials");
+    }
+
+    #[tokio::test]
+    async fn change_my_password_rejects_short_new() {
+        let app = build_router(test_app_state());
+        let token = setup_controller(&app).await;
+        let (status, body) = json_request(
+            &app,
+            Method::POST,
+            "/api/admin/me/password",
+            Some(&token),
+            Some(serde_json::json!({
+                "current_password": "hunter2-longer",
+                "new_password": "tiny",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "weak_password");
+    }
+
+    #[tokio::test]
+    async fn reset_other_user_password_as_controller() {
+        let app = build_router(test_app_state());
+        let token = setup_controller(&app).await;
+        // Invite an operator.
+        let (_, invited) = json_request(
+            &app,
+            Method::POST,
+            "/api/admin/users/invite",
+            Some(&token),
+            Some(invite_body()),
+        )
+        .await;
+        let target = invited["user_id"].as_str().unwrap().to_owned();
+
+        let (status, _) = json_request(
+            &app,
+            Method::POST,
+            &format!("/api/admin/users/{target}/password"),
+            Some(&token),
+            Some(serde_json::json!({"new_password": "operator-pass-2"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Operator's old password no longer works.
+        let (s_old, _) = json_request(
+            &app,
+            Method::POST,
+            "/api/login",
+            None,
+            Some(serde_json::json!({
+                "username": "opone",
+                "admin_password": "operator-pass-1",
+            })),
+        )
+        .await;
+        assert_eq!(s_old, StatusCode::UNAUTHORIZED);
+        // New one does.
+        let (s_new, _) = json_request(
+            &app,
+            Method::POST,
+            "/api/login",
+            None,
+            Some(serde_json::json!({
+                "username": "opone",
+                "admin_password": "operator-pass-2",
+            })),
+        )
+        .await;
+        assert_eq!(s_new, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn reset_password_refuses_self_target() {
+        let app = build_router(test_app_state());
+        let token = setup_controller(&app).await;
+        // Find the controller's own user_id from /api/admin/users.
+        let (_, body) =
+            json_request(&app, Method::GET, "/api/admin/users", Some(&token), None).await;
+        let me = body["users"][0]["user_id"].as_str().unwrap().to_owned();
+        let (status, body) = json_request(
+            &app,
+            Method::POST,
+            &format!("/api/admin/users/{me}/password"),
+            Some(&token),
+            Some(serde_json::json!({"new_password": "anything-longer"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "use_self_change");
+    }
+
+    #[tokio::test]
+    async fn reset_password_requires_controller() {
+        // Set up a controller, invite an operator, then issue a token
+        // for the operator and try to reset the controller's password
+        // — should be 403.
+        let state = test_app_state();
+        let app = build_router(state.clone());
+        let _ = setup_controller(&app).await;
+        // Insert an operator directly so we know its user_id.
+        let now = chrono::Utc::now().timestamp();
+        let op_id = "op-1";
+        let store = UserStore::new(&state.db);
+        store
+            .insert(&UserRow {
+                user_id: op_id.into(),
+                username: "op1".into(),
+                display_name: "Op".into(),
+                email: None,
+                password_hash: hash_pw("operator-pass-1").unwrap(),
+                role: UserRole::Operator,
+                created_at: now,
+                last_login_at: None,
+            })
+            .unwrap();
+        let op_token = issue_token_for(&state, op_id);
+        let (_, controller_body) =
+            json_request(&app, Method::GET, "/api/admin/users", Some(&op_token), None).await;
+        let controller_id = controller_body["users"][0]["user_id"].as_str().unwrap();
+        let (status, body) = json_request(
+            &app,
+            Method::POST,
+            &format!("/api/admin/users/{controller_id}/password"),
+            Some(&op_token),
+            Some(serde_json::json!({"new_password": "anything-longer"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "got body {body}");
     }
 }

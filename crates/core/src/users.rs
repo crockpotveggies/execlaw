@@ -207,6 +207,21 @@ impl<'db> UserStore<'db> {
         })
     }
 
+    /// Replace a user's password hash. Caller is responsible for
+    /// having already verified whatever proof-of-identity policy
+    /// applies (current-password match for self-change, Controller
+    /// auth for admin reset). Returns `true` when a row was actually
+    /// updated.
+    pub fn set_password_hash(&self, user_id: &str, hash: &str) -> Result<bool, DbError> {
+        self.db.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE users SET password_hash = ?1 WHERE user_id = ?2",
+                params![hash, user_id],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
     /// Every user row, oldest first (matches the SPA's expectation:
     /// the controller is row 0 + invitees follow). Phase-7 multi-
     /// controller surface: `GET /api/admin/users`.
@@ -390,6 +405,18 @@ mod tests {
         // Repeating returns false (idempotent observability).
         assert!(!store.delete("c1").unwrap());
         assert!(store.list_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_password_hash_updates_row_and_returns_true_then_false() {
+        let db = fresh_db();
+        let store = UserStore::new(&db);
+        store.insert(&mk_user("c1", UserRole::Controller)).unwrap();
+        assert!(store.set_password_hash("c1", "new-argon2-hash").unwrap());
+        let row = store.get_by_id("c1").unwrap().unwrap();
+        assert_eq!(row.password_hash, "new-argon2-hash");
+        // Unknown user → false, no error.
+        assert!(!store.set_password_hash("nobody", "x").unwrap());
     }
 
     #[test]

@@ -35,6 +35,28 @@ function emptyListResponse() {
     );
 }
 
+// Response bodies can only be read once, so build a fresh response
+// per call instead of caching a singleton.
+function hardwareNoGpu() {
+    return new Response(JSON.stringify({ gpus: [] }), { status: 200 });
+}
+
+function hardwareWithGpu() {
+    return new Response(
+        JSON.stringify({
+            gpus: [
+                {
+                    vendor: "NVIDIA",
+                    model: "RTX 4090",
+                    pci_vendor_id: "10de",
+                    pci_device_id: "2684",
+                },
+            ],
+        }),
+        { status: 200 },
+    );
+}
+
 function mountPage() {
     return render(
         <AuthProvider>
@@ -59,6 +81,7 @@ describe("BackendsPage", () => {
         fetchMock.mockImplementation(async (url: string) => {
             if (url === "/api/admin/me") return meResponse();
             if (url === "/api/admin/backends") return emptyListResponse();
+            if (url === "/api/admin/hardware") return hardwareNoGpu();
             return new Response("{}", { status: 200 });
         });
         mountPage();
@@ -76,6 +99,7 @@ describe("BackendsPage", () => {
         fetchMock.mockImplementation(async (url: string) => {
             if (url === "/api/admin/me") return meResponse();
             if (url === "/api/admin/backends") return emptyListResponse();
+            if (url === "/api/admin/hardware") return hardwareNoGpu();
             return new Response("{}", { status: 200 });
         });
         mountPage();
@@ -113,6 +137,7 @@ describe("BackendsPage", () => {
                     { status: 200 },
                 );
             }
+            if (url === "/api/admin/hardware") return hardwareNoGpu();
             return emptyListResponse();
         });
         mountPage();
@@ -167,6 +192,7 @@ describe("BackendsPage", () => {
         fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
             calls.push({ url, init });
             if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/hardware") return hardwareNoGpu();
             return emptyListResponse();
         });
         mountPage();
@@ -222,6 +248,7 @@ describe("BackendsPage", () => {
                     }),
                     { status: 200 },
                 );
+            if (url === "/api/admin/hardware") return hardwareNoGpu();
             return new Response("{}", { status: 200 });
         });
         mountPage();
@@ -234,5 +261,35 @@ describe("BackendsPage", () => {
         });
         expect(screen.queryByTestId("backend-edit")).toBeNull();
         expect(screen.queryByTestId("backend-clear")).toBeNull();
+    });
+
+    it("renders the hardware section below the backend list", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/backends") return emptyListResponse();
+            if (url === "/api/admin/hardware") return hardwareWithGpu();
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        await waitFor(() => {
+            expect(screen.getByTestId("settings-hardware")).toBeInTheDocument();
+        });
+        expect(screen.getByText(/GPUs \(1\)/i)).toBeInTheDocument();
+        expect(screen.getAllByText(/RTX 4090/).length).toBeGreaterThan(0);
+    });
+
+    it("hardware section reports no GPUs when the profile is empty", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/backends") return emptyListResponse();
+            if (url === "/api/admin/hardware") return hardwareNoGpu();
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        await waitFor(() => {
+            expect(
+                screen.getByText(/no gpus detected/i),
+            ).toBeInTheDocument();
+        });
     });
 });

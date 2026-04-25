@@ -644,6 +644,45 @@ export async function deleteUser(
     );
 }
 
+// ---- /api/admin/me/password + /api/admin/users/.../password ------
+
+export interface ChangeMyPasswordRequest {
+    current_password: string;
+    new_password: string;
+}
+
+export interface ResetUserPasswordRequest {
+    new_password: string;
+}
+
+/// Self-rotate the operator's password. Requires the current
+/// password as proof of identity.
+export async function changeMyPassword(
+    body: ChangeMyPasswordRequest,
+    tokenAccessor: () => string | null,
+): Promise<unknown> {
+    return apiFetch(
+        "/api/admin/me/password",
+        { method: "POST", body },
+        tokenAccessor,
+    );
+}
+
+/// Controller-only reset for another user. The server refuses if
+/// the target is the caller themselves — use `changeMyPassword`
+/// for that.
+export async function resetUserPassword(
+    userId: string,
+    body: ResetUserPasswordRequest,
+    tokenAccessor: () => string | null,
+): Promise<unknown> {
+    return apiFetch(
+        `/api/admin/users/${encodeURIComponent(userId)}/password`,
+        { method: "POST", body },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/webauthn (Phase 7e second-factor) -----------------
 
 /// Each row from `state_webauthn_credentials`, public surface (no
