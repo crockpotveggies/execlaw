@@ -75,7 +75,10 @@ Tight on purpose. No heavyweight state libraries until a real consumer arrives:
 - `react`, `react-dom` (18.3) — React.
 - `react-router-dom` (6) — routing.
 - `react-bootstrap` (2.10) + `bootstrap` (5.3 SCSS) + `bootstrap-icons` (1.11) — UI + icon set.
+- `gsap` (3.12) + `@gsap/react` (2.1) — page-transition animations.
 - `vitest` + `@testing-library/react` + `jsdom` — tests.
 - `vite` + `@vitejs/plugin-react` + `typescript` + `sass` — build.
 
-`react-native-web` is the Phase-6e target (iOS / Android); for the web target today, react-bootstrap ships the visual layer directly. The cross-platform alias arrives when the native targets land.
+Native iOS / Android targets (Phase 6e+) will land via a parallel
+component layer — Tamagui or similar — at port time. For now the SPA
+is plain React on the DOM.

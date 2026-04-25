@@ -12,14 +12,13 @@
 
 import { useState, type FormEvent } from "react";
 import { Navigate, useNavigate } from "react-router-dom";
-import Animated from "react-native-reanimated";
 import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
 import Spinner from "react-bootstrap/Spinner";
 import { ApiError } from "../api/client";
 import { postSetup } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
-import { useDismissAnimation } from "../anim/useDismissAnimation";
+import { useScreenTransition } from "../anim/useScreenTransition";
 
 interface FieldErrors {
     username?: string;
@@ -72,7 +71,9 @@ export function validateSetupForm(input: {
 export function SetupWizard() {
     const auth = useAuth();
     const navigate = useNavigate();
-    const { style: dismissStyle, dismiss } = useDismissAnimation();
+    // Setup card: scale up from 0.85 + fade in on mount, shrink + fade
+    // out on successful first-run sign-in.
+    const { ref, dismiss } = useScreenTransition<HTMLDivElement>();
 
     const [username, setUsername] = useState("");
     const [displayName, setDisplayName] = useState("");
@@ -131,12 +132,11 @@ export function SetupWizard() {
 
     return (
         <div className="execlaw-auth-shell">
-            <Animated.View style={dismissStyle}>
-                <div className="execlaw-auth-card">
-                    <h1 className="execlaw-brand h4 mb-1">execlaw</h1>
-                    <p className="execlaw-muted small mb-4">
-                        Welcome — let&rsquo;s create your controller account.
-                    </p>
+            <div ref={ref} className="execlaw-auth-card">
+                <h1 className="execlaw-brand h4 mb-1">execlaw</h1>
+                <p className="execlaw-muted small mb-4">
+                    Welcome — let&rsquo;s create your controller account.
+                </p>
 
                 {submitError && (
                     <div
@@ -236,8 +236,7 @@ export function SetupWizard() {
                         )}
                     </Button>
                 </Form>
-                </div>
-            </Animated.View>
+            </div>
         </div>
     );
 }

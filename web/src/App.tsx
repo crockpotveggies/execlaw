@@ -1,5 +1,4 @@
 import { BrowserRouter, Route, Routes } from "react-router-dom";
-import { ScreenTransition } from "./anim/ScreenTransition";
 import { AuthProvider } from "./auth/AuthContext";
 import { AppBoot } from "./routes/AppBoot";
 import { Chat } from "./routes/Chat";
@@ -12,30 +11,9 @@ export function App() {
             <BrowserRouter>
                 <Routes>
                     <Route path="/" element={<AppBoot />} />
-                    <Route
-                        path="/setup"
-                        element={
-                            <ScreenTransition kind="zoom">
-                                <SetupWizard />
-                            </ScreenTransition>
-                        }
-                    />
-                    <Route
-                        path="/login"
-                        element={
-                            <ScreenTransition kind="zoom">
-                                <Login />
-                            </ScreenTransition>
-                        }
-                    />
-                    <Route
-                        path="/chat"
-                        element={
-                            <ScreenTransition kind="fade">
-                                <Chat />
-                            </ScreenTransition>
-                        }
-                    />
+                    <Route path="/setup" element={<SetupWizard />} />
+                    <Route path="/login" element={<Login />} />
+                    <Route path="/chat" element={<Chat />} />
                     <Route path="*" element={<AppBoot />} />
                 </Routes>
             </BrowserRouter>

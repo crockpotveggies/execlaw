@@ -1,24 +1,28 @@
 // Single-controller login screen.
 //
-// One field (admin password). Submits to /api/login, hands the
-// resulting tokens to AuthContext.signIn, which then navigates to
-// /chat once the /me probe completes.
+// One field set (username + admin password). Submits to /api/login,
+// hands the resulting tokens to AuthContext.signIn, which then
+// navigates to /chat once the /me probe completes.
+//
+// Animation: GSAP scales the card from 0.85 → 1 + fades 0 → 1 on
+// mount; on successful sign-in it shrinks back to 0.85 + fades to 0
+// before navigating, so the chat shell's fade-in feels like a
+// continuous handoff.
 
 import { useState, type FormEvent } from "react";
 import { Navigate, useNavigate } from "react-router-dom";
-import Animated from "react-native-reanimated";
 import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
 import Spinner from "react-bootstrap/Spinner";
 import { ApiError } from "../api/client";
 import { postLogin } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
-import { useDismissAnimation } from "../anim/useDismissAnimation";
+import { useScreenTransition } from "../anim/useScreenTransition";
 
 export function Login() {
     const auth = useAuth();
     const navigate = useNavigate();
-    const { style: dismissStyle, dismiss } = useDismissAnimation();
+    const { ref, dismiss } = useScreenTransition<HTMLDivElement>();
 
     const [username, setUsername] = useState("");
     const [password, setPassword] = useState("");
@@ -44,8 +48,6 @@ export function Login() {
             });
             await auth.signIn(tokens);
             // Successful sign-in: shrink + fade the form, THEN navigate.
-            // The /chat route's FadeIn entry animation picks up where
-            // this leaves off so the eye reads it as a single hand-off.
             dismiss(() => navigate("/chat", { replace: true }));
             return;
         } catch (e) {
@@ -73,10 +75,9 @@ export function Login() {
 
     return (
         <div className="execlaw-auth-shell">
-            <Animated.View style={dismissStyle}>
-                <div className="execlaw-auth-card">
-                    <h1 className="execlaw-brand h4 mb-1">execlaw</h1>
-                    <p className="execlaw-muted small mb-4">Sign in to continue.</p>
+            <div ref={ref} className="execlaw-auth-card">
+                <h1 className="execlaw-brand h4 mb-1">execlaw</h1>
+                <p className="execlaw-muted small mb-4">Sign in to continue.</p>
 
                 {submitError && (
                     <div
@@ -130,8 +131,7 @@ export function Login() {
                         )}
                     </Button>
                 </Form>
-                </div>
-            </Animated.View>
+            </div>
         </div>
     );
 }
