@@ -1,6 +1,6 @@
 # execlaw build STATUS
 
-Last update: 2026-04-24, after Phase-6 backend hooks (PATCH /api/chats/:id, GET /api/admin/plugins/ui_panels, set_thread_name agent tool).
+Last update: 2026-04-24, after Phase-6a SPA scaffold (Vite + react-bootstrap + setup wizard + auth context + chat placeholder).
 
 ## TL;DR
 
@@ -8,8 +8,10 @@ Last update: 2026-04-24, after Phase-6 backend hooks (PATCH /api/chats/:id, GET 
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
 - `cargo test --workspace --no-fail-fast` — **360 passing, 0 failing**
 - `cargo bench --workspace --no-run` — **clean** (40+ benches across 9 crates)
+- `cd web && npm test` — **28 passing** (jsdom + react-testing-library)
+- `cd web && npm run build` — **clean** (176 KB JS / 300 KB CSS, both well under budget)
 - **Zero cloud-SDK dependencies** anywhere in the workspace
-- Phases 0–5 complete; Phase-6 pre-flight closed; Phase-6 backend API surface ready (thread metadata route, panel manifest route, thread-name agent tool); SPA scaffold next
+- Phases 0–5 complete; Phase-6a scaffold lands setup wizard + login + JWT auth + chat placeholder. Hands-on test ready: see [web/README.md](web/README.md).
 
 ## Migration-plan phase structure (post-2026-04-24 refactor)
 
@@ -219,6 +221,11 @@ TOTAL                    360 passing, 0 failing
 | Thread metadata route (PATCH) | `crates/server/src/chats.rs::patch_thread` |
 | UI-panel manifest route | `crates/server/src/plugins.rs::list_ui_panels_handler` |
 | Thread-name agent tool | `crates/runner-local/src/thread_tool.rs` |
+| SPA scaffold (Vite + Bootstrap) | `web/` |
+| SPA boot probe + setup-state routing | `web/src/routes/AppBoot.tsx` |
+| Setup wizard form | `web/src/routes/SetupWizard.tsx` |
+| SPA auth context + token store | `web/src/auth/` |
+| SPA API client | `web/src/api/` |
 
 ## Recent commit history (foundation branch)
 
