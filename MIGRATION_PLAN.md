@@ -918,7 +918,7 @@ execlaw-core/
 │   ├── voice-pipeline/       Two-lane Tokio graph (system + data lanes);
 │   │                          VAD, STT, LLM-stream, TTS, turn-detector, AEC,
 │   │                          barge-in + backchannel-rescind (§2.13)
-│   ├── plugin-host/          Dynamic plugin loading (WASM + subprocess)
+│   ├── plugin-host/          Dynamic plugin loading (subprocess)
 │   ├── plugin-sdk/           Rust traits + generated schemas for plugins
 │   ├── container-manager/    Docker client, service orchestration, GPU abstraction
 │   │                          (Intel /dev/dri/renderD128 via OpenVINO + nvidia-
@@ -964,7 +964,7 @@ execlaw-core/
 - **Embedded PCI ID database** (~500KB static dataset, compiled into the binary from `pciutils`) for mapping PCI vendor/device IDs to human-readable GPU model names without invoking vendor tools.
 - **Host sysfs bind-mount** at runtime (`/proc:/proc:ro` and `/sys:/sys:ro`) so the control plane can enumerate PCI devices, render nodes, and nvidia-driver info without carrying any vendor runtime itself.
 - **Inference client: HTTP (reqwest) against OpenAI-compatible API.** The internal `inference-api` crate speaks only this protocol — `/v1/chat/completions`, `/v1/embeddings`, streaming via SSE, tool calls via OpenAI function-calling format. Backends (OpenArc, vLLM, llama.cpp server, Ollama) all conform to it. **Cloud endpoints are not a supported backend** (§0 axiom #1).
-- `wasmtime` for plugin sandbox (WASI preview 2) — future tier; Phase 2 starts with subprocess tier.
+- ~~`wasmtime` for plugin sandbox (WASI preview 2)~~ — explicitly de-scoped (2026-04-25). Subprocess tier is enough for the self-hosted single-operator threat model; every plugin in `docs/plugin-inventory.md` wraps a native binary or talks HTTPS, none compile to wasm. Reconsider only if a plugin port surfaces a real need.
 - `serde` + `schemars` for plugin manifest & capability schemas.
 - `rustls` + `ed25519-dalek` / `jsonwebtoken` for capability tokens (EdDSA signed).
 - `tracing` + `tracing-subscriber` with a JSON layer writing to both a rolling `~/.execlaw/logs/*.jsonl` file and an SQLite `log_*` table (mirrors selfhosted-claw's dual sink). No OpenTelemetry, no OpenInference, no external observability services — local SQLite + JSONL is sufficient for a single-operator self-hosted system.
@@ -1003,10 +1003,13 @@ homepage = "..."
 license = "..."
 
 [runtime]
-# How the plugin runs. Choose one:
-kind = "wasm"              # wasm | subprocess | container | in-process (trusted only)
-entry = "dist/plugin.wasm"
-# For subprocess/container: command, image, etc.
+# How the plugin runs. Phase 2 ships `subprocess` only. `container`
+# is reserved for heavy services (vLLM etc.) and lands when one of
+# those needs it. WASM and in-process tiers were considered and
+# dropped — see §4.4.
+kind = "subprocess"        # subprocess | container
+entry = "dist/plugin.js"   # path inside the staged ZIP (subprocess)
+# For container: image, mounts, etc.
 
 [capabilities]
 requires = ["transport.receive", "transport.send", "vault.read:signal_*"]
@@ -1113,12 +1116,12 @@ When execlaw speaks MCP, it does so *outbound* to someone else's MCP server — 
 
 ### 4.4 Isolation tiers
 
-| Tier | Mechanism | Use for |
-|---|---|---|
-| 0: in-process | Rust dylib, signed by maintainer | Anthropic-maintained core plugins only |
-| 1: wasm | `wasmtime` component, no ambient authority | 3rd-party tools, simple transports |
-| 2: subprocess | Separate OS process, JSON-RPC over stdio | Node/Python plugins that need rich libs |
-| 3: container | Full container with declared mounts/network | Heavy services (vLLM, custom runners) |
+| Tier | Mechanism | Status | Use for |
+|---|---|---|---|
+| 0: in-process | Rust dylib, signed by maintainer | dropped | Was reserved for trusted core plugins; folded into the host instead. |
+| 1: wasm | `wasmtime` component, no ambient authority | dropped 2026-04-25 | Considered for 3rd-party tools but no plugin in `docs/plugin-inventory.md` benefits — every port wraps a native binary or talks HTTPS, none compile to wasm. Threat model is self-hosted single-operator, so the deny-by-default story doesn't pay for the wasmtime dep + Cranelift weight. Reconsider only if a future port surfaces a real need. |
+| 2: subprocess | Separate OS process, JSON-RPC over stdio | shipped (Phase 2) | Every plugin today: Node/Python/Go workers talking JSON-RPC over stdio. |
+| 3: container | Full container with declared mounts/network | reserved | Heavy services (vLLM, Whisper, Kokoro). Lands with the first such plugin port (Phase 8). |
 
 Capabilities are enforced at every tier: the plugin host *refuses* to pass a message or perform a side-effect the plugin didn't declare permission for in its manifest.
 
@@ -2352,19 +2355,16 @@ deliberate planning.
 - **Backup + restore** with DR runbook. SQLite `VACUUM INTO` for atomic encrypted-at-rest snapshot; restore validates the snapshot is a real execlaw DB (schema_version table present + row count > 0) before atomic file rename. CLI: `execlaw backup --to <path>` and `execlaw restore --from <path>`. Inherits SQLCipher encryption posture from the source DB. Integration test covers full round-trip including key-ring continuity.
 - **Multi-controller users** — list / invite / delete with `count_by_role` invariant guarding "cannot remove the last controller" + "cannot self-delete". Audit-logged on every mutation. SPA Settings → Users page with role badges, invite form (Controller-only), per-row delete with confirm. 7 server tests + 5 SPA tests + 3 core tests.
 
-**Wave 3 — sub-phases (queued; each its own deliberate scope):**
-
-Wave-3 ordering is dictated by tractability after a wave-2 audit: 7e first
-(narrowest scope, leverages existing crypto deps + extensible login path),
-then 7d (largest abstraction work — needs a `PluginRuntime` trait
-extracted before WASM execution lands), then 7f (greenfield architectural
-layer, only after 7d + 7e are solid).
+**Wave 3 — sub-phases:**
 
 | Sub-phase | Scope | Notes |
 |---|---|---|
-| **7e** | **WebAuthn controller auth** — second factor after JWT password, optional per-user. `webauthn-rs` 0.5 (passkey API) for the relying-party side, `state_webauthn_credentials` table, registration ceremony from Settings → Profile, challenge state held server-side between begin/finish, login challenge wired into `/api/login`, fallback to password if no credentials registered. | First in the queue: smallest scaffolding debt, security-critical so it deserves the focused attention. Adversarial tests must cover replay, wrong-user-id, unregistered authenticator, expired challenge, missing-credential. |
-| **7d** | **WASM plugin tier** — second isolation option after subprocess (§4.4 tier 3). Extract a `PluginRuntime` trait so subprocess + WASM live behind one dispatch surface, `wasmtime` host, capability-scoped `wasi:` imports, manifest field `[runtime] tier = "wasm"`, ZIP includes `.wasm` artifact. | Largest of the three. The trait extraction is a refactor that lands first (subprocess still works); WASM execution lands as a second commit. Sandbox-escape adversarial tests gate the merge. |
-| **7f** | **Advanced subagents** (guardrails, research fan-out). Subagents already default on per the locked decisions; this sub-phase formalizes (a) the planner→executor handoff under Rule of Two, (b) deep-research fan-out as the flagship, (c) per-subagent capability scoping (subagent inherits a *subset* of parent caps), (d) persistent subagent transcripts joined to the parent state_events stream. | Last in the queue per the original Phase 7 ordering: "only after everything above is solid." Touches §2.9 of this plan plus the runner-local crate. Will not start until 7d + 7e are done. |
+| **7e** | **WebAuthn controller auth** — second factor after JWT password, optional per-user. `webauthn-rs` 0.5 (passkey API) for the relying-party side, `state_webauthn_credentials` table, registration ceremony from Settings → Profile, challenge state held server-side between begin/finish, login challenge wired into `/api/login`, fallback to password if no credentials registered. | ✅ shipped 2026-04-25. |
+| **JWT plumbing** | Persistent refresh-token store + `/api/logout/all` + SPA silent retry on 401 + background refresh + sweeper. | ✅ shipped 2026-04-25 (post-audit gap fill). |
+| **~~7d~~** | ~~**WASM plugin tier**~~ | **Dropped 2026-04-25.** Considered and explicitly de-scoped: every plugin in `docs/plugin-inventory.md` wraps a native binary or speaks HTTPS, so none compile to wasm; the threat model is self-hosted single-operator, so the deny-by-default story doesn't pay for the `wasmtime`/Cranelift dep weight. Subprocess tier carries Phase 2-8. Reconsider only if a plugin port surfaces a real need. |
+| **~~7f~~** | ~~**Advanced subagents**~~ | **Removed from Phase 7 scope 2026-04-25.** The wave-2 audit observed 7f is greenfield (no planner/executor split, no subagent lifecycle, ~95% new code) and is fundamentally a feature, not hardening. Tracked separately as a feature roadmap item; subagents stay default-on in their current shape per the 2026-04-23 locked decision. |
+
+**Phase 7 is functionally complete** with 7e + JWT plumbing shipped. Remaining items are either dropped (above) or correctly classified as fluff / not warranted for a self-hosted single-operator appliance: rate-limiting on `/api/login` + `/api/token/refresh` (not internet-facing), HttpOnly cookies + CSRF tokens (same-origin SPA, no third-party JS), DR runbook doc (CLI + tests cover the actual work), PII redaction on log entries (retention sweeper IS the privacy control), and an active-sessions UI (the `count_for_user` primitive exists; surfacing it is Phase 8+ polish).
 
 ### Phase 8 — External plugin ports (open-ended; runs in parallel once Phase 2-7 foundations hold)
 
