@@ -18,6 +18,7 @@ import { PluginsPage } from "./PluginsPage";
 import { LogsPage } from "./LogsPage";
 import { EvalFlagsPage } from "./EvalFlagsPage";
 import { PrincipalsPage } from "./PrincipalsPage";
+import { ContactsPage } from "./ContactsPage";
 import { AuditPage } from "./AuditPage";
 import { BackendsPage } from "./BackendsPage";
 import { UserPage } from "./UserPage";
@@ -37,6 +38,9 @@ const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     // Hardware now lives at the bottom of the Backends page.
     { to: "/settings/backends", icon: "bi-cpu-fill", label: "Backends" },
     { to: "/settings/runners", icon: "bi-fire", label: "Runners" },
+    // Contacts is the curated address-book view, Principals is the
+    // "everything else" view (controllers, delegated bots, blocked).
+    { to: "/settings/contacts", icon: "bi-person-lines-fill", label: "Contacts" },
     { to: "/settings/principals", icon: "bi-people", label: "Principals" },
     { to: "/settings/logs", icon: "bi-list-columns", label: "Logs" },
     { to: "/settings/eval", icon: "bi-bar-chart", label: "Eval flags" },
@@ -138,6 +142,7 @@ export function Settings() {
                         <Route path="mcp" element={<McpServersPage />} />
                         <Route path="backends" element={<BackendsPage />} />
                         <Route path="runners" element={<RunnersPage />} />
+                        <Route path="contacts" element={<ContactsPage />} />
                         <Route path="principals" element={<PrincipalsPage />} />
                         <Route path="logs" element={<LogsPage />} />
                         <Route path="eval" element={<EvalFlagsPage />} />
