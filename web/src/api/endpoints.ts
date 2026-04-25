@@ -72,6 +72,21 @@ export async function postLogin(req: LoginRequest): Promise<LoginResponse> {
     });
 }
 
+/// Phase 7e: superset of `postLogin` that returns the new
+/// `LoginOutcome` shape (defined further down in this file). The
+/// server returns either the legacy `{access_token, refresh_token}`
+/// pair OR a webauthn challenge — callers must branch on
+/// `webauthn_required`. The non-discriminated `unknown` here is
+/// intentional; the call site narrows after the flag check.
+export async function postLoginOutcome(
+    req: LoginRequest,
+): Promise<unknown> {
+    return apiFetch<unknown>("/api/login", {
+        method: "POST",
+        body: req,
+    });
+}
+
 // ---- /api/chats ----------------------------------------------------
 
 export interface ThreadSummary {
@@ -568,6 +583,112 @@ export async function deleteUser(
         `/api/admin/users/${encodeURIComponent(userId)}`,
         { method: "DELETE" },
         tokenAccessor,
+    );
+}
+
+// ---- /api/admin/webauthn (Phase 7e second-factor) -----------------
+
+/// Each row from `state_webauthn_credentials`, public surface (no
+/// `passkey_json` blob — that's an implementation detail of the
+/// relying-party crate).
+export interface WebauthnCredentialView {
+    credential_id: string;
+    label: string;
+    created_at: number;
+    last_used_at: number | null;
+}
+
+export interface WebauthnCredentialListResponse {
+    credentials: WebauthnCredentialView[];
+}
+
+export interface WebauthnRegisterBeginResponse {
+    ceremony_id: string;
+    /// Opaque PublicKeyCredentialCreationOptions JSON. The SPA
+    /// passes this through `coerceCreationOptions()` and feeds the
+    /// result to `navigator.credentials.create()`.
+    options: unknown;
+}
+
+export interface WebauthnAssertBeginResponse {
+    webauthn_required: true;
+    ceremony_id: string;
+    options: unknown;
+}
+
+/// Discriminated by `webauthn_required`. The login route's two
+/// outcomes share the same HTTP status (200) — the SPA branches on
+/// this flag.
+export type LoginOutcome =
+    | {
+          webauthn_required: false;
+          access_token: string;
+          refresh_token: string;
+      }
+    | WebauthnAssertBeginResponse;
+
+export async function listWebauthnCredentials(
+    tokenAccessor: () => string | null,
+): Promise<WebauthnCredentialListResponse> {
+    return apiFetch<WebauthnCredentialListResponse>(
+        "/api/admin/webauthn/credentials",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function deleteWebauthnCredential(
+    credentialId: string,
+    tokenAccessor: () => string | null,
+): Promise<unknown> {
+    return apiFetch(
+        `/api/admin/webauthn/credentials/${encodeURIComponent(credentialId)}`,
+        { method: "DELETE" },
+        tokenAccessor,
+    );
+}
+
+export async function beginWebauthnRegistration(
+    label: string,
+    tokenAccessor: () => string | null,
+): Promise<WebauthnRegisterBeginResponse> {
+    return apiFetch<WebauthnRegisterBeginResponse>(
+        "/api/admin/webauthn/register/begin",
+        { method: "POST", body: { label } },
+        tokenAccessor,
+    );
+}
+
+export async function finishWebauthnRegistration(
+    ceremonyId: string,
+    credential: unknown,
+    tokenAccessor: () => string | null,
+): Promise<WebauthnCredentialView> {
+    return apiFetch<WebauthnCredentialView>(
+        "/api/admin/webauthn/register/finish",
+        {
+            method: "POST",
+            body: { ceremony_id: ceremonyId, credential },
+        },
+        tokenAccessor,
+    );
+}
+
+/// Finishes an in-flight login ceremony with the assertion produced
+/// by `navigator.credentials.get()`. Returns the standard token pair
+/// shape so callers feed it into `signIn(pair)` exactly like the
+/// password-only path.
+export async function finishWebauthnLogin(
+    ceremonyId: string,
+    credential: unknown,
+): Promise<{ access_token: string; refresh_token: string }> {
+    return apiFetch<{ access_token: string; refresh_token: string }>(
+        "/api/login/webauthn/finish",
+        {
+            method: "POST",
+            body: { ceremony_id: ceremonyId, credential },
+        },
+        () => null, // unauthenticated route — caller has no token yet
     );
 }
 

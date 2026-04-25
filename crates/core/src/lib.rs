@@ -38,6 +38,7 @@ pub mod transport_conversations;
 pub mod transport_cursor;
 pub mod users;
 pub mod vault_row;
+pub mod webauthn;
 
 pub use db::{Database, DbConfig, DbError};
 pub use events::{EventKind, EventLog, EventRecord};

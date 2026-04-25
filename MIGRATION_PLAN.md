@@ -2354,10 +2354,16 @@ deliberate planning.
 
 **Wave 3 — sub-phases (queued; each its own deliberate scope):**
 
+Wave-3 ordering is dictated by tractability after a wave-2 audit: 7e first
+(narrowest scope, leverages existing crypto deps + extensible login path),
+then 7d (largest abstraction work — needs a `PluginRuntime` trait
+extracted before WASM execution lands), then 7f (greenfield architectural
+layer, only after 7d + 7e are solid).
+
 | Sub-phase | Scope | Notes |
 |---|---|---|
-| **7d** | **WASM plugin tier** — second isolation option after subprocess (§4.4 tier 3). `wasmtime` host, capability-scoped `wasi:` imports, manifest field `[runtime] tier = "wasm"`, hook dispatch over `wit-bindgen` interfaces, ZIP includes `.wasm` artifact. | Largest of the three. Requires building a minimal `wit` interface from the existing JSON-RPC shape, host-side capability gating that mirrors subprocess tier, sandbox-escape adversarial tests. Does NOT ship until the subprocess tier has been adversarially audited under load. |
-| **7e** | **WebAuthn controller auth** — second factor after JWT password, optional per-user. `webauthn-rs` crate, registration ceremony from Settings → Profile, login challenge wired into `/api/auth/login`, fallback to password if no credentials registered. | Smaller scope than 7d but touches the auth boundary; requires a complete unit-test sweep of every JWT issuance path AND every credential round-trip. Migration adds `state_webauthn_credentials` table. |
+| **7e** | **WebAuthn controller auth** — second factor after JWT password, optional per-user. `webauthn-rs` 0.5 (passkey API) for the relying-party side, `state_webauthn_credentials` table, registration ceremony from Settings → Profile, challenge state held server-side between begin/finish, login challenge wired into `/api/login`, fallback to password if no credentials registered. | First in the queue: smallest scaffolding debt, security-critical so it deserves the focused attention. Adversarial tests must cover replay, wrong-user-id, unregistered authenticator, expired challenge, missing-credential. |
+| **7d** | **WASM plugin tier** — second isolation option after subprocess (§4.4 tier 3). Extract a `PluginRuntime` trait so subprocess + WASM live behind one dispatch surface, `wasmtime` host, capability-scoped `wasi:` imports, manifest field `[runtime] tier = "wasm"`, ZIP includes `.wasm` artifact. | Largest of the three. The trait extraction is a refactor that lands first (subprocess still works); WASM execution lands as a second commit. Sandbox-escape adversarial tests gate the merge. |
 | **7f** | **Advanced subagents** (guardrails, research fan-out). Subagents already default on per the locked decisions; this sub-phase formalizes (a) the planner→executor handoff under Rule of Two, (b) deep-research fan-out as the flagship, (c) per-subagent capability scoping (subagent inherits a *subset* of parent caps), (d) persistent subagent transcripts joined to the parent state_events stream. | Last in the queue per the original Phase 7 ordering: "only after everything above is solid." Touches §2.9 of this plan plus the runner-local crate. Will not start until 7d + 7e are done. |
 
 ### Phase 8 — External plugin ports (open-ended; runs in parallel once Phase 2-7 foundations hold)

@@ -30,6 +30,7 @@ pub mod state;
 pub mod tool_dispatch;
 pub mod tracing_layer;
 pub mod users;
+pub mod webauthn;
 
 pub use auth::{JwtSigner, RefreshStore};
 pub use events::{EventBus, UiEvent};

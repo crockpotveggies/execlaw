@@ -15,9 +15,10 @@ import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
 import Spinner from "react-bootstrap/Spinner";
 import { ApiError } from "../api/client";
-import { postLogin } from "../api/endpoints";
+import { finishWebauthnLogin, postLoginOutcome } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
 import { useScreenTransition } from "../anim/useScreenTransition";
+import { coerceRequestOptions, serializeCredential } from "../auth/webauthn";
 
 export function Login() {
     const auth = useAuth();
@@ -28,10 +29,44 @@ export function Login() {
     const [password, setPassword] = useState("");
     const [submitError, setSubmitError] = useState<string | null>(null);
     const [submitting, setSubmitting] = useState(false);
+    // Phase 7e: when the password check passes but the user has
+    // webauthn registered, the server returns a challenge. We hold
+    // the ceremony state here while the browser prompts for a
+    // passkey. `null` = no in-flight ceremony.
+    const [pendingChallenge, setPendingChallenge] = useState<
+        | { ceremonyId: string; options: unknown }
+        | null
+    >(null);
 
     if (auth.status === "authenticated") {
         return <Navigate to="/chat" replace />;
     }
+
+    const handleWebauthnAssert = async (
+        ceremonyId: string,
+        options: unknown,
+    ) => {
+        if (typeof navigator === "undefined" || !navigator.credentials) {
+            setSubmitError(
+                "This browser does not support WebAuthn. Use a modern browser or remove the registered passkey.",
+            );
+            return;
+        }
+        const reqOpts = coerceRequestOptions(options);
+        const cred = (await navigator.credentials.get({
+            publicKey: reqOpts,
+        })) as PublicKeyCredential | null;
+        if (!cred) {
+            setSubmitError("No credential returned from the authenticator.");
+            return;
+        }
+        const tokens = await finishWebauthnLogin(
+            ceremonyId,
+            serializeCredential(cred),
+        );
+        await auth.signIn(tokens);
+        dismiss(() => navigate("/chat", { replace: true }));
+    };
 
     const onSubmit = async (e: FormEvent<HTMLFormElement>) => {
         e.preventDefault();
@@ -42,19 +77,53 @@ export function Login() {
         }
         setSubmitting(true);
         try {
-            const tokens = await postLogin({
+            const outcome = (await postLoginOutcome({
                 username: username.trim(),
                 admin_password: password,
+            })) as
+                | {
+                      webauthn_required: false;
+                      access_token: string;
+                      refresh_token: string;
+                  }
+                | {
+                      webauthn_required: true;
+                      ceremony_id: string;
+                      options: unknown;
+                  };
+            if (outcome.webauthn_required) {
+                setPendingChallenge({
+                    ceremonyId: outcome.ceremony_id,
+                    options: outcome.options,
+                });
+                // Try to start the assertion ceremony immediately —
+                // the user has already pressed "Sign in", they expect
+                // their authenticator to prompt next.
+                try {
+                    await handleWebauthnAssert(
+                        outcome.ceremony_id,
+                        outcome.options,
+                    );
+                    return;
+                } catch (e) {
+                    // Surface a button so the operator can retry the
+                    // authenticator step without re-typing the password.
+                    setSubmitError(
+                        e instanceof Error
+                            ? `Passkey step failed: ${e.message}`
+                            : "Passkey step failed.",
+                    );
+                }
+                return;
+            }
+            await auth.signIn({
+                access_token: outcome.access_token,
+                refresh_token: outcome.refresh_token,
             });
-            await auth.signIn(tokens);
-            // Successful sign-in: shrink + fade the form, THEN navigate.
             dismiss(() => navigate("/chat", { replace: true }));
             return;
         } catch (e) {
             if (e instanceof ApiError) {
-                // Server returns the same `bad_credentials` for both
-                // wrong-username and wrong-password — surface a single
-                // generic message so the SPA doesn't re-leak it.
                 if (e.code === "unauthorized") {
                     setSubmitError("Incorrect username or password.");
                 } else if (e.serverCode === "not_initialized") {
@@ -73,6 +142,23 @@ export function Login() {
         }
     };
 
+    const onRetryWebauthn = async () => {
+        if (!pendingChallenge) return;
+        setSubmitError(null);
+        try {
+            await handleWebauthnAssert(
+                pendingChallenge.ceremonyId,
+                pendingChallenge.options,
+            );
+        } catch (e) {
+            setSubmitError(
+                e instanceof Error
+                    ? `Passkey step failed: ${e.message}`
+                    : "Passkey step failed.",
+            );
+        }
+    };
+
     return (
         <div className="execlaw-auth-shell">
             <div ref={ref} className="execlaw-auth-card">
@@ -86,6 +172,27 @@ export function Login() {
                         data-testid="login-error"
                     >
                         {submitError}
+                    </div>
+                )}
+
+                {pendingChallenge && (
+                    <div className="execlaw-card mb-3" data-testid="login-webauthn-pending">
+                        <div className="execlaw-card__title mb-2">
+                            <i className="bi bi-key me-2" aria-hidden />
+                            Passkey required
+                        </div>
+                        <p className="execlaw-muted small mb-3">
+                            Tap your security key or use your platform
+                            authenticator to finish signing in.
+                        </p>
+                        <Button
+                            type="button"
+                            variant="outline-primary"
+                            onClick={() => void onRetryWebauthn()}
+                            data-testid="login-webauthn-retry"
+                        >
+                            Try passkey again
+                        </Button>
                     </div>
                 )}
 

@@ -27,6 +27,7 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
         event_log_hmac_key: Some(Arc::new(b"execlaw-test-hmac-key-32-bytes!!".to_vec())),
         inference: None,
         plugin_host: PluginHost::new(db, HookRegistry::new(), stage_root),
+        webauthn: None,
     };
     (
         execlaw_server::routes::build_router(state.clone()),

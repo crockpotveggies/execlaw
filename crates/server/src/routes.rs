@@ -75,6 +75,29 @@ pub struct LoginResponse {
     pub refresh_token: String,
 }
 
+/// Either tokens (no webauthn) or a webauthn challenge (Phase 7e).
+/// The SPA branches on `webauthn_required` — it's literally `false` on
+/// the password-only path and `true` when the user has registered
+/// passkeys.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum LoginOutcome {
+    /// Password verified, no webauthn registered. Tokens issued.
+    Tokens {
+        webauthn_required: bool, // always false here
+        access_token: String,
+        refresh_token: String,
+    },
+    /// Password verified, webauthn ceremony started. Tokens NOT
+    /// issued; SPA must complete the assertion ceremony first.
+    WebauthnChallenge {
+        webauthn_required: bool, // always true here
+        ceremony_id: String,
+        #[schema(value_type = serde_json::Value)]
+        options: serde_json::Value,
+    },
+}
+
 /// Shape returned by `GET /api/admin/me` — the current logged-in
 /// user's profile so the SPA can render the bottom-of-sidebar
 /// "⚙ user@email" affordance.
@@ -404,7 +427,7 @@ pub async fn setup(
     path = "/api/login",
     request_body = LoginRequest,
     responses(
-        (status = 200, description = "Login ok", body = LoginResponse),
+        (status = 200, description = "Login ok or webauthn challenge", body = LoginOutcome),
         (status = 401, description = "Bad password"),
     ),
     tag = "auth"
@@ -412,7 +435,7 @@ pub async fn setup(
 pub async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
-) -> Result<Json<LoginResponse>, ApiError> {
+) -> Result<Json<LoginOutcome>, ApiError> {
     use execlaw_core::users::{UserStore, normalize_username};
 
     let users = UserStore::new(&state.db);
@@ -453,7 +476,24 @@ pub async fn login(
         });
     }
 
-    // Best-effort: stamp last_login_at. Failure here doesn't block login.
+    // Phase 7e branch: if the user has any registered webauthn
+    // credentials, demand a successful assertion before issuing
+    // tokens. Failures inside the webauthn helper are surfaced — we
+    // don't fall back to password-only on registered users, that
+    // would defeat the second factor.
+    let cred_count = execlaw_core::webauthn::WebauthnStore::new(&state.db)
+        .count_for_user(&user.user_id)
+        .map_err(ApiError::from)?;
+    if cred_count > 0 {
+        let challenge = crate::webauthn::begin_login_assertion(&state, &user.user_id)?;
+        return Ok(Json(LoginOutcome::WebauthnChallenge {
+            webauthn_required: true,
+            ceremony_id: challenge.ceremony_id,
+            options: challenge.options,
+        }));
+    }
+
+    // No webauthn registered — issue tokens directly (legacy path).
     let _ = users.touch_login(&user.user_id, chrono::Utc::now().timestamp());
 
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -467,7 +507,8 @@ pub async fn login(
         &session_id,
         state.config.refresh_token_ttl_secs,
     );
-    Ok(Json(LoginResponse {
+    Ok(Json(LoginOutcome::Tokens {
+        webauthn_required: false,
         access_token: access,
         refresh_token: refresh,
     }))
@@ -561,6 +602,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::observability::observability_router())
         .merge(crate::deployments::deployments_router())
         .merge(crate::users::users_router())
+        .merge(crate::webauthn::webauthn_router())
         .merge(crate::docs::docs_router())
         .with_state(state)
 }
@@ -591,6 +633,11 @@ pub fn test_app_state() -> AppState {
         )),
         inference: None,
         plugin_host: PluginHost::new(db, HookRegistry::new(), stage_root),
+        // Test fixtures don't run the WebAuthn ceremony directly —
+        // the second-factor route tests build their own AppState
+        // when needed. Leaving this `None` means count_for_user
+        // returns 0 and the password-only login path is exercised.
+        webauthn: None,
     }
 }
 
@@ -971,5 +1018,78 @@ mod tests {
         assert_eq!(s1, s2);
         assert_eq!(b1["error"]["code"], b2["error"]["code"]);
         assert_eq!(b1["error"]["code"], "bad_credentials");
+    }
+
+    /// Phase 7e baseline: when the user has zero webauthn credentials,
+    /// /api/login returns the Tokens variant of LoginOutcome (with
+    /// `webauthn_required = false`) and tokens are issued.
+    #[tokio::test]
+    async fn login_without_webauthn_credentials_returns_tokens() {
+        let app = build_router(test_app_state());
+        let _ = send_json(&app, Method::POST, "/api/setup", setup_body("hunter2-longer", "J")).await;
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/api/login",
+            login_body("tester", "hunter2-longer"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // Untagged enum: discriminator is the `webauthn_required`
+        // boolean. False here means "tokens included".
+        assert_eq!(body["webauthn_required"], false);
+        assert!(body["access_token"].as_str().is_some());
+        assert!(body["refresh_token"].as_str().is_some());
+    }
+
+    /// Phase 7e fail-closed invariant: if a user somehow has webauthn
+    /// credentials registered AND the server is running without the
+    /// webauthn feature compiled in (or with `webauthn: None`), the
+    /// login route must not silently bypass the second factor. It
+    /// either returns a webauthn challenge (feature on) or 503
+    /// webauthn_unconfigured (feature off / svc missing). We assert
+    /// the shared invariant: tokens are NOT issued.
+    #[tokio::test]
+    async fn login_with_registered_credential_does_not_silently_bypass() {
+        use execlaw_core::webauthn::{WebauthnCredentialRow, WebauthnStore};
+        let state = test_app_state();
+        let app = build_router(state.clone());
+        let _ = send_json(&app, Method::POST, "/api/setup", setup_body("hunter2-longer", "J")).await;
+
+        // Look up the user_id the setup just minted.
+        let users = execlaw_core::users::UserStore::new(&state.db);
+        let user = users.get_by_username("tester").unwrap().unwrap();
+
+        // Insert a synthetic credential. The `passkey_json` is opaque
+        // to the login route (only finish-auth parses it).
+        let store = WebauthnStore::new(&state.db);
+        store
+            .insert(&WebauthnCredentialRow {
+                credential_id: "synthetic-cred-id".into(),
+                user_id: user.user_id.clone(),
+                label: "test-key".into(),
+                passkey_json: r#"{"opaque":"blob"}"#.into(),
+                counter: 0,
+                created_at: 0,
+                last_used_at: None,
+            })
+            .unwrap();
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/api/login",
+            login_body("tester", "hunter2-longer"),
+        )
+        .await;
+        // Either 200 with WebauthnChallenge OR 503 webauthn_unconfigured
+        // when the svc is missing — what we must NEVER see is a Tokens
+        // response with valid access + refresh tokens.
+        let issued_tokens = body["access_token"].as_str().is_some()
+            && body["refresh_token"].as_str().is_some();
+        assert!(
+            !issued_tokens,
+            "login must not issue tokens when webauthn credentials exist; status={status}, body={body}",
+        );
     }
 }

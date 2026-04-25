@@ -81,6 +81,9 @@ sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 base64 = "0.22"
+# WebAuthn second-factor (Phase 7e). Passkey-only API; FIDO/U2F path not used.
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+webauthn-rs-proto = "0.5"
 
 # --- logging / tracing ---
 tracing = "0.1"

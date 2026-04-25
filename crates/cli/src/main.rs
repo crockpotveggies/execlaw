@@ -938,6 +938,36 @@ fn cmd_restore(
     Ok(())
 }
 
+/// Build a WebAuthn relying-party from environment variables. Returns
+/// `None` (so login falls back to password-only) on any error so an
+/// operator who hasn't yet configured WebAuthn isn't locked out.
+///
+/// `EXECLAW_WEBAUTHN_RP_ID` is the effective domain (hostname only —
+/// no scheme, no port). Defaults to `"localhost"`.
+/// `EXECLAW_WEBAUTHN_ORIGIN` is the full origin used to build the URL
+/// passed to webauthn-rs. Defaults to `http://<bind_addr>` so a
+/// fresh-from-clone install Just Works for local-dev.
+fn build_webauthn_from_env(
+    bind_addr: &std::net::SocketAddr,
+) -> Option<execlaw_server::webauthn::WebauthnSvc> {
+    let rp_id = std::env::var("EXECLAW_WEBAUTHN_RP_ID")
+        .unwrap_or_else(|_| "localhost".to_owned());
+    let origin = std::env::var("EXECLAW_WEBAUTHN_ORIGIN")
+        .unwrap_or_else(|_| format!("http://{bind_addr}"));
+    match execlaw_server::webauthn::WebauthnSvc::new(&rp_id, &origin, "execlaw") {
+        Ok(svc) => Some(svc),
+        Err(e) => {
+            tracing::warn!(
+                rp_id,
+                origin,
+                error = %e,
+                "webauthn relying-party build failed; falling back to password-only login"
+            );
+            None
+        }
+    }
+}
+
 /// Parse `12..48` (inclusive on both ends).
 fn parse_range(s: &str) -> anyhow::Result<(i64, i64)> {
     let mut parts = s.splitn(2, "..");
@@ -1005,6 +1035,13 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     // Re-hydrate installed plugins from the DB so they survive restart.
     plugin_host.hydrate().await.map_err(|e| anyhow::anyhow!("plugin hydrate: {e}"))?;
 
+    // Phase 7e: build the WebAuthn relying-party from EXECLAW_WEBAUTHN_*
+    // env vars. Falling back to localhost:3030 keeps local-dev working
+    // out of the box; production must set these to the real public
+    // origin (HTTPS only — webauthn-rs rejects http origins outside
+    // of `localhost`).
+    let webauthn = build_webauthn_from_env(&config.bind_addr).map(std::sync::Arc::new);
+
     let state = execlaw_server::AppState {
         db: db.clone(),
         config: config.clone(),
@@ -1014,6 +1051,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         event_log_hmac_key: hmac_key,
         inference,
         plugin_host,
+        webauthn,
     };
 
     // Phase-7 background workers — run for the lifetime of the

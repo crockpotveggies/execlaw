@@ -47,6 +47,29 @@ utoipa.workspace = true
 utoipa-axum.workspace = true
 utoipa-swagger-ui.workspace = true
 
+# Phase 7e: WebAuthn second-factor for the controller login. Optional
+# feature because the underlying `webauthn-rs` pulls in `openssl-sys`,
+# which doesn't build out of the box on Windows-host dev (needs
+# Strawberry Perl + libssl headers). Linux + Docker builds enable
+# `webauthn` so production gets the second factor; Windows dev runs
+# with `default-no-webauthn` and the routes return 503 unconfigured.
+webauthn-rs = { workspace = true, optional = true }
+webauthn-rs-proto = { workspace = true, optional = true }
+openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
+
+[features]
+default = []
+# Compile-in the WebAuthn relying-party + routes + login second-factor
+# branch. OFF by default because `webauthn-rs` pulls in `openssl-sys`,
+# which fails to build on a stock Windows-host dev environment without
+# Strawberry Perl + libssl headers. The production Docker image enables
+# the feature explicitly (`--features webauthn`) and CI runs the test
+# suite both with and without it. When the feature is off, every
+# webauthn route returns 503 `webauthn_unconfigured` and the login
+# route never demands a second factor (because registration is
+# impossible).
+webauthn = ["dep:webauthn-rs", "dep:webauthn-rs-proto", "dep:openssl-sys"]
+
 [dev-dependencies]
 tempfile.workspace = true
 reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls"] }

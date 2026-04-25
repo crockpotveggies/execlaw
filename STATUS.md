@@ -1,18 +1,19 @@
 # execlaw build STATUS
 
-Last update: 2026-04-25, after Phase 7 second wave (NULL-tag back-fill verifier + backup/restore + multi-controller users) + sub-phase carve-out.
+Last update: 2026-04-25, after Phase 7 sub-phase **7e** WebAuthn second-factor (data layer + relying-party + login branch + SPA Profile + Login flow).
 
 ## TL;DR
 
-- `cargo build --workspace` — **clean**
+- `cargo build --workspace` — **clean** (stub mode; webauthn-rs gated behind `--features webauthn` for the Linux/Docker production build)
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **431 passing, 0 failing** (+14 vs wave 1)
-- `cargo bench --workspace --no-run` — **clean** (45 benches across 9 crates)
-- `cd web && npm test` — **107 passing** (+5 vs wave 1: UsersPage)
-- `cd web && npm run build` — **clean** (306 KB JS / 311 KB CSS, both well under budget)
+- `cargo test --workspace --no-fail-fast` — **441 passing, 0 failing** (+10 vs wave 2)
+- `cargo bench --workspace --no-run` — **clean** (48 benches across 9 crates; +3 webauthn_store benches)
+- `cd web && npm test` — **113 passing** (+6 vs wave 2: webauthn-helpers)
+- `cd web && npm run build` — **clean** (313 KB JS / 311 KB CSS, both well under budget)
 - **Zero cloud-SDK dependencies** anywhere in the workspace
-- **Phase 7 wave 2 done.** Shipped: (a) **NULL-tag back-fill verifier** — `EventLog::backfill_null_tags()` requires a `KeyRing`, signs every NULL-tag row under the current key, idempotent; CLI `execlaw backfill-events`; (b) **Backup + restore** — atomic `VACUUM INTO` snapshot, validation-on-restore, CLI `execlaw backup --to <path>` / `execlaw restore --from <path>`, inherits SQLCipher posture; (c) **Multi-controller users** — list / invite / delete with last-controller + cannot-self-delete invariants, audit-logged, SPA Settings → Users page (role-gated UI, role badges, confirm-delete).
-- **Phase 7 wave 3** carved into named sub-phases in MIGRATION_PLAN.md: **7d** WASM plugin tier, **7e** WebAuthn controller auth, **7f** advanced subagents — each large enough to deserve its own design pass.
+- **Phase 7 sub-phase 7e (WebAuthn) done.** Shipped: (a) **Migration 0007** + `state_webauthn_credentials` table with per-user 10-credential cap + ON DELETE CASCADE on `users`; (b) **`WebauthnStore`** in core (insert / count_for_user / list_for_user / get / update_counter / delete_owned + 8 unit tests including ownership + cascade); (c) **`WebauthnSvc`** in server (relying-party config, register + authenticate ceremonies, 5-minute ceremony TTL with `prune_expired`, deterministic user-handle UUID); (d) **HTTP routes** for register begin/finish, list, delete, login finish — all audit-logged; (e) **/api/login second-factor branch** — when `count_for_user > 0`, returns the new `LoginOutcome::WebauthnChallenge` instead of tokens, fail-closed if the svc is missing; (f) **SPA**: `coerceCreationOptions`/`coerceRequestOptions`/`serializeCredential` browser helpers (base64url ↔ ArrayBuffer), Login screen handles the challenge (auto-prompts authenticator + retry button), Settings → Profile credential management.
+- **Build feature gate**: `webauthn-rs` pulls in `openssl-sys` which can't build out-of-the-box on Windows MSYS perl. The integration lives behind the `webauthn` feature on the server crate (default OFF) so the workspace `cargo build` works on every host. Production Docker build enables it explicitly. When the feature is OFF, every webauthn route returns 503 `webauthn_unconfigured`, registration is impossible, and the login branch never fires (because count_for_user always observes 0).
+- **Wave 3 remaining:** **7d** WASM plugin tier (largest — needs PluginRuntime trait extraction first), **7f** advanced subagents (greenfield, last per ordering).
 
 ## Migration-plan phase structure (post-2026-04-24 refactor)
 
@@ -27,7 +28,7 @@ Phase 2 used to conflate "plugin framework" with "port every selfhosted-claw int
 | 4 — Voice pipeline primitives (pure Rust; real-audio demos move to Phase 8) | two-lane graph, Vad/Audio/Stt/Tts traits + mocks, `VoiceSession` orchestrator, voice event schema wired to state_events, endpointer, barge-in | ✅ done |
 | 5 — Observability, evaluation, replay CLI (infra only) | tracing→SQLite layer, `GET /api/admin/logs`, `GET /api/admin/eval/flags`, `execlaw replay <conv> --at <seq>`, `execlaw eval flag/list`, eval-harness binary + rubric scaffolding | ✅ done (UI components for log viewer + dashboard land in Phase 6) |
 | 6 — UI port, chat-first landing | React + GSAP SPA: setup → login → chat (sidebar, thread list, streaming + cursor, channel-origin icons, long-msg truncation, external-channel filter, plugin UI panels) → settings (plugins/principals/hardware/logs/eval/audit), inline approval card with verbs, thread rename, incognito toggle, plugin install, trust revoke | ✅ done |
-| 7 — Hardening | wave 1 (deployment editor + key rotation + log retention) ✅, wave 2 (back-fill verifier + backup/restore + multi-controller users) ✅, wave 3 carved into 7d (WASM tier), 7e (WebAuthn), 7f (advanced subagents) | ongoing |
+| 7 — Hardening | wave 1 (deployment editor + key rotation + log retention) ✅, wave 2 (back-fill verifier + backup/restore + multi-controller users) ✅, wave 3 sub-phase 7e (WebAuthn second-factor) ✅; remaining: 7d (WASM tier), 7f (advanced subagents) | ongoing |
 | 8 — **External plugin ports** (open-ended) | every plugin that needs creds/external-services — see [plugin-inventory.md](docs/plugin-inventory.md) | queue; no ports started |
 | 9 — **Surface ports & native targets** (last phase) | 9a Tauri Desktop wrapper (same React bundle in a webview + OS notifications); 9b iOS / Android native (parallel component layer, Tamagui or similar) | queue |
 
@@ -99,24 +100,24 @@ EXECLAW_INFERENCE_URL=http://127.0.0.1:8000/v1 cargo start
 ## Test counts (per crate)
 
 ```
-execlaw-core             155     DB, events (+HMAC sign/verify + atomicity +
+execlaw-core             163     DB, events (+HMAC sign/verify + atomicity +
                                  NULL-tag backfill happy-path/idempotent/
                                  rejects-without-keyring/key-id stamping),
                                  outbox (+claim/record_failure/ready_pending),
                                  alerts, memory, principals (+PrincipalStore),
                                  idempotency keys, snapshots, HMAC
-                                 tamper-tests, migrations, conversation kind
-                                 derivation, eval_flagged store, log query,
-                                 UserStore (list_all ordering, idempotent
-                                 delete, count_by_role for last-controller
-                                 invariant), thread metadata
-                                 (display_name/pinned/ephemeral mutators
-                                 with upsert-preservation invariant),
-                                 ConversationResolver (controller short-
-                                 circuit, idle rotation, single-current-row
-                                 invariant, atomic transactions),
-                                 EphemeralSweeper, KeyRing rotation
-execlaw-server            90     auth, events (WS bus), capability tokens,
+                                 tamper-tests, migrations (now 7), conv
+                                 kind derivation, eval_flagged store, log
+                                 query, UserStore (list_all ordering,
+                                 idempotent delete, count_by_role for
+                                 last-controller invariant), WebauthnStore
+                                 (insert/list/count/update_counter/delete_
+                                 owned + 10-cred cap + duplicate-id reject
+                                 + ownership-scoped delete + ON DELETE
+                                 CASCADE), thread metadata mutators,
+                                 ConversationResolver, EphemeralSweeper,
+                                 KeyRing rotation
+execlaw-server            92     auth, events (WS bus), capability tokens,
                                  chat routes (streaming, policy, crash tests,
                                  cold-contact adversarial, identity-match
                                  classifier), tool_dispatch, tracing_layer,
@@ -124,9 +125,10 @@ execlaw-server            90     auth, events (WS bus), capability tokens,
                                  with JWT extractor, PATCH /api/chats/:id,
                                  GET /api/admin/plugins/ui_panels,
                                  GET /api/chats, deployments CRUD,
-                                 multi-controller users (list/invite/delete
-                                 + cannot-self-delete + last-controller-
-                                 invariant + operator-cannot-mutate),
+                                 multi-controller users, /api/login
+                                 webauthn second-factor branch (no-creds
+                                 issues tokens; with-creds never silently
+                                 bypasses → fail-closed invariant),
                                  OpenAPI coverage guard for every route,
                                  login leak-prevention, username
                                  invalid-shape rejection
@@ -150,9 +152,9 @@ execlaw-outbox            11     backoff, retry budget, drain, WakeupScheduler (
 execlaw-session            1     modality binding
 execlaw-eval-harness       2     rubric parse, mock-mode orchestration
 --------------------------------------------------------------------
-TOTAL                    431 passing, 0 failing
+TOTAL                    441 passing, 0 failing
 
-execlaw-web (vitest)     107     api/client + endpoints + tokens + auth boot,
+execlaw-web (vitest)     113     api/client + endpoints + tokens + auth boot,
                                  SetupWizard form validation (incl. username),
                                  ScreenTransition smoke, AppBoot routing,
                                  chat store (idempotent append, pinned/unread
@@ -167,7 +169,11 @@ execlaw-web (vitest)     107     api/client + endpoints + tokens + auth boot,
                                  model_spec JSON validation), UsersPage
                                  (list, role badge + 'you' marker, invite
                                  form POST body, delete confirm flow,
-                                 operator read-only view)
+                                 operator read-only view), WebAuthn helpers
+                                 (base64url ↔ ArrayBuffer round-trip,
+                                 CreationOptions + RequestOptions coercion,
+                                 attestation + assertion serialisation
+                                 wire-shape)
 ```
 
 ## Benchmarks (cargo bench --workspace)
@@ -209,6 +215,10 @@ execlaw-web (vitest)     107     api/client + endpoints + tokens + auth boot,
 | `deployment_store/list/4` | 2.7 µs | ≤1 ms for 64 rows | powers /api/admin/deployments settings page |
 | `deployment_store/list/16` | 10.2 µs | ≤1 ms | linear |
 | `deployment_store/list/64` | 40.8 µs | ≤1 ms | comfortably under budget |
+| `webauthn_store/count_for_user/0` | 1.4 µs | ≤50 µs | runs on EVERY /api/login; gate for 2FA branch |
+| `webauthn_store/count_for_user/3` | 1.5 µs | ≤50 µs | linear w/ creds, dominated by SQLite COUNT |
+| `webauthn_store/list_for_user/1` | 3.6 µs | ≤200 µs | only on the assertion path |
+| `webauthn_store/list_for_user/10` | 8.0 µs | ≤200 µs | hard cap at MAX_CREDENTIALS_PER_USER |
 
 ## Grounding-rule compliance (re-audited this session)
 
@@ -256,6 +266,11 @@ execlaw-web (vitest)     107     api/client + endpoints + tokens + auth boot,
 | Event-log key ring + back-fill verifier | `crates/core/src/events.rs::backfill_null_tags` |
 | Backup / restore CLI | `crates/cli/src/main.rs::cmd_backup` + `cmd_restore` |
 | Settings → Users SPA page | `web/src/settings/UsersPage.tsx` |
+| WebAuthn credential store + cap | `crates/core/src/webauthn.rs` |
+| WebAuthn relying-party + ceremony state | `crates/server/src/webauthn.rs` |
+| Login second-factor branch (fail-closed) | `crates/server/src/routes.rs::login` |
+| Login screen passkey flow | `web/src/routes/Login.tsx` + `web/src/auth/webauthn.ts` |
+| Settings → Profile passkey management | `web/src/settings/ProfilePage.tsx` |
 | Thread metadata route (PATCH) | `crates/server/src/chats.rs::patch_thread` |
 | UI-panel manifest route | `crates/server/src/plugins.rs::list_ui_panels_handler` |
 | Thread-name agent tool | `crates/runner-local/src/thread_tool.rs` |

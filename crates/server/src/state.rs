@@ -69,6 +69,11 @@ pub struct AppState {
     /// Plugin lifecycle manager + hook registry. Every route that
     /// enumerates tools / transports / UI panels reads from here.
     pub plugin_host: PluginHost,
+    /// Phase 7e WebAuthn relying-party + ceremony state. `None` when
+    /// the operator hasn't configured an RP origin (the SPA hides the
+    /// "Add WebAuthn" affordance and the login route skips the
+    /// second-factor branch in that mode).
+    pub webauthn: Option<crate::webauthn::SharedWebauthn>,
 }
 
 impl std::fmt::Debug for AppState {

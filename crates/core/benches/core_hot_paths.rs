@@ -26,6 +26,7 @@ use execlaw_core::ephemeral_sweeper::sweep_once;
 use execlaw_core::events::EventRecord as CoreEventRecord;
 use execlaw_core::outbox::{OutboxRow, OutboxStatus, OutboxStore};
 use execlaw_core::transport_conversations::{ConversationResolver, ResolveInput};
+use execlaw_core::webauthn::{WebauthnCredentialRow, WebauthnStore};
 
 fn fresh_db() -> Database {
     let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
@@ -715,6 +716,85 @@ fn bench_deployment_store(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// WebauthnStore — count_for_user is hit on EVERY login (gates the
+// second-factor branch), so it has to stay below ~50µs. list_for_user
+// is hit only when the second factor activates and is allowed to be
+// linear in cred count up to MAX_CREDENTIALS_PER_USER.
+// ---------------------------------------------------------------------------
+
+fn bench_webauthn_store(c: &mut Criterion) {
+    let mut group = c.benchmark_group("webauthn_store");
+
+    fn seed_user_and_creds(db: &Database, n: usize) {
+        // Insert a user row so the FK on state_webauthn_credentials
+        // is satisfied — match the shape the production user-row
+        // insert uses.
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO users \
+                 (user_id, username, display_name, email, password_hash, role, \
+                  created_at, last_login_at) \
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, NULL)",
+                rusqlite::params!["u1", "alice", "Alice", "argon2-hash", "controller", 0i64],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let store = WebauthnStore::new(db);
+        for i in 0..n {
+            store
+                .insert(&WebauthnCredentialRow {
+                    credential_id: format!("cred-{i}"),
+                    user_id: "u1".into(),
+                    label: format!("key-{i}"),
+                    passkey_json: r#"{"opaque":"blob"}"#.into(),
+                    counter: 0,
+                    created_at: i as i64,
+                    last_used_at: None,
+                })
+                .unwrap();
+        }
+    }
+
+    // Login-path hot spot: count_for_user runs on every /api/login,
+    // even when the user has no webauthn registered. Must stay tiny.
+    group.bench_function("count_for_user/0", |b| {
+        let db = fresh_db();
+        seed_user_and_creds(&db, 0);
+        let store = WebauthnStore::new(&db);
+        b.iter(|| {
+            let n = store.count_for_user(black_box("u1")).unwrap();
+            black_box(n);
+        });
+    });
+    group.bench_function("count_for_user/3", |b| {
+        let db = fresh_db();
+        seed_user_and_creds(&db, 3);
+        let store = WebauthnStore::new(&db);
+        b.iter(|| {
+            let n = store.count_for_user(black_box("u1")).unwrap();
+            black_box(n);
+        });
+    });
+
+    // Authentication-ceremony path: list_for_user assembles the
+    // candidate list passed to start_passkey_authentication.
+    for n in [1usize, 5usize, 10usize].iter() {
+        group.bench_with_input(BenchmarkId::new("list_for_user", n), n, |b, &n| {
+            let db = fresh_db();
+            seed_user_and_creds(&db, n);
+            let store = WebauthnStore::new(&db);
+            b.iter(|| {
+                let rows = store.list_for_user(black_box("u1")).unwrap();
+                black_box(rows);
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_hmac,
@@ -731,5 +811,6 @@ criterion_group!(
     bench_conversation_metadata,
     bench_list_thread_summaries,
     bench_deployment_store,
+    bench_webauthn_store,
 );
 criterion_main!(benches);
