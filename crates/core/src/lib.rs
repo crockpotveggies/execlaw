@@ -31,6 +31,7 @@ pub mod outbox;
 pub mod principal;
 pub mod research;
 pub mod transport_cursor;
+pub mod users;
 pub mod vault_row;
 
 pub use db::{Database, DbConfig, DbError};

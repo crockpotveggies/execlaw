@@ -6,7 +6,7 @@ Last update: 2026-04-24, after Phase 3 closeout + Phase 4 voice primitives.
 
 - `cargo build --workspace` — **clean**
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **316 passing, 0 failing**
+- `cargo test --workspace --no-fail-fast` — **326 passing, 0 failing**
 - `cargo bench --workspace --no-run` — **clean** (35+ benches across 8 crates)
 - **Zero cloud-SDK dependencies** anywhere in the workspace
 - Phases 0–5 complete (Phase 5 ships infra only — UI lands with Phase 6); Phase 6 UI port next
@@ -95,17 +95,19 @@ EXECLAW_INFERENCE_URL=http://127.0.0.1:8000/v1 cargo start
 ## Test counts (per crate)
 
 ```
-execlaw-core              80     DB, events (+HMAC sign/verify + atomicity),
+execlaw-core              86     DB, events (+HMAC sign/verify + atomicity),
                                  outbox (+claim/record_failure/ready_pending),
                                  alerts, memory, principals (+PrincipalStore),
                                  idempotency keys, snapshots, HMAC
                                  tamper-tests, migrations, conversation kind
-                                 derivation, eval_flagged store + log query
-execlaw-server            50     auth, events (WS bus), capability tokens,
+                                 derivation, eval_flagged store, log query,
+                                 UserStore (Phase-6 prep)
+execlaw-server            54     auth, events (WS bus), capability tokens,
                                  chat routes (streaming, policy, crash tests,
                                  cold-contact adversarial, identity-match
-                                 classifier), tool_dispatch, tracing_layer
-                                 (SQLite log_entries mirror)
+                                 classifier), tool_dispatch, tracing_layer,
+                                 /api/ping setup-detection, /api/admin/me
+                                 with JWT extractor
 execlaw-server (integ)    18     plugin_lifecycle (11) + approval_flow (7)
 execlaw-policy            43     rule_of_two, trust evaluator, spotlighting,
                                  sideband, input_guard, JWT claims
@@ -124,7 +126,7 @@ execlaw-outbox            11     backoff, retry budget, drain, WakeupScheduler (
 execlaw-session            1     modality binding
 execlaw-eval-harness       2     rubric parse, mock-mode orchestration
 --------------------------------------------------------------------
-TOTAL                    316 passing, 0 failing
+TOTAL                    326 passing, 0 failing
 ```
 
 ## Benchmarks (cargo bench --workspace)

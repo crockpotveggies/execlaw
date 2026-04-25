@@ -17,6 +17,7 @@
 
 pub mod approvals;
 pub mod auth;
+pub mod auth_extract;
 pub mod capability;
 pub mod chats;
 pub mod docs;

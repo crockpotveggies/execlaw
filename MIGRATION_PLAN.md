@@ -340,7 +340,7 @@ Old conversation rows stay linked to their `principal_id` so the UI can show "pr
 
 **Controller-thread merge** is the load-bearing UX consequence: every event payload carries a `channel_origin` field (`"web"` / `"signal"` / `"email"` / `"voice"` …). The SPA renders one pinned **Control thread** that aggregates every Controller message regardless of channel; per-message channel icons let the controller see at a glance which transport delivered each line.
 
-**Conversation metadata extensions** (migration 0005, lands before Phase 6):
+**Conversation metadata extensions** (migration 0006, lands at the start of Phase 6 — note migration 0005 was claimed by the `users` table that landed as Phase-6 prep):
 
 ```sql
 ALTER TABLE state_conversations ADD COLUMN display_name TEXT;
@@ -2275,8 +2275,21 @@ same bundle ships everywhere.
   affordance. Outbound (agent) messages do the same when they're
   longer than ~12 lines.
 - **Setup detection**: on UI boot the SPA hits `GET /api/ping` which
-  returns plain text `pong` (admin password set, normal mode) or
-  `setup` (first-run; SPA routes to the wizard).
+  returns plain text `pong` (controller user exists, normal mode) or
+  `setup` (first-run; SPA routes to the wizard). The wizard collects
+  `admin_password`, `display_name`, and an optional `email`, then
+  POSTs to `/api/setup` which writes one row to the `users` table
+  (migration 0005, landed as Phase-6 prep) and returns the access +
+  refresh JWTs. `GET /api/admin/me` returns the logged-in user's
+  profile so the SPA can render the bottom-of-sidebar `⚙ user@email`
+  affordance.
+
+  Today execlaw is **single-user-controller** by design: the `users`
+  table holds exactly one row with `role = "controller"` and the
+  Controller principal carries `["*"]` capabilities. Phase 7
+  hardening adds invite + role-scoped operators (`role = "operator"`
+  / `"viewer"`) without schema changes — the columns are already
+  there.
 - **Incognito threads**: a toggle in the new-thread modal marks the
   thread `is_ephemeral = 1` with a default 1-hour expiry. Events ARE
   persisted during the conversation (so crash recovery works) but

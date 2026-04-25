@@ -42,6 +42,14 @@ pub struct HealthResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetupRequest {
     pub admin_password: String,
+    /// Operator's display name — surfaces in the SPA's bottom-of-
+    /// sidebar affordance and in the controller-thread's "logged in
+    /// as" label.
+    pub display_name: String,
+    /// Optional email. Currently unused by core flows; reserved for
+    /// the Phase-7 invite + password-reset flows.
+    #[serde(default)]
+    pub email: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -60,6 +68,18 @@ pub struct LoginRequest {
 pub struct LoginResponse {
     pub access_token: String,
     pub refresh_token: String,
+}
+
+/// Shape returned by `GET /api/admin/me` — the current logged-in
+/// user's profile so the SPA can render the bottom-of-sidebar
+/// "⚙ user@email" affordance.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MeResponse {
+    pub user_id: String,
+    pub display_name: String,
+    pub email: Option<String>,
+    pub role: String,
+    pub last_login_at: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -158,23 +178,10 @@ impl From<execlaw_vault::PasswordError> for ApiError {
 // Helpers: read / write admin-password hash and controller principal.
 // -----------------------------------------------------------------------
 
-fn read_admin_hash(db: &Database) -> Result<Option<String>, ApiError> {
-    db.with_conn(|c| {
-        let got = c
-            .query_row(
-                "SELECT value_blob FROM vault_secrets \
-                 WHERE plugin_id IS NULL AND name = ?1",
-                params![ADMIN_PWD_KEY],
-                |r| r.get::<_, Vec<u8>>(0),
-            )
-            .ok();
-        Ok(got
-            .map(|bytes| String::from_utf8(bytes).unwrap_or_default())
-            .filter(|s| !s.is_empty()))
-    })
-    .map_err(Into::into)
-}
-
+/// Mirror the admin password hash into vault_secrets so any
+/// pre-Phase-6 caller still reading from there sees a value. The
+/// `users` table is the source of truth — this mirror disappears
+/// when the last vault_secrets reader is migrated.
 fn write_admin_hash(db: &Database, hash: &str) -> Result<(), ApiError> {
     let now = chrono::Utc::now().timestamp();
     db.with_conn(|c| {
@@ -190,21 +197,7 @@ fn write_admin_hash(db: &Database, hash: &str) -> Result<(), ApiError> {
     .map_err(Into::into)
 }
 
-fn read_controller_principal(db: &Database) -> Result<Option<String>, ApiError> {
-    db.with_conn(|c| {
-        let got = c
-            .query_row(
-                "SELECT value_blob FROM vault_secrets \
-                 WHERE plugin_id IS NULL AND name = ?1",
-                params![CONTROLLER_PRINCIPAL_KEY],
-                |r| r.get::<_, Vec<u8>>(0),
-            )
-            .ok();
-        Ok(got.map(|b| String::from_utf8(b).unwrap_or_default()))
-    })
-    .map_err(Into::into)
-}
-
+/// Mirror the controller principal id alongside the password hash.
 fn write_controller_principal(db: &Database, principal_id: &str) -> Result<(), ApiError> {
     let now = chrono::Utc::now().timestamp();
     db.with_conn(|c| {
@@ -236,6 +229,43 @@ pub async fn health() -> Json<HealthResponse> {
     })
 }
 
+/// `GET /api/ping` — plain-text setup-status probe the SPA hits on
+/// boot to decide between routing to the setup wizard or the login
+/// page. Returns the literal text `setup` (no controller user yet)
+/// or `pong` (a controller user exists; SPA shows login).
+///
+/// Deliberately NOT JSON — the SPA wants a single byte-string check
+/// without parsing.
+pub async fn ping(State(state): State<AppState>) -> impl IntoResponse {
+    use execlaw_core::users::UserStore;
+    let body = match UserStore::new(&state.db).any_exist() {
+        Ok(true) => "pong",
+        Ok(false) => "setup",
+        Err(_) => "setup",
+    };
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        body,
+    )
+}
+
+/// `GET /api/admin/me` — return the current logged-in user's
+/// profile. Used by the SPA to render the bottom-of-sidebar
+/// affordance ("⚙ user@email") and to know the role for any
+/// role-gated UI (Phase 7+).
+pub async fn admin_me(
+    user: crate::auth_extract::AuthedUser,
+) -> Json<MeResponse> {
+    Json(MeResponse {
+        user_id: user.user_id,
+        display_name: user.display_name,
+        email: user.email,
+        role: user.role.as_str().to_owned(),
+        last_login_at: user.last_login_at,
+    })
+}
+
 /// `GET /api/admin/hardware` — return the live hardware profile
 /// from a fresh sysfs scan (Tier-1 detection per §5.3).
 ///
@@ -262,6 +292,8 @@ pub async fn setup(
     State(state): State<AppState>,
     Json(req): Json<SetupRequest>,
 ) -> Result<Json<SetupResponse>, ApiError> {
+    use execlaw_core::users::{UserRole, UserRow, UserStore};
+
     if req.admin_password.len() < 8 {
         return Err(ApiError {
             status: StatusCode::BAD_REQUEST,
@@ -269,20 +301,43 @@ pub async fn setup(
             message: "admin_password must be at least 8 characters".into(),
         });
     }
+    if req.display_name.trim().is_empty() {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: "display_name_required",
+            message: "display_name must not be empty".into(),
+        });
+    }
 
-    // Refuse if already initialized.
-    if read_admin_hash(&state.db)?.is_some() {
+    let users = UserStore::new(&state.db);
+    if users.any_exist().map_err(ApiError::from)? {
         return Err(ApiError {
             status: StatusCode::CONFLICT,
             code: "already_initialized",
-            message: "admin password already set; use /api/login".into(),
+            message: "a controller user already exists; use /api/login".into(),
         });
     }
 
     let hash = hash_password(&req.admin_password)?;
-    write_admin_hash(&state.db, &hash)?;
-
     let principal_id = format!("controller-{}", uuid::Uuid::new_v4());
+    let now = chrono::Utc::now().timestamp();
+    users
+        .insert(&UserRow {
+            user_id: principal_id.clone(),
+            display_name: req.display_name.trim().to_owned(),
+            email: req.email.clone().filter(|s| !s.trim().is_empty()),
+            password_hash: hash.clone(),
+            role: UserRole::Controller,
+            created_at: now,
+            last_login_at: Some(now),
+        })
+        .map_err(ApiError::from)?;
+
+    // Mirror the admin password hash into vault_secrets for back-
+    // compat with any callers still reading via `read_admin_hash`.
+    // The `users` table is now the source of truth; this mirror
+    // disappears in a follow-up cleanup pass.
+    write_admin_hash(&state.db, &hash)?;
     write_controller_principal(&state.db, &principal_id)?;
 
     // Issue a first session.
@@ -319,12 +374,18 @@ pub async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, ApiError> {
-    let hash = read_admin_hash(&state.db)?.ok_or(ApiError {
-        status: StatusCode::CONFLICT,
-        code: "not_initialized",
-        message: "admin password not set yet; run /api/setup".into(),
-    })?;
-    if !verify_password(&req.admin_password, &hash)? {
+    use execlaw_core::users::UserStore;
+
+    let users = UserStore::new(&state.db);
+    let user = users
+        .get_first()
+        .map_err(ApiError::from)?
+        .ok_or(ApiError {
+            status: StatusCode::CONFLICT,
+            code: "not_initialized",
+            message: "no controller user exists yet; run /api/setup".into(),
+        })?;
+    if !verify_password(&req.admin_password, &user.password_hash)? {
         return Err(ApiError {
             status: StatusCode::UNAUTHORIZED,
             code: "bad_password",
@@ -332,18 +393,17 @@ pub async fn login(
         });
     }
 
-    let principal_id = read_controller_principal(&state.db)?.unwrap_or_else(|| {
-        // Should never happen — setup writes both — but be robust.
-        "controller".to_owned()
-    });
+    // Best-effort: stamp last_login_at. Failure here doesn't block login.
+    let _ = users.touch_login(&user.user_id, chrono::Utc::now().timestamp());
+
     let session_id = uuid::Uuid::new_v4().to_string();
     let access = state.signer.issue_access_token(
-        &principal_id,
+        &user.user_id,
         &session_id,
         state.config.access_token_ttl_secs,
     )?;
     let refresh = state.refresh_store.issue(
-        &principal_id,
+        &user.user_id,
         &session_id,
         state.config.refresh_token_ttl_secs,
     );
@@ -419,6 +479,8 @@ pub async fn logout(
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/ping", get(ping))
+        .route("/api/admin/me", get(admin_me))
         .route("/api/admin/hardware", get(admin_hardware))
         .route("/api/setup", post(setup))
         .route("/api/login", post(login))
@@ -495,6 +557,14 @@ mod tests {
         (status, body_json)
     }
 
+    /// Helper for tests: full setup payload with the now-required display_name.
+    fn setup_body(password: &str, display_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "admin_password": password,
+            "display_name": display_name,
+        })
+    }
+
     #[tokio::test]
     async fn health_returns_ok() {
         let state = test_app_state();
@@ -524,7 +594,7 @@ mod tests {
             &app,
             Method::POST,
             "/api/setup",
-            serde_json::json!({ "admin_password": "hunter2-longer" }),
+            setup_body("hunter2-longer", "Justin"),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "setup body was {body}");
@@ -537,7 +607,7 @@ mod tests {
             &app,
             Method::POST,
             "/api/setup",
-            serde_json::json!({ "admin_password": "another-longer" }),
+            setup_body("another-longer", "Other"),
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
@@ -630,10 +700,104 @@ mod tests {
             &app,
             Method::POST,
             "/api/setup",
-            serde_json::json!({ "admin_password": "x" }),
+            setup_body("x", "Justin"),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn setup_rejects_empty_display_name() {
+        let app = build_router(test_app_state());
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/api/setup",
+            serde_json::json!({"admin_password": "hunter2-longer", "display_name": "  "}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "display_name_required");
+    }
+
+    #[tokio::test]
+    async fn ping_is_setup_before_setup_then_pong_after() {
+        let app = build_router(test_app_state());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ping")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"setup");
+
+        // After setup, ping returns "pong".
+        let _ = send_json(&app, Method::POST, "/api/setup", setup_body("hunter2-longer", "J")).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ping")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"pong");
+    }
+
+    #[tokio::test]
+    async fn admin_me_requires_auth() {
+        let app = build_router(test_app_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/me")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_me_returns_logged_in_user_profile() {
+        let app = build_router(test_app_state());
+        // Setup then login to get a fresh access token.
+        let (_, body) = send_json(
+            &app,
+            Method::POST,
+            "/api/setup",
+            serde_json::json!({
+                "admin_password": "hunter2-longer",
+                "display_name": "Justin Long",
+                "email": "justin@example.com"
+            }),
+        )
+        .await;
+        let token = body["access_token"].as_str().unwrap().to_owned();
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/admin/me")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let me: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(me["display_name"], "Justin Long");
+        assert_eq!(me["email"], "justin@example.com");
+        assert_eq!(me["role"], "controller");
+        assert!(me["user_id"].as_str().unwrap().starts_with("controller-"));
     }
 
     #[tokio::test]
