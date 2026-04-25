@@ -42,24 +42,35 @@ export default defineConfig({
     extensions: [".web.tsx", ".web.ts", ".tsx", ".ts", ".jsx", ".js"],
   },
   optimizeDeps: {
-    // react-native-web pulls in CJS sub-deps (notably
-    // `@react-native/normalize-colors`) that the browser ESM loader
-    // can't import directly — they need esbuild's CJS-to-ESM wrap.
-    // Force pre-bundle for the entire RN-web tree so those sub-deps
-    // get wrapped. We omit `react-native` (upstream, Flow-annotated)
-    // and `react-native-reanimated` from `include` because the
-    // runtime alias redirects `react-native` to our shim and esbuild
-    // doesn't honor the regex alias during pre-bundle.
-    include: ["react-native-web"],
-    exclude: [
-      "react-native",
+    // Pre-bundle the whole RN ecosystem so esbuild wraps every CJS
+    // sub-module (normalize-colors, reanimated/scripts/*, worklets
+    // helpers) with the ESM interop the browser loader requires.
+    //
+    // The trick: pre-bundle resolution uses esbuild's own resolver,
+    // which doesn't honor Vite's regex `resolve.alias`. We pass an
+    // explicit string alias here so any `import 'react-native'`
+    // inside reanimated / worklets gets redirected to our shim
+    // BEFORE esbuild tries to parse upstream RN's Flow-annotated
+    // sources (which would otherwise crash the pre-bundle).
+    include: [
+      "react-native-web",
       "react-native-reanimated",
       "react-native-worklets",
     ],
+    exclude: [
+      // Upstream `react-native` has Flow syntax esbuild can't parse;
+      // never pre-bundle it directly — runtime + pre-bundle aliases
+      // redirect every consumer to the shim.
+      "react-native",
+    ],
     esbuildOptions: {
-      // Some upstream RN-ecosystem sources are CJS with default
-      // exports. Tell esbuild to unwrap them automatically.
       mainFields: ["browser", "module", "main"],
+      alias: {
+        "react-native": new URL(
+          "./src/shims/react-native.ts",
+          import.meta.url,
+        ).pathname.replace(/^\/(\w):/, "$1:"),
+      },
     },
   },
   define: {
@@ -68,6 +79,10 @@ export default defineConfig({
     "process.env.NODE_ENV": JSON.stringify(process.env.NODE_ENV ?? "development"),
   },
   server: {
+    // Bind explicitly to IPv4 loopback. Vite's default `localhost`
+    // resolves to `[::1]` on Windows, which Chrome won't reach when
+    // it tries 127.0.0.1 first → ERR_CONNECTION_REFUSED.
+    host: "127.0.0.1",
     port: 5173,
     strictPort: true,
     proxy: {
