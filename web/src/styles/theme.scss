@@ -263,27 +263,39 @@ body {
 }
 
 .execlaw-composer__form {
-    display: flex;
-    gap: 0.6rem;
-    align-items: flex-end;
+    width: 100%;
 }
 
-.execlaw-composer__input {
-    flex: 1 1 auto;
-    background-color: $bg-surface;
-    border: 1px solid $border-subtle;
-    color: $text-primary;
-    border-radius: 0.5rem;
-    padding: 0.55rem 0.75rem;
-    resize: none;
-    font-size: 0.92rem;
-    min-height: 2.4rem;
-    max-height: 12rem;
+// Bootstrap's input-group already removes inner border-radii so the
+// textarea + button render as a single flush unit. We tweak the
+// textarea-specific bits (resize off, max-height for auto-grow)
+// and the button width so the icon sits centered.
+.execlaw-composer__group {
+    align-items: stretch;
 
-    &:focus {
-        outline: none;
-        border-color: $accent;
-        box-shadow: 0 0 0 1px rgba($accent, 0.45);
+    > .execlaw-composer__input {
+        background-color: $bg-surface;
+        color: $text-primary;
+        border-color: $border-subtle;
+        resize: none;
+        min-height: 2.6rem;
+        max-height: 12rem;
+
+        &:focus {
+            background-color: $bg-surface;
+            color: $text-primary;
+            border-color: $accent;
+            box-shadow: 0 0 0 1px rgba($accent, 0.45);
+        }
+    }
+
+    > .btn {
+        // Snap the send button to a square footprint so the icon stays
+        // visually balanced against a single-line textarea.
+        min-width: 2.75rem;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
     }
 }
 
@@ -341,10 +353,8 @@ body {
 .execlaw-welcome__composer {
     width: 100%;
     max-width: 720px;
-    background-color: $bg-elev;
-    border: 1px solid $border-subtle;
-    border-radius: 1.25rem;
-    padding: 0.85rem 1rem;
+    // The composer's InputGroup is the visual unit — no double-border
+    // around it. Just hold the width.
 }
 
 .execlaw-welcome__suggestions {
