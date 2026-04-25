@@ -42,17 +42,25 @@ export default defineConfig({
     extensions: [".web.tsx", ".web.ts", ".tsx", ".ts", ".jsx", ".js"],
   },
   optimizeDeps: {
-    // Skip prebundle for the RN ecosystem packages — esbuild's
-    // dep scanner follows transitive `import 'react-native/...'`
-    // subpaths into Flow-annotated upstream sources our alias can't
-    // catch, which crashes the pre-bundle. Let Vite resolve them
-    // lazily via the runtime alias instead.
+    // react-native-web pulls in CJS sub-deps (notably
+    // `@react-native/normalize-colors`) that the browser ESM loader
+    // can't import directly — they need esbuild's CJS-to-ESM wrap.
+    // Force pre-bundle for the entire RN-web tree so those sub-deps
+    // get wrapped. We omit `react-native` (upstream, Flow-annotated)
+    // and `react-native-reanimated` from `include` because the
+    // runtime alias redirects `react-native` to our shim and esbuild
+    // doesn't honor the regex alias during pre-bundle.
+    include: ["react-native-web"],
     exclude: [
       "react-native",
-      "react-native-web",
       "react-native-reanimated",
       "react-native-worklets",
     ],
+    esbuildOptions: {
+      // Some upstream RN-ecosystem sources are CJS with default
+      // exports. Tell esbuild to unwrap them automatically.
+      mainFields: ["browser", "module", "main"],
+    },
   },
   define: {
     // react-native-web reads these at module load.
