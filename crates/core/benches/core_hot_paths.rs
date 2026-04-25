@@ -16,7 +16,13 @@ use execlaw_core::event_hmac::{canonical_bytes, sign_event, verify_event};
 use execlaw_core::events::{EventKind, EventLog, EventRecord, PendingEvent, ToolResultPayload, ToolUsePayload};
 use execlaw_core::ids::{ConversationId, EventSeq, IdempotencyKey, TurnSeq};
 use execlaw_core::migrations::MigrationRunner;
+use execlaw_core::conversation::{
+    ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
+};
+use execlaw_core::ephemeral_sweeper::sweep_once;
+use execlaw_core::events::EventRecord as CoreEventRecord;
 use execlaw_core::outbox::{OutboxRow, OutboxStatus, OutboxStore};
+use execlaw_core::transport_conversations::{ConversationResolver, ResolveInput};
 
 fn fresh_db() -> Database {
     let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
@@ -428,6 +434,137 @@ fn bench_principal_store(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// ConversationResolver — every inbound non-UI message hits this; budget
+// ≤ 50µs per call (single-row index lookup + at most one UPDATE).
+// ---------------------------------------------------------------------------
+
+fn fresh_conv_row(id: &str) -> ConversationRow {
+    ConversationRow {
+        conversation_id: execlaw_core::ids::ConversationId::from(id),
+        kind: ConversationKind::ControllerDM,
+        last_seq: EventSeq(0),
+        phase: Phase::Idle,
+        controller_id: None,
+        trust_class: "Controller".into(),
+        snapshot_blob: None,
+        snapshot_seq: None,
+        lease_owner: None,
+        lease_expires: None,
+        modality: Modality::Text,
+        display_name: None,
+        is_pinned: false,
+        is_ephemeral: false,
+        ephemeral_expires_at: None,
+    }
+}
+
+fn bench_conversation_resolver(c: &mut Criterion) {
+    let mut group = c.benchmark_group("conversation_resolver");
+
+    // Controller short-circuit: pure stack work, no DB writes. The
+    // hottest path on a controller-dominant deployment.
+    group.bench_function("resolve_controller_short_circuit", |b| {
+        let db = fresh_db();
+        let resolver = ConversationResolver::new(&db);
+        b.iter(|| {
+            let outcome = resolver
+                .resolve_or_mint(&ResolveInput {
+                    plugin_id: black_box("transport-signal"),
+                    transport_handle: black_box("signal:+15551234"),
+                    principal_id: black_box("controller-1"),
+                    is_controller: true,
+                    idle_timeout_ms: 60_000,
+                    now: black_box(1_000_000),
+                })
+                .unwrap();
+            black_box(outcome);
+        });
+    });
+
+    // Within-window continue: the steady-state hot path for an active
+    // outsider. One SELECT + one UPDATE in a transaction.
+    group.bench_function("resolve_continue_within_idle", |b| {
+        let db = fresh_db();
+        let resolver = ConversationResolver::new(&db);
+        // Seed a current row.
+        resolver
+            .resolve_or_mint(&ResolveInput {
+                plugin_id: "p",
+                transport_handle: "h",
+                principal_id: "x",
+                is_controller: false,
+                idle_timeout_ms: 60_000,
+                now: 1_000,
+            })
+            .unwrap();
+
+        let mut now = 1_010i64;
+        b.iter(|| {
+            now += 1;
+            let outcome = resolver
+                .resolve_or_mint(&ResolveInput {
+                    plugin_id: "p",
+                    transport_handle: "h",
+                    principal_id: "x",
+                    is_controller: false,
+                    idle_timeout_ms: 60_000,
+                    now: black_box(now),
+                })
+                .unwrap();
+            black_box(outcome);
+        });
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// EphemeralSweeper — runs ~every 5 min, hot when many incognito threads
+// expired in a window. Budget the per-conversation cost so a backlog of
+// 1,000 expired threads sweeps in <1s.
+// ---------------------------------------------------------------------------
+
+fn bench_ephemeral_sweeper(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ephemeral_sweeper");
+    group.sample_size(20); // each sample reseeds — keep runtime sane
+
+    for n in [10usize, 100usize].iter() {
+        group.bench_with_input(BenchmarkId::new("sweep_n_threads", n), n, |b, &n| {
+            b.iter_with_setup(
+                || {
+                    let db = fresh_db();
+                    let convs = ConversationStore::new(&db);
+                    for i in 0..n {
+                        let id = format!("c{i}");
+                        let cid = execlaw_core::ids::ConversationId::from(id.as_str());
+                        convs.upsert(&fresh_conv_row(&id)).unwrap();
+                        convs.mark_ephemeral(&cid, Some(50)).unwrap();
+                        // 3 events per thread — representative of a brief incognito chat.
+                        for s in 1..=3i64 {
+                            let ev = CoreEventRecord::new(
+                                cid.clone(),
+                                EventSeq(s),
+                                EventKind::UserMsg,
+                                &serde_json::json!({"i": s}),
+                                None,
+                            )
+                            .unwrap();
+                            execlaw_core::events::EventLog::new(&db).append(&ev).unwrap();
+                        }
+                    }
+                    db
+                },
+                |db| {
+                    let report = sweep_once(black_box(&db), black_box(100)).unwrap();
+                    black_box(report);
+                },
+            );
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_hmac,
@@ -439,5 +576,7 @@ criterion_group!(
     bench_event_log_replay_keyed,
     bench_outbox,
     bench_principal_store,
+    bench_conversation_resolver,
+    bench_ephemeral_sweeper,
 );
 criterion_main!(benches);

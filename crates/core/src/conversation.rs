@@ -180,6 +180,14 @@ pub struct ConversationRow {
     pub lease_owner: Option<String>,
     pub lease_expires: Option<i64>,
     pub modality: Modality,
+
+    // ---- Thread metadata (migration 0006). Set by dedicated mutators
+    // (`set_display_name`, `set_pinned`, `mark_ephemeral`) so the FSM
+    // upsert path doesn't clobber UX state on every turn.
+    pub display_name: Option<String>,
+    pub is_pinned: bool,
+    pub is_ephemeral: bool,
+    pub ephemeral_expires_at: Option<i64>,
 }
 
 /// Simple repository for `state_conversations`.
@@ -192,13 +200,21 @@ impl<'db> ConversationStore<'db> {
         Self { db }
     }
 
+    /// Insert-or-update a conversation row.
+    ///
+    /// **Important** — the metadata columns (`display_name`, `is_pinned`,
+    /// `is_ephemeral`, `ephemeral_expires_at`) are written ONLY on first
+    /// insert. Subsequent upserts of the same `conversation_id` from the
+    /// FSM hot path leave them alone; mutate them via [`set_display_name`],
+    /// [`set_pinned`], or [`mark_ephemeral`].
     pub fn upsert(&self, row: &ConversationRow) -> Result<(), DbError> {
         self.db.with_conn(|c| {
             c.execute(
                 "INSERT INTO state_conversations \
                  (conversation_id, kind, last_seq, phase, controller_id, trust_class, \
-                  snapshot_blob, snapshot_seq, lease_owner, lease_expires, modality) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                  snapshot_blob, snapshot_seq, lease_owner, lease_expires, modality, \
+                  display_name, is_pinned, is_ephemeral, ephemeral_expires_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
                  ON CONFLICT(conversation_id) DO UPDATE SET \
                     kind = excluded.kind, \
                     last_seq = excluded.last_seq, \
@@ -222,9 +238,84 @@ impl<'db> ConversationStore<'db> {
                     row.lease_owner,
                     row.lease_expires,
                     row.modality.as_str(),
+                    row.display_name,
+                    row.is_pinned as i64,
+                    row.is_ephemeral as i64,
+                    row.ephemeral_expires_at,
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    /// Update the user-facing thread title (the LLM-generated 3-word
+    /// name, or the transport-supplied group name, or a hard-coded value
+    /// like "Control thread").
+    pub fn set_display_name(
+        &self,
+        conversation_id: &ConversationId,
+        name: Option<&str>,
+    ) -> Result<(), DbError> {
+        self.db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_conversations SET display_name = ?1 WHERE conversation_id = ?2",
+                params![name, conversation_id.as_str()],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Set or clear the pinned flag for the SPA sidebar.
+    pub fn set_pinned(
+        &self,
+        conversation_id: &ConversationId,
+        pinned: bool,
+    ) -> Result<(), DbError> {
+        self.db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_conversations SET is_pinned = ?1 WHERE conversation_id = ?2",
+                params![pinned as i64, conversation_id.as_str()],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Mark a conversation as incognito with the supplied expiry (unix
+    /// seconds). Pass `None` to clear the flag.
+    pub fn mark_ephemeral(
+        &self,
+        conversation_id: &ConversationId,
+        expires_at: Option<i64>,
+    ) -> Result<(), DbError> {
+        let is_ephemeral = expires_at.is_some() as i64;
+        self.db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_conversations \
+                 SET is_ephemeral = ?1, ephemeral_expires_at = ?2 \
+                 WHERE conversation_id = ?3",
+                params![is_ephemeral, expires_at, conversation_id.as_str()],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// IDs of every ephemeral conversation whose `ephemeral_expires_at <= now`.
+    /// Used by `EphemeralSweeper` to discover what to purge.
+    pub fn list_expired_ephemeral(
+        &self,
+        now: i64,
+    ) -> Result<Vec<ConversationId>, DbError> {
+        self.db.with_conn(|c| {
+            let mut stmt = c.prepare_cached(
+                "SELECT conversation_id FROM state_conversations \
+                 WHERE is_ephemeral = 1 \
+                   AND ephemeral_expires_at IS NOT NULL \
+                   AND ephemeral_expires_at <= ?1",
+            )?;
+            let rows = stmt
+                .query_map(params![now], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows.into_iter().map(ConversationId::from).collect())
         })
     }
 
@@ -236,64 +327,54 @@ impl<'db> ConversationStore<'db> {
             let got = c
                 .query_row(
                     "SELECT kind, last_seq, phase, controller_id, trust_class, \
-                            snapshot_blob, snapshot_seq, lease_owner, lease_expires, modality \
+                            snapshot_blob, snapshot_seq, lease_owner, lease_expires, modality, \
+                            display_name, is_pinned, is_ephemeral, ephemeral_expires_at \
                      FROM state_conversations WHERE conversation_id = ?1",
                     params![conversation_id.as_str()],
-                    |row| {
-                        let kind_str: String = row.get(0)?;
-                        let last_seq: i64 = row.get(1)?;
-                        let phase_str: String = row.get(2)?;
-                        let controller_id: Option<String> = row.get(3)?;
-                        let trust_class: String = row.get(4)?;
-                        let snapshot_blob: Option<Vec<u8>> = row.get(5)?;
-                        let snapshot_seq: Option<i64> = row.get(6)?;
-                        let lease_owner: Option<String> = row.get(7)?;
-                        let lease_expires: Option<i64> = row.get(8)?;
-                        let modality_str: String = row.get(9)?;
-                        Ok((
-                            kind_str,
-                            last_seq,
-                            phase_str,
-                            controller_id,
-                            trust_class,
-                            snapshot_blob,
-                            snapshot_seq,
-                            lease_owner,
-                            lease_expires,
-                            modality_str,
-                        ))
-                    },
+                    row_to_conversation,
                 )
                 .ok();
-            Ok(got.map(
-                |(
-                    kind_str,
-                    last_seq,
-                    phase_str,
-                    controller_id,
-                    trust_class,
-                    snapshot_blob,
-                    snapshot_seq,
-                    lease_owner,
-                    lease_expires,
-                    modality_str,
-                )| ConversationRow {
-                    conversation_id: conversation_id.clone(),
-                    kind: ConversationKind::parse(&kind_str)
-                        .unwrap_or(ConversationKind::ControllerDM),
-                    last_seq: EventSeq(last_seq),
-                    phase: Phase::parse(&phase_str).unwrap_or(Phase::Idle),
-                    controller_id,
-                    trust_class,
-                    snapshot_blob,
-                    snapshot_seq: snapshot_seq.map(EventSeq),
-                    lease_owner,
-                    lease_expires,
-                    modality: Modality::parse(&modality_str).unwrap_or(Modality::Text),
-                },
-            ))
+            Ok(got.map(|mut r| {
+                r.conversation_id = conversation_id.clone();
+                r
+            }))
         })
     }
+}
+
+fn row_to_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationRow> {
+    let kind_str: String = row.get(0)?;
+    let last_seq: i64 = row.get(1)?;
+    let phase_str: String = row.get(2)?;
+    let controller_id: Option<String> = row.get(3)?;
+    let trust_class: String = row.get(4)?;
+    let snapshot_blob: Option<Vec<u8>> = row.get(5)?;
+    let snapshot_seq: Option<i64> = row.get(6)?;
+    let lease_owner: Option<String> = row.get(7)?;
+    let lease_expires: Option<i64> = row.get(8)?;
+    let modality_str: String = row.get(9)?;
+    let display_name: Option<String> = row.get(10)?;
+    let is_pinned: i64 = row.get(11)?;
+    let is_ephemeral: i64 = row.get(12)?;
+    let ephemeral_expires_at: Option<i64> = row.get(13)?;
+    Ok(ConversationRow {
+        // Filled in by the caller — we don't have the typed id here.
+        conversation_id: ConversationId::from(""),
+        kind: ConversationKind::parse(&kind_str).unwrap_or(ConversationKind::ControllerDM),
+        last_seq: EventSeq(last_seq),
+        phase: Phase::parse(&phase_str).unwrap_or(Phase::Idle),
+        controller_id,
+        trust_class,
+        snapshot_blob,
+        snapshot_seq: snapshot_seq.map(EventSeq),
+        lease_owner,
+        lease_expires,
+        modality: Modality::parse(&modality_str).unwrap_or(Modality::Text),
+        display_name,
+        is_pinned: is_pinned != 0,
+        is_ephemeral: is_ephemeral != 0,
+        ephemeral_expires_at,
+    })
 }
 
 #[cfg(test)]
@@ -308,28 +389,39 @@ mod tests {
         db
     }
 
-    #[test]
-    fn upsert_and_get_roundtrip() {
-        let db = fresh_db();
-        let store = ConversationStore::new(&db);
-        let row = ConversationRow {
-            conversation_id: ConversationId::from("c1"),
+    fn fresh_row(id: &str) -> ConversationRow {
+        ConversationRow {
+            conversation_id: ConversationId::from(id),
             kind: ConversationKind::ControllerDM,
             last_seq: EventSeq(0),
             phase: Phase::Idle,
-            controller_id: Some("p1".into()),
+            controller_id: None,
             trust_class: "Controller".into(),
             snapshot_blob: None,
             snapshot_seq: None,
             lease_owner: None,
             lease_expires: None,
             modality: Modality::Text,
-        };
+            display_name: None,
+            is_pinned: false,
+            is_ephemeral: false,
+            ephemeral_expires_at: None,
+        }
+    }
+
+    #[test]
+    fn upsert_and_get_roundtrip() {
+        let db = fresh_db();
+        let store = ConversationStore::new(&db);
+        let mut row = fresh_row("c1");
+        row.controller_id = Some("p1".into());
         store.upsert(&row).unwrap();
         let got = store.get(&row.conversation_id).unwrap().unwrap();
         assert_eq!(got.kind, ConversationKind::ControllerDM);
         assert_eq!(got.phase, Phase::Idle);
         assert_eq!(got.modality, Modality::Text);
+        assert!(!got.is_pinned);
+        assert!(!got.is_ephemeral);
     }
 
     // ---- ConversationKind::derive tests -------------------------
@@ -410,19 +502,7 @@ mod tests {
     fn upsert_updates_existing_row() {
         let db = fresh_db();
         let store = ConversationStore::new(&db);
-        let mut row = ConversationRow {
-            conversation_id: ConversationId::from("c2"),
-            kind: ConversationKind::ControllerDM,
-            last_seq: EventSeq(0),
-            phase: Phase::Idle,
-            controller_id: None,
-            trust_class: "Controller".into(),
-            snapshot_blob: None,
-            snapshot_seq: None,
-            lease_owner: None,
-            lease_expires: None,
-            modality: Modality::Text,
-        };
+        let mut row = fresh_row("c2");
         store.upsert(&row).unwrap();
         row.phase = Phase::AwaitingApproval;
         row.last_seq = EventSeq(17);
@@ -430,5 +510,86 @@ mod tests {
         let got = store.get(&row.conversation_id).unwrap().unwrap();
         assert_eq!(got.phase, Phase::AwaitingApproval);
         assert_eq!(got.last_seq, EventSeq(17));
+    }
+
+    /// Once metadata is set via the dedicated mutators, a follow-up
+    /// FSM upsert (carrying default metadata) MUST NOT clobber it.
+    #[test]
+    fn upsert_preserves_metadata_set_via_mutators() {
+        let db = fresh_db();
+        let store = ConversationStore::new(&db);
+        let row = fresh_row("c-meta");
+        store.upsert(&row).unwrap();
+
+        store
+            .set_display_name(&row.conversation_id, Some("Control thread"))
+            .unwrap();
+        store.set_pinned(&row.conversation_id, true).unwrap();
+        store
+            .mark_ephemeral(&row.conversation_id, Some(9_999))
+            .unwrap();
+
+        // FSM upsert with default metadata fields — should leave the
+        // out-of-band-set metadata untouched.
+        let mut second = fresh_row("c-meta");
+        second.last_seq = EventSeq(42);
+        second.phase = Phase::Thinking;
+        store.upsert(&second).unwrap();
+
+        let got = store.get(&row.conversation_id).unwrap().unwrap();
+        assert_eq!(got.last_seq, EventSeq(42));
+        assert_eq!(got.phase, Phase::Thinking);
+        assert_eq!(got.display_name.as_deref(), Some("Control thread"));
+        assert!(got.is_pinned);
+        assert!(got.is_ephemeral);
+        assert_eq!(got.ephemeral_expires_at, Some(9_999));
+    }
+
+    #[test]
+    fn mark_ephemeral_clears_when_passed_none() {
+        let db = fresh_db();
+        let store = ConversationStore::new(&db);
+        let row = fresh_row("c-eph");
+        store.upsert(&row).unwrap();
+        store
+            .mark_ephemeral(&row.conversation_id, Some(1_000))
+            .unwrap();
+        store.mark_ephemeral(&row.conversation_id, None).unwrap();
+        let got = store.get(&row.conversation_id).unwrap().unwrap();
+        assert!(!got.is_ephemeral);
+        assert_eq!(got.ephemeral_expires_at, None);
+    }
+
+    #[test]
+    fn list_expired_ephemeral_returns_only_due_rows() {
+        let db = fresh_db();
+        let store = ConversationStore::new(&db);
+
+        // not ephemeral
+        store.upsert(&fresh_row("plain")).unwrap();
+
+        // ephemeral, future expiry
+        store.upsert(&fresh_row("future")).unwrap();
+        store
+            .mark_ephemeral(&ConversationId::from("future"), Some(10_000))
+            .unwrap();
+
+        // ephemeral, already expired
+        store.upsert(&fresh_row("past")).unwrap();
+        store
+            .mark_ephemeral(&ConversationId::from("past"), Some(50))
+            .unwrap();
+
+        // ephemeral, expiry exactly == now (boundary: <= so it lists)
+        store.upsert(&fresh_row("edge")).unwrap();
+        store
+            .mark_ephemeral(&ConversationId::from("edge"), Some(100))
+            .unwrap();
+
+        let expired = store.list_expired_ephemeral(100).unwrap();
+        let mut ids: Vec<String> =
+            expired.into_iter().map(|c| c.as_str().to_owned()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["edge", "past"]);
     }
 }

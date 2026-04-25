@@ -862,6 +862,10 @@ fn ensure_conversation(store: &ConversationStore<'_>, cid: &ConversationId) {
         lease_owner: None,
         lease_expires: None,
         modality: Modality::Text,
+        display_name: None,
+        is_pinned: false,
+        is_ephemeral: false,
+        ephemeral_expires_at: None,
     };
     let _ = store.upsert(&row);
 }

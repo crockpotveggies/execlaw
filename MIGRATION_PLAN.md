@@ -340,7 +340,7 @@ Old conversation rows stay linked to their `principal_id` so the UI can show "pr
 
 **Controller-thread merge** is the load-bearing UX consequence: every event payload carries a `channel_origin` field (`"web"` / `"signal"` / `"email"` / `"voice"` …). The SPA renders one pinned **Control thread** that aggregates every Controller message regardless of channel; per-message channel icons let the controller see at a glance which transport delivered each line.
 
-**Conversation metadata extensions** (migration 0006, lands at the start of Phase 6 — note migration 0005 was claimed by the `users` table that landed as Phase-6 prep):
+**Conversation metadata extensions** (migration 0006 — landed as Phase-6 pre-flight alongside `ConversationResolver` and `EphemeralSweeper`; migration 0005 was claimed by the `users` table that landed earlier in the same pre-flight pass):
 
 ```sql
 ALTER TABLE state_conversations ADD COLUMN display_name TEXT;

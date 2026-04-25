@@ -1,15 +1,15 @@
 # execlaw build STATUS
 
-Last update: 2026-04-24, after Phase 3 closeout + Phase 4 voice primitives.
+Last update: 2026-04-24, after Phase-6 pre-flight gap-closure (threads metadata, ConversationResolver, EphemeralSweeper).
 
 ## TL;DR
 
 - `cargo build --workspace` — **clean**
 - `cargo clippy --workspace --all-targets -- -D warnings` — **clean**
-- `cargo test --workspace --no-fail-fast` — **326 passing, 0 failing**
-- `cargo bench --workspace --no-run` — **clean** (35+ benches across 8 crates)
+- `cargo test --workspace --no-fail-fast` — **345 passing, 0 failing**
+- `cargo bench --workspace --no-run` — **clean** (37+ benches across 8 crates)
 - **Zero cloud-SDK dependencies** anywhere in the workspace
-- Phases 0–5 complete (Phase 5 ships infra only — UI lands with Phase 6); Phase 6 UI port next
+- Phases 0–5 complete; Phase-6 pre-flight closed (users table, threads/incognito metadata, ConversationResolver, EphemeralSweeper); UI scaffold next
 
 ## Migration-plan phase structure (post-2026-04-24 refactor)
 
@@ -95,13 +95,20 @@ EXECLAW_INFERENCE_URL=http://127.0.0.1:8000/v1 cargo start
 ## Test counts (per crate)
 
 ```
-execlaw-core              86     DB, events (+HMAC sign/verify + atomicity),
+execlaw-core             113     DB, events (+HMAC sign/verify + atomicity),
                                  outbox (+claim/record_failure/ready_pending),
                                  alerts, memory, principals (+PrincipalStore),
                                  idempotency keys, snapshots, HMAC
                                  tamper-tests, migrations, conversation kind
                                  derivation, eval_flagged store, log query,
-                                 UserStore (Phase-6 prep)
+                                 UserStore (Phase-6 prep), thread metadata
+                                 (display_name/pinned/ephemeral mutators
+                                 with upsert-preservation invariant),
+                                 ConversationResolver (controller short-
+                                 circuit, idle rotation, single-current-row
+                                 invariant, atomic transactions),
+                                 EphemeralSweeper (purge + last_seq reset
+                                 + idempotency + boundary + run-loop)
 execlaw-server            54     auth, events (WS bus), capability tokens,
                                  chat routes (streaming, policy, crash tests,
                                  cold-contact adversarial, identity-match
@@ -126,7 +133,7 @@ execlaw-outbox            11     backoff, retry budget, drain, WakeupScheduler (
 execlaw-session            1     modality binding
 execlaw-eval-harness       2     rubric parse, mock-mode orchestration
 --------------------------------------------------------------------
-TOTAL                    326 passing, 0 failing
+TOTAL                    345 passing, 0 failing
 ```
 
 ## Benchmarks (cargo bench --workspace)
@@ -152,6 +159,10 @@ TOTAL                    326 passing, 0 failing
 | `stream_chunk_decode/content` | 389 ns | ≤5 µs | serde_json parse |
 | `hook_registry_tool_lookup/hit` | 24 ns | ≤200 ns | after `Arc<RegisteredTool>` optimization (-92%) |
 | `manifest_parse/realistic` | 6 µs | ≤1 ms | TOML parse + hook validation |
+| `conversation_resolver/resolve_controller_short_circuit` | 53 ns | ≤500 ns | pure id-prefix concat, no DB |
+| `conversation_resolver/resolve_continue_within_idle` | 9 µs | ≤50 µs | one SELECT + one UPDATE in tx |
+| `ephemeral_sweeper/sweep_n_threads/10` | 288 µs | — | per-thread tx; ~13 µs/thread |
+| `ephemeral_sweeper/sweep_n_threads/100` | 1.36 ms | ≤1 s for 1k threads | linear; budget headroom > 70× |
 
 ## Grounding-rule compliance (re-audited this session)
 
@@ -191,6 +202,10 @@ TOTAL                    326 passing, 0 failing
 | Endpointer | `crates/voice-pipeline/src/endpointer.rs` |
 | Barge-in rescind | `crates/voice-pipeline/src/bargein.rs` |
 | Streaming inference client | `crates/inference-api/src/lib.rs` |
+| Conversation FSM + thread metadata | `crates/core/src/conversation.rs` |
+| Transport→thread routing + Controller short-circuit | `crates/core/src/transport_conversations.rs` |
+| Incognito-thread sweeper | `crates/core/src/ephemeral_sweeper.rs` |
+| Operator users + auth lookup | `crates/core/src/users.rs` |
 
 ## Recent commit history (foundation branch)
 
