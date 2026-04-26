@@ -142,6 +142,18 @@ body {
     border-radius: 0.4rem;
     font-size: 0.9rem;
     cursor: pointer;
+    // The class is used on <button>, <div>, AND <a> (NavLink) elements.
+    // Without these rules, anchors render with the default browser
+    // underline + link color, which looks broken next to the buttons.
+    text-decoration: none;
+
+    &:hover,
+    &:focus,
+    &:visited,
+    &:active {
+        color: $text-primary;
+        text-decoration: none;
+    }
 
     &:hover {
         background-color: $bg-elev;
@@ -150,6 +162,15 @@ body {
     &.is-active {
         background-color: rgba($accent, 0.15);
         color: color.adjust($accent, $lightness: 18%);
+
+        // Re-assert active color over the link pseudo-classes above so
+        // the highlight doesn't get reset back to $text-primary.
+        &:hover,
+        &:focus,
+        &:visited,
+        &:active {
+            color: color.adjust($accent, $lightness: 18%);
+        }
     }
 }
 
