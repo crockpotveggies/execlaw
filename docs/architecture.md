@@ -908,7 +908,7 @@ Stack (locked in 2026-04-25):
 - Built static assets embedded in the Rust binary via `rust-embed` so the production artifact stays a single Docker image.
 
 UX (locked):
-- Chat-first landing; OpenWebUI-shaped sidebar with `New chat`, nav (Tasks / Contacts / More → Tools, Skills, plugin panels), thread list, settings + user at the bottom.
+- Chat-first landing; OpenWebUI-shaped sidebar with `New chat`, nav (Routines / Contacts / More → Tools, Skills, plugin panels), thread list, settings + user at the bottom.
 - **Pinned Control thread** at the top of the thread list — every controller message regardless of channel collapses here, with subtle per-message channel icons.
 - **Thread-list status icons**: empty grey dot (default), blue filled dot (agent replied unseen), animated loader (agent processing). External threads show their channel icon instead of the dot.
 - **Thread names**: "Control thread" for the pinned controller thread; truncated transport-supplied name for external groups; LLM-generated 3-word summary (via `set_thread_name(name)` agent tool) for new internal threads.

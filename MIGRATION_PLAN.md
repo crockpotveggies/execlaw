@@ -1668,7 +1668,7 @@ The WebSocket replaces the 60s polling selfhosted-claw did on the dashboard; eve
 |---|---|---|
 | Dashboard metrics | Admin → Dashboard | Low (rebuild REST queries) |
 | Plugins list + detail | Admin → Plugins | Medium — new manifest shape, ZIP-upload install flow |
-| Scheduled tasks | Admin → Schedules | Low |
+| Routines (scheduled / recurring automations, formerly "Scheduled tasks") | Sidebar → Routines | Low |
 | Personality | Admin → Personality | Low |
 | Policy | Admin → Policy (trust + capability editor) | Medium — new engine |
 | Tools | Admin → Tools (read-only view of registered tools) | Low |
@@ -2226,7 +2226,7 @@ same bundle ships everywhere.
   ```
     ✏  New chat
    ───────────────
-    📋 Tasks
+    🕒 Routines
     👥 Contacts
     ⋯  More       ← Tools / Skills / plugin UI panels
    ───────────────

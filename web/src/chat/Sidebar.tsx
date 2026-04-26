@@ -1,4 +1,4 @@
-// Sidebar: brand + new-chat + nav (Tasks / Contacts / plugin UI panels)
+// Sidebar: brand + new-chat + nav (Routines / Contacts / plugin UI panels)
 // + thread list with external-channel filter + bottom user affordance.
 //
 // Per the locked Phase-6 layout (MIGRATION_PLAN §6/§8.2): controller
@@ -69,7 +69,7 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
             </div>
 
             <nav className="execlaw-sidebar__nav">
-                <NavStub icon="bi-clipboard-check" label="Tasks" />
+                <NavStub icon="bi-clock-history" label="Routines" />
                 <NavStub icon="bi-people" label="Contacts" />
                 <button
                     type="button"
