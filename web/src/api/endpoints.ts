@@ -1351,6 +1351,140 @@ export async function deleteMyIdentifier(
     );
 }
 
+// ---- /api/admin/routines (Phase 10 — §5.6) -------------------------
+
+export type RoutineRunStatus = "Pending" | "Success" | "Failed" | "Skipped";
+
+export interface RoutineView {
+    id: string;
+    name: string;
+    schedule_cron: string;
+    timezone: string;
+    prompt: string;
+    target_conversation_id: string | null;
+    enabled: boolean;
+    last_run_at: number | null;
+    last_run_status: RoutineRunStatus | null;
+    next_run_at: number | null;
+    created_at: number;
+    updated_at: number;
+}
+
+export interface RoutineListResponse {
+    routines: RoutineView[];
+}
+
+export interface RoutineRunView {
+    id: string;
+    routine_id: string;
+    fired_at: number;
+    started_at: number | null;
+    finished_at: number | null;
+    status: RoutineRunStatus;
+    error: string | null;
+    conversation_id: string | null;
+}
+
+export interface RoutineRunListResponse {
+    runs: RoutineRunView[];
+}
+
+export interface UpsertRoutineBody {
+    name: string;
+    schedule_cron: string;
+    timezone?: string;
+    prompt: string;
+    target_conversation_id?: string | null;
+    enabled?: boolean;
+}
+
+export interface RoutinePreviewResponse {
+    next_fires_unix: number[];
+}
+
+export async function listRoutines(
+    tokenAccessor: () => string | null,
+): Promise<RoutineListResponse> {
+    return apiFetch<RoutineListResponse>(
+        "/api/admin/routines",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function createRoutine(
+    body: UpsertRoutineBody,
+    tokenAccessor: () => string | null,
+): Promise<RoutineView> {
+    return apiFetch<RoutineView>(
+        "/api/admin/routines",
+        { method: "POST", body },
+        tokenAccessor,
+    );
+}
+
+export async function updateRoutine(
+    id: string,
+    body: UpsertRoutineBody,
+    tokenAccessor: () => string | null,
+): Promise<RoutineView> {
+    return apiFetch<RoutineView>(
+        `/api/admin/routines/${encodeURIComponent(id)}`,
+        { method: "PUT", body },
+        tokenAccessor,
+    );
+}
+
+export async function deleteRoutine(
+    id: string,
+    tokenAccessor: () => string | null,
+): Promise<void> {
+    await apiFetch<unknown>(
+        `/api/admin/routines/${encodeURIComponent(id)}`,
+        { method: "DELETE" },
+        tokenAccessor,
+    );
+}
+
+export async function runRoutineNow(
+    id: string,
+    tokenAccessor: () => string | null,
+): Promise<RoutineRunView> {
+    return apiFetch<RoutineRunView>(
+        `/api/admin/routines/${encodeURIComponent(id)}/run-now`,
+        { method: "POST" },
+        tokenAccessor,
+    );
+}
+
+export async function listRoutineRuns(
+    id: string,
+    limit: number | undefined,
+    tokenAccessor: () => string | null,
+): Promise<RoutineRunListResponse> {
+    const path =
+        limit !== undefined
+            ? `/api/admin/routines/${encodeURIComponent(id)}/runs?limit=${limit}`
+            : `/api/admin/routines/${encodeURIComponent(id)}/runs`;
+    return apiFetch<RoutineRunListResponse>(path, {}, tokenAccessor);
+}
+
+export async function previewRoutine(
+    schedule_cron: string,
+    timezone: string,
+    n: number,
+    tokenAccessor: () => string | null,
+): Promise<RoutinePreviewResponse> {
+    return apiFetch<RoutinePreviewResponse>(
+        "/api/admin/routines/preview",
+        {
+            method: "POST",
+            body: { schedule_cron, timezone, n },
+        },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/logout ---------------------------------------------------
 
 export async function postLogout(refreshToken: string | null): Promise<void> {

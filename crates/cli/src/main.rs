@@ -1073,13 +1073,14 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     // reads from this; per-turn lifecycle in chats.rs registers
     // start/end. The reaper drops idle non-controller entries.
     let runner_registry = execlaw_server::runner_registry::RunnerRegistry::new();
+    let events = execlaw_server::EventBus::new();
 
     let state = execlaw_server::AppState {
         db: db.clone(),
         config: config.clone(),
         signer,
         refresh_store,
-        events: execlaw_server::EventBus::new(),
+        events: events.clone(),
         event_log_hmac_key: hmac_key,
         inference,
         plugin_host,
@@ -1121,6 +1122,15 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         let reg = runner_registry.clone();
         tokio::spawn(async move { reg.run_reaper(stop).await });
     }
+
+    // Phase 10 — wall-clock-aligned cron tick that fires due
+    // routines. The dispatch path is a stub today (marks runs
+    // Skipped with an explanatory error); becomes real when
+    // runner-local lands. See MIGRATION_PLAN §5.6.3.
+    let _routine_runner = execlaw_server::routine_runner::spawn(
+        db.clone(),
+        events.clone(),
+    );
 
     let app = execlaw_server::routes::build_router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

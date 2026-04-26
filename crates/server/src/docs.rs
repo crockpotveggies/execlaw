@@ -32,6 +32,10 @@ use crate::personality::{
     PersonalityListResponse, PersonalityPreviewResponse, PersonalityView,
     UpsertPersonalityRequest,
 };
+use crate::routines::{
+    PreviewRequest, PreviewResponse, RoutineListResponse, RoutineRunListResponse,
+    RoutineRunView, RoutineView, UpsertRoutineRequest,
+};
 use crate::trust_policy::{TrustPolicyView, UpdateTrustPolicyRequest};
 use crate::runners_admin::{RunnerListResponse, RunnerView};
 use crate::mcp_admin::{
@@ -157,6 +161,15 @@ impl Modify for SecurityAddon {
         crate::my_identities::list_handler,
         crate::my_identities::add_handler,
         crate::my_identities::delete_handler,
+        // routines (Phase 10 — cron-shaped agent automations, §5.6)
+        crate::routines::list_handler,
+        crate::routines::create_handler,
+        crate::routines::get_handler,
+        crate::routines::update_handler,
+        crate::routines::delete_handler,
+        crate::routines::run_now_handler,
+        crate::routines::runs_handler,
+        crate::routines::preview_handler,
     ),
     components(schemas(
         HealthResponse,
@@ -210,6 +223,13 @@ impl Modify for SecurityAddon {
         IdentifierView,
         MyIdentitiesResponse,
         AddIdentifierRequest,
+        RoutineView,
+        RoutineListResponse,
+        RoutineRunView,
+        RoutineRunListResponse,
+        UpsertRoutineRequest,
+        PreviewRequest,
+        PreviewResponse,
     )),
     tags(
         (name = "meta", description = "Liveness + introspection"),

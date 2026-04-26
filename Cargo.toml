@@ -97,6 +97,11 @@ thiserror = "2"
 
 # --- time / uuid ---
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.9"
+# Parses cron expressions (used by §6 routines). 7-field syntax with
+# seconds + optional year, but we restrict to standard 5-field at the
+# validation layer for predictable operator UX.
+cron = "0.12"
 uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["serde", "macros"] }
 

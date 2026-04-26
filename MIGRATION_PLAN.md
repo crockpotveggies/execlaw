@@ -1408,9 +1408,95 @@ Operators migrating from selfhosted-claw paste their existing `personality.json`
 - **Trust-class rules** — system-managed, never operator-editable here; configured in §2.9 trust-class capabilities.
 - **Tool allowlists** — managed in `config_tool_access` (Settings → Tools).
 - **Plugin settings** — `plugin_settings` table, scoped per plugin.
-- **Schedules / routines** — separate `config_routines` table when that feature ships (§5.7).
+- **Schedules / routines** — separate `config_routines` table; see §5.6.
 
 The personality table is *only* the natural-language voice. Anything that needs typed validation goes elsewhere.
+
+### 5.6 Routines (cron-shaped agent automations)
+
+A **routine** is a cron-scheduled prompt the agent runs on its own. Examples:
+
+- `0 8 * * 1-5` — every weekday at 8am, summarise overnight emails into the control thread.
+- `*/15 * * * *` — every 15 minutes, poll the on-call queue and alert on new pages.
+- `0 9 * * 1` — every Monday at 9am, post a "what's on this week" digest.
+
+This is the cron-job-shaped half of the agent's autonomy (the other half is event-driven turn dispatch from inbound transport messages). selfhosted-claw exposed a similar surface as "Scheduled tasks"; execlaw renames it Routines because the shape is recurring routine, not one-shot task.
+
+#### 5.6.1 Schema (`config_routines` + `state_routine_runs`)
+
+```rust
+struct RoutineRow {
+    id: RoutineId,                     // ulid for stable refs from runs
+    name: String,                      // operator-visible label
+    schedule_cron: String,             // 5-field cron (`m h dom mon dow`)
+    timezone: String,                  // IANA tz, e.g. "America/New_York"; default "UTC"
+    prompt: String,                    // the user-message the agent sees
+    target_conversation_id: Option<ConversationId>,
+                                       // None → mint a fresh conversation per run
+    enabled: bool,
+    last_run_at: Option<i64>,
+    last_run_status: Option<RoutineRunStatus>,  // Success | Failed | Skipped
+    next_run_at: Option<i64>,          // computed at save + after each run
+    created_at: i64,
+    updated_at: i64,
+}
+
+struct RoutineRun {
+    id: RoutineRunId,
+    routine_id: RoutineId,
+    fired_at: i64,                     // when the scheduler decided this turn fires
+    started_at: Option<i64>,           // when the runner picked it up
+    finished_at: Option<i64>,
+    status: RoutineRunStatus,
+    error: Option<String>,             // populated on Failed
+    conversation_id: Option<ConversationId>, // resolved at fire time
+}
+```
+
+`config_routines` is operator-edited, audit-logged. `state_routine_runs` is append-only — the run history. Retention sweeper trims runs older than the configured window (default 90d).
+
+#### 5.6.2 Cron parsing & evaluation
+
+Standard 5-field cron: `minute hour day-of-month month day-of-week`. Comma lists, ranges, and `*/N` step values supported via the `cron` crate's standard parser. Six-field syntax (with seconds) and the `@hourly` / `@daily` shortcuts are deferred.
+
+**Validation on save.** Reject syntactically-invalid expressions before persisting. Reject schedules whose `next_run_at` is more than 1 year out (catches `0 0 1 1 *` typos that would mean "once per year").
+
+**Timezone-aware**. The cron expression evaluates in the operator's chosen tz. `next_run_at` is stored as Unix epoch (UTC) so the scheduler tick is timezone-agnostic.
+
+**Drift handling.** If the control plane is offline when a run was due, the scheduler fires *one* catch-up at startup and skips intervening misses (no thundering-herd backfill). Operators who need missed-runs replay invoke a routine manually.
+
+#### 5.6.3 Scheduler tick
+
+A single `RoutineRunner` task in the server crate ticks every minute (aligned to the wall clock so the on-the-minute schedules don't lag by tick offset). On each tick:
+
+1. Query routines where `enabled = true AND next_run_at <= now`.
+2. For each: insert a `state_routine_runs` row in `Pending` status, dispatch the prompt to a stub turn executor (Phase 10 ships the dispatch path; the actual turn execution lands when `runner-local` is real), update `last_run_at`, recompute `next_run_at`.
+3. Errors during dispatch update the run row to `Failed` with the error string and DON'T advance `next_run_at` past the next normal occurrence — i.e. a transient failure doesn't permanently desynchronize the schedule.
+
+**Concurrency**: a routine can never fire twice concurrently. The runner takes a per-routine advisory lock for the duration of the dispatch.
+
+**Manual trigger**: `POST /api/admin/routines/{id}/run-now` queues a one-off run that doesn't affect `next_run_at`. Used for testing prompts and for manual catch-up.
+
+#### 5.6.4 SPA surface
+
+The placeholder `RoutinesPage` becomes a real list/edit/create page:
+
+- List view: table rows with name + cron + last status + next fire time + enabled toggle.
+- Editor: name, cron (with a live "next 5 fires" preview), timezone, prompt textarea, target conversation (dropdown of existing conversations + "fresh per run" option), enabled checkbox.
+- Run history: per-routine drawer showing the last 50 runs with status, duration, and any error.
+- Manual fire button.
+
+Phase 10 ships v1 of all four. Backfill of missed runs and routine cloning are nice-to-haves for v1.x.
+
+#### 5.6.5 Trust + capability scoping
+
+Routine-fired turns inherit the controller's trust class. Tools are subject to the same `config_tool_access` allowlist as a normal controller turn — no extra grants and no extra bypasses. A routine can't escalate beyond what the operator typing the same prompt manually would get.
+
+This keeps the feature side-effect-free for security: enabling a routine is exactly equivalent to setting an alarm on the operator's calendar to type that prompt.
+
+#### 5.6.6 Audit + drift
+
+Every save bumps `updated_at` and writes a `config_audit` row. Every run writes a `state_routine_runs` row. The two together let the operator answer "why did the agent do X at 8am yesterday" with one query: routine row → run history → conversation events.
 
 ---
 

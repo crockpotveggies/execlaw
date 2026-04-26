@@ -671,6 +671,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::alerts::alerts_router())
         .merge(crate::trust_policy::trust_policy_router())
         .merge(crate::my_identities::my_identities_router())
+        .merge(crate::routines::routines_router())
         .merge(crate::personality::personality_router())
         .merge(crate::runners_admin::runners_admin_router())
         .merge(crate::users::users_router())

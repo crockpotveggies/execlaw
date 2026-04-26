@@ -31,6 +31,8 @@ pub mod observability;
 pub mod personality;
 pub mod plugins;
 pub mod routes;
+pub mod routine_runner;
+pub mod routines;
 pub mod runner_registry;
 pub mod runners_admin;
 pub mod state;

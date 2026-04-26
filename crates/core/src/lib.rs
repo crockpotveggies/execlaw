@@ -37,6 +37,7 @@ pub mod personality;
 pub mod principal;
 pub mod refresh_tokens;
 pub mod research;
+pub mod routines;
 pub mod tool_access;
 pub mod transport_conversations;
 pub mod trust_policy;
