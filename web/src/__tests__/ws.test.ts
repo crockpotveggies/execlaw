@@ -58,4 +58,21 @@ describe("WsClient", () => {
         expect(onEvent).not.toHaveBeenCalled();
         client.close();
     });
+
+    it("sendBinary returns false when the socket isn't open", () => {
+        // Phase 13.A — voice frames must drop silently when the
+        // socket is offline. The voice-pipeline's VAD tolerates
+        // short audio gaps; trying to buffer across reconnects
+        // would emit stale audio that confuses the endpointer.
+        const client = new WsClient({
+            accessToken: () => null,
+            onEvent: () => {},
+            urlOverride: "ws://localhost:1/ignore",
+        });
+        // Fresh client — `open()` was never called, so no socket
+        // exists. sendBinary returns false.
+        const ok = client.sendBinary(new Uint8Array([1, 2, 3]).buffer);
+        expect(ok).toBe(false);
+        client.close();
+    });
 });

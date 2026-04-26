@@ -318,7 +318,13 @@ export function Chat() {
                         {topError}
                     </div>
                 )}
-                <ChatPane activeId={activeId} onSend={onSend} />
+                <ChatPane
+                    activeId={activeId}
+                    onSend={onSend}
+                    sendVoiceFrame={(bytes) =>
+                        wsRef.current?.sendBinary(bytes) ?? false
+                    }
+                />
             </main>
         </div>
     );
@@ -333,9 +339,11 @@ export function Chat() {
 function ChatPane({
     activeId,
     onSend,
+    sendVoiceFrame,
 }: {
     activeId: string | null;
     onSend: (text: string) => Promise<void> | void;
+    sendVoiceFrame: (bytes: ArrayBuffer) => boolean;
 }) {
     const messages = useChatState((s) =>
         activeId ? s.messages[activeId] ?? null : null,
@@ -348,17 +356,25 @@ function ChatPane({
         ((messages?.length ?? 0) > 0 || (streaming?.length ?? 0) > 0);
 
     if (!hasContent) {
-        return <WelcomeView onSend={onSend} />;
+        return <WelcomeView onSend={onSend} sendVoiceFrame={sendVoiceFrame} />;
     }
-    return <ActiveThreadPane conversationId={activeId!} onSend={onSend} />;
+    return (
+        <ActiveThreadPane
+            conversationId={activeId!}
+            onSend={onSend}
+            sendVoiceFrame={sendVoiceFrame}
+        />
+    );
 }
 
 function ActiveThreadPane({
     conversationId,
     onSend,
+    sendVoiceFrame,
 }: {
     conversationId: string;
     onSend: (text: string) => Promise<void> | void;
+    sendVoiceFrame: (bytes: ArrayBuffer) => boolean;
 }) {
     const auth = useAuth();
     const getToken = useCallback(() => auth.getAccessToken(), [auth]);
@@ -533,7 +549,7 @@ function ActiveThreadPane({
                     busy={approvalBusy}
                     onRespond={(id, verb) => void onApprovalRespond(id, verb)}
                 />
-                <Composer onSend={onSend} />
+                <Composer onSend={onSend} sendVoiceFrame={sendVoiceFrame} />
             </div>
         </>
     );

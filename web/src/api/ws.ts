@@ -82,6 +82,32 @@ export class WsClient {
         };
     }
 
+    /**
+     * Send a binary audio frame upstream — Phase 13.A voice mode.
+     *
+     * Returns `true` when the socket was open and the bytes were
+     * queued, `false` otherwise. Callers (the voice composer)
+     * should drop frames silently when this returns false; the
+     * agent's voice pipeline tolerates short audio gaps via VAD.
+     *
+     * Reconnect behaviour: this method does NOT auto-buffer for a
+     * pending reconnect. Audio that fires before the socket
+     * stabilises is dropped on the floor — buffering would be a
+     * latency footgun that disagrees with the VAD's
+     * end-of-utterance heuristic.
+     */
+    sendBinary(bytes: ArrayBuffer | Uint8Array): boolean {
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+            return false;
+        }
+        try {
+            this.socket.send(bytes);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
     /** Close the connection permanently. Disables auto-reconnect. */
     close(): void {
         this.closed = true;

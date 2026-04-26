@@ -1,19 +1,32 @@
 // Composer — text input + send button rendered as a single Bootstrap
 // input-group so they're visually flush. Auto-grows the textarea up
 // to a max height; sends on Enter, Shift+Enter inserts a newline.
+//
+// Phase 13.A — also hosts the voice mic button to the left of the
+// send button. Voice capture is gated on the chat shell providing a
+// `sendVoiceFrame` accessor; when absent (e.g. settings shell) the
+// button is hidden.
 
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
 import InputGroup from "react-bootstrap/InputGroup";
 import Spinner from "react-bootstrap/Spinner";
+import { VoiceCaptureButton } from "./VoiceCaptureButton";
 
 interface Props {
     disabled?: boolean;
     onSend: (text: string) => Promise<void> | void;
+    /**
+     * Phase 13.A — voice-mode wire. Returns true when the bytes
+     * were queued on the WebSocket; false drops the chunk. Pass
+     * `undefined` to hide the mic button entirely (e.g. routes
+     * that don't have a live WebSocket).
+     */
+    sendVoiceFrame?: (bytes: ArrayBuffer) => boolean;
 }
 
-export function Composer({ disabled, onSend }: Props) {
+export function Composer({ disabled, onSend, sendVoiceFrame }: Props) {
     const [text, setText] = useState("");
     const [submitting, setSubmitting] = useState(false);
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -63,6 +76,12 @@ export function Composer({ disabled, onSend }: Props) {
                     className="execlaw-composer__input"
                     data-testid="composer-input"
                 />
+                {sendVoiceFrame && (
+                    <VoiceCaptureButton
+                        sendBinary={sendVoiceFrame}
+                        disabled={isBusy}
+                    />
+                )}
                 <Button
                     type="submit"
                     variant="primary"

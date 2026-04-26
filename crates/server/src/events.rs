@@ -191,7 +191,21 @@ async fn handle_socket(mut socket: WebSocket, bus: EventBus) {
             },
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Close(_))) | None => break,
-                Some(Ok(_)) => {} // ignore client→server traffic for Phase 1
+                Some(Ok(Message::Binary(bytes))) => {
+                    // Phase 13.A — binary inbound frames are the
+                    // operator's microphone audio for voice mode.
+                    // The full pipeline (VAD → STT → LLM → TTS) lands
+                    // in 13.B onward; for now we just log so
+                    // operators can confirm the SPA's MediaRecorder
+                    // bytes actually reach the server. Drops the
+                    // bytes; no transcription, no event log
+                    // pollution.
+                    debug!(
+                        bytes = bytes.len(),
+                        "ws voice frame received (stub: discarded until 13.B)"
+                    );
+                }
+                Some(Ok(_)) => {} // ignore other client→server traffic
                 Some(Err(e)) => {
                     warn!("ws recv error: {e}");
                     break;

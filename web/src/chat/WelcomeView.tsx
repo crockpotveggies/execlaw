@@ -29,9 +29,16 @@ const SUGGESTIONS: ReadonlyArray<{ title: string; sub: string; prompt: string }>
 
 interface Props {
     onSend: (text: string) => Promise<void> | void;
+    /**
+     * Phase 13.A — voice mic button surfaces here too so the
+     * operator can start a voice conversation without typing
+     * anything first. Optional; absent in tests that don't bother
+     * with voice plumbing.
+     */
+    sendVoiceFrame?: (bytes: ArrayBuffer) => boolean;
 }
 
-export function WelcomeView({ onSend }: Props) {
+export function WelcomeView({ onSend, sendVoiceFrame }: Props) {
     return (
         <div className="execlaw-welcome" data-testid="welcome-view">
             <div className="execlaw-welcome__brand">
@@ -40,7 +47,7 @@ export function WelcomeView({ onSend }: Props) {
             </div>
 
             <div className="execlaw-welcome__composer">
-                <Composer onSend={onSend} />
+                <Composer onSend={onSend} sendVoiceFrame={sendVoiceFrame} />
             </div>
 
             <div className="execlaw-welcome__suggestions">
