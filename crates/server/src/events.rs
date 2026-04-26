@@ -192,18 +192,31 @@ async fn handle_socket(mut socket: WebSocket, bus: EventBus) {
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Close(_))) | None => break,
                 Some(Ok(Message::Binary(bytes))) => {
-                    // Phase 13.A — binary inbound frames are the
-                    // operator's microphone audio for voice mode.
-                    // The full pipeline (VAD → STT → LLM → TTS) lands
-                    // in 13.B onward; for now we just log so
-                    // operators can confirm the SPA's MediaRecorder
-                    // bytes actually reach the server. Drops the
-                    // bytes; no transcription, no event log
-                    // pollution.
-                    debug!(
-                        bytes = bytes.len(),
-                        "ws voice frame received (stub: discarded until 13.B)"
-                    );
+                    // Phase 13.A — parse the framing header so
+                    // operators can confirm session id + seq + codec
+                    // metadata flow end-to-end. Payload is opaque
+                    // codec bytes; the WhisperClient adapter
+                    // (Phase 13.C) decodes them. Phase 13.B replaces
+                    // this debug-and-drop with dispatch into a
+                    // per-session voice actor.
+                    match crate::voice_frame::parse_frame(&bytes) {
+                        Ok((header, payload)) => {
+                            debug!(
+                                session = %header.session,
+                                seq = header.seq,
+                                codec = %header.codec,
+                                sample_rate = header.sample_rate,
+                                payload_bytes = payload.len(),
+                                "ws voice frame received (stub: discarded until 13.B)"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                bytes = bytes.len(),
+                                "ws voice frame parse failed: {e}"
+                            );
+                        }
+                    }
                 }
                 Some(Ok(_)) => {} // ignore other client→server traffic
                 Some(Err(e)) => {

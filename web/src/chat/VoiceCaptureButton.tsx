@@ -16,6 +16,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Button from "react-bootstrap/Button";
+import { codecFromMime, VoiceSession } from "./VoiceSession";
 
 interface Props {
     /**
@@ -62,6 +63,12 @@ export function VoiceCaptureButton({
     const [error, setError] = useState<string | null>(null);
     const recorderRef = useRef<MediaRecorder | null>(null);
     const streamRef = useRef<MediaStream | null>(null);
+    /// Phase 13.A closure — voice-session lifecycle. A fresh
+    /// session id + seq counter is minted on every recording start;
+    /// torn down on stop. `framePayload` wraps each chunk in the
+    /// `[u32 header_len][JSON header][opus payload]` wire format
+    /// the server-side `voice_frame::parse_frame` consumes.
+    const sessionRef = useRef<VoiceSession | null>(null);
 
     // Releasing the mic on unmount avoids a "tab is using your mic"
     // browser indicator persisting after the component is gone.
@@ -99,6 +106,7 @@ export function VoiceCaptureButton({
             }
             streamRef.current = null;
         }
+        sessionRef.current = null;
         setRecording(false);
     }, []);
 
@@ -114,9 +122,18 @@ export function VoiceCaptureButton({
         }
         let stream: MediaStream;
         try {
+            // Browser-side echo cancellation OFF — operator decision.
+            // The plan's WebRTC AEC3 (Phase 13.E) needs the browser to
+            // pass through the raw mic signal so the server can reason
+            // about both the mic and the speaker. Browser-built-in AEC
+            // would mangle the signal first. Until 13.E lands, the
+            // limitation is "agent's TTS may pick up in the mic if
+            // speakers are loud" — acceptable for pre-13.E dogfood.
+            // NS + AGC stay on; they don't interfere with downstream
+            // AEC the way browser AEC does.
             stream = await navigator.mediaDevices.getUserMedia({
                 audio: {
-                    echoCancellation: true,
+                    echoCancellation: false,
                     noiseSuppression: true,
                     autoGainControl: true,
                 },
@@ -149,13 +166,33 @@ export function VoiceCaptureButton({
             return;
         }
         recorderRef.current = recorder;
+        // Phase 13.A closure — mint the voice session before the
+        // recorder fires its first chunk. Sample rate comes from
+        // the AudioContext default since MediaRecorder doesn't
+        // expose its capture rate directly; browsers ship 48000.
+        // The server-side decoder relies on this header field to
+        // resample for Whisper.
+        const sampleRate =
+            (typeof AudioContext !== "undefined"
+                ? new AudioContext().sampleRate
+                : undefined) ?? 48000;
+        const session = new VoiceSession({
+            codec: codecFromMime(mimeType),
+            sampleRate,
+        });
+        sessionRef.current = session;
         recorder.ondataavailable = (ev) => {
             if (ev.data.size === 0) return;
             void ev.data.arrayBuffer().then((buf) => {
-                // Drop the chunk silently if the WebSocket isn't
-                // open. The VAD tolerates short gaps; trying to
-                // buffer across reconnects produces stale audio.
-                sendBinary(buf);
+                // Wrap the opus payload in the wire framing so
+                // the server can parse session id + seq + codec
+                // metadata without out-of-band setup. Drops the
+                // chunk silently if the WebSocket isn't open —
+                // VAD tolerates short gaps; buffering across
+                // reconnects produces stale audio.
+                const sess = sessionRef.current;
+                if (!sess) return;
+                sendBinary(sess.framePayload(buf));
             });
         };
         recorder.onstop = () => {
@@ -166,6 +203,7 @@ export function VoiceCaptureButton({
                 }
                 streamRef.current = null;
             }
+            sessionRef.current = null;
             setRecording(false);
         };
         try {

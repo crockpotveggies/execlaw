@@ -44,6 +44,7 @@ pub mod tools_admin;
 pub mod tracing_layer;
 pub mod trust_policy;
 pub mod users;
+pub mod voice_frame;
 pub mod webauthn;
 
 pub use auth::{JwtSigner, RefreshStore};

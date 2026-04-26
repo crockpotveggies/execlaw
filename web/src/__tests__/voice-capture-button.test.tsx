@@ -83,8 +83,12 @@ function installMocks(opts: {
         globalThis.MediaRecorder = function () {
             throw new Error("recorder construction failed");
         };
-        // @ts-expect-error preserve the static
-        globalThis.MediaRecorder.isTypeSupported = vi.fn().mockReturnValue(true);
+        // The TS lib types narrow `globalThis.MediaRecorder` away
+        // when reassigned to a non-class function above; cast for
+        // the static-method assignment.
+        (globalThis.MediaRecorder as unknown as {
+            isTypeSupported: (s: string) => boolean;
+        }).isTypeSupported = vi.fn().mockReturnValue(true);
     } else {
         // @ts-expect-error replace global with our stub class
         globalThis.MediaRecorder = MockMediaRecorder;
@@ -114,7 +118,7 @@ describe("VoiceCaptureButton", () => {
         expect(btn).toHaveAttribute("aria-label", "Start voice capture");
     });
 
-    it("starts recording on click and pipes chunks through sendBinary", async () => {
+    it("starts recording on click and pipes framed chunks through sendBinary", async () => {
         vi.useRealTimers(); // MediaRecorder needs setTimeout to fire
         installMocks({ permissionGranted: true });
         const sent: ArrayBuffer[] = [];
@@ -137,6 +141,23 @@ describe("VoiceCaptureButton", () => {
             },
             { timeout: 500 },
         );
+        // Phase 13.A closure — every chunk is now wrapped in the
+        // [u32 header_len][JSON header][payload] envelope. Decode
+        // the first frame and assert the header + opus payload
+        // round-trip.
+        const frame = sent[0];
+        expect(frame.byteLength).toBeGreaterThan(4);
+        const view = new DataView(frame);
+        const headerLen = view.getUint32(0, false);
+        const headerBytes = new Uint8Array(frame, 4, headerLen);
+        const header = JSON.parse(new TextDecoder().decode(headerBytes));
+        expect(typeof header.session).toBe("string");
+        expect(header.session.length).toBeGreaterThan(0);
+        expect(header.seq).toBe(0);
+        expect(header.codec).toBe("opus");
+        expect(typeof header.sample_rate).toBe("number");
+        const payload = new Uint8Array(frame, 4 + headerLen);
+        expect(new TextDecoder().decode(payload)).toBe("frame-bytes");
     });
 
     it("stops recording + releases mic tracks on second click", async () => {
