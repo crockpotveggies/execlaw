@@ -474,8 +474,15 @@ async fn run_real_turn(
     } else {
         None
     };
-    let mut messages: Vec<ChatMessage> =
-        vec![ChatMessage::system(&state.config.system_prompt)];
+    // Phase 11.B — same personality+base composition as the
+    // tool-capable path so the streaming-only run_real_turn picks
+    // up operator personality edits without an extra round trip.
+    let composed_system = assemble_system_prompt(
+        &state.db,
+        Some(cid.as_str()),
+        &state.config.system_prompt,
+    );
+    let mut messages: Vec<ChatMessage> = vec![ChatMessage::system(&composed_system)];
     for ev in &history {
         match ev.kind {
             EventKind::UserMsg => {
@@ -624,9 +631,24 @@ async fn run_tool_capable_turn(
         .with_mcp(state.mcp_host.clone()),
     );
     let exec = TurnExecutor::new((*inference).clone(), dispatch);
+    // Phase 11.A — wire a phase observer that fans the runner's
+    // Thinking ↔ AwaitingTool transitions onto the event bus. The
+    // SPA's is_processing classification covers both, so the typing
+    // indicator stays continuously on through the tool loop without
+    // flicker. Transports that want finer granularity can branch on
+    // the raw phase string.
+    let phase_observer: Arc<dyn execlaw_runner_local::turn::PhaseObserver> =
+        Arc::new(BusPhaseObserver {
+            events: state.events.clone(),
+            conversation_id: cid.as_str().to_owned(),
+        });
     let cfg = TurnConfig {
         model: ModelId(state.config.model_id.clone()),
-        system_prompt: state.config.system_prompt.clone(),
+        system_prompt: assemble_system_prompt(
+            &state.db,
+            Some(cid.as_str()),
+            &state.config.system_prompt,
+        ),
         temperature: None,
         max_tokens: None,
         max_tool_rounds: state.config.max_tool_rounds,
@@ -635,6 +657,7 @@ async fn run_tool_capable_turn(
             .event_log_hmac_key
             .as_ref()
             .map(|k| (**k).clone()),
+        phase_observer: Some(phase_observer),
     };
     let summary = exec
         .run_turn(&state.db, cid, user_text, sender_principal_id, &cfg)
@@ -881,6 +904,136 @@ fn event_log(state: &AppState) -> EventLog<'_> {
     match &state.event_log_hmac_key {
         Some(k) => log.with_hmac_key((**k).clone()),
         None => log,
+    }
+}
+
+/// Phase 11.A — bridge from the runner's `PhaseObserver` trait to the
+/// server's WS event bus. Construct one per turn with the active
+/// `conversation_id`; every callback publishes a
+/// `ConversationPhaseChanged` event that downstream subscribers
+/// (SPA tabs, transport plugins) translate into typing-indicator
+/// transitions.
+struct BusPhaseObserver {
+    events: crate::events::EventBus,
+    conversation_id: String,
+}
+
+impl execlaw_runner_local::turn::PhaseObserver for BusPhaseObserver {
+    fn observe(&self, phase: Phase) {
+        self.events.publish(UiEvent::ConversationPhaseChanged {
+            conversation_id: self.conversation_id.clone(),
+            phase: phase.as_str().to_owned(),
+        });
+    }
+}
+
+/// Result of a routine-triggered turn dispatch.
+#[derive(Debug, Clone)]
+pub struct RoutineDispatchOutcome {
+    /// The conversation id the turn ran on. For routines whose
+    /// `target_conversation_id` was set, this echoes it back; for
+    /// `None`-target routines, the freshly-minted id.
+    pub conversation_id: String,
+    /// The assistant's text reply. Empty when the model emitted no
+    /// final text (e.g. a tool-only turn that hit the round cap).
+    pub assistant_text: String,
+}
+
+/// Phase 11.C — entry point for routine-fired turns. Wraps the same
+/// dispatch path as a controller-typed message so a routine is
+/// behaviourally identical to "the controller typed this prompt at
+/// time T". Skips the trust-resolution / cold-contact branches
+/// because the sender is the controller by construction.
+///
+/// Falls back to the stub turn when no inference backend is wired,
+/// so routines still produce success/failure history rows in
+/// dev/test environments without a live LLM.
+pub async fn dispatch_routine_turn(
+    state: &AppState,
+    routine_id: &str,
+    target_conversation_id: Option<&str>,
+    prompt: &str,
+) -> Result<RoutineDispatchOutcome, String> {
+    use execlaw_core::conversation::ConversationStore;
+    let cid_str = target_conversation_id
+        .map(String::from)
+        .unwrap_or_else(|| format!("routine-{routine_id}-{}", uuid::Uuid::new_v4()));
+    let cid = ConversationId::from(cid_str.as_str());
+
+    // Make sure a conversation row exists before any turn writes
+    // event log entries against it. Same shape as the inbound-chat
+    // path (`ensure_conversation` is the helper above).
+    let store = ConversationStore::new(&state.db);
+    ensure_conversation(&store, &cid);
+
+    let sender = Some("controller".to_owned());
+    // Controller turns get the wildcard capability set. We hardcode
+    // it here rather than re-running the policy engine because a
+    // routine fire by definition has Controller trust.
+    let caller_caps: Vec<String> = vec!["*".into()];
+    let caller_trust = TrustLevel::Controller;
+
+    let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
+    let result = match &state.inference {
+        Some(inference) if has_plugin_tools => {
+            run_tool_capable_turn(
+                state,
+                inference.clone(),
+                &cid,
+                prompt,
+                sender.clone(),
+                caller_caps,
+                caller_trust,
+            )
+            .await
+        }
+        Some(inference) => {
+            // Spotlighting off: the prompt comes from the operator,
+            // not from an external sender, so no untrusted-content
+            // wrapping needed.
+            run_real_turn(state, inference.clone(), &cid, prompt, sender.clone(), false).await
+        }
+        None => run_stub_turn(state, &cid, prompt, sender.clone()),
+    };
+
+    result
+        .map(|(_user_seq, text, _assistant_seq)| RoutineDispatchOutcome {
+            conversation_id: cid_str,
+            assistant_text: text,
+        })
+}
+
+/// Phase 11.B — assemble the turn's system prompt. Two halves:
+///
+///   1. **Operator-editable personality** (§5.5). Pulled from
+///      `config_personality` via `compose_system_prompt`. Includes
+///      the conversation-scope override merged on top of the global
+///      default. Best-effort — a missing/corrupt personality table
+///      collapses to an empty chunk so the static base alone still
+///      flies.
+///   2. **Static system base** (§2.8). The trust-class rules,
+///      refusal behaviour, etc. that operators don't tweak. Comes
+///      from `state.config.system_prompt`. Sits *after* the
+///      personality so it has the final word on conflict.
+///
+/// Operators override "agent voice"; the static base owns
+/// non-negotiable safety rules.
+pub(crate) fn assemble_system_prompt(
+    db: &execlaw_core::Database,
+    conversation_id: Option<&str>,
+    static_base: &str,
+) -> String {
+    let store = execlaw_core::personality::PersonalityStore::new(db);
+    let personality_chunk =
+        execlaw_core::personality::compose_system_prompt(&store, conversation_id)
+            .unwrap_or_default();
+    let p = personality_chunk.trim();
+    let b = static_base.trim();
+    match (p.is_empty(), b.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => b.to_owned(),
+        (false, true) => p.to_owned(),
+        (false, false) => format!("{p}\n\n---\n\n{b}"),
     }
 }
 
@@ -1291,6 +1444,86 @@ mod tests {
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0]["kind"].as_str().unwrap(), "user_msg");
         assert_eq!(msgs[1]["kind"].as_str().unwrap(), "model_turn");
+    }
+
+    #[test]
+    fn assemble_system_prompt_concatenates_personality_then_base() {
+        // Phase 11.B: personality chunk is rendered above the static
+        // base, separated by `---`. The seeded default personality
+        // produces an Identity section.
+        let state = test_app_state();
+        let prompt = super::assemble_system_prompt(
+            &state.db,
+            None, // no per-conversation override
+            "You are a helpful agent. Refuse unsafe requests.",
+        );
+        assert!(
+            prompt.contains("# Identity"),
+            "personality block must come first: {prompt}"
+        );
+        assert!(prompt.contains("Name: execlaw"));
+        // Static base lands AFTER the personality (gives it the last
+        // word on conflict).
+        let base_start = prompt.find("You are a helpful agent").unwrap();
+        let identity_start = prompt.find("# Identity").unwrap();
+        assert!(
+            identity_start < base_start,
+            "personality must precede base in the composed prompt"
+        );
+    }
+
+    #[test]
+    fn assemble_system_prompt_falls_through_to_base_when_personality_empty() {
+        let state = test_app_state();
+        // Wipe the seeded default — a fresh DB then; the function
+        // must still return the static base alone.
+        execlaw_core::db::Database::with_conn(&state.db, |c| {
+            c.execute("DELETE FROM config_personality", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let prompt = super::assemble_system_prompt(&state.db, None, "STATIC ONLY");
+        assert_eq!(prompt, "STATIC ONLY");
+    }
+
+    #[test]
+    fn assemble_system_prompt_per_conversation_override_changes_output() {
+        // A conversation-scope tone override must show up in the
+        // composed prompt for that conversation but not for others.
+        let state = test_app_state();
+        let store =
+            execlaw_core::personality::PersonalityStore::new(&state.db);
+        let mut over_fields = std::collections::HashSet::new();
+        over_fields.insert(execlaw_core::personality::PersonalityField::Tone);
+        store
+            .upsert(
+                &execlaw_core::personality::PersonalityUpsert {
+                    scope_kind:
+                        execlaw_core::personality::PersonalityScopeKind::Conversation,
+                    scope_ref: "conv-pirate".into(),
+                    display_name: "".into(),
+                    role: "".into(),
+                    tone: "Pirate".into(),
+                    communication_style: "".into(),
+                    initiative: "".into(),
+                    about_agent: "".into(),
+                    about_controller: "".into(),
+                    custom_instructions: "".into(),
+                    voice_id: None,
+                    override_fields: over_fields,
+                },
+                100,
+            )
+            .unwrap();
+
+        let pirate = super::assemble_system_prompt(
+            &state.db,
+            Some("conv-pirate"),
+            "BASE",
+        );
+        let plain = super::assemble_system_prompt(&state.db, None, "BASE");
+        assert!(pirate.contains("# Tone\nPirate"));
+        assert!(!plain.contains("Pirate"));
     }
 
     #[tokio::test]

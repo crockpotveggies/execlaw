@@ -1123,14 +1123,12 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         tokio::spawn(async move { reg.run_reaper(stop).await });
     }
 
-    // Phase 10 — wall-clock-aligned cron tick that fires due
-    // routines. The dispatch path is a stub today (marks runs
-    // Skipped with an explanatory error); becomes real when
-    // runner-local lands. See MIGRATION_PLAN §5.6.3.
-    let _routine_runner = execlaw_server::routine_runner::spawn(
-        db.clone(),
-        events.clone(),
-    );
+    // Phase 10 + 11.C — wall-clock-aligned cron tick that fires due
+    // routines. Dispatch routes through chats::dispatch_routine_turn
+    // so a routine fire is behaviourally identical to the controller
+    // typing the prompt manually. Falls back to stub turn when no
+    // inference backend is wired. See MIGRATION_PLAN §5.6.3.
+    let _routine_runner = execlaw_server::routine_runner::spawn(state.clone());
 
     // Phase 10 closure — purge state_routine_runs rows past the
     // 90-day retention window every hour. Mirrors the existing

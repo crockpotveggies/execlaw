@@ -19,7 +19,7 @@
 //! integration) land incrementally on top of this shape.
 
 use async_trait::async_trait;
-use execlaw_core::conversation::ConversationStore;
+use execlaw_core::conversation::{ConversationStore, Phase};
 use execlaw_core::db::Database;
 use execlaw_core::events::{
     EventKind, EventLog, EventRecord, PendingEvent, ToolResultPayload, ToolUsePayload,
@@ -32,6 +32,29 @@ use execlaw_inference_api::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
+
+// ---------------------------------------------------------------------------
+// Phase observer
+// ---------------------------------------------------------------------------
+
+/// Hook the runner calls at FSM-phase boundaries during a turn. The
+/// runner-local crate stays agnostic of the server's event bus —
+/// implementations are wired by the caller.
+///
+/// Today the runner emits two transitions:
+///   * `Phase::AwaitingTool` immediately before dispatching a tool
+///     call (so transports can keep the typing indicator on through
+///     the tool round).
+///   * `Phase::Thinking` immediately after a tool round completes,
+///     when the next LLM call starts.
+///
+/// `Phase::Idle` is the responsibility of the *caller* (`chats.rs`),
+/// since it knows when the entire send-message pipeline has finished
+/// — including the parts that aren't the runner's concern (audit
+/// log, message broadcast, conversation row bump).
+pub trait PhaseObserver: Send + Sync {
+    fn observe(&self, phase: Phase);
+}
 
 // ---------------------------------------------------------------------------
 // Tool dispatch trait
@@ -71,7 +94,7 @@ pub struct ModelTurnPayload {
 }
 
 /// Configuration for one turn.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TurnConfig {
     pub model: ModelId,
     pub system_prompt: String,
@@ -86,6 +109,28 @@ pub struct TurnConfig {
     /// pre-setup; production always sets this from the server's shared
     /// key so every row the executor writes is tamper-evident.
     pub event_log_hmac_key: Option<Vec<u8>>,
+    /// Optional FSM-phase observer. The runner calls
+    /// `observer.observe(Phase::AwaitingTool)` before tool dispatch
+    /// and `observe(Phase::Thinking)` after the tool round finishes.
+    /// Server wires this to `EventBus::publish(ConversationPhaseChanged)`.
+    /// `None` during tests skips publishing — the runner's behaviour
+    /// is identical either way.
+    pub phase_observer: Option<Arc<dyn PhaseObserver>>,
+}
+
+impl std::fmt::Debug for TurnConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnConfig")
+            .field("model", &self.model)
+            .field("system_prompt_len", &self.system_prompt.len())
+            .field("temperature", &self.temperature)
+            .field("max_tokens", &self.max_tokens)
+            .field("max_tool_rounds", &self.max_tool_rounds)
+            .field("tools_len", &self.tools.len())
+            .field("hmac_key_set", &self.event_log_hmac_key.is_some())
+            .field("phase_observer_set", &self.phase_observer.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -237,6 +282,17 @@ impl TurnExecutor {
                 break;
             }
 
+            // Phase 11.A — signal that the agent is now in a tool
+            // round. Transports use this to keep the typing
+            // indicator on through dispatch even though the LLM is
+            // momentarily idle. We notify *once* per round
+            // regardless of how many parallel tool calls the model
+            // emitted; the is_processing classification on the
+            // consumer side dedupes back-to-back transitions.
+            if let Some(obs) = cfg.phase_observer.as_ref() {
+                obs.observe(Phase::AwaitingTool);
+            }
+
             // Dispatch each tool call, producing paired use/result events.
             for tc in &choice.message.tool_calls {
                 let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
@@ -277,6 +333,15 @@ impl TurnExecutor {
             }
 
             rounds += 1;
+
+            // Tool round done; the agent is back to LLM-bound thinking.
+            // Idle is *never* published from here — that's chats.rs's
+            // job after the whole pipeline (including audit + broadcast)
+            // finishes. is_processing() classifies both states as busy
+            // so the indicator stays on without flicker.
+            if let Some(obs) = cfg.phase_observer.as_ref() {
+                obs.observe(Phase::Thinking);
+            }
         }
 
         // 4. Commit the turn atomically. `commit_turn` enforces the
@@ -455,6 +520,7 @@ mod tests {
             max_tool_rounds: 3,
             tools: vec![],
             event_log_hmac_key: None,
+            phase_observer: None,
         };
 
         let summary = exec
@@ -545,6 +611,7 @@ mod tests {
                 serde_json::json!({"type":"object"}),
             )],
             event_log_hmac_key: None,
+            phase_observer: None,
         };
 
         let summary = exec
@@ -554,6 +621,61 @@ mod tests {
 
         assert_eq!(summary.tool_rounds, 1);
         assert_eq!(summary.assistant_text, "ok got pong");
+
+        // Phase 11.A — repeat the same turn with a phase observer
+        // attached and assert it sees the AwaitingTool→Thinking
+        // transition for each round. We use a separate
+        // conversation so the events from the prior turn don't
+        // contaminate this assertion.
+        struct Recorder {
+            seen: std::sync::Mutex<Vec<Phase>>,
+        }
+        impl PhaseObserver for Recorder {
+            fn observe(&self, phase: Phase) {
+                self.seen.lock().unwrap().push(phase);
+            }
+        }
+        let recorder = std::sync::Arc::new(Recorder {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let addr2 = run_mock_server(Arc::new(ChainedMockServer {
+            responses: vec![
+                r#"{"id":"r1","model":"m","choices":[{"index":0,
+                    "message":{"role":"assistant","content":null,
+                        "tool_calls":[{"id":"tc1","type":"function",
+                            "function":{"name":"echo","arguments":"{}"}}]},
+                    "finish_reason":"tool_calls"}]}"#
+                    .to_owned(),
+                r#"{"id":"r2","model":"m","choices":[{"index":0,
+                    "message":{"role":"assistant","content":"done"},
+                    "finish_reason":"stop"}]}"#
+                    .to_owned(),
+            ],
+            served: AtomicUsize::new(0),
+        }))
+        .await;
+        let exec2 = TurnExecutor::new(
+            InferenceClient::new(format!("http://{addr2}/v1")),
+            Arc::new(EchoTool),
+        );
+        let cid2 = ConversationId::from("conv-phase-obs");
+        let cfg2 = TurnConfig {
+            phase_observer: Some(
+                recorder.clone() as std::sync::Arc<dyn PhaseObserver>,
+            ),
+            ..cfg.clone()
+        };
+        let _ = exec2
+            .run_turn(&db, &cid2, "go", None, &cfg2)
+            .await
+            .unwrap();
+        let seen = recorder.seen.lock().unwrap().clone();
+        // One round → AwaitingTool then Thinking.
+        assert_eq!(
+            seen,
+            vec![Phase::AwaitingTool, Phase::Thinking],
+            "observer must see exactly one tool round's transitions",
+        );
 
         // Verify the event log: user_msg + tool_use + tool_result + model_turn
         let log = EventLog::new(&db);
@@ -636,6 +758,7 @@ mod tests {
                 serde_json::json!({"type":"object"}),
             )],
             event_log_hmac_key: None,
+            phase_observer: None,
         };
         let _ = exec
             .run_turn(&db, &cid, "try it", None, &cfg)
@@ -708,6 +831,7 @@ mod tests {
                 serde_json::json!({"type":"object"}),
             )],
             event_log_hmac_key: None,
+            phase_observer: None,
         };
         let err = exec
             .run_turn(&db, &cid, "go", None, &cfg)

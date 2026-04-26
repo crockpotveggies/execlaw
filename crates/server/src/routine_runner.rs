@@ -1,22 +1,26 @@
-//! Routine scheduler tick (Phase 10, MIGRATION_PLAN §5.6.3).
+//! Routine scheduler tick (Phase 10 + 11.C, MIGRATION_PLAN §5.6.3).
 //!
 //! Single tokio task that wakes every `TICK_INTERVAL_SECS`, queries
 //! routines whose `next_run_at <= now`, and dispatches each as a
-//! controller turn. The dispatch path itself is a stub for v1 — we
-//! insert the run-history row, mark it `Skipped` with an explanatory
-//! error, and advance `next_run_at`. When `runner-local` is real this
-//! is where the prompt → turn handoff happens.
+//! controller-trust turn via [`crate::chats::dispatch_routine_turn`].
+//!
+//! Phase 10 shipped this as a stub (every fire marked `Skipped`).
+//! Phase 11.C wires the actual dispatch: the routine prompt goes
+//! through the same path as a controller-typed message, the
+//! conversation id is either the routine's `target_conversation_id`
+//! or a freshly-minted one, and the run history row records
+//! `Success`/`Failed`/`Skipped` with the resulting conversation id.
 //!
 //! The tick is wall-clock-aligned: we sleep until the next minute
 //! boundary, not a fixed duration from start, so a routine scheduled
 //! for `0 * * * *` doesn't slowly skew off the on-the-minute mark.
 
-use crate::events::{EventBus, UiEvent};
+use crate::events::UiEvent;
+use crate::state::AppState;
 use chrono::{DurationRound, TimeDelta, TimeZone, Utc};
 use execlaw_core::routines::{
     next_fire_after, parse_cron, parse_timezone, RoutineRunStatus, RoutineStore,
 };
-use execlaw_core::Database;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -24,12 +28,11 @@ use tracing::{info, warn};
 /// Wall-clock alignment target: tick at the top of every minute.
 const TICK_INTERVAL_SECS: i64 = 60;
 
-/// Spawn the tick task. Owns no resources beyond the `Database`
-/// clone + a handle to the event bus, so cancellation is just
-/// dropping the returned `JoinHandle`.
-pub fn spawn(db: Database, events: EventBus) -> tokio::task::JoinHandle<()> {
+/// Spawn the tick task. Owns the state clone for the lifetime of
+/// the process; cancellation is dropping the `JoinHandle`.
+pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let inner = Arc::new(Inner { db, events });
+        let inner = Arc::new(Inner { state });
         info!(
             "routine scheduler running; interval_secs={}",
             TICK_INTERVAL_SECS
@@ -48,7 +51,7 @@ pub fn spawn(db: Database, events: EventBus) -> tokio::task::JoinHandle<()> {
                 .unwrap_or(Duration::from_secs(TICK_INTERVAL_SECS as u64));
             tokio::time::sleep(sleep_for).await;
 
-            if let Err(e) = inner.tick_once() {
+            if let Err(e) = inner.tick_once().await {
                 warn!("routine scheduler tick failed: {e}");
             }
         }
@@ -56,23 +59,22 @@ pub fn spawn(db: Database, events: EventBus) -> tokio::task::JoinHandle<()> {
 }
 
 struct Inner {
-    db: Database,
-    events: EventBus,
+    state: AppState,
 }
 
 impl Inner {
     /// Run one tick: enumerate due routines, dispatch each, advance
     /// `next_run_at`. Errors at the row level are isolated — one
     /// busted routine shouldn't poison the whole tick.
-    fn tick_once(&self) -> Result<(), execlaw_core::routines::RoutineError> {
-        let store = RoutineStore::new(&self.db);
+    async fn tick_once(&self) -> Result<(), execlaw_core::routines::RoutineError> {
+        let store = RoutineStore::new(&self.state.db);
         let now = Utc::now().timestamp();
         let due = store.list_due(now)?;
         if due.is_empty() {
             return Ok(());
         }
         for routine in due {
-            if let Err(e) = self.fire_one(&store, &routine, now) {
+            if let Err(e) = self.fire_one(&store, &routine, now).await {
                 warn!(
                     "routine fire failed for '{}' ({}): {}",
                     routine.id, routine.name, e
@@ -82,7 +84,7 @@ impl Inner {
         Ok(())
     }
 
-    fn fire_one(
+    async fn fire_one(
         &self,
         store: &RoutineStore<'_>,
         routine: &execlaw_core::routines::RoutineRow,
@@ -93,27 +95,44 @@ impl Inner {
         // immediately so the SPA's run-history drawer reflects the
         // attempt without polling.
         let run_id = store.insert_run_pending(&routine.id, now)?;
-        self.events.publish(UiEvent::RoutineRunChanged {
+        self.state.events.publish(UiEvent::RoutineRunChanged {
             routine_id: routine.id.clone(),
             run_id: run_id.clone(),
             status: RoutineRunStatus::Pending.as_str().to_owned(),
         });
 
-        // v1 dispatch is a stub: mark the run Skipped with an
-        // explanatory error so the operator can see "yes, the schedule
-        // fired, but the dispatch pipeline isn't wired yet." Once
-        // runner-local is real, this is where we hand off to the
-        // turn executor.
-        let dispatch_status = RoutineRunStatus::Skipped;
-        let dispatch_error = Some(
-            "scheduler fired; turn dispatch lands with runner-local",
-        );
+        // Phase 11.C — actual dispatch. Routes through the same path
+        // as a controller-typed message; falls back to the stub
+        // turn when no inference backend is wired so routines still
+        // produce success/failure history rows in dev/test
+        // environments without a live LLM.
+        let outcome = crate::chats::dispatch_routine_turn(
+            &self.state,
+            &routine.id,
+            routine.target_conversation_id.as_deref(),
+            &routine.prompt,
+        )
+        .await;
+
+        let (dispatch_status, dispatch_error, conversation_id) = match outcome {
+            Ok(o) => (
+                RoutineRunStatus::Success,
+                None,
+                Some(o.conversation_id),
+            ),
+            Err(e) => (
+                RoutineRunStatus::Failed,
+                Some(e),
+                routine.target_conversation_id.clone(),
+            ),
+        };
+
         store.finish_run(
             &run_id,
             dispatch_status,
-            now,
-            dispatch_error,
-            routine.target_conversation_id.as_deref(),
+            Utc::now().timestamp(),
+            dispatch_error.as_deref(),
+            conversation_id.as_deref(),
         )?;
 
         // Recompute next_run_at so the routine doesn't fire again on
@@ -134,7 +153,7 @@ impl Inner {
 
         // Notify the SPA so the run history view updates live without
         // waiting for a refresh.
-        self.events.publish(UiEvent::RoutineRunChanged {
+        self.state.events.publish(UiEvent::RoutineRunChanged {
             routine_id: routine.id.clone(),
             run_id,
             status: dispatch_status.as_str().to_owned(),
@@ -146,15 +165,7 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use execlaw_core::db::DbConfig;
-    use execlaw_core::routines::{RoutineUpsert, RoutineStore};
-    use execlaw_core::MigrationRunner;
-
-    fn fresh_db() -> Database {
-        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
-        MigrationRunner::new(&db).apply_all().unwrap();
-        db
-    }
+    use execlaw_core::routines::{RoutineStore, RoutineUpsert};
 
     fn upsert_one(store: &RoutineStore<'_>, name: &str, cron: &str, now: i64) -> String {
         let row = store
@@ -164,7 +175,7 @@ mod tests {
                     name: name.into(),
                     schedule_cron: cron.into(),
                     timezone: "UTC".into(),
-                    prompt: "do".into(),
+                    prompt: "do the thing".into(),
                     target_conversation_id: None,
                     enabled: true,
                 },
@@ -174,23 +185,20 @@ mod tests {
         row.id
     }
 
-    #[test]
-    fn tick_once_advances_next_run_at_for_every_due_routine() {
-        let db = fresh_db();
-        let bus = EventBus::new();
-        let inner = Inner { db: db.clone(), events: bus };
-        let store = RoutineStore::new(&db);
+    #[tokio::test]
+    async fn tick_once_advances_next_run_at_for_every_due_routine() {
+        let state = crate::routes::test_app_state();
+        let inner = Inner { state: state.clone() };
+        let store = RoutineStore::new(&state.db);
         let now = Utc::now().timestamp();
 
-        // Force a routine into "due" by recording a past fire.
         let id = upsert_one(&store, "due", "*/5 * * * *", now);
         store
             .record_run(&id, RoutineRunStatus::Success, now - 600, Some(now - 1))
             .unwrap();
 
-        inner.tick_once().unwrap();
+        inner.tick_once().await.unwrap();
 
-        // After tick, next_run_at must have advanced past `now`.
         let row = store.get(&id).unwrap().unwrap();
         let next = row.next_run_at.expect("scheduler computed next fire");
         assert!(
@@ -198,21 +206,18 @@ mod tests {
             "next_run_at must advance past now (got {next}, now {now})",
         );
 
-        // A run history row exists and is in a terminal status.
         let runs = store.list_runs(&id, 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_ne!(runs[0].status, RoutineRunStatus::Pending);
     }
 
-    #[test]
-    fn tick_once_skips_disabled_routines() {
-        let db = fresh_db();
-        let bus = EventBus::new();
-        let inner = Inner { db: db.clone(), events: bus };
-        let store = RoutineStore::new(&db);
+    #[tokio::test]
+    async fn tick_once_skips_disabled_routines() {
+        let state = crate::routes::test_app_state();
+        let inner = Inner { state: state.clone() };
+        let store = RoutineStore::new(&state.db);
         let now = Utc::now().timestamp();
 
-        // Create an enabled routine, then disable + force "due".
         let row = store
             .upsert(
                 &RoutineUpsert {
@@ -231,18 +236,17 @@ mod tests {
             .record_run(&row.id, RoutineRunStatus::Success, now - 600, Some(now - 1))
             .unwrap();
 
-        inner.tick_once().unwrap();
+        inner.tick_once().await.unwrap();
         let runs = store.list_runs(&row.id, 10).unwrap();
         assert!(runs.is_empty(), "disabled routine must not fire");
     }
 
     #[tokio::test]
     async fn tick_once_publishes_pending_then_terminal_event() {
-        let db = fresh_db();
-        let bus = EventBus::new();
-        let mut rx = bus.subscribe();
-        let inner = Inner { db: db.clone(), events: bus };
-        let store = RoutineStore::new(&db);
+        let state = crate::routes::test_app_state();
+        let mut rx = state.events.subscribe();
+        let inner = Inner { state: state.clone() };
+        let store = RoutineStore::new(&state.db);
         let now = Utc::now().timestamp();
 
         let id = upsert_one(&store, "due", "*/5 * * * *", now);
@@ -250,13 +254,11 @@ mod tests {
             .record_run(&id, RoutineRunStatus::Success, now - 600, Some(now - 1))
             .unwrap();
 
-        inner.tick_once().unwrap();
+        inner.tick_once().await.unwrap();
 
-        // Drain the channel and assert: a Pending event arrives
-        // before its terminal counterpart for the same run_id.
         let mut pending_run_id: Option<String> = None;
         let mut terminal_seen = false;
-        for _ in 0..16 {
+        for _ in 0..32 {
             match tokio::time::timeout(
                 std::time::Duration::from_millis(200),
                 rx.recv(),
@@ -289,28 +291,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tick_once_isolates_failure_per_routine() {
-        // Two routines; we manually corrupt one's cron to make
-        // record_run's recompute fail. The other should still fire.
-        let db = fresh_db();
-        let bus = EventBus::new();
-        let inner = Inner { db: db.clone(), events: bus };
-        let store = RoutineStore::new(&db);
+    #[tokio::test]
+    async fn tick_once_isolates_failure_per_routine() {
+        let state = crate::routes::test_app_state();
+        let inner = Inner { state: state.clone() };
+        let store = RoutineStore::new(&state.db);
         let now = Utc::now().timestamp();
 
         let healthy_id = upsert_one(&store, "ok", "*/5 * * * *", now);
         let broken_id = upsert_one(&store, "broken", "*/5 * * * *", now);
-
-        // Force both due.
         for id in [&healthy_id, &broken_id] {
             store
                 .record_run(id, RoutineRunStatus::Success, now - 600, Some(now - 1))
                 .unwrap();
         }
 
-        // Corrupt the broken one's cron AFTER the upsert.
-        db.with_conn(|c| {
+        // Corrupt the broken one's cron AFTER the upsert so the
+        // recompute step fails for that row only.
+        state.db.with_conn(|c| {
             c.execute(
                 "UPDATE config_routines SET schedule_cron = 'lol bad' WHERE id = ?1",
                 rusqlite::params![broken_id],
@@ -319,11 +317,49 @@ mod tests {
         })
         .unwrap();
 
-        // tick_once must NOT propagate the per-routine failure.
-        inner.tick_once().unwrap();
+        inner.tick_once().await.unwrap();
 
-        // Healthy advanced.
         let healthy = store.get(&healthy_id).unwrap().unwrap();
         assert!(healthy.next_run_at.unwrap() > now);
+    }
+
+    #[tokio::test]
+    async fn tick_once_marks_run_success_when_dispatch_lands() {
+        // Phase 11.C: with no inference backend wired (test_app_state
+        // has inference=None), dispatch_routine_turn falls back to
+        // the stub turn — which returns a successful echoed reply.
+        // The runner should record Success and capture the
+        // freshly-minted conversation_id in the run row.
+        let state = crate::routes::test_app_state();
+        let inner = Inner { state: state.clone() };
+        let store = RoutineStore::new(&state.db);
+        let now = Utc::now().timestamp();
+
+        let id = upsert_one(&store, "echo", "*/5 * * * *", now);
+        store
+            .record_run(&id, RoutineRunStatus::Success, now - 600, Some(now - 1))
+            .unwrap();
+
+        inner.tick_once().await.unwrap();
+
+        let runs = store.list_runs(&id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].status,
+            RoutineRunStatus::Success,
+            "stub-turn dispatch should produce a Success run, not Skipped",
+        );
+        assert!(
+            runs[0].conversation_id.is_some(),
+            "successful dispatch must record the conversation id it ran on",
+        );
+        assert!(
+            runs[0]
+                .conversation_id
+                .as_ref()
+                .unwrap()
+                .starts_with(&format!("routine-{id}-")),
+            "auto-minted conversation id should be prefix-tagged with routine id",
+        );
     }
 }
