@@ -8,7 +8,7 @@
 // section.
 
 import { useState, type ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { Link, NavLink } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import type { UiPanelSummary } from "../api/endpoints";
 import { setActiveThread, useChatState } from "./store";
@@ -69,8 +69,18 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
             </div>
 
             <nav className="execlaw-sidebar__nav">
-                <NavStub icon="bi-clock-history" label="Routines" />
-                <NavStub icon="bi-people" label="Contacts" />
+                <SidebarNavLink
+                    to="/settings/routines"
+                    icon="bi-clock-history"
+                    label="Routines"
+                    testId="sidebar-routines"
+                />
+                <SidebarNavLink
+                    to="/settings/contacts"
+                    icon="bi-person-lines-fill"
+                    label="Contacts"
+                    testId="sidebar-contacts"
+                />
                 <button
                     type="button"
                     className="execlaw-thread-item w-100"
@@ -215,15 +225,31 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
     );
 }
 
-function NavStub({ icon, label }: { icon: string; label: string }) {
+interface SidebarNavLinkProps {
+    to: string;
+    icon: string;
+    label: string;
+    testId?: string;
+}
+
+function SidebarNavLink({ to, icon, label, testId }: SidebarNavLinkProps) {
+    // NavLink applies the `is-active` className when its `to` matches
+    // the current URL — so the same class hooks we use for thread
+    // items light up for these top-level destinations too.
     return (
-        <div className="execlaw-thread-item" aria-disabled="true">
+        <NavLink
+            to={to}
+            className={({ isActive }) =>
+                "execlaw-thread-item" + (isActive ? " is-active" : "")
+            }
+            data-testid={testId}
+        >
             <i
                 className={`bi ${icon} execlaw-muted execlaw-thread-item__icon`}
                 aria-hidden
             />
             <span className="execlaw-thread-item__name">{label}</span>
-        </div>
+        </NavLink>
     );
 }
 

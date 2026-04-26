@@ -25,6 +25,7 @@ import { UserPage } from "./UserPage";
 import { ToolsPage } from "./ToolsPage";
 import { McpServersPage } from "./McpServersPage";
 import { RunnersPage } from "./RunnersPage";
+import { RoutinesPage } from "./RoutinesPage";
 
 const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     // User first — operator accounts, password, passkeys, sessions.
@@ -32,6 +33,10 @@ const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     // (other operators are listed inside it for Controllers). Was
     // briefly called "Login" but that read as the sign-in screen.
     { to: "/settings/user", icon: "bi-person-circle", label: "User" },
+    // Routines is a top-level destination from the chat sidebar but
+    // also lives here so it's discoverable from Settings. Placeholder
+    // page until the feature lands.
+    { to: "/settings/routines", icon: "bi-clock-history", label: "Routines" },
     { to: "/settings/plugins", icon: "bi-plug", label: "Plugins" },
     { to: "/settings/tools", icon: "bi-wrench-adjustable", label: "Tools" },
     { to: "/settings/mcp", icon: "bi-broadcast", label: "MCP" },
@@ -137,6 +142,7 @@ export function Settings() {
                             element={<Navigate to="user" replace />}
                         />
                         <Route path="user" element={<UserPage />} />
+                        <Route path="routines" element={<RoutinesPage />} />
                         <Route path="plugins" element={<PluginsPage />} />
                         <Route path="tools" element={<ToolsPage />} />
                         <Route path="mcp" element={<McpServersPage />} />
