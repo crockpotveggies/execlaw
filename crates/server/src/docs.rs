@@ -25,10 +25,14 @@ use crate::backends::{
     BackendListEntry, BackendListResponse, BackendView, UpsertBackendRequest,
 };
 use crate::alerts::{AlertCountResponse, AlertListResponse, AlertView};
+use crate::my_identities::{
+    AddIdentifierRequest, IdentifierView, MyIdentitiesResponse,
+};
 use crate::personality::{
     PersonalityListResponse, PersonalityPreviewResponse, PersonalityView,
     UpsertPersonalityRequest,
 };
+use crate::trust_policy::{TrustPolicyView, UpdateTrustPolicyRequest};
 use crate::runners_admin::{RunnerListResponse, RunnerView};
 use crate::mcp_admin::{
     McpServerListResponse, McpServerView, McpServerWriteRequest,
@@ -146,6 +150,13 @@ impl Modify for SecurityAddon {
         crate::alerts::count_handler,
         crate::alerts::ack_handler,
         crate::alerts::resolve_handler,
+        // trust policy (Phase 9.2 — operator-editable trust ladder rules, §2.6)
+        crate::trust_policy::get_handler,
+        crate::trust_policy::put_handler,
+        // my identities (Phase 9.3 — controller's per-transport handles, §7.1)
+        crate::my_identities::list_handler,
+        crate::my_identities::add_handler,
+        crate::my_identities::delete_handler,
     ),
     components(schemas(
         HealthResponse,
@@ -194,6 +205,11 @@ impl Modify for SecurityAddon {
         AlertView,
         AlertListResponse,
         AlertCountResponse,
+        TrustPolicyView,
+        UpdateTrustPolicyRequest,
+        IdentifierView,
+        MyIdentitiesResponse,
+        AddIdentifierRequest,
     )),
     tags(
         (name = "meta", description = "Liveness + introspection"),

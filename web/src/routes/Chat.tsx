@@ -254,6 +254,18 @@ export function Chat() {
                     }
                 }
                 break;
+            case "alert_fired":
+            case "alert_resolved":
+                // §10.8 live alert pipeline — a freshly fired or
+                // ack/resolved alert should bump the badge without
+                // waiting for the 60s poll. We don't trust the local
+                // count math (deduplication on the server side could
+                // make a "fired" event a no-op for an existing
+                // fingerprint), so re-query the canonical count.
+                getAlertCount(getToken)
+                    .then((r) => setAlertFiringCount(r.firing_count))
+                    .catch(() => {});
+                break;
             default:
                 // Ignore unknown event kinds — additive event vocabulary.
                 break;

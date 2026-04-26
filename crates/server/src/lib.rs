@@ -26,6 +26,7 @@ pub mod docs;
 pub mod events;
 pub mod mcp_admin;
 pub mod mcp_host;
+pub mod my_identities;
 pub mod observability;
 pub mod personality;
 pub mod plugins;
@@ -37,6 +38,7 @@ pub mod tool_dispatch;
 pub mod tool_sync;
 pub mod tools_admin;
 pub mod tracing_layer;
+pub mod trust_policy;
 pub mod users;
 pub mod webauthn;
 

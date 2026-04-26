@@ -39,6 +39,7 @@ pub mod refresh_tokens;
 pub mod research;
 pub mod tool_access;
 pub mod transport_conversations;
+pub mod trust_policy;
 pub mod transport_cursor;
 pub mod users;
 pub mod vault_row;

@@ -1270,6 +1270,87 @@ export async function resolveAlert(
     );
 }
 
+// ---- /api/admin/trust-policy (Phase 9.2 — §2.6) --------------------
+
+export type MinTrustHint = "Contact" | "Colleague" | "Organization";
+export type MixedTrustPolicy = "min_wins";
+
+export interface TrustPolicyView {
+    auto_trust_contacts: boolean;
+    min_trust_hint_for_auto_trust: MinTrustHint;
+    mixed_trust_policy: MixedTrustPolicy;
+    identity_plugin_order: string[];
+    /** Duration string, e.g. "7d", "12h". */
+    delegated_trust_default_ttl: string;
+}
+
+export async function getTrustPolicy(
+    tokenAccessor: () => string | null,
+): Promise<TrustPolicyView> {
+    return apiFetch<TrustPolicyView>(
+        "/api/admin/trust-policy",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function putTrustPolicy(
+    body: TrustPolicyView,
+    tokenAccessor: () => string | null,
+): Promise<TrustPolicyView> {
+    return apiFetch<TrustPolicyView>(
+        "/api/admin/trust-policy",
+        { method: "PUT", body },
+        tokenAccessor,
+    );
+}
+
+// ---- /api/admin/me/identifiers (Phase 9.3 — §7.1) ------------------
+
+export interface IdentifierView {
+    transport: string;
+    handle: string;
+}
+
+export interface MyIdentitiesResponse {
+    controller_principal_id: string;
+    identifiers: IdentifierView[];
+}
+
+export async function listMyIdentifiers(
+    tokenAccessor: () => string | null,
+): Promise<MyIdentitiesResponse> {
+    return apiFetch<MyIdentitiesResponse>(
+        "/api/admin/me/identifiers",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function addMyIdentifier(
+    transport: string,
+    handle: string,
+    tokenAccessor: () => string | null,
+): Promise<MyIdentitiesResponse> {
+    return apiFetch<MyIdentitiesResponse>(
+        "/api/admin/me/identifiers",
+        { method: "POST", body: { transport, handle } },
+        tokenAccessor,
+    );
+}
+
+export async function deleteMyIdentifier(
+    transport: string,
+    handle: string,
+    tokenAccessor: () => string | null,
+): Promise<MyIdentitiesResponse> {
+    return apiFetch<MyIdentitiesResponse>(
+        `/api/admin/me/identifiers/${encodeURIComponent(transport)}/${encodeURIComponent(handle)}`,
+        { method: "DELETE" },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/logout ---------------------------------------------------
 
 export async function postLogout(refreshToken: string | null): Promise<void> {

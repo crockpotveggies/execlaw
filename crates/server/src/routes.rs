@@ -250,6 +250,42 @@ fn write_controller_principal(db: &Database, principal_id: &str) -> Result<(), A
     .map_err(Into::into)
 }
 
+/// Read the controller principal id from the vault. Returns 500 if
+/// missing — the row is written by `/api/setup` so any authenticated
+/// caller is post-setup; absence is a corrupt-DB indicator.
+pub fn controller_principal_id(db: &Database) -> Result<execlaw_core::PrincipalId, ApiError> {
+    let bytes: Option<Vec<u8>> = db
+        .with_conn(|c| {
+            let got = c
+                .query_row(
+                    "SELECT value_blob FROM vault_secrets \
+                     WHERE name = ?1 AND plugin_id IS NULL",
+                    params![CONTROLLER_PRINCIPAL_KEY],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )
+                .ok();
+            Ok(got)
+        })
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "db_error",
+            message: e.to_string(),
+        })?;
+    let Some(bytes) = bytes else {
+        return Err(ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "controller_missing",
+            message: "controller principal id is not set; was /api/setup ever run?".into(),
+        });
+    };
+    let s = String::from_utf8(bytes).map_err(|_| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "controller_corrupt",
+        message: "controller principal id is not utf-8".into(),
+    })?;
+    Ok(execlaw_core::PrincipalId::from(s))
+}
+
 // -----------------------------------------------------------------------
 // Handlers
 // -----------------------------------------------------------------------
@@ -633,6 +669,8 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::observability::observability_router())
         .merge(crate::backends::backends_router())
         .merge(crate::alerts::alerts_router())
+        .merge(crate::trust_policy::trust_policy_router())
+        .merge(crate::my_identities::my_identities_router())
         .merge(crate::personality::personality_router())
         .merge(crate::runners_admin::runners_admin_router())
         .merge(crate::users::users_router())

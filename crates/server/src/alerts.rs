@@ -19,6 +19,7 @@
 //!   * `POST /api/admin/alerts/{id}/resolve` (Controller-only)
 
 use crate::auth_extract::AuthedUser;
+use crate::events::UiEvent;
 use crate::routes::ApiError;
 use crate::state::AppState;
 use axum::extract::{Path as AxumPath, Query, State};
@@ -197,6 +198,12 @@ pub async fn ack_handler(
     }
     let now = chrono::Utc::now().timestamp();
     store.ack(&alert_id, &user.user_id, now).map_err(db_err)?;
+    // §10.8: push so the badge updates without waiting for the next
+    // poll. Acked counts as "no longer firing" from the badge's
+    // perspective; the SPA decrements on this event.
+    state.events.publish(UiEvent::AlertResolved {
+        alert_id: alert_id.as_str().to_owned(),
+    });
     Ok(StatusCode::OK)
 }
 
@@ -231,6 +238,9 @@ pub async fn resolve_handler(
     store
         .resolve(&alert_id, &user.user_id, now)
         .map_err(db_err)?;
+    state.events.publish(UiEvent::AlertResolved {
+        alert_id: alert_id.as_str().to_owned(),
+    });
     Ok(StatusCode::OK)
 }
 
@@ -439,6 +449,48 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ack_publishes_alert_resolved_event() {
+        // §10.8: ack/resolve must push an `alert_resolved` event so the
+        // SPA can drop the badge live without waiting for the 60s poll.
+        let state = test_app_state();
+        let mut rx = state.events.subscribe();
+        let app = build_router(state.clone());
+        let tok = setup_controller_token(&app).await;
+        let id = mk_alert(&state, "fp-ws");
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/admin/alerts/{}/ack", id.as_str()))
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Drain events until we see AlertResolved (the bus may emit
+        // unrelated test events first; we only require ours appears).
+        let mut found = false;
+        for _ in 0..16 {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                rx.recv(),
+            )
+            .await
+            {
+                Ok(Ok(crate::events::UiEvent::AlertResolved { alert_id })) => {
+                    if alert_id == id.as_str() {
+                        found = true;
+                        break;
+                    }
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(found, "ack should publish AlertResolved");
     }
 
     #[tokio::test]

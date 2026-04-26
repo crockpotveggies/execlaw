@@ -28,6 +28,9 @@ import { RunnersPage } from "./RunnersPage";
 import { RoutinesPage } from "./RoutinesPage";
 import { PersonalityPage } from "./PersonalityPage";
 import { AlertsPage } from "./AlertsPage";
+import { SkillsPage } from "./SkillsPage";
+import { TrustPolicyPage } from "./TrustPolicyPage";
+import { MyIdentitiesPage } from "./MyIdentitiesPage";
 
 const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     // User first — operator accounts, password, passkeys, sessions.
@@ -43,12 +46,20 @@ const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
         icon: "bi-chat-square-quote",
         label: "Personality",
     },
+    {
+        to: "/settings/my-identities",
+        icon: "bi-person-badge",
+        label: "My identities",
+    },
     // Routines is a top-level destination from the chat sidebar but
     // also lives here so it's discoverable from Settings. Placeholder
     // page until the feature lands.
     { to: "/settings/routines", icon: "bi-clock-history", label: "Routines" },
     { to: "/settings/plugins", icon: "bi-plug", label: "Plugins" },
     { to: "/settings/tools", icon: "bi-wrench-adjustable", label: "Tools" },
+    // Skills is a derived "what can my agent do" view of the tools
+    // registry, grouped by source (Built-in / Plugin / MCP).
+    { to: "/settings/skills", icon: "bi-stars", label: "Skills" },
     { to: "/settings/mcp", icon: "bi-broadcast", label: "MCP" },
     // Hardware now lives at the bottom of the Backends page.
     { to: "/settings/backends", icon: "bi-cpu-fill", label: "Backends" },
@@ -57,6 +68,7 @@ const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     // "everything else" view (controllers, delegated bots, blocked).
     { to: "/settings/contacts", icon: "bi-person-lines-fill", label: "Contacts" },
     { to: "/settings/principals", icon: "bi-people", label: "Principals" },
+    { to: "/settings/trust-policy", icon: "bi-shield-lock", label: "Trust policy" },
     { to: "/settings/alerts", icon: "bi-bell", label: "Alerts" },
     { to: "/settings/logs", icon: "bi-list-columns", label: "Logs" },
     { to: "/settings/eval", icon: "bi-bar-chart", label: "Eval flags" },
@@ -154,14 +166,17 @@ export function Settings() {
                         />
                         <Route path="user" element={<UserPage />} />
                         <Route path="personality" element={<PersonalityPage />} />
+                        <Route path="my-identities" element={<MyIdentitiesPage />} />
                         <Route path="routines" element={<RoutinesPage />} />
                         <Route path="plugins" element={<PluginsPage />} />
                         <Route path="tools" element={<ToolsPage />} />
+                        <Route path="skills" element={<SkillsPage />} />
                         <Route path="mcp" element={<McpServersPage />} />
                         <Route path="backends" element={<BackendsPage />} />
                         <Route path="runners" element={<RunnersPage />} />
                         <Route path="contacts" element={<ContactsPage />} />
                         <Route path="principals" element={<PrincipalsPage />} />
+                        <Route path="trust-policy" element={<TrustPolicyPage />} />
                         <Route path="alerts" element={<AlertsPage />} />
                         <Route path="logs" element={<LogsPage />} />
                         <Route path="eval" element={<EvalFlagsPage />} />
