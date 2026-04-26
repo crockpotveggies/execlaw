@@ -26,6 +26,7 @@ pub mod events;
 pub mod mcp_admin;
 pub mod mcp_host;
 pub mod observability;
+pub mod personality;
 pub mod plugins;
 pub mod routes;
 pub mod runner_registry;

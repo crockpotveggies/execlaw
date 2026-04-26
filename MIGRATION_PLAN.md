@@ -1311,6 +1311,107 @@ On nvidia-only hosts, everything runs on nvidia (Kokoro via ONNX+CUDA, Whisper v
 
 **Runtime behavior.** When a conversation's turn starts, the core looks up the default deployment for the runner purpose implied by modality + trust class, fetches the corresponding endpoint from the container manager, and hands the `runner-local` crate an `InferenceClient` pointed at that endpoint. `runner-local` is model- and vendor-agnostic — it speaks OpenAI-compatible API regardless of what's on the other end.
 
+### 5.5 Personality & system-prompt composition
+
+The operator's voice for the agent — name, tone, custom instructions, persona, voice ID — lives in `config_personality`. This is the *user-editable* half of the agent's system prompt. The other half (trust-class rules, tool-allowlist boilerplate, refusal behaviour) is built-in and not operator-tweakable; see §2.3.
+
+selfhosted-claw split this into a "Personality" admin page with ~9 editable fields scoped at three levels (global / main / per-group). execlaw inherits the same field set and a simplified two-level scope:
+
+- **`default`** scope — exactly one row, always present. The fallback for every conversation.
+- **`conversation`** scope — sparse, keyed by `conversation_id`. Optional per-conversation overrides; absent rows fall back to `default`.
+
+A third level (per-transport-group) is available later by extending the `scope_kind` enum without a schema change; v1 ships with the two scopes above.
+
+#### 5.5.1 Schema (`config_personality`)
+
+```rust
+struct PersonalityRow {
+    scope_kind: PersonalityScopeKind,   // "default" | "conversation"
+    scope_ref: String,                  // "" for default; conversation_id for conversation
+    display_name: String,               // "Earl" — what the agent calls itself
+    role: String,                       // "Personal assistant" / "Research analyst"
+    tone: String,                       // "Concise, practical"
+    communication_style: String,        // formatting rules ("single-sentence replies, no markdown")
+    initiative: String,                 // proactivity bounds ("ask before scheduling")
+    about_agent: String,                // persona / backstory in the agent's voice
+    about_controller: String,           // facts the agent knows about you (operator-curated)
+    custom_instructions: String,        // freeform multi-paragraph directives — biggest field
+    voice_id: Option<String>,           // pin TTS voice for this scope (default `bf_emma`)
+    version: i64,                       // monotonic; bumped on every save so audit can trace prompt drift
+    created_at: i64,
+    updated_at: i64,
+}
+```
+
+Composite PK is `(scope_kind, scope_ref)`. The default row is seeded by migration 0013 with conservative built-in defaults (e.g. `display_name = "execlaw"`, empty free-form fields) so first-run conversations have a deterministic prompt before the operator edits anything.
+
+CHECK constraints: `scope_kind ∈ {'default','conversation'}`; if `scope_kind = 'default'` then `scope_ref = ''`.
+
+#### 5.5.2 Composition algorithm
+
+```
+compose_system_prompt(conversation_id) -> String:
+    base   = load(scope_kind=default,      scope_ref="")          # always present
+    over   = load(scope_kind=conversation, scope_ref=conversation_id)   # may be None
+    fields = field_by_field_merge(base, over)   # most-specific scope wins per field
+    return render_markdown(fields)
+```
+
+**Field-by-field merge, not row-replacement.** A conversation override that only sets `tone` inherits every other field from `default`. An override is a sparse patch, not a complete replacement.
+
+**Empty string ≠ unset for overrides.** A conversation row whose `tone = ""` deliberately blanks the tone for that conversation; only fields the SPA explicitly sends are stored. The store distinguishes "not in override" (use base) from "blank in override" (force blank).
+
+**Render order** in the produced markdown:
+
+1. `# Identity` — display_name, role
+2. `# Tone` — tone
+3. `# Communication style` — communication_style
+4. `# Initiative` — initiative
+5. `# About me (the agent)` — about_agent
+6. `# About you (the controller)` — about_controller
+7. `# Additional instructions` — custom_instructions
+
+Empty sections are omitted entirely so the prompt stays small for fresh installs. The renderer is in `crates/core/src/personality.rs::compose_system_prompt`; `runner-local` calls it once per turn with the conversation id.
+
+#### 5.5.3 Memory layer interaction (§2.5)
+
+`about_controller` is the **operator-curated** facts surface. The agent-learned `controller_facts` memory layer (§2.5) is appended *after* `about_controller` in the rendered prompt, never overwritten. This keeps the operator's hand-edited canonical truth above the agent's probabilistic recollections — the agent sees the operator's note first, then its own running notes.
+
+If the two ever conflict, the operator's edit wins by virtue of source ordering; the agent is instructed (in its built-in system prompt half) to defer to the `# About you` section over its own memory layer when in doubt.
+
+#### 5.5.4 Voice tie-in
+
+`voice_id` pins the TTS voice for that scope. Default is `bf_emma` (locked decision 2026-04-23). The voice-pipeline runner reads this through the same composer and passes it to the `service-kokoro` backend on each TTS request. Per-conversation override lets the operator pick `am_michael` for a male-voice scope without changing the global default.
+
+#### 5.5.5 Versioning + audit
+
+Every save bumps `version` and writes a `config_audit` row with old/new JSON. The audit page already shows `config_*` table changes, so personality drift is visible without extra UI. The version number is exposed in the prompt as a discreet trailing comment (e.g. `<!-- personality v=42 -->`) so a turn's events can be correlated with a specific personality version when debugging "why did the agent suddenly start replying in haiku."
+
+#### 5.5.6 Migration from selfhosted-claw
+
+| selfhosted-claw `PersonalityProfile` | execlaw `PersonalityRow` | Notes |
+|---|---|---|
+| `displayName` | `display_name` | Direct |
+| `role` | `role` | Direct |
+| `tone` | `tone` | Direct |
+| `communicationStyle` | `communication_style` | Snake-case rename |
+| `initiative` | `initiative` | Direct |
+| `aboutAgent` | `about_agent` | Direct |
+| `aboutController` | `about_controller` | Direct; semantic merge with `controller_facts` memory layer documented above |
+| `customInstructions` | `custom_instructions` | Direct |
+| `updatedAt` | `updated_at` (+ new `version`) | Existing audit infra obviates the explicit field |
+
+Operators migrating from selfhosted-claw paste their existing `personality.json` content field-by-field into the SPA. There is no automatic JSON import in v1 — the field set is small enough that copy/paste is faster than maintaining an importer for a single one-time event.
+
+#### 5.5.7 What's NOT in personality
+
+- **Trust-class rules** — system-managed, never operator-editable here; configured in §2.9 trust-class capabilities.
+- **Tool allowlists** — managed in `config_tool_access` (Settings → Tools).
+- **Plugin settings** — `plugin_settings` table, scoped per plugin.
+- **Schedules / routines** — separate `config_routines` table when that feature ships (§5.7).
+
+The personality table is *only* the natural-language voice. Anything that needs typed validation goes elsewhere.
+
 ---
 
 ## 6. Configuration & Secrets (No `.env`, SQLite-Backed)

@@ -33,6 +33,7 @@ pub mod mcp_servers;
 pub mod memory;
 pub mod migrations;
 pub mod outbox;
+pub mod personality;
 pub mod principal;
 pub mod refresh_tokens;
 pub mod research;

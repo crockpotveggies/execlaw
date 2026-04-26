@@ -24,6 +24,10 @@ use crate::approvals::{
 use crate::backends::{
     BackendListEntry, BackendListResponse, BackendView, UpsertBackendRequest,
 };
+use crate::personality::{
+    PersonalityListResponse, PersonalityPreviewResponse, PersonalityView,
+    UpsertPersonalityRequest,
+};
 use crate::runners_admin::{RunnerListResponse, RunnerView};
 use crate::mcp_admin::{
     McpServerListResponse, McpServerView, McpServerWriteRequest,
@@ -128,6 +132,14 @@ impl Modify for SecurityAddon {
         crate::mcp_admin::create_handler,
         crate::mcp_admin::update_handler,
         crate::mcp_admin::delete_handler,
+        // personality (Phase 9 — system-prompt fields, §5.5)
+        crate::personality::list_handler,
+        crate::personality::get_default_handler,
+        crate::personality::upsert_default_handler,
+        crate::personality::get_conversation_handler,
+        crate::personality::upsert_conversation_handler,
+        crate::personality::delete_conversation_handler,
+        crate::personality::preview_handler,
     ),
     components(schemas(
         HealthResponse,
@@ -169,6 +181,10 @@ impl Modify for SecurityAddon {
         McpServerView,
         McpServerListResponse,
         McpServerWriteRequest,
+        PersonalityView,
+        PersonalityListResponse,
+        PersonalityPreviewResponse,
+        UpsertPersonalityRequest,
     )),
     tags(
         (name = "meta", description = "Liveness + introspection"),

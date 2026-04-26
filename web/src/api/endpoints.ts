@@ -1045,6 +1045,143 @@ export async function respondApproval(
     );
 }
 
+// ---- /api/admin/personality (Phase 9 — §5.5) -----------------------
+
+/**
+ * Field names that the operator can override at any scope. Mirrors
+ * `PersonalityField` on the Rust side. The SPA uses these strings
+ * verbatim in the `override_fields` array on PUT requests.
+ */
+export const PERSONALITY_FIELDS = [
+    "display_name",
+    "role",
+    "tone",
+    "communication_style",
+    "initiative",
+    "about_agent",
+    "about_controller",
+    "custom_instructions",
+    "voice_id",
+] as const;
+export type PersonalityField = (typeof PERSONALITY_FIELDS)[number];
+
+export type PersonalityScopeKind = "default" | "conversation";
+
+export interface PersonalityView {
+    scope_kind: PersonalityScopeKind;
+    /** "" for default scope; conversation_id for conversation overrides. */
+    scope_ref: string;
+    display_name: string;
+    role: string;
+    tone: string;
+    communication_style: string;
+    initiative: string;
+    about_agent: string;
+    about_controller: string;
+    custom_instructions: string;
+    voice_id: string | null;
+    /** Field names the operator explicitly set at this scope. */
+    override_fields: PersonalityField[];
+    version: number;
+    created_at: number;
+    updated_at: number;
+}
+
+export interface PersonalityListResponse {
+    default: PersonalityView;
+    overrides: PersonalityView[];
+}
+
+export interface PersonalityPreviewResponse {
+    conversation_id: string;
+    system_prompt: string;
+}
+
+export interface UpsertPersonalityBody {
+    display_name?: string;
+    role?: string;
+    tone?: string;
+    communication_style?: string;
+    initiative?: string;
+    about_agent?: string;
+    about_controller?: string;
+    custom_instructions?: string;
+    voice_id?: string | null;
+    /**
+     * Conversation-scope only. List of fields this scope explicitly
+     * overrides; absent fields fall through to default. Ignored for
+     * default-scope upserts (every field is implicitly overridden at
+     * the default level).
+     */
+    override_fields?: PersonalityField[];
+}
+
+export async function listPersonality(
+    tokenAccessor: () => string | null,
+): Promise<PersonalityListResponse> {
+    return apiFetch<PersonalityListResponse>(
+        "/api/admin/personality",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function upsertPersonalityDefault(
+    body: UpsertPersonalityBody,
+    tokenAccessor: () => string | null,
+): Promise<PersonalityView> {
+    return apiFetch<PersonalityView>(
+        "/api/admin/personality/default",
+        { method: "PUT", body },
+        tokenAccessor,
+    );
+}
+
+export async function getPersonalityConversation(
+    conversationId: string,
+    tokenAccessor: () => string | null,
+): Promise<PersonalityView> {
+    return apiFetch<PersonalityView>(
+        `/api/admin/personality/conversation/${encodeURIComponent(conversationId)}`,
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function upsertPersonalityConversation(
+    conversationId: string,
+    body: UpsertPersonalityBody,
+    tokenAccessor: () => string | null,
+): Promise<PersonalityView> {
+    return apiFetch<PersonalityView>(
+        `/api/admin/personality/conversation/${encodeURIComponent(conversationId)}`,
+        { method: "PUT", body },
+        tokenAccessor,
+    );
+}
+
+export async function deletePersonalityConversation(
+    conversationId: string,
+    tokenAccessor: () => string | null,
+): Promise<void> {
+    await apiFetch<unknown>(
+        `/api/admin/personality/conversation/${encodeURIComponent(conversationId)}`,
+        { method: "DELETE" },
+        tokenAccessor,
+    );
+}
+
+export async function previewPersonality(
+    conversationId: string | null,
+    tokenAccessor: () => string | null,
+): Promise<PersonalityPreviewResponse> {
+    const path =
+        conversationId && conversationId.length > 0
+            ? `/api/admin/personality/preview?conversation_id=${encodeURIComponent(conversationId)}`
+            : "/api/admin/personality/preview";
+    return apiFetch<PersonalityPreviewResponse>(path, {}, tokenAccessor);
+}
+
 // ---- /api/logout ---------------------------------------------------
 
 export async function postLogout(refreshToken: string | null): Promise<void> {

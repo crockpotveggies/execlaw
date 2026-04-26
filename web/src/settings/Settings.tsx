@@ -26,6 +26,7 @@ import { ToolsPage } from "./ToolsPage";
 import { McpServersPage } from "./McpServersPage";
 import { RunnersPage } from "./RunnersPage";
 import { RoutinesPage } from "./RoutinesPage";
+import { PersonalityPage } from "./PersonalityPage";
 
 const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     // User first — operator accounts, password, passkeys, sessions.
@@ -33,6 +34,14 @@ const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     // (other operators are listed inside it for Controllers). Was
     // briefly called "Login" but that read as the sign-in screen.
     { to: "/settings/user", icon: "bi-person-circle", label: "User" },
+    // Personality — operator-editable half of the system prompt
+    // (Phase 9, MIGRATION_PLAN §5.5). Distinct from User because it's
+    // about the AGENT's voice, not the operator's account.
+    {
+        to: "/settings/personality",
+        icon: "bi-chat-square-quote",
+        label: "Personality",
+    },
     // Routines is a top-level destination from the chat sidebar but
     // also lives here so it's discoverable from Settings. Placeholder
     // page until the feature lands.
@@ -142,6 +151,7 @@ export function Settings() {
                             element={<Navigate to="user" replace />}
                         />
                         <Route path="user" element={<UserPage />} />
+                        <Route path="personality" element={<PersonalityPage />} />
                         <Route path="routines" element={<RoutinesPage />} />
                         <Route path="plugins" element={<PluginsPage />} />
                         <Route path="tools" element={<ToolsPage />} />
