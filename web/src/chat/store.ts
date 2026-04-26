@@ -17,8 +17,15 @@ import type {
 interface ThreadView extends ThreadSummary {
     /** Local-only flag: agent has replied since the user last opened this thread. */
     has_unread: boolean;
-    /** Local-only flag: agent is currently producing a reply on this thread. */
-    is_thinking: boolean;
+    /**
+     * Local-only flag: agent is hot-path-busy on this thread —
+     * driven by the server's `ConversationPhaseChanged` event when
+     * the phase enters `Thinking` / `AwaitingTool` (i.e. the
+     * `is_processing()` set on the Rust side). Surfaced as the
+     * sidebar's typing-spinner and as the typing-indicator hook
+     * that transports use to drive Signal/email "is typing" UX.
+     */
+    is_processing: boolean;
 }
 
 export interface ChatState {
@@ -86,11 +93,11 @@ export function useChatState<T>(selector: (s: ChatState) => T): T {
  */
 export function setThreads(next: ThreadSummary[]) {
     setState((prev) => {
-        const localFlags = new Map<string, { has_unread: boolean; is_thinking: boolean }>();
+        const localFlags = new Map<string, { has_unread: boolean; is_processing: boolean }>();
         for (const t of prev.threads) {
             localFlags.set(t.conversation_id, {
                 has_unread: t.has_unread,
-                is_thinking: t.is_thinking,
+                is_processing: t.is_processing,
             });
         }
         return {
@@ -100,7 +107,7 @@ export function setThreads(next: ThreadSummary[]) {
                 return {
                     ...t,
                     has_unread: flags?.has_unread ?? false,
-                    is_thinking: flags?.is_thinking ?? false,
+                    is_processing: flags?.is_processing ?? false,
                 };
             }),
         };
@@ -151,10 +158,32 @@ export function appendStreamingToken(conversationId: string, token: string) {
             },
             threads: prev.threads.map((t) =>
                 t.conversation_id === conversationId
-                    ? { ...t, is_thinking: true }
+                    ? { ...t, is_processing: true }
                     : t,
             ),
         };
+    });
+}
+
+/**
+ * Set the `is_processing` flag on a thread directly. Driven by the
+ * server's `ConversationPhaseChanged` WS event so the indicator
+ * works cross-tab and for inbound transport messages that this tab
+ * never originated. Idempotent.
+ */
+export function setThreadProcessing(
+    conversationId: string,
+    processing: boolean,
+) {
+    setState((prev) => {
+        let changed = false;
+        const threads = prev.threads.map((t) => {
+            if (t.conversation_id !== conversationId) return t;
+            if (t.is_processing === processing) return t;
+            changed = true;
+            return { ...t, is_processing: processing };
+        });
+        return changed ? { ...prev, threads } : prev;
     });
 }
 
@@ -168,7 +197,7 @@ export function clearStreamingBuffer(conversationId: string) {
             streamingBuffer: rest,
             threads: prev.threads.map((t) =>
                 t.conversation_id === conversationId
-                    ? { ...t, is_thinking: false }
+                    ? { ...t, is_processing: false }
                     : t,
             ),
         };

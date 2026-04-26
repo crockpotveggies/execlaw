@@ -140,6 +140,24 @@ impl Phase {
             _ => None,
         }
     }
+
+    /// True iff the agent is hot-path-busy on this conversation —
+    /// i.e. the recipient should see a "typing" / "processing"
+    /// indicator. The set is the union of phases where the server
+    /// is actively producing toward a reply: `Thinking` (LLM running)
+    /// and `AwaitingTool` (tool call in progress, still on the hot
+    /// path between inbound message and outbound reply).
+    ///
+    /// Phases that wait on a human (`AwaitingApproval`,
+    /// `AwaitingTrustDecision`) or a clock (`AwaitingWakeup`,
+    /// `AwaitingReconnect`) explicitly do NOT count as processing —
+    /// the recipient shouldn't see typing dots while the controller
+    /// is pondering. Terminal `TrustRevoked` and the idle baseline
+    /// also return false. See MIGRATION_PLAN §5.6 / agent-processing
+    /// awareness notes.
+    pub fn is_processing(&self) -> bool {
+        matches!(self, Phase::Thinking | Phase::AwaitingTool)
+    }
 }
 
 /// Modality (§2.13).
@@ -442,6 +460,47 @@ mod tests {
     use super::*;
     use crate::db::{Database, DbConfig};
     use crate::migrations::MigrationRunner;
+
+    #[test]
+    fn is_processing_covers_thinking_and_awaiting_tool_only() {
+        // The set is intentionally narrow: human-wait and clock-wait
+        // phases do NOT count as processing — the recipient shouldn't
+        // see typing dots while the controller is pondering.
+        for p in [Phase::Thinking, Phase::AwaitingTool] {
+            assert!(p.is_processing(), "{} must count as processing", p.as_str());
+        }
+        for p in [
+            Phase::Idle,
+            Phase::AwaitingApproval,
+            Phase::AwaitingWakeup,
+            Phase::AwaitingReconnect,
+            Phase::AwaitingTrustDecision,
+            Phase::TrustRevoked,
+        ] {
+            assert!(
+                !p.is_processing(),
+                "{} must NOT count as processing",
+                p.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn phase_round_trips_through_serialized_form() {
+        for p in [
+            Phase::Idle,
+            Phase::Thinking,
+            Phase::AwaitingTool,
+            Phase::AwaitingApproval,
+            Phase::AwaitingWakeup,
+            Phase::AwaitingReconnect,
+            Phase::AwaitingTrustDecision,
+            Phase::TrustRevoked,
+        ] {
+            assert_eq!(Phase::parse(p.as_str()), Some(p));
+        }
+        assert_eq!(Phase::parse("nope"), None);
+    }
 
     fn fresh_db() -> Database {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();

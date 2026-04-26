@@ -227,6 +227,22 @@ pub async fn send_message(
     // later refinement; stripping tools is the load-bearing invariant.
     let use_tool_path = has_plugin_tools && !policy.planner_executor;
 
+    // Phase 10.1 — agent-processing awareness. Publish a phase
+    // transition so subscribers (SPA tabs, transport plugins) can
+    // surface a typing/processing indicator. The is_processing()
+    // helper on Phase classifies Thinking + AwaitingTool as the
+    // hot-path-busy set; we enter it here, after every early-return
+    // (validation, trust-resolution, cold-contact, rule-of-two) has
+    // passed, and leave it in the success path right after the
+    // turn commits. Cold-contact / Blocked / require-approval
+    // branches above don't publish Thinking — those land in
+    // AwaitingTrustDecision or AwaitingApproval, which deliberately
+    // don't count as processing.
+    state.events.publish(UiEvent::ConversationPhaseChanged {
+        conversation_id: cid.as_str().to_owned(),
+        phase: Phase::Thinking.as_str().to_owned(),
+    });
+
     // Phase 8.5 runner-registry hookup: every turn entering this code
     // path gets a corresponding `register_turn_start`. The Settings →
     // Runners page reads from this. Controller-trust callers get the
@@ -292,6 +308,15 @@ pub async fn send_message(
     // `in_flight = true` until the next turn or restart, which gives
     // the operator visibility into stuck runners).
     state.runner_registry.register_turn_end(cid.as_str());
+
+    // Phase 10.1 — leave the processing window. Published BEFORE
+    // ChatMessageOutbound below so subscribers see "agent stopped
+    // typing" before "agent's reply arrived", matching how a human
+    // chat partner behaves (typing dots stop a beat, then text).
+    state.events.publish(UiEvent::ConversationPhaseChanged {
+        conversation_id: cid.as_str().to_owned(),
+        phase: Phase::Idle.as_str().to_owned(),
+    });
 
     // Step 4 — broadcast both user and assistant events on the bus
     // AFTER the commit lands, so subscribers never see an outbound
@@ -1275,13 +1300,18 @@ mod tests {
         let app = crate::routes::build_router(state);
         let _ = send(app, "hi").await;
 
-        // Expect at least one inbound + one outbound.
+        // Expect at least one inbound + one outbound. Phase 10.1
+        // adds ConversationPhaseChanged to the same channel, so the
+        // loop has to skip those instead of hard-breaking on any
+        // unmatched variant — otherwise the typing-indicator events
+        // mask the inbound/outbound asserts.
         let mut saw_inbound = false;
         let mut saw_outbound = false;
-        for _ in 0..5 {
+        for _ in 0..10 {
             match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
                 Ok(Ok(UiEvent::ChatMessageInbound { .. })) => saw_inbound = true,
                 Ok(Ok(UiEvent::ChatMessageOutbound { .. })) => saw_outbound = true,
+                Ok(Ok(_)) => continue, // ignore ConversationPhaseChanged + other variants
                 _ => break,
             }
             if saw_inbound && saw_outbound {
@@ -1290,6 +1320,54 @@ mod tests {
         }
         assert!(saw_inbound, "expected ChatMessageInbound");
         assert!(saw_outbound, "expected ChatMessageOutbound");
+    }
+
+    #[tokio::test]
+    async fn send_message_publishes_processing_phase_lifecycle() {
+        // Phase 10.1: a successful send should produce
+        // ConversationPhaseChanged{phase=thinking} BEFORE
+        // ChatMessageOutbound, and ConversationPhaseChanged{phase=idle}
+        // BEFORE ChatMessageOutbound too — so subscribers that drive
+        // a typing indicator (SPA, transport plugins) get the
+        // "agent stopped typing" beat right before the reply lands.
+        let state = test_app_state();
+        let mut rx = state.events.subscribe();
+        let app = crate::routes::build_router(state);
+        let _ = send(app, "hi").await;
+
+        let mut saw_thinking = false;
+        let mut saw_idle = false;
+        let mut saw_outbound = false;
+        let mut idle_before_outbound = false;
+        for _ in 0..16 {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(UiEvent::ConversationPhaseChanged { phase, .. })) => {
+                    if phase == "thinking" {
+                        saw_thinking = true;
+                    } else if phase == "idle" {
+                        saw_idle = true;
+                    }
+                }
+                Ok(Ok(UiEvent::ChatMessageOutbound { .. })) => {
+                    saw_outbound = true;
+                    // Idle must already have arrived by the time we
+                    // observe the outbound message.
+                    idle_before_outbound = saw_idle;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+            if saw_thinking && saw_idle && saw_outbound {
+                break;
+            }
+        }
+        assert!(saw_thinking, "expected phase=thinking");
+        assert!(saw_idle, "expected phase=idle");
+        assert!(saw_outbound, "expected ChatMessageOutbound");
+        assert!(
+            idle_before_outbound,
+            "phase=idle must precede ChatMessageOutbound so transports stop the typing indicator before sending the reply"
+        );
     }
 
     /// Stub-path committed rows must be HMAC-signed (the test AppState

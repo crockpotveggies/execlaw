@@ -41,6 +41,7 @@ import {
     setAlertFiringCount,
     setMessages,
     setPendingApprovals,
+    setThreadProcessing,
     setThreads,
     useChatState,
 } from "../chat/store";
@@ -265,6 +266,23 @@ export function Chat() {
                 getAlertCount(getToken)
                     .then((r) => setAlertFiringCount(r.firing_count))
                     .catch(() => {});
+                break;
+            case "conversation_phase_changed":
+                // Phase 10.1: server's authoritative typing /
+                // processing indicator. The processing set is
+                // {Thinking, AwaitingTool} — those are the only two
+                // serialized phase strings we treat as "agent busy."
+                // Anything else (idle / awaiting_*, trust_revoked)
+                // clears the indicator. Mirrors `Phase::is_processing`
+                // on the Rust side so the SPA flag is cross-tab and
+                // covers inbound transport messages this tab never
+                // originated.
+                if (cid && typeof ev.phase === "string") {
+                    const processing =
+                        ev.phase === "thinking" ||
+                        ev.phase === "awaiting_tool";
+                    setThreadProcessing(cid, processing);
+                }
                 break;
             default:
                 // Ignore unknown event kinds — additive event vocabulary.

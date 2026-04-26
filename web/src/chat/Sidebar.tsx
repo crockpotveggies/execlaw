@@ -207,7 +207,7 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                                 data-thread-id={t.conversation_id}
                             >
                                 <ThreadStatusIcon
-                                    isThinking={t.is_thinking}
+                                    isProcessing={t.is_processing}
                                     isUnread={t.has_unread}
                                     isPinned={t.is_pinned}
                                 />
@@ -294,13 +294,13 @@ function SidebarNavLink({ to, icon, label, testId, badge }: SidebarNavLinkProps)
 }
 
 interface IconProps {
-    isThinking: boolean;
+    isProcessing: boolean;
     isUnread: boolean;
     isPinned: boolean;
 }
 
-function ThreadStatusIcon({ isThinking, isUnread, isPinned }: IconProps): ReactNode {
-    if (isThinking) {
+function ThreadStatusIcon({ isProcessing, isUnread, isPinned }: IconProps): ReactNode {
+    if (isProcessing) {
         return (
             <span
                 className="execlaw-thread-item__icon"

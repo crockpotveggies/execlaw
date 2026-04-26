@@ -8,6 +8,7 @@ import {
     markUnread,
     setActiveThread,
     setMessages,
+    setThreadProcessing,
     setThreads,
 } from "../chat/store";
 import type { MessageView, ThreadSummary } from "../api/endpoints";
@@ -93,25 +94,54 @@ describe("chat store", () => {
         expect(getChatState().messages.conv.map((m) => m.seq)).toEqual([10]);
     });
 
-    it("appendStreamingToken concatenates and toggles is_thinking", () => {
+    it("appendStreamingToken concatenates and toggles is_processing", () => {
         setThreads([T("conv")]);
         appendStreamingToken("conv", "Hel");
         appendStreamingToken("conv", "lo");
         expect(getChatState().streamingBuffer.conv).toBe("Hello");
         expect(
             getChatState().threads.find((t) => t.conversation_id === "conv")!
-                .is_thinking,
+                .is_processing,
         ).toBe(true);
     });
 
-    it("clearStreamingBuffer drops the buffer and resets is_thinking", () => {
+    it("clearStreamingBuffer drops the buffer and resets is_processing", () => {
         setThreads([T("conv")]);
         appendStreamingToken("conv", "abc");
         clearStreamingBuffer("conv");
         expect(getChatState().streamingBuffer.conv).toBeUndefined();
         expect(
             getChatState().threads.find((t) => t.conversation_id === "conv")!
-                .is_thinking,
+                .is_processing,
         ).toBe(false);
+    });
+
+    it("setThreadProcessing toggles the per-thread flag in place", () => {
+        // Phase 10.1: phase-driven setter that the WS event handler
+        // calls when ConversationPhaseChanged lands.
+        setThreads([T("conv")]);
+        setThreadProcessing("conv", true);
+        expect(
+            getChatState().threads.find((t) => t.conversation_id === "conv")!
+                .is_processing,
+        ).toBe(true);
+
+        // Idempotent: a redundant `true` doesn't churn references.
+        const beforeRefs = getChatState().threads;
+        setThreadProcessing("conv", true);
+        expect(getChatState().threads).toBe(beforeRefs);
+
+        setThreadProcessing("conv", false);
+        expect(
+            getChatState().threads.find((t) => t.conversation_id === "conv")!
+                .is_processing,
+        ).toBe(false);
+    });
+
+    it("setThreadProcessing on an unknown thread is a no-op", () => {
+        setThreads([T("conv")]);
+        const before = getChatState().threads;
+        setThreadProcessing("ghost-conv", true);
+        expect(getChatState().threads).toBe(before);
     });
 });

@@ -37,6 +37,15 @@ pub struct RegisteredUiPanel {
 }
 
 /// A transport connection (Signal, email, etc.).
+///
+/// Today this is only metadata — the actual `dyn Transport`
+/// instances land when the plugin host learns to spawn transport
+/// plugin processes (Phase 11+). When that lands, the host will
+/// also subscribe to the server's event bus and fan
+/// `UiEvent::ConversationPhaseChanged` out to every registered
+/// transport via `Transport::on_phase_changed` (Phase 10.1
+/// established the trait; the relay is the missing-but-trivial
+/// glue).
 #[derive(Debug, Clone)]
 pub struct RegisteredTransport {
     pub plugin_id: String,
