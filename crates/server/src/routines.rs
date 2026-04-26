@@ -406,26 +406,45 @@ pub async fn run_now_handler(
         run_id: run_id.clone(),
         status: RoutineRunStatus::Pending.as_str().to_owned(),
     });
-    // Mark the run Skipped immediately for v1 — the actual dispatch
-    // path lands when runner-local is real. The history row still
-    // exists so the operator can see "yes, the manual-fire button
-    // worked." Once dispatch is wired, this will hand off to the
-    // runner instead.
+
+    // Phase 11 closure — actually dispatch instead of marking
+    // Skipped. The manual-fire button now behaves identically to a
+    // scheduler-tick fire: same dispatch path, same trust class
+    // (Controller), same fall-through to stub turn when no inference
+    // backend is wired. Records Success/Failed with the resulting
+    // conversation id (or the routine's existing target).
+    let dispatch_outcome = crate::chats::dispatch_routine_turn(
+        &state,
+        &row.id,
+        row.target_conversation_id.as_deref(),
+        &row.prompt,
+    )
+    .await;
+    let (status, error, conversation_id) = match dispatch_outcome {
+        Ok(o) => (
+            RoutineRunStatus::Success,
+            None,
+            Some(o.conversation_id),
+        ),
+        Err(e) => (
+            RoutineRunStatus::Failed,
+            Some(e),
+            row.target_conversation_id.clone(),
+        ),
+    };
     store
         .finish_run(
             &run_id,
-            RoutineRunStatus::Skipped,
-            now,
-            Some(
-                "manual run queued; dispatch pipeline lands with runner-local",
-            ),
-            None,
+            status,
+            chrono::Utc::now().timestamp(),
+            error.as_deref(),
+            conversation_id.as_deref(),
         )
         .map_err(ApiError::from)?;
     state.events.publish(crate::events::UiEvent::RoutineRunChanged {
         routine_id: row.id.clone(),
         run_id: run_id.clone(),
-        status: RoutineRunStatus::Skipped.as_str().to_owned(),
+        status: status.as_str().to_owned(),
     });
     let runs = store.list_runs(&row.id, 1).map_err(ApiError::from)?;
     let run = runs.first().ok_or(ApiError {
@@ -720,11 +739,14 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        // v1 placeholder dispatch marks the run Skipped with an
-        // explanatory error string. When runner-local lands, this
-        // becomes Success/Failed.
-        assert_eq!(v["status"], "Skipped");
-        assert!(v["error"].is_string());
+        // Phase 11 closure: the manual run-now route dispatches
+        // through chats::dispatch_routine_turn. With no inference
+        // backend in test_app_state(), the stub turn fallback
+        // returns success (echo reply) — so the run row lands
+        // Success, not Skipped.
+        assert_eq!(v["status"], "Success");
+        // Successful runs record the conversation id they ran on.
+        assert!(v["conversation_id"].is_string());
 
         // Run-history endpoint sees the row.
         let req = Request::builder()

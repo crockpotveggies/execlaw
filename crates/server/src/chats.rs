@@ -243,6 +243,17 @@ pub async fn send_message(
         phase: Phase::Thinking.as_str().to_owned(),
     });
 
+    // Phase 11 closure — guard ensures Idle is published on every
+    // exit path, including err_500 early-returns from the turn
+    // dispatchers. Pre-fix, a turn that errored left the typing
+    // indicator stuck on "thinking" forever. Disarmed on the
+    // success path so the explicit Idle publish lands BEFORE
+    // ChatMessageOutbound (typing-dots-stop-a-beat-before-reply UX).
+    let idle_guard = IdlePhaseGuard::new(
+        state.events.clone(),
+        cid.as_str().to_owned(),
+    );
+
     // Phase 8.5 runner-registry hookup: every turn entering this code
     // path gets a corresponding `register_turn_start`. The Settings →
     // Runners page reads from this. Controller-trust callers get the
@@ -309,14 +320,12 @@ pub async fn send_message(
     // the operator visibility into stuck runners).
     state.runner_registry.register_turn_end(cid.as_str());
 
-    // Phase 10.1 — leave the processing window. Published BEFORE
-    // ChatMessageOutbound below so subscribers see "agent stopped
-    // typing" before "agent's reply arrived", matching how a human
-    // chat partner behaves (typing dots stop a beat, then text).
-    state.events.publish(UiEvent::ConversationPhaseChanged {
-        conversation_id: cid.as_str().to_owned(),
-        phase: Phase::Idle.as_str().to_owned(),
-    });
+    // Phase 10.1 + 11 closure — leave the processing window via the
+    // RAII guard. The disarm publishes Idle and then prevents Drop
+    // from publishing again. Idle lands BEFORE ChatMessageOutbound
+    // below so subscribers see "agent stopped typing" before "agent's
+    // reply arrived" (human chat partner UX).
+    idle_guard.disarm_after_publishing_idle();
 
     // Step 4 — broadcast both user and assistant events on the bus
     // AFTER the commit lands, so subscribers never see an outbound
@@ -927,6 +936,55 @@ impl execlaw_runner_local::turn::PhaseObserver for BusPhaseObserver {
     }
 }
 
+/// RAII guard that publishes `phase=idle` on Drop unless explicitly
+/// disarmed first. Closes the Phase 11 audit gap where every
+/// `err_500` early-return left the typing indicator stuck on
+/// "thinking" forever — every failure path now drops the guard,
+/// which fires Idle on the way out.
+///
+/// Success paths call `disarm_after_publishing_idle()` to take
+/// ownership of the publish (so the explicit Idle event still fires
+/// before `ChatMessageOutbound`, matching the human "typing dots
+/// stop a beat before the message lands" UX). After disarming, the
+/// Drop is a no-op so we don't double-publish.
+struct IdlePhaseGuard {
+    events: crate::events::EventBus,
+    conversation_id: String,
+    armed: bool,
+}
+
+impl IdlePhaseGuard {
+    fn new(events: crate::events::EventBus, conversation_id: String) -> Self {
+        Self {
+            events,
+            conversation_id,
+            armed: true,
+        }
+    }
+
+    /// Publish Idle now and disable the Drop publish. Use on the
+    /// success path so the Idle beat fires *before* the outbound
+    /// reply event.
+    fn disarm_after_publishing_idle(mut self) {
+        self.events.publish(UiEvent::ConversationPhaseChanged {
+            conversation_id: self.conversation_id.clone(),
+            phase: Phase::Idle.as_str().to_owned(),
+        });
+        self.armed = false;
+    }
+}
+
+impl Drop for IdlePhaseGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.events.publish(UiEvent::ConversationPhaseChanged {
+                conversation_id: self.conversation_id.clone(),
+                phase: Phase::Idle.as_str().to_owned(),
+            });
+        }
+    }
+}
+
 /// Result of a routine-triggered turn dispatch.
 #[derive(Debug, Clone)]
 pub struct RoutineDispatchOutcome {
@@ -948,6 +1006,12 @@ pub struct RoutineDispatchOutcome {
 /// Falls back to the stub turn when no inference backend is wired,
 /// so routines still produce success/failure history rows in
 /// dev/test environments without a live LLM.
+///
+/// Phase 11 closure — also publishes the outer
+/// `phase=Thinking` / `phase=Idle` window so transports can drive a
+/// typing indicator for the entire dispatch span (same UX as an
+/// inbound chat message). The IdlePhaseGuard guarantees Idle fires
+/// even if a tool call panics or the inference HTTP times out.
 pub async fn dispatch_routine_turn(
     state: &AppState,
     routine_id: &str,
@@ -965,6 +1029,15 @@ pub async fn dispatch_routine_turn(
     // path (`ensure_conversation` is the helper above).
     let store = ConversationStore::new(&state.db);
     ensure_conversation(&store, &cid);
+
+    // Outer processing window — start. Mirrors the chat-handler's
+    // pattern at line ~241 so a routine-fired turn produces the
+    // same typing-indicator UX as a controller-typed turn.
+    state.events.publish(UiEvent::ConversationPhaseChanged {
+        conversation_id: cid_str.clone(),
+        phase: Phase::Thinking.as_str().to_owned(),
+    });
+    let idle_guard = IdlePhaseGuard::new(state.events.clone(), cid_str.clone());
 
     let sender = Some("controller".to_owned());
     // Controller turns get the wildcard capability set. We hardcode
@@ -996,11 +1069,22 @@ pub async fn dispatch_routine_turn(
         None => run_stub_turn(state, &cid, prompt, sender.clone()),
     };
 
-    result
-        .map(|(_user_seq, text, _assistant_seq)| RoutineDispatchOutcome {
-            conversation_id: cid_str,
-            assistant_text: text,
-        })
+    let mapped = result.map(|(_user_seq, text, _assistant_seq)| RoutineDispatchOutcome {
+        conversation_id: cid_str,
+        assistant_text: text,
+    });
+    // Success path publishes Idle explicitly (so it lands a beat
+    // before any caller-driven outbound event); failure path lets
+    // Drop fire it. Either way, the typing indicator drops.
+    match &mapped {
+        Ok(_) => idle_guard.disarm_after_publishing_idle(),
+        Err(_) => {
+            // Drop will publish Idle. Explicitly drop here for
+            // clarity — RAII semantics work either way.
+            drop(idle_guard);
+        }
+    }
+    mapped
 }
 
 /// Phase 11.B — assemble the turn's system prompt. Two halves:
@@ -1553,6 +1637,108 @@ mod tests {
         }
         assert!(saw_inbound, "expected ChatMessageInbound");
         assert!(saw_outbound, "expected ChatMessageOutbound");
+    }
+
+    #[test]
+    fn idle_phase_guard_publishes_on_drop_when_armed() {
+        // Phase 11 closure — the guard's whole reason to exist:
+        // if a turn errors and the explicit Idle publish never runs,
+        // Drop must fire one anyway so the typing indicator drops.
+        use crate::events::EventBus;
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        {
+            let _g = super::IdlePhaseGuard::new(bus.clone(), "c-drop".into());
+            // Goes out of scope here without disarming.
+        }
+        // Drop should have published.
+        let received = rx.try_recv();
+        match received {
+            Ok(UiEvent::ConversationPhaseChanged {
+                conversation_id,
+                phase,
+            }) => {
+                assert_eq!(conversation_id, "c-drop");
+                assert_eq!(phase, "idle");
+            }
+            other => panic!("expected idle on drop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn idle_phase_guard_disarm_publishes_idle_only_once() {
+        // Disarm publishes Idle and prevents Drop from publishing
+        // again — no double-publish, no missed publish.
+        use crate::events::EventBus;
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let g = super::IdlePhaseGuard::new(bus.clone(), "c-once".into());
+        g.disarm_after_publishing_idle(); // consumes self → drop runs immediately, but disarmed.
+        // First recv: the explicit publish.
+        let first = rx.try_recv().expect("explicit publish");
+        match first {
+            UiEvent::ConversationPhaseChanged { phase, .. } => {
+                assert_eq!(phase, "idle");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Second recv: nothing (Drop did NOT publish).
+        let second = rx.try_recv();
+        assert!(
+            second.is_err(),
+            "disarm must prevent the Drop publish; got {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_routine_turn_publishes_outer_phase_window() {
+        // Phase 11 closure — routine fires must wrap their dispatch
+        // in phase=Thinking → phase=Idle so transports drive the
+        // typing indicator for the whole window, not just the
+        // tool-loop interior. With no inference (test_app_state),
+        // the stub turn returns a synthetic reply and the wrapper
+        // should still see both boundary events.
+        let state = crate::routes::test_app_state();
+        let mut rx = state.events.subscribe();
+        let outcome = super::dispatch_routine_turn(
+            &state,
+            "rt-test",
+            None,
+            "do the thing",
+        )
+        .await
+        .expect("stub turn fallback should succeed");
+        assert!(
+            outcome.conversation_id.starts_with("routine-rt-test-"),
+            "auto-mint convention: {}",
+            outcome.conversation_id
+        );
+
+        let mut saw_thinking = false;
+        let mut saw_idle = false;
+        for _ in 0..32 {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                rx.recv(),
+            )
+            .await
+            {
+                Ok(Ok(UiEvent::ConversationPhaseChanged { phase, .. })) => {
+                    if phase == "thinking" {
+                        saw_thinking = true;
+                    } else if phase == "idle" {
+                        saw_idle = true;
+                    }
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+            if saw_thinking && saw_idle {
+                break;
+            }
+        }
+        assert!(saw_thinking, "outer phase=thinking must fire");
+        assert!(saw_idle, "outer phase=idle must fire");
     }
 
     #[tokio::test]
