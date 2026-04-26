@@ -171,7 +171,10 @@ impl BollardServiceController {
 #[async_trait]
 impl ServiceController for BollardServiceController {
     async fn spawn(&self, spec: &ServiceSpec) -> Result<ServiceHandle, ServiceError> {
-        use bollard::container::{Config, CreateContainerOptions, StartContainerOptions};
+        use bollard::container::{
+            Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,
+            StopContainerOptions,
+        };
         use bollard::image::CreateImageOptions;
         use bollard::secret::{
             DeviceRequest, HostConfig, HostConfigLogConfig, PortBinding,
@@ -186,7 +189,30 @@ impl ServiceController for BollardServiceController {
             return Err(ServiceError::Invalid("image must not be empty".into()));
         }
 
-        // --- 1. Pull the image (no-op when cached). The stream
+        // --- 1. Remove any stale container with the same name. This
+        // happens on a server restart while previous managed
+        // containers were still running: bollard's
+        // create_container errors with HTTP 409 on name conflict,
+        // which would brick the spawn. Best-effort: stop + force-
+        // remove. Errors are logged and swallowed — if the
+        // container truly doesn't exist, both calls 404 and we
+        // continue to the create.
+        let _ = self
+            .docker
+            .stop_container(&spec.name, Some(StopContainerOptions { t: 5 }))
+            .await;
+        let _ = self
+            .docker
+            .remove_container(
+                &spec.name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        // --- 2. Pull the image (no-op when cached). The stream
         // surface is bollard's; we drain it and only error on the
         // first reported failure event.
         let opts = CreateImageOptions {
@@ -374,6 +400,10 @@ struct MockState {
     pinned_status: Option<ServiceStatus>,
     /// What `health_check` returns. Defaults to true.
     health_response: Option<Result<bool, String>>,
+    /// What `spawn` returns. Defaults to a synthetic Ok handle.
+    /// Tests pin this to simulate image-pull failures, name
+    /// collisions, or other Docker errors.
+    spawn_response: Option<Result<(), String>>,
     /// Spawn-call recorder for assertions.
     pub spawn_log: Vec<ServiceSpec>,
     /// Stop-call recorder for assertions.
@@ -398,6 +428,14 @@ impl MockServiceController {
         self.inner.lock().await.health_response = Some(Err(msg.into()));
     }
 
+    /// Force the next `spawn` (and every subsequent one until
+    /// cleared) to return `ServiceError::Pull(msg)`. Tests use this
+    /// to exercise the supervisor's spawn-failure branch without a
+    /// real Docker daemon.
+    pub async fn pin_spawn_pull_error(&self, msg: impl Into<String>) {
+        self.inner.lock().await.spawn_response = Some(Err(msg.into()));
+    }
+
     pub async fn spawn_count(&self) -> usize {
         self.inner.lock().await.spawn_log.len()
     }
@@ -416,13 +454,16 @@ impl MockServiceController {
 impl ServiceController for MockServiceController {
     async fn spawn(&self, spec: &ServiceSpec) -> Result<ServiceHandle, ServiceError> {
         let mut state = self.inner.lock().await;
+        state.spawn_log.push(spec.clone());
+        if let Some(Err(msg)) = state.spawn_response.clone() {
+            return Err(ServiceError::Pull(msg));
+        }
         let handle = ServiceHandle {
             container_id: format!("mock-{}", spec.name),
             name: spec.name.clone(),
             host_port: spec.host_port,
         };
         state.running.insert(spec.name.clone(), handle.clone());
-        state.spawn_log.push(spec.clone());
         Ok(handle)
     }
 
@@ -536,5 +577,25 @@ mod tests {
         mock.pin_health_error("dns lookup failed").await;
         let err = mock.health_check("http://x").await.unwrap_err();
         assert!(matches!(err, ServiceError::Health(_)));
+    }
+
+    #[tokio::test]
+    async fn mock_spawn_pin_pull_error_returns_service_error_pull() {
+        // Closure for Phase 12 audit gap #4: the BollardServiceController's
+        // `ServiceError::Pull` branch couldn't be exercised in tests.
+        // The mock's `pin_spawn_pull_error` simulates the same shape so
+        // the BackendSupervisor's spawn-failure handling has coverage.
+        let mock = MockServiceController::new();
+        mock.pin_spawn_pull_error("registry returned 404").await;
+        let err = mock.spawn(&fixture_spec()).await.unwrap_err();
+        match err {
+            ServiceError::Pull(msg) => {
+                assert!(msg.contains("registry returned 404"));
+            }
+            other => panic!("expected Pull, got {other:?}"),
+        }
+        // The spawn was still recorded — tests that count attempts
+        // see a real attempt rather than a silently-skipped one.
+        assert_eq!(mock.spawn_count().await, 1);
     }
 }

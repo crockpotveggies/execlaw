@@ -190,6 +190,26 @@ impl BackendSupervisor {
         self.kick.notify_one();
     }
 
+    /// Reset the per-purpose restart counter. Called by the upsert
+    /// handler after every save so a row that was parked at
+    /// `MAX_RESTART_ATTEMPTS` gets a fresh runway when the operator
+    /// edits it (presumed-fixed config). Does not touch the
+    /// `handle` — the next reconcile pass decides spawn vs no-op
+    /// based on the row's current spec.
+    pub async fn reset_attempts(&self, purpose: BackendPurpose) {
+        let mut slots = self.slots.lock().await;
+        if let Some(slot) = slots.get_mut(purpose.as_str()) {
+            slot.restart_attempts = 0;
+            // If the slot was parked CrashLooping, drop the status
+            // so the next reconcile makes a fresh determination
+            // instead of re-reading "looping past cap".
+            if matches!(slot.status, ServiceStatus::CrashLooping { .. }) {
+                slot.status = ServiceStatus::Stopped;
+                slot.handle = None;
+            }
+        }
+    }
+
     /// Read-only status snapshot for the SPA. Returns one entry per
     /// configured backend (any mode); `external` rows always report
     /// `Stopped` here because the supervisor doesn't manage them.
@@ -699,6 +719,94 @@ mod tests {
         sup.reconcile_once().await;
         assert_eq!(mock.spawn_count().await, 2);
         assert_eq!(mock.stop_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn spawn_error_increments_restart_attempts_and_records_crash_looping() {
+        // Closure for Phase 12 audit gap #4: when the controller's
+        // `spawn` returns Err (e.g. image pull failed), the
+        // supervisor must mark the slot CrashLooping and bump the
+        // restart counter so the cap eventually engages instead of
+        // looping forever.
+        let db = fresh_db();
+        let store = BackendStore::new(&db);
+        upsert_managed(&store, BackendPurpose::Standard, "vllm:nope");
+        let mock = Arc::new(MockServiceController::new());
+        mock.pin_spawn_pull_error("registry 404").await;
+        let sup = BackendSupervisor::new(db, mock.clone());
+
+        for _ in 0..3 {
+            sup.reconcile_once().await;
+        }
+        let snap = sup.snapshot_status().await;
+        let row = snap
+            .iter()
+            .find(|s| s.purpose == BackendPurpose::Standard)
+            .unwrap();
+        match &row.status {
+            ServiceStatus::CrashLooping { .. } => {} // expected
+            other => panic!("expected CrashLooping after spawn errors, got {other:?}"),
+        }
+        assert!(
+            row.restart_attempts > 0,
+            "spawn-error path must increment restart_attempts; got {}",
+            row.restart_attempts
+        );
+        // Verify spawn was attempted at least once (not silently
+        // suppressed) — actual count varies because once the cap
+        // hits the supervisor stops attempting.
+        assert!(mock.spawn_count().await >= 1);
+    }
+
+    #[tokio::test]
+    async fn reset_attempts_unparks_a_crashlooping_row() {
+        // Phase 12 closure — after the supervisor parks a row at
+        // MAX_RESTART_ATTEMPTS, the upsert handler calls
+        // reset_attempts so the next reconcile makes a fresh
+        // determination. Without this, the only way to recover
+        // from a crash loop was a server restart.
+        let db = fresh_db();
+        let store = BackendStore::new(&db);
+        upsert_managed(&store, BackendPurpose::Standard, "vllm:bad");
+        let mock = Arc::new(MockServiceController::new());
+        let sup = BackendSupervisor::new(db, mock.clone());
+
+        sup.reconcile_once().await;
+        mock.pin_status(ServiceStatus::CrashLooping { restart_count: 5 })
+            .await;
+        for _ in 0..6 {
+            sup.reconcile_once().await;
+        }
+
+        // Verify we're parked.
+        let snap = sup.snapshot_status().await;
+        let parked = snap
+            .iter()
+            .find(|s| s.purpose == BackendPurpose::Standard)
+            .unwrap();
+        assert!(parked.restart_attempts >= MAX_RESTART_ATTEMPTS);
+
+        // Operator's "save" → reset_attempts() → kick. Drop the
+        // pinned status so the mock's next inspect reports the
+        // running container as Healthy again.
+        sup.reset_attempts(BackendPurpose::Standard).await;
+        // Clear the pin so subsequent inspects fall through to the
+        // mock's default (Healthy when running). We do this by
+        // pinning Healthy explicitly.
+        mock.pin_status(ServiceStatus::Healthy).await;
+
+        sup.reconcile_once().await;
+        sup.reconcile_once().await;
+        let snap2 = sup.snapshot_status().await;
+        let unstuck = snap2
+            .iter()
+            .find(|s| s.purpose == BackendPurpose::Standard)
+            .unwrap();
+        assert_eq!(
+            unstuck.restart_attempts, 0,
+            "reset_attempts must clear the counter"
+        );
+        assert_eq!(unstuck.status, ServiceStatus::Healthy);
     }
 
     #[tokio::test]

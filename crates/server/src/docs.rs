@@ -22,7 +22,8 @@ use crate::approvals::{
     PrincipalListResponse, PrincipalSummary,
 };
 use crate::backends::{
-    BackendListEntry, BackendListResponse, BackendView, UpsertBackendRequest,
+    BackendListEntry, BackendListResponse, BackendStatusResponse, BackendView,
+    UpsertBackendRequest,
 };
 use crate::alerts::{AlertCountResponse, AlertListResponse, AlertView};
 use crate::my_identities::{
@@ -124,6 +125,9 @@ impl Modify for SecurityAddon {
         crate::backends::list_handler,
         crate::backends::upsert_handler,
         crate::backends::clear_handler,
+        // backend supervisor (Phase 12.C — managed-mode lifecycle)
+        crate::backends::status_handler,
+        crate::backends::restart_handler,
         // runners (Phase 8.5 — view-only + restart)
         crate::runners_admin::list_handler,
         crate::runners_admin::restart_handler,
@@ -197,6 +201,7 @@ impl Modify for SecurityAddon {
         BackendView,
         BackendListResponse,
         BackendListEntry,
+        BackendStatusResponse,
         UpsertBackendRequest,
         RunnerView,
         RunnerListResponse,
@@ -410,6 +415,8 @@ mod tests {
             ("/api/admin/audit", &["get"]),
             ("/api/admin/backends", &["get"]),
             ("/api/admin/backends/{purpose}", &["put", "delete"]),
+            ("/api/admin/backends/{purpose}/status", &["get"]),
+            ("/api/admin/backends/{purpose}/restart", &["post"]),
             ("/api/admin/runners", &["get"]),
             ("/api/admin/runners/{conversation_id}/restart", &["post"]),
             ("/api/admin/users", &["get"]),

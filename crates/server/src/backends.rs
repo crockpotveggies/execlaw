@@ -238,6 +238,17 @@ pub async fn upsert_handler(
         )
         .map_err(ApiError::from)?;
 
+    // Phase 12 closure — kick the supervisor so the reconcile
+    // happens within milliseconds instead of waiting up to one
+    // tick (~5s). Also reset the per-purpose restart counter so a
+    // row that was parked CrashLooping gets a fresh runway after
+    // the operator edits its spec. Both are no-ops for external
+    // rows; the supervisor only acts on Managed.
+    if let Some(sup) = state.backend_supervisor.as_ref() {
+        sup.reset_attempts(purpose).await;
+        sup.kick();
+    }
+
     let _ = AuditStore::new(&state.db).insert(
         &user.user_id,
         "config_backends",
