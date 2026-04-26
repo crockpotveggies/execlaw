@@ -19,7 +19,7 @@ use execlaw_core::migrations::MigrationRunner;
 use execlaw_core::conversation::{
     ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
 };
-use execlaw_core::backends::{BackendPurpose, BackendStore, BackendUpsert};
+use execlaw_core::backends::{BackendMode, BackendPurpose, BackendStore, BackendUpsert};
 use execlaw_core::ephemeral_sweeper::sweep_once;
 use execlaw_core::events::EventRecord as CoreEventRecord;
 use execlaw_core::outbox::{OutboxRow, OutboxStatus, OutboxStore};
@@ -696,6 +696,7 @@ fn bench_backend_store(c: &mut Criterion) {
                         endpoint: Some("http://127.0.0.1:8000/v1".into()),
                         notes: None,
                         reasoning_enabled: false,
+                        mode: BackendMode::External,
                     },
                     0,
                 )
@@ -721,6 +722,7 @@ fn bench_backend_store(c: &mut Criterion) {
                         endpoint: None,
                         notes: None,
                         reasoning_enabled: false,
+                        mode: BackendMode::External,
                     },
                     0,
                 )

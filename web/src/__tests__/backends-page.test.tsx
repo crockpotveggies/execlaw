@@ -292,4 +292,171 @@ describe("BackendsPage", () => {
             ).toBeInTheDocument();
         });
     });
+
+    // ---- Phase 12.D — Mode toggle + status pill -----------------------
+
+    function listResponseWithManagedStandard() {
+        return new Response(
+            JSON.stringify({
+                backends: FOUR_PURPOSES.map((purpose) => ({
+                    purpose,
+                    configured: purpose === "Standard",
+                    backend:
+                        purpose === "Standard"
+                            ? {
+                                  purpose,
+                                  inference_backend: "service-vllm",
+                                  model_spec: { image: "vllm:test" },
+                                  gpu_id: "0",
+                                  endpoint: "http://127.0.0.1:8101",
+                                  notes: null,
+                                  reasoning_enabled: false,
+                                  supports_reasoning_toggle: true,
+                                  mode: "managed",
+                                  created_at: 0,
+                                  updated_at: 0,
+                              }
+                            : null,
+                })),
+            }),
+            { status: 200 },
+        );
+    }
+
+    it("renders managed badge + Healthy status pill on managed rows", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/backends")
+                return listResponseWithManagedStandard();
+            if (url === "/api/admin/backends/Standard/status") {
+                return new Response(
+                    JSON.stringify({
+                        purpose: "Standard",
+                        mode: "managed",
+                        status: "Healthy",
+                        endpoint: "http://127.0.0.1:8101",
+                        restart_attempts: 0,
+                        supervisor_available: true,
+                    }),
+                    { status: 200 },
+                );
+            }
+            if (url === "/api/admin/hardware") return hardwareNoGpu();
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        await waitFor(() => {
+            expect(screen.getByTestId("backend-mode-badge")).toBeInTheDocument();
+        });
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("backend-status-pill"),
+            ).toHaveTextContent("Healthy");
+        });
+    });
+
+    it("renders 'Docker offline' when supervisor_available is false", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/backends")
+                return listResponseWithManagedStandard();
+            if (url === "/api/admin/backends/Standard/status") {
+                return new Response(
+                    JSON.stringify({
+                        purpose: "Standard",
+                        mode: "managed",
+                        status: "Stopped",
+                        endpoint: null,
+                        restart_attempts: 0,
+                        supervisor_available: false,
+                    }),
+                    { status: 200 },
+                );
+            }
+            if (url === "/api/admin/hardware") return hardwareNoGpu();
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("backend-status-pill"),
+            ).toHaveTextContent("Docker offline");
+        });
+    });
+
+    it("PUTs mode=managed and null endpoint when toggle picks managed", async () => {
+        const calls: Array<{ url: string; init?: RequestInit }> = [];
+        fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+            calls.push({ url, init });
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/backends" && (!init || init.method === "GET" || init.method === undefined))
+                return emptyListResponse();
+            if (
+                url === "/api/admin/backends/Standard" &&
+                init?.method === "PUT"
+            ) {
+                return new Response(
+                    JSON.stringify({
+                        purpose: "Standard",
+                        inference_backend: "service-vllm",
+                        model_spec: { image: "vllm:test" },
+                        gpu_id: "0",
+                        endpoint: null,
+                        notes: null,
+                        reasoning_enabled: false,
+                        supports_reasoning_toggle: true,
+                        mode: "managed",
+                        created_at: 0,
+                        updated_at: 0,
+                    }),
+                    { status: 200 },
+                );
+            }
+            if (url === "/api/admin/hardware") return hardwareNoGpu();
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        await waitFor(() => {
+            expect(screen.getAllByTestId("backend-row")).toHaveLength(4);
+        });
+        const editButtons = screen.getAllByTestId("backend-edit");
+        // Standard is alphabetically first.
+        fireEvent.click(editButtons[0]);
+        await waitFor(() => {
+            expect(screen.getByTestId("backend-form")).toBeInTheDocument();
+        });
+        fireEvent.click(screen.getByTestId("backend-form-mode-managed"));
+        fireEvent.change(screen.getByTestId("backend-form-backend"), {
+            target: { value: "service-vllm" },
+        });
+        fireEvent.change(screen.getByTestId("backend-form-model-spec"), {
+            target: {
+                value: '{"image":"vllm:test","args":["--model","X"],"container_port":8000}',
+            },
+        });
+        // Endpoint field is disabled in managed mode — verify and skip
+        // typing.
+        const endpointField = screen.getByTestId(
+            "backend-form-endpoint",
+        ) as HTMLInputElement;
+        expect(endpointField.disabled).toBe(true);
+        fireEvent.click(screen.getByTestId("backend-form-save"));
+        await waitFor(() => {
+            expect(
+                calls.some(
+                    (c) =>
+                        c.url === "/api/admin/backends/Standard" &&
+                        c.init?.method === "PUT",
+                ),
+            ).toBe(true);
+        });
+        const put = calls.find(
+            (c) =>
+                c.url === "/api/admin/backends/Standard" &&
+                c.init?.method === "PUT",
+        )!;
+        const body = JSON.parse((put.init?.body as string) ?? "{}");
+        expect(body.mode).toBe("managed");
+        expect(body.endpoint).toBeNull();
+    });
 });

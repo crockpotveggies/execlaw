@@ -16,5 +16,13 @@
 #![forbid(unsafe_code)]
 
 pub mod hardware;
+pub mod service;
 
 pub use hardware::{GpuDevice, GpuId, GpuVendor, HardwareProfile, SysfsSource, detect_sysfs};
+pub use service::{
+    BollardServiceController, ServiceController, ServiceError, ServiceHandle, ServiceSpec,
+    ServiceStatus,
+};
+
+#[cfg(any(test, feature = "test-mock"))]
+pub use service::MockServiceController;

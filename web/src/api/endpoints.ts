@@ -496,6 +496,8 @@ export const BACKEND_PURPOSES: ReadonlyArray<BackendPurpose> = [
     "VoiceTTS",
 ];
 
+export type BackendMode = "external" | "managed";
+
 export interface BackendView {
     purpose: BackendPurpose;
     inference_backend: string;
@@ -511,8 +513,33 @@ export interface BackendView {
     /// True when this purpose accepts a reasoning_enabled value.
     /// The SPA shows the toggle only when this is true.
     supports_reasoning_toggle: boolean;
+    /// Phase 12 — lifecycle ownership. "external" (operator URL) or
+    /// "managed" (control plane spawns the container). Pre-Phase-12
+    /// rows default to "external" via the migration.
+    mode: BackendMode;
     created_at: number;
     updated_at: number;
+}
+
+export type BackendStatus =
+    | "Pulling"
+    | "Starting"
+    | "Healthy"
+    | "CrashLooping"
+    | "Stopped"
+    | "NotFound";
+
+export interface BackendStatusResponse {
+    purpose: BackendPurpose;
+    mode: BackendMode;
+    status: BackendStatus;
+    endpoint: string | null;
+    restart_attempts: number;
+    /// False when the supervisor isn't wired (e.g. dev build,
+    /// Docker daemon unreachable). The SPA renders a "Docker
+    /// unreachable" notice when the row is managed and this is
+    /// false.
+    supervisor_available: boolean;
 }
 
 /// One entry per purpose, regardless of whether the operator has
@@ -539,6 +566,9 @@ export interface UpsertBackendRequest {
     /// support reasoning (the field is silently zeroed). Send
     /// freely; let the server enforce the Standard-only rule.
     reasoning_enabled?: boolean;
+    /// Phase 12 — lifecycle ownership. Defaults to "external" on
+    /// the server when omitted, so older clients keep working.
+    mode?: BackendMode;
 }
 
 export async function listBackends(
@@ -570,6 +600,32 @@ export async function clearBackend(
     return apiFetch(
         `/api/admin/backends/${encodeURIComponent(purpose)}`,
         { method: "DELETE" },
+        tokenAccessor,
+    );
+}
+
+/// Phase 12 — supervisor status for the SPA's mode pill. Polled by
+/// the BackendsPage when at least one row is in managed mode.
+export async function getBackendStatus(
+    purpose: BackendPurpose,
+    tokenAccessor: () => string | null,
+): Promise<BackendStatusResponse> {
+    return apiFetch<BackendStatusResponse>(
+        `/api/admin/backends/${encodeURIComponent(purpose)}/status`,
+        {},
+        tokenAccessor,
+    );
+}
+
+/// Force-restart a managed backend. 503 when the supervisor isn't
+/// wired (Docker unreachable).
+export async function restartBackend(
+    purpose: BackendPurpose,
+    tokenAccessor: () => string | null,
+): Promise<void> {
+    await apiFetch<unknown>(
+        `/api/admin/backends/${encodeURIComponent(purpose)}/restart`,
+        { method: "POST" },
         tokenAccessor,
     );
 }

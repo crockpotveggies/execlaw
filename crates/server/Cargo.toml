@@ -79,6 +79,10 @@ tower = { workspace = true, features = ["util"] }
 criterion.workspace = true
 zip = { workspace = true }
 execlaw-plugin-sdk = { path = "../plugin-sdk" }
+# Phase 12.B/C — supervisor tests use the in-memory mock controller
+# that the container-manager crate exposes behind the test-mock
+# feature.
+execlaw-container-manager = { path = "../container-manager", features = ["test-mock"] }
 
 [[bench]]
 name = "server_hot_paths"

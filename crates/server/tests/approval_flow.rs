@@ -30,6 +30,7 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
         webauthn: None,
         mcp_host: execlaw_server::mcp_host::McpHost::new(db),
         runner_registry: execlaw_server::runner_registry::RunnerRegistry::new(),
+        backend_supervisor: None,
     };
     (
         execlaw_server::routes::build_router(state.clone()),

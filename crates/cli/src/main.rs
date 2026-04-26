@@ -1075,6 +1075,25 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     let runner_registry = execlaw_server::runner_registry::RunnerRegistry::new();
     let events = execlaw_server::EventBus::new();
 
+    // Phase 12.C — supervisor for managed inference backends. Best-
+    // effort connect to the local Docker daemon; if it fails (no
+    // Docker, e.g. dev on a host without Docker installed) we fall
+    // through to `None` and managed-mode rows just sit `Stopped`
+    // until Docker is available. The actual `run()` task is spawned
+    // below alongside the other sweepers so it shares `sweep_stop`.
+    let backend_supervisor = match execlaw_container_manager::BollardServiceController::connect() {
+        Ok(ctrl) => Some(execlaw_server::backend_supervisor::BackendSupervisor::new(
+            db.clone(),
+            std::sync::Arc::new(ctrl),
+        )),
+        Err(e) => {
+            tracing::warn!(
+                "backend supervisor disabled — Docker daemon unreachable: {e}"
+            );
+            None
+        }
+    };
+
     let state = execlaw_server::AppState {
         db: db.clone(),
         config: config.clone(),
@@ -1087,6 +1106,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         webauthn,
         mcp_host,
         runner_registry: runner_registry.clone(),
+        backend_supervisor,
     };
 
     // Phase-7 background workers — run for the lifetime of the
@@ -1141,6 +1161,15 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
                 db.clone(),
             );
         tokio::spawn(async move { routine_run_sweeper.run(stop).await });
+    }
+
+    // Phase 12.C — backend supervisor reconcile loop. Only spawns
+    // if the Docker connect succeeded above; otherwise managed-mode
+    // backends are inert and the SPA shows a "Docker unreachable"
+    // notice on the Backends page status pill.
+    if let Some(sup) = state.backend_supervisor.clone() {
+        let stop = sweep_stop.clone();
+        tokio::spawn(async move { sup.run(stop).await });
     }
 
     let app = execlaw_server::routes::build_router(state);

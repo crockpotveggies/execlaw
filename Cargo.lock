@@ -901,6 +901,8 @@ dependencies = [
  "async-trait",
  "bollard",
  "execlaw-core",
+ "futures-util",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

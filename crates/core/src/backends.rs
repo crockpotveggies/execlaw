@@ -34,6 +34,37 @@ pub enum BackendPurpose {
     VoiceTts,
 }
 
+/// Lifecycle ownership for a backend (Phase 12 — §5.4).
+///
+///   * `External` — operator points us at a URL they manage. Control
+///     plane never touches the process; we just call the endpoint.
+///   * `Managed` — control plane spawns + supervises the inference
+///     container. `endpoint` is computed at spawn time and written
+///     back to the row; operator picks image tag + cmd args in
+///     `model_spec_json`. The supervisor lives in the server crate
+///     (BackendSupervisor); the storage layer is mode-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub enum BackendMode {
+    External,
+    Managed,
+}
+
+impl BackendMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::External => "external",
+            Self::Managed => "managed",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "external" => Some(Self::External),
+            "managed" => Some(Self::Managed),
+            _ => None,
+        }
+    }
+}
+
 impl BackendPurpose {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -85,6 +116,10 @@ pub struct BackendRow {
     /// backend. Only meaningful for Standard. Persisted so the
     /// runner doesn't have to look up a separate config.
     pub reasoning_enabled: bool,
+    /// Phase 12 — lifecycle ownership. Defaults to `External` so
+    /// every existing row keeps its current behaviour after the
+    /// migration. The supervisor only acts on `Managed` rows.
+    pub mode: BackendMode,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -100,6 +135,7 @@ pub struct BackendUpsert {
     pub endpoint: Option<String>,
     pub notes: Option<String>,
     pub reasoning_enabled: bool,
+    pub mode: BackendMode,
 }
 
 #[derive(Debug, Error)]
@@ -138,8 +174,8 @@ impl<'db> BackendStore<'db> {
             c.execute(
                 "INSERT INTO config_backends \
                    (purpose, inference_backend, model_spec_json, gpu_id, endpoint, notes, \
-                    reasoning_enabled, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8) \
+                    reasoning_enabled, mode, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9) \
                  ON CONFLICT(purpose) DO UPDATE SET \
                     inference_backend = excluded.inference_backend, \
                     model_spec_json   = excluded.model_spec_json, \
@@ -147,6 +183,7 @@ impl<'db> BackendStore<'db> {
                     endpoint          = excluded.endpoint, \
                     notes             = excluded.notes, \
                     reasoning_enabled = excluded.reasoning_enabled, \
+                    mode              = excluded.mode, \
                     updated_at        = excluded.updated_at",
                 params![
                     payload.purpose.as_str(),
@@ -156,6 +193,7 @@ impl<'db> BackendStore<'db> {
                     payload.endpoint,
                     payload.notes,
                     reasoning as i64,
+                    payload.mode.as_str(),
                     now,
                 ],
             )?;
@@ -170,7 +208,7 @@ impl<'db> BackendStore<'db> {
             let got = c
                 .query_row(
                     "SELECT purpose, inference_backend, model_spec_json, gpu_id, endpoint, \
-                            notes, reasoning_enabled, created_at, updated_at \
+                            notes, reasoning_enabled, mode, created_at, updated_at \
                      FROM config_backends WHERE purpose = ?1",
                     params![purpose.as_str()],
                     row_to_backend,
@@ -188,7 +226,7 @@ impl<'db> BackendStore<'db> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT purpose, inference_backend, model_spec_json, gpu_id, endpoint, \
-                        notes, reasoning_enabled, created_at, updated_at \
+                        notes, reasoning_enabled, mode, created_at, updated_at \
                  FROM config_backends \
                  ORDER BY purpose ASC",
             )?;
@@ -198,6 +236,29 @@ impl<'db> BackendStore<'db> {
             Ok(rows)
         })?;
         Ok(rows)
+    }
+
+    /// Patch only the `endpoint` column. Used by the
+    /// BackendSupervisor (Phase 12) to write back the
+    /// computed-after-spawn endpoint for managed rows without
+    /// disturbing the rest of the operator's config.
+    pub fn set_endpoint(
+        &self,
+        purpose: BackendPurpose,
+        endpoint: Option<&str>,
+        now: i64,
+    ) -> Result<(), BackendError> {
+        let endpoint_owned = endpoint.map(|s| s.to_owned());
+        self.db.with_conn(|c| {
+            c.execute(
+                "UPDATE config_backends \
+                 SET endpoint = ?1, updated_at = ?2 \
+                 WHERE purpose = ?3",
+                params![endpoint_owned, now, purpose.as_str()],
+            )?;
+            Ok(())
+        })
+        .map_err(BackendError::from)
     }
 
     /// Operator can clear a configured backend without inserting a
@@ -231,6 +292,11 @@ fn row_to_backend(row: &rusqlite::Row<'_>) -> rusqlite::Result<BackendRow> {
     let model_blob: Vec<u8> = row.get(2)?;
     let model_spec_json: serde_json::Value = serde_json::from_slice(&model_blob)
         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    let mode_str: String = row.get(7)?;
+    // Unknown mode strings collapse to External as a safe default —
+    // refusing to load the row would brick the Backends page on a
+    // corrupt enum value.
+    let mode = BackendMode::parse(&mode_str).unwrap_or(BackendMode::External);
     Ok(BackendRow {
         purpose,
         inference_backend: row.get(1)?,
@@ -239,8 +305,9 @@ fn row_to_backend(row: &rusqlite::Row<'_>) -> rusqlite::Result<BackendRow> {
         endpoint: row.get(4)?,
         notes: row.get(5)?,
         reasoning_enabled: row.get::<_, i64>(6)? != 0,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        mode,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 
@@ -265,6 +332,7 @@ mod tests {
             endpoint: Some("http://127.0.0.1:8000/v1".into()),
             notes: None,
             reasoning_enabled: false,
+            mode: BackendMode::External,
         }
     }
 
@@ -370,5 +438,92 @@ mod tests {
             assert_eq!(BackendPurpose::parse(p.as_str()), Some(*p));
         }
         assert_eq!(BackendPurpose::parse("nope"), None);
+    }
+
+    #[test]
+    fn backend_mode_parse_round_trips() {
+        for m in [BackendMode::External, BackendMode::Managed] {
+            assert_eq!(BackendMode::parse(m.as_str()), Some(m));
+        }
+        assert_eq!(BackendMode::parse("nope"), None);
+    }
+
+    #[test]
+    fn upsert_persists_mode_and_round_trips() {
+        let db = fresh_db();
+        let store = BackendStore::new(&db);
+        let mut payload = upsert_payload(BackendPurpose::Standard);
+        payload.mode = BackendMode::Managed;
+        // Managed rows typically don't have an operator-set endpoint.
+        // The store doesn't enforce that — it just persists what it
+        // gets — but we exercise the realistic shape here.
+        payload.endpoint = None;
+        let r = store.upsert(&payload, 100).unwrap();
+        assert_eq!(r.mode, BackendMode::Managed);
+        assert!(r.endpoint.is_none());
+
+        // Re-read; mode survives a round trip and the row continues
+        // to honour conflict-update semantics for the rest of the
+        // fields.
+        let got = store.get(BackendPurpose::Standard).unwrap().unwrap();
+        assert_eq!(got.mode, BackendMode::Managed);
+    }
+
+    #[test]
+    fn fresh_db_rows_default_to_external_mode() {
+        // The migration's `DEFAULT 'external'` keeps every legacy
+        // row's behaviour identical: nothing turns Managed by
+        // surprise. We construct a fresh row via the upsert path
+        // (default in the upsert struct is also External) and
+        // verify the round-trip.
+        let db = fresh_db();
+        let store = BackendStore::new(&db);
+        let r = store
+            .upsert(&upsert_payload(BackendPurpose::Standard), 100)
+            .unwrap();
+        assert_eq!(r.mode, BackendMode::External);
+    }
+
+    #[test]
+    fn set_endpoint_only_touches_endpoint_and_updated_at() {
+        // The supervisor uses set_endpoint to write back the
+        // computed-after-spawn URL. This must not disturb the rest
+        // of the operator's config (e.g. mode, model_spec_json).
+        let db = fresh_db();
+        let store = BackendStore::new(&db);
+        let mut payload = upsert_payload(BackendPurpose::Standard);
+        payload.mode = BackendMode::Managed;
+        payload.endpoint = None;
+        store.upsert(&payload, 100).unwrap();
+
+        store
+            .set_endpoint(
+                BackendPurpose::Standard,
+                Some("http://127.0.0.1:8001/v1"),
+                200,
+            )
+            .unwrap();
+
+        let got = store.get(BackendPurpose::Standard).unwrap().unwrap();
+        assert_eq!(got.endpoint.as_deref(), Some("http://127.0.0.1:8001/v1"));
+        assert_eq!(got.mode, BackendMode::Managed);
+        assert_eq!(got.updated_at, 200);
+    }
+
+    #[test]
+    fn set_endpoint_with_none_clears_the_value() {
+        // Used when the supervisor stops a managed backend — the
+        // endpoint goes back to "no URL available" so the runner
+        // doesn't try to call a dead container.
+        let db = fresh_db();
+        let store = BackendStore::new(&db);
+        store
+            .upsert(&upsert_payload(BackendPurpose::Standard), 100)
+            .unwrap();
+        store
+            .set_endpoint(BackendPurpose::Standard, None, 200)
+            .unwrap();
+        let got = store.get(BackendPurpose::Standard).unwrap().unwrap();
+        assert!(got.endpoint.is_none());
     }
 }

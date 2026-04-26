@@ -8,6 +8,13 @@ repository.workspace = true
 authors.workspace = true
 description = "Docker client + hardware profile detection (sysfs + docker info + probes)."
 
+[features]
+# Exposes `MockServiceController` for downstream test crates (server)
+# that exercise BackendSupervisor. Production builds do NOT enable
+# this — the mock is gated behind cfg(any(test, feature = "test-mock"))
+# so the trait + bollard impl ship alone.
+test-mock = []
+
 [dependencies]
 execlaw-core = { path = "../core" }
 bollard.workspace = true
@@ -18,6 +25,11 @@ tracing.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
+# Phase 12.B — service-container HTTP health probes + bollard pull
+# stream draining.
+reqwest = { workspace = true }
+futures-util = "0.3"
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

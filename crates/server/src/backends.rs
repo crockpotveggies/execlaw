@@ -28,7 +28,9 @@ use axum::response::Json;
 use axum::routing::{get, put};
 use axum::Router;
 use execlaw_core::audit::AuditStore;
-use execlaw_core::backends::{BackendError, BackendPurpose, BackendRow, BackendStore, BackendUpsert};
+use execlaw_core::backends::{
+    BackendError, BackendMode, BackendPurpose, BackendRow, BackendStore, BackendUpsert,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -49,6 +51,10 @@ pub struct BackendView {
     /// Lets the SPA decide whether to render the checkbox without
     /// duplicating the enum locally.
     pub supports_reasoning_toggle: bool,
+    /// Phase 12 — lifecycle ownership. One of "external" |
+    /// "managed". Defaults to external for every existing row; the
+    /// SPA exposes a Mode toggle.
+    pub mode: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -64,6 +70,7 @@ impl From<&BackendRow> for BackendView {
             notes: r.notes.clone(),
             reasoning_enabled: r.reasoning_enabled,
             supports_reasoning_toggle: r.purpose.supports_reasoning_toggle(),
+            mode: r.mode.as_str().to_owned(),
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -104,6 +111,15 @@ pub struct UpsertBackendRequest {
     /// it freely without per-purpose branching.
     #[serde(default)]
     pub reasoning_enabled: bool,
+    /// Phase 12 — lifecycle ownership. Defaults to "external" so
+    /// pre-Phase-12 SPAs that don't send the field keep their
+    /// current behaviour. Unknown values are rejected with 400.
+    #[serde(default = "default_mode")]
+    pub mode: String,
+}
+
+fn default_mode() -> String {
+    "external".to_owned()
 }
 
 impl From<BackendError> for ApiError {
@@ -195,6 +211,14 @@ pub async fn upsert_handler(
             message: "inference_backend is required".into(),
         });
     }
+    let mode = BackendMode::parse(&req.mode).ok_or_else(|| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        code: "unknown_mode",
+        message: format!(
+            "'{}' is not a recognised backend mode (expected 'external' or 'managed')",
+            req.mode
+        ),
+    })?;
     let store = BackendStore::new(&state.db);
     let prior = store.get(purpose).map_err(ApiError::from)?;
     let now = chrono::Utc::now().timestamp();
@@ -208,6 +232,7 @@ pub async fn upsert_handler(
                 endpoint: req.endpoint.clone(),
                 notes: req.notes.clone(),
                 reasoning_enabled: req.reasoning_enabled,
+                mode,
             },
             now,
         )
@@ -304,13 +329,144 @@ fn require_controller(state: &AppState, user: &AuthedUser) -> Result<(), ApiErro
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 12.C — managed-backend status + restart routes
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BackendStatusResponse {
+    pub purpose: String,
+    pub mode: String,
+    /// One of "Pulling" | "Starting" | "Healthy" | "CrashLooping" |
+    /// "Stopped" | "NotFound". `Stopped` for external rows.
+    pub status: String,
+    pub endpoint: Option<String>,
+    pub restart_attempts: u32,
+    /// True when the supervisor is wired (Docker reachable). False
+    /// in dev/test builds; the SPA shows a "Docker unreachable"
+    /// notice when this is false and the row is managed.
+    pub supervisor_available: bool,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/admin/backends/{purpose}/status",
+    params(("purpose" = String, Path, description = "Backend purpose")),
+    responses(
+        (status = 200, description = "Live runtime status", body = BackendStatusResponse),
+        (status = 400, description = "Unknown purpose"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "backends"
+)]
+pub async fn status_handler(
+    State(state): State<AppState>,
+    _user: AuthedUser,
+    AxumPath(purpose): AxumPath<String>,
+) -> Result<Json<BackendStatusResponse>, ApiError> {
+    let purpose = BackendPurpose::parse(&purpose).ok_or_else(|| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        code: "unknown_purpose",
+        message: format!("'{purpose}' is not a recognised backend purpose"),
+    })?;
+
+    let store = BackendStore::new(&state.db);
+    let row = store.get(purpose).map_err(ApiError::from)?;
+    // No row at all → Stopped + external. The supervisor never sees
+    // a row that doesn't exist; the SPA still wants a response so
+    // the status pill renders deterministically.
+    let (mode, endpoint) = match row {
+        Some(r) => (r.mode, r.endpoint),
+        None => (BackendMode::External, None),
+    };
+
+    let supervisor_available = state.backend_supervisor.is_some();
+    let (status, restart_attempts) = if let Some(sup) = state.backend_supervisor.as_ref() {
+        let snap = sup.snapshot_status().await;
+        let entry = snap.iter().find(|s| s.purpose == purpose);
+        match entry {
+            Some(e) => (
+                runtime_status_str(&e.status).to_owned(),
+                e.restart_attempts,
+            ),
+            None => ("Stopped".to_owned(), 0),
+        }
+    } else {
+        ("Stopped".to_owned(), 0)
+    };
+
+    Ok(Json(BackendStatusResponse {
+        purpose: purpose.as_str().to_owned(),
+        mode: mode.as_str().to_owned(),
+        status,
+        endpoint,
+        restart_attempts,
+        supervisor_available,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/admin/backends/{purpose}/restart",
+    params(("purpose" = String, Path, description = "Backend purpose")),
+    responses(
+        (status = 200, description = "Restart queued"),
+        (status = 400, description = "Unknown purpose"),
+        (status = 403, description = "Caller is not a Controller"),
+        (status = 503, description = "Supervisor not running (Docker unreachable)"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "backends"
+)]
+pub async fn restart_handler(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    AxumPath(purpose): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    require_controller(&state, &user)?;
+    let purpose = BackendPurpose::parse(&purpose).ok_or_else(|| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        code: "unknown_purpose",
+        message: format!("'{purpose}' is not a recognised backend purpose"),
+    })?;
+    let sup = state
+        .backend_supervisor
+        .as_ref()
+        .ok_or_else(|| ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "supervisor_unavailable",
+            message: "backend supervisor is not running (Docker unreachable?)".into(),
+        })?;
+    sup.restart(purpose).await.map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "supervisor_error",
+        message: e.to_string(),
+    })?;
+    Ok(StatusCode::OK)
+}
+
+fn runtime_status_str(s: &execlaw_container_manager::ServiceStatus) -> &'static str {
+    use execlaw_container_manager::ServiceStatus::*;
+    match s {
+        Pulling => "Pulling",
+        Starting => "Starting",
+        Healthy => "Healthy",
+        CrashLooping { .. } => "CrashLooping",
+        Stopped => "Stopped",
+        NotFound => "NotFound",
+    }
+}
+
 pub fn backends_router() -> Router<AppState> {
+    use axum::routing::post;
     Router::new()
         .route("/api/admin/backends", get(list_handler))
         .route(
             "/api/admin/backends/{purpose}",
             put(upsert_handler).delete(clear_handler),
         )
+        .route("/api/admin/backends/{purpose}/status", get(status_handler))
+        .route("/api/admin/backends/{purpose}/restart", post(restart_handler))
 }
 
 #[cfg(test)]
@@ -480,6 +636,187 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn list_returns_default_external_mode_for_existing_rows() {
+        // Phase 12.A: a backend created without a `mode` field
+        // (legacy SPA, missing field) defaults to external. The
+        // BackendView in the response carries that string back so
+        // the SPA can render the toggle.
+        let app = build_router(test_app_state());
+        let tok = setup_controller_token(&app).await;
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/admin/backends/Standard")
+                    .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(upsert_body().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/admin/backends")
+                    .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let standard = v["backends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["purpose"] == "Standard")
+            .unwrap();
+        assert_eq!(
+            standard["backend"]["mode"], "external",
+            "absent mode field defaults to external on the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_managed_round_trips_mode() {
+        // Phase 12.A: an explicit `mode: "managed"` round-trips on
+        // the View. The endpoint can be null at this stage — the
+        // BackendSupervisor (Phase 12.C) writes it back after spawn.
+        let app = build_router(test_app_state());
+        let tok = setup_controller_token(&app).await;
+        let mut body = upsert_body();
+        body["mode"] = serde_json::Value::String("managed".into());
+        body["endpoint"] = serde_json::Value::Null;
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/admin/backends/Standard")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["mode"], "managed");
+        assert!(v["endpoint"].is_null());
+    }
+
+    #[tokio::test]
+    async fn upsert_rejects_unknown_mode() {
+        let app = build_router(test_app_state());
+        let tok = setup_controller_token(&app).await;
+        let mut body = upsert_body();
+        body["mode"] = serde_json::Value::String("kubernetes".into());
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/admin/backends/Standard")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn status_route_reports_supervisor_unavailable_in_test_state() {
+        // Phase 12.C — test_app_state ships supervisor=None, so the
+        // status route must surface that fact (so the SPA can show a
+        // "Docker unreachable" notice).
+        let app = build_router(test_app_state());
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/admin/backends/Standard/status")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["mode"], "external");
+        assert_eq!(v["status"], "Stopped");
+        assert_eq!(v["supervisor_available"], false);
+    }
+
+    #[tokio::test]
+    async fn status_route_with_managed_supervisor_reports_healthy() {
+        // Build an AppState with a mock-controller-backed supervisor
+        // and a managed Standard row. After two reconcile passes the
+        // supervisor reports Healthy and the status route surfaces
+        // it.
+        use execlaw_container_manager::MockServiceController;
+        use execlaw_core::backends::BackendUpsert;
+        let mut state = test_app_state();
+        let mock = std::sync::Arc::new(MockServiceController::new());
+        let sup = crate::backend_supervisor::BackendSupervisor::new(
+            state.db.clone(),
+            mock.clone(),
+        );
+        state.backend_supervisor = Some(sup.clone());
+
+        // Seed a managed Standard row.
+        execlaw_core::backends::BackendStore::new(&state.db)
+            .upsert(
+                &BackendUpsert {
+                    purpose: BackendPurpose::Standard,
+                    inference_backend: "service-vllm".into(),
+                    model_spec_json: serde_json::json!({
+                        "image": "vllm:test",
+                        "args": ["--model", "X"],
+                        "container_port": 8000,
+                    }),
+                    gpu_id: Some("0".into()),
+                    endpoint: None,
+                    notes: None,
+                    reasoning_enabled: true,
+                    mode: BackendMode::Managed,
+                },
+                100,
+            )
+            .unwrap();
+        sup.reconcile_once().await;
+        sup.reconcile_once().await;
+
+        let app = build_router(state);
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/admin/backends/Standard/status")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["mode"], "managed");
+        assert_eq!(v["status"], "Healthy");
+        assert_eq!(v["supervisor_available"], true);
+        assert!(v["endpoint"].as_str().unwrap().starts_with("http://127.0.0.1:"));
+    }
+
+    #[tokio::test]
+    async fn restart_route_503_when_supervisor_absent() {
+        let app = build_router(test_app_state());
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/admin/backends/Standard/restart")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

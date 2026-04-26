@@ -18,11 +18,15 @@ import Form from "react-bootstrap/Form";
 import {
     BACKEND_PURPOSES,
     clearBackend,
+    getBackendStatus,
     getHardware,
     listBackends,
+    restartBackend,
     upsertBackend,
     type BackendListEntry,
+    type BackendMode,
     type BackendPurpose,
+    type BackendStatusResponse,
     type BackendView,
     type HardwareProfile,
 } from "../api/endpoints";
@@ -46,6 +50,11 @@ interface FormState {
     endpoint: string;
     notes: string;
     reasoning_enabled: boolean;
+    /// Phase 12 — lifecycle ownership. Default external preserves
+    /// pre-Phase-12 behaviour; switching to managed makes the
+    /// endpoint field a server-set output instead of an operator
+    /// input.
+    mode: BackendMode;
 }
 
 const EMPTY_FORM: FormState = {
@@ -55,6 +64,7 @@ const EMPTY_FORM: FormState = {
     endpoint: "",
     notes: "",
     reasoning_enabled: false,
+    mode: "external",
 };
 
 function fromBackend(b: BackendView): FormState {
@@ -65,13 +75,26 @@ function fromBackend(b: BackendView): FormState {
         endpoint: b.endpoint ?? "",
         notes: b.notes ?? "",
         reasoning_enabled: b.reasoning_enabled,
+        mode: b.mode,
     };
 }
+
+const STATUS_BADGE: Record<string, string> = {
+    Pulling: "is-pending",
+    Starting: "is-pending",
+    Healthy: "is-known",
+    CrashLooping: "is-blocked",
+    Stopped: "is-limited",
+    NotFound: "is-limited",
+};
 
 export function BackendsPage() {
     const auth = useAuth();
     const getToken = useCallback(() => auth.getAccessToken(), [auth]);
     const [entries, setEntries] = useState<BackendListEntry[] | null>(null);
+    const [statuses, setStatuses] = useState<
+        Record<string, BackendStatusResponse>
+    >({});
     const [error, setError] = useState<string | null>(null);
     const [editing, setEditing] = useState<BackendPurpose | null>(null);
     const [form, setForm] = useState<FormState>(EMPTY_FORM);
@@ -87,9 +110,52 @@ export function BackendsPage() {
         }
     }, [getToken]);
 
+    /// Pull live runtime status for every managed row. Cheap — one
+    /// HTTP per managed purpose, four max. Polled every 5s while
+    /// any managed row is configured.
+    const refreshStatuses = useCallback(
+        async (rows: BackendListEntry[]) => {
+            const managed = rows.filter(
+                (e) => e.backend && e.backend.mode === "managed",
+            );
+            if (managed.length === 0) {
+                setStatuses({});
+                return;
+            }
+            const next: Record<string, BackendStatusResponse> = {};
+            for (const entry of managed) {
+                try {
+                    const s = await getBackendStatus(entry.purpose, getToken);
+                    next[entry.purpose] = s;
+                } catch {
+                    // Silent — a transient probe failure shouldn't
+                    // pollute the page. The pill will stay stale
+                    // until the next tick.
+                }
+            }
+            setStatuses(next);
+        },
+        [getToken],
+    );
+
     useEffect(() => {
         void refresh();
     }, [refresh]);
+
+    // Poll statuses whenever the entry list changes, then every 5s
+    // for as long as at least one row is managed.
+    useEffect(() => {
+        if (!entries) return;
+        void refreshStatuses(entries);
+        const anyManaged = entries.some(
+            (e) => e.backend && e.backend.mode === "managed",
+        );
+        if (!anyManaged) return;
+        const id = window.setInterval(() => {
+            void refreshStatuses(entries);
+        }, 5_000);
+        return () => window.clearInterval(id);
+    }, [entries, refreshStatuses]);
 
     const meRole = auth.user?.role ?? "viewer";
     const canMutate = meRole === "controller";
@@ -126,12 +192,22 @@ export function BackendsPage() {
                     inference_backend: form.inference_backend.trim(),
                     model_spec: parsedSpec,
                     gpu_id: form.gpu_id.trim().length > 0 ? form.gpu_id.trim() : null,
+                    // For managed mode the operator doesn't supply
+                    // an endpoint — the supervisor writes it back
+                    // after spawn. We send null so a stale URL
+                    // from a previous external mode isn't carried
+                    // over.
                     endpoint:
-                        form.endpoint.trim().length > 0 ? form.endpoint.trim() : null,
+                        form.mode === "managed"
+                            ? null
+                            : form.endpoint.trim().length > 0
+                              ? form.endpoint.trim()
+                              : null,
                     notes: form.notes.trim().length > 0 ? form.notes.trim() : null,
                     // Server zeroes this for non-Standard purposes;
                     // we still pass the form value through.
                     reasoning_enabled: form.reasoning_enabled,
+                    mode: form.mode,
                 },
                 getToken,
             );
@@ -161,6 +237,20 @@ export function BackendsPage() {
             }
         },
         [getToken, refresh],
+    );
+
+    const onRestart = useCallback(
+        async (purpose: BackendPurpose) => {
+            try {
+                await restartBackend(purpose, getToken);
+                // Surfaces in the next status poll; refresh now
+                // for snappier UX.
+                if (entries) await refreshStatuses(entries);
+            } catch (e) {
+                setError(e instanceof Error ? e.message : String(e));
+            }
+        },
+        [entries, getToken, refreshStatuses],
     );
 
     return (
@@ -216,7 +306,7 @@ export function BackendsPage() {
                             data-testid="backend-row"
                             data-purpose={purpose}
                         >
-                            <div className="d-flex align-items-center gap-2 mb-1">
+                            <div className="d-flex align-items-center gap-2 mb-1 flex-wrap">
                                 <span className="execlaw-card__title flex-grow-1">
                                     {purpose}
                                     {!entry.configured && (
@@ -229,6 +319,14 @@ export function BackendsPage() {
                                             configured
                                         </span>
                                     )}
+                                    {entry.backend?.mode === "managed" && (
+                                        <span
+                                            className="execlaw-trust-badge ms-2 is-known"
+                                            data-testid="backend-mode-badge"
+                                        >
+                                            managed
+                                        </span>
+                                    )}
                                     {entry.backend?.reasoning_enabled && (
                                         <span
                                             className="execlaw-trust-badge ms-2 is-known"
@@ -237,6 +335,28 @@ export function BackendsPage() {
                                             reasoning on
                                         </span>
                                     )}
+                                    {entry.backend?.mode === "managed" &&
+                                        statuses[purpose] && (
+                                            <span
+                                                className={
+                                                    "execlaw-trust-badge ms-2 " +
+                                                    (STATUS_BADGE[
+                                                        statuses[purpose].status
+                                                    ] ?? "is-limited")
+                                                }
+                                                data-testid="backend-status-pill"
+                                                title={
+                                                    statuses[purpose]
+                                                        .supervisor_available
+                                                        ? "Reported by the BackendSupervisor"
+                                                        : "Docker daemon unreachable — supervisor offline"
+                                                }
+                                            >
+                                                {statuses[purpose].supervisor_available
+                                                    ? statuses[purpose].status
+                                                    : "Docker offline"}
+                                            </span>
+                                        )}
                                 </span>
                                 {canMutate && !isEditing && (
                                     <>
@@ -248,6 +368,17 @@ export function BackendsPage() {
                                         >
                                             {entry.configured ? "Edit" : "Add backend"}
                                         </Button>
+                                        {entry.backend?.mode === "managed" &&
+                                            statuses[purpose]?.supervisor_available && (
+                                                <Button
+                                                    size="sm"
+                                                    variant="outline-warning"
+                                                    onClick={() => void onRestart(purpose)}
+                                                    data-testid="backend-restart"
+                                                >
+                                                    Restart
+                                                </Button>
+                                            )}
                                         {entry.configured && (
                                             <Button
                                                 size="sm"
@@ -283,6 +414,43 @@ export function BackendsPage() {
                             )}
                             {isEditing && (
                                 <div className="mt-2" data-testid="backend-form">
+                                    <Form.Group className="mb-2">
+                                        <Form.Label className="execlaw-muted small mb-1">
+                                            Mode
+                                        </Form.Label>
+                                        <div
+                                            className="d-flex gap-3"
+                                            data-testid="backend-form-mode"
+                                        >
+                                            <Form.Check
+                                                type="radio"
+                                                id={`backend-form-mode-external-${purpose}`}
+                                                name={`backend-form-mode-${purpose}`}
+                                                label="External (operator-supplied URL)"
+                                                checked={form.mode === "external"}
+                                                onChange={() =>
+                                                    setForm({ ...form, mode: "external" })
+                                                }
+                                                data-testid="backend-form-mode-external"
+                                            />
+                                            <Form.Check
+                                                type="radio"
+                                                id={`backend-form-mode-managed-${purpose}`}
+                                                name={`backend-form-mode-${purpose}`}
+                                                label="Managed (control plane runs the container)"
+                                                checked={form.mode === "managed"}
+                                                onChange={() =>
+                                                    setForm({ ...form, mode: "managed" })
+                                                }
+                                                data-testid="backend-form-mode-managed"
+                                            />
+                                        </div>
+                                        <Form.Text className="execlaw-muted">
+                                            {form.mode === "managed"
+                                                ? "Endpoint is set by the supervisor after spawn. Provide the image tag + args in the model_spec JSON below."
+                                                : "Operator-managed endpoint. Configure the URL below."}
+                                        </Form.Text>
+                                    </Form.Group>
                                     <Form.Group className="mb-2">
                                         <Form.Label className="execlaw-muted small mb-1">
                                             Inference backend (PluginId)
@@ -336,10 +504,17 @@ export function BackendsPage() {
                                         </Form.Group>
                                         <Form.Group className="col-sm-6">
                                             <Form.Label className="execlaw-muted small mb-1">
-                                                Endpoint (optional)
+                                                Endpoint{" "}
+                                                {form.mode === "managed"
+                                                    ? "(server-managed)"
+                                                    : "(optional)"}
                                             </Form.Label>
                                             <Form.Control
-                                                value={form.endpoint}
+                                                value={
+                                                    form.mode === "managed"
+                                                        ? "(set after container spawn)"
+                                                        : form.endpoint
+                                                }
                                                 onChange={(e) =>
                                                     setForm({
                                                         ...form,
@@ -347,6 +522,7 @@ export function BackendsPage() {
                                                     })
                                                 }
                                                 placeholder="http://127.0.0.1:8000/v1"
+                                                disabled={form.mode === "managed"}
                                                 data-testid="backend-form-endpoint"
                                             />
                                         </Form.Group>

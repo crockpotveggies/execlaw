@@ -86,6 +86,11 @@ pub struct AppState {
     /// others reap after 10 minutes idle (see
     /// `crate::runner_registry::IDLE_TTL`).
     pub runner_registry: crate::runner_registry::RunnerRegistry,
+    /// Phase 12.C — supervisor for managed inference backends.
+    /// `None` when no `ServiceController` is wired (tests, dev
+    /// builds without Docker). Routes that depend on it return
+    /// 503 in that mode.
+    pub backend_supervisor: Option<crate::backend_supervisor::BackendSupervisor>,
 }
 
 impl std::fmt::Debug for AppState {
