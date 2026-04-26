@@ -2,7 +2,6 @@
 
 use crate::events::EventBus;
 use execlaw_core::Database;
-use execlaw_inference_api::InferenceClient;
 use execlaw_plugin_host::PluginHost;
 use std::sync::Arc;
 
@@ -62,10 +61,14 @@ pub struct AppState {
     /// HMAC key used to sign `state_events` rows (§7.8). `None` during
     /// tests + pre-setup; production loads it from the vault on boot.
     pub event_log_hmac_key: Option<Arc<Vec<u8>>>,
-    /// OpenAI-compatible client, constructed from `config.inference_base_url`.
-    /// `None` when no backend is configured; chat route falls back to
-    /// the Phase 0 stub reply.
-    pub inference: Option<Arc<InferenceClient>>,
+    /// Phase 12.E — inference-client resolver. Picks the right URL
+    /// per turn from `config_backends`, falling through to a
+    /// boot-time bootstrap client when no row covers the requested
+    /// purpose. The resolver itself is always present; its
+    /// `resolve` method returns `Option<Arc<InferenceClient>>` so
+    /// the chat route still falls back to the stub reply when no
+    /// URL is available anywhere.
+    pub inference: Arc<crate::inference_resolver::InferenceResolver>,
     /// Plugin lifecycle manager + hook registry. Every route that
     /// enumerates tools / transports / UI panels reads from here.
     pub plugin_host: PluginHost,

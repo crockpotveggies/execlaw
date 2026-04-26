@@ -17,6 +17,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use execlaw_core::backends::BackendPurpose;
 use execlaw_core::conversation::{
     ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
     ThreadSummary,
@@ -278,7 +279,16 @@ pub async fn send_message(
             controller_runner,
         );
     }
-    let (user_msg_seq, assistant_text, assistant_seq) = match &state.inference {
+    // Phase 12.E — pick the inference client per turn from the
+    // resolver. A managed-mode Backend whose supervisor has written
+    // its endpoint back resolves here; the bootstrap URL is used
+    // when no row covers the requested purpose. Resolved freshly on
+    // each turn so a Backends save propagates without a server
+    // restart.
+    let inference_for_turn = state
+        .inference
+        .resolve(&state.db, BackendPurpose::Standard);
+    let (user_msg_seq, assistant_text, assistant_seq) = match inference_for_turn {
         Some(inference) if use_tool_path => match run_tool_capable_turn(
             &state,
             inference.clone(),
@@ -1047,7 +1057,11 @@ pub async fn dispatch_routine_turn(
     let caller_trust = TrustLevel::Controller;
 
     let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
-    let result = match &state.inference {
+    // Phase 12.E — same per-turn resolver as send_message uses.
+    let inference_for_turn = state
+        .inference
+        .resolve(&state.db, BackendPurpose::Standard);
+    let result = match inference_for_turn {
         Some(inference) if has_plugin_tools => {
             run_tool_capable_turn(
                 state,
@@ -1488,6 +1502,54 @@ mod tests {
 
     fn build_app() -> axum::Router {
         crate::routes::build_router(test_app_state())
+    }
+
+    #[tokio::test]
+    async fn chat_routes_through_inference_resolver_when_backends_row_has_endpoint() {
+        // Phase 12.E coverage — proves the chats handler reads
+        // `state.inference.resolve(...)` per turn. Pre-12.E,
+        // `state.inference: None` always took the stub path and
+        // returned a synthetic echo (200 OK). Post-12.E, planting
+        // an external Backends row with an endpoint that no real
+        // server is listening on flips the resolver to `Some(...)`,
+        // and the chat handler attempts the call → connection
+        // refused → 500. That status delta is the regression
+        // canary if anyone accidentally re-introduces
+        // `state.inference` as a single Option.
+        use execlaw_core::backends::{
+            BackendMode, BackendPurpose, BackendStore, BackendUpsert,
+        };
+
+        let state = crate::routes::test_app_state();
+        // Plant a Backends row pointing at a port nothing's
+        // listening on (port 1 is reserved on most OSes).
+        BackendStore::new(&state.db)
+            .upsert(
+                &BackendUpsert {
+                    purpose: BackendPurpose::Standard,
+                    inference_backend: "service-vllm".into(),
+                    model_spec_json: serde_json::json!({}),
+                    gpu_id: None,
+                    endpoint: Some("http://127.0.0.1:1/v1".into()),
+                    notes: None,
+                    reasoning_enabled: false,
+                    mode: BackendMode::External,
+                },
+                100,
+            )
+            .unwrap();
+
+        let app = crate::routes::build_router(state);
+        let (status, _body) = send(app, "hi").await;
+        // Stub path would have returned 200. A 500 here means
+        // resolve() returned Some(client), the handler called
+        // run_real_turn which couldn't connect, and the err_500
+        // path fired — the new wiring is live.
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "with a Backends row in place, the chats handler must attempt the URL via the resolver instead of stubbing"
+        );
     }
 
     #[tokio::test]

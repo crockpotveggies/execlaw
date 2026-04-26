@@ -1008,9 +1008,14 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         ..Default::default()
     });
 
-    let inference = inference_base_url.map(|url| {
+    // Phase 12.E — bootstrap is the boot-time global URL; per-turn
+    // resolution may override it via config_backends rows.
+    let bootstrap_inference = inference_base_url.map(|url| {
         std::sync::Arc::new(execlaw_inference_api::InferenceClient::new(url))
     });
+    let inference = std::sync::Arc::new(
+        execlaw_server::inference_resolver::InferenceResolver::new(bootstrap_inference),
+    );
 
     // Load-or-create the event-log HMAC key. Phase 1 derives it from
     // the same OS keyring entry as the SQLCipher master; a future

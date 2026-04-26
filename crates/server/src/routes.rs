@@ -706,7 +706,11 @@ pub fn test_app_state() -> AppState {
         event_log_hmac_key: Some(Arc::new(
             b"execlaw-test-hmac-key-32-bytes!!".to_vec(),
         )),
-        inference: None,
+        // Phase 12.E — resolver with no bootstrap and no rows
+        // returns None on resolve, matching the previous
+        // `inference: None` semantics that drove the stub-turn
+        // path.
+        inference: Arc::new(crate::inference_resolver::InferenceResolver::new(None)),
         plugin_host: PluginHost::new(db.clone(), HookRegistry::new(), stage_root),
         // Test fixtures don't run the WebAuthn ceremony directly —
         // the second-factor route tests build their own AppState

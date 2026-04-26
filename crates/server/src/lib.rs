@@ -25,6 +25,7 @@ pub mod capability;
 pub mod chats;
 pub mod docs;
 pub mod events;
+pub mod inference_resolver;
 pub mod mcp_admin;
 pub mod mcp_host;
 pub mod my_identities;

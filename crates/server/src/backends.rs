@@ -222,6 +222,23 @@ pub async fn upsert_handler(
     let store = BackendStore::new(&state.db);
     let prior = store.get(purpose).map_err(ApiError::from)?;
     let now = chrono::Utc::now().timestamp();
+
+    // Phase 12.E closure — preserve the supervisor-written endpoint
+    // when an operator re-saves a managed row. The SPA always sends
+    // `endpoint: null` for managed rows (it's a server-managed
+    // field), but blindly persisting null would briefly null out
+    // the runtime URL — turning the next turn into a stub fallback
+    // until the supervisor reconciles a moment later. If the prior
+    // row was managed and had an endpoint, carry it forward; the
+    // supervisor will overwrite when the spec change actually
+    // forces a respawn.
+    let effective_endpoint = match (mode, &req.endpoint, prior.as_ref()) {
+        (BackendMode::Managed, None, Some(p)) if p.mode == BackendMode::Managed => {
+            p.endpoint.clone()
+        }
+        _ => req.endpoint.clone(),
+    };
+
     let row = store
         .upsert(
             &BackendUpsert {
@@ -229,7 +246,7 @@ pub async fn upsert_handler(
                 inference_backend: req.inference_backend.clone(),
                 model_spec_json: req.model_spec.clone(),
                 gpu_id: req.gpu_id.clone(),
-                endpoint: req.endpoint.clone(),
+                endpoint: effective_endpoint,
                 notes: req.notes.clone(),
                 reasoning_enabled: req.reasoning_enabled,
                 mode,
@@ -718,6 +735,118 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["mode"], "managed");
         assert!(v["endpoint"].is_null());
+    }
+
+    #[tokio::test]
+    async fn re_saving_managed_row_preserves_supervisor_written_endpoint() {
+        // Phase 12.E closure — the SPA sends `endpoint: null` when
+        // saving a managed row (server-managed field). The handler
+        // must NOT overwrite a supervisor-written endpoint with
+        // null, because the next turn would briefly stub-fall-back
+        // before the supervisor reconciles.
+        let app = build_router(test_app_state());
+        let tok = setup_controller_token(&app).await;
+
+        // Create a managed row.
+        let mut body = upsert_body();
+        body["mode"] = serde_json::Value::String("managed".into());
+        body["endpoint"] = serde_json::Value::Null;
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/admin/backends/Standard")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let _ = app.clone().oneshot(req).await.unwrap();
+
+        // Simulate supervisor writing the endpoint back.
+        execlaw_core::backends::BackendStore::new(
+            &execlaw_core::Database::open(
+                &execlaw_core::db::DbConfig::in_memory_unencrypted(),
+            )
+            .unwrap(),
+        );
+        // Manually patch via the actual app's DB by reissuing as
+        // an upsert with explicit endpoint — the cleanest test
+        // shape since we don't have a handle to the app's db
+        // through the router.
+        let mut body2 = upsert_body();
+        body2["mode"] = serde_json::Value::String("managed".into());
+        body2["endpoint"] = serde_json::Value::String("http://127.0.0.1:8101".into());
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/admin/backends/Standard")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body2.to_string()))
+            .unwrap();
+        let _ = app.clone().oneshot(req).await.unwrap();
+
+        // Re-save with mode=managed + endpoint=null — what the SPA
+        // sends. Handler must preserve the prior endpoint.
+        let mut body3 = upsert_body();
+        body3["mode"] = serde_json::Value::String("managed".into());
+        body3["endpoint"] = serde_json::Value::Null;
+        body3["notes"] = serde_json::Value::String("just changed notes".into());
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/admin/backends/Standard")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body3.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["endpoint"], "http://127.0.0.1:8101",
+            "managed re-save with null endpoint must preserve the prior endpoint"
+        );
+        assert_eq!(v["notes"], "just changed notes");
+    }
+
+    #[tokio::test]
+    async fn flipping_managed_to_external_lets_operator_endpoint_survive() {
+        // Mirror of the supervisor test — confirm the upsert
+        // handler also doesn't accidentally clobber when the
+        // operator flips mode while typing a fresh external URL.
+        let app = build_router(test_app_state());
+        let tok = setup_controller_token(&app).await;
+
+        // managed → endpoint set by sim
+        let mut body = upsert_body();
+        body["mode"] = serde_json::Value::String("managed".into());
+        body["endpoint"] = serde_json::Value::String("http://127.0.0.1:8101".into());
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/admin/backends/Standard")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let _ = app.clone().oneshot(req).await.unwrap();
+
+        // Flip to external with a fresh URL — handler must take the
+        // operator's input verbatim, NOT preserve the prior managed
+        // URL.
+        let mut body2 = upsert_body();
+        body2["mode"] = serde_json::Value::String("external".into());
+        body2["endpoint"] =
+            serde_json::Value::String("http://192.168.1.50:8000/v1".into());
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/admin/backends/Standard")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body2.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["mode"], "external");
+        assert_eq!(v["endpoint"], "http://192.168.1.50:8000/v1");
     }
 
     #[tokio::test]
