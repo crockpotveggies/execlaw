@@ -11,16 +11,24 @@
 //! Preset table is locked in code rather than schema-driven so the
 //! shipping defaults are deterministic + reviewable. Future per-
 //! plugin presets land via plugin manifests when the plugin host
-//! grows that surface; for v1 the four `BackendPurpose` values
-//! (Standard / Small / VoiceSTT / VoiceTTS) × three GPU vendors
-//! (NVIDIA / Intel Arc / CPU fallback) cover every host the locked
-//! decisions in §2.13 + §5.4 anticipate.
+//! grows that surface; for v1 we cover every host that has a
+//! runnable preset for its purpose — the matrix is sparse (vLLM
+//! ships NVIDIA + CPU; Whisper ships NVIDIA + Intel Arc + CPU;
+//! Kokoro ships NVIDIA + Intel Arc; Piper covers the CPU-only
+//! voice-tts fallback) but every `BackendPurpose` has at least one
+//! preset for every host class.
 //!
-//! Image references are intentionally placeholder for the
-//! execlaw-built images (`execlaw/service-whisper-cuda:v1` etc.) —
-//! the operator can override via the wizard's "Show advanced"
-//! disclosure that surfaces the raw JSON. Public images we already
-//! depend on (vLLM) use their canonical tags.
+//! Image references for the execlaw-built service-* images are
+//! intentionally placeholders — the operator overrides via the
+//! wizard's "Show advanced" disclosure when their registry differs.
+//! The vLLM GPU image (`vllm/vllm-openai`) is a real public tag.
+//! There is no published vLLM CPU image — the CPU-fallback presets
+//! reference an `execlaw/service-vllm-cpu` placeholder the
+//! deployment is responsible for building from `Dockerfile.cpu`.
+//!
+//! Each preset carries an `inference_backend` (PluginId) so the SPA
+//! never has to guess from the preset id; the server is the single
+//! source of truth for both image+args and the matching plugin.
 
 use execlaw_container_manager::GpuVendor;
 use execlaw_core::backends::BackendPurpose;
@@ -78,6 +86,11 @@ pub struct BackendPreset {
     pub id: String,
     /// Which BackendPurpose this preset belongs to.
     pub purpose: String,
+    /// PluginId of the inference plugin that runs this preset. The
+    /// SPA writes this verbatim into `inference_backend` on save —
+    /// no guessing from the preset id. Example: `service-vllm`,
+    /// `service-whisper-stt`, `service-kokoro-tts`, `service-piper-tts`.
+    pub inference_backend: String,
     /// Human-friendly display name. Example: "faster-whisper (NVIDIA)".
     pub name: String,
     /// One-sentence description for the wizard card.
@@ -163,6 +176,7 @@ pub fn all_presets() -> Vec<BackendPreset> {
         BackendPreset {
             id: "vllm-cuda".into(),
             purpose: BackendPurpose::Standard.as_str().to_owned(),
+            inference_backend: "service-vllm".into(),
             name: "vLLM (NVIDIA)".into(),
             description: "OpenAI-compatible vLLM server on NVIDIA. Default model is the locked-decision Qwen3.5-27B-AWQ; smaller GPUs override via advanced.".into(),
             image: "vllm/vllm-openai:v0.6.2".into(),
@@ -174,9 +188,14 @@ pub fn all_presets() -> Vec<BackendPreset> {
         BackendPreset {
             id: "vllm-cpu".into(),
             purpose: BackendPurpose::Standard.as_str().to_owned(),
+            inference_backend: "service-vllm".into(),
             name: "vLLM (CPU)".into(),
-            description: "CPU-only fallback for hosts without a supported GPU. Slow but functional for dev or smoke tests.".into(),
-            image: "vllm/vllm-openai:cpu-v0.6.2".into(),
+            // vLLM doesn't publish a CPU image; the deployment
+            // builds one from Dockerfile.cpu and tags it under the
+            // execlaw namespace. Operator override is encouraged
+            // via the advanced disclosure.
+            description: "CPU-only fallback for hosts without a supported GPU. Slow but functional for dev or smoke tests; image must be built locally from vLLM's Dockerfile.cpu.".into(),
+            image: "execlaw/service-vllm-cpu:v1".into(),
             container_port: 8000,
             vendor: PresetVendor::Cpu.as_str().to_owned(),
             default_args: vec![],
@@ -186,6 +205,7 @@ pub fn all_presets() -> Vec<BackendPreset> {
         BackendPreset {
             id: "vllm-small-cuda".into(),
             purpose: BackendPurpose::Small.as_str().to_owned(),
+            inference_backend: "service-vllm".into(),
             name: "vLLM Small (NVIDIA)".into(),
             description: "Same vLLM image as Standard; pinned to the small Qwen variant for voice-mode fast-path latency.".into(),
             image: "vllm/vllm-openai:v0.6.2".into(),
@@ -197,9 +217,10 @@ pub fn all_presets() -> Vec<BackendPreset> {
         BackendPreset {
             id: "vllm-small-cpu".into(),
             purpose: BackendPurpose::Small.as_str().to_owned(),
+            inference_backend: "service-vllm".into(),
             name: "vLLM Small (CPU)".into(),
-            description: "CPU fallback for the fast-path slot. Acceptable for low-volume dev work.".into(),
-            image: "vllm/vllm-openai:cpu-v0.6.2".into(),
+            description: "CPU fallback for the fast-path slot. Acceptable for low-volume dev work; image must be built locally from vLLM's Dockerfile.cpu.".into(),
+            image: "execlaw/service-vllm-cpu:v1".into(),
             container_port: 8000,
             vendor: PresetVendor::Cpu.as_str().to_owned(),
             default_args: vec![],
@@ -209,6 +230,7 @@ pub fn all_presets() -> Vec<BackendPreset> {
         BackendPreset {
             id: "whisper-faster-cuda".into(),
             purpose: BackendPurpose::VoiceStt.as_str().to_owned(),
+            inference_backend: "service-whisper-stt".into(),
             name: "faster-whisper (NVIDIA)".into(),
             description: "CTranslate2-based faster-whisper on CUDA. Locked-decision STT for NVIDIA hosts.".into(),
             image: "execlaw/service-whisper-cuda:v1".into(),
@@ -220,6 +242,7 @@ pub fn all_presets() -> Vec<BackendPreset> {
         BackendPreset {
             id: "whisper-openvino-arc".into(),
             purpose: BackendPurpose::VoiceStt.as_str().to_owned(),
+            inference_backend: "service-whisper-stt".into(),
             name: "Whisper OpenVINO (Intel Arc)".into(),
             description: "OpenVINO GenAI WhisperPipeline tuned for Intel Arc. Locked-decision STT for Intel hosts.".into(),
             image: "execlaw/service-whisper-openvino:v1".into(),
@@ -231,6 +254,7 @@ pub fn all_presets() -> Vec<BackendPreset> {
         BackendPreset {
             id: "whisper-cpu".into(),
             purpose: BackendPurpose::VoiceStt.as_str().to_owned(),
+            inference_backend: "service-whisper-stt".into(),
             name: "Whisper (CPU)".into(),
             description: "CPU-only Whisper. Latency depends on model size; tiny / base are usually acceptable on a modern CPU.".into(),
             image: "execlaw/service-whisper-cpu:v1".into(),
@@ -243,6 +267,7 @@ pub fn all_presets() -> Vec<BackendPreset> {
         BackendPreset {
             id: "kokoro-cuda".into(),
             purpose: BackendPurpose::VoiceTts.as_str().to_owned(),
+            inference_backend: "service-kokoro-tts".into(),
             name: "Kokoro-82M (NVIDIA)".into(),
             description: "Kokoro v1.0 ONNX runtime on CUDA. Voice id is per-conversation via Settings → Personality.".into(),
             image: "execlaw/service-kokoro-cuda:v1".into(),
@@ -254,6 +279,7 @@ pub fn all_presets() -> Vec<BackendPreset> {
         BackendPreset {
             id: "kokoro-openvino-arc".into(),
             purpose: BackendPurpose::VoiceTts.as_str().to_owned(),
+            inference_backend: "service-kokoro-tts".into(),
             name: "Kokoro OpenVINO (Intel Arc)".into(),
             description: "Kokoro on OpenVINO for Intel Arc. Same per-conversation voice id as the CUDA variant.".into(),
             image: "execlaw/service-kokoro-openvino:v1".into(),
@@ -265,6 +291,7 @@ pub fn all_presets() -> Vec<BackendPreset> {
         BackendPreset {
             id: "piper-cpu".into(),
             purpose: BackendPurpose::VoiceTts.as_str().to_owned(),
+            inference_backend: "service-piper-tts".into(),
             name: "Piper (CPU)".into(),
             description: "Piper as the CPU TTS fallback. Lower-quality voices than Kokoro but runs anywhere.".into(),
             image: "execlaw/service-piper:v1".into(),

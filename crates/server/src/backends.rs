@@ -498,6 +498,39 @@ pub struct PresetsQuery {
     pub purpose: String,
 }
 
+/// Pure helper that turns a `(purpose, detected_vendors)` pair into a
+/// PresetsResponse. Split out from `presets_handler` so tests can
+/// pin the input regardless of the host's `/sys` tree — the handler
+/// stays a thin axum wrapper that only does the sysfs scan.
+fn build_presets_response(
+    purpose: BackendPurpose,
+    detected_vendors: &[GpuVendor],
+) -> PresetsResponse {
+    let presets = backend_presets::presets_for(purpose, detected_vendors);
+
+    // Stringify + dedupe. A multi-card host (two NVIDIA GPUs) would
+    // otherwise yield duplicate "nvidia" entries that React keys by
+    // and warns about.
+    let mut detected_str: Vec<String> = Vec::new();
+    for v in detected_vendors {
+        let s = match v {
+            GpuVendor::Nvidia => "nvidia",
+            GpuVendor::Intel => "intel",
+            GpuVendor::Amd => "amd",
+            GpuVendor::Unknown => continue,
+        };
+        if !detected_str.iter().any(|existing| existing == s) {
+            detected_str.push(s.to_owned());
+        }
+    }
+
+    PresetsResponse {
+        purpose: purpose.as_str().to_owned(),
+        detected_vendors: detected_str,
+        presets,
+    }
+}
+
 /// `GET /api/admin/backends/presets?purpose=VoiceSTT` — returns the
 /// curated preset list for the given purpose, with per-preset
 /// `recommended` flags driven by a fresh sysfs Tier-1 hardware scan.
@@ -529,27 +562,15 @@ pub async fn presets_handler(
 
     // Fresh sysfs scan — same path as `GET /api/admin/hardware`. On
     // non-Linux dev hosts this returns an empty profile and the wizard
-    // recommends the CPU preset, which is the right answer.
+    // recommends the CPU preset, which is the right answer. A future
+    // refactor (Phase 7 desktop) should carry a HardwareProvider on
+    // AppState so the wizard works on Windows / macOS desktops too;
+    // today the control plane is meant to run inside a Linux container
+    // so the hardcoded path is the pragmatic call.
     let profile = detect_sysfs(StdPath::new("/sys"));
     let detected_vendors: Vec<GpuVendor> = profile.gpus.iter().map(|g| g.vendor).collect();
 
-    let presets = backend_presets::presets_for(purpose, &detected_vendors);
-
-    let detected_str: Vec<String> = detected_vendors
-        .iter()
-        .filter_map(|v| match v {
-            GpuVendor::Nvidia => Some("nvidia".to_owned()),
-            GpuVendor::Intel => Some("intel".to_owned()),
-            GpuVendor::Amd => Some("amd".to_owned()),
-            GpuVendor::Unknown => None,
-        })
-        .collect();
-
-    Ok(Json(PresetsResponse {
-        purpose: purpose.as_str().to_owned(),
-        detected_vendors: detected_str,
-        presets,
-    }))
+    Ok(Json(build_presets_response(purpose, &detected_vendors)))
 }
 
 pub fn backends_router() -> Router<AppState> {
@@ -1067,6 +1088,90 @@ mod tests {
     }
 
     // ---------- Phase 13.B.1 — presets endpoint --------------------------
+
+    #[test]
+    fn build_presets_response_recommends_cpu_on_no_gpu_host() {
+        // Pure helper — no sysfs dependency, so this asserts the
+        // CPU recommendation regardless of the dev host's hardware.
+        let resp = build_presets_response(BackendPurpose::VoiceStt, &[]);
+        assert_eq!(resp.purpose, "VoiceSTT");
+        assert!(resp.detected_vendors.is_empty());
+        let cpu = resp
+            .presets
+            .iter()
+            .find(|p| p.preset.id == "whisper-cpu")
+            .expect("cpu preset present");
+        assert!(cpu.recommended);
+        // GPU presets are still returned but unrecommended.
+        for p in resp.presets.iter() {
+            if p.preset.vendor != "cpu" {
+                assert!(!p.recommended);
+            }
+        }
+    }
+
+    #[test]
+    fn build_presets_response_recommends_intel_on_arc_host() {
+        let resp = build_presets_response(
+            BackendPurpose::VoiceStt,
+            &[GpuVendor::Intel],
+        );
+        assert_eq!(resp.detected_vendors, vec!["intel"]);
+        let intel = resp
+            .presets
+            .iter()
+            .find(|p| p.preset.id == "whisper-openvino-arc")
+            .unwrap();
+        assert!(intel.recommended);
+        let cpu = resp
+            .presets
+            .iter()
+            .find(|p| p.preset.id == "whisper-cpu")
+            .unwrap();
+        assert!(!cpu.recommended);
+    }
+
+    #[test]
+    fn build_presets_response_dedupes_multi_card_vendors() {
+        // Two NVIDIA cards must not produce ["nvidia", "nvidia"]
+        // — the SPA keys badges by vendor string and would warn
+        // about duplicate React keys + render two identical chips.
+        let resp = build_presets_response(
+            BackendPurpose::VoiceStt,
+            &[GpuVendor::Nvidia, GpuVendor::Nvidia, GpuVendor::Intel],
+        );
+        assert_eq!(resp.detected_vendors, vec!["nvidia", "intel"]);
+    }
+
+    #[test]
+    fn build_presets_response_skips_unknown_vendor() {
+        // Unknown vendor (e.g. unsupported PCI id) — no recommendation
+        // signal, but it shouldn't appear in the detected_vendors
+        // string list either since the SPA's vendor-label table
+        // can't render it.
+        let resp = build_presets_response(
+            BackendPurpose::VoiceStt,
+            &[GpuVendor::Unknown],
+        );
+        assert!(resp.detected_vendors.is_empty());
+    }
+
+    #[test]
+    fn build_presets_response_carries_inference_backend_per_preset() {
+        // Audit fix: SPA used to guess inference_backend from the
+        // preset id prefix. Server is now the single source of
+        // truth. Spot-check a few.
+        let resp = build_presets_response(
+            BackendPurpose::Standard,
+            &[GpuVendor::Nvidia],
+        );
+        let vllm = resp
+            .presets
+            .iter()
+            .find(|p| p.preset.id == "vllm-cuda")
+            .unwrap();
+        assert_eq!(vllm.preset.inference_backend, "service-vllm");
+    }
 
     #[tokio::test]
     async fn presets_route_returns_per_purpose_library() {

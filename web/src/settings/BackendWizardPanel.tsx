@@ -59,21 +59,6 @@ const VENDOR_LABEL: Record<string, string> = {
     cpu: "CPU",
 };
 
-/// Maps a preset id prefix to its inference-backend (PluginId). The
-/// server doesn't need this — it's purely a SPA convenience to keep
-/// the user from having to type `service-vllm` separately. Exported
-/// for direct testing — the locked preset ids in
-/// `crates/server/src/backend_presets.rs` must each match one of
-/// these prefixes; an unmapped id silently falls through to
-/// `service-managed`, which is invalid.
-export function inferenceBackendFor(presetId: string): string {
-    if (presetId.startsWith("vllm-")) return "service-vllm";
-    if (presetId.startsWith("whisper-")) return "service-whisper-stt";
-    if (presetId.startsWith("kokoro-")) return "service-kokoro-tts";
-    if (presetId.startsWith("piper-")) return "service-piper-tts";
-    return "service-managed";
-}
-
 /// Locally apply the same arg-template substitution the server does
 /// in `materialise_spec`. The wizard sends a fully-formed
 /// `model_spec` JSON straight to PUT, so this function — not the
@@ -172,7 +157,10 @@ export function BackendWizardPanel({
         const image =
             overrideImage.trim().length > 0 ? overrideImage.trim() : selected.image;
         onApply({
-            inference_backend: inferenceBackendFor(selected.id),
+            // Server-driven (audit closure) — the preset itself
+            // declares the matching PluginId so the SPA never
+            // guesses from the preset id.
+            inference_backend: selected.inference_backend,
             model_spec: {
                 image,
                 args,

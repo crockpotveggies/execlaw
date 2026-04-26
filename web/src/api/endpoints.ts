@@ -649,6 +649,11 @@ export interface PresetField {
 export interface BackendPreset {
     id: string;
     purpose: BackendPurpose;
+    /// PluginId of the inference plugin that runs this preset. The
+    /// SPA writes this verbatim into `inference_backend` on save —
+    /// no client-side guessing from the preset id (audit closure
+    /// for 13.B.1).
+    inference_backend: string;
     name: string;
     description: string;
     image: string;

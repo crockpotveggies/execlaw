@@ -9,7 +9,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import {
     BackendWizardPanel,
-    inferenceBackendFor,
     type MaterialisedSpec,
 } from "../settings/BackendWizardPanel";
 import type { PresetsResponse } from "../api/endpoints";
@@ -26,6 +25,7 @@ function makePresetsResponse(
             {
                 id: "whisper-faster-cuda",
                 purpose: "VoiceSTT",
+                inference_backend: "service-whisper-stt",
                 name: "faster-whisper (NVIDIA)",
                 description: "CTranslate2-based faster-whisper on CUDA.",
                 image: "execlaw/service-whisper-cuda:v1",
@@ -46,6 +46,7 @@ function makePresetsResponse(
             {
                 id: "whisper-cpu",
                 purpose: "VoiceSTT",
+                inference_backend: "service-whisper-stt",
                 name: "Whisper (CPU)",
                 description: "CPU-only Whisper.",
                 image: "execlaw/service-whisper-cpu:v1",
@@ -75,34 +76,6 @@ beforeEach(() => {
 
 afterEach(() => {
     vi.unstubAllGlobals();
-});
-
-describe("inferenceBackendFor", () => {
-    // Pins the prefix → PluginId map against every locked-decision
-    // preset id in `crates/server/src/backend_presets.rs`. A future
-    // preset id missing a known prefix would silently fall through
-    // to `service-managed`, which doesn't exist as a plugin — this
-    // test catches that drift before it ships.
-    it.each([
-        ["vllm-cuda", "service-vllm"],
-        ["vllm-cpu", "service-vllm"],
-        ["vllm-small-cuda", "service-vllm"],
-        ["vllm-small-cpu", "service-vllm"],
-        ["whisper-faster-cuda", "service-whisper-stt"],
-        ["whisper-openvino-arc", "service-whisper-stt"],
-        ["whisper-cpu", "service-whisper-stt"],
-        ["kokoro-cuda", "service-kokoro-tts"],
-        ["kokoro-openvino-arc", "service-kokoro-tts"],
-        ["piper-cpu", "service-piper-tts"],
-    ])("maps %s → %s", (presetId, expected) => {
-        expect(inferenceBackendFor(presetId)).toBe(expected);
-    });
-
-    it("falls through to service-managed for unrecognised ids", () => {
-        // Documents the fallback behavior explicitly so a future
-        // refactor doesn't change it accidentally.
-        expect(inferenceBackendFor("unknown-preset")).toBe("service-managed");
-    });
 });
 
 describe("BackendWizardPanel", () => {

@@ -67,11 +67,9 @@ function presetsResponseFor(purpose: string) {
             detected_vendors: ["nvidia"],
             presets: [
                 {
-                    // Use the real production preset ids so the SPA's
-                    // inferenceBackendFor() prefix-matching kicks in
-                    // and tests the wizard → form bridge end-to-end.
                     id: "vllm-cuda",
                     purpose,
+                    inference_backend: "service-vllm",
                     name: "vLLM (NVIDIA)",
                     description: "Fixture",
                     image: "test/image:v1",
@@ -92,6 +90,7 @@ function presetsResponseFor(purpose: string) {
                 {
                     id: "vllm-cpu",
                     purpose,
+                    inference_backend: "service-vllm",
                     name: "vLLM (CPU)",
                     description: "Fixture CPU",
                     image: "test/image-cpu:v1",
