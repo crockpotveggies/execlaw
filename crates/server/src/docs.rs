@@ -24,6 +24,7 @@ use crate::approvals::{
 use crate::backends::{
     BackendListEntry, BackendListResponse, BackendView, UpsertBackendRequest,
 };
+use crate::alerts::{AlertCountResponse, AlertListResponse, AlertView};
 use crate::personality::{
     PersonalityListResponse, PersonalityPreviewResponse, PersonalityView,
     UpsertPersonalityRequest,
@@ -140,6 +141,11 @@ impl Modify for SecurityAddon {
         crate::personality::upsert_conversation_handler,
         crate::personality::delete_conversation_handler,
         crate::personality::preview_handler,
+        // alerts (Phase 9.1 — operational anomalies, §10)
+        crate::alerts::list_handler,
+        crate::alerts::count_handler,
+        crate::alerts::ack_handler,
+        crate::alerts::resolve_handler,
     ),
     components(schemas(
         HealthResponse,
@@ -185,6 +191,9 @@ impl Modify for SecurityAddon {
         PersonalityListResponse,
         PersonalityPreviewResponse,
         UpsertPersonalityRequest,
+        AlertView,
+        AlertListResponse,
+        AlertCountResponse,
     )),
     tags(
         (name = "meta", description = "Liveness + introspection"),

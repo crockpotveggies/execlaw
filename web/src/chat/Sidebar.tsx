@@ -34,6 +34,17 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
     const auth = useAuth();
     const threads = useChatState((s) => s.threads);
     const activeId = useChatState((s) => s.activeId);
+    // Pending-approvals badge — when the cold-contact flow has any
+    // open approvals waiting on the controller, surface a count in
+    // the sidebar so the operator notices even without an active
+    // thread that surfaces the inline ApprovalCard.
+    const pendingApprovalCount = useChatState(
+        (s) => Object.keys(s.pendingApprovals).length,
+    );
+    // Firing-alert badge — operational anomalies surfaced through
+    // §10's alert pipeline. Polled by Chat.tsx every 60s and
+    // refreshed on focus.
+    const alertFiringCount = useChatState((s) => s.alertFiringCount);
 
     const [hideExternal, setHideExternal] = useState(false);
     const [moreExpanded, setMoreExpanded] = useState(false);
@@ -81,6 +92,24 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                     label="Contacts"
                     testId="sidebar-contacts"
                 />
+                {pendingApprovalCount > 0 && (
+                    <SidebarNavLink
+                        to="/chat"
+                        icon="bi-shield-exclamation"
+                        label="Approvals"
+                        testId="sidebar-approvals"
+                        badge={pendingApprovalCount}
+                    />
+                )}
+                {alertFiringCount > 0 && (
+                    <SidebarNavLink
+                        to="/settings/alerts"
+                        icon="bi-bell-fill"
+                        label="Alerts"
+                        testId="sidebar-alerts"
+                        badge={alertFiringCount}
+                    />
+                )}
                 <button
                     type="button"
                     className="execlaw-thread-item w-100"
@@ -230,9 +259,11 @@ interface SidebarNavLinkProps {
     icon: string;
     label: string;
     testId?: string;
+    /** Optional integer count rendered as a small accent-coloured pill. */
+    badge?: number;
 }
 
-function SidebarNavLink({ to, icon, label, testId }: SidebarNavLinkProps) {
+function SidebarNavLink({ to, icon, label, testId, badge }: SidebarNavLinkProps) {
     // NavLink applies the `is-active` className when its `to` matches
     // the current URL — so the same class hooks we use for thread
     // items light up for these top-level destinations too.
@@ -249,6 +280,15 @@ function SidebarNavLink({ to, icon, label, testId }: SidebarNavLinkProps) {
                 aria-hidden
             />
             <span className="execlaw-thread-item__name">{label}</span>
+            {badge !== undefined && badge > 0 && (
+                <span
+                    className="execlaw-nav-badge"
+                    aria-label={`${badge} pending`}
+                    data-testid={testId ? `${testId}-badge` : undefined}
+                >
+                    {badge}
+                </span>
+            )}
         </NavLink>
     );
 }

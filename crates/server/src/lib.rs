@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod alerts;
 pub mod approvals;
 pub mod auth;
 pub mod auth_extract;

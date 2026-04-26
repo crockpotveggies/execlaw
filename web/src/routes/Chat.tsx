@@ -14,6 +14,7 @@ import { Navigate } from "react-router-dom";
 import { useScreenTransition } from "../anim/useScreenTransition";
 import { ApiError } from "../api/client";
 import {
+    getAlertCount,
     listMessages,
     listPendingApprovals,
     listThreads,
@@ -37,6 +38,7 @@ import {
     clearStreamingBuffer,
     markUnread,
     setActiveThread,
+    setAlertFiringCount,
     setMessages,
     setPendingApprovals,
     setThreads,
@@ -77,21 +79,27 @@ export function Chat() {
     // Stable accessor used by everything that needs the live access token.
     const getToken = useCallback(() => auth.getAccessToken(), [auth]);
 
-    // Initial + live thread list + pending approvals + plugin UI panels.
+    // Initial + live thread list + pending approvals + plugin UI panels
+    // + firing-alert count for the sidebar badge.
     useEffect(() => {
         if (auth.status !== "authenticated") return;
         let cancelled = false;
         (async () => {
             try {
-                const [threadsResp, approvalsResp, panelsResp] = await Promise.all([
-                    listThreads(getToken),
-                    listPendingApprovals(getToken),
-                    listUiPanels(getToken),
-                ]);
+                const [threadsResp, approvalsResp, panelsResp, alertCount] =
+                    await Promise.all([
+                        listThreads(getToken),
+                        listPendingApprovals(getToken),
+                        listUiPanels(getToken),
+                        getAlertCount(getToken).catch(() => ({
+                            firing_count: 0,
+                        })),
+                    ]);
                 if (!cancelled) {
                     setThreads(threadsResp.threads);
                     setPendingApprovals(approvalsResp.approvals);
                     setUiPanels(panelsResp.panels);
+                    setAlertFiringCount(alertCount.firing_count);
                 }
             } catch (e) {
                 if (!cancelled)
@@ -105,6 +113,24 @@ export function Chat() {
         return () => {
             cancelled = true;
         };
+    }, [auth.status, getToken]);
+
+    // Cheap firing-count poll every 60s so the badge tracks alerts
+    // that arrive while the user is sitting on the chat shell. The
+    // dedicated AlertsPage refreshes its own list when opened; this
+    // poll is just for the sidebar indicator. Switch to WS-pushed
+    // alert events once the alert bus lands (§10.8).
+    useEffect(() => {
+        if (auth.status !== "authenticated") return;
+        const id = window.setInterval(async () => {
+            try {
+                const r = await getAlertCount(getToken);
+                setAlertFiringCount(r.firing_count);
+            } catch {
+                // Silent — a transient failure shouldn't pollute the UI.
+            }
+        }, 60_000);
+        return () => window.clearInterval(id);
     }, [auth.status, getToken]);
 
     // Lazy load messages on active-thread change.

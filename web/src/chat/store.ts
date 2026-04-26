@@ -31,6 +31,10 @@ export interface ChatState {
     streamingBuffer: Record<string, string>;
     /** Pending cold-contact approvals keyed by conversation id. */
     pendingApprovals: Record<string, PendingApprovalSummary>;
+    /** Count of alerts in `Firing` status. Surfaced in the sidebar
+     *  badge so the operator notices an active alert without having
+     *  to open the page. */
+    alertFiringCount: number;
 }
 
 type Listener = () => void;
@@ -42,6 +46,7 @@ let state: ChatState = {
     messages: {},
     streamingBuffer: {},
     pendingApprovals: {},
+    alertFiringCount: 0,
 };
 
 function emit() {
@@ -205,6 +210,15 @@ export function clearPendingApproval(conversationId: string) {
     });
 }
 
+/** Set the firing-alerts count surfaced by the sidebar badge. */
+export function setAlertFiringCount(count: number) {
+    setState((prev) =>
+        prev.alertFiringCount === count
+            ? prev
+            : { ...prev, alertFiringCount: count },
+    );
+}
+
 /** Test seam: reset the entire store. Production code never calls this. */
 export function __resetChatStore() {
     state = {
@@ -213,6 +227,7 @@ export function __resetChatStore() {
         messages: {},
         streamingBuffer: {},
         pendingApprovals: {},
+        alertFiringCount: 0,
     };
     emit();
 }

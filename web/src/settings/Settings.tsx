@@ -27,6 +27,7 @@ import { McpServersPage } from "./McpServersPage";
 import { RunnersPage } from "./RunnersPage";
 import { RoutinesPage } from "./RoutinesPage";
 import { PersonalityPage } from "./PersonalityPage";
+import { AlertsPage } from "./AlertsPage";
 
 const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     // User first — operator accounts, password, passkeys, sessions.
@@ -56,6 +57,7 @@ const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     // "everything else" view (controllers, delegated bots, blocked).
     { to: "/settings/contacts", icon: "bi-person-lines-fill", label: "Contacts" },
     { to: "/settings/principals", icon: "bi-people", label: "Principals" },
+    { to: "/settings/alerts", icon: "bi-bell", label: "Alerts" },
     { to: "/settings/logs", icon: "bi-list-columns", label: "Logs" },
     { to: "/settings/eval", icon: "bi-bar-chart", label: "Eval flags" },
     { to: "/settings/audit", icon: "bi-journal-text", label: "Audit" },
@@ -160,6 +162,7 @@ export function Settings() {
                         <Route path="runners" element={<RunnersPage />} />
                         <Route path="contacts" element={<ContactsPage />} />
                         <Route path="principals" element={<PrincipalsPage />} />
+                        <Route path="alerts" element={<AlertsPage />} />
                         <Route path="logs" element={<LogsPage />} />
                         <Route path="eval" element={<EvalFlagsPage />} />
                         <Route path="audit" element={<AuditPage />} />

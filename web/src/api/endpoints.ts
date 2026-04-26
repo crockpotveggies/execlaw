@@ -1182,6 +1182,94 @@ export async function previewPersonality(
     return apiFetch<PersonalityPreviewResponse>(path, {}, tokenAccessor);
 }
 
+// ---- /api/admin/alerts (Phase 9.1 — §10) ---------------------------
+
+export type AlertSeverity = "Critical" | "Error" | "Warning" | "Info";
+export type AlertStatus = "Firing" | "Acked" | "Resolved" | "Snoozed";
+
+export interface AlertView {
+    id: string;
+    fingerprint: string;
+    severity: AlertSeverity;
+    source: string;
+    title: string;
+    detail: string | null;
+    status: AlertStatus;
+    first_seen_at: number;
+    last_seen_at: number;
+    occurrence_count: number;
+    resolved_at: number | null;
+    resolved_by: string | null;
+    ack_at: number | null;
+    ack_by: string | null;
+    snooze_until: number | null;
+    incident_id: string | null;
+}
+
+export interface AlertListResponse {
+    alerts: AlertView[];
+    firing_count: number;
+}
+
+export interface AlertCountResponse {
+    firing_count: number;
+}
+
+/**
+ * List alerts with optional status filter + cap.
+ * `status` accepts comma-separated `Firing,Acked,Resolved,Snoozed`.
+ * The server caps `limit` at 1000.
+ */
+export async function listAlerts(
+    opts: { status?: AlertStatus[]; limit?: number },
+    tokenAccessor: () => string | null,
+): Promise<AlertListResponse> {
+    const qs = new URLSearchParams();
+    if (opts.status && opts.status.length > 0) {
+        qs.set("status", opts.status.join(","));
+    }
+    if (opts.limit !== undefined) {
+        qs.set("limit", String(opts.limit));
+    }
+    const path = qs.toString()
+        ? `/api/admin/alerts?${qs.toString()}`
+        : "/api/admin/alerts";
+    return apiFetch<AlertListResponse>(path, {}, tokenAccessor);
+}
+
+/** Cheap firing-count query — used by the sidebar badge. */
+export async function getAlertCount(
+    tokenAccessor: () => string | null,
+): Promise<AlertCountResponse> {
+    return apiFetch<AlertCountResponse>(
+        "/api/admin/alerts/count",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function ackAlert(
+    alertId: string,
+    tokenAccessor: () => string | null,
+): Promise<void> {
+    await apiFetch<unknown>(
+        `/api/admin/alerts/${encodeURIComponent(alertId)}/ack`,
+        { method: "POST" },
+        tokenAccessor,
+    );
+}
+
+export async function resolveAlert(
+    alertId: string,
+    tokenAccessor: () => string | null,
+): Promise<void> {
+    await apiFetch<unknown>(
+        `/api/admin/alerts/${encodeURIComponent(alertId)}/resolve`,
+        { method: "POST" },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/logout ---------------------------------------------------
 
 export async function postLogout(refreshToken: string | null): Promise<void> {
