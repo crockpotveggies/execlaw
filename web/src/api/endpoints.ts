@@ -630,6 +630,61 @@ export async function restartBackend(
     );
 }
 
+// ---- Phase 13.B.1 — backend wizard presets ------------------------
+
+/// One configurable knob a preset exposes (e.g. Whisper model size).
+/// `kind` is the discriminator the SPA uses to pick a renderer; today
+/// only "model_size" and "model" ship.
+export interface PresetField {
+    kind: string;
+    label: string;
+    choices: string[];
+    default: string;
+    /// Server-side template — purely informational on the SPA. The
+    /// server materialises the spec on save; we just round-trip the
+    /// kind+value pair.
+    arg_template: string;
+}
+
+export interface BackendPreset {
+    id: string;
+    purpose: BackendPurpose;
+    name: string;
+    description: string;
+    image: string;
+    container_port: number;
+    /// "nvidia" | "intel" | "cpu" — drives the preset's badge + the
+    /// recommended-card highlight.
+    vendor: string;
+    default_args: string[];
+    fields: PresetField[];
+}
+
+export interface PresetWithFlag extends BackendPreset {
+    /// True when this preset's vendor matches the host's detected
+    /// hardware. The wizard pre-selects the recommended card.
+    recommended: boolean;
+}
+
+export interface PresetsResponse {
+    purpose: BackendPurpose;
+    /// "nvidia" | "intel" | "amd" — empty array when no GPU was
+    /// detected. The wizard uses this for the "Detected: NVIDIA"
+    /// header badge.
+    detected_vendors: string[];
+    presets: PresetWithFlag[];
+}
+
+/// Phase 13.B.1 — fetch the curated preset list for a purpose, with
+/// per-preset `recommended` flags driven by a fresh sysfs Tier-1 scan.
+export async function listBackendPresets(
+    purpose: BackendPurpose,
+    tokenAccessor: () => string | null,
+): Promise<PresetsResponse> {
+    const url = `/api/admin/backends/presets?purpose=${encodeURIComponent(purpose)}`;
+    return apiFetch<PresetsResponse>(url, {}, tokenAccessor);
+}
+
 // ---- /api/admin/plugins/ui_panels ---------------------------------
 
 export interface UiPanelSummary {

@@ -19,6 +19,7 @@ pub mod alerts;
 pub mod approvals;
 pub mod auth;
 pub mod auth_extract;
+pub mod backend_presets;
 pub mod backend_supervisor;
 pub mod backends;
 pub mod capability;

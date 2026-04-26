@@ -31,6 +31,10 @@ import {
     type HardwareProfile,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import {
+    BackendWizardPanel,
+    type MaterialisedSpec,
+} from "./BackendWizardPanel";
 
 const PURPOSE_HINT: Record<BackendPurpose, string> = {
     Standard:
@@ -160,16 +164,44 @@ export function BackendsPage() {
     const meRole = auth.user?.role ?? "viewer";
     const canMutate = meRole === "controller";
 
+    /// True when the wizard should drive the form. We show it for
+    /// fresh "Add backend" clicks (no prior config) and let the
+    /// operator skip into raw JSON via the "I'll type the JSON" link.
+    /// Editing an already-configured row goes straight to raw JSON
+    /// since the operator's already past the picking phase.
+    const [wizardActive, setWizardActive] = useState(false);
+
     const onEdit = (entry: BackendListEntry) => {
         setEditing(entry.purpose);
         setForm(entry.backend ? fromBackend(entry.backend) : EMPTY_FORM);
         setError(null);
+        // Wizard surfaces only for fresh adds. Existing rows go to
+        // raw JSON since the operator already picked.
+        setWizardActive(!entry.configured);
     };
 
     const onCancel = () => {
         setEditing(null);
         setForm(EMPTY_FORM);
+        setWizardActive(false);
     };
+
+    /// Wizard → form bridge. The wizard hands us a fully-formed
+    /// MaterialisedSpec; we drop it into the form's managed-mode
+    /// fields, then flip into the raw-JSON view so the operator
+    /// can review + click Save.
+    const onWizardApply = useCallback((spec: MaterialisedSpec) => {
+        setForm((prev) => ({
+            ...prev,
+            mode: "managed",
+            inference_backend: spec.inference_backend,
+            model_spec: JSON.stringify(spec.model_spec, null, 2),
+            gpu_id: spec.gpu_id,
+            // Managed mode — endpoint is server-managed.
+            endpoint: "",
+        }));
+        setWizardActive(false);
+    }, []);
 
     const onSave = useCallback(async () => {
         if (!editing) return;
@@ -412,7 +444,30 @@ export function BackendsPage() {
                                     )}
                                 </div>
                             )}
-                            {isEditing && (
+                            {isEditing && wizardActive && (
+                                <div
+                                    className="mt-2"
+                                    data-testid="backend-wizard-host"
+                                >
+                                    <BackendWizardPanel
+                                        purpose={purpose}
+                                        getToken={getToken}
+                                        onApply={onWizardApply}
+                                        onSkip={() => setWizardActive(false)}
+                                    />
+                                    <div className="mt-2">
+                                        <Button
+                                            variant="outline-secondary"
+                                            size="sm"
+                                            onClick={onCancel}
+                                            data-testid="backend-wizard-cancel"
+                                        >
+                                            Cancel
+                                        </Button>
+                                    </div>
+                                </div>
+                            )}
+                            {isEditing && !wizardActive && (
                                 <div className="mt-2" data-testid="backend-form">
                                     <Form.Group className="mb-2">
                                         <Form.Label className="execlaw-muted small mb-1">
@@ -585,6 +640,15 @@ export function BackendsPage() {
                                         >
                                             Cancel
                                         </Button>
+                                        {form.mode === "managed" && (
+                                            <Button
+                                                variant="outline-secondary"
+                                                onClick={() => setWizardActive(true)}
+                                                data-testid="backend-form-rerun-wizard"
+                                            >
+                                                Re-run wizard
+                                            </Button>
+                                        )}
                                     </div>
                                 </div>
                             )}

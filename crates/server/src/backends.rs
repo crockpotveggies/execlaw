@@ -20,18 +20,21 @@
 //!     PUTting a placeholder.
 
 use crate::auth_extract::AuthedUser;
+use crate::backend_presets::{self, PresetsResponse};
 use crate::routes::ApiError;
 use crate::state::AppState;
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, put};
 use axum::Router;
+use execlaw_container_manager::{detect_sysfs, GpuVendor};
 use execlaw_core::audit::AuditStore;
 use execlaw_core::backends::{
     BackendError, BackendMode, BackendPurpose, BackendRow, BackendStore, BackendUpsert,
 };
 use serde::{Deserialize, Serialize};
+use std::path::Path as StdPath;
 use utoipa::ToSchema;
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -485,10 +488,75 @@ fn runtime_status_str(s: &execlaw_container_manager::ServiceStatus) -> &'static 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 13.B.1 — managed-backend preset wizard endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct PresetsQuery {
+    /// Backend purpose: Standard | Small | VoiceSTT | VoiceTTS.
+    pub purpose: String,
+}
+
+/// `GET /api/admin/backends/presets?purpose=VoiceSTT` — returns the
+/// curated preset list for the given purpose, with per-preset
+/// `recommended` flags driven by a fresh sysfs Tier-1 hardware scan.
+///
+/// The wizard calls this once on Mount. It only reads — no DB writes,
+/// no supervisor side-effects — so it doesn't need Controller role
+/// (the existing `AuthedUser` extractor is enough; `PUT` on the same
+/// row still requires Controller).
+#[utoipa::path(
+    get,
+    path = "/api/admin/backends/presets",
+    params(("purpose" = String, Query, description = "Backend purpose: Standard | Small | VoiceSTT | VoiceTTS")),
+    responses(
+        (status = 200, description = "Hardware-aware preset list", body = PresetsResponse),
+        (status = 400, description = "Unknown purpose"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "backends"
+)]
+pub async fn presets_handler(
+    _user: AuthedUser,
+    Query(q): Query<PresetsQuery>,
+) -> Result<Json<PresetsResponse>, ApiError> {
+    let purpose = BackendPurpose::parse(&q.purpose).ok_or_else(|| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        code: "unknown_purpose",
+        message: format!("'{}' is not a recognised backend purpose", q.purpose),
+    })?;
+
+    // Fresh sysfs scan — same path as `GET /api/admin/hardware`. On
+    // non-Linux dev hosts this returns an empty profile and the wizard
+    // recommends the CPU preset, which is the right answer.
+    let profile = detect_sysfs(StdPath::new("/sys"));
+    let detected_vendors: Vec<GpuVendor> = profile.gpus.iter().map(|g| g.vendor).collect();
+
+    let presets = backend_presets::presets_for(purpose, &detected_vendors);
+
+    let detected_str: Vec<String> = detected_vendors
+        .iter()
+        .filter_map(|v| match v {
+            GpuVendor::Nvidia => Some("nvidia".to_owned()),
+            GpuVendor::Intel => Some("intel".to_owned()),
+            GpuVendor::Amd => Some("amd".to_owned()),
+            GpuVendor::Unknown => None,
+        })
+        .collect();
+
+    Ok(Json(PresetsResponse {
+        purpose: purpose.as_str().to_owned(),
+        detected_vendors: detected_str,
+        presets,
+    }))
+}
+
 pub fn backends_router() -> Router<AppState> {
     use axum::routing::post;
     Router::new()
         .route("/api/admin/backends", get(list_handler))
+        .route("/api/admin/backends/presets", get(presets_handler))
         .route(
             "/api/admin/backends/{purpose}",
             put(upsert_handler).delete(clear_handler),
@@ -996,5 +1064,118 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["reasoning_enabled"], true);
         assert_eq!(v["supports_reasoning_toggle"], true);
+    }
+
+    // ---------- Phase 13.B.1 — presets endpoint --------------------------
+
+    #[tokio::test]
+    async fn presets_route_returns_per_purpose_library() {
+        let app = build_router(test_app_state());
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/admin/backends/presets?purpose=VoiceSTT")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["purpose"], "VoiceSTT");
+
+        let presets = v["presets"].as_array().unwrap();
+        // VoiceSTT ships nvidia + intel + cpu presets per the locked decisions.
+        assert!(presets.iter().any(|p| p["id"] == "whisper-faster-cuda"));
+        assert!(presets.iter().any(|p| p["id"] == "whisper-openvino-arc"));
+        assert!(presets.iter().any(|p| p["id"] == "whisper-cpu"));
+
+        // Whisper preset must surface model_size with default = small.
+        let whisper = presets
+            .iter()
+            .find(|p| p["id"] == "whisper-faster-cuda")
+            .unwrap();
+        let fields = whisper["fields"].as_array().unwrap();
+        let model_size = fields
+            .iter()
+            .find(|f| f["kind"] == "model_size")
+            .expect("Whisper preset must expose model_size");
+        assert_eq!(model_size["default"], "small");
+    }
+
+    #[tokio::test]
+    async fn presets_route_recommends_cpu_when_no_gpu_detected() {
+        // Test hosts without /sys (e.g. macOS CI) get an empty profile,
+        // which the wizard interprets as "no GPU detected" and the CPU
+        // preset is the recommended one.
+        let app = build_router(test_app_state());
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/admin/backends/presets?purpose=VoiceTTS")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // On a no-GPU host the SPA shows the CPU card highlighted.
+        // We can't assert "exactly the CPU preset is recommended"
+        // because the dev rig may have an NVIDIA GPU; instead assert
+        // every recommended preset's vendor matches at least one
+        // detected vendor or 'cpu' iff no GPU was detected.
+        let detected = v["detected_vendors"].as_array().unwrap();
+        let presets = v["presets"].as_array().unwrap();
+        for p in presets {
+            if p["recommended"].as_bool().unwrap_or(false) {
+                let vendor = p["vendor"].as_str().unwrap();
+                if detected.is_empty() {
+                    assert_eq!(
+                        vendor, "cpu",
+                        "no-GPU host must only recommend CPU presets"
+                    );
+                } else {
+                    assert!(
+                        detected.iter().any(|d| d.as_str() == Some(vendor))
+                            || vendor == "cpu" && detected.is_empty(),
+                        "recommended preset's vendor must match a detected GPU"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn presets_route_rejects_unknown_purpose() {
+        let app = build_router(test_app_state());
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/admin/backends/presets?purpose=Hallucinated")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn presets_route_requires_auth() {
+        let app = build_router(test_app_state());
+        // No setup, no token — the auth extractor should reject.
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/admin/backends/presets?purpose=Standard")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            resp.status() == StatusCode::UNAUTHORIZED
+                || resp.status() == StatusCode::FORBIDDEN,
+            "expected auth rejection, got {}",
+            resp.status()
+        );
     }
 }

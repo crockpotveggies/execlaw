@@ -21,6 +21,9 @@ use crate::approvals::{
     IdentifierSummary, PendingApprovalSummary, PendingApprovalsResponse,
     PrincipalListResponse, PrincipalSummary,
 };
+use crate::backend_presets::{
+    BackendPreset, PresetField, PresetWithFlag, PresetsResponse,
+};
 use crate::backends::{
     BackendListEntry, BackendListResponse, BackendStatusResponse, BackendView,
     UpsertBackendRequest,
@@ -128,6 +131,8 @@ impl Modify for SecurityAddon {
         // backend supervisor (Phase 12.C — managed-mode lifecycle)
         crate::backends::status_handler,
         crate::backends::restart_handler,
+        // backend presets (Phase 13.B.1 — managed-mode wizard library)
+        crate::backends::presets_handler,
         // runners (Phase 8.5 — view-only + restart)
         crate::runners_admin::list_handler,
         crate::runners_admin::restart_handler,
@@ -203,6 +208,10 @@ impl Modify for SecurityAddon {
         BackendListEntry,
         BackendStatusResponse,
         UpsertBackendRequest,
+        BackendPreset,
+        PresetField,
+        PresetWithFlag,
+        PresetsResponse,
         RunnerView,
         RunnerListResponse,
         UserView,
