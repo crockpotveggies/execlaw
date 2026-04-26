@@ -1004,7 +1004,6 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
 
     let config = std::sync::Arc::new(execlaw_server::ServerConfig {
         bind_addr: bind.parse()?,
-        inference_base_url: inference_base_url.clone(),
         ..Default::default()
     });
 
