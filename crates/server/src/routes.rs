@@ -724,7 +724,26 @@ pub fn test_app_state() -> AppState {
         // routes report 503 if exercised. Tests that DO want a
         // mock-backed supervisor construct AppState manually.
         backend_supervisor: None,
-        voice_sessions: crate::voice_session::VoiceSessionRegistry::new(events),
+        voice_sessions: crate::voice_session::VoiceSessionRegistry::new(events.clone()),
+        // Test fixtures use mock STT/TTS factories — production
+        // wires real Whisper + Kokoro clients via
+        // `VoiceRuntime::with_http_clients` from `cli/main.rs`.
+        voice_runtime: crate::voice_runtime::VoiceRuntime::new(
+            events,
+            std::sync::Arc::new(|| {
+                Box::new(execlaw_voice_pipeline::traits::MockStt::new(
+                    Vec::new(),
+                    String::new(),
+                ))
+            }),
+            std::sync::Arc::new(|| {
+                (
+                    Box::new(execlaw_voice_pipeline::traits::MockTts::default())
+                        as Box<dyn execlaw_voice_pipeline::traits::TtsClient>,
+                    None,
+                )
+            }),
+        ),
     }
 }
 

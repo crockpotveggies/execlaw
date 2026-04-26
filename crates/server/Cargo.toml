@@ -18,6 +18,7 @@ execlaw-runner-local = { path = "../runner-local" }
 execlaw-plugin-host = { path = "../plugin-host" }
 execlaw-container-manager = { path = "../container-manager" }
 execlaw-mcp-client = { path = "../mcp-client" }
+execlaw-voice-pipeline = { path = "../voice-pipeline" }
 futures.workspace = true
 tempfile.workspace = true
 
@@ -43,6 +44,12 @@ uuid.workspace = true
 async-trait.workspace = true
 dashmap.workspace = true
 rusqlite.workspace = true
+
+# Phase 13.C — voice STT/TTS adapters POST audio to the managed
+# faster-whisper / Kokoro containers. Multipart for the WAV upload,
+# json for the TTS request body, stream for future barge-in
+# cancellation. No default features so OpenSSL doesn't sneak back in.
+reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls", "multipart", "stream"] }
 
 utoipa.workspace = true
 utoipa-axum.workspace = true
@@ -83,6 +90,9 @@ execlaw-plugin-sdk = { path = "../plugin-sdk" }
 # that the container-manager crate exposes behind the test-mock
 # feature.
 execlaw-container-manager = { path = "../container-manager", features = ["test-mock"] }
+# Phase 13.C — integration tests build their own AppState with mock
+# voice clients, which live in the voice-pipeline crate.
+execlaw-voice-pipeline = { path = "../voice-pipeline" }
 
 [[bench]]
 name = "server_hot_paths"

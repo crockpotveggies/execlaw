@@ -36,9 +36,11 @@ interface Props {
      * with voice plumbing.
      */
     sendVoiceFrame?: (bytes: ArrayBuffer) => boolean;
+    /// Phase 13.C — voice control passthrough.
+    sendVoiceControl?: (payload: object) => boolean;
 }
 
-export function WelcomeView({ onSend, sendVoiceFrame }: Props) {
+export function WelcomeView({ onSend, sendVoiceFrame, sendVoiceControl }: Props) {
     return (
         <div className="execlaw-welcome" data-testid="welcome-view">
             <div className="execlaw-welcome__brand">
@@ -47,7 +49,11 @@ export function WelcomeView({ onSend, sendVoiceFrame }: Props) {
             </div>
 
             <div className="execlaw-welcome__composer">
-                <Composer onSend={onSend} sendVoiceFrame={sendVoiceFrame} />
+                <Composer
+                    onSend={onSend}
+                    sendVoiceFrame={sendVoiceFrame}
+                    sendVoiceControl={sendVoiceControl}
+                />
             </div>
 
             <div className="execlaw-welcome__suggestions">

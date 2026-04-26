@@ -30,6 +30,7 @@ import { ApprovalCard } from "../chat/ApprovalCard";
 import { Composer } from "../chat/Composer";
 import { MessageStream } from "../chat/MessageStream";
 import { Sidebar } from "../chat/Sidebar";
+import { VoicePlayback, type VoiceAudioOutbound } from "../chat/VoicePlayback";
 import { WelcomeView } from "../chat/WelcomeView";
 import {
     appendMessage,
@@ -62,6 +63,19 @@ export function Chat() {
     const [topError, setTopError] = useState<string | null>(null);
     const [uiPanels, setUiPanels] = useState<UiPanelSummary[] | null>(null);
     const wsRef = useRef<WsClient | null>(null);
+    /// Phase 13.C — VoicePlayback singleton for the chat shell.
+    /// Lazily constructed on the first VoiceAudioOutbound event so
+    /// browsers that gate AudioContext on a user gesture don't error
+    /// before the operator's first mic press.
+    const playbackRef = useRef<VoicePlayback | null>(null);
+    /// Live voice transcript per session — keeps the SPA's "still
+    /// listening…" indicator + commits the final text once the
+    /// server flushes Whisper.
+    const [voiceTranscript, setVoiceTranscript] = useState<{
+        session: string;
+        text: string;
+        is_final: boolean;
+    } | null>(null);
 
     // Chat shell fade: opacity-only on both ends. Login screen's
     // scale-up + fade picks up after the shell has fully faded out.
@@ -176,6 +190,11 @@ export function Chat() {
         return () => {
             client.close();
             wsRef.current = null;
+            // Release the AudioContext when the chat shell unmounts.
+            if (playbackRef.current) {
+                playbackRef.current.close();
+                playbackRef.current = null;
+            }
         };
     }, [auth.status, getToken]);
 
@@ -284,6 +303,47 @@ export function Chat() {
                     setThreadProcessing(cid, processing);
                 }
                 break;
+            // ---- Phase 13.C — voice events --------------------------
+            case "voice_transcript": {
+                // The server's final transcript for this utterance.
+                // Pre-final partials are emitted by future streaming
+                // adapters; v1 ships only `is_final: true`.
+                const session = typeof ev.session === "string" ? ev.session : "";
+                const text = typeof ev.text === "string" ? ev.text : "";
+                const isFinal = ev.is_final === true;
+                if (session) {
+                    setVoiceTranscript({ session, text, is_final: isFinal });
+                }
+                break;
+            }
+            case "voice_audio_outbound": {
+                // Server is streaming TTS audio. Lazily instantiate
+                // the VoicePlayback queue and enqueue the chunk.
+                if (!playbackRef.current) {
+                    playbackRef.current = new VoicePlayback(24_000);
+                }
+                playbackRef.current.enqueue(ev as unknown as VoiceAudioOutbound);
+                break;
+            }
+            case "voice_interrupted": {
+                // Operator (or server-side VAD) interrupted the
+                // agent's reply. Flush playback + clear the
+                // transcript banner so the operator sees the
+                // pipeline reset.
+                if (playbackRef.current) {
+                    playbackRef.current.flush();
+                }
+                setVoiceTranscript(null);
+                break;
+            }
+            case "voice_session_ended": {
+                // Drop the playback queue's pending chunks — the
+                // session is over.
+                if (playbackRef.current) {
+                    playbackRef.current.flush();
+                }
+                break;
+            }
             default:
                 // Ignore unknown event kinds — additive event vocabulary.
                 break;
@@ -324,6 +384,10 @@ export function Chat() {
                     sendVoiceFrame={(bytes) =>
                         wsRef.current?.sendBinary(bytes) ?? false
                     }
+                    sendVoiceControl={(payload) =>
+                        wsRef.current?.sendText(payload) ?? false
+                    }
+                    voiceTranscript={voiceTranscript}
                 />
             </main>
         </div>
@@ -340,10 +404,18 @@ function ChatPane({
     activeId,
     onSend,
     sendVoiceFrame,
+    sendVoiceControl,
+    voiceTranscript,
 }: {
     activeId: string | null;
     onSend: (text: string) => Promise<void> | void;
     sendVoiceFrame: (bytes: ArrayBuffer) => boolean;
+    sendVoiceControl: (payload: object) => boolean;
+    voiceTranscript: {
+        session: string;
+        text: string;
+        is_final: boolean;
+    } | null;
 }) {
     const messages = useChatState((s) =>
         activeId ? s.messages[activeId] ?? null : null,
@@ -356,14 +428,103 @@ function ChatPane({
         ((messages?.length ?? 0) > 0 || (streaming?.length ?? 0) > 0);
 
     if (!hasContent) {
-        return <WelcomeView onSend={onSend} sendVoiceFrame={sendVoiceFrame} />;
+        return (
+            <>
+                <VoiceStatusBar
+                    transcript={voiceTranscript}
+                    sendVoiceControl={sendVoiceControl}
+                />
+                <WelcomeView
+                    onSend={onSend}
+                    sendVoiceFrame={sendVoiceFrame}
+                    sendVoiceControl={sendVoiceControl}
+                />
+            </>
+        );
     }
     return (
-        <ActiveThreadPane
-            conversationId={activeId!}
-            onSend={onSend}
-            sendVoiceFrame={sendVoiceFrame}
-        />
+        <>
+            <VoiceStatusBar
+                transcript={voiceTranscript}
+                sendVoiceControl={sendVoiceControl}
+            />
+            <ActiveThreadPane
+                conversationId={activeId!}
+                onSend={onSend}
+                sendVoiceFrame={sendVoiceFrame}
+                sendVoiceControl={sendVoiceControl}
+            />
+        </>
+    );
+}
+
+/// Phase 13.C — small banner showing the voice transcript + an
+/// "Interrupt" button while the agent is speaking. Mounts in both
+/// WelcomeView and ActiveThreadPane so the operator sees the same
+/// indicator regardless of conversation state.
+function VoiceStatusBar({
+    transcript,
+    sendVoiceControl,
+}: {
+    transcript: {
+        session: string;
+        text: string;
+        is_final: boolean;
+    } | null;
+    sendVoiceControl: (payload: object) => boolean;
+}) {
+    if (!transcript) return null;
+    const onInterrupt = () => {
+        sendVoiceControl({
+            op: "voice_interrupt",
+            session: transcript.session,
+        });
+    };
+    // Empty final transcript = either silence or the codec mismatch
+    // documented in docs/voice-followups.md. Surface it explicitly
+    // so the operator doesn't see a phantom blank banner.
+    const isEmptyFinal =
+        transcript.is_final && transcript.text.trim().length === 0;
+    return (
+        <div
+            className="execlaw-voice-banner mx-3 mt-2 d-flex align-items-center gap-2"
+            data-testid="voice-status-bar"
+            data-empty-final={isEmptyFinal ? "true" : "false"}
+        >
+            <span className="execlaw-muted small flex-grow-1">
+                {isEmptyFinal ? (
+                    <>
+                        <i
+                            className="bi bi-exclamation-triangle me-1"
+                            aria-hidden
+                        />
+                        Voice STT didn't return a transcript — make sure a
+                        VoiceSTT backend is configured (Settings → Backends)
+                        and that mic input is reaching the server.
+                    </>
+                ) : transcript.is_final ? (
+                    <>
+                        <i className="bi bi-mic me-1" aria-hidden />
+                        <em>{transcript.text}</em>
+                    </>
+                ) : (
+                    <>
+                        <i className="bi bi-mic-fill me-1" aria-hidden />
+                        Listening… {transcript.text}
+                    </>
+                )}
+            </span>
+            {transcript.is_final && !isEmptyFinal && (
+                <button
+                    type="button"
+                    className="btn btn-sm btn-outline-warning"
+                    onClick={onInterrupt}
+                    data-testid="voice-interrupt"
+                >
+                    Interrupt
+                </button>
+            )}
+        </div>
     );
 }
 
@@ -371,10 +532,12 @@ function ActiveThreadPane({
     conversationId,
     onSend,
     sendVoiceFrame,
+    sendVoiceControl,
 }: {
     conversationId: string;
     onSend: (text: string) => Promise<void> | void;
     sendVoiceFrame: (bytes: ArrayBuffer) => boolean;
+    sendVoiceControl: (payload: object) => boolean;
 }) {
     const auth = useAuth();
     const getToken = useCallback(() => auth.getAccessToken(), [auth]);
@@ -549,7 +712,11 @@ function ActiveThreadPane({
                     busy={approvalBusy}
                     onRespond={(id, verb) => void onApprovalRespond(id, verb)}
                 />
-                <Composer onSend={onSend} sendVoiceFrame={sendVoiceFrame} />
+                <Composer
+                    onSend={onSend}
+                    sendVoiceFrame={sendVoiceFrame}
+                    sendVoiceControl={sendVoiceControl}
+                />
             </div>
         </>
     );

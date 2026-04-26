@@ -1101,6 +1101,50 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     let voice_sessions =
         execlaw_server::voice_session::VoiceSessionRegistry::new(events.clone());
 
+    // Phase 13.C — voice runtime resolves Whisper / Kokoro endpoints
+    // from `config_backends` per session. The factories pull URLs +
+    // voice id at construction time; a Backends save mid-conversation
+    // takes effect on the next utterance (mirrors InferenceResolver).
+    let voice_runtime = {
+        let db_for_whisper = db.clone();
+        let db_for_kokoro = db.clone();
+        let db_for_voice = db.clone();
+        execlaw_server::voice_runtime::VoiceRuntime::with_http_clients(
+            events.clone(),
+            std::sync::Arc::new(move || {
+                use execlaw_core::backends::{BackendPurpose, BackendStore};
+                BackendStore::new(&db_for_whisper)
+                    .get(BackendPurpose::VoiceStt)
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.endpoint)
+                    .filter(|s| !s.trim().is_empty())
+            }),
+            std::sync::Arc::new(move || {
+                use execlaw_core::backends::{BackendPurpose, BackendStore};
+                BackendStore::new(&db_for_kokoro)
+                    .get(BackendPurpose::VoiceTts)
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.endpoint)
+                    .filter(|s| !s.trim().is_empty())
+            }),
+            std::sync::Arc::new(move || {
+                // Voice id from Settings → Personality (default
+                // personality row). Falls back to the locked-decision
+                // blend `bf_emma+am_michael` when no personality
+                // row carries a `voice_id`.
+                use execlaw_core::personality::PersonalityStore;
+                PersonalityStore::new(&db_for_voice)
+                    .get_default()
+                    .ok()
+                    .and_then(|p| p.voice_id)
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "bf_emma+am_michael".to_owned())
+            }),
+        )
+    };
+
     let state = execlaw_server::AppState {
         db: db.clone(),
         config: config.clone(),
@@ -1115,6 +1159,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         runner_registry: runner_registry.clone(),
         backend_supervisor,
         voice_sessions,
+        voice_runtime,
     };
 
     // Phase-7 background workers — run for the lifetime of the
@@ -1179,6 +1224,17 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         let stop = sweep_stop.clone();
         tokio::spawn(async move { sup.run(stop).await });
     }
+
+    // Phase 13.D — voice-session reaper. Drops idle voice sessions
+    // (operator closed the tab mid-mic) every REAP_INTERVAL so the
+    // registry doesn't accumulate ghost entries. Both the
+    // VoiceSessionRegistry and VoiceRuntime are passed in so future
+    // versions can sweep both maps in lockstep.
+    execlaw_server::voice_reaper::spawn(
+        state.voice_sessions.clone(),
+        state.voice_runtime.clone(),
+        sweep_stop.clone(),
+    );
 
     let app = execlaw_server::routes::build_router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

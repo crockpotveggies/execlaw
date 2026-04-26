@@ -27,6 +27,12 @@ interface Props {
      */
     sendBinary: (bytes: ArrayBuffer) => boolean;
     /**
+     * Phase 13.C — fire a control message upstream. Carries
+     * voice_stop on mic-off (server flushes STT + runs the agent
+     * reply path). Returns false silently when the WS is offline.
+     */
+    sendControl?: (payload: object) => boolean;
+    /**
      * Disabled when the chat shell is busy with another action
      * (e.g. composer mid-submit) or when the WebSocket is offline.
      */
@@ -56,6 +62,7 @@ function pickSupportedMimeType(): string | undefined {
 
 export function VoiceCaptureButton({
     sendBinary,
+    sendControl,
     disabled,
     timesliceMs = DEFAULT_TIMESLICE_MS,
 }: Props) {
@@ -106,9 +113,16 @@ export function VoiceCaptureButton({
             }
             streamRef.current = null;
         }
+        // Phase 13.C — tell the server to flush STT + run the agent
+        // reply path. The server's `voice_stop` handler also closes
+        // the registry session and emits VoiceSessionEnded.
+        const sess = sessionRef.current;
+        if (sess && sendControl) {
+            sendControl({ op: "voice_stop", session: sess.sessionId });
+        }
         sessionRef.current = null;
         setRecording(false);
-    }, []);
+    }, [sendControl]);
 
     const startRecording = useCallback(async () => {
         setError(null);

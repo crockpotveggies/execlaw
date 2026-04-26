@@ -202,13 +202,15 @@ pub async fn stream_handler(
 ) -> impl IntoResponse {
     let bus = state.events.clone();
     let voice = state.voice_sessions.clone();
-    ws.on_upgrade(move |socket| handle_socket(socket, bus, voice))
+    let runtime = state.voice_runtime.clone();
+    ws.on_upgrade(move |socket| handle_socket(socket, bus, voice, runtime))
 }
 
 async fn handle_socket(
     mut socket: WebSocket,
     bus: EventBus,
     voice: crate::voice_session::VoiceSessionRegistry,
+    runtime: crate::voice_runtime::VoiceRuntime,
 ) {
     let mut rx = bus.subscribe();
     debug!(
@@ -253,14 +255,16 @@ async fn handle_socket(
                 Some(Ok(Message::Binary(bytes))) => {
                     // Phase 13.B — parse the framing header, then
                     // hand the chunk to the voice-session registry.
-                    // The registry owns per-session jitter buffer
-                    // + lifecycle events; the Phase-13.C
-                    // WhisperClient adapter consumes the released
-                    // chunks for real STT.
+                    // Phase 13.C — the registry's released chunks
+                    // are forwarded into `voice_runtime.ingest_chunks`,
+                    // which feeds the real Whisper adapter.
                     match crate::voice_frame::parse_frame(&bytes) {
                         Ok((header, payload)) => {
                             let outcome = voice.observe_frame(&header, payload).await;
                             voice.publish_outcome(&header, &outcome);
+                            if !outcome.released.is_empty() {
+                                runtime.ingest_chunks(&outcome.released).await;
+                            }
                         }
                         Err(e) => {
                             warn!(
@@ -269,6 +273,16 @@ async fn handle_socket(
                             );
                         }
                     }
+                }
+                Some(Ok(Message::Text(text))) => {
+                    // Phase 13.C / 13.D — voice control messages.
+                    // Schema:
+                    //   {"op":"voice_stop","session":"…"}
+                    //   {"op":"voice_interrupt","session":"…"}
+                    // Anything else is ignored. The control surface
+                    // is intentionally tiny so a malformed message
+                    // can't tear down the WS.
+                    handle_voice_control(&text, &voice, &runtime).await;
                 }
                 Some(Ok(_)) => {} // ignore other client→server traffic
                 Some(Err(e)) => {
@@ -279,6 +293,68 @@ async fn handle_socket(
         }
     }
     debug!("ws stream disconnected");
+}
+
+/// Phase 13.C/D — parse + dispatch a voice-control text message.
+/// Public for unit testing; the WS handler calls it directly.
+pub async fn handle_voice_control(
+    text: &str,
+    voice: &crate::voice_session::VoiceSessionRegistry,
+    runtime: &crate::voice_runtime::VoiceRuntime,
+) {
+    let parsed: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(_) => return, // not JSON — silently ignore (could be a future text op)
+    };
+    let op = parsed.get("op").and_then(|v| v.as_str()).unwrap_or("");
+    let session = parsed
+        .get("session")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if session.is_empty() {
+        return;
+    }
+    match op {
+        "voice_stop" => {
+            // Operator toggled mic off. Flush STT, then run the
+            // agent reply path. The agent callback is wired in the
+            // chat layer (Phase 13.C+); for v1 we stub with the
+            // identity transcript so the pipeline is observable
+            // end-to-end without yet plumbing into the chat router.
+            // The real agent_reply hookup lands in 13.D.
+            //
+            // The finalize_utterance + drop_session run sequentially
+            // — finalize awaits the agent reply + TTS, drop_session
+            // can only run once that returns or there's a race
+            // between the cleanup and an in-flight synthesize.
+            let session_id = session.to_owned();
+            let runtime_for_finalize = runtime.clone();
+            let runtime_for_cleanup = runtime.clone();
+            let voice_for_cleanup = voice.clone();
+            tokio::spawn(async move {
+                runtime_for_finalize
+                    .finalize_utterance(&session_id, |transcript| async move {
+                        // Placeholder: echo the transcript so the
+                        // SPA can verify the round-trip. Phase 13.D
+                        // wires this to the runner / chat path.
+                        format!("you said: {transcript}")
+                    })
+                    .await;
+                voice_for_cleanup
+                    .end_session(&session_id, "operator_stopped")
+                    .await;
+                runtime_for_cleanup.drop_session(&session_id).await;
+            });
+        }
+        "voice_interrupt" => {
+            // Operator (or future server-side VAD) interrupted the
+            // agent's reply mid-stream.
+            runtime
+                .interrupt(session, "operator_barge_in")
+                .await;
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -325,5 +401,144 @@ mod tests {
         assert_eq!(bus.subscriber_count(), 2);
         drop(_a);
         assert_eq!(bus.subscriber_count(), 1);
+    }
+
+    // ---- Phase 13.C — voice control message dispatch -------------
+
+    use crate::voice_runtime::{SttFactory, TtsFactory, VoiceRuntime};
+    use crate::voice_session::VoiceSessionRegistry;
+    use execlaw_voice_pipeline::traits::{MockStt, MockTts, TtsClient};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn mock_runtime(bus: EventBus) -> VoiceRuntime {
+        let stt: SttFactory = Arc::new(|| {
+            Box::new(MockStt::new(Vec::new(), "transcribed!".to_owned()))
+        });
+        let tts: TtsFactory =
+            Arc::new(|| (Box::new(MockTts::default()) as Box<dyn TtsClient>, None));
+        VoiceRuntime::new(bus, stt, tts)
+    }
+
+    #[tokio::test]
+    async fn handle_voice_control_ignores_non_json_text() {
+        let bus = EventBus::new();
+        let voice = VoiceSessionRegistry::new(bus.clone());
+        let runtime = mock_runtime(bus);
+        // Should not panic.
+        handle_voice_control("not json", &voice, &runtime).await;
+    }
+
+    #[tokio::test]
+    async fn handle_voice_control_ignores_unknown_op() {
+        let bus = EventBus::new();
+        let voice = VoiceSessionRegistry::new(bus.clone());
+        let runtime = mock_runtime(bus);
+        handle_voice_control(
+            r#"{"op":"voice_yodel","session":"s1"}"#,
+            &voice,
+            &runtime,
+        )
+        .await;
+        // No assertion target — pass if no panic + no event. The
+        // shape of "did nothing" is captured by the lack of side
+        // effects in subsequent tests.
+    }
+
+    #[tokio::test]
+    async fn handle_voice_control_drops_messages_without_session() {
+        let bus = EventBus::new();
+        let voice = VoiceSessionRegistry::new(bus.clone());
+        let runtime = mock_runtime(bus);
+        handle_voice_control(r#"{"op":"voice_stop"}"#, &voice, &runtime).await;
+    }
+
+    #[tokio::test]
+    async fn voice_interrupt_op_publishes_voice_interrupted() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let voice = VoiceSessionRegistry::new(bus.clone());
+        let runtime = mock_runtime(bus);
+        // Need a live runtime session for interrupt to do anything.
+        // Create one by ingesting a chunk first.
+        let chunk = crate::voice_session::OrderedAudioChunk {
+            session: "s1".into(),
+            seq: 0,
+            codec: "pcm16le".into(),
+            sample_rate: 16_000,
+            channels: 1,
+            payload: vec![0u8; 32],
+        };
+        runtime.ingest_chunks(&[chunk]).await;
+        handle_voice_control(
+            r#"{"op":"voice_interrupt","session":"s1"}"#,
+            &voice,
+            &runtime,
+        )
+        .await;
+        let mut saw = false;
+        for _ in 0..16 {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(UiEvent::VoiceInterrupted { session, reason })) => {
+                    if session == "s1" && reason == "operator_barge_in" {
+                        saw = true;
+                        break;
+                    }
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(saw, "VoiceInterrupted must publish on voice_interrupt op");
+    }
+
+    #[tokio::test]
+    async fn voice_stop_op_finalizes_and_ends_session() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let voice = VoiceSessionRegistry::new(bus.clone());
+        let runtime = mock_runtime(bus);
+        // Open the session via the registry path so the SPA-facing
+        // VoiceSessionStarted/Ended sequence is real.
+        let header = crate::voice_frame::VoiceFrameHeader {
+            session: "s1".into(),
+            seq: 0,
+            codec: "pcm16le".into(),
+            sample_rate: 16_000,
+            channels: 1,
+            ts_ms: None,
+        };
+        let outcome = voice.observe_frame(&header, &[0u8; 32]).await;
+        runtime.ingest_chunks(&outcome.released).await;
+        handle_voice_control(
+            r#"{"op":"voice_stop","session":"s1"}"#,
+            &voice,
+            &runtime,
+        )
+        .await;
+        // The voice_stop branch spawns a task; give it a moment.
+        let mut saw_final_transcript = false;
+        let mut saw_session_end = false;
+        for _ in 0..50 {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(UiEvent::VoiceTranscript { is_final, text, .. }))
+                    if is_final && text == "transcribed!" =>
+                {
+                    saw_final_transcript = true;
+                }
+                Ok(Ok(UiEvent::VoiceSessionEnded { session, reason }))
+                    if session == "s1" && reason == "operator_stopped" =>
+                {
+                    saw_session_end = true;
+                }
+                Ok(Ok(_)) => continue,
+                _ => {}
+            }
+            if saw_final_transcript && saw_session_end {
+                break;
+            }
+        }
+        assert!(saw_final_transcript, "voice_stop must publish a final transcript");
+        assert!(saw_session_end, "voice_stop must end the registry session");
     }
 }

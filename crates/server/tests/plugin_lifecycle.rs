@@ -57,7 +57,23 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
         mcp_host: execlaw_server::mcp_host::McpHost::new(db),
         runner_registry: execlaw_server::runner_registry::RunnerRegistry::new(),
         backend_supervisor: None,
-        voice_sessions: execlaw_server::voice_session::VoiceSessionRegistry::new(events),
+        voice_sessions: execlaw_server::voice_session::VoiceSessionRegistry::new(events.clone()),
+        voice_runtime: execlaw_server::voice_runtime::VoiceRuntime::new(
+            events,
+            Arc::new(|| {
+                Box::new(execlaw_voice_pipeline::traits::MockStt::new(
+                    Vec::new(),
+                    String::new(),
+                ))
+            }),
+            Arc::new(|| {
+                (
+                    Box::new(execlaw_voice_pipeline::traits::MockTts::default())
+                        as Box<dyn execlaw_voice_pipeline::traits::TtsClient>,
+                    None,
+                )
+            }),
+        ),
     };
     (
         execlaw_server::routes::build_router(state.clone()),

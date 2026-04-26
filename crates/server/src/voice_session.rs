@@ -58,7 +58,7 @@ pub struct OrderedAudioChunk {
 }
 
 #[derive(Debug)]
-struct Session {
+pub struct Session {
     /// Once-per-session metadata. Subsequent frames for the same
     /// session whose codec / sample_rate disagree are logged and
     /// the first-set value wins.
@@ -113,8 +113,28 @@ pub struct VoiceSessionRegistry {
 }
 
 #[derive(Default)]
-struct Inner {
+pub struct Inner {
     sessions: HashMap<String, Session>,
+}
+
+impl Inner {
+    /// Test-only accessor — lets the reaper tests reach into the
+    /// per-session state to forge `last_seen_at` for stale-reap
+    /// scenarios without sleeping.
+    #[cfg(test)]
+    pub fn sessions_mut(&mut self) -> &mut HashMap<String, Session> {
+        &mut self.sessions
+    }
+}
+
+impl Session {
+    /// Test-only setter for `last_seen_at`. Used by the reaper
+    /// tests to age a session into the past without waiting for
+    /// the 30-second idle timeout.
+    #[cfg(test)]
+    pub fn set_last_seen_for_test(&mut self, at: Instant) {
+        self.last_seen_at = at;
+    }
 }
 
 impl VoiceSessionRegistry {
@@ -227,27 +247,17 @@ impl VoiceSessionRegistry {
         outcome
     }
 
-    /// Publish lifecycle events + Phase-13.B-stub VoiceTranscript
-    /// events for each released chunk. Phase 13.C swaps the stub
-    /// for real Whisper output.
+    /// Publish lifecycle events for the parsed frame. Phase 13.C:
+    /// the released-chunks path no longer emits a stub
+    /// VoiceTranscript here — the WS handler hands the chunks to
+    /// `voice_runtime.ingest_chunks`, which feeds the real Whisper
+    /// adapter and emits `VoiceTranscript` on flush.
     pub fn publish_outcome(&self, header: &VoiceFrameHeader, outcome: &FrameOutcome) {
         if outcome.session_opened {
             self.events.publish(UiEvent::VoiceSessionStarted {
                 session: header.session.clone(),
                 codec: header.codec.clone(),
                 sample_rate: header.sample_rate,
-            });
-        }
-        for chunk in &outcome.released {
-            // Phase 13.B stub — emit a placeholder transcript so
-            // the SPA's WS handler can be wired before Whisper
-            // lands. Phase 13.C replaces this with the real
-            // adapter.
-            self.events.publish(UiEvent::VoiceTranscript {
-                session: chunk.session.clone(),
-                seq: chunk.seq,
-                text: format!("[stub seq={} bytes={}]", chunk.seq, chunk.payload.len()),
-                is_final: false,
             });
         }
         for evicted_seq in &outcome.evicted_seqs {
@@ -277,9 +287,21 @@ impl VoiceSessionRegistry {
         }
     }
 
+    /// Test-only inner-handle accessor — lets `voice_reaper` tests
+    /// forge a session's `last_seen_at` into the past without
+    /// waiting for the real `SESSION_IDLE_TIMEOUT`. Production code
+    /// goes through the public methods.
+    #[cfg(test)]
+    pub async fn private_inner_for_test(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().await
+    }
+
     /// Sweep sessions whose last frame is older than
-    /// `SESSION_IDLE_TIMEOUT`. Returns the number reaped.
-    pub async fn reap_stale(&self) -> usize {
+    /// `SESSION_IDLE_TIMEOUT`. Returns the reaped session ids so
+    /// callers (e.g. `voice_reaper`) can drop matching runtime state.
+    pub async fn reap_stale(&self) -> Vec<String> {
         let now = Instant::now();
         let mut inner = self.inner.lock().await;
         let stale: Vec<String> = inner
@@ -300,7 +322,7 @@ impl VoiceSessionRegistry {
                 reason: "stale_reap".to_owned(),
             });
         }
-        stale.len()
+        stale
     }
 }
 
@@ -443,14 +465,18 @@ mod tests {
             }
         }
         let reaped = reg.reap_stale().await;
-        assert_eq!(reaped, 1);
+        assert_eq!(reaped, vec!["idle".to_owned()]);
         assert_eq!(reg.live_count().await, 1);
         let inner = reg.inner.lock().await;
         assert!(inner.sessions.contains_key("fresh"));
     }
 
     #[tokio::test]
-    async fn publish_outcome_emits_session_started_then_transcripts() {
+    async fn publish_outcome_emits_session_started_only() {
+        // Phase 13.C closure: publish_outcome no longer fires a
+        // stub VoiceTranscript per chunk. The WS handler now hands
+        // released chunks to `voice_runtime.ingest_chunks`, which
+        // emits VoiceTranscript on flush via the real adapter.
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
         let reg = VoiceSessionRegistry::new(bus);
@@ -460,24 +486,22 @@ mod tests {
 
         let mut saw_start = false;
         let mut saw_transcript = false;
-        for _ in 0..16 {
-            match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+        for _ in 0..8 {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
                 Ok(Ok(UiEvent::VoiceSessionStarted { session, .. })) if session == "s1" => {
                     saw_start = true;
                 }
-                Ok(Ok(UiEvent::VoiceTranscript { session, seq, .. }))
-                    if session == "s1" && seq == 0 =>
-                {
+                Ok(Ok(UiEvent::VoiceTranscript { .. })) => {
                     saw_transcript = true;
                 }
                 Ok(Ok(_)) => continue,
                 _ => break,
             }
-            if saw_start && saw_transcript {
-                break;
-            }
         }
-        assert!(saw_start);
-        assert!(saw_transcript);
+        assert!(saw_start, "VoiceSessionStarted must publish on first frame");
+        assert!(
+            !saw_transcript,
+            "VoiceTranscript must NOT come from publish_outcome — runtime owns it now"
+        );
     }
 }

@@ -24,9 +24,18 @@ interface Props {
      * that don't have a live WebSocket).
      */
     sendVoiceFrame?: (bytes: ArrayBuffer) => boolean;
+    /// Phase 13.C — voice control message accessor. Used to fire
+    /// `voice_stop` on mic-off so the server flushes Whisper. The
+    /// VoiceCaptureButton calls this when its session ends.
+    sendVoiceControl?: (payload: object) => boolean;
 }
 
-export function Composer({ disabled, onSend, sendVoiceFrame }: Props) {
+export function Composer({
+    disabled,
+    onSend,
+    sendVoiceFrame,
+    sendVoiceControl,
+}: Props) {
     const [text, setText] = useState("");
     const [submitting, setSubmitting] = useState(false);
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -79,6 +88,7 @@ export function Composer({ disabled, onSend, sendVoiceFrame }: Props) {
                 {sendVoiceFrame && (
                     <VoiceCaptureButton
                         sendBinary={sendVoiceFrame}
+                        sendControl={sendVoiceControl}
                         disabled={isBusy}
                     />
                 )}

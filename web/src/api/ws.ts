@@ -108,6 +108,30 @@ export class WsClient {
         }
     }
 
+    /**
+     * Send a text control message upstream — Phase 13.C voice mode.
+     *
+     * Used for `voice_stop` (mic toggled off, finalize transcript)
+     * and `voice_interrupt` (operator barged in mid-reply). Server
+     * side is `crate::events::handle_voice_control`. JSON is
+     * stringified once here so callers can pass the structured
+     * shape.
+     *
+     * Returns `false` when the socket isn't open. Voice control
+     * is fire-and-forget; the SPA shouldn't retry.
+     */
+    sendText(payload: object): boolean {
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+            return false;
+        }
+        try {
+            this.socket.send(JSON.stringify(payload));
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
     /** Close the connection permanently. Disables auto-reconnect. */
     close(): void {
         this.closed = true;

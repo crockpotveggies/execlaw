@@ -95,6 +95,12 @@ pub struct AppState {
     /// jitter buffer + lifecycle state. Always present (cheap to
     /// construct); no HTTP route depends on it being None vs Some.
     pub voice_sessions: crate::voice_session::VoiceSessionRegistry,
+    /// Phase 13.C — voice runtime orchestrator. Bridges the
+    /// registry's ordered chunks to STT/TTS clients + emits
+    /// `VoiceTranscript` / `VoiceAudioOutbound` events. Always
+    /// present (mock factories in tests, real Whisper/Kokoro
+    /// resolver in production).
+    pub voice_runtime: crate::voice_runtime::VoiceRuntime,
 }
 
 impl std::fmt::Debug for AppState {

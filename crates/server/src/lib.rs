@@ -45,7 +45,10 @@ pub mod tools_admin;
 pub mod tracing_layer;
 pub mod trust_policy;
 pub mod users;
+pub mod voice_clients;
 pub mod voice_frame;
+pub mod voice_reaper;
+pub mod voice_runtime;
 pub mod voice_session;
 pub mod webauthn;
 
