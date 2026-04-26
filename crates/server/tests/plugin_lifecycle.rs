@@ -41,12 +41,13 @@ fn build_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
 fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
     let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
     MigrationRunner::new(&db).apply_all().unwrap();
+    let events = EventBus::new();
     let state = AppState {
         db: db.clone(),
         config: Arc::new(ServerConfig::default()),
         signer: Arc::new(JwtSigner::generate("execlaw-test".into())),
         refresh_store: Arc::new(RefreshStore::new(db.clone())),
-        events: EventBus::new(),
+        events: events.clone(),
         event_log_hmac_key: Some(Arc::new(b"execlaw-test-hmac-key-32-bytes!!".to_vec())),
         inference: Arc::new(
             execlaw_server::inference_resolver::InferenceResolver::new(None),
@@ -56,6 +57,7 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
         mcp_host: execlaw_server::mcp_host::McpHost::new(db),
         runner_registry: execlaw_server::runner_registry::RunnerRegistry::new(),
         backend_supervisor: None,
+        voice_sessions: execlaw_server::voice_session::VoiceSessionRegistry::new(events),
     };
     (
         execlaw_server::routes::build_router(state.clone()),

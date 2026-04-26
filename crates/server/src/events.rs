@@ -91,6 +91,59 @@ pub enum UiEvent {
         /// | "Failed" | "Skipped".
         status: String,
     },
+
+    // ---- Phase 13.B — voice session lifecycle ----------------
+
+    /// A voice session opened — first frame for the given session
+    /// id arrived. Consumed by the SPA to render a "live mic" UX.
+    VoiceSessionStarted {
+        session: String,
+        codec: String,
+        sample_rate: u32,
+    },
+    /// A voice session ended either because the operator hit stop
+    /// or because the server's stale-session reaper aged it out.
+    VoiceSessionEnded {
+        session: String,
+        /// One of "operator_stopped" | "stale_reap" |
+        /// "transport_closed".
+        reason: String,
+    },
+    /// Streaming partial transcript. The Whisper adapter (Phase
+    /// 13.C) feeds these as text accumulates; SPA renders them
+    /// inline with the typing-indicator UX.
+    VoiceTranscript {
+        session: String,
+        seq: u32,
+        text: String,
+        /// True when the segment is the final transcript (the
+        /// endpointer fired and the LLM call is being dispatched).
+        /// SPA uses this to commit the partial to the chat log.
+        is_final: bool,
+    },
+    /// Outbound TTS audio chunk for the SPA to play. Phase 13.C
+    /// fills these with real Kokoro output; today this variant
+    /// exists so the SPA's WS handler can be wired ahead of the
+    /// adapter landing.
+    VoiceAudioOutbound {
+        session: String,
+        seq: u32,
+        /// Codec the bytes are encoded in. SPA's audio pipeline
+        /// picks the right MediaSource decoder.
+        codec: String,
+        /// base64 of the codec payload — keeps the WS event JSON
+        /// inspectable in dev tools. Binary out lands when the
+        /// SPA's audio pipeline is ready for raw frames.
+        audio_b64: String,
+    },
+    /// Operator (or VAD) interrupted the agent mid-response. The
+    /// SPA flushes any in-flight audio playback; the runner halts
+    /// the LLM stream and TTS synthesis.
+    VoiceInterrupted {
+        session: String,
+        /// One of "operator_barge_in" | "vad_speech_detected".
+        reason: String,
+    },
 }
 
 /// Broadcast channel capacity. Lagging subscribers drop the oldest
@@ -147,10 +200,16 @@ pub async fn stream_handler(
     State(state): State<AppState>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state.events.clone()))
+    let bus = state.events.clone();
+    let voice = state.voice_sessions.clone();
+    ws.on_upgrade(move |socket| handle_socket(socket, bus, voice))
 }
 
-async fn handle_socket(mut socket: WebSocket, bus: EventBus) {
+async fn handle_socket(
+    mut socket: WebSocket,
+    bus: EventBus,
+    voice: crate::voice_session::VoiceSessionRegistry,
+) {
     let mut rx = bus.subscribe();
     debug!(
         "ws stream connected; subscribers now {}",
@@ -192,23 +251,16 @@ async fn handle_socket(mut socket: WebSocket, bus: EventBus) {
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Close(_))) | None => break,
                 Some(Ok(Message::Binary(bytes))) => {
-                    // Phase 13.A — parse the framing header so
-                    // operators can confirm session id + seq + codec
-                    // metadata flow end-to-end. Payload is opaque
-                    // codec bytes; the WhisperClient adapter
-                    // (Phase 13.C) decodes them. Phase 13.B replaces
-                    // this debug-and-drop with dispatch into a
-                    // per-session voice actor.
+                    // Phase 13.B — parse the framing header, then
+                    // hand the chunk to the voice-session registry.
+                    // The registry owns per-session jitter buffer
+                    // + lifecycle events; the Phase-13.C
+                    // WhisperClient adapter consumes the released
+                    // chunks for real STT.
                     match crate::voice_frame::parse_frame(&bytes) {
                         Ok((header, payload)) => {
-                            debug!(
-                                session = %header.session,
-                                seq = header.seq,
-                                codec = %header.codec,
-                                sample_rate = header.sample_rate,
-                                payload_bytes = payload.len(),
-                                "ws voice frame received (stub: discarded until 13.B)"
-                            );
+                            let outcome = voice.observe_frame(&header, payload).await;
+                            voice.publish_outcome(&header, &outcome);
                         }
                         Err(e) => {
                             warn!(

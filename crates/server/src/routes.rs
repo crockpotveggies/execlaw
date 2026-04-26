@@ -696,12 +696,13 @@ pub fn test_app_state() -> AppState {
         "execlaw-test-plugins-{}",
         uuid::Uuid::new_v4()
     ));
+    let events = crate::events::EventBus::new();
     AppState {
         db: db.clone(),
         config: Arc::new(ServerConfig::default()),
         signer: Arc::new(JwtSigner::generate("execlaw-test".into())),
         refresh_store: Arc::new(RefreshStore::new(db.clone())),
-        events: crate::events::EventBus::new(),
+        events: events.clone(),
         // Tests use a deterministic HMAC key so replay works end-to-end.
         event_log_hmac_key: Some(Arc::new(
             b"execlaw-test-hmac-key-32-bytes!!".to_vec(),
@@ -723,6 +724,7 @@ pub fn test_app_state() -> AppState {
         // routes report 503 if exercised. Tests that DO want a
         // mock-backed supervisor construct AppState manually.
         backend_supervisor: None,
+        voice_sessions: crate::voice_session::VoiceSessionRegistry::new(events),
     }
 }
 

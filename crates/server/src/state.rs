@@ -91,6 +91,10 @@ pub struct AppState {
     /// builds without Docker). Routes that depend on it return
     /// 503 in that mode.
     pub backend_supervisor: Option<crate::backend_supervisor::BackendSupervisor>,
+    /// Phase 13.B — voice-session registry. Owns the per-session
+    /// jitter buffer + lifecycle state. Always present (cheap to
+    /// construct); no HTTP route depends on it being None vs Some.
+    pub voice_sessions: crate::voice_session::VoiceSessionRegistry,
 }
 
 impl std::fmt::Debug for AppState {

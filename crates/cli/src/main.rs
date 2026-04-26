@@ -1098,6 +1098,9 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         }
     };
 
+    let voice_sessions =
+        execlaw_server::voice_session::VoiceSessionRegistry::new(events.clone());
+
     let state = execlaw_server::AppState {
         db: db.clone(),
         config: config.clone(),
@@ -1111,6 +1114,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         mcp_host,
         runner_registry: runner_registry.clone(),
         backend_supervisor,
+        voice_sessions,
     };
 
     // Phase-7 background workers — run for the lifetime of the
