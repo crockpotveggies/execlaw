@@ -79,6 +79,18 @@ pub enum UiEvent {
     AlertResolved {
         alert_id: String,
     },
+
+    /// A routine run-history row's status changed (queued, picked up,
+    /// finished). Drives live updates in the Settings → Routines
+    /// run-history drawer so the operator doesn't have to refresh
+    /// after a manual fire or to watch a scheduled fire complete.
+    RoutineRunChanged {
+        routine_id: String,
+        run_id: String,
+        /// Mirrors `RoutineRunStatus` — one of "Pending" | "Success"
+        /// | "Failed" | "Skipped".
+        status: String,
+    },
 }
 
 /// Broadcast channel capacity. Lagging subscribers drop the oldest

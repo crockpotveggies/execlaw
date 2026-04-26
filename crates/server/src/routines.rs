@@ -401,6 +401,11 @@ pub async fn run_now_handler(
         })?;
     let now = chrono::Utc::now().timestamp();
     let run_id = store.insert_run_pending(&row.id, now).map_err(ApiError::from)?;
+    state.events.publish(crate::events::UiEvent::RoutineRunChanged {
+        routine_id: row.id.clone(),
+        run_id: run_id.clone(),
+        status: RoutineRunStatus::Pending.as_str().to_owned(),
+    });
     // Mark the run Skipped immediately for v1 — the actual dispatch
     // path lands when runner-local is real. The history row still
     // exists so the operator can see "yes, the manual-fire button
@@ -417,6 +422,11 @@ pub async fn run_now_handler(
             None,
         )
         .map_err(ApiError::from)?;
+    state.events.publish(crate::events::UiEvent::RoutineRunChanged {
+        routine_id: row.id.clone(),
+        run_id: run_id.clone(),
+        status: RoutineRunStatus::Skipped.as_str().to_owned(),
+    });
     let runs = store.list_runs(&row.id, 1).map_err(ApiError::from)?;
     let run = runs.first().ok_or(ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,

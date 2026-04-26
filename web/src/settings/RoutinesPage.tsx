@@ -93,6 +93,31 @@ function statusBadgeClass(s: string | null): string {
     }
 }
 
+/**
+ * Format a run's duration. Prefers (finished_at - started_at) when
+ * the runner populated `started_at`; falls back to
+ * (finished_at - fired_at) which is queue-to-completion (still
+ * meaningful — operators care about wall-clock latency, not just
+ * runner CPU). Returns null for runs that haven't finished yet.
+ */
+function formatDuration(
+    fired_at: number,
+    started_at: number | null,
+    finished_at: number | null,
+): string | null {
+    if (finished_at === null) return null;
+    const startRef = started_at ?? fired_at;
+    const seconds = Math.max(0, finished_at - startRef);
+    if (seconds < 1) return "<1s";
+    if (seconds < 60) return `${seconds}s`;
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    if (m < 60) return s === 0 ? `${m}m` : `${m}m ${s}s`;
+    const h = Math.floor(m / 60);
+    const mm = m % 60;
+    return mm === 0 ? `${h}h` : `${h}h ${mm}m`;
+}
+
 export function RoutinesPage() {
     const auth = useAuth();
     const getToken = useCallback(() => auth.getAccessToken(), [auth]);
@@ -543,6 +568,21 @@ export function RoutinesPage() {
                                                     {run.status}
                                                 </span>
                                                 fired {fmtTs(run.fired_at)}
+                                                {(() => {
+                                                    const dur = formatDuration(
+                                                        run.fired_at,
+                                                        run.started_at,
+                                                        run.finished_at,
+                                                    );
+                                                    return dur ? (
+                                                        <span
+                                                            className="ms-2"
+                                                            data-testid="routine-history-duration"
+                                                        >
+                                                            · {dur}
+                                                        </span>
+                                                    ) : null;
+                                                })()}
                                                 {run.error && (
                                                     <span className="text-danger ms-2">
                                                         {run.error}

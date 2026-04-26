@@ -394,6 +394,27 @@ impl<'db> RoutineStore<'db> {
         .map_err(RoutineError::from)
     }
 
+    /// Purge run-history rows older than `cutoff_unix`. Returns the
+    /// number deleted. Only runs in a terminal status are eligible —
+    /// a `Pending` row that's been hanging for longer than retention
+    /// is preserved so the operator can still see it (and so a
+    /// crash-mid-fire row doesn't silently disappear). The retention
+    /// sweeper at boot calls this on the configured cadence.
+    pub fn purge_runs_older_than(
+        &self,
+        cutoff_unix: i64,
+    ) -> Result<usize, RoutineError> {
+        let n = self.db.with_conn(|c| {
+            let n = c.execute(
+                "DELETE FROM state_routine_runs \
+                 WHERE fired_at < ?1 AND status != 'Pending'",
+                params![cutoff_unix],
+            )?;
+            Ok(n)
+        })?;
+        Ok(n)
+    }
+
     /// Run history for a routine, most-recent first. Capped to
     /// `limit` so a deep history doesn't dump a million rows.
     pub fn list_runs(

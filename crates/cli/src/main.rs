@@ -1132,6 +1132,19 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         events.clone(),
     );
 
+    // Phase 10 closure — purge state_routine_runs rows past the
+    // 90-day retention window every hour. Mirrors the existing
+    // log/ephemeral/refresh sweepers. Pending rows are preserved
+    // regardless of age (a crashed mid-fire row stays visible).
+    {
+        let stop = sweep_stop.clone();
+        let routine_run_sweeper =
+            execlaw_core::routine_run_retention::RoutineRunRetentionSweeper::new(
+                db.clone(),
+            );
+        tokio::spawn(async move { routine_run_sweeper.run(stop).await });
+    }
+
     let app = execlaw_server::routes::build_router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "execlaw server listening");

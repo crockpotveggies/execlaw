@@ -89,8 +89,15 @@ impl Inner {
         now: i64,
     ) -> Result<(), execlaw_core::routines::RoutineError> {
         // Insert a Pending run row first so the operator sees the
-        // attempt even if dispatch fails.
+        // attempt even if dispatch fails. Publish a Pending event
+        // immediately so the SPA's run-history drawer reflects the
+        // attempt without polling.
         let run_id = store.insert_run_pending(&routine.id, now)?;
+        self.events.publish(UiEvent::RoutineRunChanged {
+            routine_id: routine.id.clone(),
+            run_id: run_id.clone(),
+            status: RoutineRunStatus::Pending.as_str().to_owned(),
+        });
 
         // v1 dispatch is a stub: mark the run Skipped with an
         // explanatory error so the operator can see "yes, the schedule
@@ -127,9 +134,10 @@ impl Inner {
 
         // Notify the SPA so the run history view updates live without
         // waiting for a refresh.
-        self.events.publish(UiEvent::ConversationPhaseChanged {
-            conversation_id: format!("routine:{}", routine.id),
-            phase: dispatch_status.as_str().to_owned(),
+        self.events.publish(UiEvent::RoutineRunChanged {
+            routine_id: routine.id.clone(),
+            run_id,
+            status: dispatch_status.as_str().to_owned(),
         });
         Ok(())
     }
@@ -226,6 +234,59 @@ mod tests {
         inner.tick_once().unwrap();
         let runs = store.list_runs(&row.id, 10).unwrap();
         assert!(runs.is_empty(), "disabled routine must not fire");
+    }
+
+    #[tokio::test]
+    async fn tick_once_publishes_pending_then_terminal_event() {
+        let db = fresh_db();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let inner = Inner { db: db.clone(), events: bus };
+        let store = RoutineStore::new(&db);
+        let now = Utc::now().timestamp();
+
+        let id = upsert_one(&store, "due", "*/5 * * * *", now);
+        store
+            .record_run(&id, RoutineRunStatus::Success, now - 600, Some(now - 1))
+            .unwrap();
+
+        inner.tick_once().unwrap();
+
+        // Drain the channel and assert: a Pending event arrives
+        // before its terminal counterpart for the same run_id.
+        let mut pending_run_id: Option<String> = None;
+        let mut terminal_seen = false;
+        for _ in 0..16 {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                rx.recv(),
+            )
+            .await
+            {
+                Ok(Ok(UiEvent::RoutineRunChanged {
+                    routine_id,
+                    run_id,
+                    status,
+                })) if routine_id == id => {
+                    if status == "Pending" {
+                        pending_run_id = Some(run_id);
+                    } else if pending_run_id.as_deref() == Some(run_id.as_str()) {
+                        terminal_seen = true;
+                        break;
+                    }
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(
+            pending_run_id.is_some(),
+            "scheduler must publish a Pending RoutineRunChanged",
+        );
+        assert!(
+            terminal_seen,
+            "scheduler must publish a terminal RoutineRunChanged for the same run_id",
+        );
     }
 
     #[test]
