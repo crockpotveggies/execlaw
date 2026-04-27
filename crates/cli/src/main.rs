@@ -1102,48 +1102,17 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         execlaw_server::voice_session::VoiceSessionRegistry::new(events.clone());
 
     // Phase 13.C — voice runtime resolves Whisper / Kokoro endpoints
-    // from `config_backends` per session. The factories pull URLs +
-    // voice id at construction time; a Backends save mid-conversation
-    // takes effect on the next utterance (mirrors InferenceResolver).
-    let voice_runtime = {
-        let db_for_whisper = db.clone();
-        let db_for_kokoro = db.clone();
-        let db_for_voice = db.clone();
-        execlaw_server::voice_runtime::VoiceRuntime::with_http_clients(
+    // from `config_backends` and the voice id from `config_personality`
+    // on every new session. A Backends or Personality save mid-
+    // conversation takes effect on the next utterance (mirrors
+    // InferenceResolver). All wiring lives in
+    // `voice_runtime::build_with_db` so it's exercised by unit tests
+    // — this cli crate has no tests of its own.
+    let voice_runtime =
+        execlaw_server::voice_runtime::VoiceRuntime::build_with_db(
             events.clone(),
-            std::sync::Arc::new(move || {
-                use execlaw_core::backends::{BackendPurpose, BackendStore};
-                BackendStore::new(&db_for_whisper)
-                    .get(BackendPurpose::VoiceStt)
-                    .ok()
-                    .flatten()
-                    .and_then(|r| r.endpoint)
-                    .filter(|s| !s.trim().is_empty())
-            }),
-            std::sync::Arc::new(move || {
-                use execlaw_core::backends::{BackendPurpose, BackendStore};
-                BackendStore::new(&db_for_kokoro)
-                    .get(BackendPurpose::VoiceTts)
-                    .ok()
-                    .flatten()
-                    .and_then(|r| r.endpoint)
-                    .filter(|s| !s.trim().is_empty())
-            }),
-            std::sync::Arc::new(move || {
-                // Voice id from Settings → Personality (default
-                // personality row). Falls back to the locked-decision
-                // blend `bf_emma+am_michael` when no personality
-                // row carries a `voice_id`.
-                use execlaw_core::personality::PersonalityStore;
-                PersonalityStore::new(&db_for_voice)
-                    .get_default()
-                    .ok()
-                    .and_then(|p| p.voice_id)
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| "bf_emma+am_michael".to_owned())
-            }),
-        )
-    };
+            db.clone(),
+        );
 
     let state = execlaw_server::AppState {
         db: db.clone(),

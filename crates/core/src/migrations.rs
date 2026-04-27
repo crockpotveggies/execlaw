@@ -102,6 +102,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "backend-mode",
         sql: include_str!("../migrations/0015_backend_mode.sql"),
     },
+    Migration {
+        id: 16,
+        name: "personality-voice-id-blend",
+        sql: include_str!("../migrations/0016_personality_voice_id_blend.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]

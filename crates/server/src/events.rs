@@ -229,6 +229,18 @@ async fn handle_socket(
         ))
         .await;
 
+    // Phase 13.D audit closure — track every voice session this WS
+    // opens so we can drop them on disconnect. Without this, a tab
+    // close mid-utterance leaves the session in the registry until
+    // the 30-second reaper sweeps it; meanwhile TTS keeps streaming
+    // VoiceAudioOutbound events to a dead WS and the Whisper /
+    // Kokoro reqwest pools sit open. A `HashSet` is overkill — the
+    // operator only opens one mic at a time today, so the typical
+    // size is 0 or 1, but the structure supports a future
+    // multi-source UX.
+    let mut owned_sessions: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
     loop {
         tokio::select! {
             ev = rx.recv() => match ev {
@@ -261,6 +273,9 @@ async fn handle_socket(
                     match crate::voice_frame::parse_frame(&bytes) {
                         Ok((header, payload)) => {
                             let outcome = voice.observe_frame(&header, payload).await;
+                            if outcome.session_opened {
+                                owned_sessions.insert(header.session.clone());
+                            }
                             voice.publish_outcome(&header, &outcome);
                             if !outcome.released.is_empty() {
                                 runtime.ingest_chunks(&outcome.released).await;
@@ -282,7 +297,13 @@ async fn handle_socket(
                     // Anything else is ignored. The control surface
                     // is intentionally tiny so a malformed message
                     // can't tear down the WS.
-                    handle_voice_control(&text, &voice, &runtime).await;
+                    let closed = handle_voice_control(&text, &voice, &runtime).await;
+                    // The voice_stop branch closes its own session;
+                    // remove it from the per-WS tracking set so we
+                    // don't double-close on disconnect.
+                    if let Some(session_id) = closed {
+                        owned_sessions.remove(&session_id);
+                    }
                 }
                 Some(Ok(_)) => {} // ignore other client→server traffic
                 Some(Err(e)) => {
@@ -292,19 +313,39 @@ async fn handle_socket(
             }
         }
     }
+
+    // Phase 13.D audit closure — sweep every voice session this WS
+    // owned. `voice_stop` already drained the matching session from
+    // the set, so this only fires for the disconnect path (tab
+    // close / network drop / server shutdown).
+    if !owned_sessions.is_empty() {
+        debug!(
+            "ws stream disconnected; cleaning up {} owned voice session(s)",
+            owned_sessions.len()
+        );
+        for session_id in owned_sessions {
+            voice.end_session(&session_id, "transport_closed").await;
+            runtime.drop_session(&session_id).await;
+        }
+    }
     debug!("ws stream disconnected");
 }
 
 /// Phase 13.C/D — parse + dispatch a voice-control text message.
 /// Public for unit testing; the WS handler calls it directly.
+///
+/// Returns `Some(session_id)` when the message closed a session
+/// (i.e. `voice_stop`) so the caller's per-WS owned-session tracker
+/// can drop it without double-closing. Returns `None` for
+/// `voice_interrupt`, malformed input, and unknown ops.
 pub async fn handle_voice_control(
     text: &str,
     voice: &crate::voice_session::VoiceSessionRegistry,
     runtime: &crate::voice_runtime::VoiceRuntime,
-) {
+) -> Option<String> {
     let parsed: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
-        Err(_) => return, // not JSON — silently ignore (could be a future text op)
+        Err(_) => return None, // not JSON — silently ignore (could be a future text op)
     };
     let op = parsed.get("op").and_then(|v| v.as_str()).unwrap_or("");
     let session = parsed
@@ -312,7 +353,7 @@ pub async fn handle_voice_control(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if session.is_empty() {
-        return;
+        return None;
     }
     match op {
         "voice_stop" => {
@@ -323,15 +364,22 @@ pub async fn handle_voice_control(
             // end-to-end without yet plumbing into the chat router.
             // The real agent_reply hookup lands in 13.D.
             //
-            // The finalize_utterance + drop_session run sequentially
-            // — finalize awaits the agent reply + TTS, drop_session
-            // can only run once that returns or there's a race
-            // between the cleanup and an in-flight synthesize.
+            // Panic safety (audit closure): the spawned task runs
+            // finalize_utterance + cleanup. A panic in either would
+            // strand the registry session forever without the
+            // VoiceStopGuard below — its Drop impl always calls
+            // end_session + drop_session, so the cleanup path
+            // survives any panic in finalize_utterance or in a
+            // future real `agent_reply` callback.
             let session_id = session.to_owned();
             let runtime_for_finalize = runtime.clone();
-            let runtime_for_cleanup = runtime.clone();
-            let voice_for_cleanup = voice.clone();
+            let guard = VoiceStopGuard {
+                session_id: session_id.clone(),
+                voice: voice.clone(),
+                runtime: runtime.clone(),
+            };
             tokio::spawn(async move {
+                let _guard = guard;
                 runtime_for_finalize
                     .finalize_utterance(&session_id, |transcript| async move {
                         // Placeholder: echo the transcript so the
@@ -340,11 +388,11 @@ pub async fn handle_voice_control(
                         format!("you said: {transcript}")
                     })
                     .await;
-                voice_for_cleanup
-                    .end_session(&session_id, "operator_stopped")
-                    .await;
-                runtime_for_cleanup.drop_session(&session_id).await;
+                // _guard drops here on the happy path → end_session
+                // + drop_session run regardless of whether the
+                // finalize_utterance future panicked.
             });
+            return Some(session.to_owned());
         }
         "voice_interrupt" => {
             // Operator (or future server-side VAD) interrupted the
@@ -354,6 +402,34 @@ pub async fn handle_voice_control(
                 .await;
         }
         _ => {}
+    }
+    None
+}
+
+/// Phase 13.D audit closure — RAII guard that closes a voice
+/// session in its Drop impl. Used by the `voice_stop` spawn so a
+/// panic inside `finalize_utterance` (or a future real chat-path
+/// callback) doesn't strand the session in the registry.
+///
+/// The Drop impl spawns its own background task because Drop is
+/// sync but `end_session` / `drop_session` are async. The guard's
+/// fields are cheap clones (`Arc` underneath) so the spawn doesn't
+/// require any allocation outside the Arc itself.
+struct VoiceStopGuard {
+    session_id: String,
+    voice: crate::voice_session::VoiceSessionRegistry,
+    runtime: crate::voice_runtime::VoiceRuntime,
+}
+
+impl Drop for VoiceStopGuard {
+    fn drop(&mut self) {
+        let session_id = std::mem::take(&mut self.session_id);
+        let voice = self.voice.clone();
+        let runtime = self.runtime.clone();
+        tokio::spawn(async move {
+            voice.end_session(&session_id, "operator_stopped").await;
+            runtime.drop_session(&session_id).await;
+        });
     }
 }
 
@@ -490,6 +566,97 @@ mod tests {
             }
         }
         assert!(saw, "VoiceInterrupted must publish on voice_interrupt op");
+    }
+
+    #[tokio::test]
+    async fn voice_stop_returns_session_id_for_owned_set_tracking() {
+        // Audit closure: the WS handler tracks owned sessions and
+        // drops them on disconnect. handle_voice_control must
+        // signal which sessions it already closed so the disconnect
+        // path doesn't double-end them.
+        let bus = EventBus::new();
+        let voice = VoiceSessionRegistry::new(bus.clone());
+        let runtime = mock_runtime(bus);
+        let result = handle_voice_control(
+            r#"{"op":"voice_stop","session":"s99"}"#,
+            &voice,
+            &runtime,
+        )
+        .await;
+        assert_eq!(result.as_deref(), Some("s99"));
+    }
+
+    #[tokio::test]
+    async fn voice_interrupt_returns_none_so_owned_set_keeps_session() {
+        let bus = EventBus::new();
+        let voice = VoiceSessionRegistry::new(bus.clone());
+        let runtime = mock_runtime(bus);
+        let result = handle_voice_control(
+            r#"{"op":"voice_interrupt","session":"s1"}"#,
+            &voice,
+            &runtime,
+        )
+        .await;
+        assert_eq!(
+            result, None,
+            "interrupt does NOT close the session; the WS owned-set must keep it"
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_stop_drop_guard_cleans_up_on_panic() {
+        // Audit closure: panic-safety. Spawn a voice_stop and force
+        // the spawned task to panic (we can't make the real
+        // handle_voice_control panic without real Whisper, so
+        // exercise the VoiceStopGuard directly).
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let voice = VoiceSessionRegistry::new(bus.clone());
+        let runtime = mock_runtime(bus);
+        // Open a session through the registry so end_session has
+        // something to drop.
+        let header = crate::voice_frame::VoiceFrameHeader {
+            session: "panic-victim".into(),
+            seq: 0,
+            codec: "pcm16le".into(),
+            sample_rate: 16_000,
+            channels: 1,
+            ts_ms: None,
+        };
+        voice.observe_frame(&header, &[0u8; 32]).await;
+        // Drop the guard inside a panicking task; the Drop impl
+        // schedules cleanup on a fresh tokio task.
+        let voice_clone = voice.clone();
+        let runtime_clone = runtime.clone();
+        let h = tokio::spawn(async move {
+            let _guard = VoiceStopGuard {
+                session_id: "panic-victim".into(),
+                voice: voice_clone,
+                runtime: runtime_clone,
+            };
+            panic!("simulated panic in finalize_utterance");
+        });
+        let _ = h.await; // collects the panic; task is detached
+
+        // VoiceSessionEnded with reason=operator_stopped must fire
+        // even though the parent task panicked.
+        let mut saw = false;
+        for _ in 0..32 {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(UiEvent::VoiceSessionEnded { session, reason }))
+                    if session == "panic-victim" && reason == "operator_stopped" =>
+                {
+                    saw = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => continue,
+            }
+        }
+        assert!(
+            saw,
+            "VoiceStopGuard's Drop must publish VoiceSessionEnded even on panic"
+        );
     }
 
     #[tokio::test]

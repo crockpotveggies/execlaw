@@ -728,6 +728,37 @@ The latency delta we're accepting:
 
 **Safety note for voice specifically.** STT transcripts are untrusted input like any other inbound channel — prompt injection via speech is real. The spotlighting defense (§2.5, §7.4) wraps transcripts with a random per-conversation delimiter before the LLM sees them. Planner/executor split applies for `ExternalWithOutsider` voice. Rate limits and anomaly tripwires still apply.
 
+#### 2.13.7 What Phase 13.A-D actually shipped (and what's deferred)
+
+The voice pipeline above is the *target*. Phase 13.A-D landed a working subset; the rest is queued in `docs/voice-followups.md`. This subsection is the reader's source of truth for "what runs today."
+
+**Shipped (Phase 13.A-D, commits `56e4c90` → `72d1f63`):**
+
+- **Wire framing** — SPA's `framePayload` emits `[u32 header_len BE][JSON header][audio payload]`. Header carries `{session, seq, codec, sample_rate, channels, ts_ms}` so future mobile-native + phone-bridge sources can use the same protocol.
+- **Server-side jitter buffer** — `crates/server/src/voice_session.rs::VoiceSessionRegistry`. Per-session `BTreeMap`-backed reorder, `MAX_BUFFER_FRAMES = 8`, `SESSION_IDLE_TIMEOUT = 30s`, periodic reaper (`voice_reaper.rs`).
+- **STT/TTS HTTP clients** — `voice_clients/whisper.rs` posts WAV to faster-whisper's OpenAI-compat `/v1/audio/transcriptions`; `voice_clients/kokoro.rs` posts JSON to Kokoro-FastAPI's `/v1/audio/speech` and parses raw PCM16 LE. Both have request-shape-validating tests against a hand-rolled TCP fixture.
+- **Voice runtime** — `voice_runtime.rs::VoiceRuntime` wires registry chunks → STT → agent callback → TTS → outbound events. Synthesize runs **lock-free** via a take-tts/put-tts swap so other sessions' ingest + barge-in proceed in parallel; cancel epoch is checked at three points so an interrupt at any pipeline stage halts cleanly.
+- **WS control protocol** — `events.rs::handle_voice_control` parses `{"op":"voice_stop","session":"…"}` and `{"op":"voice_interrupt","session":"…"}`. The WS handler tracks per-connection owned sessions and drops them on disconnect (no waiting for the 30s reaper). The `voice_stop` spawn is panic-safe via a `Drop`-guard.
+- **Backend wizard (Phase 13.B.1)** — `Settings → Backends` exposes a hardware-aware preset picker (Whisper/Kokoro/Piper/vLLM × NVIDIA/Intel Arc/CPU) so the operator clicks a card instead of hand-crafting `model_spec_json`.
+- **SPA playback + transcript banner** — `web/src/chat/VoicePlayback.ts` decodes PCM16 from the server through an `AudioContext`; `VoiceStatusBar.tsx` shows the live transcript + Interrupt button + an explicit "VoiceSTT didn't return a transcript" message when the server returns an empty final.
+
+**Locked-decision defaults that ship today** (per `project_locked_decisions_2026_04_23.md`):
+
+- Voice id default: `bf_emma+am_michael` (Kokoro's combined-voice syntax). Migration `0016_personality_voice_id_blend.sql` sets the default-personality row's `voice_id`.
+- Push-to-talk only — the SPA's mic button toggles capture; mic-off sends `voice_stop`.
+
+**Explicitly deferred (`docs/voice-followups.md`):**
+
+| Deferral | Status | Why deferred |
+|---|---|---|
+| **AEC3 (Phase 13.E)** | Browser AEC stays OFF; **headphones required** | C++ FFI yak shave or sidecar service; ~3-5d of work. Revisit when phone-bridge sources land — they have no headphone option. |
+| **SPA mic codec (Opus → PCM16)** | TTS playback round-trip works; STT round-trip is wired but inert | `VoiceCaptureButton` emits Opus via `MediaRecorder`; `voice_runtime` accepts only `pcm16le`. The SPA's `VoiceStatusBar` surfaces the empty final explicitly so this isn't a silent failure. Fix: AudioWorklet PCM capture (also unlocks future phone-bridge / mobile-native sources). |
+| **Continuous VAD endpointing** | Push-to-talk only | The `voice-pipeline` crate has the `Vad` trait; a server-side `webrtc-vad` adapter is the cleanest first cut so phone-bridge sources work too. |
+| **Real chat-path agent reply on `voice_stop`** | Echoes `you said: <transcript>` | Avoids coupling `voice_runtime` to `chats::dispatch_turn` until the chat path supports cancellable streams. |
+| **`played_through_sentence` on barge-in** | Not tracked | Conversation history truncates the agent's outbound message to "all of it" on barge-in. Fix is bookkeeping in the runtime + a richer `VoiceInterrupted` payload. |
+
+**Verification surface as of `72d1f63`:** 281 server lib + 22 integration + 2 voice WS round-trip = 305 server tests. 207 SPA tests across 33 files. Clippy clean, tsc clean. Criterion benchmarks land for `decode_pcm16_le`, `encode_pcm16_le`, `pcm_to_wav`, `observe_frame`, and `ingest_chunks`.
+
 ### 2.14 Identity resolution and cold-contact escalation
 
 Every inbound message is resolved to a Principal before the agent sees it. A principal is never seen twice as a different person just because they switched transports, and no stranger reaches the agent without the controller having chosen to admit them.
@@ -1336,7 +1367,7 @@ struct PersonalityRow {
     about_agent: String,                // persona / backstory in the agent's voice
     about_controller: String,           // facts the agent knows about you (operator-curated)
     custom_instructions: String,        // freeform multi-paragraph directives — biggest field
-    voice_id: Option<String>,           // pin TTS voice for this scope (default `bf_emma`)
+    voice_id: Option<String>,           // pin TTS voice for this scope (default `bf_emma+am_michael` — Kokoro blend)
     version: i64,                       // monotonic; bumped on every save so audit can trace prompt drift
     created_at: i64,
     updated_at: i64,
@@ -1381,7 +1412,7 @@ If the two ever conflict, the operator's edit wins by virtue of source ordering;
 
 #### 5.5.4 Voice tie-in
 
-`voice_id` pins the TTS voice for that scope. Default is `bf_emma` (locked decision 2026-04-23). The voice-pipeline runner reads this through the same composer and passes it to the `service-kokoro` backend on each TTS request. Per-conversation override lets the operator pick `am_michael` for a male-voice scope without changing the global default.
+`voice_id` pins the TTS voice for that scope. Default is the locked-decision blend `bf_emma+am_michael` (per `project_locked_decisions_2026_04_23.md`; populated by migration `0016_personality_voice_id_blend.sql`). The voice-pipeline runner reads this through the same composer and passes it to the `service-kokoro` backend on each TTS request. Per-conversation override lets the operator pick a single voice (e.g. `am_michael`) for that scope without changing the global default.
 
 #### 5.5.5 Versioning + audit
 
