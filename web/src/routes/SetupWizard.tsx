@@ -103,13 +103,31 @@ export function SetupWizard() {
     const { ref, dismiss } = useScreenTransition<HTMLDivElement>();
 
     // Phase-14 resume-mid-wizard: an authenticated operator landing
-    // on /setup means `/api/ping` returned `wizard` from AppBoot —
-    // skip the account form and start at the docker step. The
-    // wizard component is mounted only when /api/ping says we
-    // should be here, so we don't need to re-probe ping inside.
-    const initialStep: WizardStep =
-        auth.status === "authenticated" ? "docker" : "account";
-    const [step, setStep] = useState<WizardStep>(initialStep);
+    // on /setup means `/api/ping` returned `wizard` (or the route
+    // guard sent them here from /chat) — skip the account form
+    // and start at the docker step.
+    //
+    // Two reads:
+    //   * The `useState` initializer covers the simple case where
+    //     auth is already "authenticated" at mount (no flash of
+    //     account form on a refresh).
+    //   * The `useEffect` covers the post-login race where auth is
+    //     briefly "loading" at first render (AuthProvider is still
+    //     bootstrapping the /me probe). When it resolves to
+    //     authenticated we advance.
+    //
+    // Without the effect, an operator who logs in with an existing
+    // account got stuck staring at the account-creation form,
+    // because `useState`'s initializer only runs once and read the
+    // pre-resolved auth status.
+    const [step, setStep] = useState<WizardStep>(() =>
+        auth.status === "authenticated" ? "docker" : "account",
+    );
+    useEffect(() => {
+        if (auth.status === "authenticated" && step === "account") {
+            setStep("docker");
+        }
+    }, [auth.status, step]);
     // Preflight state lifted to the parent so both Docker and
     // Backend steps share the same source of truth — when the
     // operator clicks "Refresh hardware" on the Backend step it

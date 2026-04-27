@@ -698,6 +698,46 @@ describe("SetupWizard — multi-step flow", () => {
         });
     });
 
+    it("post-login resume: existing controller landing on /setup skips account form", async () => {
+        // Regression: after a user with an already-created account
+        // logs in via /login, the route guard bounces them to
+        // /setup (because the wizard wasn't completed). The wizard
+        // must NOT show the account-creation form again — it must
+        // start at the docker step.
+        //
+        // We simulate the post-login state by pre-populating the
+        // localStorage tokens AuthProvider reads on bootstrap. The
+        // /me response identifies the user as a controller, which
+        // flips auth.status to "authenticated" once the bootstrap
+        // resolves.
+        localStorage.setItem("execlaw.access_token", "tok");
+        localStorage.setItem("execlaw.refresh_token", "tok");
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/setup/preflight") {
+                return new Response(
+                    JSON.stringify({
+                        docker: { available: true, version: "24.0.7" },
+                        gpus: [],
+                    }),
+                    { status: 200 },
+                );
+            }
+            return new Response("{}", { status: 200 });
+        });
+        mountWizard();
+        // Once auth bootstrap resolves we should see the docker
+        // step, not the account form.
+        await waitFor(() => {
+            expect(screen.getByTestId("setup-docker-ok")).toBeInTheDocument();
+        });
+        // The account form's submit button must NOT have rendered
+        // at any point — it would mean the operator was momentarily
+        // staring at the account-creation page.
+        expect(screen.queryByTestId("setup-account-form")).toBeNull();
+        expect(screen.queryByTestId("setup-account-submit")).toBeNull();
+    });
+
     it("docker step (success state): exposes a Re-check button", async () => {
         // The user installed Docker mid-flow and just wants to
         // re-confirm before continuing. The OK card now carries a
