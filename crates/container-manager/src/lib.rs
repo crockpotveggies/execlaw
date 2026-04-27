@@ -18,7 +18,9 @@
 pub mod hardware;
 pub mod service;
 
-pub use hardware::{GpuDevice, GpuId, GpuVendor, HardwareProfile, SysfsSource, detect_sysfs};
+pub use hardware::{
+    detect, detect_sysfs, GpuDevice, GpuId, GpuVendor, HardwareProfile, SysfsSource,
+};
 pub use service::{
     BollardServiceController, ServiceController, ServiceError, ServiceHandle, ServiceSpec,
     ServiceStatus,

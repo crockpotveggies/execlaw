@@ -1296,7 +1296,11 @@ fn main() -> ExitCode {
     match result {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("execlaw: error: {e}");
+            // {:#} prints the full anyhow chain (top context + every
+            // wrapped source separated by `: `). Without it the user
+            // only sees the outermost `with_context` message, which
+            // for service-install hides the underlying SCM error.
+            eprintln!("execlaw: error: {e:#}");
             ExitCode::FAILURE
         }
     }

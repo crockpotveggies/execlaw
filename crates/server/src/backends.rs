@@ -28,13 +28,12 @@ use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, put};
 use axum::Router;
-use execlaw_container_manager::{detect_sysfs, GpuVendor};
+use execlaw_container_manager::{detect, GpuVendor};
 use execlaw_core::audit::AuditStore;
 use execlaw_core::backends::{
     BackendError, BackendMode, BackendPurpose, BackendRow, BackendStore, BackendUpsert,
 };
 use serde::{Deserialize, Serialize};
-use std::path::Path as StdPath;
 use utoipa::ToSchema;
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -560,14 +559,11 @@ pub async fn presets_handler(
         message: format!("'{}' is not a recognised backend purpose", q.purpose),
     })?;
 
-    // Fresh sysfs scan — same path as `GET /api/admin/hardware`. On
-    // non-Linux dev hosts this returns an empty profile and the wizard
-    // recommends the CPU preset, which is the right answer. A future
-    // refactor (Phase 7 desktop) should carry a HardwareProvider on
-    // AppState so the wizard works on Windows / macOS desktops too;
-    // today the control plane is meant to run inside a Linux container
-    // so the hardcoded path is the pragmatic call.
-    let profile = detect_sysfs(StdPath::new("/sys"));
+    // Phase 14 — cross-platform GPU probe via `hardware-query`. WMI
+    // on Windows, sysfs on Linux, IOKit on macOS. Failure modes
+    // downgrade to "no GPU detected" so the wizard recommends CPU
+    // (correct on a host where the probe couldn't reach the OS).
+    let profile = detect();
     let detected_vendors: Vec<GpuVendor> = profile.gpus.iter().map(|g| g.vendor).collect();
 
     Ok(Json(build_presets_response(purpose, &detected_vendors)))

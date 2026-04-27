@@ -30,6 +30,13 @@ async-trait.workspace = true
 reqwest = { workspace = true }
 futures-util = "0.3"
 
+# Phase 14 — cross-platform hardware probe. Replaces our hand-rolled
+# sysfs walker for the production code path; tests still exercise
+# `detect_sysfs` directly to keep the mock-tree assertions. The crate
+# wraps WMI (Windows), sysfs (Linux), and IOKit (macOS) behind one
+# `HardwareInfo::query()` call that returns multi-GPU enumerations.
+hardware-query = "0.2"
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

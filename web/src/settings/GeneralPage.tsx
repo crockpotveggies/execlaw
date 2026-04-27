@@ -37,6 +37,11 @@ export function GeneralPage() {
     /// Tracks whether the operator has changed bind_address since
     /// the last load — drives the "service restart required" hint.
     const [bindDirty, setBindDirty] = useState(false);
+    /// Same shape for `start_on_boot` — the autostart flag on the
+    /// installed service unit only updates on the next
+    /// `execlaw service install` run, so the toggle persists to the
+    /// DB but doesn't immediately re-register.
+    const [bootDirty, setBootDirty] = useState(false);
 
     const refresh = useCallback(async () => {
         try {
@@ -45,6 +50,7 @@ export function GeneralPage() {
             setBindAddress(r.bind_address);
             setStartOnBoot(r.start_on_boot);
             setBindDirty(false);
+            setBootDirty(false);
             setError(null);
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e));
@@ -78,6 +84,7 @@ export function GeneralPage() {
             setBindAddress(r.bind_address);
             setStartOnBoot(r.start_on_boot);
             setBindDirty(false);
+            setBootDirty(false);
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e));
         } finally {
@@ -124,7 +131,10 @@ export function GeneralPage() {
                             label="Start at boot"
                             checked={startOnBoot}
                             disabled={!canMutate || busy}
-                            onChange={(e) => setStartOnBoot(e.target.checked)}
+                            onChange={(e) => {
+                                setStartOnBoot(e.target.checked);
+                                setBootDirty(true);
+                            }}
                             data-testid="general-start-on-boot"
                         />
                         <Form.Text className="execlaw-muted">
@@ -134,6 +144,21 @@ export function GeneralPage() {
                             service-manager registration on disk doesn't
                             change until then.
                         </Form.Text>
+                        {bootDirty && (
+                            <div
+                                className="execlaw-muted small mt-2"
+                                data-testid="general-boot-reinstall-hint"
+                            >
+                                <i
+                                    className="bi bi-info-circle me-1"
+                                    aria-hidden
+                                />
+                                Re-run{" "}
+                                <code>execlaw service install</code> from a
+                                terminal to apply the new autostart flag (or
+                                an elevated PowerShell on Windows).
+                            </div>
+                        )}
                     </Form.Group>
 
                     <Form.Group className="mb-3">

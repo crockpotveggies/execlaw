@@ -17,12 +17,11 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use execlaw_container_manager::{HardwareProfile, detect_sysfs};
+use execlaw_container_manager::{HardwareProfile, detect};
 use execlaw_core::{Database, DbConfig};
 use execlaw_vault::{hash_password, verify_password};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
@@ -358,23 +357,19 @@ pub async fn admin_me(
     })
 }
 
-/// `GET /api/admin/hardware` — return the live hardware profile
-/// from a fresh sysfs scan (Tier-1 detection per §5.3).
-///
-/// On Linux this hits `/sys/class/drm/card*/device/`; on non-Linux
-/// hosts it returns an empty `HardwareProfile` (the control plane
-/// is meant to run inside a Linux container — bare-Windows dev runs
-/// are a known degenerate path).
+/// `GET /api/admin/hardware` — return the live hardware profile via
+/// the cross-platform `hardware-query` probe (Phase 14 bare-metal
+/// pivot). WMI on Windows, sysfs on Linux, IOKit on macOS.
 #[utoipa::path(
     get,
     path = "/api/admin/hardware",
     responses(
-        (status = 200, description = "Detected GPU + CPU + memory profile (sysfs Tier-1)"),
+        (status = 200, description = "Detected GPU + CPU + memory profile (Tier-1)"),
     ),
     tag = "admin"
 )]
 pub async fn admin_hardware() -> impl IntoResponse {
-    let profile: HardwareProfile = detect_sysfs(Path::new("/sys"));
+    let profile: HardwareProfile = detect();
     (StatusCode::OK, Json(profile)).into_response()
 }
 

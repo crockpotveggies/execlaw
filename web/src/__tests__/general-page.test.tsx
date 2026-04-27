@@ -90,6 +90,26 @@ describe("GeneralPage", () => {
         expect(save.disabled).toBe(false);
     });
 
+    it("toggling start_on_boot surfaces the service-install hint", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/settings/general") return settingsResponse();
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        await waitFor(() => {
+            expect(screen.getByTestId("general-form")).toBeInTheDocument();
+        });
+        // Hint absent before any change.
+        expect(screen.queryByTestId("general-boot-reinstall-hint")).toBeNull();
+        // Flip the toggle.
+        fireEvent.click(screen.getByTestId("general-start-on-boot"));
+        // Hint surfaces with the actionable command + Windows note.
+        const hint = screen.getByTestId("general-boot-reinstall-hint");
+        expect(hint).toHaveTextContent(/execlaw service install/);
+        expect(hint).toHaveTextContent(/elevated PowerShell/i);
+    });
+
     it("PUTs the changed bind_address and surfaces the restart hint", async () => {
         const calls: Array<{ url: string; init?: RequestInit }> = [];
         fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {

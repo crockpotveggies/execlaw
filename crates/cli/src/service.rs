@@ -58,7 +58,23 @@ fn label() -> ServiceLabel {
 fn manager(system: bool) -> anyhow::Result<Box<dyn ServiceManager>> {
     let mut mgr = <dyn ServiceManager>::native()
         .context("no native service manager available on this OS")?;
-    let level = if system {
+    // Windows SCM is system-only — there's no "user-level" service
+    // concept on Windows. Coerce to System and emit a notice on
+    // `install` so the operator knows their `--system` flag was
+    // ignored (or implied). Linux + macOS honour the flag verbatim.
+    let level = if cfg!(target_os = "windows") {
+        if !system {
+            let invoked_verb = std::env::args().nth(2).unwrap_or_default();
+            if invoked_verb == "install" {
+                eprintln!(
+                    "NOTE: Windows always uses system-level service install \
+                     (the SCM has no per-user mode). Requires an elevated \
+                     PowerShell."
+                );
+            }
+        }
+        ServiceLevel::System
+    } else if system {
         ServiceLevel::System
     } else {
         ServiceLevel::User
@@ -96,6 +112,11 @@ fn service_run_args(db_path: &PathBuf, bind: &str) -> Vec<OsString> {
 /// Windows it returns a "service exists" error which we surface
 /// verbatim. The operator-facing recovery is `execlaw service
 /// uninstall` followed by re-install.
+///
+/// Permission failures (Windows SCM access denied, Linux/macOS root
+/// requirement for system-level) are detected via the io::Error kind
+/// and surfaced as a clear actionable message rather than a raw OS
+/// errno.
 pub fn install(system: bool, bind: Option<String>, db: Option<PathBuf>) -> anyhow::Result<()> {
     let mgr = manager(system)?;
     let bind = bind.unwrap_or_else(|| SERVICE_BIND.to_owned());
@@ -114,8 +135,9 @@ pub fn install(system: bool, bind: Option<String>, db: Option<PathBuf>) -> anyho
         autostart: true,
         disable_restart_on_failure: false,
     };
-    mgr.install(ctx)
-        .with_context(|| format!("could not install service `{SERVICE_LABEL}`"))?;
+    if let Err(e) = mgr.install(ctx) {
+        return Err(decorate_permission_error(e, system, "install"));
+    }
     println!(
         "==> service installed: {} → {} ({} level)",
         SERVICE_LABEL,
@@ -130,16 +152,18 @@ pub fn install(system: bool, bind: Option<String>, db: Option<PathBuf>) -> anyho
 
 pub fn start(system: bool) -> anyhow::Result<()> {
     let mgr = manager(system)?;
-    mgr.start(ServiceStartCtx { label: label() })
-        .with_context(|| format!("could not start `{SERVICE_LABEL}`"))?;
+    if let Err(e) = mgr.start(ServiceStartCtx { label: label() }) {
+        return Err(decorate_permission_error(e, system, "start"));
+    }
     println!("==> service started: {SERVICE_LABEL}");
     Ok(())
 }
 
 pub fn stop(system: bool) -> anyhow::Result<()> {
     let mgr = manager(system)?;
-    mgr.stop(ServiceStopCtx { label: label() })
-        .with_context(|| format!("could not stop `{SERVICE_LABEL}`"))?;
+    if let Err(e) = mgr.stop(ServiceStopCtx { label: label() }) {
+        return Err(decorate_permission_error(e, system, "stop"));
+    }
     println!("==> service stopped: {SERVICE_LABEL}");
     Ok(())
 }
@@ -152,10 +176,17 @@ pub fn restart(system: bool) -> anyhow::Result<()> {
     // it's running" idempotent verb.
     let mgr = manager(system)?;
     if let Err(e) = mgr.stop(ServiceStopCtx { label: label() }) {
+        // Permission errors on the stop step are still actionable —
+        // the operator likely needs elevation for the start too. So
+        // surface them with the decorator instead of swallowing.
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            return Err(decorate_permission_error(e, system, "restart"));
+        }
         eprintln!("WARN: stop failed (probably not running): {e}");
     }
-    mgr.start(ServiceStartCtx { label: label() })
-        .with_context(|| format!("could not start `{SERVICE_LABEL}`"))?;
+    if let Err(e) = mgr.start(ServiceStartCtx { label: label() }) {
+        return Err(decorate_permission_error(e, system, "restart"));
+    }
     println!("==> service restarted: {SERVICE_LABEL}");
     Ok(())
 }
@@ -165,8 +196,9 @@ pub fn uninstall(system: bool) -> anyhow::Result<()> {
     // Best-effort stop first so the uninstall doesn't race a
     // running instance.
     let _ = mgr.stop(ServiceStopCtx { label: label() });
-    mgr.uninstall(ServiceUninstallCtx { label: label() })
-        .with_context(|| format!("could not uninstall `{SERVICE_LABEL}`"))?;
+    if let Err(e) = mgr.uninstall(ServiceUninstallCtx { label: label() }) {
+        return Err(decorate_permission_error(e, system, "uninstall"));
+    }
     println!("==> service uninstalled: {SERVICE_LABEL}");
     Ok(())
 }
@@ -195,6 +227,89 @@ pub fn status(system: bool) -> anyhow::Result<()> {
         println!("  Get-EventLog -Source {SERVICE_LABEL} -LogName Application");
     }
     Ok(())
+}
+
+/// Translate an `io::Error` from service-manager into an
+/// operator-actionable message when the cause is missing privileges.
+/// Otherwise pass the error through with the verb in context.
+///
+/// `service-manager` shells out to `sc.exe` (Windows), `systemctl`
+/// (Linux), and `launchctl` (macOS) under the hood — it wraps the
+/// child's stderr in an `io::Error` whose `kind()` is `Other`, so we
+/// can't trust kind-based dispatch. Instead, we sniff the error
+/// message for the platform-specific access-denied signature:
+///
+/// - Windows: `sc.exe` returns exit 5 + "Access is denied"
+/// - Linux:   `systemctl` says "Access denied" or "EACCES"
+/// - macOS:   `launchctl` returns "Permission denied" or
+///   "Operation not permitted"
+fn decorate_permission_error(
+    err: std::io::Error,
+    system: bool,
+    verb: &str,
+) -> anyhow::Error {
+    let denied = is_access_denied(&err);
+    if !denied {
+        return anyhow::Error::new(err)
+            .context(format!("could not {verb} `{SERVICE_LABEL}`"));
+    }
+    let hint = if cfg!(target_os = "windows") {
+        // Windows SCM is system-only; --system is implied.
+        "Re-run from an elevated PowerShell (right-click → Run as Administrator). \
+         The Service Control Manager refuses non-Administrator access."
+    } else if system {
+        "Re-run with `sudo` — system-level service registration writes to \
+         a root-owned directory."
+    } else {
+        // Per-user service install on Linux/macOS shouldn't need root;
+        // a permission error here means the user-level service dir is
+        // unwritable for some other reason (umask, ACL, …).
+        "Permission denied for the user-level service directory. \
+         Check that the systemd / launchd user dir is writable, or \
+         re-run with `--system` + `sudo` for a system-level install."
+    };
+    anyhow::Error::new(err).context(format!(
+        "could not {verb} `{SERVICE_LABEL}`: access denied. {hint}"
+    ))
+}
+
+/// Sniff an `io::Error` for the access-denied signature. Combines:
+///
+///   1. The standard `PermissionDenied` kind (set when service-manager
+///      itself produces an `io::Error` from a syscall, e.g. for the
+///      systemd user-dir mkdir path).
+///   2. The Win32 `ERROR_ACCESS_DENIED = 5` raw OS error.
+///   3. The Unix `EACCES = 13` raw OS error.
+///   4. Sub-process stderr substrings — service-manager shells out to
+///      `sc.exe` / `systemctl` / `launchctl` and wraps the child's
+///      output in `io::Error::other`, where `kind()` is `Other` but
+///      the message carries the access-denied text.
+fn is_access_denied(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        return true;
+    }
+    match err.raw_os_error() {
+        Some(5) | Some(13) => return true,
+        _ => {}
+    }
+    // service-manager's sub-process errors put the child stderr in
+    // either the top-level `Display` (single-line case) or as a
+    // chained source (when the wrapper splits into "Command failed"
+    // + "<stderr>"). Concatenate both so we don't miss the literal
+    // "Access is denied." text from `sc.exe`.
+    let mut combined = err.to_string().to_ascii_lowercase();
+    let mut source: Option<&dyn std::error::Error> =
+        std::error::Error::source(err);
+    while let Some(s) = source {
+        combined.push_str(" | ");
+        combined.push_str(&s.to_string().to_ascii_lowercase());
+        source = s.source();
+    }
+    combined.contains("access is denied")
+        || combined.contains("access denied")
+        || combined.contains("permission denied")
+        || combined.contains("operation not permitted")
+        || combined.contains("exit code 5") // sc.exe ERROR_ACCESS_DENIED
 }
 
 // ---------------------------------------------------------------------------
@@ -352,5 +467,123 @@ mod windows_runtime {
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `decorate_permission_error` is the only function in this
+    /// module worth unit-testing without a live SCM / systemd —
+    /// everything else is a thin pass-through to service-manager.
+    #[test]
+    fn decorate_passes_through_non_permission_errors() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing unit");
+        let err = decorate_permission_error(io_err, false, "stop");
+        let msg = format!("{err:#}");
+        // No elevation hint when the cause isn't permissions.
+        assert!(!msg.contains("Administrator"));
+        assert!(!msg.contains("sudo"));
+        // The verb + label still appear so the user knows which
+        // command failed.
+        assert!(msg.contains("stop"));
+        assert!(msg.contains(SERVICE_LABEL));
+    }
+
+    #[test]
+    fn is_access_denied_matches_kind_and_raw_os_error() {
+        // 1. ErrorKind::PermissionDenied — most direct signal.
+        let e1 = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "EACCES",
+        );
+        assert!(is_access_denied(&e1));
+        // 2. Sub-process stderr text from sc.exe — kind is Other.
+        let e2 = std::io::Error::other(
+            "Command failed with exit code 5: [SC] OpenSCManager FAILED 5: \
+             \r\n\r\nAccess is denied.",
+        );
+        assert!(is_access_denied(&e2));
+        // 3. Stderr text from systemctl.
+        let e3 = std::io::Error::other(
+            "Failed to start execlaw.service: Access denied",
+        );
+        assert!(is_access_denied(&e3));
+        // 4. macOS launchctl text.
+        let e4 = std::io::Error::other(
+            "/bin/launchctl bootstrap returned: Operation not permitted",
+        );
+        assert!(is_access_denied(&e4));
+        // 5. Generic "not found" — doesn't match.
+        let e5 = std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "service not registered",
+        );
+        assert!(!is_access_denied(&e5));
+    }
+
+    #[test]
+    fn decorate_recognizes_sc_exe_access_denied_substring() {
+        // The Windows live-test failure mode: service-manager shells
+        // out to `sc.exe`, the SCM rejects with code 5, the err is
+        // an io::Error::other with the stderr concatenated. Our
+        // decorator must pick this up.
+        let io_err = std::io::Error::other(
+            "Command failed with exit code 5: [SC] OpenSCManager FAILED 5: \
+             \r\n\r\nAccess is denied.",
+        );
+        let err = decorate_permission_error(io_err, false, "install");
+        let msg = format!("{err:#}");
+        if cfg!(target_os = "windows") {
+            assert!(
+                msg.contains("Administrator") || msg.contains("elevated"),
+                "Windows path must include the Administrator hint; got: {msg}"
+            );
+        } else {
+            // On non-Windows, the same error text still triggers
+            // the access-denied branch but the hint is the
+            // platform-specific one.
+            assert!(
+                msg.contains("user-level service directory")
+                    || msg.contains("sudo"),
+                "non-Windows path must include the dir/sudo hint; got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn decorate_permission_denied_includes_admin_hint_on_windows() {
+        let io_err = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Access is denied. (os error 5)",
+        );
+        let err = decorate_permission_error(io_err, false, "install");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("elevated PowerShell"));
+        assert!(msg.contains("Administrator"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn decorate_permission_denied_with_system_includes_sudo_hint() {
+        let io_err =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "EACCES");
+        let err = decorate_permission_error(io_err, true, "install");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("sudo"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn decorate_permission_denied_user_level_includes_dir_hint() {
+        let io_err =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "EACCES");
+        let err = decorate_permission_error(io_err, false, "install");
+        let msg = format!("{err:#}");
+        // User-level install hint should mention the writable check
+        // rather than promising sudo will fix it.
+        assert!(msg.contains("user-level service directory"));
     }
 }
