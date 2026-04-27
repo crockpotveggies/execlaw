@@ -84,6 +84,17 @@ beforeEach(() => {
         if (url.startsWith("/api/admin/eval/flags")) {
             return new Response(JSON.stringify({ flags: [] }), { status: 200 });
         }
+        if (url === "/api/admin/settings/general") {
+            return new Response(
+                JSON.stringify({
+                    start_on_boot: true,
+                    bind_address: "127.0.0.1:3030",
+                    updated_at: 0,
+                    bind_address_requires_restart: true,
+                }),
+                { status: 200 },
+            );
+        }
         return new Response("{}", { status: 200 });
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -95,13 +106,12 @@ afterEach(() => {
 });
 
 describe("Settings shell", () => {
-    it("/settings redirects to user (the new index)", async () => {
-        // User page makes calls to /api/admin/users +
-        // /api/admin/webauthn/credentials; the default mock returns
-        // empty lists for both via the catch-all branch.
+    it("/settings redirects to general (Phase 14 new index)", async () => {
+        // Phase 14 bare-metal pivot — General is now the index page
+        // (host-service settings come before per-account settings).
         mountAt("/settings");
         await waitFor(() => {
-            expect(screen.getByTestId("settings-user")).toBeInTheDocument();
+            expect(screen.getByTestId("settings-general")).toBeInTheDocument();
         });
     });
 

@@ -35,3 +35,16 @@ thiserror.workspace = true
 directories.workspace = true
 keyring.workspace = true
 axum.workspace = true
+
+# Phase 14 — bare-metal install. service-manager abstracts systemd
+# (Linux) / launchd (macOS) / Windows SCM behind one trait so the
+# `execlaw service install/start/stop/uninstall` commands carry one
+# Rust impl instead of three platform-specific install scripts.
+service-manager = "0.8"
+
+# windows-service is the runtime side of the Windows story: when
+# running as a Windows service, the binary needs to handle SCM
+# control messages (start/stop/PowerEvent) — service-manager only
+# handles registration with the SCM, not the runtime loop.
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"

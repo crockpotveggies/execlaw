@@ -26,6 +26,7 @@ pub mod ephemeral_sweeper;
 pub mod eval;
 pub mod event_hmac;
 pub mod events;
+pub mod general_settings;
 pub mod ids;
 pub mod log_retention;
 pub mod logs;

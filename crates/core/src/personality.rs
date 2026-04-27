@@ -586,7 +586,11 @@ mod tests {
         let def = store.get_default().unwrap();
         assert_eq!(def.scope_kind, PersonalityScopeKind::Default);
         assert_eq!(def.display_name, "execlaw");
-        assert_eq!(def.voice_id.as_deref(), Some("bf_emma"));
+        // Migration 0013 seeds 'bf_emma'; migration 0016 (audit
+        // closure for the locked-decision default) updates it to
+        // the blend. After both migrations apply, the row carries
+        // the blended value.
+        assert_eq!(def.voice_id.as_deref(), Some("bf_emma+am_michael"));
         assert_eq!(def.version, 1);
     }
 

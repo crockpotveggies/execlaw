@@ -1,30 +1,32 @@
 //! `execlaw` CLI.
 //!
-//! Container lifecycle:
+//! Bare-metal lifecycle (Phase 14 — replaces the Phase 0 docker-compose
+//! wrappers):
 //!
-//! - `execlaw build`            build the docker image (`docker build ...`)
-//! - `execlaw install`          first-run install: migrate + build + start
-//! - `execlaw start` / `up`     `docker compose up -d`
-//! - `execlaw restart`          `docker compose restart`
-//! - `execlaw stop` / `down`    `docker compose down`
-//! - `execlaw status`           `docker compose ps`
-//! - `execlaw logs`             `docker compose logs` (add `--follow` for -f)
+//! - `execlaw install`           one-shot: migrate + register + start
+//! - `execlaw service install`   register with systemd / launchd / SCM
+//! - `execlaw service start`     start the service
+//! - `execlaw service stop`      stop it
+//! - `execlaw service restart`   stop + start
+//! - `execlaw service status`    print install state + per-OS log commands
+//! - `execlaw service uninstall` deregister
 //!
 //! Other:
 //!
-//! - `execlaw doctor`           checks docker + sqlcipher + keyring + bootstrap
-//! - `execlaw db migrate`       run pending migrations
-//! - `execlaw hw rescan`        (stub — §Phase 2)
-//! - `execlaw serve`            run the server directly (for dev; production
-//!   uses the container)
+//! - `execlaw doctor`            checks vault + db + (optional) Docker for
+//!   managed-mode backends
+//! - `execlaw db migrate`        run pending migrations
+//! - `execlaw hw rescan`         (stub — §Phase 2)
+//! - `execlaw serve`             run the server in foreground (dev / debug)
 //!
-//! These subcommands are also exposed as cargo aliases (`.cargo/config.toml`):
-//! `cargo start`, `cargo stop`, `cargo restart`, `cargo status`, `cargo logs`,
-//! `cargo image` (= build), `cargo bootstrap` (= install).
+//! Docker is only relevant for managed-mode backends now (Phase 12);
+//! the control plane itself runs as a host service.
 
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+mod service;
 
 #[derive(Debug, Parser)]
 #[command(name = "execlaw", version, about = "execlaw control plane CLI")]
@@ -35,80 +37,34 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Build the control-plane docker image (`docker build -f Dockerfile.control-plane ...`).
-    Build {
-        /// Image tag. Defaults to `execlaw-control-plane:dev`.
-        #[arg(long, default_value = "execlaw-control-plane:dev")]
-        tag: String,
-        /// Dockerfile path. Defaults to `Dockerfile.control-plane`.
-        #[arg(long)]
-        dockerfile: Option<PathBuf>,
-        /// Pass `--no-cache` to the docker build.
-        #[arg(long, default_value_t = false)]
-        no_cache: bool,
-    },
-    /// First-run install: run migrations locally, build the image, start the stack.
-    ///
-    /// This is the one-command bootstrap for a fresh checkout. Equivalent to:
-    ///   execlaw db migrate && execlaw build && execlaw start
+    /// First-run bare-metal install: db migrate + register + start the
+    /// service. The service uses systemd (Linux), launchd (macOS), or
+    /// Windows Service Control Manager — see `execlaw service --help`.
     Install {
-        #[arg(long)]
-        compose_file: Option<PathBuf>,
-        #[arg(long)]
-        dockerfile: Option<PathBuf>,
-        #[arg(long, default_value_t = false)]
-        no_cache: bool,
-        /// Skip `db migrate` — useful if you're installing in a container
-        /// where migrations run on first `serve`.
-        #[arg(long, default_value_t = false)]
-        skip_migrate: bool,
         /// Open the local DB plaintext during migrate (dev only).
         #[arg(long, default_value_t = false)]
         no_encrypt: bool,
-    },
-    /// Start the control plane (wraps `docker compose up -d`).
-    Up {
-        /// Path to docker-compose.yml (defaults to the repo root one).
+        /// Install at system level (root / Administrator) instead of
+        /// per-user. Required on Windows for SCM access; optional on
+        /// Linux + macOS.
+        #[arg(long, default_value_t = false)]
+        system: bool,
+        /// Skip db migrate (e.g. operator already ran it).
+        #[arg(long, default_value_t = false)]
+        skip_migrate: bool,
+        /// Override the default bind address (loopback:3030).
         #[arg(long)]
-        compose_file: Option<PathBuf>,
-    },
-    /// Alias for `up` — start the control plane.
-    Start {
+        bind: Option<String>,
+        /// Override the default DB path (`~/.execlaw/execlaw.db`).
         #[arg(long)]
-        compose_file: Option<PathBuf>,
+        db: Option<PathBuf>,
     },
-    /// Restart the control plane (`docker compose restart`).
-    Restart {
-        #[arg(long)]
-        compose_file: Option<PathBuf>,
+    /// Manage the long-running control-plane service.
+    Service {
+        #[command(subcommand)]
+        op: ServiceOp,
     },
-    /// Stop the control plane (wraps `docker compose down`).
-    Down {
-        #[arg(long)]
-        compose_file: Option<PathBuf>,
-    },
-    /// Alias for `down` — stop the control plane.
-    Stop {
-        #[arg(long)]
-        compose_file: Option<PathBuf>,
-    },
-    /// Show container status (`docker compose ps`).
-    Status {
-        #[arg(long)]
-        compose_file: Option<PathBuf>,
-    },
-    /// Show container logs (`docker compose logs`).
-    Logs {
-        #[arg(long)]
-        compose_file: Option<PathBuf>,
-        /// Follow log output (pass `-f` to docker compose).
-        #[arg(long, short, default_value_t = false)]
-        follow: bool,
-        /// Tail N lines before following.
-        #[arg(long, default_value_t = 200)]
-        tail: usize,
-    },
-    /// Run preflight environment checks.
+    /// Run preflight environment checks (DB, vault, optional Docker).
     Doctor,
     /// Database operations.
     Db {
@@ -192,6 +148,56 @@ enum Command {
         /// Allow overwriting a non-empty target file.
         #[arg(long, default_value_t = false)]
         force: bool,
+        #[arg(long, default_value_t = false)]
+        no_encrypt: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceOp {
+    /// Register the service with the host's service manager.
+    Install {
+        #[arg(long, default_value_t = false)]
+        system: bool,
+        #[arg(long)]
+        bind: Option<String>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Start the service.
+    Start {
+        #[arg(long, default_value_t = false)]
+        system: bool,
+    },
+    /// Stop the service.
+    Stop {
+        #[arg(long, default_value_t = false)]
+        system: bool,
+    },
+    /// Stop, then start.
+    Restart {
+        #[arg(long, default_value_t = false)]
+        system: bool,
+    },
+    /// Print install state + per-OS commands for live status / logs.
+    Status {
+        #[arg(long, default_value_t = false)]
+        system: bool,
+    },
+    /// Deregister the service.
+    Uninstall {
+        #[arg(long, default_value_t = false)]
+        system: bool,
+    },
+    /// Hidden — invoked by the service unit / SCM. Operators don't
+    /// run this directly; `service install` registers it as the
+    /// program path.
+    #[command(hide = true)]
+    Run {
+        #[arg(long, default_value = "127.0.0.1:3030")]
+        bind: String,
+        #[arg(long)]
+        db: Option<PathBuf>,
         #[arg(long, default_value_t = false)]
         no_encrypt: bool,
     },
@@ -363,109 +369,47 @@ fn open_db(db_path: &Path, no_encrypt: bool) -> anyhow::Result<execlaw_core::Dat
     Ok(execlaw_core::Database::open(&cfg)?)
 }
 
-/// Run `docker compose -f <compose_path> <args...>` and verify it succeeded.
-fn run_compose(compose_file: Option<PathBuf>, args: &[&str]) -> anyhow::Result<()> {
-    let compose_path = compose_file.unwrap_or_else(|| PathBuf::from("docker-compose.yml"));
-    anyhow::ensure!(
-        compose_path.exists(),
-        "docker-compose.yml not found at {}",
-        compose_path.display()
-    );
-    let status = std::process::Command::new("docker")
-        .args(["compose", "-f"])
-        .arg(&compose_path)
-        .args(args)
-        .status()
-        .map_err(|e| anyhow::anyhow!("failed to invoke docker: {e}"))?;
-    anyhow::ensure!(
-        status.success(),
-        "`docker compose {}` failed",
-        args.join(" ")
-    );
-    Ok(())
-}
-
-fn cmd_build(tag: String, dockerfile: Option<PathBuf>, no_cache: bool) -> anyhow::Result<()> {
-    let dockerfile_path = dockerfile.unwrap_or_else(|| PathBuf::from("Dockerfile.control-plane"));
-    anyhow::ensure!(
-        dockerfile_path.exists(),
-        "Dockerfile not found at {}",
-        dockerfile_path.display()
-    );
-    let mut cmd = std::process::Command::new("docker");
-    cmd.args(["build", "-f"])
-        .arg(&dockerfile_path)
-        .args(["-t", &tag]);
-    if no_cache {
-        cmd.arg("--no-cache");
-    }
-    cmd.arg(".");
-    let status = cmd
-        .status()
-        .map_err(|e| anyhow::anyhow!("failed to invoke docker: {e}"))?;
-    anyhow::ensure!(status.success(), "`docker build` failed");
-    println!("built image: {tag}");
-    Ok(())
-}
-
-fn cmd_up(compose_file: Option<PathBuf>) -> anyhow::Result<()> {
-    run_compose(compose_file, &["up", "-d"])
-}
-
-fn cmd_restart(compose_file: Option<PathBuf>) -> anyhow::Result<()> {
-    run_compose(compose_file, &["restart"])
-}
-
-fn cmd_down(compose_file: Option<PathBuf>) -> anyhow::Result<()> {
-    run_compose(compose_file, &["down"])
-}
-
-fn cmd_status(compose_file: Option<PathBuf>) -> anyhow::Result<()> {
-    run_compose(compose_file, &["ps"])
-}
-
-fn cmd_logs(compose_file: Option<PathBuf>, follow: bool, tail: usize) -> anyhow::Result<()> {
-    let tail_arg = tail.to_string();
-    let mut args: Vec<&str> = vec!["logs", "--tail", &tail_arg];
-    if follow {
-        args.push("-f");
-    }
-    run_compose(compose_file, &args)
-}
-
 fn cmd_install(
-    compose_file: Option<PathBuf>,
-    dockerfile: Option<PathBuf>,
-    no_cache: bool,
-    skip_migrate: bool,
     no_encrypt: bool,
+    system: bool,
+    skip_migrate: bool,
+    bind: Option<String>,
+    db: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    println!("==> execlaw install");
+    println!("==> execlaw install (bare-metal)");
 
-    // 1. Migrate the local SQLite (if not skipped — inside the container,
-    //    migrations run on first serve).
+    // 1. Make sure the data dir exists. The vault + keyring + DB
+    //    paths all live under it; the service unit also points its
+    //    working_directory at it.
+    let data_dir = default_data_dir();
+    if !data_dir.exists() {
+        std::fs::create_dir_all(&data_dir)?;
+        println!("--> created {}", data_dir.display());
+    }
+
+    // 2. Migrate the local SQLite (encrypted by default; --no-encrypt
+    //    for dev plaintext mode).
     if !skip_migrate {
-        println!("--> db migrate");
-        cmd_db_migrate(default_db_path(), no_encrypt)?;
+        let db_path = db.clone().unwrap_or_else(default_db_path);
+        println!("--> db migrate ({})", db_path.display());
+        cmd_db_migrate(db_path, no_encrypt)?;
     } else {
         println!("--  skipping db migrate (--skip-migrate)");
     }
 
-    // 2. Build the image.
-    println!("--> build image");
-    cmd_build(
-        "execlaw-control-plane:dev".to_string(),
-        dockerfile,
-        no_cache,
-    )?;
+    // 3. Register the service with systemd / launchd / Windows SCM.
+    println!("--> service install ({} level)", if system { "system" } else { "user" });
+    service::install(system, bind, db)?;
 
-    // 3. Start the stack.
-    println!("--> start stack");
-    cmd_up(compose_file)?;
+    // 4. Start it.
+    println!("--> service start");
+    service::start(system)?;
 
     println!(
-        "==> install complete — verify with `execlaw status` or `curl http://localhost:3030/api/health`"
+        "==> install complete — verify with `curl http://{}/api/health`",
+        service::SERVICE_BIND
     );
+    println!("    Use `execlaw service status` for live state + log paths.");
     Ok(())
 }
 
@@ -473,21 +417,27 @@ fn cmd_doctor() -> anyhow::Result<()> {
     let mut ok = true;
     let mut report = String::new();
 
-    // 1. Docker.
+    // 1. Docker — optional now (Phase 14). The control plane runs as
+    //    a host service; Docker is only needed for managed-mode
+    //    backends (Phase 12) where the supervisor spawns container
+    //    sidecars. A missing Docker downgrades to a NOTE not a
+    //    failure.
     match std::process::Command::new("docker")
         .arg("--version")
         .output()
     {
         Ok(out) if out.status.success() => {
             report.push_str(&format!(
-                "OK  docker:   {}",
+                "OK   docker:   {} (managed-mode backends available)",
                 String::from_utf8_lossy(&out.stdout).trim()
             ));
             report.push('\n');
         }
         _ => {
-            ok = false;
-            report.push_str("MISS docker:   not found in PATH\n");
+            report.push_str(
+                "NOTE docker:   not found — managed-mode backends disabled. \
+                 External backends (operator-supplied URLs) still work.\n",
+            );
         }
     }
 
@@ -1219,27 +1169,50 @@ fn main() -> ExitCode {
     let _tracing_guard = init_tracing();
     let cli = Cli::parse();
     let result: anyhow::Result<()> = (|| match cli.command {
-        Command::Build {
-            tag,
-            dockerfile,
-            no_cache,
-        } => cmd_build(tag, dockerfile, no_cache),
         Command::Install {
-            compose_file,
-            dockerfile,
-            no_cache,
-            skip_migrate,
             no_encrypt,
-        } => cmd_install(compose_file, dockerfile, no_cache, skip_migrate, no_encrypt),
-        Command::Up { compose_file } | Command::Start { compose_file } => cmd_up(compose_file),
-        Command::Restart { compose_file } => cmd_restart(compose_file),
-        Command::Down { compose_file } | Command::Stop { compose_file } => cmd_down(compose_file),
-        Command::Status { compose_file } => cmd_status(compose_file),
-        Command::Logs {
-            compose_file,
-            follow,
-            tail,
-        } => cmd_logs(compose_file, follow, tail),
+            system,
+            skip_migrate,
+            bind,
+            db,
+        } => cmd_install(no_encrypt, system, skip_migrate, bind, db),
+        Command::Service { op } => match op {
+            ServiceOp::Install { system, bind, db } => service::install(system, bind, db),
+            ServiceOp::Start { system } => service::start(system),
+            ServiceOp::Stop { system } => service::stop(system),
+            ServiceOp::Restart { system } => service::restart(system),
+            ServiceOp::Status { system } => service::status(system),
+            ServiceOp::Uninstall { system } => service::uninstall(system),
+            ServiceOp::Run {
+                bind,
+                db,
+                no_encrypt,
+            } => {
+                // The Windows path bootstraps its own tokio runtime
+                // because StartServiceCtrlDispatcher returns BEFORE
+                // we can establish one. The non-Windows path just
+                // forwards into cmd_serve.
+                #[cfg(windows)]
+                {
+                    service::windows_runtime_run(
+                        bind,
+                        db.unwrap_or_else(default_db_path),
+                        no_encrypt,
+                    )
+                }
+                #[cfg(not(windows))]
+                {
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()?;
+                    rt.block_on(cmd_serve(
+                        bind,
+                        db.unwrap_or_else(default_db_path),
+                        no_encrypt,
+                    ))
+                }
+            }
+        },
         Command::Doctor => cmd_doctor(),
         Command::Db { op } => match op {
             DbOp::Migrate { db, no_encrypt } => {

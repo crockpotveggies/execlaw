@@ -38,6 +38,7 @@ pub mod routine_runner;
 pub mod routines;
 pub mod runner_registry;
 pub mod runners_admin;
+pub mod settings_general;
 pub mod state;
 pub mod tool_dispatch;
 pub mod tool_sync;

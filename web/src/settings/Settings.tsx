@@ -14,6 +14,7 @@ import { setActiveThread } from "../chat/store";
 import { useNavigate } from "react-router-dom";
 import { listUiPanels, type UiPanelSummary } from "../api/endpoints";
 
+import { GeneralPage } from "./GeneralPage";
 import { PluginsPage } from "./PluginsPage";
 import { LogsPage } from "./LogsPage";
 import { EvalFlagsPage } from "./EvalFlagsPage";
@@ -33,7 +34,11 @@ import { TrustPolicyPage } from "./TrustPolicyPage";
 import { MyIdentitiesPage } from "./MyIdentitiesPage";
 
 const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
-    // User first — operator accounts, password, passkeys, sessions.
+    // General first (Phase 14 bare-metal pivot) — host-service knobs
+    // like start-on-boot + bind address. These are operator settings
+    // about the install itself, before any per-feature configuration.
+    { to: "/settings/general", icon: "bi-gear", label: "General" },
+    // User — operator accounts, password, passkeys, sessions.
     // Singular "User" because it's the page about *your* account
     // (other operators are listed inside it for Controllers). Was
     // briefly called "Login" but that read as the sign-in screen.
@@ -162,8 +167,9 @@ export function Settings() {
                     <Routes>
                         <Route
                             index
-                            element={<Navigate to="user" replace />}
+                            element={<Navigate to="general" replace />}
                         />
+                        <Route path="general" element={<GeneralPage />} />
                         <Route path="user" element={<UserPage />} />
                         <Route path="personality" element={<PersonalityPage />} />
                         <Route path="my-identities" element={<MyIdentitiesPage />} />

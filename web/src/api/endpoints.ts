@@ -1609,3 +1609,42 @@ export async function postLogout(refreshToken: string | null): Promise<void> {
         body: refreshToken ? { refresh_token: refreshToken } : {},
     });
 }
+
+// ---- /api/admin/settings/general (Phase 14 — bare-metal pivot) ----
+
+export interface GeneralSettings {
+    start_on_boot: boolean;
+    bind_address: string;
+    updated_at: number;
+    /// Server contract: editing `bind_address` requires
+    /// `execlaw service restart` to take effect. The SPA reads
+    /// this flag rather than hardcoding the message so a future
+    /// in-process rebind can flip it without an SPA change.
+    bind_address_requires_restart: boolean;
+}
+
+export interface UpdateGeneralSettingsRequest {
+    start_on_boot?: boolean;
+    bind_address?: string;
+}
+
+export async function getGeneralSettings(
+    tokenAccessor: () => string | null,
+): Promise<GeneralSettings> {
+    return apiFetch<GeneralSettings>(
+        "/api/admin/settings/general",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function updateGeneralSettings(
+    body: UpdateGeneralSettingsRequest,
+    tokenAccessor: () => string | null,
+): Promise<GeneralSettings> {
+    return apiFetch<GeneralSettings>(
+        "/api/admin/settings/general",
+        { method: "PUT", body },
+        tokenAccessor,
+    );
+}

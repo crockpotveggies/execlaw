@@ -22,52 +22,65 @@ agent model.
 
 ## Quick start
 
-### One-shot (via cargo aliases — recommended)
+execlaw runs as a host service on bare metal — systemd on Linux,
+launchd on macOS, the Service Control Manager on Windows. Docker is
+optional and only needed for managed-mode inference backends (Phase
+12); the control plane itself is a single Rust binary.
+
+### One-shot install
 
 ```bash
-cargo bootstrap          # migrate + build image + start stack
-cargo ps                 # verify container is running
-curl http://localhost:3030/api/health    # → {"status":"ok"}
-open http://localhost:3030/api/docs      # Swagger + AsyncAPI
+cargo install --path crates/cli   # or `cargo build --release` and copy the binary
+execlaw install                   # migrate DB → register service → start it
+curl http://127.0.0.1:3030/api/health    # → {"status":"ok"}
+open http://127.0.0.1:3030/api/docs      # Swagger + AsyncAPI
 ```
 
-### Container lifecycle
+`execlaw install` registers a per-user service by default. Add
+`--system` for a system-wide install (root / Administrator). On
+Windows the Service Control Manager always runs system-level, so
+`--system` is implied.
 
-Cargo aliases defined in `.cargo/config.toml` — each delegates to the
-`execlaw` CLI, which wraps `docker compose` for you:
+### Service lifecycle
 
-| Cargo command | What it does | Underlying call |
-|---|---|---|
-| `cargo image` | Build the control-plane docker image | `docker build -f Dockerfile.control-plane ...` |
-| `cargo bootstrap` | First-run install (migrate + image + start) | `db migrate` → `build` → `up -d` |
-| `cargo start` | Start the stack | `docker compose up -d` |
-| `cargo restart` | Restart the stack | `docker compose restart` |
-| `cargo stop` | Stop the stack | `docker compose down` |
-| `cargo ps` | Show container status | `docker compose ps` |
-| `cargo logs` | Tail logs (last 200 lines) | `docker compose logs --tail 200` |
-| `cargo tail` | Follow logs live (`-f`) | `docker compose logs --tail 200 -f` |
-| `cargo doctor` | Preflight env checks | docker + sqlcipher + keyring |
+| Command | What it does |
+|---|---|
+| `execlaw install` | First-run: migrate + register + start |
+| `execlaw service install` | Register (without starting) |
+| `execlaw service start` | Start the service |
+| `execlaw service restart` | Stop + start |
+| `execlaw service stop` | Stop the service |
+| `execlaw service status` | Print install state + per-OS log commands |
+| `execlaw service uninstall` | Deregister |
+| `execlaw doctor` | Preflight checks (DB, vault, optional Docker) |
+| `execlaw serve` | Run in the foreground (dev / debug) |
 
-Notes:
+`cargo bootstrap`, `cargo start`, `cargo stop`, `cargo restart`,
+`cargo svc-status`, and `cargo doctor` are convenience aliases that
+forward to the equivalent `execlaw …` invocations
+(see `.cargo/config.toml`).
 
-- `cargo build` and `cargo install` retain their native Rust meanings
-  (Rust compilation and binary install). The container image is
-  `cargo image`; the first-run install is `cargo bootstrap`.
-- All aliases forward extra args — `cargo image -- --no-cache`,
-  `cargo logs -- --tail 1000`, `cargo start -- --compose-file other.yml`.
-- The equivalent direct invocations are `execlaw build`, `execlaw install`,
-  `execlaw start`, `execlaw restart`, `execlaw stop`, `execlaw status`,
-  `execlaw logs`. Run `execlaw --help` for the full list.
+### Live logs
 
-### Manual (without cargo aliases)
+| OS | Command |
+|---|---|
+| Linux (user) | `journalctl --user -u execlaw -f` |
+| Linux (system) | `journalctl -u execlaw -f` |
+| macOS | `log stream --predicate 'process == "execlaw"'` |
+| Windows | `Get-EventLog -Source execlaw -LogName Application` |
+
+`execlaw service status` prints the right command for your platform.
+
+### First-run setup
 
 ```bash
-docker compose up -d
-curl http://localhost:3030/api/health
-curl -X POST http://localhost:3030/api/setup \
+curl -X POST http://127.0.0.1:3030/api/setup \
   -H 'content-type: application/json' \
   -d '{"admin_password":"pick-something-longer"}'
 ```
+
+The SPA at `http://127.0.0.1:3030/` will guide you through the rest
+(backend wizard, plugin install, personality, etc.).
 
 ## Workspace layout
 
@@ -89,7 +102,7 @@ See [`MIGRATION_PLAN.md` §3.1](MIGRATION_PLAN.md) for the full rationale.
 | `crates/identity-api` | Trait an identity-provider plugin implements |
 | `crates/outbox` | Outbox relay primitives |
 | `crates/server` | Axum HTTP + WebSocket surface |
-| `crates/cli` | `execlaw` binary (up, doctor, db migrate, serve, ...) |
+| `crates/cli` | `execlaw` binary (install, service install/start/stop, doctor, serve, ...) |
 
 ## Building from source (developer)
 
@@ -98,13 +111,15 @@ See [`MIGRATION_PLAN.md` §3.1](MIGRATION_PLAN.md) for the full rationale.
 cargo test --workspace
 cargo run -p execlaw -- doctor
 
-# Full SQLCipher path (production build — the Docker image does this).
+# Full SQLCipher path (production build).
 cargo test --workspace --no-default-features -F execlaw-core/sqlcipher
 ```
 
-Requires Rust 1.85+ (edition 2024). The production target is
-`x86_64-unknown-linux-gnu` inside the container image — see
-`Dockerfile.control-plane`.
+Requires Rust 1.85+ (edition 2024). Bare-metal targets:
+`x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`,
+`x86_64-apple-darwin`, `aarch64-apple-darwin`. Service registration
+on each is handled by the
+[`service-manager`](https://crates.io/crates/service-manager) crate.
 
 ## License
 

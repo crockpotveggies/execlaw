@@ -40,6 +40,9 @@ use crate::routines::{
     PreviewRequest, PreviewResponse, RoutineListResponse, RoutineRunListResponse,
     RoutineRunView, RoutineView, UpsertRoutineRequest,
 };
+use crate::settings_general::{
+    GeneralSettingsView, UpdateGeneralSettingsRequest,
+};
 use crate::trust_policy::{TrustPolicyView, UpdateTrustPolicyRequest};
 use crate::runners_admin::{RunnerListResponse, RunnerView};
 use crate::mcp_admin::{
@@ -179,6 +182,9 @@ impl Modify for SecurityAddon {
         crate::routines::run_now_handler,
         crate::routines::runs_handler,
         crate::routines::preview_handler,
+        // general settings (Phase 14 — start-on-boot, bind, ...)
+        crate::settings_general::get_handler,
+        crate::settings_general::put_handler,
     ),
     components(schemas(
         HealthResponse,
@@ -244,6 +250,8 @@ impl Modify for SecurityAddon {
         UpsertRoutineRequest,
         PreviewRequest,
         PreviewResponse,
+        GeneralSettingsView,
+        UpdateGeneralSettingsRequest,
     )),
     tags(
         (name = "meta", description = "Liveness + introspection"),
