@@ -1648,3 +1648,39 @@ export async function updateGeneralSettings(
         tokenAccessor,
     );
 }
+
+// ---- /api/admin/setup/preflight (Phase 14 — first-run wizard) ----
+
+export interface DockerStatus {
+    available: boolean;
+    version: string | null;
+}
+
+export interface DetectedGpu {
+    /// Stringified `GpuId`. Server uses `<vendor_hex>:<device_or_card>`
+    /// — opaque to the SPA. Used as the `gpu_id` value when saving
+    /// the Standard backend if the operator picks a specific card.
+    id: { 0: string } | string;
+    vendor: "Nvidia" | "Intel" | "Amd" | "Unknown";
+    pci_vendor_id: string;
+    pci_device_id: string;
+    /// Linux-only on bare-metal sysfs paths; empty on Windows/macOS
+    /// hardware-query results.
+    device_files?: string[];
+    kernel_card_index?: number;
+}
+
+export interface PreflightResponse {
+    docker: DockerStatus;
+    gpus: DetectedGpu[];
+}
+
+export async function getSetupPreflight(
+    tokenAccessor: () => string | null,
+): Promise<PreflightResponse> {
+    return apiFetch<PreflightResponse>(
+        "/api/admin/setup/preflight",
+        {},
+        tokenAccessor,
+    );
+}

@@ -65,6 +65,104 @@ body {
     padding: 2rem;
 }
 
+// Setup wizard timeline indicator (Phase 14).
+//
+// Three-step horizontal stepper with circle markers connected by
+// short lines, mirroring the Microsoft 365 onboarding pattern.
+// Upcoming = open circle, current = filled accent, done = filled
+// success with checkmark.
+.execlaw-stepper {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.25rem;
+    margin: 0.25rem 0 1.5rem;
+}
+
+.execlaw-stepper__step {
+    flex: 1 1 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    position: relative;
+    min-width: 0;
+}
+
+.execlaw-stepper__circle {
+    width: 1.75rem;
+    height: 1.75rem;
+    border-radius: 50%;
+    border: 2px solid $border-subtle;
+    background-color: $bg-surface;
+    color: $text-muted;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.85rem;
+    font-weight: 600;
+    transition: border-color 200ms ease, background-color 200ms ease,
+        color 200ms ease;
+    flex: 0 0 auto;
+}
+
+.execlaw-stepper__step.is-current .execlaw-stepper__circle {
+    border-color: $primary;
+    background-color: $primary;
+    color: #fff;
+}
+
+.execlaw-stepper__step.is-done .execlaw-stepper__circle {
+    border-color: $success;
+    background-color: $success;
+    color: #0d1117;
+}
+
+.execlaw-stepper__label {
+    margin-top: 0.4rem;
+    font-size: 0.75rem;
+    color: $text-muted;
+    line-height: 1.2;
+    word-break: break-word;
+}
+
+.execlaw-stepper__step.is-current .execlaw-stepper__label {
+    color: $text-primary;
+    font-weight: 600;
+}
+
+.execlaw-stepper__step.is-done .execlaw-stepper__label {
+    color: $text-primary;
+}
+
+// Connector line lives on the step itself as an absolutely-positioned
+// pseudo-element so it spans across the gap to the next circle. We
+// skip it on the last step.
+.execlaw-stepper__step::after {
+    content: "";
+    position: absolute;
+    top: calc(0.875rem - 1px);
+    left: calc(50% + 1.05rem);
+    right: calc(-50% + 1.05rem);
+    height: 2px;
+    background-color: $border-subtle;
+    z-index: 0;
+}
+
+.execlaw-stepper__step:last-child::after {
+    display: none;
+}
+
+.execlaw-stepper__step.is-done::after {
+    background-color: $success;
+}
+
+// Keep the circle above the connector line.
+.execlaw-stepper__circle {
+    position: relative;
+    z-index: 1;
+}
+
 .execlaw-brand {
     font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     font-weight: 600;

@@ -43,6 +43,7 @@ use crate::routines::{
 use crate::settings_general::{
     GeneralSettingsView, UpdateGeneralSettingsRequest,
 };
+use crate::setup_preflight::{DockerStatus, PreflightResponse};
 use crate::trust_policy::{TrustPolicyView, UpdateTrustPolicyRequest};
 use crate::runners_admin::{RunnerListResponse, RunnerView};
 use crate::mcp_admin::{
@@ -185,6 +186,8 @@ impl Modify for SecurityAddon {
         // general settings (Phase 14 — start-on-boot, bind, ...)
         crate::settings_general::get_handler,
         crate::settings_general::put_handler,
+        // setup preflight (Phase 14 — first-run wizard docker + gpu)
+        crate::setup_preflight::get_handler,
     ),
     components(schemas(
         HealthResponse,
@@ -252,6 +255,8 @@ impl Modify for SecurityAddon {
         PreviewResponse,
         GeneralSettingsView,
         UpdateGeneralSettingsRequest,
+        PreflightResponse,
+        DockerStatus,
     )),
     tags(
         (name = "meta", description = "Liveness + introspection"),
