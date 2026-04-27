@@ -133,6 +133,12 @@ pub async fn put_handler(
             &GeneralSettingsUpdate {
                 start_on_boot: req.start_on_boot,
                 bind_address: req.bind_address.clone(),
+                // The wizard-dismissed flag has its own dedicated
+                // endpoint (`POST /api/admin/setup/dismiss`); the
+                // /general PUT route doesn't expose it so the SPA
+                // can't accidentally clear it from the General
+                // settings page.
+                setup_wizard_dismissed: None,
             },
             now,
         )

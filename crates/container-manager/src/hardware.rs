@@ -101,10 +101,15 @@ pub struct HardwareProfile {
 /// issue. The error is logged via `tracing::warn!`.
 pub fn detect() -> HardwareProfile {
     match hardware_query::HardwareInfo::query() {
-        Ok(hw) => HardwareProfile {
-            gpus: hw.gpus().iter().map(GpuDevice::from_query).collect(),
-            source: SysfsSource::HardwareQuery,
-        },
+        Ok(hw) => {
+            let mut gpus: Vec<GpuDevice> =
+                hw.gpus().iter().map(GpuDevice::from_query).collect();
+            apply_vram_corrections(&mut gpus);
+            HardwareProfile {
+                gpus,
+                source: SysfsSource::HardwareQuery,
+            }
+        }
         Err(e) => {
             tracing::warn!(
                 "hardware-query failed: {e}; reporting no GPUs (CPU-only fallback)"
@@ -112,6 +117,65 @@ pub fn detect() -> HardwareProfile {
             HardwareProfile {
                 gpus: Vec::new(),
                 source: SysfsSource::HardwareQuery,
+            }
+        }
+    }
+}
+
+/// Apply per-vendor VRAM overrides on top of the hardware-query
+/// readout. See `gpu_memory.rs` for why each path exists.
+///
+/// The corrections are best-effort: if NVML / the registry lookup
+/// fails we keep the original (possibly truncated) hardware-query
+/// value so the wizard still functions, just with the known
+/// under-reporting.
+fn apply_vram_corrections(gpus: &mut [GpuDevice]) {
+    // NVIDIA — order in NVML matches `nvml.device_by_index` enumeration
+    // order, which on every Windows / Linux host I've checked matches
+    // hardware-query's NVIDIA-merge order. We zip by NVIDIA-only
+    // position to be defensive against multi-vendor hosts where
+    // hardware-query interleaves Intel + NVIDIA in a different order.
+    let nvml = crate::gpu_memory::nvidia_memory_mb_via_nvml();
+    let mut nvml_iter = nvml.into_iter();
+    for g in gpus.iter_mut().filter(|g| g.vendor == GpuVendor::Nvidia) {
+        if let Some(mb) = nvml_iter.next() {
+            tracing::debug!(
+                model = ?g.model_name,
+                old_memory_mb = ?g.memory_mb,
+                new_memory_mb = mb,
+                "apply NVML VRAM override"
+            );
+            g.memory_mb = Some(mb);
+        }
+    }
+
+    // Intel — match by `model_name` substring against the registry's
+    // `DriverDesc`. Both come from Windows, so the strings tend to
+    // line up exactly ("Intel(R) Arc(TM) B580 Graphics"). We do a
+    // case-insensitive substring test in case driver versions tweak
+    // formatting.
+    let registry_intel = crate::gpu_memory::intel_memory_mb_via_registry();
+    for g in gpus.iter_mut().filter(|g| g.vendor == GpuVendor::Intel) {
+        let model = match &g.model_name {
+            Some(m) => m,
+            None => continue,
+        };
+        let model_lower = model.to_ascii_lowercase();
+        for (desc, mb) in &registry_intel {
+            let desc_lower = desc.to_ascii_lowercase();
+            if desc_lower == model_lower
+                || desc_lower.contains(&model_lower)
+                || model_lower.contains(&desc_lower)
+            {
+                tracing::debug!(
+                    model = %model,
+                    driver_desc = %desc,
+                    old_memory_mb = ?g.memory_mb,
+                    new_memory_mb = mb,
+                    "apply Intel registry VRAM override"
+                );
+                g.memory_mb = Some(*mb);
+                break;
             }
         }
     }

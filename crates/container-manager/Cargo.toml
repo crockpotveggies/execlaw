@@ -37,6 +37,19 @@ futures-util = "0.3"
 # `HardwareInfo::query()` call that returns multi-GPU enumerations.
 hardware-query = "0.2"
 
+# hardware-query 0.2.1's `query_all` has a known bug — it does not
+# propagate `memory_mb` from the NVIDIA NVML enrichment back into the
+# merged `GPUInfo`, so WMI's UINT32-capped 4 GB wins over NVML's
+# accurate value. We call NVML directly to override.
+nvml-wrapper = "0.11"
+
+# Windows-only: read the per-display-class registry node that
+# `Win32_VideoController.AdapterRAM` truncates. The 64-bit
+# `HardwareInformation.qwMemorySize` value gives us accurate VRAM
+# for >4 GB Intel Arc / large NVIDIA cards. WMI alone caps out.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

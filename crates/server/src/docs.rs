@@ -188,6 +188,7 @@ impl Modify for SecurityAddon {
         crate::settings_general::put_handler,
         // setup preflight (Phase 14 — first-run wizard docker + gpu)
         crate::setup_preflight::get_handler,
+        crate::setup_preflight::dismiss_handler,
     ),
     components(schemas(
         HealthResponse,

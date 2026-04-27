@@ -2,12 +2,20 @@
 //
 // 1. Probe `/api/ping` to learn whether the server has been initialized.
 // 2. While probing, render a minimal loading screen.
-// 3. On `setup`  → /setup
-// 4. On `pong`   → /login (or /chat if AuthProvider already restored a session)
-// 5. On error    → an unobtrusive "can't reach server" panel with retry.
+// 3. On `setup`   → /setup (account-creation step).
+// 4. On `wizard`  → /setup (resume at docker step). Phase-14:
+//                   account exists but the first-run wizard hasn't
+//                   completed; route back so the operator finishes
+//                   the docker + backend steps. Without this, a
+//                   refresh mid-wizard left the user kicked into
+//                   /chat with no inference backend.
+// 5. On `pong`    → /login (or /chat if AuthProvider already restored a session).
+// 6. On error     → an unobtrusive "can't reach server" panel with retry.
 //
 // The setup-state probe runs once per app load. After setup or login,
-// we navigate forward by-route, not by re-pinging.
+// we navigate forward by-route, not by re-pinging — except for the
+// `RequireSetupComplete` guard, which re-probes on entering /chat or
+// /settings to catch direct-URL navigation past an unfinished wizard.
 
 import { useEffect, useState } from "react";
 import { Navigate } from "react-router-dom";
@@ -54,14 +62,16 @@ export function AppBoot() {
         return <BootErrorScreen message={probe.message} />;
     }
 
+    // Setup-required states route to /setup regardless of auth —
+    // SetupWizard handles both "no controller" (account form) and
+    // "controller exists, wizard mid-flow" (resume at docker step).
+    if (probe.ping === "setup" || probe.ping === "wizard") {
+        return <Navigate to="/setup" replace />;
+    }
+
     // Auth context already restored an active session → straight to chat.
     if (auth.status === "authenticated") {
         return <Navigate to="/chat" replace />;
-    }
-
-    // Server says no controller user yet → setup wizard.
-    if (probe.ping === "setup") {
-        return <Navigate to="/setup" replace />;
     }
 
     // Server initialized, no local session → login.

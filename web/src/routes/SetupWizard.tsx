@@ -24,16 +24,16 @@
 import {
     useCallback,
     useEffect,
-    useRef,
     useState,
     type FormEvent,
 } from "react";
-import { Navigate, useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
 import Spinner from "react-bootstrap/Spinner";
 import { ApiError } from "../api/client";
 import {
+    dismissSetupWizard,
     getSetupPreflight,
     postSetup,
     upsertBackend,
@@ -102,7 +102,14 @@ export function SetupWizard() {
     // out on successful first-run sign-in.
     const { ref, dismiss } = useScreenTransition<HTMLDivElement>();
 
-    const [step, setStep] = useState<WizardStep>("account");
+    // Phase-14 resume-mid-wizard: an authenticated operator landing
+    // on /setup means `/api/ping` returned `wizard` from AppBoot —
+    // skip the account form and start at the docker step. The
+    // wizard component is mounted only when /api/ping says we
+    // should be here, so we don't need to re-probe ping inside.
+    const initialStep: WizardStep =
+        auth.status === "authenticated" ? "docker" : "account";
+    const [step, setStep] = useState<WizardStep>(initialStep);
     // Preflight state lifted to the parent so both Docker and
     // Backend steps share the same source of truth — when the
     // operator clicks "Refresh hardware" on the Backend step it
@@ -131,22 +138,33 @@ export function SetupWizard() {
 
     const finish = useCallback(() => {
         // Same shrink + fade as the original single-screen wizard.
+        // The "complete" path runs after a successful backend save:
+        // ping naturally flips to `pong` because the Standard
+        // backend now exists, so the chat shell admits the operator.
         dismiss(() => navigate("/chat", { replace: true }));
     }, [dismiss, navigate]);
 
-    // Snapshot the auth status at first mount. Once the operator
-    // submits the account form `auth.signIn` flips us to
-    // authenticated mid-flow, but we must NOT redirect to /chat at
-    // that moment — the wizard owns the rest of the journey
-    // (Docker, Backend). Only the operator who lands here already
-    // signed in (e.g. typed /setup in the URL bar) should bounce.
-    const wasAuthenticatedAtMount = useRef<boolean | null>(null);
-    if (wasAuthenticatedAtMount.current === null) {
-        wasAuthenticatedAtMount.current = auth.status === "authenticated";
-    }
-    if (wasAuthenticatedAtMount.current && step === "account") {
-        return <Navigate to="/chat" replace />;
-    }
+    const skipBackend = useCallback(async () => {
+        // The "Skip for now" path: persist the dismissal so the
+        // RequireSetupComplete guard stops bouncing the operator
+        // back to /setup on every navigation. Failure is non-fatal
+        // — a transient network blip shouldn't trap the operator on
+        // the wizard. We log and continue; the next ping check on
+        // /chat will simply route them back here.
+        try {
+            await dismissSetupWizard(getToken);
+        } catch (e) {
+            console.warn("setup wizard dismiss failed:", e);
+        }
+        finish();
+    }, [getToken, finish]);
+
+    // Note: we deliberately don't bounce authenticated users away
+    // from /setup. AppBoot routes here only when ping says `setup`
+    // or `wizard`; if the operator lands here directly via URL when
+    // ping is `pong`, the wizard's Skip+finish paths still safely
+    // route to /chat. The previous "auth-snapshot at mount" guard
+    // is gone with the move to ping-driven routing.
 
     return (
         <div className="execlaw-auth-shell">
@@ -175,7 +193,7 @@ export function SetupWizard() {
                         refreshing={preflightLoading}
                         refresh={refreshPreflight}
                         onComplete={finish}
-                        onSkip={finish}
+                        onSkip={() => void skipBackend()}
                     />
                 )}
             </div>

@@ -7,11 +7,17 @@ import { ApiError, apiFetch } from "./client";
 
 // ---- /api/ping -----------------------------------------------------
 
-export type PingState = "setup" | "pong";
+export type PingState = "setup" | "wizard" | "pong";
 
 /**
- * Probe the server for its setup state. Returns "setup" when no
- * controller user exists yet, "pong" once setup has completed.
+ * Probe the server for its setup state. Three-state response:
+ *
+ *   * "setup"  — no controller user yet (account-creation flow).
+ *   * "wizard" — controller exists but the first-run wizard hasn't
+ *                completed (no Standard backend configured AND
+ *                operator hasn't dismissed). SPA routes back to
+ *                /setup, resuming at the docker step.
+ *   * "pong"   — fully provisioned (or wizard dismissed).
  *
  * Any non-2xx response (including network failures) is surfaced as a
  * thrown ApiError so the caller can show a "can't reach server"
@@ -20,6 +26,7 @@ export type PingState = "setup" | "pong";
 export async function ping(): Promise<PingState> {
     const text = await apiFetch<string>("/api/ping", { rawText: true });
     if (text === "setup") return "setup";
+    if (text === "wizard") return "wizard";
     if (text === "pong") return "pong";
     // Defensive: a future server might add states; treat anything
     // unrecognized as "needs setup" rather than crashing the SPA.
@@ -27,6 +34,22 @@ export async function ping(): Promise<PingState> {
         "unknown",
         `unexpected /api/ping response: ${text}`,
         200,
+    );
+}
+
+/**
+ * Phase 14 — explicit "Skip for now" on the first-run wizard's
+ * backend step. POSTs to mark the wizard dismissed; subsequent
+ * `ping()` calls return "pong" so the SPA stops bouncing the
+ * operator back to /setup.
+ */
+export async function dismissSetupWizard(
+    tokenAccessor: () => string | null,
+): Promise<void> {
+    await apiFetch<unknown>(
+        "/api/admin/setup/dismiss",
+        { method: "POST", body: {} },
+        tokenAccessor,
     );
 }
 

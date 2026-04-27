@@ -63,38 +63,6 @@ const meResponse = () =>
         { status: 200 },
     );
 
-const presetsResponseFor = (purpose: string) =>
-    new Response(
-        JSON.stringify({
-            purpose,
-            detected_vendors: ["nvidia"],
-            presets: [
-                {
-                    id: "vllm-cuda",
-                    purpose,
-                    inference_backend: "service-vllm",
-                    name: "vLLM (NVIDIA)",
-                    description: "Fixture",
-                    image: "vllm/vllm-openai:v0.6.2",
-                    container_port: 8000,
-                    vendor: "nvidia",
-                    default_args: ["--gpu-memory-utilization=0.9"],
-                    fields: [
-                        {
-                            kind: "model",
-                            label: "Model",
-                            choices: ["QuantTrio/Qwen3.5-27B-AWQ"],
-                            default: "QuantTrio/Qwen3.5-27B-AWQ",
-                            arg_template: "--model={value}",
-                        },
-                    ],
-                    recommended: true,
-                },
-            ],
-        }),
-        { status: 200 },
-    );
-
 const upsertBackendResponse = () =>
     new Response(
         JSON.stringify({

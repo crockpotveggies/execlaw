@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod gpu_memory;
 pub mod hardware;
 pub mod service;
 

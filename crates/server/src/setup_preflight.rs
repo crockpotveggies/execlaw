@@ -24,12 +24,16 @@
 //! Backend wizard uses (Phase 14 follow-up).
 
 use crate::auth_extract::AuthedUser;
+use crate::routes::ApiError;
 use crate::state::AppState;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::Json;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use execlaw_container_manager::{detect, GpuDevice};
+use execlaw_core::audit::AuditStore;
+use execlaw_core::general_settings::GeneralSettingsStore;
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -115,8 +119,68 @@ fn detect_docker() -> DockerStatus {
     }
 }
 
+/// `POST /api/admin/setup/dismiss` — mark the first-run wizard as
+/// dismissed so `/api/ping` flips from `wizard` to `pong` and the
+/// SPA's setup guard stops bouncing the operator back to /setup.
+///
+/// Idempotent. Audit-logged. The SPA's "Skip for now" button on the
+/// backend step calls this immediately before navigating to /chat.
+#[utoipa::path(
+    post,
+    path = "/api/admin/setup/dismiss",
+    responses(
+        (status = 200, description = "Wizard marked dismissed"),
+        (status = 403, description = "Caller is not a Controller"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "setup"
+)]
+pub async fn dismiss_handler(
+    State(state): State<AppState>,
+    user: AuthedUser,
+) -> Result<StatusCode, ApiError> {
+    require_controller(&state, &user)?;
+    let now = chrono::Utc::now().timestamp();
+    GeneralSettingsStore::new(&state.db)
+        .dismiss_setup_wizard(now)
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "db_error",
+            message: e.to_string(),
+        })?;
+    let _ = AuditStore::new(&state.db).insert(
+        &user.user_id,
+        "setup_wizard",
+        "dismiss",
+        None,
+        Some(&serde_json::json!({ "dismissed_at": now })),
+    );
+    Ok(StatusCode::OK)
+}
+
+fn require_controller(state: &AppState, user: &AuthedUser) -> Result<(), ApiError> {
+    use execlaw_core::users::{UserRole, UserStore};
+    let row = UserStore::new(&state.db)
+        .get_by_id(&user.user_id)
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "db_error",
+            message: e.to_string(),
+        })?;
+    match row.map(|u| u.role) {
+        Some(UserRole::Controller) => Ok(()),
+        _ => Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            code: "controller_only",
+            message: "only a Controller can dismiss the setup wizard".into(),
+        }),
+    }
+}
+
 pub fn setup_preflight_router() -> Router<AppState> {
-    Router::new().route("/api/admin/setup/preflight", get(get_handler))
+    Router::new()
+        .route("/api/admin/setup/preflight", get(get_handler))
+        .route("/api/admin/setup/dismiss", post(dismiss_handler))
 }
 
 #[cfg(test)]
@@ -176,6 +240,71 @@ mod tests {
         let req = Request::builder()
             .method(Method::GET)
             .uri("/api/admin/setup/preflight")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            resp.status() == StatusCode::UNAUTHORIZED
+                || resp.status() == StatusCode::FORBIDDEN,
+            "expected 401/403, got {}",
+            resp.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn dismiss_marks_wizard_complete_and_flips_ping_to_pong() {
+        use execlaw_core::general_settings::GeneralSettingsStore;
+        let state = crate::routes::test_app_state();
+        let app = build_router(state.clone());
+        let tok = setup_controller_token(&app).await;
+        // Pre-condition: ping says wizard (account exists, backend
+        // doesn't, not dismissed).
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ping")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"wizard");
+
+        // Dismiss.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/admin/setup/dismiss")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Store carries the timestamp.
+        assert!(GeneralSettingsStore::new(&state.db).wizard_dismissed().unwrap());
+
+        // Ping now says pong.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ping")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"pong");
+    }
+
+    #[tokio::test]
+    async fn dismiss_requires_auth() {
+        let app = build_router(crate::routes::test_app_state());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/admin/setup/dismiss")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();

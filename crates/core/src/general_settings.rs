@@ -21,12 +21,24 @@ pub struct GeneralSettings {
     /// Edit takes effect on next `execlaw service restart`.
     pub bind_address: String,
     pub updated_at: i64,
+    /// Phase 14 — first-run wizard "skip for now" timestamp. `Some`
+    /// when the operator dismissed the backend step explicitly;
+    /// `None` until they do or until they configure a backend (in
+    /// which case the wizard naturally completes through the
+    /// Standard-backend-exists path). The `/api/ping` handler reads
+    /// this together with `config_backends` to decide between
+    /// `wizard` and `pong`.
+    pub setup_wizard_dismissed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GeneralSettingsUpdate {
     pub start_on_boot: Option<bool>,
     pub bind_address: Option<String>,
+    /// Phase 14 — `Some(true)` flips `setup_wizard_dismissed_at` to
+    /// the current timestamp; `Some(false)` clears it (re-arms the
+    /// wizard for testing). `None` leaves the column alone.
+    pub setup_wizard_dismissed: Option<bool>,
 }
 
 #[derive(Debug, Error)]
@@ -54,7 +66,8 @@ impl<'a> GeneralSettingsStore<'a> {
     pub fn get(&self) -> Result<Option<GeneralSettings>, GeneralSettingsError> {
         self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT start_on_boot, bind_address, updated_at \
+                "SELECT start_on_boot, bind_address, updated_at, \
+                        setup_wizard_dismissed_at \
                  FROM config_general WHERE id = 1",
             )?;
             let row = stmt
@@ -63,12 +76,43 @@ impl<'a> GeneralSettingsStore<'a> {
                         start_on_boot: r.get::<_, i64>(0)? != 0,
                         bind_address: r.get(1)?,
                         updated_at: r.get(2)?,
+                        setup_wizard_dismissed_at: r.get(3)?,
                     })
                 })
                 .ok();
             Ok(row)
         })
         .map_err(GeneralSettingsError::from)
+    }
+
+    /// Cheap "is the first-run wizard considered complete?" probe.
+    /// Used by `/api/ping` so the SPA's AppBoot + setup guard can
+    /// route the operator back to /setup until either condition
+    /// holds. Mirrors the contract the wizard's "Skip for now"
+    /// button writes to via [`Self::dismiss_setup_wizard`].
+    pub fn wizard_dismissed(&self) -> Result<bool, GeneralSettingsError> {
+        Ok(self
+            .get()?
+            .and_then(|s| s.setup_wizard_dismissed_at)
+            .is_some())
+    }
+
+    /// Mark the wizard as dismissed at `now`. Idempotent — calling
+    /// twice just rewrites the timestamp. The wizard's "Skip for
+    /// now" button calls this immediately before navigating to
+    /// /chat.
+    pub fn dismiss_setup_wizard(
+        &self,
+        now: i64,
+    ) -> Result<GeneralSettings, GeneralSettingsError> {
+        self.update(
+            &GeneralSettingsUpdate {
+                start_on_boot: None,
+                bind_address: None,
+                setup_wizard_dismissed: Some(true),
+            },
+            now,
+        )
     }
 
     /// Apply an update. Validates the bind address before writing.
@@ -84,33 +128,42 @@ impl<'a> GeneralSettingsStore<'a> {
         }
         let upd = upd.clone();
         let saved = self.db.with_conn(|c| {
-            // Read-modify-write so a partial update preserves the
-            // other field. Singleton row → no contention concerns
+            // Read-modify-write so a partial update preserves
+            // siblings. Singleton row → no contention concerns
             // beyond the connection pool's serialization.
-            let current: Option<(i64, String)> = c
+            let current: Option<(i64, String, Option<i64>)> = c
                 .query_row(
-                    "SELECT start_on_boot, bind_address FROM config_general WHERE id = 1",
+                    "SELECT start_on_boot, bind_address, setup_wizard_dismissed_at \
+                     FROM config_general WHERE id = 1",
                     [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .ok();
-            let (cur_boot, cur_bind) =
-                current.unwrap_or((1, "127.0.0.1:3030".to_owned()));
+            let (cur_boot, cur_bind, cur_dismissed) =
+                current.unwrap_or((1, "127.0.0.1:3030".to_owned(), None));
             let new_boot = upd.start_on_boot.map(|b| b as i64).unwrap_or(cur_boot);
             let new_bind = upd.bind_address.clone().unwrap_or(cur_bind);
+            let new_dismissed: Option<i64> = match upd.setup_wizard_dismissed {
+                Some(true) => Some(now),
+                Some(false) => None,
+                None => cur_dismissed,
+            };
             c.execute(
-                "INSERT INTO config_general (id, start_on_boot, bind_address, updated_at) \
-                 VALUES (1, ?1, ?2, ?3) \
+                "INSERT INTO config_general \
+                    (id, start_on_boot, bind_address, updated_at, setup_wizard_dismissed_at) \
+                 VALUES (1, ?1, ?2, ?3, ?4) \
                  ON CONFLICT(id) DO UPDATE SET \
                     start_on_boot = excluded.start_on_boot, \
                     bind_address = excluded.bind_address, \
-                    updated_at = excluded.updated_at",
-                params![new_boot, new_bind, now],
+                    updated_at = excluded.updated_at, \
+                    setup_wizard_dismissed_at = excluded.setup_wizard_dismissed_at",
+                params![new_boot, new_bind, now, new_dismissed],
             )?;
             Ok(GeneralSettings {
                 start_on_boot: new_boot != 0,
                 bind_address: new_bind,
                 updated_at: now,
+                setup_wizard_dismissed_at: new_dismissed,
             })
         })?;
         Ok(saved)
@@ -174,7 +227,7 @@ mod tests {
             .update(
                 &GeneralSettingsUpdate {
                     start_on_boot: Some(false),
-                    bind_address: None,
+                    ..Default::default()
                 },
                 100,
             )
@@ -194,8 +247,8 @@ mod tests {
         store
             .update(
                 &GeneralSettingsUpdate {
-                    start_on_boot: None,
                     bind_address: Some("0.0.0.0:7777".into()),
+                    ..Default::default()
                 },
                 4242,
             )
@@ -211,8 +264,8 @@ mod tests {
         let store = GeneralSettingsStore::new(&db);
         let r = store.update(
             &GeneralSettingsUpdate {
-                start_on_boot: None,
                 bind_address: Some("".into()),
+                ..Default::default()
             },
             100,
         );
@@ -228,8 +281,8 @@ mod tests {
         let store = GeneralSettingsStore::new(&db);
         let r = store.update(
             &GeneralSettingsUpdate {
-                start_on_boot: None,
                 bind_address: Some("not a host port".into()),
+                ..Default::default()
             },
             100,
         );
@@ -246,12 +299,43 @@ mod tests {
         store
             .update(
                 &GeneralSettingsUpdate {
-                    start_on_boot: None,
                     bind_address: Some("[::1]:3030".into()),
+                    ..Default::default()
                 },
                 100,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn dismiss_setup_wizard_records_timestamp_and_round_trips() {
+        let db = open();
+        let store = GeneralSettingsStore::new(&db);
+        assert!(!store.wizard_dismissed().unwrap());
+        store.dismiss_setup_wizard(9999).unwrap();
+        assert!(store.wizard_dismissed().unwrap());
+        let s = store.get().unwrap().unwrap();
+        assert_eq!(s.setup_wizard_dismissed_at, Some(9999));
+    }
+
+    #[test]
+    fn dismiss_then_clear_resets_wizard_state() {
+        // Test re-arming the wizard via the explicit `Some(false)`
+        // branch in GeneralSettingsUpdate.
+        let db = open();
+        let store = GeneralSettingsStore::new(&db);
+        store.dismiss_setup_wizard(100).unwrap();
+        assert!(store.wizard_dismissed().unwrap());
+        store
+            .update(
+                &GeneralSettingsUpdate {
+                    setup_wizard_dismissed: Some(false),
+                    ..Default::default()
+                },
+                200,
+            )
+            .unwrap();
+        assert!(!store.wizard_dismissed().unwrap());
     }
 
     #[test]

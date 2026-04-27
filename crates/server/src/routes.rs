@@ -317,11 +317,37 @@ pub async fn health() -> Json<HealthResponse> {
     tag = "meta"
 )]
 pub async fn ping(State(state): State<AppState>) -> impl IntoResponse {
+    use execlaw_core::backends::{BackendPurpose, BackendStore};
+    use execlaw_core::general_settings::GeneralSettingsStore;
     use execlaw_core::users::UserStore;
+
+    // Three-state ping driving the SPA's first-run flow:
+    //
+    //   * `setup`  — no controller user yet. SPA → /setup, account
+    //                creation step.
+    //   * `wizard` — controller exists but the first-run wizard
+    //                hasn't completed (no Standard backend AND
+    //                operator hasn't dismissed). SPA → /setup,
+    //                resume at the docker step.
+    //   * `pong`   — fully provisioned (or wizard dismissed). SPA
+    //                → /chat / /login as before.
     let body = match UserStore::new(&state.db).any_exist() {
-        Ok(true) => "pong",
-        Ok(false) => "setup",
-        Err(_) => "setup",
+        Ok(false) | Err(_) => "setup",
+        Ok(true) => {
+            let backend_configured = BackendStore::new(&state.db)
+                .get(BackendPurpose::Standard)
+                .ok()
+                .flatten()
+                .is_some();
+            let dismissed = GeneralSettingsStore::new(&state.db)
+                .wizard_dismissed()
+                .unwrap_or(false);
+            if backend_configured || dismissed {
+                "pong"
+            } else {
+                "wizard"
+            }
+        }
     };
     (
         StatusCode::OK,
@@ -964,7 +990,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ping_is_setup_before_setup_then_pong_after() {
+    async fn ping_is_setup_before_setup_then_wizard_after() {
+        // Phase 14 — ping now has three states. Account creation
+        // alone flips us from `setup` → `wizard` (not `pong`),
+        // because the operator still needs to walk the docker +
+        // backend steps. The transition to `pong` happens via
+        // either backend save or explicit dismiss.
         let app = build_router(test_app_state());
         let resp = app
             .clone()
@@ -980,8 +1011,72 @@ mod tests {
         let body = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"setup");
 
-        // After setup, ping returns "pong".
         let _ = send_json(&app, Method::POST, "/api/setup", setup_body("hunter2-longer", "J")).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ping")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            &body[..],
+            b"wizard",
+            "after account creation, ping must say `wizard` until the operator either configures a Standard backend or dismisses the wizard"
+        );
+    }
+
+    #[tokio::test]
+    async fn ping_flips_to_pong_when_standard_backend_configured() {
+        use execlaw_core::backends::{
+            BackendMode, BackendPurpose, BackendStore, BackendUpsert,
+        };
+        let state = test_app_state();
+        let app = build_router(state.clone());
+        let _ = send_json(&app, Method::POST, "/api/setup", setup_body("hunter2-longer", "J")).await;
+        // Configuring Standard backend (any mode) is enough.
+        BackendStore::new(&state.db)
+            .upsert(
+                &BackendUpsert {
+                    purpose: BackendPurpose::Standard,
+                    inference_backend: "service-vllm".into(),
+                    model_spec_json: serde_json::json!({}),
+                    gpu_id: None,
+                    endpoint: Some("http://127.0.0.1:8000/v1".into()),
+                    notes: None,
+                    reasoning_enabled: false,
+                    mode: BackendMode::External,
+                },
+                100,
+            )
+            .unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ping")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"pong");
+    }
+
+    #[tokio::test]
+    async fn ping_flips_to_pong_when_wizard_dismissed() {
+        use execlaw_core::general_settings::GeneralSettingsStore;
+        let state = test_app_state();
+        let app = build_router(state.clone());
+        let _ = send_json(&app, Method::POST, "/api/setup", setup_body("hunter2-longer", "J")).await;
+        // No Standard backend, but operator clicked Skip → ping
+        // should still flip to pong.
+        GeneralSettingsStore::new(&state.db)
+            .dismiss_setup_wizard(123)
+            .unwrap();
         let resp = app
             .oneshot(
                 Request::builder()
