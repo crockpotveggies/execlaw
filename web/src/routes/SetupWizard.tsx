@@ -42,10 +42,6 @@ import {
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
 import { useScreenTransition } from "../anim/useScreenTransition";
-import {
-    BackendWizardPanel,
-    type MaterialisedSpec,
-} from "../settings/BackendWizardPanel";
 
 interface FieldErrors {
     username?: string;
@@ -646,15 +642,6 @@ function BackendStep({
 }) {
     const gpus = preflight?.gpus ?? [];
     const dockerAvailable = preflight?.docker.available ?? false;
-    // GPUs we recognize (Nvidia / Intel / Amd) — Unknown vendors map
-    // to "no managed backend possible for this card", so for the
-    // multi-GPU picker + preset wizard we filter to known vendors.
-    const usableGpus = gpus.filter(
-        (g) => g.vendor === "Nvidia" || g.vendor === "Intel" || g.vendor === "Amd",
-    );
-
-    const hasManagedPath = dockerAvailable && usableGpus.length > 0;
-
     return (
         <>
             <HardwareSummary
@@ -662,25 +649,13 @@ function BackendStep({
                 refreshing={refreshing}
                 refresh={refresh}
             />
-            {hasManagedPath ? (
-                <ManagedBackendForm
-                    getToken={getToken}
-                    usableGpus={usableGpus}
-                    onComplete={onComplete}
-                    onSkip={onSkip}
-                />
-            ) : (
-                <ExternalBackendForm
-                    getToken={getToken}
-                    reason={
-                        !dockerAvailable
-                            ? "Docker isn't reachable, so managed backends are unavailable."
-                            : "No supported GPU detected (NVIDIA / Intel Arc / AMD)."
-                    }
-                    onComplete={onComplete}
-                    onSkip={onSkip}
-                />
-            )}
+            <UnifiedBackendForm
+                getToken={getToken}
+                gpus={gpus}
+                dockerAvailable={dockerAvailable}
+                onComplete={onComplete}
+                onSkip={onSkip}
+            />
         </>
     );
 }
@@ -759,185 +734,317 @@ function HardwareSummary({
     );
 }
 
-function ManagedBackendForm({
+// ---------------------------------------------------------------------------
+// Unified backend picker
+//
+// Single dropdown: "target" — every detected GPU plus a "Remote
+// OpenAI-compatible endpoint" sentinel. Below the target picker the
+// form switches:
+//
+//   * GPU + NVIDIA  → vLLM is the only serving method (locked-in
+//                     because that's what the production presets
+//                     point at; the operator doesn't pick).
+//   * GPU + Intel   → radios for OpenVINO vs OpenArc.
+//   * GPU + AMD     → not yet supported; the wizard hides AMD GPUs
+//                     from the dropdown so the operator routes
+//                     through Remote until ROCm/vLLM-AMD lands.
+//   * Remote        → URL + optional model-id form.
+//
+// On GPU targets a model dropdown surfaces below the serving
+// method, filtered to entries that fit in the chosen card's VRAM.
+// ---------------------------------------------------------------------------
+
+type ServingMethod = "vllm" | "openvino" | "openarc";
+
+interface ModelOption {
+    /// Hugging Face repo id / OpenVINO model id — used as the
+    /// `--model={id}` CLI arg the supervisor passes to the chosen
+    /// container.
+    id: string;
+    /// Display label in the dropdown.
+    label: string;
+    /// Approximate minimum VRAM required, in MiB. The wizard hides
+    /// entries that exceed the picked GPU's `memory_mb`.
+    min_mb: number;
+}
+
+const SERVING_LABEL: Record<ServingMethod, string> = {
+    vllm: "vLLM",
+    openvino: "OpenVINO model server",
+    openarc: "OpenArc",
+};
+
+const SERVING_PLUGIN: Record<ServingMethod, string> = {
+    vllm: "service-vllm",
+    openvino: "service-vllm-openvino-arc",
+    openarc: "service-openarc",
+};
+
+const SERVING_IMAGE: Record<ServingMethod, string> = {
+    vllm: "vllm/vllm-openai:v0.6.2",
+    openvino: "execlaw/service-vllm-openvino-arc:v1",
+    openarc: "execlaw/service-openarc:v1",
+};
+
+/// Curated catalog. Sized to fit the preset library's locked
+/// decisions (Qwen3.5-27B-AWQ as the flagship Standard model, plus
+/// smaller fallbacks). The user can override anything via the
+/// Settings → Backends page once setup completes.
+const MODEL_CATALOG: Record<ServingMethod, ModelOption[]> = {
+    vllm: [
+        {
+            id: "QuantTrio/Qwen3.5-27B-AWQ",
+            label: "Qwen 3.5 27B (AWQ, ~18 GB)",
+            min_mb: 18_000,
+        },
+        {
+            id: "Qwen/Qwen2.5-7B-Instruct-AWQ",
+            label: "Qwen 2.5 7B (AWQ, ~8 GB)",
+            min_mb: 8_000,
+        },
+        {
+            id: "Qwen/Qwen2.5-3B-Instruct-AWQ",
+            label: "Qwen 2.5 3B (AWQ, ~4 GB)",
+            min_mb: 4_000,
+        },
+    ],
+    openvino: [
+        {
+            id: "OpenVINO/Qwen2.5-7B-Instruct-int4-ov",
+            label: "Qwen 2.5 7B (INT4 OpenVINO, ~6 GB)",
+            min_mb: 6_000,
+        },
+        {
+            id: "OpenVINO/Phi-3-mini-4k-instruct-int4-ov",
+            label: "Phi-3 Mini 4k (INT4 OpenVINO, ~3 GB)",
+            min_mb: 3_000,
+        },
+    ],
+    openarc: [
+        {
+            id: "OpenVINO/Qwen2.5-7B-Instruct-int4-ov",
+            label: "Qwen 2.5 7B (INT4, ~6 GB)",
+            min_mb: 6_000,
+        },
+        {
+            id: "OpenVINO/Phi-3-mini-4k-instruct-int4-ov",
+            label: "Phi-3 Mini 4k (INT4, ~3 GB)",
+            min_mb: 3_000,
+        },
+    ],
+};
+
+interface ManagedTarget {
+    kind: "gpu";
+    gpu: DetectedGpu;
+    /// Index in the gpu list — used as a stable React key.
+    gpuIdx: number;
+}
+
+interface RemoteTarget {
+    kind: "remote";
+}
+
+type Target = ManagedTarget | RemoteTarget;
+
+const REMOTE_TARGET_KEY = "__remote";
+
+function targetKey(t: Target): string {
+    if (t.kind === "remote") return REMOTE_TARGET_KEY;
+    return `gpu:${t.gpuIdx}`;
+}
+
+function targetLabel(t: Target): string {
+    if (t.kind === "remote") return "Remote OpenAI-compatible endpoint";
+    return gpuLabel(t.gpu);
+}
+
+function servingMethodsFor(gpu: DetectedGpu): ServingMethod[] {
+    switch (gpu.vendor) {
+        case "Nvidia":
+            return ["vllm"];
+        case "Intel":
+            return ["openvino", "openarc"];
+        default:
+            return [];
+    }
+}
+
+function modelsFor(serving: ServingMethod, memory_mb: number | null): ModelOption[] {
+    const all = MODEL_CATALOG[serving];
+    if (memory_mb === null) {
+        // Unknown VRAM — show everything; operator can override
+        // post-setup if it doesn't fit.
+        return all;
+    }
+    return all.filter((m) => m.min_mb <= memory_mb);
+}
+
+function UnifiedBackendForm({
     getToken,
-    usableGpus,
+    gpus,
+    dockerAvailable,
     onComplete,
     onSkip,
 }: {
     getToken: () => string | null;
-    usableGpus: DetectedGpu[];
+    gpus: DetectedGpu[];
+    dockerAvailable: boolean;
     onComplete: () => void;
     onSkip: () => void;
 }) {
-    const [pickedGpuIdx, setPickedGpuIdx] = useState(0);
+    // Build the target list. We include a GPU only if (a) Docker is
+    // available AND (b) the vendor has at least one supported serving
+    // method (NVIDIA / Intel Arc). AMD + Apple Silicon + Unknown
+    // route through Remote until their plugins ship.
+    const targets: Target[] = [];
+    if (dockerAvailable) {
+        gpus.forEach((g, idx) => {
+            if (servingMethodsFor(g).length > 0) {
+                targets.push({ kind: "gpu", gpu: g, gpuIdx: idx });
+            }
+        });
+    }
+    targets.push({ kind: "remote" });
+
+    const [targetIdx, setTargetIdx] = useState(0);
+    const target = targets[targetIdx] ?? targets[0];
+
+    // Default the serving method to the first available for the
+    // currently-selected GPU. Resets when the operator switches
+    // GPUs.
+    const availableServing =
+        target.kind === "gpu" ? servingMethodsFor(target.gpu) : [];
+    const [serving, setServing] = useState<ServingMethod>(
+        availableServing[0] ?? "vllm",
+    );
+    useEffect(() => {
+        if (target.kind === "gpu") {
+            const opts = servingMethodsFor(target.gpu);
+            if (!opts.includes(serving)) setServing(opts[0]);
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [targetIdx]);
+
+    // Available models for the current GPU + serving combo.
+    const availableModels =
+        target.kind === "gpu"
+            ? modelsFor(serving, target.gpu.memory_mb ?? null)
+            : [];
+    const [modelId, setModelId] = useState<string>("");
+    // Reset model when target / serving changes — picks the first
+    // available so the dropdown is never empty.
+    useEffect(() => {
+        if (target.kind === "gpu") {
+            if (
+                modelId.length === 0 ||
+                !availableModels.find((m) => m.id === modelId)
+            ) {
+                setModelId(availableModels[0]?.id ?? "");
+            }
+        } else {
+            setModelId("");
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [targetIdx, serving, availableModels.length]);
+
+    // Remote-mode fields.
+    const [endpoint, setEndpoint] = useState("");
+    const [remoteModel, setRemoteModel] = useState("");
+
+    // Submission state.
     const [submitting, setSubmitting] = useState(false);
     const [submitError, setSubmitError] = useState<string | null>(null);
+    const [endpointError, setEndpointError] = useState<string | null>(null);
 
-    const onApply = useCallback(
-        async (spec: MaterialisedSpec) => {
-            setSubmitting(true);
+    const onSubmit = useCallback(
+        async (e: FormEvent<HTMLFormElement>) => {
+            e.preventDefault();
             setSubmitError(null);
+            setEndpointError(null);
+            setSubmitting(true);
             try {
-                // Override the wizard's gpu_id with the operator's
-                // multi-GPU choice when the host has more than one.
-                // The wizard's own gpu_id field is hidden via the
-                // `data-testid="backend-wizard-gpu"` input — we let
-                // the operator type there too, but the picker below
-                // is the canonical source for the multi-GPU case.
-                const chosenGpu = usableGpus[pickedGpuIdx];
-                const gpu_id =
-                    spec.gpu_id.trim().length > 0
-                        ? spec.gpu_id.trim()
-                        : gpuIdString(chosenGpu);
-                await upsertBackend(
-                    "Standard",
-                    {
-                        inference_backend: spec.inference_backend,
-                        model_spec: spec.model_spec,
-                        gpu_id: gpu_id.length > 0 ? gpu_id : null,
-                        endpoint: null,
-                        notes: "Configured via first-run wizard",
-                        reasoning_enabled: false,
-                        mode: "managed",
-                    },
-                    getToken,
-                );
+                if (target.kind === "remote") {
+                    const trimmed = endpoint.trim();
+                    if (trimmed.length === 0) {
+                        setEndpointError("Required.");
+                        setSubmitting(false);
+                        return;
+                    }
+                    try {
+                        new URL(trimmed);
+                    } catch {
+                        setEndpointError(
+                            "Doesn't look like a URL. Example: http://localhost:8000/v1",
+                        );
+                        setSubmitting(false);
+                        return;
+                    }
+                    await upsertBackend(
+                        "Standard",
+                        {
+                            inference_backend: "external",
+                            model_spec: remoteModel.trim().length > 0
+                                ? { model: remoteModel.trim() }
+                                : {},
+                            gpu_id: null,
+                            endpoint: trimmed,
+                            notes: "Configured via first-run wizard (remote)",
+                            reasoning_enabled: false,
+                            mode: "external",
+                        },
+                        getToken,
+                    );
+                } else {
+                    if (!modelId) {
+                        setSubmitError(
+                            "Pick a model that fits this GPU (or skip and configure later).",
+                        );
+                        setSubmitting(false);
+                        return;
+                    }
+                    await upsertBackend(
+                        "Standard",
+                        {
+                            inference_backend: SERVING_PLUGIN[serving],
+                            model_spec: {
+                                image: SERVING_IMAGE[serving],
+                                args: [`--model=${modelId}`],
+                                container_port: 8000,
+                            },
+                            gpu_id: gpuIdString(target.gpu),
+                            endpoint: null,
+                            notes: `Configured via first-run wizard (${SERVING_LABEL[serving]})`,
+                            reasoning_enabled: false,
+                            mode: "managed",
+                        },
+                        getToken,
+                    );
+                }
                 onComplete();
-            } catch (e) {
+            } catch (err) {
                 setSubmitError(
-                    e instanceof Error ? e.message : String(e),
+                    err instanceof Error ? err.message : String(err),
                 );
             } finally {
                 setSubmitting(false);
             }
         },
-        [getToken, onComplete, pickedGpuIdx, usableGpus],
+        [
+            target,
+            serving,
+            modelId,
+            endpoint,
+            remoteModel,
+            getToken,
+            onComplete,
+        ],
     );
 
     return (
-        <div data-testid="setup-backend-managed">
+        <div data-testid="setup-backend-unified">
             <p className="execlaw-muted small mb-3">
-                Pick a managed backend for your Standard chat model.
-            </p>
-            {submitError && (
-                <div
-                    className="execlaw-error-banner mb-3"
-                    role="alert"
-                    data-testid="setup-backend-error"
-                >
-                    {submitError}
-                </div>
-            )}
-            {usableGpus.length > 1 && (
-                <Form.Group
-                    className="mb-3"
-                    data-testid="setup-gpu-picker"
-                >
-                    <Form.Label className="execlaw-muted small mb-1">
-                        Pin to which GPU?
-                    </Form.Label>
-                    <Form.Select
-                        value={pickedGpuIdx}
-                        onChange={(e) =>
-                            setPickedGpuIdx(parseInt(e.target.value, 10))
-                        }
-                        disabled={submitting}
-                        data-testid="setup-gpu-picker-select"
-                    >
-                        {usableGpus.map((g, i) => (
-                            <option key={gpuIdString(g)} value={i}>
-                                {gpuLabel(g)}
-                            </option>
-                        ))}
-                    </Form.Select>
-                    <Form.Text className="execlaw-muted">
-                        Multiple GPUs detected. The Standard backend
-                        will be pinned to the one you pick; the others
-                        remain available for VoiceSTT / VoiceTTS later.
-                    </Form.Text>
-                </Form.Group>
-            )}
-            <BackendWizardPanel
-                purpose="Standard"
-                getToken={getToken}
-                onApply={(spec) => void onApply(spec)}
-                onSkip={onSkip}
-            />
-        </div>
-    );
-}
-
-function ExternalBackendForm({
-    getToken,
-    reason,
-    onComplete,
-    onSkip,
-}: {
-    getToken: () => string | null;
-    reason: string;
-    onComplete: () => void;
-    onSkip: () => void;
-}) {
-    const [endpoint, setEndpoint] = useState("");
-    const [model, setModel] = useState("");
-    const [submitting, setSubmitting] = useState(false);
-    const [submitError, setSubmitError] = useState<string | null>(null);
-    const [endpointError, setEndpointError] = useState<string | null>(null);
-
-    const onSubmit = async (e: FormEvent<HTMLFormElement>) => {
-        e.preventDefault();
-        setSubmitError(null);
-        setEndpointError(null);
-        const trimmed = endpoint.trim();
-        if (trimmed.length === 0) {
-            setEndpointError("Required.");
-            return;
-        }
-        try {
-            // Loose URL sanity check — server side will validate
-            // properly on connect.
-            new URL(trimmed);
-        } catch {
-            setEndpointError(
-                "Doesn't look like a URL. Example: http://localhost:8000/v1",
-            );
-            return;
-        }
-        setSubmitting(true);
-        try {
-            await upsertBackend(
-                "Standard",
-                {
-                    inference_backend: "external",
-                    model_spec: model.trim().length > 0
-                        ? { model: model.trim() }
-                        : {},
-                    gpu_id: null,
-                    endpoint: trimmed,
-                    notes: "Configured via first-run wizard (external)",
-                    reasoning_enabled: false,
-                    mode: "external",
-                },
-                getToken,
-            );
-            onComplete();
-        } catch (e) {
-            setSubmitError(e instanceof Error ? e.message : String(e));
-        } finally {
-            setSubmitting(false);
-        }
-    };
-
-    return (
-        <div data-testid="setup-backend-external">
-            <p className="execlaw-muted small mb-3">{reason}</p>
-            <p className="execlaw-muted small mb-3">
-                Point execlaw at any OpenAI-compatible endpoint —
-                vLLM, llama.cpp, Ollama, LM Studio, or a hosted
-                proxy. The control plane talks
-                {" "}<code>POST /v1/chat/completions</code>{" "}
-                only; no vendor SDKs.
+                Pick where your Standard chat model runs.
             </p>
             {submitError && (
                 <div
@@ -949,51 +1056,171 @@ function ExternalBackendForm({
                 </div>
             )}
             <Form noValidate onSubmit={onSubmit}>
-                <Form.Group className="mb-3" controlId="setup-external-endpoint">
-                    <Form.Label>Endpoint URL</Form.Label>
-                    <Form.Control
-                        type="url"
-                        value={endpoint}
-                        onChange={(e) => setEndpoint(e.target.value)}
-                        isInvalid={!!endpointError}
-                        disabled={submitting}
-                        placeholder="http://localhost:8000/v1"
-                        autoFocus
-                        data-testid="setup-external-endpoint"
-                    />
-                    <Form.Control.Feedback type="invalid">
-                        {endpointError}
-                    </Form.Control.Feedback>
-                    <Form.Text className="execlaw-muted">
-                        Include the <code>/v1</code> suffix if your
-                        server requires it (vLLM, LM Studio do; some
-                        local stacks don&rsquo;t).
-                    </Form.Text>
-                </Form.Group>
-                <Form.Group className="mb-3" controlId="setup-external-model">
-                    <Form.Label>
-                        Model id <span className="execlaw-muted">(optional)</span>
+                <Form.Group className="mb-3">
+                    <Form.Label className="execlaw-muted small mb-1">
+                        Target
                     </Form.Label>
-                    <Form.Control
-                        type="text"
-                        value={model}
-                        onChange={(e) => setModel(e.target.value)}
+                    <Form.Select
+                        value={targetIdx}
+                        onChange={(e) =>
+                            setTargetIdx(parseInt(e.target.value, 10))
+                        }
                         disabled={submitting}
-                        placeholder="QuantTrio/Qwen3.5-27B-AWQ"
-                        data-testid="setup-external-model"
-                    />
-                    <Form.Text className="execlaw-muted">
-                        Sent in the <code>model</code> field on every
-                        request. Leave blank if your endpoint only
-                        serves a single default.
-                    </Form.Text>
+                        data-testid="setup-target-select"
+                    >
+                        {targets.map((t, i) => (
+                            <option key={targetKey(t)} value={i}>
+                                {targetLabel(t)}
+                            </option>
+                        ))}
+                    </Form.Select>
+                    {target.kind === "remote" && (
+                        <Form.Text className="execlaw-muted">
+                            Point execlaw at any OpenAI-compatible
+                            endpoint — vLLM, llama.cpp, Ollama, LM
+                            Studio, or a hosted proxy. The control
+                            plane only speaks
+                            {" "}<code>POST /v1/chat/completions</code>{" "}
+                            (no vendor SDKs).
+                        </Form.Text>
+                    )}
                 </Form.Group>
+
+                {target.kind === "gpu" && (
+                    <>
+                        {availableServing.length === 1 ? (
+                            <div
+                                className="execlaw-muted small mb-3"
+                                data-testid="setup-serving-fixed"
+                            >
+                                Serving method:{" "}
+                                <strong>{SERVING_LABEL[serving]}</strong>
+                                {" "}(only supported method for this GPU
+                                vendor today).
+                            </div>
+                        ) : (
+                            <Form.Group
+                                className="mb-3"
+                                data-testid="setup-serving-picker"
+                            >
+                                <Form.Label className="execlaw-muted small mb-1">
+                                    Serving method
+                                </Form.Label>
+                                <div className="d-flex gap-3">
+                                    {availableServing.map((m) => (
+                                        <Form.Check
+                                            key={m}
+                                            type="radio"
+                                            id={`setup-serving-${m}`}
+                                            name="setup-serving"
+                                            label={SERVING_LABEL[m]}
+                                            checked={serving === m}
+                                            onChange={() => setServing(m)}
+                                            disabled={submitting}
+                                            data-testid={`setup-serving-${m}`}
+                                        />
+                                    ))}
+                                </div>
+                                <Form.Text className="execlaw-muted">
+                                    OpenVINO is the standard Intel
+                                    serving stack; OpenArc is a
+                                    vLLM-compatible drop-in tuned for
+                                    Arc.
+                                </Form.Text>
+                            </Form.Group>
+                        )}
+
+                        <Form.Group className="mb-3">
+                            <Form.Label className="execlaw-muted small mb-1">
+                                Model
+                            </Form.Label>
+                            {availableModels.length === 0 ? (
+                                <div
+                                    className="execlaw-muted small"
+                                    data-testid="setup-no-models"
+                                >
+                                    No model in the curated catalog fits
+                                    this GPU&rsquo;s {target.gpu.memory_mb ?? "?"}
+                                    {" "}MiB of VRAM. Skip and configure a
+                                    custom model later via Settings →
+                                    Backends.
+                                </div>
+                            ) : (
+                                <>
+                                    <Form.Select
+                                        value={modelId}
+                                        onChange={(e) => setModelId(e.target.value)}
+                                        disabled={submitting}
+                                        data-testid="setup-model-select"
+                                    >
+                                        {availableModels.map((m) => (
+                                            <option key={m.id} value={m.id}>
+                                                {m.label}
+                                            </option>
+                                        ))}
+                                    </Form.Select>
+                                    <Form.Text className="execlaw-muted">
+                                        Filtered to entries that fit in
+                                        this GPU&rsquo;s VRAM
+                                        {target.gpu.memory_mb
+                                            ? ` (${(target.gpu.memory_mb / 1024).toFixed(1)} GB)`
+                                            : ""}
+                                        . You can swap models later from
+                                        Settings → Backends.
+                                    </Form.Text>
+                                </>
+                            )}
+                        </Form.Group>
+                    </>
+                )}
+
+                {target.kind === "remote" && (
+                    <>
+                        <Form.Group className="mb-3" controlId="setup-external-endpoint">
+                            <Form.Label>Endpoint URL</Form.Label>
+                            <Form.Control
+                                type="url"
+                                value={endpoint}
+                                onChange={(e) => setEndpoint(e.target.value)}
+                                isInvalid={!!endpointError}
+                                disabled={submitting}
+                                placeholder="http://localhost:8000/v1"
+                                data-testid="setup-external-endpoint"
+                            />
+                            <Form.Control.Feedback type="invalid">
+                                {endpointError}
+                            </Form.Control.Feedback>
+                            <Form.Text className="execlaw-muted">
+                                Include the <code>/v1</code> suffix if
+                                your server requires it.
+                            </Form.Text>
+                        </Form.Group>
+                        <Form.Group className="mb-3" controlId="setup-external-model">
+                            <Form.Label>
+                                Model id <span className="execlaw-muted">(optional)</span>
+                            </Form.Label>
+                            <Form.Control
+                                type="text"
+                                value={remoteModel}
+                                onChange={(e) => setRemoteModel(e.target.value)}
+                                disabled={submitting}
+                                placeholder="QuantTrio/Qwen3.5-27B-AWQ"
+                                data-testid="setup-external-model"
+                            />
+                            <Form.Text className="execlaw-muted">
+                                Sent in the <code>model</code> field on
+                                every request.
+                            </Form.Text>
+                        </Form.Group>
+                    </>
+                )}
+
                 <div className="d-flex gap-2">
                     <Button
                         type="submit"
                         variant="primary"
                         disabled={submitting}
-                        data-testid="setup-external-submit"
+                        data-testid="setup-backend-submit"
                     >
                         {submitting ? (
                             <>
@@ -1028,14 +1255,53 @@ function ExternalBackendForm({
 // ---------------------------------------------------------------------------
 
 function gpuLabel(g: DetectedGpu): string {
-    const vendor =
-        g.vendor === "Nvidia"
-            ? "NVIDIA"
-            : g.vendor === "Amd"
-              ? "AMD"
-              : g.vendor;
-    const id = gpuIdString(g);
-    return `${vendor} (${id})`;
+    const vendor = vendorDisplayName(g.vendor);
+    // Prefer the resolved SKU (e.g. "GeForce RTX 4090") + memory if
+    // hardware-query gave us those. Falls back to a short
+    // vendor + cleaned PCI device id when only the legacy sysfs
+    // path is available — never the multi-line PNP string.
+    const sku =
+        g.model_name && g.model_name.trim().length > 0
+            ? g.model_name.trim()
+            : `${vendor} GPU (${cleanPciDeviceId(g.pci_device_id)})`;
+    const mem = g.memory_mb && g.memory_mb > 0
+        ? ` · ${(g.memory_mb / 1024).toFixed(1)} GB`
+        : "";
+    // For NVIDIA the SKU usually already includes "NVIDIA" or
+    // "GeForce" so prefixing the vendor would be redundant. For
+    // Intel Arc the SKU is just "Arc A770", so prefix with "Intel".
+    if (g.vendor === "Intel" && !sku.toLowerCase().startsWith("intel")) {
+        return `Intel ${sku}${mem}`;
+    }
+    return `${sku}${mem}`;
+}
+
+function vendorDisplayName(v: DetectedGpu["vendor"]): string {
+    switch (v) {
+        case "Nvidia":
+            return "NVIDIA";
+        case "Intel":
+            return "Intel";
+        case "Amd":
+            return "AMD";
+        default:
+            return "GPU";
+    }
+}
+
+/// Strip multi-line / over-long PCI device strings down to a short
+/// label suitable for a badge. Defends against the Windows PNP
+/// shape (`PCI\VEN_…&DEV_NNNN&…`) that the server-side adapter is
+/// supposed to clean up — we mirror the heuristic so older servers
+/// that pre-date the cleanup still render correctly.
+function cleanPciDeviceId(raw: string): string {
+    if (raw.startsWith("0x") || raw.startsWith("0X")) return raw;
+    const devIdx = raw.indexOf("DEV_");
+    if (devIdx >= 0) {
+        const hex = raw.slice(devIdx + 4, devIdx + 8);
+        if (/^[0-9a-fA-F]{4}$/.test(hex)) return `0x${hex.toLowerCase()}`;
+    }
+    return raw.length > 14 ? `${raw.slice(0, 13)}…` : raw;
 }
 
 function gpuIdString(g: DetectedGpu): string {

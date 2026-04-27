@@ -51,18 +51,28 @@ body {
 .execlaw-auth-shell {
     min-height: 100vh;
     display: flex;
-    align-items: center;
+    // Top-aligned with vertical scroll so a tall wizard step (e.g.
+    // the backend picker with model dropdown + serving choice) can
+    // grow past the viewport instead of overflowing off-screen with
+    // no way to reach the buttons below.
+    align-items: flex-start;
     justify-content: center;
-    padding: 1.5rem;
+    padding: 3rem 1.5rem;
+    overflow-y: auto;
 }
 
 .execlaw-auth-card {
     width: 100%;
-    max-width: 28rem;
+    // Wizard steps with model lists + multiple form rows want a
+    // little more horizontal room than the original 28rem login
+    // card. 32rem stays mobile-friendly while letting the dropdowns
+    // breathe.
+    max-width: 32rem;
     background-color: $bg-surface;
     border: 1px solid $border-subtle;
     border-radius: 0.75rem;
     padding: 2rem;
+    margin: auto 0;
 }
 
 // Setup wizard timeline indicator (Phase 14).

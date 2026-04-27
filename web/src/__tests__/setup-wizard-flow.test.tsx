@@ -220,13 +220,17 @@ describe("SetupWizard — multi-step flow", () => {
             expect(screen.getByTestId("setup-docker-missing")).toBeInTheDocument();
         });
         fireEvent.click(screen.getByTestId("setup-docker-skip"));
-        // No Docker = external backend form.
+        // No Docker = unified backend with only the "Remote" option.
         await waitFor(() => {
-            expect(screen.getByTestId("setup-backend-external")).toBeInTheDocument();
+            expect(screen.getByTestId("setup-backend-unified")).toBeInTheDocument();
         });
-        expect(
-            screen.getByText(/Docker isn't reachable/i),
-        ).toBeInTheDocument();
+        const select = screen.getByTestId(
+            "setup-target-select",
+        ) as HTMLSelectElement;
+        // Only the Remote target — no GPU rows because Docker isn't
+        // available.
+        expect(select.options.length).toBe(1);
+        expect(select.options[0].textContent).toMatch(/Remote/);
     });
 
     it("docker reachable + no GPU → external backend form with no-GPU rationale", async () => {
@@ -252,14 +256,15 @@ describe("SetupWizard — multi-step flow", () => {
         });
         fireEvent.click(screen.getByTestId("setup-docker-continue"));
         await waitFor(() => {
-            expect(screen.getByTestId("setup-backend-external")).toBeInTheDocument();
+            expect(screen.getByTestId("setup-backend-unified")).toBeInTheDocument();
         });
-        // The rationale string includes the parenthetical vendor
-        // list — that's the discriminator from the hardware-summary
-        // card, which also says "No supported GPU detected".
-        expect(
-            screen.getByText(/NVIDIA \/ Intel Arc \/ AMD/i),
-        ).toBeInTheDocument();
+        // No GPUs detected — the target dropdown should only carry
+        // the Remote option.
+        const select = screen.getByTestId(
+            "setup-target-select",
+        ) as HTMLSelectElement;
+        expect(select.options.length).toBe(1);
+        expect(select.options[0].textContent).toMatch(/Remote/);
     });
 
     it("external form: validates URL + saves with mode=external", async () => {
@@ -306,11 +311,13 @@ describe("SetupWizard — multi-step flow", () => {
         });
         fireEvent.click(screen.getByTestId("setup-docker-continue"));
         await waitFor(() => {
-            expect(screen.getByTestId("setup-backend-external")).toBeInTheDocument();
+            expect(screen.getByTestId("setup-backend-unified")).toBeInTheDocument();
         });
 
-        // Empty submit → validation error.
-        fireEvent.click(screen.getByTestId("setup-external-submit"));
+        // Remote is the only target when there are no usable GPUs;
+        // the form already shows the URL field. Empty submit →
+        // validation error.
+        fireEvent.click(screen.getByTestId("setup-backend-submit"));
         await waitFor(() => {
             expect(screen.getByText(/Required/i)).toBeInTheDocument();
         });
@@ -319,7 +326,7 @@ describe("SetupWizard — multi-step flow", () => {
         fireEvent.change(screen.getByTestId("setup-external-endpoint"), {
             target: { value: "not a url" },
         });
-        fireEvent.click(screen.getByTestId("setup-external-submit"));
+        fireEvent.click(screen.getByTestId("setup-backend-submit"));
         await waitFor(() => {
             expect(screen.getByText(/Doesn't look like a URL/i)).toBeInTheDocument();
         });
@@ -331,7 +338,7 @@ describe("SetupWizard — multi-step flow", () => {
         fireEvent.change(screen.getByTestId("setup-external-model"), {
             target: { value: "Qwen3.5-27B-AWQ" },
         });
-        fireEvent.click(screen.getByTestId("setup-external-submit"));
+        fireEvent.click(screen.getByTestId("setup-backend-submit"));
 
         await waitFor(() => {
             expect(screen.getByTestId("chat-shell")).toBeInTheDocument();
@@ -347,7 +354,7 @@ describe("SetupWizard — multi-step flow", () => {
         expect(body.model_spec).toEqual({ model: "Qwen3.5-27B-AWQ" });
     });
 
-    it("docker + GPUs → renders managed BackendWizardPanel", async () => {
+    it("nvidia GPU → vLLM is the only serving method, model dropdown filters by VRAM", async () => {
         fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
             calls.push({ url, init });
             if (url === "/api/setup") return setupResponse();
@@ -362,63 +369,13 @@ describe("SetupWizard — multi-step flow", () => {
                                 vendor: "Nvidia",
                                 pci_vendor_id: "0x10de",
                                 pci_device_id: "0x2684",
+                                model_name: "GeForce RTX 4090",
+                                memory_mb: 24_576,
                             },
                         ],
                     }),
                     { status: 200 },
                 );
-            }
-            if (url.startsWith("/api/admin/backends/presets")) {
-                return presetsResponseFor("Standard");
-            }
-            return new Response("{}", { status: 200 });
-        });
-        mountWizard();
-        await fillAndSubmitAccount();
-        await waitFor(() => {
-            expect(screen.getByTestId("setup-docker-ok")).toBeInTheDocument();
-        });
-        fireEvent.click(screen.getByTestId("setup-docker-continue"));
-        await waitFor(() => {
-            expect(screen.getByTestId("setup-backend-managed")).toBeInTheDocument();
-        });
-        // No multi-GPU picker for a single GPU host.
-        expect(screen.queryByTestId("setup-gpu-picker")).toBeNull();
-        // BackendWizardPanel renders.
-        await waitFor(() => {
-            expect(screen.getByTestId("backend-wizard")).toBeInTheDocument();
-        });
-    });
-
-    it("multi-GPU: picker is visible + chosen id is sent in PUT", async () => {
-        fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
-            calls.push({ url, init });
-            if (url === "/api/setup") return setupResponse();
-            if (url === "/api/admin/me") return meResponse();
-            if (url === "/api/admin/setup/preflight") {
-                return new Response(
-                    JSON.stringify({
-                        docker: { available: true, version: "24.0.7" },
-                        gpus: [
-                            {
-                                id: "0x10de:0x2684",
-                                vendor: "Nvidia",
-                                pci_vendor_id: "0x10de",
-                                pci_device_id: "0x2684",
-                            },
-                            {
-                                id: "0x8086:0xe20b",
-                                vendor: "Intel",
-                                pci_vendor_id: "0x8086",
-                                pci_device_id: "0xe20b",
-                            },
-                        ],
-                    }),
-                    { status: 200 },
-                );
-            }
-            if (url.startsWith("/api/admin/backends/presets")) {
-                return presetsResponseFor("Standard");
             }
             if (
                 url === "/api/admin/backends/Standard" &&
@@ -435,22 +392,26 @@ describe("SetupWizard — multi-step flow", () => {
         });
         fireEvent.click(screen.getByTestId("setup-docker-continue"));
         await waitFor(() => {
-            expect(screen.getByTestId("setup-gpu-picker")).toBeInTheDocument();
+            expect(screen.getByTestId("setup-backend-unified")).toBeInTheDocument();
         });
+        // Two targets: the NVIDIA GPU + Remote.
         const select = screen.getByTestId(
-            "setup-gpu-picker-select",
+            "setup-target-select",
         ) as HTMLSelectElement;
-        // Two options surfaced.
         expect(select.options.length).toBe(2);
-        // Pick the second GPU (Intel Arc).
-        fireEvent.change(select, { target: { value: "1" } });
-        // Click "Use this preset" inside the embedded BackendWizardPanel.
-        await waitFor(() => {
-            expect(
-                screen.getByTestId("backend-wizard-apply"),
-            ).toBeInTheDocument();
-        });
-        fireEvent.click(screen.getByTestId("backend-wizard-apply"));
+        expect(select.options[0].textContent).toMatch(/GeForce RTX 4090/);
+        // For NVIDIA we don't show the radio picker — we render a
+        // "fixed serving method" note instead.
+        expect(screen.getByTestId("setup-serving-fixed")).toBeInTheDocument();
+        expect(screen.queryByTestId("setup-serving-picker")).toBeNull();
+        // Model dropdown should include all three vLLM catalog
+        // entries because 24 GB fits the 18 GB flagship.
+        const modelSelect = screen.getByTestId(
+            "setup-model-select",
+        ) as HTMLSelectElement;
+        expect(modelSelect.options.length).toBe(3);
+        // Save → PUT with vLLM image + chosen model in args.
+        fireEvent.click(screen.getByTestId("setup-backend-submit"));
         await waitFor(() => {
             expect(screen.getByTestId("chat-shell")).toBeInTheDocument();
         });
@@ -461,8 +422,196 @@ describe("SetupWizard — multi-step flow", () => {
         )!;
         const body = JSON.parse((put.init?.body as string) ?? "{}");
         expect(body.mode).toBe("managed");
-        // gpu_id should match the second GPU's id (Intel Arc).
+        expect(body.inference_backend).toBe("service-vllm");
+        expect(body.gpu_id).toBe("0x10de:0x2684");
+        expect(body.model_spec.image).toBe("vllm/vllm-openai:v0.6.2");
+        // The first option in the dropdown is the 27B AWQ flagship
+        // — that's what gets saved on default.
+        expect(body.model_spec.args).toContain(
+            "--model=QuantTrio/Qwen3.5-27B-AWQ",
+        );
+    });
+
+    it("intel arc GPU → OpenVINO + OpenArc radios + INT4 catalog", async () => {
+        fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+            calls.push({ url, init });
+            if (url === "/api/setup") return setupResponse();
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/setup/preflight") {
+                return new Response(
+                    JSON.stringify({
+                        docker: { available: true, version: "24.0.7" },
+                        gpus: [
+                            {
+                                id: "0x8086:0xe20b",
+                                vendor: "Intel",
+                                pci_vendor_id: "0x8086",
+                                pci_device_id: "0xe20b",
+                                model_name: "Arc A770",
+                                memory_mb: 16_384,
+                            },
+                        ],
+                    }),
+                    { status: 200 },
+                );
+            }
+            if (
+                url === "/api/admin/backends/Standard" &&
+                init?.method === "PUT"
+            ) {
+                return upsertBackendResponse();
+            }
+            return new Response("{}", { status: 200 });
+        });
+        mountWizard();
+        await fillAndSubmitAccount();
+        await waitFor(() => {
+            expect(screen.getByTestId("setup-docker-ok")).toBeInTheDocument();
+        });
+        fireEvent.click(screen.getByTestId("setup-docker-continue"));
+        await waitFor(() => {
+            expect(screen.getByTestId("setup-serving-picker")).toBeInTheDocument();
+        });
+        // Radios for both serving methods.
+        const openvino = screen.getByTestId(
+            "setup-serving-openvino",
+        ) as HTMLInputElement;
+        const openarc = screen.getByTestId(
+            "setup-serving-openarc",
+        ) as HTMLInputElement;
+        expect(openvino.checked).toBe(true);
+        // Switch to OpenArc.
+        fireEvent.click(openarc);
+        expect(openarc.checked).toBe(true);
+        // Save → PUT with the openarc plugin id.
+        fireEvent.click(screen.getByTestId("setup-backend-submit"));
+        await waitFor(() => {
+            expect(screen.getByTestId("chat-shell")).toBeInTheDocument();
+        });
+        const put = calls.find(
+            (c) =>
+                c.url === "/api/admin/backends/Standard" &&
+                c.init?.method === "PUT",
+        )!;
+        const body = JSON.parse((put.init?.body as string) ?? "{}");
+        expect(body.inference_backend).toBe("service-openarc");
         expect(body.gpu_id).toBe("0x8086:0xe20b");
+    });
+
+    it("multi-GPU host: dropdown lists every (GPU, serving) combination + Remote", async () => {
+        fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+            calls.push({ url, init });
+            if (url === "/api/setup") return setupResponse();
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/setup/preflight") {
+                return new Response(
+                    JSON.stringify({
+                        docker: { available: true, version: "24.0.7" },
+                        gpus: [
+                            {
+                                id: "0x10de:0x2684",
+                                vendor: "Nvidia",
+                                pci_vendor_id: "0x10de",
+                                pci_device_id: "0x2684",
+                                model_name: "GeForce RTX 4090",
+                                memory_mb: 24_576,
+                            },
+                            {
+                                id: "0x8086:0xe20b",
+                                vendor: "Intel",
+                                pci_vendor_id: "0x8086",
+                                pci_device_id: "0xe20b",
+                                model_name: "Arc A770",
+                                memory_mb: 16_384,
+                            },
+                        ],
+                    }),
+                    { status: 200 },
+                );
+            }
+            if (
+                url === "/api/admin/backends/Standard" &&
+                init?.method === "PUT"
+            ) {
+                return upsertBackendResponse();
+            }
+            return new Response("{}", { status: 200 });
+        });
+        mountWizard();
+        await fillAndSubmitAccount();
+        await waitFor(() => {
+            expect(screen.getByTestId("setup-docker-ok")).toBeInTheDocument();
+        });
+        fireEvent.click(screen.getByTestId("setup-docker-continue"));
+        await waitFor(() => {
+            expect(screen.getByTestId("setup-target-select")).toBeInTheDocument();
+        });
+        const select = screen.getByTestId(
+            "setup-target-select",
+        ) as HTMLSelectElement;
+        // 1 NVIDIA + 1 Intel + 1 Remote = 3 options. (Intel +
+        // OpenVINO/OpenArc collapses into one target row; the
+        // serving-method radios live below.)
+        expect(select.options.length).toBe(3);
+        const labels = Array.from(select.options).map((o) => o.textContent ?? "");
+        expect(labels.some((l) => /GeForce RTX 4090/.test(l))).toBe(true);
+        expect(labels.some((l) => /Arc A770/.test(l))).toBe(true);
+        expect(labels.some((l) => /Remote/.test(l))).toBe(true);
+        // Switch to the Intel Arc target — radios appear.
+        fireEvent.change(select, { target: { value: "1" } });
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("setup-serving-picker"),
+            ).toBeInTheDocument();
+        });
+    });
+
+    it("hardware summary uses model_name SKU instead of raw PCI string", async () => {
+        // The user-reported bug: the badge rendered as
+        // "NVIDIA (0x10de:PCI\VEN_10DE&DEV_2230&SUBSYS_…)" — multi
+        // line, overflowing. With model_name resolved we should
+        // see clean SKU + memory text instead.
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/setup") return setupResponse();
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/setup/preflight") {
+                return new Response(
+                    JSON.stringify({
+                        docker: { available: true, version: "24.0.7" },
+                        gpus: [
+                            {
+                                id: "0x10de:0x2230",
+                                vendor: "Nvidia",
+                                pci_vendor_id: "0x10de",
+                                pci_device_id: "0x2230",
+                                model_name: "RTX A6000",
+                                memory_mb: 49_152,
+                            },
+                        ],
+                    }),
+                    { status: 200 },
+                );
+            }
+            return new Response("{}", { status: 200 });
+        });
+        mountWizard();
+        await fillAndSubmitAccount();
+        await waitFor(() => {
+            expect(screen.getByTestId("setup-docker-ok")).toBeInTheDocument();
+        });
+        fireEvent.click(screen.getByTestId("setup-docker-continue"));
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("setup-hardware-summary"),
+            ).toBeInTheDocument();
+        });
+        const badge = screen.getByTestId("setup-hardware-gpu");
+        expect(badge.textContent).toMatch(/RTX A6000/);
+        expect(badge.textContent).toMatch(/48\.0 GB/);
+        // Critical: the badge must NOT contain the multi-line PNP
+        // string the user complained about.
+        expect(badge.textContent).not.toMatch(/PCI\\VEN_/);
+        expect(badge.textContent).not.toMatch(/SUBSYS/);
     });
 
     // ---- Timeline indicator (Microsoft 365-style) -----------------------

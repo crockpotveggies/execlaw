@@ -1668,6 +1668,14 @@ export interface DetectedGpu {
     /// hardware-query results.
     device_files?: string[];
     kernel_card_index?: number;
+    /// Resolved SKU like "GeForce RTX 4090" or "Arc A770". Falls
+    /// back to `null` on the legacy sysfs path. The setup wizard
+    /// renders this as the badge label.
+    model_name?: string | null;
+    /// VRAM in MiB. Used by the model catalog to filter to entries
+    /// that fit. `null` when unresolvable (Apple Silicon unified
+    /// memory, sysfs path, etc.).
+    memory_mb?: number | null;
 }
 
 export interface PreflightResponse {

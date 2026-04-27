@@ -48,6 +48,17 @@ pub struct GpuDevice {
     pub pci_device_id: String,
     pub device_files: Vec<PathBuf>,
     pub kernel_card_index: u32,
+    /// Resolved SKU from `hardware-query`'s WMI / sysfs / IOKit
+    /// readout (e.g. "GeForce RTX 4090", "Arc A770", "Apple M3 Pro").
+    /// `None` for the legacy sysfs path which only carries PCI ids.
+    /// The setup wizard renders this as the badge text instead of
+    /// the raw PCI string.
+    #[serde(default)]
+    pub model_name: Option<String>,
+    /// VRAM in MiB, also from `hardware-query`. Used by the setup
+    /// wizard to filter the model catalog to entries that fit.
+    #[serde(default)]
+    pub memory_mb: Option<u64>,
 }
 
 /// Where the hardware data came from. Pre-Phase-14 this was always
@@ -124,9 +135,15 @@ impl GpuDevice {
             // the truth until those backends ship.
             _ => (GpuVendor::Unknown, "0x0000"),
         };
+        // hardware-query's `pci_device_id` includes Windows PNP
+        // strings like `PCI\VEN_10DE&DEV_2230&SUBSYS_…&REV_A1\…` —
+        // useful to forensic operators, but unreadable as a label.
+        // `display_pci_device_id` extracts a clean `0xXXXX` from the
+        // PNP string when possible, falling back to whatever we got.
         let device_hex = g
             .pci_device_id
-            .clone()
+            .as_deref()
+            .map(extract_clean_device_hex)
             .unwrap_or_else(|| "0x0000".to_owned());
         let id = GpuId(format!(
             "{}:{}",
@@ -137,6 +154,16 @@ impl GpuDevice {
                 .clone()
                 .unwrap_or_else(|| g.model_name.clone())
         ));
+        let model_name = if g.model_name.trim().is_empty() {
+            None
+        } else {
+            Some(g.model_name.clone())
+        };
+        let memory_mb = if g.memory_mb == 0 {
+            None
+        } else {
+            Some(g.memory_mb)
+        };
         Self {
             id,
             vendor,
@@ -148,7 +175,39 @@ impl GpuDevice {
             // this empty is correct.
             device_files: Vec::new(),
             kernel_card_index: 0,
+            model_name,
+            memory_mb,
         }
+    }
+}
+
+/// Pull a clean `0xXXXX` hex out of whatever `hardware-query`'s
+/// `pci_device_id` string carries:
+///
+/// * Linux sysfs path: already `0x2684` — return as-is.
+/// * Windows PNP path: `PCI\VEN_10DE&DEV_2230&SUBSYS_…&REV_A1\…` —
+///   parse `&DEV_XXXX` out and prefix with `0x`.
+/// * macOS IOKit path: `0xa07` — return as-is.
+/// * Anything else → fall through to the original string truncated
+///   to 16 chars so the SPA never displays multi-line garbage.
+fn extract_clean_device_hex(raw: &str) -> String {
+    if raw.starts_with("0x") || raw.starts_with("0X") {
+        return raw.to_owned();
+    }
+    // Windows PNP shape — search for `DEV_` followed by 4 hex chars.
+    if let Some(idx) = raw.find("DEV_") {
+        let after = &raw[idx + 4..];
+        let hex: String = after.chars().take(4).collect();
+        if hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return format!("0x{}", hex.to_lowercase());
+        }
+    }
+    // Truncate anything else so the SPA doesn't render a ~100-char
+    // PNP string as a badge label.
+    if raw.len() > 16 {
+        format!("{}…", &raw[..15])
+    } else {
+        raw.to_owned()
     }
 }
 
@@ -222,6 +281,12 @@ pub fn detect_sysfs(root: &Path) -> HardwareProfile {
             pci_device_id: device_trimmed,
             device_files,
             kernel_card_index: kernel_idx,
+            // Sysfs alone doesn't expose human-readable model names
+            // or VRAM size — that's why the wizard's primary path
+            // goes through `detect()` (hardware-query). Sysfs stays
+            // as a deterministic test fixture.
+            model_name: None,
+            memory_mb: None,
         });
     }
 
@@ -405,6 +470,54 @@ mod tests {
         );
         let dev = GpuDevice::from_query(&g);
         assert_eq!(dev.vendor, GpuVendor::Unknown);
+    }
+
+    #[test]
+    fn from_query_pulls_model_name_and_memory_mb() {
+        let g = mk_query_gpu("\"NVIDIA\"", "GeForce RTX 4090", Some("0x2684"));
+        let mut g = g;
+        g.memory_mb = 24_576;
+        let dev = GpuDevice::from_query(&g);
+        assert_eq!(dev.model_name.as_deref(), Some("GeForce RTX 4090"));
+        assert_eq!(dev.memory_mb, Some(24_576));
+    }
+
+    #[test]
+    fn from_query_zero_memory_falls_through_to_none() {
+        // hardware-query reports memory_mb=0 when it can't resolve
+        // (Apple Silicon unified-memory often hits this). Our adapter
+        // must surface None, not Some(0), so the SPA filters models
+        // correctly.
+        let g = mk_query_gpu("\"Apple\"", "M3 Pro", None);
+        let dev = GpuDevice::from_query(&g);
+        assert_eq!(dev.memory_mb, None);
+    }
+
+    #[test]
+    fn extract_clean_device_hex_handles_linux_sysfs() {
+        // Linux sysfs already gives `0xNNNN`.
+        assert_eq!(extract_clean_device_hex("0x2684"), "0x2684");
+    }
+
+    #[test]
+    fn extract_clean_device_hex_parses_windows_pnp() {
+        // Windows PNP IDs from `Win32_VideoController` look like:
+        //   PCI\VEN_10DE&DEV_2230&SUBSYS_145910DE&REV_A1\4&8BD6E8D&0&0008
+        //   PCI\VEN_8086&DEV_E20B&SUBSYS_11008086&REV_00\6&2421D8B7&0&000800E8
+        // The user reported these rendering as multi-line badge text.
+        let pnp =
+            "PCI\\VEN_10DE&DEV_2230&SUBSYS_145910DE&REV_A1\\4&8BD6E8D&0&0008";
+        assert_eq!(extract_clean_device_hex(pnp), "0x2230");
+        let arc =
+            "PCI\\VEN_8086&DEV_E20B&SUBSYS_11008086&REV_00\\6&2421D8B7&0&000800E8";
+        assert_eq!(extract_clean_device_hex(arc), "0xe20b");
+    }
+
+    #[test]
+    fn extract_clean_device_hex_truncates_garbage() {
+        let weird = "totally-not-a-pci-id-but-very-long-string-here";
+        let got = extract_clean_device_hex(weird);
+        assert!(got.chars().count() <= 17, "got: {got}");
     }
 
     #[test]
