@@ -391,15 +391,36 @@ impl RunnerSupervisor {
 
         // Wait for the runner to phone home + complete the WS
         // registration. `register_pending_spawn`'s Notify is
-        // notified by `accept_registration` on success.
-        match tokio::time::timeout(timeout, registered.notified()).await {
-            Ok(()) => {}
-            Err(_) => {
-                // Timed out. Best-effort cleanup of the half-
-                // started container so we don't leak.
-                let _ = launcher.kill(&id.container_id).await;
-                self.inner.pending_spawns.remove(group_id);
-                return Err(EnsureError::Timeout);
+        // notified by `accept_registration` on success
+        // (`notify_one`, so a permit waits even if the registration
+        // beat us to the await).
+        //
+        // Belt-and-suspenders: poll the registry every 100ms during
+        // the wait so a *missed* permit (impossible with notify_one
+        // but cheap to guard against) still recovers. Also lets us
+        // exit early once the registration lands without waiting
+        // for tokio's timer wheel.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut registered_fut = std::pin::pin!(registered.notified());
+        loop {
+            tokio::select! {
+                _ = registered_fut.as_mut() => break,
+                _ = tokio::time::sleep_until(deadline) => {
+                    // Timed out. Best-effort cleanup of the half-
+                    // started container so we don't leak.
+                    let _ = launcher.kill(&id.container_id).await;
+                    self.inner.pending_spawns.remove(group_id);
+                    return Err(EnsureError::Timeout);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    // Poll the registry — if accept_registration
+                    // already inserted, the runner is up even
+                    // though our notify never woke (shouldn't
+                    // happen with notify_one, but cheap guard).
+                    if self.inner.runners.contains_key(group_id) {
+                        break;
+                    }
+                }
             }
         }
 
@@ -663,7 +684,16 @@ impl RunnerSupervisor {
         self.inner
             .runners
             .insert(group_id.to_owned(), handle.clone());
-        pending.registered.notify_waiters();
+        // 2026-04-28: was `notify_waiters()` which only wakes
+        // futures that are ALREADY polling. With a fast-spawning
+        // Docker container the runner can WS-register before
+        // `ensure_runner` reaches its `tokio::time::timeout(...)`
+        // await — the notification fires with no waiters and is
+        // lost, then `ensure_runner` waits 30s for a notification
+        // that never comes again. `notify_one()` keeps a permit
+        // for the next waiter so a late await still wakes
+        // immediately.
+        pending.registered.notify_one();
         Ok(handle)
     }
 
