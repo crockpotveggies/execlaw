@@ -255,6 +255,91 @@ fn bench_voice_ingest_chunks(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Phase 16 — runner supervisor hot paths.
+//
+// Budgets:
+//   * principal_set_hash — ≤ 5µs for ≤16 principals. Called once per
+//     turn to resolve the group_id; the SHA-256 is the only crypto
+//     on this path.
+//   * runner registry get — ≤ 1µs. Called once per turn (sometimes
+//     more, e.g. cancel_turn). DashMap reads are usually 200ns range.
+//   * frame encode/decode for ServerToRunner / RunnerToServer —
+//     ≤ 50µs per frame for typical token deltas. WS pumps thousands
+//     of these per turn for streaming chats; serde_json overhead
+//     dominates and we want a clean baseline.
+// ---------------------------------------------------------------------------
+
+fn bench_runner_principal_group_hash(c: &mut Criterion) {
+    use execlaw_core::ids::PrincipalId;
+    use execlaw_core::principal_groups::principal_set_hash;
+    let small: Vec<PrincipalId> = vec![PrincipalId::from("controller")];
+    let medium: Vec<PrincipalId> = (0..8)
+        .map(|i| PrincipalId::from(format!("principal-{i:02}")))
+        .collect();
+    let large: Vec<PrincipalId> = (0..32)
+        .map(|i| PrincipalId::from(format!("principal-{i:02}")))
+        .collect();
+    c.bench_function("principal_set_hash/1", |b| {
+        b.iter(|| principal_set_hash(black_box(&small)))
+    });
+    c.bench_function("principal_set_hash/8", |b| {
+        b.iter(|| principal_set_hash(black_box(&medium)))
+    });
+    c.bench_function("principal_set_hash/32", |b| {
+        b.iter(|| principal_set_hash(black_box(&large)))
+    });
+}
+
+fn bench_runner_registry_lookup(c: &mut Criterion) {
+    use execlaw_server::events::EventBus;
+    use execlaw_server::runner_supervisor::RunnerSupervisor;
+    let db = execlaw_core::Database::open(
+        &execlaw_core::db::DbConfig::in_memory_unencrypted(),
+    )
+    .unwrap();
+    execlaw_core::MigrationRunner::new(&db).apply_all().unwrap();
+    let sup = RunnerSupervisor::new(db, EventBus::new());
+    // Seed 64 registry entries via the public auth path so the
+    // DashMap shard count reflects realistic working sets.
+    for i in 0..64 {
+        let key = format!("g-{i:03}");
+        let (sec, _) = sup.register_pending_spawn(&key);
+        let _ = sup.accept_registration(&key, &sec, i == 0);
+    }
+    c.bench_function("runner_registry_get_hit", |b| {
+        b.iter(|| sup.get(black_box("g-032")).map(|h| h.group_id))
+    });
+    c.bench_function("runner_registry_get_miss", |b| {
+        b.iter(|| sup.get(black_box("g-not-here")).map(|h| h.group_id))
+    });
+}
+
+fn bench_runner_frame_codec(c: &mut Criterion) {
+    use execlaw_runner_protocol::{RunnerToServer, ServerToRunner};
+    let token_delta = RunnerToServer::TokenDelta {
+        turn_id: "turn-1234".into(),
+        conversation_id: "conv-abc".into(),
+        text: "Hello, this is a streaming token delta.".into(),
+    };
+    let cancel = ServerToRunner::CancelTurn {
+        turn_id: "turn-1234".into(),
+    };
+    c.bench_function("runner_frame_encode_token_delta", |b| {
+        b.iter(|| serde_json::to_string(black_box(&token_delta)).unwrap())
+    });
+    let encoded =
+        serde_json::to_string(&token_delta).unwrap();
+    c.bench_function("runner_frame_decode_token_delta", |b| {
+        b.iter(|| {
+            serde_json::from_str::<RunnerToServer>(black_box(&encoded)).unwrap()
+        })
+    });
+    c.bench_function("runner_frame_encode_cancel", |b| {
+        b.iter(|| serde_json::to_string(black_box(&cancel)).unwrap())
+    });
+}
+
 criterion_group!(
     benches,
     bench_capability_token,
@@ -263,5 +348,8 @@ criterion_group!(
     bench_voice_pcm_codecs,
     bench_voice_observe_frame,
     bench_voice_ingest_chunks,
+    bench_runner_principal_group_hash,
+    bench_runner_registry_lookup,
+    bench_runner_frame_codec,
 );
 criterion_main!(benches);

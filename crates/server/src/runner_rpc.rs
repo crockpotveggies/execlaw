@@ -92,7 +92,7 @@ pub async fn register_runner(
     // registration. v1 just defers it to first reap-pass lookup.
     let controller_runner = false;
 
-    let handle = match supervisor.accept_registration(
+    let _handle = match supervisor.accept_registration(
         &group_id,
         &secret_bytes,
         controller_runner,

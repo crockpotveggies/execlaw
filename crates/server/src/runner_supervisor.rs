@@ -39,16 +39,15 @@ use dashmap::DashMap;
 use execlaw_core::Database;
 use execlaw_core::principal_groups::PrincipalGroupStore;
 use execlaw_runner_protocol::{
-    RegistrationAck, RunnerToServer, ServerToRunner, ShutdownReason, ToolCallResult,
-    ToolOutcome, TurnRequest,
+    RunnerToServer, ServerToRunner, ShutdownReason, ToolCallResult, TurnRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
-use tracing::{debug, info, warn};
+use tokio::sync::{Mutex, Notify, RwLock, mpsc};
+use tracing::{info, warn};
 
 /// Idle TTL for non-controller runners.
 pub const IDLE_TTL: Duration = Duration::from_secs(10 * 60);
@@ -241,8 +240,6 @@ struct SupervisorInner {
     pending_spawns: DashMap<String, PendingSpawn>,
     /// Monotonic counter for `turn_id`s minted server-side.
     next_turn_seq: AtomicU64,
-    /// Reaper-stop signal. Owned by the spawned reaper task.
-    pub stop: Arc<Notify>,
     /// Event bus for translating runner frames into SPA WS events.
     pub events: EventBus,
     /// Database handle for principal-group `last_active_at` writes
@@ -257,7 +254,6 @@ impl RunnerSupervisor {
                 runners: DashMap::new(),
                 pending_spawns: DashMap::new(),
                 next_turn_seq: AtomicU64::new(1),
-                stop: Arc::new(Notify::new()),
                 events,
                 db,
             }),
@@ -267,6 +263,14 @@ impl RunnerSupervisor {
     /// Mint a unique `turn_id`. The seq is per-process — fine
     /// because the runner just echoes it; no cross-process
     /// uniqueness needed.
+    /// Borrow the event bus the supervisor publishes on. Tests +
+    /// the chat handler subscribe through this so the
+    /// supervisor's internal `Arc<SupervisorInner>` stays
+    /// encapsulated.
+    pub fn events(&self) -> &EventBus {
+        &self.inner.events
+    }
+
     pub fn mint_turn_id(&self) -> String {
         let n = self.inner.next_turn_seq.fetch_add(1, Ordering::Relaxed);
         format!("turn-{n}-{}", uuid::Uuid::new_v4())
@@ -547,6 +551,79 @@ impl RunnerSupervisor {
                 let _ = store.touch_active(&handle.group_id, now);
             }
         }
+    }
+
+    /// Boot-time orphan sweep: list every `execlaw-runner-*`
+    /// volume the daemon knows about; for each, check whether
+    /// `state_principal_groups` still has the corresponding row.
+    /// Volumes for groups that no longer exist (and aren't the
+    /// controller's — but a deleted controller group is still a
+    /// valid orphan) are wiped.
+    ///
+    /// Runs once on server boot, before the supervisor accepts any
+    /// inbound traffic. Idempotent: safe to call multiple times.
+    /// Returns the list of `group_id`s whose volumes were wiped.
+    pub async fn boot_orphan_sweep<L: crate::runner_spawn::RunnerLauncher>(
+        &self,
+        launcher: &L,
+    ) -> Vec<String> {
+        use crate::runner_spawn::volume_name_for;
+
+        let store = PrincipalGroupStore::new(&self.inner.db);
+        let known_groups = match store.list_all() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(error = %e, "boot_orphan_sweep: list_all failed");
+                return Vec::new();
+            }
+        };
+        let known_ids: std::collections::HashSet<String> =
+            known_groups.iter().map(|g| g.group_id.clone()).collect();
+
+        let volumes = match launcher.list_runner_volumes().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "boot_orphan_sweep: list_runner_volumes failed");
+                return Vec::new();
+            }
+        };
+        let prefix = "execlaw-runner-";
+        let mut wiped = Vec::new();
+        for vol in volumes {
+            let Some(group_id) = vol.strip_prefix(prefix) else {
+                continue;
+            };
+            // Sanity check: only sweep if name actually matches our
+            // expected pattern.
+            if vol != volume_name_for(group_id) {
+                continue;
+            }
+            if known_ids.contains(group_id) {
+                // Active group; volume is expected. Leave it.
+                continue;
+            }
+            info!(
+                group_id = %group_id,
+                "boot_orphan_sweep: removing orphan workspace volume"
+            );
+            match launcher.wipe_volume(group_id).await {
+                Ok(_) => wiped.push(group_id.to_owned()),
+                Err(e) => {
+                    warn!(
+                        group_id = %group_id,
+                        error = %e,
+                        "boot_orphan_sweep: wipe failed"
+                    );
+                }
+            }
+        }
+        if !wiped.is_empty() {
+            info!(
+                wiped_count = wiped.len(),
+                "boot_orphan_sweep: removed orphan workspace volumes"
+            );
+        }
+        wiped
     }
 
     /// Internal: called by the WS read loop when a frame arrives
@@ -1039,6 +1116,67 @@ mod tests {
         }
         // Registry entry is gone.
         assert!(s.get("g-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn boot_orphan_sweep_wipes_only_unknown_volumes() {
+        use crate::runner_spawn::{MockRunnerLauncher, RunnerLauncher, RunnerSpec};
+        let s = fresh_supervisor();
+        // Seed a known group via the principal-group store.
+        let store = PrincipalGroupStore::new(&s.inner.db);
+        let known = store
+            .resolve(
+                &execlaw_core::principal_groups::GroupKey {
+                    channel: "web",
+                    native_group_id: None,
+                    principals: &[execlaw_core::ids::PrincipalId::from("controller")],
+                    includes_controller: true,
+                },
+                1000,
+            )
+            .unwrap();
+
+        let launcher = MockRunnerLauncher::new();
+        // Spawn one volume for the known group, plus two orphans.
+        let _ = launcher
+            .spawn(&RunnerSpec {
+                group_id: known.group_id.clone(),
+                image: "x".into(),
+                spawn_secret_hex: "00".into(),
+                rpc_url: "ws://x".into(),
+                inference_url: "http://x".into(),
+                memory_bytes: None,
+                network: None,
+                env: vec![],
+            })
+            .await
+            .unwrap();
+        launcher.seed_volume("execlaw-runner-orphan-1").await;
+        launcher.seed_volume("execlaw-runner-orphan-2").await;
+
+        let wiped = s.boot_orphan_sweep(&launcher).await;
+        assert_eq!(wiped.len(), 2);
+        assert!(wiped.iter().any(|g| g == "orphan-1"));
+        assert!(wiped.iter().any(|g| g == "orphan-2"));
+        // The known group's volume was preserved.
+        let after = launcher.list_runner_volumes().await.unwrap();
+        assert!(
+            after.iter().any(|v| v == &format!("execlaw-runner-{}", known.group_id))
+        );
+        assert!(!after.iter().any(|v| v == "execlaw-runner-orphan-1"));
+    }
+
+    #[tokio::test]
+    async fn boot_orphan_sweep_skips_non_runner_volumes() {
+        use crate::runner_spawn::{MockRunnerLauncher, RunnerLauncher};
+        let s = fresh_supervisor();
+        let launcher = MockRunnerLauncher::new();
+        // A volume that doesn't match the runner prefix should be
+        // ignored (e.g. an unrelated bind mount the operator
+        // happens to have).
+        launcher.seed_volume("postgres-data").await;
+        let wiped = s.boot_orphan_sweep(&launcher).await;
+        assert!(wiped.is_empty());
     }
 
     #[tokio::test]
