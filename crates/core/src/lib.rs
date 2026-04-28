@@ -36,6 +36,7 @@ pub mod migrations;
 pub mod outbox;
 pub mod personality;
 pub mod principal;
+pub mod principal_groups;
 pub mod refresh_tokens;
 pub mod research;
 pub mod routine_run_retention;

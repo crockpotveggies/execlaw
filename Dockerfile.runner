@@ -1,0 +1,61 @@
+# execlaw runner image. One container per principal group; spawned by
+# the supervisor in `crates/server/src/runner_supervisor.rs`.
+#
+# Build:
+#   docker build -f Dockerfile.runner -t execlaw/runner:dev .
+#
+# At runtime the supervisor passes the env vars the binary reads:
+#   EXECLAW_RPC_URL=ws://control-plane:3030
+#   EXECLAW_GROUP_ID=<uuid>
+#   EXECLAW_SPAWN_SECRET=<hex>
+#   EXECLAW_INFERENCE_URL=http://127.0.0.1:8101/v1   # default; per-turn overridable
+#   RUST_LOG=info,execlaw_runner=debug                # optional
+#
+# A named volume `execlaw-runner-<group_id>` is bind-mounted at
+# /workspace; the runner can scratch there freely.
+#
+# ---- builder ----
+FROM rust:1.85-bookworm AS builder
+WORKDIR /build
+
+# Cache the dependency graph: copy manifests first, then sources.
+# Workspace `Cargo.toml` references many crates we don't need at
+# runtime (server, cli, etc.), so we copy the whole tree but only
+# build the runner-binary target. Adjust if/when the build matrix
+# gets expensive.
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY plugins ./plugins
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --bin execlaw-runner --no-default-features \
+    && cp target/release/execlaw-runner /tmp/execlaw-runner
+
+# ---- runtime ----
+# Minimal Debian — needs ca-certificates for outbound HTTPS to vLLM
+# (operators sometimes terminate TLS at the inference proxy). No
+# shell tools by design; the runner doesn't exec anything externally
+# in v1.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Workspace mount point. Supervisor mounts the per-group named
+# volume here; the runner has full RW within /workspace and zero
+# access elsewhere on the FS.
+RUN mkdir -p /workspace
+WORKDIR /workspace
+
+COPY --from=builder /tmp/execlaw-runner /usr/local/bin/execlaw-runner
+
+# Drop privileges. The runner reads env vars set by the supervisor
+# at `docker run` time; UID/GID 1000 keeps any files written to
+# /workspace owned by a non-root user (matters when the operator
+# inspects the volume from the host).
+RUN useradd -u 1000 -m -d /home/runner -s /usr/sbin/nologin runner \
+    && chown -R runner:runner /workspace
+USER runner
+
+ENTRYPOINT ["/usr/local/bin/execlaw-runner"]

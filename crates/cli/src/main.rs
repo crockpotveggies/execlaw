@@ -1169,6 +1169,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         voice_sessions,
         voice_runtime,
         turn_cancel: execlaw_server::turn_cancel::TurnCancellationRegistry::new(),
+        runner_supervisor: None,
     };
 
     // Phase-7 background workers — run for the lifetime of the

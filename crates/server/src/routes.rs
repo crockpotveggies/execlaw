@@ -777,6 +777,7 @@ pub fn test_app_state() -> AppState {
             }),
         ),
         turn_cancel: crate::turn_cancel::TurnCancellationRegistry::new(),
+        runner_supervisor: None,
     }
 }
 

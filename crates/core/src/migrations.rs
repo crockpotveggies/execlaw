@@ -146,6 +146,11 @@ pub const MIGRATIONS: &[Migration] = &[
             "../migrations/0023_append_v1_to_managed_endpoints.sql"
         ),
     },
+    Migration {
+        id: 24,
+        name: "principal-groups",
+        sql: include_str!("../migrations/0024_principal_groups.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -279,7 +284,10 @@ mod tests {
         let applied = runner.apply_all().unwrap();
         assert_eq!(
             applied,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+            vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                23, 24,
+            ]
         );
 
         // Spot-check: every documented table exists.
@@ -342,7 +350,10 @@ mod tests {
         let second = runner.apply_all().unwrap();
         assert_eq!(
             first,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+            vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                23, 24,
+            ]
         );
         assert!(
             second.is_empty(),

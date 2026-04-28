@@ -130,6 +130,12 @@ pub struct AppState {
     /// every SSE chunk; `POST /api/chats/:id/stop` flips the flag.
     /// Always present — registry is a cheap DashMap behind an Arc.
     pub turn_cancel: crate::turn_cancel::TurnCancellationRegistry,
+    /// Phase 16 — per-principal-group runner supervisor. `None`
+    /// when the operator hasn't enabled the runner stack
+    /// (`RUNNERS_ENABLED=0` or build-time disabled). When `Some`,
+    /// the chat path forwards turns to the runner instead of
+    /// running them in-process.
+    pub runner_supervisor: Option<crate::runner_supervisor::RunnerSupervisor>,
 }
 
 impl std::fmt::Debug for AppState {

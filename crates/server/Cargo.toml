@@ -15,6 +15,8 @@ execlaw-policy = { path = "../policy" }
 execlaw-plugin-sdk = { path = "../plugin-sdk" }
 execlaw-inference-api = { path = "../inference-api" }
 execlaw-runner-local = { path = "../runner-local" }
+execlaw-runner-protocol = { path = "../runner-protocol" }
+bollard = { workspace = true }
 execlaw-plugin-host = { path = "../plugin-host" }
 execlaw-container-manager = { path = "../container-manager" }
 execlaw-mcp-client = { path = "../mcp-client" }
@@ -76,6 +78,10 @@ openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
 
 [features]
 default = []
+# Phase 16 — exposes the in-memory `MockRunnerLauncher` to other
+# crates (server tests, future cli probes). Production builds keep
+# only the bollard-backed launcher.
+test-mock = []
 # Compile-in the WebAuthn relying-party + routes + login second-factor
 # branch. OFF by default because `webauthn-rs` pulls in `openssl-sys`,
 # which fails to build on a stock Windows-host dev environment without

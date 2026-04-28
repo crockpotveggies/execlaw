@@ -5,6 +5,8 @@ members = [
     "crates/session",
     "crates/inference-api",
     "crates/runner-local",
+    "crates/runner-protocol",
+    "crates/runner-binary",
     "crates/voice-pipeline",
     "crates/plugin-host",
     "crates/plugin-sdk",

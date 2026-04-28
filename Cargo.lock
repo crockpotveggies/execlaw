@@ -1186,6 +1186,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "execlaw-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "execlaw-inference-api",
+ "execlaw-runner-protocol",
+ "futures",
+ "futures-util",
+ "hex",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "execlaw-runner-local"
 version = "0.1.0"
 dependencies = [
@@ -1203,6 +1224,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "execlaw-runner-protocol"
+version = "0.1.0"
+dependencies = [
+ "execlaw-inference-api",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "execlaw-server"
 version = "0.1.0"
 dependencies = [
@@ -1210,6 +1241,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "bollard",
  "chrono",
  "criterion",
  "dashmap",
@@ -1223,6 +1255,7 @@ dependencies = [
  "execlaw-plugin-sdk",
  "execlaw-policy",
  "execlaw-runner-local",
+ "execlaw-runner-protocol",
  "execlaw-vault",
  "execlaw-voice-pipeline",
  "fs4",
