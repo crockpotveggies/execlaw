@@ -126,6 +126,16 @@ export function setThreads(next: ThreadSummary[]) {
 }
 
 export function setActiveThread(conversationId: string | null) {
+    // 2026-04-28 dev-only: log every activeId change with the
+    // calling stack so we can spot which code path is wiping
+    // activeId during an incognito session.
+    if (state.activeId !== conversationId) {
+        // eslint-disable-next-line no-console
+        console.log(
+            `[chat-store] setActiveThread: ${state.activeId} → ${conversationId}`,
+            new Error().stack?.split("\n").slice(2, 6).join("\n"),
+        );
+    }
     setState((prev) => {
         if (prev.activeId === conversationId) return prev;
         // Opening a thread clears its unread + thinking flags.

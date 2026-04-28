@@ -441,12 +441,20 @@ export function Chat() {
             case "chat_message_inbound":
                 if (cid) {
                     clearStreamingBuffer(cid);
-                    listThreads(getToken)
-                        .then((r) => setThreads(r.threads))
-                        .catch(() => {});
-                    listMessages(cid, getToken)
-                        .then((r) => setMessages(cid, r.messages))
-                        .catch(() => {});
+                    // Incognito: nothing on the server to refetch.
+                    // Skipping prevents the GET-then-empty-set-
+                    // messages race that would clobber the local
+                    // transcript and bounce ChatPane back to the
+                    // welcome view (hasContent flips false → true →
+                    // false within a frame).
+                    if (!cid.startsWith("incognito:")) {
+                        listThreads(getToken)
+                            .then((r) => setThreads(r.threads))
+                            .catch(() => {});
+                        listMessages(cid, getToken)
+                            .then((r) => setMessages(cid, r.messages))
+                            .catch(() => {});
+                    }
                     if (
                         ev.kind === "chat_message_outbound" &&
                         cid !== activeId
@@ -645,6 +653,23 @@ function ChatPane({
     const hasContent =
         activeId !== null &&
         ((messages?.length ?? 0) > 0 || (streaming?.length ?? 0) > 0);
+    // 2026-04-28 dev-only: diagnostic for the incognito flash bug.
+    if (
+        typeof activeId === "string" &&
+        activeId.startsWith("incognito:")
+    ) {
+        // eslint-disable-next-line no-console
+        console.log(
+            "[ChatPane] render incognito",
+            {
+                activeId,
+                messagesLen: messages?.length ?? null,
+                streamingLen: streaming?.length ?? null,
+                hasContent,
+                pane: hasContent ? "ActiveThreadPane" : "WelcomeView",
+            },
+        );
+    }
 
     if (!hasContent) {
         return (
