@@ -376,6 +376,35 @@ pub struct BackendStatusResponse {
     /// in dev/test builds; the SPA shows a "Docker unreachable"
     /// notice when this is false and the row is managed.
     pub supervisor_available: bool,
+    /// Higher-resolution lifecycle phase. One of "Idle",
+    /// "PullingImage", "ContainerStarting", "LoadingModel",
+    /// "Healthy", "Failed". Lets the SPA render the right pill
+    /// copy + helpful message during long warm-ups (vLLM loading
+    /// 27 GB of weights into VRAM is `LoadingModel`, not just
+    /// `Starting`).
+    pub stage: String,
+    /// Wall-clock seconds since the most recent successful spawn.
+    /// `None` when no spawn has happened yet. Drives the SPA's
+    /// "Loading model · 4m elapsed" copy.
+    pub elapsed_secs: Option<u64>,
+    /// Most recent meaningful log line from the running container.
+    /// Surfaced inline in the status pill / detail so the operator
+    /// can see "vLLM is busy loading checkpoint shards (3/12)"
+    /// without opening the logs modal.
+    pub last_log_line: Option<String>,
+    /// In-flight HF model download progress. Populated only while
+    /// `stage == "DownloadingModel"`. The SPA renders
+    /// `Downloading model · 8.5 / 18.0 GB · 47%` from these
+    /// fields.
+    pub download_progress: Option<DownloadProgressView>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DownloadProgressView {
+    pub bytes_downloaded: u64,
+    pub total_bytes: u64,
+    pub file_idx: u64,
+    pub file_count: u64,
 }
 
 #[utoipa::path(
@@ -411,19 +440,29 @@ pub async fn status_handler(
     };
 
     let supervisor_available = state.backend_supervisor.is_some();
-    let (status, restart_attempts) = if let Some(sup) = state.backend_supervisor.as_ref() {
-        let snap = sup.snapshot_status().await;
-        let entry = snap.iter().find(|s| s.purpose == purpose);
-        match entry {
-            Some(e) => (
-                runtime_status_str(&e.status).to_owned(),
-                e.restart_attempts,
-            ),
-            None => ("Stopped".to_owned(), 0),
-        }
-    } else {
-        ("Stopped".to_owned(), 0)
-    };
+    let (status, restart_attempts, stage, elapsed_secs, last_log_line, download_progress) =
+        if let Some(sup) = state.backend_supervisor.as_ref() {
+            let snap = sup.snapshot_status().await;
+            let entry = snap.iter().find(|s| s.purpose == purpose);
+            match entry {
+                Some(e) => (
+                    runtime_status_str(&e.status).to_owned(),
+                    e.restart_attempts,
+                    e.stage.as_str().to_owned(),
+                    e.elapsed_secs,
+                    e.last_log_line.clone(),
+                    e.download_progress.map(|p| DownloadProgressView {
+                        bytes_downloaded: p.bytes_downloaded,
+                        total_bytes: p.total_bytes,
+                        file_idx: p.file_idx as u64,
+                        file_count: p.file_count as u64,
+                    }),
+                ),
+                None => ("Stopped".to_owned(), 0, "Idle".to_owned(), None, None, None),
+            }
+        } else {
+            ("Stopped".to_owned(), 0, "Idle".to_owned(), None, None, None)
+        };
 
     Ok(Json(BackendStatusResponse {
         purpose: purpose.as_str().to_owned(),
@@ -432,7 +471,94 @@ pub async fn status_handler(
         endpoint,
         restart_attempts,
         supervisor_available,
+        stage,
+        elapsed_secs,
+        last_log_line,
+        download_progress,
     }))
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BackendLogsResponse {
+    pub purpose: String,
+    /// Captured log tail. Empty string when there is no log material
+    /// available (no managed container ever spawned, or supervisor
+    /// not running). The SPA renders that as "no logs yet" rather
+    /// than treating it as an error.
+    pub logs: String,
+    /// True when the supervisor is wired. False ⇒ the response
+    /// `logs` is always empty; the SPA renders a "Docker
+    /// unreachable" notice in that case.
+    pub supervisor_available: bool,
+    /// Whether this snapshot came from a live, still-running
+    /// container or from the supervisor's CrashLooping cache. Lets
+    /// the SPA prefix the panel with "(crashed)" so the operator
+    /// knows they're reading post-mortem output, not a tail-f.
+    pub from_cache: bool,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/admin/backends/{purpose}/logs",
+    params(
+        ("purpose" = String, Path, description = "Backend purpose"),
+        ("lines" = Option<u32>, Query, description = "Tail length, default 200, max 2000"),
+    ),
+    responses(
+        (status = 200, description = "Container log tail", body = BackendLogsResponse),
+        (status = 400, description = "Unknown purpose"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "backends"
+)]
+pub async fn logs_handler(
+    State(state): State<AppState>,
+    _user: AuthedUser,
+    AxumPath(purpose): AxumPath<String>,
+    Query(q): Query<LogsQuery>,
+) -> Result<Json<BackendLogsResponse>, ApiError> {
+    let purpose = BackendPurpose::parse(&purpose).ok_or_else(|| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        code: "unknown_purpose",
+        message: format!("'{purpose}' is not a recognised backend purpose"),
+    })?;
+    let lines = q.lines.unwrap_or(200).min(2000) as usize;
+    let supervisor_available = state.backend_supervisor.is_some();
+    let logs = match state.backend_supervisor.as_ref() {
+        Some(sup) => sup.logs(purpose, lines).await.map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "supervisor_error",
+            message: e.to_string(),
+        })?,
+        None => String::new(),
+    };
+    // The supervisor's logs() returns the live tail when a handle is
+    // present and the cached tail otherwise. We don't have a clean
+    // "is the container still alive?" signal here without a second
+    // RPC; infer it from the status snapshot.
+    let from_cache = match state.backend_supervisor.as_ref() {
+        Some(sup) => {
+            let snap = sup.snapshot_status().await;
+            snap.iter()
+                .find(|s| s.purpose == purpose)
+                .map(|s| !matches!(s.status, execlaw_container_manager::ServiceStatus::Healthy
+                    | execlaw_container_manager::ServiceStatus::Starting
+                    | execlaw_container_manager::ServiceStatus::Pulling))
+                .unwrap_or(true)
+        }
+        None => true,
+    };
+    Ok(Json(BackendLogsResponse {
+        purpose: purpose.as_str().to_owned(),
+        logs,
+        supervisor_available,
+        from_cache,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LogsQuery {
+    pub lines: Option<u32>,
 }
 
 #[utoipa::path(
@@ -579,6 +705,7 @@ pub fn backends_router() -> Router<AppState> {
             put(upsert_handler).delete(clear_handler),
         )
         .route("/api/admin/backends/{purpose}/status", get(status_handler))
+        .route("/api/admin/backends/{purpose}/logs", get(logs_handler))
         .route("/api/admin/backends/{purpose}/restart", post(restart_handler))
 }
 
@@ -1028,6 +1155,45 @@ mod tests {
         assert_eq!(v["status"], "Healthy");
         assert_eq!(v["supervisor_available"], true);
         assert!(v["endpoint"].as_str().unwrap().starts_with("http://127.0.0.1:"));
+    }
+
+    #[tokio::test]
+    async fn logs_route_serves_supervisor_cached_tail() {
+        // Phase 14 follow-up — the /logs endpoint reads the
+        // supervisor's per-purpose cached log tail (captured the
+        // last time the container CrashLooped). With no supervisor
+        // wired the route still 200s with empty logs +
+        // supervisor_available=false so the SPA renders a
+        // "Docker offline" notice rather than a generic error toast.
+        let app = build_router(test_app_state());
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/admin/backends/Standard/logs?lines=50")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["purpose"], "Standard");
+        assert_eq!(v["supervisor_available"], false);
+        assert_eq!(v["logs"], "");
+    }
+
+    #[tokio::test]
+    async fn logs_route_rejects_unknown_purpose() {
+        let app = build_router(test_app_state());
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/admin/backends/Hallucinated/logs")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

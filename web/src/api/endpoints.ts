@@ -552,6 +552,22 @@ export type BackendStatus =
     | "Stopped"
     | "NotFound";
 
+export type BackendStage =
+    | "Idle"
+    | "DownloadingModel"
+    | "PullingImage"
+    | "ContainerStarting"
+    | "LoadingModel"
+    | "Healthy"
+    | "Failed";
+
+export interface DownloadProgress {
+    bytes_downloaded: number;
+    total_bytes: number;
+    file_idx: number;
+    file_count: number;
+}
+
 export interface BackendStatusResponse {
     purpose: BackendPurpose;
     mode: BackendMode;
@@ -563,6 +579,50 @@ export interface BackendStatusResponse {
     /// unreachable" notice when the row is managed and this is
     /// false.
     supervisor_available: boolean;
+    /// Higher-resolution lifecycle phase. The original `status`
+    /// enum has only 6 values; `stage` subdivides "Starting" into
+    /// PullingImage / ContainerStarting / LoadingModel so the SPA
+    /// can render meaningful copy during long warm-ups.
+    stage: BackendStage;
+    /// Wall-clock seconds since the most recent successful spawn.
+    /// `null` when no spawn has happened yet (Idle / external).
+    elapsed_secs: number | null;
+    /// Last meaningful log line from the running container.
+    /// Surfaced in the status pill so the operator can see what
+    /// the service is doing right now without opening the logs
+    /// modal.
+    last_log_line: string | null;
+    /// In-flight HF model download progress. Populated only while
+    /// stage = `DownloadingModel`.
+    download_progress: DownloadProgress | null;
+}
+
+// ---- /api/admin/settings/hf-cache (Phase 14.C) -------------------
+
+export interface HfCacheView {
+    secondary_paths: string[];
+    requires_restart: boolean;
+}
+
+export async function getHfCache(
+    tokenAccessor: () => string | null,
+): Promise<HfCacheView> {
+    return apiFetch<HfCacheView>(
+        "/api/admin/settings/hf-cache",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function putHfCache(
+    body: { secondary_paths: string[] },
+    tokenAccessor: () => string | null,
+): Promise<HfCacheView> {
+    return apiFetch<HfCacheView>(
+        "/api/admin/settings/hf-cache",
+        { method: "PUT", body },
+        tokenAccessor,
+    );
 }
 
 /// One entry per purpose, regardless of whether the operator has
@@ -651,6 +711,33 @@ export async function restartBackend(
         { method: "POST" },
         tokenAccessor,
     );
+}
+
+/// Phase 14 follow-up — fetch the last `lines` lines of the
+/// managed container's stdout+stderr. Returns the cached
+/// CrashLooping tail when the container has already been removed
+/// by the supervisor, so the operator can see WHY it died.
+export interface BackendLogsResponse {
+    purpose: BackendPurpose;
+    logs: string;
+    supervisor_available: boolean;
+    /// True when the snapshot came from the supervisor's cached
+    /// CrashLooping tail (live container is gone). The SPA prefixes
+    /// the modal title with "(crashed)" so the operator knows
+    /// they're looking at post-mortem output.
+    from_cache: boolean;
+}
+
+export async function getBackendLogs(
+    purpose: BackendPurpose,
+    lines: number | undefined,
+    tokenAccessor: () => string | null,
+): Promise<BackendLogsResponse> {
+    const path =
+        lines !== undefined
+            ? `/api/admin/backends/${encodeURIComponent(purpose)}/logs?lines=${lines}`
+            : `/api/admin/backends/${encodeURIComponent(purpose)}/logs`;
+    return apiFetch<BackendLogsResponse>(path, {}, tokenAccessor);
 }
 
 // ---- Phase 13.B.1 — backend wizard presets ------------------------

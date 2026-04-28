@@ -17,6 +17,7 @@
 //! NVIDIA case via `DeviceRequest`; Intel Arc / AMD passthrough lands
 //! when those plugins do.
 
+use crate::hardware::GpuVendor;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -40,12 +41,56 @@ pub struct ServiceSpec {
     /// Operator-supplied GPU id; `None` runs CPU-only. The
     /// production controller resolves this against the host's
     /// detected hardware.
+    ///
+    /// Format depends on `gpu_vendor`:
+    ///   * `Some(Nvidia)` — a small ordinal index (`"0"`, `"1"`)
+    ///     matching nvidia-docker's `--gpus device=N` semantics, or
+    ///     a CUDA UUID like `"GPU-…"`. The full PCI/PNP string from
+    ///     `GpuId` is NOT acceptable to nvidia-docker.
+    ///   * `Some(Intel)` — currently informational; Intel
+    ///     passthrough binds `/dev/dri` (Linux) without consulting
+    ///     this field.
+    ///   * `Some(Amd)` / `None` — CPU-only spawn (no device passthrough).
     pub gpu_id: Option<String>,
+    /// Vendor of the picked GPU, if any. Drives which container-runtime
+    /// device passthrough strategy `BollardServiceController` uses.
+    /// Stored in `model_spec_json` as the `gpu_vendor` string field
+    /// (`"nvidia" | "intel" | "amd"`); rows that omit it fall through
+    /// to "no GPU passthrough" so a misconfigured row can't fail
+    /// `create_container` with a runtime error the operator can't
+    /// diagnose.
+    pub gpu_vendor: Option<GpuVendor>,
+    /// Host directories to bind into the container. Used today for
+    /// mounting the host-side HuggingFace model cache so vLLM
+    /// reads pre-downloaded weights from disk instead of pulling
+    /// from HF on every spawn. Each entry maps a host path to a
+    /// container path with a read-only flag; `read_only=true` is
+    /// strongly preferred for cache mounts since the host-side
+    /// downloader is the single writer.
+    pub mounts: Vec<HostMount>,
     /// Host port to bind the service on. Picked by the supervisor
     /// from a per-purpose pool to keep URLs stable across restarts.
     pub host_port: u16,
     /// Container port the service listens on internally.
     pub container_port: u16,
+}
+
+/// One bind-mount the supervisor wires into the container's
+/// `HostConfig.binds`. We use `Binds` (simple `host:container[:ro]`
+/// strings) rather than the newer `Mounts` API because Docker
+/// Desktop on Windows handles the path translation transparently
+/// when the host path lives under a Drive that's been added to
+/// "File sharing" (the default for `C:\` on a fresh install).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostMount {
+    /// Absolute path on the host. Windows paths (`C:\Users\…`) are
+    /// accepted as-is — bollard hands them to dockerd which does
+    /// the translation.
+    pub host_path: String,
+    /// Absolute path inside the container.
+    pub container_path: String,
+    /// True for read-only mounts (recommended for cache mounts).
+    pub read_only: bool,
 }
 
 /// Handle returned by `spawn`. The supervisor stores this so it can
@@ -127,6 +172,18 @@ pub trait ServiceController: Send + Sync {
     /// timeout default is appropriate for loopback probes; remote
     /// callers should override at construction.
     async fn health_check(&self, url: &str) -> Result<bool, ServiceError>;
+
+    /// Return the last `lines` log entries from the container,
+    /// concatenated with newlines. Used by the supervisor to attach
+    /// failure context to a CrashLooping alert + by the SPA's "view
+    /// logs" affordance. Best-effort: callers must tolerate Ok(empty)
+    /// for containers that haven't emitted anything yet, and Err
+    /// only for protocol-level failures (Docker daemon unreachable).
+    async fn tail_logs(
+        &self,
+        handle: &ServiceHandle,
+        lines: usize,
+    ) -> Result<String, ServiceError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -212,20 +269,73 @@ impl ServiceController for BollardServiceController {
             )
             .await;
 
-        // --- 2. Pull the image (no-op when cached). The stream
-        // surface is bollard's; we drain it and only error on the
-        // first reported failure event.
+        // --- 2. Pull the image (no-op when cached, but Docker
+        // ALWAYS does a manifest check against the registry so
+        // even cached images take a few seconds — `:nightly` /
+        // `:latest` tags can take 30s+ when fresh layers are
+        // available). We log periodic progress so the supervisor
+        // doesn't appear "silent" during long pulls; without this
+        // an operator watching the SPA's Provisioning pill has no
+        // signal that work is happening.
         let opts = CreateImageOptions {
             from_image: spec.image.clone(),
             ..Default::default()
         };
         let mut pull = self.docker.create_image(Some(opts), None, None);
+        let mut last_log = std::time::Instant::now();
+        let mut last_status = String::new();
+        let mut event_count: u32 = 0;
+        let pull_started = std::time::Instant::now();
+        tracing::info!(
+            image = %spec.image,
+            container = %spec.name,
+            "image pull started"
+        );
         while let Some(ev) = pull.next().await {
             match ev {
-                Ok(_) => {} // progress event; ignore
-                Err(e) => return Err(ServiceError::Pull(e.to_string())),
+                Ok(info) => {
+                    event_count += 1;
+                    // Log on status-string change (rare — "Pulling
+                    // fs layer", "Downloading", "Extracting") OR
+                    // every 5 seconds so a long download still
+                    // emits a heartbeat.
+                    if let Some(status) = info.status.as_deref() {
+                        if status != last_status {
+                            tracing::info!(
+                                image = %spec.image,
+                                layer = ?info.id,
+                                status = %status,
+                                event_count,
+                                "image pull progress"
+                            );
+                            last_status = status.to_owned();
+                            last_log = std::time::Instant::now();
+                        } else if last_log.elapsed() >= std::time::Duration::from_secs(5) {
+                            tracing::info!(
+                                image = %spec.image,
+                                layer = ?info.id,
+                                status = %status,
+                                progress = ?info.progress,
+                                event_count,
+                                "image pull heartbeat"
+                            );
+                            last_log = std::time::Instant::now();
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(image = %spec.image, "image pull failed: {e}");
+                    return Err(ServiceError::Pull(e.to_string()));
+                }
             }
         }
+        tracing::info!(
+            image = %spec.image,
+            container = %spec.name,
+            elapsed_secs = pull_started.elapsed().as_secs(),
+            event_count,
+            "image pull complete"
+        );
 
         // --- 2. Build the container Config + HostConfig.
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
@@ -240,22 +350,101 @@ impl ServiceController for BollardServiceController {
         let mut exposed: HashMap<String, HashMap<(), ()>> = HashMap::new();
         exposed.insert(key, HashMap::new());
 
-        // GPU passthrough — NVIDIA is the locked-decision default;
-        // operators on Intel Arc / AMD wire equivalent device
-        // mappings later via separate plugins.
-        let device_requests = spec.gpu_id.as_ref().map(|id| {
-            vec![DeviceRequest {
-                driver: Some("nvidia".into()),
-                device_ids: Some(vec![id.clone()]),
-                capabilities: Some(vec![vec!["gpu".into()]]),
-                count: None,
-                options: None,
-            }]
-        });
+        // GPU passthrough — vendor-aware:
+        //   * NVIDIA → DeviceRequest with the nvidia driver. Requires
+        //     a small ordinal (`"0"`, `"1"`) or a CUDA UUID; the full
+        //     `GpuId` string ("0x10de:PCI\VEN_10DE&DEV_…") that the
+        //     SetupWizard used to send is NOT accepted and bricks
+        //     create_container with HTTP 400.
+        //   * Intel → bind /dev/dri devices on Linux (Docker Desktop
+        //     on Windows + macOS has no device-passthrough surface
+        //     for Intel Arc, so the spawn falls through to CPU mode
+        //     and the inference container will run on CPU. The Intel
+        //     plugins should refuse to start in that case rather
+        //     than silently degrading.)
+        //   * AMD / None → no passthrough (CPU-only).
+        let mut device_requests: Option<Vec<DeviceRequest>> = None;
+        let mut devices: Option<Vec<bollard::secret::DeviceMapping>> = None;
+        match (spec.gpu_vendor, spec.gpu_id.as_deref()) {
+            (Some(GpuVendor::Nvidia), Some(id)) => {
+                device_requests = Some(vec![DeviceRequest {
+                    driver: Some("nvidia".into()),
+                    device_ids: Some(vec![id.to_owned()]),
+                    capabilities: Some(vec![vec!["gpu".into()]]),
+                    count: None,
+                    options: None,
+                }]);
+            }
+            (Some(GpuVendor::Nvidia), None) => {
+                // "Any NVIDIA GPU" — the operator picked NVIDIA but
+                // didn't pin a card. Pass count=-1 (== all) so docker
+                // exposes every available card; the inference image
+                // sees them via CUDA_VISIBLE_DEVICES inside.
+                device_requests = Some(vec![DeviceRequest {
+                    driver: Some("nvidia".into()),
+                    device_ids: None,
+                    capabilities: Some(vec![vec!["gpu".into()]]),
+                    count: Some(-1),
+                    options: None,
+                }]);
+            }
+            (Some(GpuVendor::Intel), _) => {
+                // Linux-only — Docker Desktop on Windows/macOS doesn't
+                // forward /dev/dri to containers. We attempt the bind
+                // unconditionally; on a host without /dev/dri the
+                // bollard call fails with a clear "no such file"
+                // error which the supervisor reports as CrashLooping
+                // — the operator gets a real signal instead of a
+                // silent CPU fallback that pretends to be GPU mode.
+                devices = Some(vec![
+                    bollard::secret::DeviceMapping {
+                        path_on_host: Some("/dev/dri".into()),
+                        path_in_container: Some("/dev/dri".into()),
+                        cgroup_permissions: Some("rwm".into()),
+                    },
+                ]);
+            }
+            // AMD or no vendor → no device passthrough. The container
+            // runs CPU-only; the inference image's startup script
+            // decides whether that's acceptable.
+            _ => {}
+        }
+
+        // Render `spec.mounts` into the bollard `binds` shape:
+        // `"<host>:<container>[:ro]"`. We sanity-check the host
+        // path exists on this side so a typo doesn't get to dockerd
+        // (which would error 400 with a less-helpful message).
+        // Read-only mounts get the `:ro` suffix; rw is the default.
+        let binds: Vec<String> = spec
+            .mounts
+            .iter()
+            .filter(|m| {
+                let host = std::path::Path::new(&m.host_path);
+                if !host.exists() {
+                    tracing::warn!(
+                        host_path = %m.host_path,
+                        container_path = %m.container_path,
+                        "mount host_path does not exist; skipping bind"
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .map(|m| {
+                if m.read_only {
+                    format!("{}:{}:ro", m.host_path, m.container_path)
+                } else {
+                    format!("{}:{}", m.host_path, m.container_path)
+                }
+            })
+            .collect();
 
         let host_config = HostConfig {
             port_bindings: Some(port_bindings),
             device_requests,
+            devices,
+            binds: if binds.is_empty() { None } else { Some(binds) },
             log_config: Some(HostConfigLogConfig {
                 typ: Some("json-file".into()),
                 config: Some(
@@ -375,6 +564,49 @@ impl ServiceController for BollardServiceController {
             Err(e) => Err(ServiceError::Health(e.to_string())),
         }
     }
+
+    async fn tail_logs(
+        &self,
+        handle: &ServiceHandle,
+        lines: usize,
+    ) -> Result<String, ServiceError> {
+        use bollard::container::LogsOptions;
+        use futures_util::StreamExt;
+
+        let opts = LogsOptions::<String> {
+            stdout: true,
+            stderr: true,
+            // Bollard expects "all" or a numeric string for tail.
+            tail: lines.to_string(),
+            timestamps: false,
+            follow: false,
+            ..Default::default()
+        };
+        let mut stream = self.docker.logs(&handle.name, Some(opts));
+        let mut out = String::new();
+        while let Some(ev) = stream.next().await {
+            match ev {
+                Ok(chunk) => {
+                    // bollard's LogOutput Display impl strips the
+                    // 8-byte header docker prepends to each frame, so
+                    // we can just push the rendered string. Each
+                    // frame already carries its trailing newline.
+                    out.push_str(&chunk.to_string());
+                }
+                Err(e) => {
+                    // Container removed mid-read isn't fatal — return
+                    // whatever we collected so far.
+                    if out.is_empty() {
+                        return Err(ServiceError::Runtime(format!(
+                            "logs stream: {e}"
+                        )));
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +640,9 @@ struct MockState {
     pub spawn_log: Vec<ServiceSpec>,
     /// Stop-call recorder for assertions.
     pub stop_log: Vec<ServiceHandle>,
+    /// Per-container synthetic log output for tests that exercise
+    /// the supervisor's "attach logs to alert" path.
+    pub pinned_logs: std::collections::HashMap<String, String>,
 }
 
 #[cfg(any(test, feature = "test-mock"))]
@@ -434,6 +669,24 @@ impl MockServiceController {
     /// real Docker daemon.
     pub async fn pin_spawn_pull_error(&self, msg: impl Into<String>) {
         self.inner.lock().await.spawn_response = Some(Err(msg.into()));
+    }
+
+    /// Drop a previously-pinned spawn response so subsequent calls
+    /// fall through to the default success path. Used by tests that
+    /// simulate "broken → fixed" recovery flows.
+    pub async fn clear_spawn_response(&self) {
+        self.inner.lock().await.spawn_response = None;
+    }
+
+    /// Pin a synthetic log payload for the given container name.
+    /// Tests use this to verify that supervisor failure paths
+    /// attach the captured log tail to the resulting alert.
+    pub async fn pin_logs(&self, container_name: impl Into<String>, body: impl Into<String>) {
+        self.inner
+            .lock()
+            .await
+            .pinned_logs
+            .insert(container_name.into(), body.into());
     }
 
     pub async fn spawn_count(&self) -> usize {
@@ -494,6 +747,22 @@ impl ServiceController for MockServiceController {
             None => Ok(true),
         }
     }
+
+    async fn tail_logs(
+        &self,
+        handle: &ServiceHandle,
+        _lines: usize,
+    ) -> Result<String, ServiceError> {
+        let state = self.inner.lock().await;
+        // Tests can pin a synthetic log payload via `pin_logs`;
+        // otherwise return an empty string so the supervisor's
+        // "best-effort attach logs" path stays exercised without
+        // forcing every test to set up fixtures.
+        match state.pinned_logs.get(&handle.name) {
+            Some(s) => Ok(s.clone()),
+            None => Ok(String::new()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -507,6 +776,8 @@ mod tests {
             args: vec!["--model".into(), "Qwen3.5-27B-AWQ".into()],
             env: vec![("HF_HOME".into(), "/cache".into())],
             gpu_id: Some("0".into()),
+            gpu_vendor: Some(GpuVendor::Nvidia),
+            mounts: Vec::new(),
             host_port: 8001,
             container_port: 8000,
         }

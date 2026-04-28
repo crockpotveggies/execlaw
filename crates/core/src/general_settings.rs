@@ -97,6 +97,90 @@ impl<'a> GeneralSettingsStore<'a> {
             .is_some())
     }
 
+    /// Phase 14.C — read the operator-configured list of additional
+    /// HuggingFace cache directories. The supervisor scans these
+    /// (read-only) when the host-side downloader needs a model;
+    /// already-downloaded files get hardlinked / copied into the
+    /// primary cache, avoiding re-download.
+    ///
+    /// Stored as a JSON array of paths in `config_general`. We
+    /// store as JSON rather than as a new table because the list is
+    /// always small (< 10 entries) and we avoid joining on every
+    /// supervisor reconcile. Returns an empty Vec when the column
+    /// is null or unparseable.
+    pub fn read_secondary_hf_caches(
+        &self,
+    ) -> Result<Vec<std::path::PathBuf>, GeneralSettingsError> {
+        let raw: Option<String> = self.db.with_conn(|c| {
+            let v: Option<String> = c
+                .query_row(
+                    "SELECT hf_secondary_caches_json FROM config_general WHERE id = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .ok();
+            Ok(v)
+        })?;
+        let Some(raw) = raw else { return Ok(Vec::new()) };
+        if raw.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        match serde_json::from_str::<Vec<String>>(&raw) {
+            Ok(v) => Ok(v.into_iter().map(std::path::PathBuf::from).collect()),
+            Err(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// Phase 14.C — write the operator-configured list of secondary
+    /// HF caches. Settings UI calls this. Validates that every entry
+    /// is non-empty + an absolute path; relative paths are rejected
+    /// because the supervisor's reconcile loop runs from a service
+    /// working directory the operator probably didn't expect.
+    pub fn write_secondary_hf_caches(
+        &self,
+        paths: &[std::path::PathBuf],
+        now: i64,
+    ) -> Result<(), GeneralSettingsError> {
+        for p in paths {
+            if p.as_os_str().is_empty() {
+                return Err(GeneralSettingsError::InvalidBindAddress(
+                    "HF cache path must not be empty".into(),
+                ));
+            }
+            // Cross-platform absolute-path check: `Path::is_absolute()`
+            // is OS-specific (rejects `/home/me/...` on Windows, rejects
+            // `C:\...` on Linux). Since this validation runs on the
+            // server but the path string was minted by an operator
+            // who might be configuring a remote server from any host,
+            // we accept either shape: a leading `/` (POSIX absolute)
+            // OR a `<drive>:` prefix followed by `\` or `/` (Windows
+            // absolute). Relative paths still get rejected.
+            let s = p.to_string_lossy();
+            let posix_abs = s.starts_with('/');
+            let windows_abs = s.len() >= 3
+                && s.as_bytes()[1] == b':'
+                && (s.as_bytes()[2] == b'\\' || s.as_bytes()[2] == b'/')
+                && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
+            if !posix_abs && !windows_abs {
+                return Err(GeneralSettingsError::InvalidBindAddress(format!(
+                    "HF cache path must be absolute: {}",
+                    p.display()
+                )));
+            }
+        }
+        let payload =
+            serde_json::to_string(&paths.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>())
+                .unwrap_or_else(|_| "[]".to_owned());
+        self.db.with_conn(|c| {
+            c.execute(
+                "UPDATE config_general SET hf_secondary_caches_json = ?1, updated_at = ?2 WHERE id = 1",
+                params![payload, now],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     /// Mark the wizard as dismissed at `now`. Idempotent — calling
     /// twice just rewrites the timestamp. The wizard's "Skip for
     /// now" button calls this immediately before navigating to

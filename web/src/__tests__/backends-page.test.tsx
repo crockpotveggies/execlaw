@@ -109,11 +109,19 @@ function presetsResponseFor(purpose: string) {
 /// Helper that skips the wizard the way an operator would when
 /// they want to type the JSON directly. Many existing tests target
 /// the raw form, so they call this right after clicking "Add backend".
-async function skipWizard() {
+///
+/// Phase 14 follow-up: the inline wizard is now `UnifiedBackendForm`
+/// with per-purpose test IDs (`backends-wizard-{Purpose}-...`). This
+/// helper assumes the operator just clicked the Standard row's edit
+/// button — that's the alphabetically-first row and the path every
+/// existing caller takes.
+async function skipWizard(purpose: string = "Standard") {
+    const formTid = `backends-wizard-${purpose}-form`;
+    const skipTid = `backends-wizard-${purpose}-skip`;
     await waitFor(() => {
-        expect(screen.getByTestId("backend-wizard")).toBeInTheDocument();
+        expect(screen.getByTestId(formTid)).toBeInTheDocument();
     });
-    fireEvent.click(screen.getByTestId("backend-wizard-skip"));
+    fireEvent.click(screen.getByTestId(skipTid));
     await waitFor(() => {
         expect(screen.getByTestId("backend-form")).toBeInTheDocument();
     });
@@ -199,6 +207,17 @@ describe("BackendsPage", () => {
                     { status: 200 },
                 );
             }
+            if (url === "/api/admin/setup/preflight") {
+                return new Response(
+                    JSON.stringify({
+                        docker: { available: true, version: "24.0.7" },
+                        gpus: [],
+                    }),
+                    { status: 200 },
+                );
+            }
+            // The legacy preset endpoint is no longer fetched by the
+            // BackendsPage but some tests mock it for backwards-compat.
             if (url.startsWith("/api/admin/backends/presets"))
                 return presetsResponseFor("Standard");
             if (url === "/api/admin/hardware") return hardwareNoGpu();
@@ -256,6 +275,17 @@ describe("BackendsPage", () => {
         fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
             calls.push({ url, init });
             if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/setup/preflight") {
+                return new Response(
+                    JSON.stringify({
+                        docker: { available: true, version: "24.0.7" },
+                        gpus: [],
+                    }),
+                    { status: 200 },
+                );
+            }
+            // The legacy preset endpoint is no longer fetched by the
+            // BackendsPage but some tests mock it for backwards-compat.
             if (url.startsWith("/api/admin/backends/presets"))
                 return presetsResponseFor("Standard");
             if (url === "/api/admin/hardware") return hardwareNoGpu();
@@ -479,6 +509,17 @@ describe("BackendsPage", () => {
                     { status: 200 },
                 );
             }
+            if (url === "/api/admin/setup/preflight") {
+                return new Response(
+                    JSON.stringify({
+                        docker: { available: true, version: "24.0.7" },
+                        gpus: [],
+                    }),
+                    { status: 200 },
+                );
+            }
+            // The legacy preset endpoint is no longer fetched by the
+            // BackendsPage but some tests mock it for backwards-compat.
             if (url.startsWith("/api/admin/backends/presets"))
                 return presetsResponseFor("Standard");
             if (url === "/api/admin/hardware") return hardwareNoGpu();
@@ -527,13 +568,20 @@ describe("BackendsPage", () => {
         expect(body.endpoint).toBeNull();
     });
 
-    // ---- Phase 13.B.1 — managed-backend setup wizard ------------------
+    // ---- Phase 14 follow-up — managed-backend UnifiedBackendForm ------
 
     it("opens the wizard inline when adding a fresh backend", async () => {
         fetchMock.mockImplementation(async (url: string) => {
             if (url === "/api/admin/me") return meResponse();
-            if (url.startsWith("/api/admin/backends/presets"))
-                return presetsResponseFor("Standard");
+            if (url === "/api/admin/setup/preflight") {
+                return new Response(
+                    JSON.stringify({
+                        docker: { available: true, version: "24.0.7" },
+                        gpus: [],
+                    }),
+                    { status: 200 },
+                );
+            }
             if (url === "/api/admin/hardware") return hardwareNoGpu();
             return emptyListResponse();
         });
@@ -544,97 +592,25 @@ describe("BackendsPage", () => {
         fireEvent.click(screen.getAllByTestId("backend-edit")[0]);
         // Wizard, not the raw form.
         await waitFor(() => {
-            expect(screen.getByTestId("backend-wizard")).toBeInTheDocument();
-        });
-        expect(screen.queryByTestId("backend-form")).toBeNull();
-    });
-
-    it("wizard pre-selects the recommended preset and exposes its fields", async () => {
-        fetchMock.mockImplementation(async (url: string) => {
-            if (url === "/api/admin/me") return meResponse();
-            if (url.startsWith("/api/admin/backends/presets"))
-                return presetsResponseFor("VoiceSTT");
-            if (url === "/api/admin/hardware") return hardwareNoGpu();
-            return emptyListResponse();
-        });
-        mountPage();
-        await waitFor(() => {
-            expect(screen.getAllByTestId("backend-row")).toHaveLength(4);
-        });
-        // VoiceSTT is the third row.
-        const editButtons = screen.getAllByTestId("backend-edit");
-        // Find the VoiceSTT one by walking rows.
-        const voiceRow = screen
-            .getAllByTestId("backend-row")
-            .find((r) => r.getAttribute("data-purpose") === "VoiceSTT");
-        const editBtn = voiceRow!.querySelector(
-            '[data-testid="backend-edit"]',
-        ) as HTMLElement;
-        fireEvent.click(editBtn ?? editButtons[2]);
-        await waitFor(() => {
-            expect(screen.getByTestId("backend-wizard")).toBeInTheDocument();
-        });
-        // Recommended badge surfaces.
-        await waitFor(() => {
             expect(
-                screen.getByTestId("backend-wizard-recommended-badge"),
+                screen.getByTestId("backends-wizard-Standard-form"),
             ).toBeInTheDocument();
         });
-        // The recommended preset's fields render — model_size dropdown.
-        const fieldSelect = screen.getByTestId("backend-wizard-field");
-        expect(fieldSelect.getAttribute("data-field-kind")).toBe("model_size");
-    });
-
-    it("'Use this preset' fills the form with materialised spec + flips to managed", async () => {
-        fetchMock.mockImplementation(async (url: string) => {
-            if (url === "/api/admin/me") return meResponse();
-            if (url.startsWith("/api/admin/backends/presets"))
-                return presetsResponseFor("Standard");
-            if (url === "/api/admin/hardware") return hardwareNoGpu();
-            return emptyListResponse();
-        });
-        mountPage();
-        await waitFor(() => {
-            expect(screen.getAllByTestId("backend-row")).toHaveLength(4);
-        });
-        fireEvent.click(screen.getAllByTestId("backend-edit")[0]);
-        await waitFor(() => {
-            expect(screen.getByTestId("backend-wizard")).toBeInTheDocument();
-        });
-        // Change model_size to medium so the materialised arg differs.
-        const fieldSelect = screen.getByTestId(
-            "backend-wizard-field",
-        ) as HTMLSelectElement;
-        fireEvent.change(fieldSelect, { target: { value: "medium" } });
-        fireEvent.click(screen.getByTestId("backend-wizard-apply"));
-        // Wizard closes, raw form appears with managed mode + the
-        // materialised model_spec JSON.
-        await waitFor(() => {
-            expect(screen.getByTestId("backend-form")).toBeInTheDocument();
-        });
-        // Mode radio is on managed.
-        const managedRadio = screen.getByTestId(
-            "backend-form-mode-managed",
-        ) as HTMLInputElement;
-        expect(managedRadio.checked).toBe(true);
-        // Inference backend is the wizard-derived plugin id.
-        const beField = screen.getByTestId(
-            "backend-form-backend",
-        ) as HTMLInputElement;
-        expect(beField.value).toBe("service-vllm");
-        // model_spec carries the materialised arg.
-        const specField = screen.getByTestId(
-            "backend-form-model-spec",
-        ) as HTMLTextAreaElement;
-        expect(specField.value).toContain("--model-size=medium");
-        expect(specField.value).toContain("test/image:v1");
+        expect(screen.queryByTestId("backend-form")).toBeNull();
     });
 
     it("'I'll type the JSON' skip button shows the raw form", async () => {
         fetchMock.mockImplementation(async (url: string) => {
             if (url === "/api/admin/me") return meResponse();
-            if (url.startsWith("/api/admin/backends/presets"))
-                return presetsResponseFor("Standard");
+            if (url === "/api/admin/setup/preflight") {
+                return new Response(
+                    JSON.stringify({
+                        docker: { available: true, version: "24.0.7" },
+                        gpus: [],
+                    }),
+                    { status: 200 },
+                );
+            }
             if (url === "/api/admin/hardware") return hardwareNoGpu();
             return emptyListResponse();
         });
@@ -644,14 +620,18 @@ describe("BackendsPage", () => {
         });
         fireEvent.click(screen.getAllByTestId("backend-edit")[0]);
         await waitFor(() => {
-            expect(screen.getByTestId("backend-wizard")).toBeInTheDocument();
+            expect(
+                screen.getByTestId("backends-wizard-Standard-form"),
+            ).toBeInTheDocument();
         });
-        fireEvent.click(screen.getByTestId("backend-wizard-skip"));
+        fireEvent.click(screen.getByTestId("backends-wizard-Standard-skip"));
         await waitFor(() => {
             expect(screen.getByTestId("backend-form")).toBeInTheDocument();
         });
         // Wizard is gone.
-        expect(screen.queryByTestId("backend-wizard")).toBeNull();
+        expect(
+            screen.queryByTestId("backends-wizard-Standard-form"),
+        ).toBeNull();
     });
 
     it("editing an already-configured row goes straight to the raw form", async () => {
@@ -672,6 +652,17 @@ describe("BackendsPage", () => {
                     { status: 200 },
                 );
             if (url === "/api/admin/hardware") return hardwareNoGpu();
+            if (url === "/api/admin/setup/preflight") {
+                return new Response(
+                    JSON.stringify({
+                        docker: { available: true, version: "24.0.7" },
+                        gpus: [],
+                    }),
+                    { status: 200 },
+                );
+            }
+            // The legacy preset endpoint is no longer fetched by the
+            // BackendsPage but some tests mock it for backwards-compat.
             if (url.startsWith("/api/admin/backends/presets"))
                 return presetsResponseFor("Standard");
             return new Response("{}", { status: 200 });
@@ -686,7 +677,9 @@ describe("BackendsPage", () => {
         await waitFor(() => {
             expect(screen.getByTestId("backend-form")).toBeInTheDocument();
         });
-        expect(screen.queryByTestId("backend-wizard")).toBeNull();
+        expect(
+            screen.queryByTestId("backends-wizard-Standard-form"),
+        ).toBeNull();
         // "Re-run wizard" button is exposed for managed rows.
         expect(
             screen.getByTestId("backend-form-rerun-wizard"),

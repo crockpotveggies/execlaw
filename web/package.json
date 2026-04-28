@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:3031": "node scripts/dev-3031.mjs",
+    "dev:server": "bash ../scripts/dev-server.sh",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "test": "vitest run",

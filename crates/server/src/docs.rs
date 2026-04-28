@@ -25,8 +25,8 @@ use crate::backend_presets::{
     BackendPreset, PresetField, PresetWithFlag, PresetsResponse,
 };
 use crate::backends::{
-    BackendListEntry, BackendListResponse, BackendStatusResponse, BackendView,
-    UpsertBackendRequest,
+    BackendListEntry, BackendListResponse, BackendLogsResponse,
+    BackendStatusResponse, BackendView, UpsertBackendRequest,
 };
 use crate::alerts::{AlertCountResponse, AlertListResponse, AlertView};
 use crate::my_identities::{
@@ -135,6 +135,7 @@ impl Modify for SecurityAddon {
         // backend supervisor (Phase 12.C — managed-mode lifecycle)
         crate::backends::status_handler,
         crate::backends::restart_handler,
+        crate::backends::logs_handler,
         // backend presets (Phase 13.B.1 — managed-mode wizard library)
         crate::backends::presets_handler,
         // runners (Phase 8.5 — view-only + restart)
@@ -215,6 +216,7 @@ impl Modify for SecurityAddon {
         PendingApprovalsResponse,
         BackendView,
         BackendListResponse,
+        BackendLogsResponse,
         BackendListEntry,
         BackendStatusResponse,
         UpsertBackendRequest,

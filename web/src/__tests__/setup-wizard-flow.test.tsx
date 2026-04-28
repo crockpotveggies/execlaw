@@ -190,10 +190,10 @@ describe("SetupWizard — multi-step flow", () => {
         fireEvent.click(screen.getByTestId("setup-docker-skip"));
         // No Docker = unified backend with only the "Remote" option.
         await waitFor(() => {
-            expect(screen.getByTestId("setup-backend-unified")).toBeInTheDocument();
+            expect(screen.getByTestId("setup-backend-form")).toBeInTheDocument();
         });
         const select = screen.getByTestId(
-            "setup-target-select",
+            "setup-backend-target-select",
         ) as HTMLSelectElement;
         // Only the Remote target — no GPU rows because Docker isn't
         // available.
@@ -224,12 +224,12 @@ describe("SetupWizard — multi-step flow", () => {
         });
         fireEvent.click(screen.getByTestId("setup-docker-continue"));
         await waitFor(() => {
-            expect(screen.getByTestId("setup-backend-unified")).toBeInTheDocument();
+            expect(screen.getByTestId("setup-backend-form")).toBeInTheDocument();
         });
         // No GPUs detected — the target dropdown should only carry
         // the Remote option.
         const select = screen.getByTestId(
-            "setup-target-select",
+            "setup-backend-target-select",
         ) as HTMLSelectElement;
         expect(select.options.length).toBe(1);
         expect(select.options[0].textContent).toMatch(/Remote/);
@@ -279,7 +279,7 @@ describe("SetupWizard — multi-step flow", () => {
         });
         fireEvent.click(screen.getByTestId("setup-docker-continue"));
         await waitFor(() => {
-            expect(screen.getByTestId("setup-backend-unified")).toBeInTheDocument();
+            expect(screen.getByTestId("setup-backend-form")).toBeInTheDocument();
         });
 
         // Remote is the only target when there are no usable GPUs;
@@ -291,7 +291,7 @@ describe("SetupWizard — multi-step flow", () => {
         });
 
         // Garbage URL → validation error.
-        fireEvent.change(screen.getByTestId("setup-external-endpoint"), {
+        fireEvent.change(screen.getByTestId("setup-backend-external-endpoint"), {
             target: { value: "not a url" },
         });
         fireEvent.click(screen.getByTestId("setup-backend-submit"));
@@ -300,10 +300,10 @@ describe("SetupWizard — multi-step flow", () => {
         });
 
         // Real URL + model → success.
-        fireEvent.change(screen.getByTestId("setup-external-endpoint"), {
+        fireEvent.change(screen.getByTestId("setup-backend-external-endpoint"), {
             target: { value: "http://localhost:8000/v1" },
         });
-        fireEvent.change(screen.getByTestId("setup-external-model"), {
+        fireEvent.change(screen.getByTestId("setup-backend-external-model"), {
             target: { value: "Qwen3.5-27B-AWQ" },
         });
         fireEvent.click(screen.getByTestId("setup-backend-submit"));
@@ -360,24 +360,25 @@ describe("SetupWizard — multi-step flow", () => {
         });
         fireEvent.click(screen.getByTestId("setup-docker-continue"));
         await waitFor(() => {
-            expect(screen.getByTestId("setup-backend-unified")).toBeInTheDocument();
+            expect(screen.getByTestId("setup-backend-form")).toBeInTheDocument();
         });
         // Two targets: the NVIDIA GPU + Remote.
         const select = screen.getByTestId(
-            "setup-target-select",
+            "setup-backend-target-select",
         ) as HTMLSelectElement;
         expect(select.options.length).toBe(2);
         expect(select.options[0].textContent).toMatch(/GeForce RTX 4090/);
         // For NVIDIA we don't show the radio picker — we render a
         // "fixed serving method" note instead.
-        expect(screen.getByTestId("setup-serving-fixed")).toBeInTheDocument();
-        expect(screen.queryByTestId("setup-serving-picker")).toBeNull();
-        // Model dropdown should include all three vLLM catalog
-        // entries because 24 GB fits the 18 GB flagship.
+        expect(screen.getByTestId("setup-backend-serving-fixed")).toBeInTheDocument();
+        expect(screen.queryByTestId("setup-backend-serving-picker")).toBeNull();
+        // Model dropdown should include all five vLLM catalog
+        // entries because 24 GB fits the 20 GB Qwen 2.5 32B and
+        // the 18 GB Qwen 3.5 27B flagship.
         const modelSelect = screen.getByTestId(
-            "setup-model-select",
+            "setup-backend-model-select",
         ) as HTMLSelectElement;
-        expect(modelSelect.options.length).toBe(3);
+        expect(modelSelect.options.length).toBe(5);
         // Save → PUT with vLLM image + chosen model in args.
         fireEvent.click(screen.getByTestId("setup-backend-submit"));
         await waitFor(() => {
@@ -391,10 +392,18 @@ describe("SetupWizard — multi-step flow", () => {
         const body = JSON.parse((put.init?.body as string) ?? "{}");
         expect(body.mode).toBe("managed");
         expect(body.inference_backend).toBe("service-vllm");
-        expect(body.gpu_id).toBe("0x10de:0x2684");
-        expect(body.model_spec.image).toBe("vllm/vllm-openai:v0.6.2");
-        // The first option in the dropdown is the 27B AWQ flagship
-        // — that's what gets saved on default.
+        // gpu_id is the per-vendor ordinal (matches nvidia-docker's
+        // `--gpus device=N` semantics), NOT the long GpuId string
+        // that bricks create_container.
+        expect(body.gpu_id).toBe("0");
+        // The supervisor reads `gpu_vendor` from model_spec to pick
+        // the device-passthrough strategy.
+        expect(body.model_spec.gpu_vendor).toBe("nvidia");
+        // Wizard tracks the `nightly` vLLM tag because Qwen 3.5
+        // architecture support isn't in any stable cut yet.
+        expect(body.model_spec.image).toBe("vllm/vllm-openai:nightly");
+        // First option in the dropdown is the locked-decision
+        // Qwen 3.5 27B AWQ flagship.
         expect(body.model_spec.args).toContain(
             "--model=QuantTrio/Qwen3.5-27B-AWQ",
         );
@@ -438,14 +447,14 @@ describe("SetupWizard — multi-step flow", () => {
         });
         fireEvent.click(screen.getByTestId("setup-docker-continue"));
         await waitFor(() => {
-            expect(screen.getByTestId("setup-serving-picker")).toBeInTheDocument();
+            expect(screen.getByTestId("setup-backend-serving-picker")).toBeInTheDocument();
         });
         // Radios for both serving methods.
         const openvino = screen.getByTestId(
-            "setup-serving-openvino",
+            "setup-backend-serving-openvino",
         ) as HTMLInputElement;
         const openarc = screen.getByTestId(
-            "setup-serving-openarc",
+            "setup-backend-serving-openarc",
         ) as HTMLInputElement;
         expect(openvino.checked).toBe(true);
         // Switch to OpenArc.
@@ -463,7 +472,11 @@ describe("SetupWizard — multi-step flow", () => {
         )!;
         const body = JSON.parse((put.init?.body as string) ?? "{}");
         expect(body.inference_backend).toBe("service-openarc");
-        expect(body.gpu_id).toBe("0x8086:0xe20b");
+        // gpu_id is the per-vendor ordinal — first Intel card on
+        // the host is "0", regardless of how many NVIDIA cards
+        // precede it in the list.
+        expect(body.gpu_id).toBe("0");
+        expect(body.model_spec.gpu_vendor).toBe("intel");
     });
 
     it("multi-GPU host: dropdown lists every (GPU, serving) combination + Remote", async () => {
@@ -512,10 +525,10 @@ describe("SetupWizard — multi-step flow", () => {
         });
         fireEvent.click(screen.getByTestId("setup-docker-continue"));
         await waitFor(() => {
-            expect(screen.getByTestId("setup-target-select")).toBeInTheDocument();
+            expect(screen.getByTestId("setup-backend-target-select")).toBeInTheDocument();
         });
         const select = screen.getByTestId(
-            "setup-target-select",
+            "setup-backend-target-select",
         ) as HTMLSelectElement;
         // 1 NVIDIA + 1 Intel + 1 Remote = 3 options. (Intel +
         // OpenVINO/OpenArc collapses into one target row; the
@@ -529,7 +542,7 @@ describe("SetupWizard — multi-step flow", () => {
         fireEvent.change(select, { target: { value: "1" } });
         await waitFor(() => {
             expect(
-                screen.getByTestId("setup-serving-picker"),
+                screen.getByTestId("setup-backend-serving-picker"),
             ).toBeInTheDocument();
         });
     });

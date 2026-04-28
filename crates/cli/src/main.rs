@@ -1035,11 +1035,54 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     // through to `None` and managed-mode rows just sit `Stopped`
     // until Docker is available. The actual `run()` task is spawned
     // below alongside the other sweepers so it shares `sweep_stop`.
+    //
+    // Phase 14.C — when the supervisor IS wired, we also stand up
+    // a host-side HuggingFace downloader pointed at
+    // `~/.execlaw/hf-cache`. The supervisor blocks every managed
+    // row's spawn behind a cache check + (if missing) a download,
+    // surfacing real progress in the SPA pill and avoiding the
+    // "container redownloads 18 GB on every CrashLoop" failure
+    // mode that filled the user's disk on first run.
     let backend_supervisor = match execlaw_container_manager::BollardServiceController::connect() {
-        Ok(ctrl) => Some(execlaw_server::backend_supervisor::BackendSupervisor::new(
-            db.clone(),
-            std::sync::Arc::new(ctrl),
-        )),
+        Ok(ctrl) => {
+            // Resolve the host's primary HF cache directory.
+            // Operator can override with EXECLAW_HF_CACHE; default
+            // is `~/.execlaw/hf-cache/`. Created on demand so a
+            // fresh install Just Works without manual setup.
+            let primary_cache: std::path::PathBuf = match std::env::var("EXECLAW_HF_CACHE") {
+                Ok(p) => std::path::PathBuf::from(p),
+                Err(_) => directories::ProjectDirs::from("", "", "execlaw")
+                    .map(|d| d.data_dir().join("hf-cache"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("./.execlaw-hf-cache")),
+            };
+            if let Err(e) = std::fs::create_dir_all(primary_cache.join("hub")) {
+                tracing::warn!(
+                    path = %primary_cache.display(),
+                    "failed to create host HF cache directory: {e}"
+                );
+            }
+            // Operator-supplied secondary caches live in
+            // `config_general.hf_secondary_caches_json`. We snapshot
+            // them at boot time; changing the list requires a
+            // service restart for the supervisor to pick up. (Future
+            // work: dynamic reload via `BackendSupervisor::reload_hf_caches()`.)
+            let secondaries = execlaw_core::general_settings::GeneralSettingsStore::new(&db)
+                .read_secondary_hf_caches()
+                .unwrap_or_default();
+            let token = std::env::var("HF_TOKEN").ok();
+            let downloader = execlaw_container_manager::HfDownloader::new(
+                primary_cache.clone(),
+                secondaries,
+                token,
+            );
+            Some(
+                execlaw_server::backend_supervisor::BackendSupervisor::new(
+                    db.clone(),
+                    std::sync::Arc::new(ctrl),
+                )
+                .with_hf_downloader(downloader, primary_cache),
+            )
+        }
         Err(e) => {
             tracing::warn!(
                 "backend supervisor disabled — Docker daemon unreachable: {e}"

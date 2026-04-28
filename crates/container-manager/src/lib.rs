@@ -17,14 +17,17 @@
 
 pub mod gpu_memory;
 pub mod hardware;
+pub mod hf_downloader;
 pub mod service;
+
+pub use hf_downloader::{DownloadEvent, DownloadStream, HfDownloader, HfError, ResolvedModel};
 
 pub use hardware::{
     detect, detect_sysfs, GpuDevice, GpuId, GpuVendor, HardwareProfile, SysfsSource,
 };
 pub use service::{
-    BollardServiceController, ServiceController, ServiceError, ServiceHandle, ServiceSpec,
-    ServiceStatus,
+    BollardServiceController, HostMount, ServiceController, ServiceError, ServiceHandle,
+    ServiceSpec, ServiceStatus,
 };
 
 #[cfg(any(test, feature = "test-mock"))]

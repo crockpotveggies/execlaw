@@ -121,6 +121,44 @@ Requires Rust 1.85+ (edition 2024). Bare-metal targets:
 on each is handled by the
 [`service-manager`](https://crates.io/crates/service-manager) crate.
 
+## Hot-reload dev workflow
+
+Two long-running processes give you a restart-free edit cycle for
+both the Rust server and the SPA:
+
+```bash
+# One-time install of the Rust file-watcher:
+cargo install cargo-watch --locked
+
+# Terminal 1 — Rust hot-reload. cargo-watch rebuilds + restarts the
+# binary on every .rs save. Wraps `cargo run -p execlaw -- serve`.
+cd web && npm run dev:server
+#   POSIX direct:   bash scripts/dev-server.sh
+#   PowerShell:     pwsh scripts/dev-server.ps1
+
+# Terminal 2 — SPA hot-reload (Vite HMR). Proxies /api → :3031.
+cd web && npm run dev:3031
+```
+
+Open http://127.0.0.1:5173/ — the SPA hits the Vite dev server, which
+proxies API calls to the cargo-watch'd Rust binary on :3031. Editing
+a `.tsx` file triggers a Vite HMR push; editing a `.rs` file triggers
+a `cargo build` + binary restart and the next API call hits the new
+code (typically <5s for incremental edits).
+
+Why :3031 instead of the production :3030 — Docker Desktop's vpnkit
+squats :3030 on Windows hosts, so the dev server steers off it to
+avoid `EADDRINUSE`. The Vite proxy reads `VITE_API_TARGET` to match;
+`npm run dev:3031` sets it for you. Override with
+`EXECLAW_DEV_BIND=127.0.0.1:3030` on hosts where Docker isn't a
+problem (and adjust the Vite target to match).
+
+### Disk-space note
+
+The Rust workspace's `target/` directory grows quickly (40+ GB on a
+warm dev box). If `cargo-watch` rebuilds start failing with
+`No space left on device`, run `cargo clean` to reclaim.
+
 ## License
 
 AGPL-3.0-or-later.

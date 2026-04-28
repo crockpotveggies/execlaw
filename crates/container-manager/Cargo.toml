@@ -30,6 +30,14 @@ async-trait.workspace = true
 reqwest = { workspace = true }
 futures-util = "0.3"
 
+# Phase 14.C — host-side HuggingFace model downloader. We call the
+# raw HTTP HF Hub API ourselves rather than pulling in the `hf-hub`
+# crate because hf-hub 0.4 brings hard deps on `ureq` + `native-tls`,
+# duplicating reqwest's TLS stack and inflating the binary by ~3 MB.
+# Our needs are narrow (resolve manifest → stream files into a cache
+# dir), so a 200-line direct implementation costs less than the
+# crate-graph weight.
+
 # Phase 14 — cross-platform hardware probe. Replaces our hand-rolled
 # sysfs walker for the production code path; tests still exercise
 # `detect_sysfs` directly to keep the mock-tree assertions. The crate

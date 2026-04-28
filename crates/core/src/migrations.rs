@@ -117,6 +117,28 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "general-setup-dismissed",
         sql: include_str!("../migrations/0018_general_setup_dismissed.sql"),
     },
+    Migration {
+        id: 19,
+        name: "repair-legacy-gpu-id",
+        sql: include_str!("../migrations/0019_repair_legacy_gpu_id.sql"),
+    },
+    Migration {
+        id: 20,
+        name: "bump-vllm-image-to-nightly",
+        sql: include_str!("../migrations/0020_bump_vllm_image_to_nightly.sql"),
+    },
+    Migration {
+        id: 21,
+        name: "repair-model-spec-storage-class",
+        sql: include_str!(
+            "../migrations/0021_repair_model_spec_storage_class.sql"
+        ),
+    },
+    Migration {
+        id: 22,
+        name: "hf-cache",
+        sql: include_str!("../migrations/0022_hf_cache.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -250,7 +272,7 @@ mod tests {
         let applied = runner.apply_all().unwrap();
         assert_eq!(
             applied,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
         );
 
         // Spot-check: every documented table exists.
@@ -313,12 +335,246 @@ mod tests {
         let second = runner.apply_all().unwrap();
         assert_eq!(
             first,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
         );
         assert!(
             second.is_empty(),
             "rerun must not re-apply already-applied migrations"
         );
+    }
+
+    #[test]
+    fn repair_storage_class_round_trips_blob_correctly() {
+        // Phase 14 follow-up — migration 0021 fixes rows whose
+        // `model_spec_json` storage class drifted from BLOB to TEXT
+        // under the buggy first cut of 0020. The repair must:
+        //   * leave already-BLOB cells byte-identical
+        //   * coerce TEXT cells (UTF-8 JSON) back to BLOB so
+        //     `row.get::<_, Vec<u8>>()` succeeds again.
+        //
+        // We can't easily construct a TEXT cell on a BLOB column via
+        // a normal INSERT (rusqlite would store the &[u8] payload as
+        // BLOB), so we drive the same UPDATE 0020 ran first to
+        // reproduce the storage-class drift, then run 0021 to fix
+        // it, then read back via the BackendStore-style `Vec<u8>`
+        // pattern.
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        db.with_conn(|c| {
+            for m in MIGRATIONS.iter().take_while(|m| m.id < 20) {
+                c.execute_batch(m.sql).unwrap();
+            }
+            c.execute(
+                "INSERT INTO config_backends \
+                 (purpose, inference_backend, model_spec_json, gpu_id, endpoint, \
+                  notes, reasoning_enabled, mode, created_at, updated_at) VALUES \
+                 ('Standard', 'service-vllm', \
+                   '{\"image\":\"vllm/vllm-openai:v0.6.2\",\"args\":[]}', \
+                   '0', NULL, NULL, 0, 'managed', 100, 100)",
+                [],
+            ).unwrap();
+            // Run 0020 (the buggy json_set without CAST). Now
+            // model_spec_json is TEXT-affinity.
+            let m20 = MIGRATIONS.iter().find(|m| m.id == 20).unwrap();
+            c.execute_batch(m20.sql).unwrap();
+            Ok(())
+        }).unwrap();
+
+        // Verify the storage class IS now TEXT (sanity: this is the
+        // bug 0021 fixes).
+        let typeof_after_20: String = db
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT typeof(model_spec_json) FROM config_backends \
+                     WHERE purpose = 'Standard'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap())
+            })
+            .unwrap();
+        assert_eq!(
+            typeof_after_20, "text",
+            "0020 alone must leave the cell as TEXT; otherwise 0021 has nothing to fix"
+        );
+
+        // Run 0021 — repair the storage class.
+        db.with_conn(|c| {
+            let m21 = MIGRATIONS.iter().find(|m| m.id == 21).unwrap();
+            c.execute_batch(m21.sql).unwrap();
+            Ok(())
+        }).unwrap();
+
+        // Now `typeof()` should be 'blob' and the BackendStore-style
+        // read should succeed.
+        let (typeof_after_21, blob_bytes): (String, Vec<u8>) = db
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT typeof(model_spec_json), model_spec_json \
+                     FROM config_backends WHERE purpose = 'Standard'",
+                    [],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Vec<u8>>(1)?,
+                        ))
+                    },
+                )
+                .unwrap())
+            })
+            .unwrap();
+        assert_eq!(
+            typeof_after_21, "blob",
+            "0021 must coerce the TEXT cell back to BLOB"
+        );
+        // The bytes must still parse as JSON with the bumped image.
+        let v: serde_json::Value = serde_json::from_slice(&blob_bytes).unwrap();
+        assert_eq!(v["image"], "vllm/vllm-openai:nightly");
+    }
+
+    #[test]
+    fn vllm_image_bump_targets_only_legacy_v062_managed_rows() {
+        // Phase 14 follow-up — migration 0020 rewrites
+        // `model_spec_json.image` for managed rows that still hold
+        // the locked-in `vllm/vllm-openai:v0.6.2` (pre-Qwen-3.5).
+        // It must NOT touch:
+        //   * external rows (operator-managed; we don't drive that)
+        //   * managed rows with a different image (pinned digests,
+        //     custom forks, OpenVINO/OpenArc images)
+        //   * rows with no image field at all (malformed but legal)
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        // Apply through migration 19 so config_backends exists.
+        db.with_conn(|c| {
+            for m in MIGRATIONS.iter().take_while(|m| m.id < 20) {
+                c.execute_batch(m.sql).unwrap();
+            }
+            // Seed four rows representing each "should/shouldn't be
+            // rewritten" case.
+            c.execute(
+                "INSERT INTO config_backends \
+                 (purpose, inference_backend, model_spec_json, gpu_id, endpoint, \
+                  notes, reasoning_enabled, mode, created_at, updated_at) VALUES \
+                 ('Standard', 'service-vllm', \
+                   '{\"image\":\"vllm/vllm-openai:v0.6.2\",\"args\":[]}', \
+                   '0', NULL, NULL, 0, 'managed', 100, 100), \
+                 ('Small',    'service-vllm', \
+                   '{\"image\":\"vllm/vllm-openai:v0.6.2\",\"args\":[]}', \
+                   '0', NULL, NULL, 0, 'external', 100, 100), \
+                 ('VoiceSTT', 'service-whisper-stt', \
+                   '{\"image\":\"execlaw/service-whisper-cuda:v1\",\"args\":[]}', \
+                   '0', NULL, NULL, 0, 'managed', 100, 100), \
+                 ('VoiceTTS', 'service-vllm', \
+                   '{\"args\":[]}', \
+                   '0', NULL, NULL, 0, 'managed', 100, 100)",
+                [],
+            ).unwrap();
+            Ok(())
+        }).unwrap();
+
+        // Run migration 20.
+        db.with_conn(|c| {
+            let m = MIGRATIONS.iter().find(|m| m.id == 20).unwrap();
+            c.execute_batch(m.sql).unwrap();
+            Ok(())
+        }).unwrap();
+
+        // Inspect each row.
+        let by_purpose = db.with_conn(|c| {
+            let mut stmt = c
+                .prepare(
+                    "SELECT purpose, json_extract(model_spec_json, '$.image') \
+                     FROM config_backends",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>();
+            Ok(rows)
+        }).unwrap();
+        let lookup: std::collections::HashMap<_, _> = by_purpose.into_iter().collect();
+        // Standard (managed + legacy image) → bumped to nightly.
+        assert_eq!(
+            lookup["Standard"].as_deref(),
+            Some("vllm/vllm-openai:nightly"),
+            "managed v0.6.2 row must be bumped to nightly"
+        );
+        // Small (external) → image left alone (we don't touch
+        // external rows; the URL is the operator's, not ours).
+        assert_eq!(
+            lookup["Small"].as_deref(),
+            Some("vllm/vllm-openai:v0.6.2"),
+            "external rows must not be rewritten"
+        );
+        // VoiceSTT (different image) → left alone.
+        assert_eq!(
+            lookup["VoiceSTT"].as_deref(),
+            Some("execlaw/service-whisper-cuda:v1"),
+        );
+        // VoiceTTS (no image field) → still no image field.
+        assert!(lookup["VoiceTTS"].is_none());
+    }
+
+    #[test]
+    fn legacy_gpu_id_repair_replaces_pnp_strings_and_leaves_clean_values_alone() {
+        // Phase 14 follow-up — migration 0019 fixes pre-fix wizard
+        // saves where `gpu_id` was the full GpuId string. We seed
+        // four rows representing each real shape we've observed +
+        // one CUDA UUID (must be left alone) + one already-clean
+        // ordinal (must also be left alone) and verify the migration
+        // is precise.
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        // Apply through migration 18 first so config_backends exists
+        // but migration 19 hasn't run.
+        db.with_conn(|c| {
+            for m in MIGRATIONS.iter().take_while(|m| m.id < 19) {
+                c.execute_batch(m.sql).unwrap();
+            }
+            // Seed the pre-fix shapes.
+            c.execute(
+                "INSERT INTO config_backends \
+                 (purpose, inference_backend, model_spec_json, gpu_id, endpoint, \
+                  notes, reasoning_enabled, mode, created_at, updated_at) VALUES \
+                 ('Standard',  'service-vllm', '{}', '0x10de:PCI\\VEN_10DE&DEV_2230&SUBSYS_X', NULL, NULL, 0, 'managed',  100, 100), \
+                 ('Small',     'service-vllm', '{}', '0x8086:0xe20b',                          NULL, NULL, 0, 'managed',  100, 100), \
+                 ('VoiceSTT',  'service-vllm', '{}', 'GPU-abc-12345',                          NULL, NULL, 0, 'managed',  100, 100), \
+                 ('VoiceTTS',  'service-vllm', '{}', '0',                                       NULL, NULL, 0, 'managed',  100, 100)",
+                [],
+            ).unwrap();
+            Ok(())
+        }).unwrap();
+
+        // Now run migration 19.
+        db.with_conn(|c| {
+            let m = MIGRATIONS.iter().find(|m| m.id == 19).unwrap();
+            c.execute_batch(m.sql).unwrap();
+            Ok(())
+        }).unwrap();
+
+        // Inspect every row.
+        let by_purpose = db.with_conn(|c| {
+            let mut stmt = c
+                .prepare("SELECT purpose, gpu_id FROM config_backends")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>();
+            Ok(rows)
+        }).unwrap();
+        let lookup: std::collections::HashMap<_, _> = by_purpose.into_iter().collect();
+        // Both legacy shapes get repaired to the per-vendor ordinal "0".
+        assert_eq!(lookup["Standard"].as_deref(), Some("0"));
+        assert_eq!(lookup["Small"].as_deref(), Some("0"));
+        // CUDA UUID is left untouched.
+        assert_eq!(lookup["VoiceSTT"].as_deref(), Some("GPU-abc-12345"));
+        // Already-clean ordinal is left untouched.
+        assert_eq!(lookup["VoiceTTS"].as_deref(), Some("0"));
     }
 
     #[test]

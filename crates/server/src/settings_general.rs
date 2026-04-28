@@ -183,10 +183,98 @@ fn require_controller(state: &AppState, user: &AuthedUser) -> Result<(), ApiErro
 }
 
 pub fn settings_router() -> Router<AppState> {
-    Router::new().route(
-        "/api/admin/settings/general",
-        get(get_handler).put(put_handler),
-    )
+    Router::new()
+        .route(
+            "/api/admin/settings/general",
+            get(get_handler).put(put_handler),
+        )
+        .route(
+            "/api/admin/settings/hf-cache",
+            get(get_hf_cache_handler).put(put_hf_cache_handler),
+        )
+}
+
+// ----- Phase 14.C — operator-supplied secondary HF cache list -----
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HfCacheView {
+    /// Host paths the supervisor scans (read-only) before falling
+    /// back to a network download. Order is preserved from the
+    /// last write — there's no priority semantics, but ordering is
+    /// the operator's choice.
+    pub secondary_paths: Vec<String>,
+    /// True iff the new value will take effect on the next
+    /// `execlaw service restart`. We snapshot the secondary list at
+    /// supervisor boot today; live reload is future work.
+    pub requires_restart: bool,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateHfCacheRequest {
+    /// Replace the full list. Pass an empty array to clear.
+    pub secondary_paths: Vec<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/admin/settings/hf-cache",
+    responses((status = 200, description = "Configured secondary HF cache paths", body = HfCacheView)),
+    security(("bearer_jwt" = [])),
+    tag = "settings"
+)]
+pub async fn get_hf_cache_handler(
+    State(state): State<AppState>,
+    _user: AuthedUser,
+) -> Result<Json<HfCacheView>, ApiError> {
+    let store = GeneralSettingsStore::new(&state.db);
+    let paths = store.read_secondary_hf_caches().map_err(ApiError::from)?;
+    Ok(Json(HfCacheView {
+        secondary_paths: paths
+            .into_iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        requires_restart: true,
+    }))
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/admin/settings/hf-cache",
+    request_body = UpdateHfCacheRequest,
+    responses(
+        (status = 200, description = "Saved", body = HfCacheView),
+        (status = 400, description = "Invalid path (must be absolute, non-empty)"),
+        (status = 403, description = "Caller is not a Controller"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "settings"
+)]
+pub async fn put_hf_cache_handler(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Json(req): Json<UpdateHfCacheRequest>,
+) -> Result<Json<HfCacheView>, ApiError> {
+    require_controller(&state, &user)?;
+    let paths: Vec<std::path::PathBuf> = req
+        .secondary_paths
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    let store = GeneralSettingsStore::new(&state.db);
+    store
+        .write_secondary_hf_caches(&paths, chrono::Utc::now().timestamp())
+        .map_err(ApiError::from)?;
+    let _ = AuditStore::new(&state.db).insert(
+        &user.user_id,
+        "config_general",
+        "hf_secondary_caches_json",
+        None,
+        Some(&serde_json::json!({ "secondary_paths": &req.secondary_paths })),
+    );
+    Ok(Json(HfCacheView {
+        secondary_paths: req.secondary_paths,
+        requires_restart: true,
+    }))
 }
 
 #[cfg(test)]
@@ -294,5 +382,83 @@ mod tests {
         let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["start_on_boot"], false);
+    }
+
+    #[tokio::test]
+    async fn hf_cache_get_starts_empty_and_put_round_trips() {
+        // Phase 14.C — fresh DB has no secondary caches configured.
+        // PUT replaces the full list; subsequent GET returns the
+        // operator's saved paths.
+        let app = build_router(test_app_state());
+        let tok = setup_controller_token(&app).await;
+
+        // GET on a fresh DB returns an empty list.
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/admin/settings/hf-cache")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["secondary_paths"].as_array().unwrap().len(), 0);
+
+        // PUT writes the list.
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/admin/settings/hf-cache")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "secondary_paths": ["/home/me/.cache/huggingface", "/data/hf"]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // GET reflects the new state.
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/admin/settings/hf-cache")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = v["secondary_paths"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], "/home/me/.cache/huggingface");
+        assert_eq!(arr[1], "/data/hf");
+    }
+
+    #[tokio::test]
+    async fn hf_cache_put_rejects_relative_paths() {
+        // Defense-in-depth — a relative path resolved from the
+        // service's working directory probably isn't what the
+        // operator meant. The store rejects with `invalid_bind_address`
+        // (the existing GeneralSettingsError variant; we reuse it
+        // for path validation since the message is descriptive).
+        let app = build_router(test_app_state());
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/admin/settings/hf-cache")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "secondary_paths": ["./relative/path"]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

@@ -581,6 +581,43 @@ body {
     &.is-blocked { color: color.adjust($danger, $lightness: 8%); border-color: rgba($danger, 0.4); }
 }
 
+// Container-logs panel for the BackendsPage logs modal. Mono font,
+// preserved whitespace, dark background so the operator's eye
+// distinguishes log output from the surrounding chrome at a glance.
+.execlaw-log-tail {
+    background-color: $bg-elev;
+    color: $text-primary;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    line-height: 1.4;
+    padding: 0.75rem;
+    border-radius: 0.25rem;
+    border: 1px solid $border-subtle;
+    max-height: 65vh;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin-bottom: 0;
+}
+
+// Inline spinner dot for the "Provisioning" status pill — a small
+// pulsing circle that signals "the supervisor is doing work" without
+// crowding the badge with a full Bootstrap spinner.
+.execlaw-spinner-dot {
+    display: inline-block;
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background-color: currentColor;
+    animation: execlaw-spinner-dot-pulse 1.2s ease-in-out infinite;
+    vertical-align: middle;
+}
+
+@keyframes execlaw-spinner-dot-pulse {
+    0%, 100% { opacity: 0.35; transform: scale(0.85); }
+    50%      { opacity: 1.0;  transform: scale(1.05); }
+}
+
 .execlaw-log-row {
     display: grid;
     grid-template-columns: 7rem 4.5rem 9rem 1fr;
