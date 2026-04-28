@@ -20,10 +20,6 @@ execlaw-container-manager = { path = "../container-manager" }
 execlaw-mcp-client = { path = "../mcp-client" }
 execlaw-voice-pipeline = { path = "../voice-pipeline" }
 futures.workspace = true
-# 2026-04-28 — used by the incognito streaming endpoint to yield
-# SSE chunks from the async tokio loop.
-async-stream.workspace = true
-bytes.workspace = true
 
 axum = { workspace = true, features = ["ws"] }
 tower.workspace = true

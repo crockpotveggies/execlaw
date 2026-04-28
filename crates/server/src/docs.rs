@@ -110,7 +110,6 @@ impl Modify for SecurityAddon {
         crate::chats::send_message,
         crate::chats::stop_turn,
         crate::chats::generate_title,
-        crate::chats::incognito_turn,
         crate::chats::list_messages,
         crate::chats::patch_thread,
         crate::chats::delete_thread,

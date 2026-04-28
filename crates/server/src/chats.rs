@@ -41,6 +41,30 @@ pub struct SendMessageRequest {
     pub text: String,
     /// Optional override — defaults to the controller's principal id.
     pub sender_principal_id: Option<String>,
+    /// 2026-04-28 — when true, run the turn against inference but
+    /// skip every persistent write: no event-log rows, no
+    /// conversation-table upsert, no outbox, no display-name
+    /// generation. The SPA owns the transcript and ships the
+    /// running history in `prior_messages` on each turn.
+    /// Streaming token deltas + phase events still broadcast over
+    /// the WS bus keyed on `conversation_id`, matching the regular
+    /// chat UX exactly. Default false.
+    #[serde(default)]
+    pub incognito: bool,
+    /// 2026-04-28 — running transcript for incognito turns. The
+    /// server reads this in place of replaying the event log when
+    /// `incognito = true`. Ordered oldest-first; excludes the new
+    /// user message in `text` (server appends that itself before
+    /// calling the model). Each entry's `role` is `"user"` or
+    /// `"assistant"`. Ignored when `incognito = false`.
+    #[serde(default)]
+    pub prior_messages: Vec<IncognitoTurnMessage>,
+}
+
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+pub struct IncognitoTurnMessage {
+    pub role: String,
+    pub content: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -106,6 +130,26 @@ pub async fn send_message(
     }
 
     let cid = ConversationId::from(conversation_id.as_str());
+
+    // 2026-04-28 — incognito short-circuit. We branch BEFORE
+    // identity resolution / policy evaluation / event-log writes
+    // so the regular chat pipeline (which is the source of truth
+    // for the event log + conversation-table contract) stays
+    // intact. Incognito gets:
+    //   * the same WS broadcast path (token deltas, phase events)
+    //   * the same cancel-flag plumbing (stop button works)
+    //   * the same SendMessageResponse shape, so the SPA can
+    //     reuse `postMessage` without forking
+    // and skips:
+    //   * event-log append + commit_turn
+    //   * conversation-table upsert / kind refresh
+    //   * personality merge into the system prompt
+    //   * trust resolution / policy gate (controller-only)
+    //   * outbox / capability tokens
+    if req.incognito {
+        return run_incognito_send(&state, &cid, &req).await;
+    }
+
     let log = event_log(&state);
     let store = ConversationStore::new(&state.db);
 
@@ -1526,110 +1570,49 @@ pub async fn patch_thread(
 /// persistent storage. The SPA holds the entire transcript in
 /// memory and ships the relevant slice on each turn.
 ///
-/// The point: an "incognito" conversation that the operator can
-/// throw away by navigating off the screen. No `state_events`
-/// rows, no `state_conversations` rows, no outbox enqueue, no
-/// audit trail. Bypasses the runner-local pipeline entirely
-/// because that path's contract is "every turn lands in the
-/// event log."
+/// Incognito branch of `send_message`. Same wire shape as the
+/// regular path (SendMessageRequest in, SendMessageResponse out,
+/// streaming token deltas + phase events on the WS bus keyed on
+/// `conversation_id`), but ZERO persistent writes:
+///   * no event-log append / commit_turn
 ///
-/// Trade-offs we accept for the privacy story:
-///   * No tools, no plugin host, no policy gate. Incognito is for
-///     conversational throwaway chat — running tools (which
-///     would write outbox rows) would defeat the "nothing
-///     persists" guarantee.
-///   * No streaming. We could SSE-stream the body, but chunked
-///     responses are conspicuously different from regular chat
-///     and the simpler shape gets the feature shipped. Streaming
-///     can land later without breaking the client contract.
-///   * Same Standard backend as regular chat. Routing to a
-///     different backend for incognito would be nice
-///     defence-in-depth but isn't necessary for the local-model
-///     deployment everyone runs.
-#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
-pub struct IncognitoMessage {
-    /// "user" or "assistant" — the only two roles incognito chat
-    /// emits client-side.
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
-pub struct IncognitoRequest {
-    /// Prior turns in this client-only conversation, ordered
-    /// oldest-first. Excludes the new user message — that's
-    /// passed separately in `text`.
-    #[serde(default)]
-    pub messages: Vec<IncognitoMessage>,
-    pub text: String,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct IncognitoResponse {
-    pub text: String,
-    pub model: String,
-    pub finish_reason: Option<String>,
-}
-
-#[utoipa::path(
-    post,
-    path = "/api/chats/incognito",
-    request_body = IncognitoRequest,
-    responses(
-        (status = 200, description = "Assistant reply, never persisted", body = IncognitoResponse),
-        (status = 401, description = "Missing or invalid Authorization header"),
-        (status = 503, description = "No inference backend configured"),
-    ),
-    security(("bearer_jwt" = [])),
-    tag = "chats"
-)]
-pub async fn incognito_turn(
-    State(state): State<AppState>,
-    _user: crate::auth_extract::AuthedUser,
-    Json(req): Json<IncognitoRequest>,
-) -> impl IntoResponse {
+///   * no `state_conversations` upsert / kind refresh / display
+///     name
+///
+///   * no policy gate (controller-only privacy mode)
+///   * no personality merge — only the static restraint prompt
+///   * no outbox / capability tokens / runner registry
+///
+/// History on each turn comes from `req.prior_messages` (the SPA
+/// holds the running transcript). Stop button works because the
+/// turn registers a `TurnCancelGuard` keyed on the same
+/// conversation_id; `POST /api/chats/:id/stop` flips the flag
+/// regardless of incognito vs regular.
+async fn run_incognito_send(
+    state: &AppState,
+    cid: &ConversationId,
+    req: &SendMessageRequest,
+) -> axum::response::Response {
     use execlaw_inference_api::{ChatMessage, ChatRequest, Role};
+    use futures::StreamExt;
 
-    if req.text.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "text must not be empty"})),
-        )
-            .into_response();
-    }
+    let Some(inference) = state.inference.resolve(&state.db, BackendPurpose::Standard) else {
+        return err_500("no inference backend configured for incognito chat");
+    };
 
-    let inference =
-        match state.inference.resolve(&state.db, BackendPurpose::Standard) {
-            Some(c) => c,
-            None => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({
-                        "error": "no inference backend configured for incognito chat",
-                    })),
-                )
-                    .into_response();
-            }
-        };
-
-    // Compose: static system prompt (NO personality lookup — that
-    // would hit the personality table, which is fine, but the
-    // operator-editable voice isn't the point of incognito; we
-    // want the rules-only base) + prior history + new user text.
-    let system = state.config.system_prompt.clone();
-    let mut messages: Vec<ChatMessage> = Vec::with_capacity(req.messages.len() + 2);
-    messages.push(ChatMessage::system(system));
-    for m in &req.messages {
+    // Compose: static system prompt (no personality merge) +
+    // prior client-supplied history + new user text.
+    let mut messages: Vec<ChatMessage> = Vec::with_capacity(req.prior_messages.len() + 2);
+    messages.push(ChatMessage::system(&state.config.system_prompt));
+    for m in &req.prior_messages {
         match m.role.as_str() {
             "assistant" => messages.push(ChatMessage::assistant(&m.content)),
-            // Treat unknown roles as user — defensive against a
-            // bad client.
             _ => messages.push(ChatMessage::user(&m.content)),
         }
     }
     messages.push(ChatMessage {
         role: Role::User,
-        content: Some(req.text),
+        content: Some(req.text.clone()),
         tool_call_id: None,
         name: None,
         tool_calls: vec![],
@@ -1641,14 +1624,37 @@ pub async fn incognito_turn(
         .flatten()
         .map(|r| r.reasoning_enabled)
         .unwrap_or(false);
-    // 2026-04-28 — STREAMING. The original implementation used
-    // `chat_completions` (non-streaming) and hung the HTTP request
-    // for the full inference duration. With a 27B local model the
-    // browser's fetch threw `NetworkError when attempting to
-    // fetch resource` because the dev-proxy / browser tore the
-    // connection down before any bytes came back. Streaming via
-    // SSE keeps the wire active throughout, matching the regular
-    // chat path.
+
+    // Phase events + cancel flag use the SAME plumbing as the
+    // regular path so the SPA's typing indicator + stop button
+    // light up identically.
+    state.events.publish(UiEvent::ConversationPhaseChanged {
+        conversation_id: cid.as_str().to_owned(),
+        phase: Phase::Thinking.as_str().to_owned(),
+    });
+    let idle_guard = IdlePhaseGuard::new(
+        state.events.clone(),
+        cid.as_str().to_owned(),
+    );
+    let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
+        state.turn_cancel.clone(),
+        cid.as_str().to_owned(),
+    );
+    let cancel_flag = cancel_guard.flag.clone();
+
+    // Echo the inbound user message on the WS bus so any other
+    // tabs watching this conversation see it land. We synthesise
+    // a transient seq because there's no event-log row to draw
+    // from — the SPA already has the user message in its local
+    // transcript, so this echo is mostly defensive (tests, future
+    // multi-tab support).
+    state.events.publish(UiEvent::ChatMessageInbound {
+        conversation_id: cid.as_str().to_owned(),
+        seq: 0,
+        text: req.text.clone(),
+        sender: req.sender_principal_id.clone(),
+    });
+
     let chat_req = ChatRequest {
         model: ModelId(state.config.model_id.clone()),
         messages,
@@ -1660,96 +1666,96 @@ pub async fn incognito_turn(
             "enable_thinking": reasoning_enabled,
         })),
     };
-    let upstream = match inference.chat_completions_stream(&chat_req).await {
+    let mut stream = match inference.chat_completions_stream(&chat_req).await {
         Ok(s) => s,
-        Err(e) => {
-            return err_500(&format!("incognito stream open: {e}"));
-        }
+        Err(e) => return err_500(&format!("incognito stream open: {e}")),
     };
 
-    // Aggregate + relay. We frame each emitted text chunk as one
-    // SSE `data:` line so the SPA can render incrementally; the
-    // closing `data: {"done": true, ...}` carries the final
-    // text + model + finish_reason as a single JSON record so
-    // the client doesn't have to re-assemble the deltas itself
-    // (it gets both: the per-chunk live deltas AND a canonical
-    // final payload).
-    use axum::body::Body;
-    use axum::response::Response;
-    use futures::StreamExt;
-    let body_stream = async_stream::stream! {
-        let mut stream = std::pin::pin!(upstream);
-        let mut filter = crate::think_filter::ThinkBlockFilter::new();
-        let mut assembled = String::new();
-        let mut model = String::new();
-        let mut finish: Option<String> = None;
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(c) => {
-                    if model.is_empty() {
-                        model = c.model.clone();
+    // Drain the stream, broadcasting each visible chunk as a
+    // ChatTokenDelta on the WS bus — exactly what `run_real_turn`
+    // does. The SPA's existing `chat_token_delta` handler appends
+    // into the streaming buffer keyed on conversation_id; nothing
+    // about the SPA-side rendering is incognito-aware.
+    let mut filter = crate::think_filter::ThinkBlockFilter::new();
+    let mut assembled = String::new();
+    let mut finish_reason: Option<String> = None;
+    let mut was_cancelled = false;
+    while let Some(chunk) = stream.next().await {
+        if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            was_cancelled = true;
+            break;
+        }
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => return err_500(&format!("incognito stream chunk: {e}")),
+        };
+        for ch in &chunk.choices {
+            if let Some(t) = &ch.delta.content {
+                if !t.is_empty() {
+                    let visible = filter.feed(t);
+                    if !visible.is_empty() {
+                        assembled.push_str(&visible);
+                        state.events.publish(UiEvent::ChatTokenDelta {
+                            conversation_id: cid.as_str().to_owned(),
+                            text: visible,
+                        });
                     }
-                    for ch in &c.choices {
-                        if let Some(t) = &ch.delta.content {
-                            if !t.is_empty() {
-                                let visible = filter.feed(t);
-                                if !visible.is_empty() {
-                                    assembled.push_str(&visible);
-                                    let payload = serde_json::json!({
-                                        "delta": visible,
-                                    });
-                                    yield Ok::<_, std::io::Error>(
-                                        bytes::Bytes::from(format!(
-                                            "data: {}\n\n",
-                                            payload,
-                                        )),
-                                    );
-                                }
-                            }
-                        }
-                        if let Some(fr) = &ch.finish_reason {
-                            finish = Some(fr.clone());
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Surface upstream errors to the client as a
-                    // structured SSE event so the SPA can show a
-                    // banner instead of a silent fail.
-                    let payload = serde_json::json!({
-                        "error": format!("{e}"),
-                    });
-                    yield Ok::<_, std::io::Error>(bytes::Bytes::from(format!(
-                        "data: {}\n\n",
-                        payload,
-                    )));
-                    return;
                 }
             }
+            if let Some(fr) = &ch.finish_reason {
+                finish_reason = Some(fr.clone());
+            }
         }
-        let tail = filter.flush();
-        if !tail.is_empty() {
-            assembled.push_str(&tail);
-        }
-        let final_payload = serde_json::json!({
-            "done": true,
-            "text": assembled.trim(),
-            "model": model,
-            "finish_reason": finish,
+    }
+    drop(stream);
+    let tail = filter.flush();
+    if !tail.is_empty() {
+        assembled.push_str(&tail);
+        state.events.publish(UiEvent::ChatTokenDelta {
+            conversation_id: cid.as_str().to_owned(),
+            text: tail,
         });
-        yield Ok::<_, std::io::Error>(bytes::Bytes::from(format!(
-            "data: {}\n\n",
-            final_payload,
-        )));
+    }
+    if was_cancelled {
+        finish_reason = Some("cancelled".into());
+    }
+    let _ = finish_reason;
+
+    let assistant_text = if assembled.is_empty() {
+        if was_cancelled {
+            "(stopped before any output)".to_owned()
+        } else {
+            "(empty response)".to_owned()
+        }
+    } else if was_cancelled {
+        format!("{assembled} … (stopped)")
+    } else {
+        assembled
     };
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .header("x-accel-buffering", "no")
-        .body(Body::from_stream(body_stream))
-        .unwrap()
+    // Broadcast the final outbound — same envelope shape the
+    // regular path uses, so the SPA can flush its streaming
+    // buffer and append the canonical assistant message via the
+    // existing `chat_message_outbound` listener.
+    state.events.publish(UiEvent::ChatMessageOutbound {
+        conversation_id: cid.as_str().to_owned(),
+        seq: 0,
+        text: assistant_text.clone(),
+    });
+
+    idle_guard.disarm_after_publishing_idle();
+    drop(cancel_guard);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(SendMessageResponse {
+            conversation_id: cid.as_str().to_owned(),
+            user_msg_seq: 0,
+            assistant_text,
+            assistant_seq: 0,
+        })),
+    )
+        .into_response()
 }
 
 /// `POST /api/chats/:id/generate-title` — synthesise a 3-5 word

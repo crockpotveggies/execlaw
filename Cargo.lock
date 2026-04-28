@@ -1207,11 +1207,9 @@ name = "execlaw-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-stream",
  "async-trait",
  "axum",
  "base64 0.22.1",
- "bytes",
  "chrono",
  "criterion",
  "dashmap",

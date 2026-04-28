@@ -21,7 +21,6 @@ import {
     listUiPanels,
     patchThread,
     postGenerateTitle,
-    postIncognitoTurn,
     postMessage,
     postStopTurn,
     respondApproval,
@@ -261,102 +260,30 @@ export function Chat() {
 
     const onSend = useCallback(
         async (text: string) => {
-            // 2026-04-28 — incognito branch. Skip the URL push, the
-            // event log, and the thread list — the entire
-            // conversation lives in the in-memory `messages` map
-            // until the operator navigates away.
-            if (incognito) {
-                const targetId =
-                    typeof activeId === "string" &&
-                    activeId.startsWith("incognito:")
-                        ? activeId
-                        : `incognito:${mintConversationId()}`;
-                if (targetId !== activeId) {
-                    setActiveThread(targetId);
-                }
-                // Optimistic user message. Use a monotonic seq so the
-                // message order matches insertion even though there's
-                // no server-assigned canonical seq.
-                const userSeq = Date.now();
-                appendMessage(targetId, {
-                    seq: userSeq,
-                    kind: "user_msg",
-                    text,
-                    actor: auth.user?.user_id ?? null,
-                    committed_at: Math.floor(Date.now() / 1000),
-                });
-                markSendingThread(targetId);
-                // Build the request history from the existing
-                // in-memory transcript (excluding the message we
-                // JUST appended — we send that separately as `text`).
-                // Read straight off the store snapshot rather than
-                // via the hook (this is a callback, not a render).
-                const prior = (
-                    getChatState().messages[targetId] ?? []
-                )
-                    .filter((m) => m.seq !== userSeq)
-                    .filter(
-                        (m) => m.kind === "user_msg" || m.kind === "model_turn",
-                    )
-                    .map((m) => ({
-                        role: (m.kind === "user_msg" ? "user" : "assistant") as
-                            | "user"
-                            | "assistant",
-                        content: m.text ?? "",
-                    }));
-                try {
-                    const r = await postIncognitoTurn(
-                        { messages: prior, text },
-                        getToken,
-                        {
-                            onDelta: (delta) => {
-                                // Live-stream into the per-thread
-                                // streaming buffer; the existing
-                                // MessageStream component already
-                                // renders that buffer below the
-                                // committed messages, so incognito
-                                // chats animate in just like
-                                // regular ones.
-                                appendStreamingToken(targetId, delta);
-                            },
-                        },
-                    );
-                    appendMessage(targetId, {
-                        seq: userSeq + 1,
-                        kind: "model_turn",
-                        text: r.text,
-                        actor: "agent",
-                        committed_at: Math.floor(Date.now() / 1000),
-                    });
-                    clearStreamingBuffer(targetId);
-                } catch (e) {
-                    // If the stream errored mid-way, drop any
-                    // partial buffer so we don't leave half a
-                    // reply hanging under the user's message.
-                    clearStreamingBuffer(targetId);
-                    setTopError(
-                        e instanceof Error ? e.message : "incognito send failed",
-                    );
-                } finally {
-                    clearSendingThread(targetId);
-                }
-                return;
-            }
-
             // Lazy-mint a fresh ConversationId on first send when no
-            // thread is active. Welcome → first message lands on a
-            // brand-new thread, server-side ensure_conversation creates
-            // the row, listThreads picks it up.
-            const targetId = activeId ?? mintConversationId();
+            // thread is active. Incognito sends use the same path —
+            // they just carry an `incognito: true` flag that tells
+            // the server to skip every persistent write (and the SPA
+            // marks the id with an `incognito:` prefix so the
+            // sidebar / thread list never picks it up + so navigation
+            // away can wipe local state).
+            const targetId =
+                activeId ??
+                (incognito
+                    ? `incognito:${mintConversationId()}`
+                    : mintConversationId());
             if (!activeId) {
                 setActiveThread(targetId);
-                // Push the new id into the URL so deep-link / browser
-                // back works once the thread exists. `replace: true`
-                // avoids cluttering history with the welcome view we
-                // just left.
-                navigate(`/chat/${encodeURIComponent(targetId)}`, {
-                    replace: true,
-                });
+                if (!incognito) {
+                    // Push the new id into the URL so deep-link /
+                    // browser back works once the thread exists.
+                    // Incognito ids deliberately stay out of the
+                    // URL (sharable URLs imply persistence, which
+                    // is the whole thing incognito refuses).
+                    navigate(`/chat/${encodeURIComponent(targetId)}`, {
+                        replace: true,
+                    });
+                }
             }
 
             // 2026-04-28 — flag the thread as "sending" in the store
@@ -370,9 +297,12 @@ export function Chat() {
             markSendingThread(targetId);
 
             // Optimistic user_msg — the server will return the canonical
-            // seq, which appendMessage de-duplicates on.
+            // seq for regular chats, which appendMessage de-duplicates
+            // on. For incognito the seq stays client-only since there's
+            // no event-log row to derive a canonical one from.
+            const optimisticSeq = Date.now();
             appendMessage(targetId, {
-                seq: Date.now(),
+                seq: optimisticSeq,
                 kind: "user_msg",
                 text,
                 actor: auth.user?.user_id ?? null,
@@ -385,33 +315,83 @@ export function Chat() {
             // momentarily flickering as the model re-titles a
             // long-running chat.
             const isFirstTurn = !activeId;
+            // For incognito sends the server can't replay the event
+            // log — collect the running transcript from the local
+            // store and ship it. Read the snapshot synchronously
+            // (we're inside a callback, not a render).
+            const priorMessages = incognito
+                ? (getChatState().messages[targetId] ?? [])
+                      .filter((m) => m.seq !== optimisticSeq)
+                      .filter(
+                          (m) =>
+                              m.kind === "user_msg" || m.kind === "model_turn",
+                      )
+                      .map((m) => ({
+                          role: (m.kind === "user_msg"
+                              ? "user"
+                              : "assistant") as "user" | "assistant",
+                          content: m.text ?? "",
+                      }))
+                : undefined;
             try {
-                const resp = await postMessage(targetId, { text }, getToken);
-                // Reload the canonical history so seqs are correct.
-                const fresh = await listMessages(targetId, getToken);
-                setMessages(targetId, fresh.messages);
-                clearStreamingBuffer(targetId);
-                // Refresh the thread list (last_seq + new threads land here).
-                listThreads(getToken)
-                    .then((r) => setThreads(r.threads))
-                    .catch(() => {});
-                // 2026-04-28 — async title generation. Fire-and-
-                // forget so the operator doesn't wait on a second
-                // model round-trip; refresh the thread list once
-                // it lands so the new label shows up in the
-                // sidebar without a manual reload.
-                if (isFirstTurn) {
-                    void postGenerateTitle(targetId, getToken)
-                        .then((r) => {
-                            if (!r.skipped) {
-                                return listThreads(getToken).then((tr) => {
-                                    setThreads(tr.threads);
-                                });
-                            }
-                        })
-                        .catch((e) => {
-                            console.warn("title generation failed", e);
-                        });
+                const resp = await postMessage(
+                    targetId,
+                    incognito
+                        ? {
+                              text,
+                              incognito: true,
+                              prior_messages: priorMessages,
+                          }
+                        : { text },
+                    getToken,
+                );
+                if (incognito) {
+                    // Server emitted a `chat_message_outbound` on
+                    // the WS bus with the final assistant text.
+                    // That handler already clears the streaming
+                    // buffer and appends to messages — we just
+                    // append the assistant turn here as a fallback
+                    // in case the WS race lost. The store dedupes
+                    // on seq so a double-add is a no-op.
+                    appendMessage(targetId, {
+                        seq: optimisticSeq + 1,
+                        kind: "model_turn",
+                        text: resp.assistant_text ?? "",
+                        actor: "agent",
+                        committed_at: Math.floor(Date.now() / 1000),
+                    });
+                    clearStreamingBuffer(targetId);
+                } else {
+                    // Reload the canonical history so seqs are correct.
+                    const fresh = await listMessages(targetId, getToken);
+                    setMessages(targetId, fresh.messages);
+                    clearStreamingBuffer(targetId);
+                    // Refresh the thread list (last_seq + new threads land here).
+                    listThreads(getToken)
+                        .then((r) => setThreads(r.threads))
+                        .catch(() => {});
+                    // 2026-04-28 — async title generation. Fire-and-
+                    // forget so the operator doesn't wait on a second
+                    // model round-trip; refresh the thread list once
+                    // it lands so the new label shows up in the
+                    // sidebar without a manual reload. Skipped for
+                    // incognito (nothing to title — the row doesn't
+                    // exist).
+                    if (isFirstTurn) {
+                        void postGenerateTitle(targetId, getToken)
+                            .then((r) => {
+                                if (!r.skipped) {
+                                    return listThreads(getToken).then(
+                                        (tr) => {
+                                            setThreads(tr.threads);
+                                        },
+                                    );
+                                }
+                            })
+                            .catch((e) => {
+                                console.warn("title generation failed", e);
+                            });
+                    }
                 }
                 void resp;
             } catch (e) {

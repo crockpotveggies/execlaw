@@ -687,7 +687,6 @@ pub fn build_router(state: AppState) -> Router {
             "/api/chats/{conversation_id}/generate-title",
             post(crate::chats::generate_title),
         )
-        .route("/api/chats/incognito", post(crate::chats::incognito_turn))
         .route(
             "/api/chats/{conversation_id}",
             axum::routing::patch(crate::chats::patch_thread)
