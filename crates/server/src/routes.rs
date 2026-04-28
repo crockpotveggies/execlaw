@@ -694,6 +694,15 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/chats", get(crate::chats::list_threads))
         .route("/api/stream", get(crate::events::stream_handler))
+        // Phase 16 — runner WebSocket. Each runner container
+        // connects here at startup carrying its one-time bearer
+        // secret in the Authorization header. The handler 401s
+        // before the WS upgrade completes for any bad secret;
+        // see `runner_rpc::register_runner` for the full handshake.
+        .route(
+            "/api/runner/register/{group_id}",
+            get(crate::runner_rpc::register_runner),
+        )
         .merge(crate::plugins::plugins_router())
         .merge(crate::approvals::approvals_router())
         .merge(crate::observability::observability_router())

@@ -1153,6 +1153,43 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
             db.clone(),
         );
 
+    // Phase 16 — per-principal-group runner supervisor. Opt-in via
+    // `EXECLAW_RUNNERS_ENABLED=1` so operators on Docker-less hosts
+    // (or anyone who wants to keep the existing in-process chat
+    // path) can run unaffected. When enabled, we instantiate the
+    // supervisor + a Bollard launcher; the reaper task + controller
+    // prewarm spawn below.
+    let runners_enabled = std::env::var("EXECLAW_RUNNERS_ENABLED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let (runner_supervisor, runner_launcher) = if runners_enabled {
+        let supervisor = execlaw_server::runner_supervisor::RunnerSupervisor::new(
+            db.clone(),
+            events.clone(),
+        );
+        match execlaw_server::runner_spawn::BollardRunnerLauncher::new() {
+            Ok(launcher) => {
+                tracing::info!("runner supervisor enabled");
+                (
+                    Some(supervisor),
+                    Some(std::sync::Arc::new(launcher)
+                        as std::sync::Arc<
+                            dyn execlaw_server::runner_spawn::RunnerLauncher,
+                        >),
+                )
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "EXECLAW_RUNNERS_ENABLED set but Docker is unreachable; supervisor disabled"
+                );
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+
     let state = execlaw_server::AppState {
         db: db.clone(),
         config: config.clone(),
@@ -1169,7 +1206,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         voice_sessions,
         voice_runtime,
         turn_cancel: execlaw_server::turn_cancel::TurnCancellationRegistry::new(),
-        runner_supervisor: None,
+        runner_supervisor: runner_supervisor.clone(),
     };
 
     // Phase-7 background workers — run for the lifetime of the
@@ -1245,6 +1282,136 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         state.voice_runtime.clone(),
         sweep_stop.clone(),
     );
+
+    // Phase 16 — runner-supervisor reaper + controller prewarm.
+    // Both opt-in via `runner_supervisor.is_some()`. Reaper sweeps
+    // every REAP_INTERVAL (60s by default), wipes idle non-
+    // controller runners' workspace volumes, and runs the per-turn
+    // max-duration watchdog. Prewarm fires once on boot to spawn
+    // the controller's runner so the first chat doesn't pay
+    // cold-start latency.
+    if let (Some(sup), Some(launcher)) =
+        (runner_supervisor.as_ref(), runner_launcher.as_ref())
+    {
+        let reaper_sup = sup.clone();
+        let reaper_launcher = launcher.clone();
+        let stop = sweep_stop.clone();
+        tokio::spawn(async move {
+            tracing::info!(
+                interval_secs = execlaw_server::runner_supervisor::REAP_INTERVAL.as_secs(),
+                ttl_secs = execlaw_server::runner_supervisor::IDLE_TTL.as_secs(),
+                max_turn_secs =
+                    execlaw_server::runner_supervisor::MAX_TURN_DURATION.as_secs(),
+                "runner supervisor reaper running",
+            );
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(
+                        execlaw_server::runner_supervisor::REAP_INTERVAL,
+                    ) => {
+                        let _ = reaper_sup
+                            .reap_idle_with_launcher(reaper_launcher.as_ref())
+                            .await;
+                        reaper_sup.watchdog_pass().await;
+                    }
+                    _ = stop.notified() => {
+                        tracing::info!("runner supervisor reaper stopping");
+                        return;
+                    }
+                }
+            }
+        });
+
+        // Boot orphan sweep: remove runner workspace volumes
+        // whose principal group rows are gone (server crash mid-
+        // reap, or operator deleted a group). Best-effort; logs
+        // and continues on failure.
+        let sweep_sup = sup.clone();
+        let sweep_launcher = launcher.clone();
+        tokio::spawn(async move {
+            sweep_sup
+                .boot_orphan_sweep(sweep_launcher.as_ref())
+                .await;
+        });
+
+        // Prewarm the controller's runner. The first time anyone
+        // chats with the controller we DON'T want a 1-3s cold
+        // spawn delay; the supervisor blocks idle-reap on
+        // controller groups by policy so this runner stays hot
+        // until shutdown.
+        let prewarm_sup = sup.clone();
+        let prewarm_launcher = launcher.clone();
+        let prewarm_db = db.clone();
+        let prewarm_inference = state.inference.clone();
+        let prewarm_model = state.config.model_id.clone();
+        tokio::spawn(async move {
+            // Wait briefly so the WS endpoint is up before the
+            // runner phones home. (Axum's `serve` task hasn't
+            // necessarily started by the time we get here.)
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            let inference_url = match prewarm_inference
+                .resolve(&prewarm_db, execlaw_core::backends::BackendPurpose::Standard)
+            {
+                Some(c) => c.base_url.clone(),
+                None => {
+                    tracing::info!(
+                        "prewarm skipped: no inference backend configured (controller runner will spawn lazily on first chat)"
+                    );
+                    return;
+                }
+            };
+
+            let image = std::env::var("EXECLAW_RUNNER_IMAGE")
+                .unwrap_or_else(|_| "execlaw/runner:dev".to_owned());
+            let rpc_url = std::env::var("EXECLAW_RPC_URL").unwrap_or_else(|_| {
+                // Default points at the host's loopback; the
+                // runner container reaches it via host-gateway.
+                "ws://host.docker.internal:3031".to_owned()
+            });
+            let network = std::env::var("EXECLAW_RUNNER_NETWORK").ok();
+
+            let spec = execlaw_server::runner_spawn::RunnerSpec {
+                group_id: String::new(), // filled in by ensure_runner
+                image,
+                spawn_secret_hex: String::new(), // filled in
+                rpc_url,
+                inference_url,
+                memory_bytes: Some(2 * 1024 * 1024 * 1024),
+                network,
+                env: vec![("RUST_LOG".into(), "info,execlaw_runner=debug".into())],
+            };
+
+            // The web SPA's send_message resolves an absent
+            // `sender_principal_id` to the literal string
+            // "controller" (see chats::resolve_sender). The chat
+            // route's resolve_chat_group then hashes
+            // `["controller"]` into the principal-set hash for
+            // group `(web, {controller})`. Mirror that exactly so
+            // the prewarmed group_id matches the one the chat
+            // path will look up on the first send.
+            let _ = prewarm_model; // reserved for spec.env
+            match prewarm_sup
+                .prewarm_controller(
+                    prewarm_launcher.as_ref(),
+                    "controller",
+                    spec,
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+            {
+                Ok(handle) => {
+                    tracing::info!(
+                        group_id = %handle.group_id,
+                        "controller runner prewarmed"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "controller prewarm failed (will spawn lazily on first chat)");
+                }
+            }
+        });
+    }
 
     let app = execlaw_server::routes::build_router(state);
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

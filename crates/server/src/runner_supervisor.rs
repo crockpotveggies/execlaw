@@ -833,7 +833,7 @@ impl RunnerSupervisor {
     /// Runs once on server boot, before the supervisor accepts any
     /// inbound traffic. Idempotent: safe to call multiple times.
     /// Returns the list of `group_id`s whose volumes were wiped.
-    pub async fn boot_orphan_sweep<L: crate::runner_spawn::RunnerLauncher>(
+    pub async fn boot_orphan_sweep<L: crate::runner_spawn::RunnerLauncher + ?Sized>(
         &self,
         launcher: &L,
     ) -> Vec<String> {

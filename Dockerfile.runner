@@ -15,7 +15,8 @@
 # /workspace; the runner can scratch there freely.
 #
 # ---- builder ----
-FROM rust:1.85-bookworm AS builder
+# 1.86+ required because some transitive deps (icu_*) bumped MSRV.
+FROM rust:1.90-bookworm AS builder
 WORKDIR /build
 
 # Cache the dependency graph: copy manifests first, then sources.
