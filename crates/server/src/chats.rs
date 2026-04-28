@@ -947,6 +947,16 @@ pub(crate) async fn run_runner_turn(
         spotlight: spotlight.as_ref().map(|s| s.open.clone()),
     };
 
+    // Step 3.5 — lazy-spawn the runner if it's not registered yet.
+    // Prewarm covers the controller's group on boot, but every
+    // other group spawns on first inbound turn. `ensure_for_group`
+    // returns the existing handle when one's already up so this
+    // costs ~50µs in the hot path.
+    supervisor
+        .ensure_for_group(group_id, std::time::Duration::from_secs(30))
+        .await
+        .map_err(|e| format!("ensure runner: {e}"))?;
+
     // Step 4 — forward + drain.
     let mut rx = supervisor
         .forward_turn(group_id, req)

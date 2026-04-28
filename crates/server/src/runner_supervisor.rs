@@ -235,6 +235,20 @@ pub struct PendingSpawn {
 #[derive(Clone)]
 pub struct RunnerSupervisor {
     inner: Arc<SupervisorInner>,
+    /// Launcher used for lazy spawn from the chat path. `None`
+    /// during tests + when the supervisor was constructed without
+    /// `with_launcher` (in which case `ensure_for_group` returns
+    /// an error and the chat path will surface "runner not
+    /// available"). Keeping this Option here rather than a
+    /// separate `Option<Arc<dyn RunnerLauncher>>` field on
+    /// `AppState` means the chat handler doesn't have to plumb
+    /// the launcher through every call site.
+    launcher: Option<Arc<dyn crate::runner_spawn::RunnerLauncher>>,
+    /// Template the supervisor uses when it has to spawn a fresh
+    /// runner for an existing group (lazy spawn from the chat
+    /// path, or operator restart). `group_id` + `spawn_secret_hex`
+    /// are filled in per-spawn; everything else is reused.
+    spec_template: Option<RunnerSpec>,
 }
 
 struct SupervisorInner {
@@ -263,7 +277,56 @@ impl RunnerSupervisor {
                 events,
                 db,
             }),
+            launcher: None,
+            spec_template: None,
         }
+    }
+
+    /// Attach a launcher + base spec so the chat hot path can
+    /// lazy-spawn runners when a turn lands for a group that
+    /// doesn't have one yet. Builder-style so test harnesses can
+    /// keep using `RunnerSupervisor::new(...)` without rewriting.
+    pub fn with_launcher(
+        mut self,
+        launcher: Arc<dyn crate::runner_spawn::RunnerLauncher>,
+        spec_template: RunnerSpec,
+    ) -> Self {
+        self.launcher = Some(launcher);
+        self.spec_template = Some(spec_template);
+        self
+    }
+
+    /// Lazy-spawn entry point for the chat path. Returns the
+    /// existing handle when one is registered, otherwise spawns a
+    /// fresh container (using the launcher + spec_template
+    /// configured via `with_launcher`) and awaits its WS
+    /// registration. Errors when:
+    ///   * no launcher is configured (test-mode supervisor), OR
+    ///   * the underlying ensure_runner fails (Docker error /
+    ///     timeout).
+    pub async fn ensure_for_group(
+        &self,
+        group_id: &str,
+        timeout: Duration,
+    ) -> Result<RunnerHandle, EnsureError> {
+        if let Some(h) = self.get(group_id) {
+            // Existing runner — just bump activity. Avoids
+            // spawning a duplicate when the chat path races the
+            // prewarm.
+            let mut s = h.state.write().await;
+            s.last_active_at = Utc::now();
+            return Ok(h.clone());
+        }
+        let launcher = self
+            .launcher
+            .as_ref()
+            .ok_or_else(|| EnsureError::Spawn("no launcher configured".into()))?;
+        let template = self
+            .spec_template
+            .clone()
+            .ok_or_else(|| EnsureError::Spawn("no spec template configured".into()))?;
+        self.ensure_runner(launcher.as_ref(), group_id, template, timeout)
+            .await
     }
 
     /// Mint a unique `turn_id`. The seq is per-process — fine

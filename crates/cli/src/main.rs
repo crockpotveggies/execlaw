@@ -1187,18 +1187,46 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
                         image = %runner_image,
                         "runner supervisor enabled"
                     );
+                    // Build the spec template the supervisor will
+                    // use for every lazy spawn (and for the
+                    // controller prewarm). `group_id` +
+                    // `spawn_secret_hex` get filled in per-spawn
+                    // by `ensure_runner`; everything else is
+                    // reused.
+                    let rpc_url_template = std::env::var("EXECLAW_RPC_URL")
+                        .unwrap_or_else(|_| {
+                            "ws://host.docker.internal:3031".to_owned()
+                        });
+                    let runner_network = std::env::var("EXECLAW_RUNNER_NETWORK").ok();
+                    let spec_template = execlaw_server::runner_spawn::RunnerSpec {
+                        group_id: String::new(),
+                        image: runner_image.clone(),
+                        spawn_secret_hex: String::new(),
+                        rpc_url: rpc_url_template,
+                        // Filled per-turn by ensure_runner from
+                        // the resolved inference URL. We seed a
+                        // sensible default here so a runner
+                        // spawned before the chat path's per-turn
+                        // override can still answer health checks.
+                        inference_url: "http://host.docker.internal:8101/v1".into(),
+                        memory_bytes: Some(2 * 1024 * 1024 * 1024),
+                        network: runner_network,
+                        env: vec![(
+                            "RUST_LOG".into(),
+                            "info,execlaw_runner=debug".into(),
+                        )],
+                    };
+                    let launcher_arc = std::sync::Arc::new(launcher)
+                        as std::sync::Arc<
+                            dyn execlaw_server::runner_spawn::RunnerLauncher,
+                        >;
                     let supervisor =
                         execlaw_server::runner_supervisor::RunnerSupervisor::new(
                             db.clone(),
                             events.clone(),
-                        );
-                    (
-                        Some(supervisor),
-                        Some(std::sync::Arc::new(launcher)
-                            as std::sync::Arc<
-                                dyn execlaw_server::runner_spawn::RunnerLauncher,
-                            >),
-                    )
+                        )
+                        .with_launcher(launcher_arc.clone(), spec_template);
+                    (Some(supervisor), Some(launcher_arc))
                 } else {
                     tracing::warn!(
                         image = %runner_image,
