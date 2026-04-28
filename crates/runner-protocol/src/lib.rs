@@ -86,7 +86,7 @@ pub enum ServerToRunner {
     Heartbeat { nonce: u64 },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ShutdownReason {
     /// Idle TTL hit. Workspace will be wiped after the runner exits.

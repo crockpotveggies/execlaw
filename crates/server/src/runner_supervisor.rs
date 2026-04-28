@@ -34,6 +34,7 @@
 //! mpsc pair that stands in for the socket.
 
 use crate::events::{EventBus, UiEvent};
+use crate::runner_spawn::{RunnerLauncher, RunnerSpec};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use execlaw_core::Database;
@@ -101,11 +102,16 @@ pub enum TurnEvent {
         tool_name: String,
         args: serde_json::Value,
     },
-    /// Runner wants an event log row appended. Supervisor proxy
-    /// already handled the HMAC + commit before this fires; the
-    /// chat handler doesn't need to do anything beyond logging.
-    EventCommitted {
+    /// Runner proposed an event log append. The chat handler that
+    /// owns this turn is responsible for HMAC-signing + committing
+    /// (SQLite is single-writer; the supervisor doesn't hold the
+    /// event-log handle). Carries the full payload so the chat
+    /// handler can encode + commit without round-tripping back to
+    /// the runner.
+    EventLogAppend {
         kind: String,
+        payload: serde_json::Value,
+        actor: Option<String>,
     },
     Complete {
         assistant_text: String,
@@ -269,6 +275,270 @@ impl RunnerSupervisor {
     /// encapsulated.
     pub fn events(&self) -> &EventBus {
         &self.inner.events
+    }
+
+    /// Borrow the database. Used by `chats.rs` when it commits a
+    /// runner-proposed `EventLogAppend` frame on behalf of the
+    /// runner — SQLite stays single-writer.
+    pub fn db(&self) -> &Database {
+        &self.inner.db
+    }
+
+    /// Spawn (or return existing) a runner for `group_id`. Awaits
+    /// the WS registration handshake before returning so callers
+    /// can immediately `forward_turn` against the result.
+    ///
+    /// The spawn flow:
+    ///   1. If a runner is already registered → return its handle.
+    ///   2. Otherwise mint a fresh spawn secret, call
+    ///      `launcher.spawn(spec)` to start the container, await
+    ///      the `register_pending_spawn` notify (set by
+    ///      `accept_registration`) up to `timeout`.
+    ///   3. Update the registry entry with the container id +
+    ///      controller-pin flag from `state_principal_groups`.
+    ///   4. Return the handle.
+    pub async fn ensure_runner<L: RunnerLauncher + ?Sized>(
+        &self,
+        launcher: &L,
+        group_id: &str,
+        spec: RunnerSpec,
+        timeout: Duration,
+    ) -> Result<RunnerHandle, EnsureError> {
+        if let Some(h) = self.get(group_id) {
+            // Already up. Refresh last_active_at so we don't reap
+            // it mid-use. (The chat handler also calls touch on
+            // turn end; this is belt-and-suspenders for the case
+            // where the supervisor's reap pass races a new turn.)
+            let mut s = h.state.write().await;
+            s.last_active_at = Utc::now();
+            return Ok(h.clone());
+        }
+
+        let (secret, registered) = self.register_pending_spawn(group_id);
+
+        // Bake the secret into the spec we hand to the launcher.
+        let mut spec = spec;
+        spec.spawn_secret_hex = hex::encode(secret);
+        spec.group_id = group_id.to_owned();
+
+        let id = launcher
+            .spawn(&spec)
+            .await
+            .map_err(|e| EnsureError::Spawn(format!("{e}")))?;
+
+        // Wait for the runner to phone home + complete the WS
+        // registration. `register_pending_spawn`'s Notify is
+        // notified by `accept_registration` on success.
+        match tokio::time::timeout(timeout, registered.notified()).await {
+            Ok(()) => {}
+            Err(_) => {
+                // Timed out. Best-effort cleanup of the half-
+                // started container so we don't leak.
+                let _ = launcher.kill(&id.container_id).await;
+                self.inner.pending_spawns.remove(group_id);
+                return Err(EnsureError::Timeout);
+            }
+        }
+
+        // Stamp the container id + controller-pin flag.
+        let store = PrincipalGroupStore::new(&self.inner.db);
+        let controller_runner = match store.get(group_id) {
+            Ok(Some(g)) => g.includes_controller,
+            _ => false,
+        };
+        if let Some(handle) = self.get(group_id) {
+            let mut s = handle.state.write().await;
+            s.container_id = Some(id.container_id.clone());
+            // Re-affirm controller-pin (acceptance handler may
+            // have used a default).
+            drop(s);
+            // controller_runner is a top-level field, not in
+            // RunnerState. Re-insert with the corrected value.
+            let mut updated = handle.clone();
+            updated.controller_runner = controller_runner;
+            self.inner.runners.insert(group_id.to_owned(), updated);
+            return Ok(self.get(group_id).expect("just inserted"));
+        }
+        Err(EnsureError::Spawn(
+            "runner registered but registry entry vanished".into(),
+        ))
+    }
+
+    /// Full reap path: send Shutdown frame, wait for the WS to
+    /// close (or the grace window), kill the container, drop
+    /// the registry entry, and (when the reason warrants it) wipe
+    /// the workspace volume.
+    ///
+    /// Volume policy:
+    ///   * `IdleReap` / `OperatorWipe` / `GroupDeleted` → wipe
+    ///   * `OperatorRestart` / `ServerShutdown` → preserve
+    ///
+    /// Idempotent — calling `reap_runner` twice on the same group
+    /// is a no-op the second time.
+    pub async fn reap_runner<L: RunnerLauncher + ?Sized>(
+        &self,
+        launcher: &L,
+        group_id: &str,
+        reason: ShutdownReason,
+    ) -> Result<ReapReport, ReapError> {
+        let handle = match self.inner.runners.get(group_id) {
+            Some(h) => h.value().clone(),
+            None => return Ok(ReapReport::default()),
+        };
+        if handle.controller_runner && reason == ShutdownReason::IdleReap {
+            return Err(ReapError::ControllerProtected);
+        }
+
+        // Snapshot container id BEFORE we tell the runner to shut
+        // down, so even if the registry entry gets cleared by
+        // `drop_registration` (WS close handler) we still know
+        // which container to kill.
+        let container_id = {
+            let s = handle.state.read().await;
+            s.container_id.clone()
+        };
+        {
+            let mut s = handle.state.write().await;
+            s.status = RunnerStatus::Stopping;
+        }
+
+        // Polite shutdown frame. Runner exits its main loop and
+        // closes the WS; the `runner_rpc` read loop sees the close
+        // and calls `drop_registration` for us.
+        let _ = send_to_runner(&handle, ServerToRunner::Shutdown { reason }).await;
+
+        // Wait briefly for the WS to actually close (registry
+        // entry to disappear). Cap at 5s — runner has had its
+        // chance.
+        let close_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < close_deadline {
+            if self.get(group_id).is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Force-evict registry entry if the runner didn't close
+        // gracefully.
+        self.drop_registration(group_id).await;
+
+        // Kill the container (idempotent — `kill` on a
+        // non-existent container is a no-op for the bollard
+        // launcher).
+        if let Some(cid) = container_id {
+            if let Err(e) = launcher.kill(&cid).await {
+                warn!(
+                    group_id,
+                    container_id = %cid,
+                    error = %e,
+                    "reap_runner: kill failed (continuing)"
+                );
+            }
+        }
+
+        // Wipe the volume when the reason calls for it.
+        let mut wiped_volume = false;
+        let wipe = matches!(
+            reason,
+            ShutdownReason::IdleReap
+                | ShutdownReason::OperatorWipe
+                | ShutdownReason::GroupDeleted
+        );
+        if wipe {
+            // Sanity: never wipe the controller's workspace via
+            // an idle reap (defence-in-depth — earlier check
+            // should've caught it).
+            if handle.controller_runner && reason == ShutdownReason::IdleReap {
+                warn!(
+                    group_id,
+                    "controller workspace wipe blocked at last gate"
+                );
+            } else {
+                match launcher.wipe_volume(group_id).await {
+                    Ok(_) => {
+                        wiped_volume = true;
+                        info!(group_id, ?reason, "wiped workspace volume");
+                    }
+                    Err(e) => {
+                        warn!(group_id, error = %e, "wipe_volume failed");
+                    }
+                }
+            }
+        }
+        Ok(ReapReport {
+            killed_container: handle.state.read().await.container_id.clone(),
+            wiped_volume,
+        })
+    }
+
+    /// Prewarm the controller's runner on server boot. Resolves
+    /// `(web, {controller})` (creating the principal group row if
+    /// needed), then `ensure_runner` to spawn + register. The
+    /// controller's runner stays hot for the rest of the process
+    /// lifetime by virtue of `controller_runner = true` blocking
+    /// the idle reaper.
+    ///
+    /// Best-effort: returns Err if the prewarm path fails, but the
+    /// caller (CLI's `cmd_serve`) only logs the error and keeps
+    /// going so a busted Docker daemon doesn't break the whole
+    /// server.
+    pub async fn prewarm_controller<L: RunnerLauncher + ?Sized>(
+        &self,
+        launcher: &L,
+        controller_principal_id: &str,
+        spec_template: RunnerSpec,
+        timeout: Duration,
+    ) -> Result<RunnerHandle, EnsureError> {
+        use execlaw_core::ids::PrincipalId;
+        use execlaw_core::principal_groups::{GroupKey, PrincipalGroupStore};
+        let store = PrincipalGroupStore::new(&self.inner.db);
+        let principals = vec![PrincipalId::from(controller_principal_id)];
+        let now = Utc::now().timestamp();
+        let group = store
+            .resolve(
+                &GroupKey {
+                    channel: "web",
+                    native_group_id: None,
+                    principals: &principals,
+                    includes_controller: true,
+                },
+                now,
+            )
+            .map_err(|e| EnsureError::Spawn(format!("resolve group: {e}")))?;
+        info!(
+            group_id = %group.group_id,
+            "prewarming controller runner"
+        );
+        self.ensure_runner(launcher, &group.group_id, spec_template, timeout)
+            .await
+    }
+
+    /// Idle-reap pass that kills containers + wipes volumes for
+    /// every reapable runner. Replaces the WS-only `reap_idle()`
+    /// path used by tests; the production reaper task should use
+    /// this method instead.
+    pub async fn reap_idle_with_launcher<L: RunnerLauncher + ?Sized>(
+        &self,
+        launcher: &L,
+    ) -> Vec<String> {
+        let now = Utc::now();
+        let mut reaped = Vec::new();
+        for handle in self.snapshot() {
+            if handle.is_reapable(now, IDLE_TTL).await {
+                if let Err(e) = self
+                    .reap_runner(launcher, &handle.group_id, ShutdownReason::IdleReap)
+                    .await
+                {
+                    warn!(group_id = %handle.group_id, error = %e, "reap_runner failed");
+                    continue;
+                }
+                reaped.push(handle.group_id.clone());
+            }
+        }
+        if !reaped.is_empty() {
+            info!(reaped_count = reaped.len(), "runner supervisor: idle-reaped runners");
+        }
+        reaped
     }
 
     pub fn mint_turn_id(&self) -> String {
@@ -681,15 +951,19 @@ impl RunnerSupervisor {
                 turn_id,
                 conversation_id: _,
                 kind,
-                payload: _,
-                actor: _,
+                payload,
+                actor,
             } => {
-                // The actual HMAC sign + commit is wired in
-                // chats.rs (it has the EventLog handle). Here we
-                // just notify the in-flight chat handler so it
-                // can perform the commit on its turn.
+                // Forward verbatim to the chat handler — it owns
+                // the EventLog handle + the turn_seq context, so
+                // it does the HMAC sign + commit. SQLite stays
+                // single-writer.
                 if let Some(tx) = handle.turn_streams.get(&turn_id) {
-                    let _ = tx.send(TurnEvent::EventCommitted { kind });
+                    let _ = tx.send(TurnEvent::EventLogAppend {
+                        kind,
+                        payload,
+                        actor,
+                    });
                 }
             }
             RunnerToServer::TurnComplete {
@@ -822,6 +1096,20 @@ pub enum ReapError {
     UnknownGroup,
     #[error("controller groups are protected from idle reap")]
     ControllerProtected,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ReapReport {
+    pub killed_container: Option<String>,
+    pub wiped_volume: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum EnsureError {
+    #[error("spawn failed: {0}")]
+    Spawn(String),
+    #[error("timed out waiting for runner registration")]
+    Timeout,
 }
 
 /// Constant-time byte slice comparison — guards the registration
@@ -1164,6 +1452,186 @@ mod tests {
             after.iter().any(|v| v == &format!("execlaw-runner-{}", known.group_id))
         );
         assert!(!after.iter().any(|v| v == "execlaw-runner-orphan-1"));
+    }
+
+    #[tokio::test]
+    async fn ensure_runner_returns_existing_when_already_registered() {
+        use crate::runner_spawn::{MockRunnerLauncher, RunnerSpec};
+        let s = fresh_supervisor();
+        let launcher = MockRunnerLauncher::new();
+        // Pre-register a runner directly.
+        let (sec, _) = s.register_pending_spawn("g-1");
+        let _h = s.accept_registration("g-1", &sec, false).unwrap();
+        // ensure_runner returns the existing handle without spawning.
+        let h = s
+            .ensure_runner(
+                &launcher,
+                "g-1",
+                RunnerSpec {
+                    group_id: "g-1".into(),
+                    image: "x".into(),
+                    spawn_secret_hex: "".into(),
+                    rpc_url: "ws://x".into(),
+                    inference_url: "http://x".into(),
+                    memory_bytes: None,
+                    network: None,
+                    env: vec![],
+                },
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap();
+        assert_eq!(h.group_id, "g-1");
+        assert_eq!(launcher.spawn_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn ensure_runner_times_out_when_runner_never_registers() {
+        use crate::runner_spawn::{MockRunnerLauncher, RunnerSpec};
+        let s = fresh_supervisor();
+        let launcher = MockRunnerLauncher::new();
+        let res = s
+            .ensure_runner(
+                &launcher,
+                "g-no-runner",
+                RunnerSpec {
+                    group_id: "g-no-runner".into(),
+                    image: "x".into(),
+                    spawn_secret_hex: "".into(),
+                    rpc_url: "ws://x".into(),
+                    inference_url: "http://x".into(),
+                    memory_bytes: None,
+                    network: None,
+                    env: vec![],
+                },
+                Duration::from_millis(50),
+            )
+            .await;
+        assert!(matches!(res, Err(EnsureError::Timeout)));
+        // Mock spawn was called once.
+        assert_eq!(launcher.spawn_count().await, 1);
+        // Container was killed on timeout (cleanup).
+        let killed = launcher.killed().await;
+        assert_eq!(killed.len(), 1);
+        // Pending spawn entry was cleared.
+        assert!(s.inner.pending_spawns.get("g-no-runner").is_none());
+    }
+
+    #[tokio::test]
+    async fn reap_runner_idle_kills_container_and_wipes_volume() {
+        use crate::runner_spawn::{MockRunnerLauncher, RunnerLauncher, RunnerSpec};
+        let s = fresh_supervisor();
+        let launcher = MockRunnerLauncher::new();
+        let id = launcher
+            .spawn(&RunnerSpec {
+                group_id: "g-1".into(),
+                image: "x".into(),
+                spawn_secret_hex: "00".into(),
+                rpc_url: "ws://x".into(),
+                inference_url: "http://x".into(),
+                memory_bytes: None,
+                network: None,
+                env: vec![],
+            })
+            .await
+            .unwrap();
+        // Manually build a registry entry pointing at that container.
+        let (sec, _) = s.register_pending_spawn("g-1");
+        let h = s.accept_registration("g-1", &sec, false).unwrap();
+        h.state.write().await.container_id = Some(id.container_id.clone());
+        // Attach a noop outbound channel so reap can send Shutdown.
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        *h.tx.lock().await = Some(out_tx);
+
+        let report = s
+            .reap_runner(&launcher, "g-1", ShutdownReason::IdleReap)
+            .await
+            .unwrap();
+        assert!(report.wiped_volume, "idle reap must wipe volume");
+        assert_eq!(launcher.killed().await, vec![id.container_id]);
+        assert_eq!(launcher.wiped().await, vec!["execlaw-runner-g-1"]);
+        assert!(s.get("g-1").is_none(), "registry entry dropped");
+    }
+
+    #[tokio::test]
+    async fn reap_runner_operator_restart_preserves_volume() {
+        use crate::runner_spawn::{MockRunnerLauncher, RunnerLauncher, RunnerSpec};
+        let s = fresh_supervisor();
+        let launcher = MockRunnerLauncher::new();
+        let id = launcher
+            .spawn(&RunnerSpec {
+                group_id: "g-1".into(),
+                image: "x".into(),
+                spawn_secret_hex: "00".into(),
+                rpc_url: "ws://x".into(),
+                inference_url: "http://x".into(),
+                memory_bytes: None,
+                network: None,
+                env: vec![],
+            })
+            .await
+            .unwrap();
+        let (sec, _) = s.register_pending_spawn("g-1");
+        let h = s.accept_registration("g-1", &sec, false).unwrap();
+        h.state.write().await.container_id = Some(id.container_id.clone());
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        *h.tx.lock().await = Some(out_tx);
+
+        let report = s
+            .reap_runner(&launcher, "g-1", ShutdownReason::OperatorRestart)
+            .await
+            .unwrap();
+        assert!(!report.wiped_volume, "operator restart preserves volume");
+        // Container WAS killed (it's a restart, not a no-op).
+        assert_eq!(launcher.killed().await, vec![id.container_id]);
+        // Volume wasn't wiped — restart preserves the workspace.
+        assert!(launcher.wiped().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reap_runner_blocks_controller_idle_path() {
+        use crate::runner_spawn::MockRunnerLauncher;
+        let s = fresh_supervisor();
+        let launcher = MockRunnerLauncher::new();
+        let h = RunnerHandle::test_handle("g-controller", true);
+        s.inner.runners.insert("g-controller".into(), h);
+        let res = s
+            .reap_runner(&launcher, "g-controller", ShutdownReason::IdleReap)
+            .await;
+        assert!(matches!(res, Err(ReapError::ControllerProtected)));
+    }
+
+    #[tokio::test]
+    async fn reap_runner_operator_wipe_works_on_controller() {
+        use crate::runner_spawn::{MockRunnerLauncher, RunnerLauncher, RunnerSpec};
+        // Operator-driven wipe is an explicit override — works
+        // even on the controller's runner.
+        let s = fresh_supervisor();
+        let launcher = MockRunnerLauncher::new();
+        let id = launcher
+            .spawn(&RunnerSpec {
+                group_id: "g-controller".into(),
+                image: "x".into(),
+                spawn_secret_hex: "00".into(),
+                rpc_url: "ws://x".into(),
+                inference_url: "http://x".into(),
+                memory_bytes: None,
+                network: None,
+                env: vec![],
+            })
+            .await
+            .unwrap();
+        let (sec, _) = s.register_pending_spawn("g-controller");
+        let h = s.accept_registration("g-controller", &sec, true).unwrap();
+        h.state.write().await.container_id = Some(id.container_id.clone());
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        *h.tx.lock().await = Some(out_tx);
+
+        let report = s
+            .reap_runner(&launcher, "g-controller", ShutdownReason::OperatorWipe)
+            .await
+            .unwrap();
+        assert!(report.wiped_volume);
     }
 
     #[tokio::test]

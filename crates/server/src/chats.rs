@@ -342,8 +342,58 @@ pub async fn send_message(
     let inference_for_turn = state
         .inference
         .resolve(&state.db, BackendPurpose::Standard);
-    let (user_msg_seq, assistant_text, assistant_seq) = match inference_for_turn {
-        Some(inference) if use_tool_path => match run_tool_capable_turn(
+
+    // Phase 16: per-principal-group runner routing. Eligibility:
+    //   * supervisor configured (`RUNNERS_ENABLED=1` on boot), AND
+    //   * inference backend resolved (no stub fallback in this path), AND
+    //   * no plugin tools registered (v1 runner doesn't proxy tools yet),
+    //   * AND not the cold-contact / approval-pending branch
+    //     (those returned early above).
+    // When all true, resolve_chat_group binds the conversation to a
+    // principal_group_id, the supervisor ensures a live runner, and
+    // run_runner_turn drains the resulting TurnEvent stream.
+    let runner_eligible = state.runner_supervisor.is_some()
+        && inference_for_turn.is_some()
+        && !use_tool_path;
+    let runner_routed = if runner_eligible {
+        match resolve_chat_group(&state, &cid, &principal).await {
+            Ok(group_id) => Some(group_id),
+            Err(e) => {
+                tracing::warn!(error = %e, "runner routing skipped: group resolve failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let (user_msg_seq, assistant_text, assistant_seq) = match (
+        inference_for_turn,
+        runner_routed.as_deref(),
+    ) {
+        (Some(_inference), Some(group_id)) => {
+            let supervisor = state
+                .runner_supervisor
+                .as_ref()
+                .expect("runner_eligible implies Some")
+                .clone();
+            match run_runner_turn(
+                &state,
+                &supervisor,
+                group_id,
+                &cid,
+                &req.text,
+                req.sender_principal_id.clone(),
+                spotlight_content,
+                cancel_flag.clone(),
+            )
+            .await
+            {
+                Ok(out) => out,
+                Err(e) => return err_500(&format!("runner turn failed: {e}")),
+            }
+        }
+        (Some(inference), None) if use_tool_path => match run_tool_capable_turn(
             &state,
             inference.clone(),
             &cid,
@@ -357,7 +407,7 @@ pub async fn send_message(
             Ok(out) => out,
             Err(e) => return err_500(&format!("tool-capable turn failed: {e}")),
         },
-        Some(inference) => {
+        (Some(inference), None) => {
             match run_real_turn(
                 &state,
                 inference.clone(),
@@ -373,7 +423,7 @@ pub async fn send_message(
                 Err(e) => return err_500(&format!("turn failed: {e}")),
             }
         }
-        None => match run_stub_turn(&state, &cid, &req.text, req.sender_principal_id.clone()) {
+        (None, _) => match run_stub_turn(&state, &cid, &req.text, req.sender_principal_id.clone()) {
             Ok(out) => out,
             Err(e) => return err_500(&format!("stub turn failed: {e}")),
         },
@@ -716,6 +766,300 @@ async fn run_real_turn(
         .find(|e| e.kind == EventKind::ModelTurn)
         .map(|e| e.seq.0)
         .unwrap_or(latest.0 + 1);
+
+    Ok((user_seq.0, assistant_text, assistant_seq))
+}
+
+/// Resolve the principal_group for a chat send + bind it to the
+/// conversation row. Today only the `web` channel reaches this
+/// helper; transport plugins will pass `(channel, native_group_id,
+/// principals)` directly when they land. The web case maps every
+/// controller-initiated chat to the same `(web, {controller})`
+/// group.
+async fn resolve_chat_group(
+    state: &AppState,
+    cid: &ConversationId,
+    principal: &execlaw_core::principal::Principal,
+) -> Result<String, String> {
+    use execlaw_core::ids::PrincipalId;
+    use execlaw_core::principal_groups::{GroupKey, PrincipalGroupStore};
+    let store = PrincipalGroupStore::new(&state.db);
+    let principals: Vec<PrincipalId> = vec![principal.id.clone()];
+    let includes_controller = matches!(
+        principal.trust_level,
+        execlaw_core::principal::TrustLevel::Controller,
+    );
+    let now = chrono::Utc::now().timestamp();
+    let group = store
+        .resolve(
+            &GroupKey {
+                channel: "web",
+                native_group_id: None,
+                principals: &principals,
+                includes_controller,
+            },
+            now,
+        )
+        .map_err(|e| format!("resolve principal group: {e}"))?;
+    store
+        .bind_conversation(cid.as_str(), &group.group_id)
+        .map_err(|e| format!("bind conversation: {e}"))?;
+    Ok(group.group_id)
+}
+
+/// Run a turn through the per-principal-group runner container
+/// (Phase 16 cutover). Mirrors `run_real_turn` in shape but the
+/// model + streaming live in the runner process; the chat handler:
+///
+///   * Resolves + binds `principal_group_id`.
+///   * Appends `user_msg` to the event log (still single-writer).
+///   * Builds a `TurnRequest` from the replayed history + composed
+///     system prompt + active tool catalog.
+///   * Forwards to the supervisor (`forward_turn`).
+///   * Drains the per-turn `TurnEvent` stream, signing + committing
+///     `EventLogAppend` proposals from the runner, returning the
+///     final `(user_seq, assistant_text, assistant_seq)`.
+///
+/// v1 scope: streaming inference, no tools (runner doesn't yet
+/// proxy `ToolCallRequest`). The chat path that needs tools stays
+/// on `run_tool_capable_turn` until the runner-side tool RPC lands.
+///
+/// Cancellation: same `cancel_flag` plumbing as `run_real_turn`.
+/// The caller flips the flag (operator-driven stop button); we
+/// translate by sending a `CancelTurn` frame to the runner.
+pub(crate) async fn run_runner_turn(
+    state: &AppState,
+    supervisor: &crate::runner_supervisor::RunnerSupervisor,
+    group_id: &str,
+    cid: &ConversationId,
+    user_text: &str,
+    sender_principal_id: Option<String>,
+    spotlight_content: bool,
+    cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(i64, String, i64), String> {
+    use crate::runner_supervisor::TurnEvent;
+    use execlaw_inference_api::ChatMessage;
+    use execlaw_policy::spotlighting::Spotlight;
+
+    let log = event_log(state);
+
+    // Step 1 — append user_msg.
+    let base_seq = log.last_seq(cid).map_err(|e| format!("last_seq: {e}"))?;
+    let user_seq = base_seq.next();
+    let user_event = EventRecord::new(
+        cid.clone(),
+        user_seq,
+        EventKind::UserMsg,
+        &UserMessagePayload {
+            text: user_text.to_owned(),
+            sender_principal_id: sender_principal_id.clone(),
+        },
+        sender_principal_id.clone(),
+    )
+    .map_err(|e| format!("encode user_msg: {e}"))?;
+    log.append(&user_event)
+        .map_err(|e| format!("append user_msg: {e}"))?;
+
+    // Step 2 — hydrate history. Same logic as run_real_turn.
+    let history = log
+        .replay_since(cid, EventSeq(0))
+        .map_err(|e| format!("replay: {e}"))?;
+    let spotlight = if spotlight_content {
+        Some(Spotlight::generate())
+    } else {
+        None
+    };
+    let composed_system = assemble_system_prompt(
+        &state.db,
+        Some(cid.as_str()),
+        &state.config.system_prompt,
+    );
+    let mut hist_messages: Vec<ChatMessage> = Vec::new();
+    for ev in &history {
+        match ev.kind {
+            EventKind::UserMsg => {
+                if let Ok(p) = ev.decode_payload::<UserMessagePayload>() {
+                    let content = match &spotlight {
+                        Some(s) => s.wrap(&p.text),
+                        None => p.text,
+                    };
+                    // Don't include the user_msg we just appended
+                    // — the runner gets it via TurnRequest.user_text.
+                    if ev.seq != user_seq {
+                        hist_messages.push(ChatMessage::user(content));
+                    }
+                }
+            }
+            EventKind::ModelTurn => {
+                if let Ok(p) = ev.decode_payload::<RealModelTurnPayload>() {
+                    hist_messages.push(ChatMessage::assistant(p.text));
+                } else if let Ok(p) = ev.decode_payload::<StubModelTurnPayload>() {
+                    hist_messages.push(ChatMessage::assistant(p.text));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Step 3 — build TurnRequest.
+    let turn_id = supervisor.mint_turn_id();
+    let inference_url = state
+        .inference
+        .resolve(&state.db, BackendPurpose::Standard)
+        .map(|c| c.base_url.clone())
+        .ok_or_else(|| "no inference backend configured".to_owned())?;
+    let reasoning_enabled = execlaw_core::backends::BackendStore::new(&state.db)
+        .get(BackendPurpose::Standard)
+        .ok()
+        .flatten()
+        .map(|r| r.reasoning_enabled)
+        .unwrap_or(false);
+
+    let req = execlaw_runner_protocol::TurnRequest {
+        turn_id: turn_id.clone(),
+        conversation_id: cid.as_str().to_owned(),
+        group_id: group_id.to_owned(),
+        user_text: user_text.to_owned(),
+        sender_principal_id: sender_principal_id
+            .clone()
+            .unwrap_or_else(|| "controller".into()),
+        sender_trust_class: "Controller".into(),
+        system_prompt: composed_system,
+        history: hist_messages,
+        tool_catalog: vec![],
+        inference_url,
+        model: state.config.model_id.clone(),
+        temperature: None,
+        max_tokens: None,
+        reasoning_enabled,
+        capability_token: String::new(),
+        // Send the OPEN delimiter so the runner can reconstruct
+        // the wrap; the runner mirrors policy::Spotlight::wrap on
+        // its side.
+        spotlight: spotlight.as_ref().map(|s| s.open.clone()),
+    };
+
+    // Step 4 — forward + drain.
+    let mut rx = supervisor
+        .forward_turn(group_id, req)
+        .await
+        .map_err(|e| format!("forward_turn: {e}"))?;
+
+    // Cancellation: spawn a tiny task that watches the flag and
+    // pushes CancelTurn when set. The task ends when the turn
+    // completes (we drop our handle, which doesn't actually stop
+    // the spawned task, so we use a JoinHandle abort).
+    let supervisor_clone = supervisor.clone();
+    let group_id_clone = group_id.to_owned();
+    let turn_id_clone = turn_id.clone();
+    let cancel_flag_clone = cancel_flag.clone();
+    let cancel_watcher = tokio::spawn(async move {
+        loop {
+            if cancel_flag_clone.load(std::sync::atomic::Ordering::SeqCst) {
+                supervisor_clone
+                    .cancel_turn(&group_id_clone, &turn_id_clone)
+                    .await;
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    });
+
+    // Drain. Sign + commit each EventLogAppend the runner proposes.
+    let mut pending: Vec<execlaw_core::events::PendingEvent> = Vec::new();
+    let mut assistant_text = String::new();
+    let mut got_complete = false;
+    let mut error_message: Option<String> = None;
+    let mut was_cancelled = false;
+
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            TurnEvent::TokenDelta { .. } => {
+                // Already on the EventBus via supervisor.handle_inbound.
+            }
+            TurnEvent::Phase { .. } => {
+                // Same.
+            }
+            TurnEvent::ToolCallRequest { call_id, .. } => {
+                // v1: no tools wired through the runner. Reply
+                // with an Err so the runner can either continue
+                // or surface to the model.
+                let result = execlaw_runner_protocol::ToolCallResult {
+                    turn_id: turn_id.clone(),
+                    call_id,
+                    outcome: execlaw_runner_protocol::ToolOutcome::Err {
+                        message: "tools not wired through runner in v1".into(),
+                    },
+                };
+                supervisor.submit_tool_result(group_id, result).await;
+            }
+            TurnEvent::EventLogAppend {
+                kind,
+                payload,
+                actor,
+            } => {
+                let kind_enum = EventKind::parse(&kind);
+                // `encode` is generic; `serde_json::Value` is
+                // Serialize so it round-trips through rmp the
+                // same way a typed payload would.
+                let pending_ev = execlaw_core::events::PendingEvent::encode(
+                    kind_enum, &payload, actor,
+                )
+                .map_err(|e| format!("encode runner event: {e}"))?;
+                pending.push(pending_ev);
+            }
+            TurnEvent::Complete {
+                assistant_text: text,
+                finish_reason,
+                ..
+            } => {
+                let _ = finish_reason;
+                assistant_text = text;
+                got_complete = true;
+                break;
+            }
+            TurnEvent::Error {
+                message,
+                cancelled,
+            } => {
+                error_message = Some(message);
+                was_cancelled = cancelled;
+                break;
+            }
+        }
+    }
+    cancel_watcher.abort();
+
+    if !got_complete && error_message.is_some() {
+        // Surface as a turn error. Don't commit any partials.
+        return Err(error_message.unwrap_or_else(|| "runner error".into()));
+    }
+    if was_cancelled {
+        // Synthesise a "stopped" reply so the transcript stays
+        // well-formed.
+        if assistant_text.is_empty() {
+            assistant_text = "(stopped before any output)".into();
+        }
+    }
+
+    // Step 5 — commit accumulated events. The runner currently
+    // sends one model_turn per turn; richer flows (tool_use /
+    // tool_result pairs) land when tool RPC arrives.
+    let latest = log.last_seq(cid).map_err(|e| format!("last_seq: {e}"))?;
+    let written = log
+        .commit_turn(cid, latest, pending)
+        .map_err(|e| format!("commit_turn: {e}"))?;
+    let assistant_seq = written
+        .iter()
+        .find(|e| e.kind == EventKind::ModelTurn)
+        .map(|e| e.seq.0)
+        .unwrap_or(latest.0 + 1);
+
+    // Touch the principal group's last_active_at so the reaper
+    // measures from "this turn ended" not "row inserted."
+    let now = chrono::Utc::now().timestamp();
+    let _ = execlaw_core::principal_groups::PrincipalGroupStore::new(&state.db)
+        .touch_active(group_id, now);
 
     Ok((user_seq.0, assistant_text, assistant_seq))
 }

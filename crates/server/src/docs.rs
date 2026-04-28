@@ -45,7 +45,9 @@ use crate::settings_general::{
 };
 use crate::setup_preflight::{DockerStatus, PreflightResponse};
 use crate::trust_policy::{TrustPolicyView, UpdateTrustPolicyRequest};
-use crate::runners_admin::{RunnerListResponse, RunnerView};
+use crate::runners_admin::{
+    GroupRunnerListResponse, GroupRunnerView, RunnerListResponse, RunnerView,
+};
 use crate::mcp_admin::{
     McpServerListResponse, McpServerView, McpServerWriteRequest,
 };
@@ -144,6 +146,9 @@ impl Modify for SecurityAddon {
         // runners (Phase 8.5 — view-only + restart)
         crate::runners_admin::list_handler,
         crate::runners_admin::restart_handler,
+        crate::runners_admin::list_groups_handler,
+        crate::runners_admin::restart_group_handler,
+        crate::runners_admin::wipe_group_handler,
         // users (multi-controller) + Phase-8.6 password rotation
         crate::users::list_handler,
         crate::users::invite_handler,
@@ -229,6 +234,8 @@ impl Modify for SecurityAddon {
         PresetsResponse,
         RunnerView,
         RunnerListResponse,
+        GroupRunnerView,
+        GroupRunnerListResponse,
         UserView,
         UserListResponse,
         InviteUserRequest,
