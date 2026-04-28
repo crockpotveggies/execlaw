@@ -986,7 +986,29 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     let db = open_db(&db_path, no_encrypt)?;
     execlaw_core::MigrationRunner::new(&db).apply_all()?;
 
-    let signer = std::sync::Arc::new(execlaw_server::auth::JwtSigner::generate("execlaw".into()));
+    // 2026-04-28 — derive the JWT signing key from the vault's
+    // master key. Pre-fix this was `JwtSigner::generate(...)` which
+    // minted a fresh keypair on every boot, silently invalidating
+    // every previously-issued access_token whenever cargo-watch
+    // rebuilt. Now: same master across boots → same JWT signing
+    // key → tokens survive the rebuild. Fall back to the random
+    // generator only when the keyring isn't reachable AT ALL
+    // (rare; we'd already be running with a degraded vault).
+    let signer = match execlaw_vault::load_or_create_master_key() {
+        Ok(master) => std::sync::Arc::new(
+            execlaw_server::auth::JwtSigner::from_master_key(&master, "execlaw".into()),
+        ),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not load vault master key; JWT signing key will be ephemeral. \
+                 Operators will be signed out on every restart."
+            );
+            std::sync::Arc::new(execlaw_server::auth::JwtSigner::generate(
+                "execlaw".into(),
+            ))
+        }
+    };
     // Phase-7 hardening: refresh tokens persist in SQLite so a
     // server restart no longer signs every operator out.
     let refresh_store =

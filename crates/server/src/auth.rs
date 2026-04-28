@@ -143,6 +143,36 @@ impl JwtSigner {
         Self::from_keys(signing_key, verifying_key, issuer)
     }
 
+    /// Derive the Ed25519 signing key deterministically from the
+    /// vault's master key. Same master across restarts → same JWT
+    /// signing key → access_tokens issued before the restart still
+    /// verify after it.
+    ///
+    /// Pre-fix, `cli::cmd_serve` minted the signing key with
+    /// `SigningKey::generate(&mut OsRng)` at every boot, which
+    /// silently invalidated every operator's stored tokens whenever
+    /// cargo-watch rebuilt. The SPA's silent-refresh path papered
+    /// over it most of the time, but races during the rebuild
+    /// window surfaced as "internal server error" on the next API
+    /// call. Persisting the signing key removes the entire failure
+    /// mode.
+    ///
+    /// Derivation: the master key is 32 bytes of high-entropy
+    /// random; we run it through SHA-256 with a domain-separator
+    /// constant so this key never collides with anything else
+    /// derived from the master (e.g. event-log HMAC).
+    pub fn from_master_key(master_key: &[u8; 32], issuer: String) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"execlaw/jwt-signing-key/v1");
+        hasher.update(master_key);
+        let derived = hasher.finalize();
+        let bytes: [u8; 32] = derived.into();
+        let signing_key = SigningKey::from_bytes(&bytes);
+        let verifying_key = signing_key.verifying_key();
+        Self::from_keys(signing_key, verifying_key, issuer)
+    }
+
     pub fn from_keys(signing_key: SigningKey, verifying_key: VerifyingKey, issuer: String) -> Self {
         // Use PEM throughout — jsonwebtoken handles both PKCS#8-encoded
         // private and SubjectPublicKeyInfo public PEM for EdDSA.
@@ -313,6 +343,34 @@ mod tests {
         let mut v = Validation::new(Algorithm::EdDSA);
         v.set_issuer(std::slice::from_ref(&s.issuer));
         let _data = decode::<AccessClaims>(&tok, s.decoding_key(), &v).unwrap();
+    }
+
+    #[test]
+    fn from_master_key_is_deterministic_across_instances() {
+        // The whole point of derive-from-master: a token issued by
+        // one signer instance verifies against a freshly-derived
+        // signer that uses the same master. This is what makes
+        // cargo-watch rebuilds NOT invalidate logged-in sessions.
+        let master = [42u8; 32];
+        let s1 = JwtSigner::from_master_key(&master, "execlaw".into());
+        let s2 = JwtSigner::from_master_key(&master, "execlaw".into());
+        let tok = s1.issue_access_token("p-1", "sess-x", 60).unwrap();
+        let claims = s2.verify_access_token(&tok).unwrap();
+        assert_eq!(claims.sub, "p-1");
+        assert_eq!(claims.sid, "sess-x");
+    }
+
+    #[test]
+    fn from_master_key_distinct_masters_distinct_keys() {
+        // Different master → different signing key → tokens
+        // refuse to cross-verify. Defence-in-depth on the
+        // domain-separator constant: even if two execlaw
+        // instances shared an issuer string, distinct masters
+        // give distinct trust domains.
+        let s1 = JwtSigner::from_master_key(&[1u8; 32], "execlaw".into());
+        let s2 = JwtSigner::from_master_key(&[2u8; 32], "execlaw".into());
+        let tok = s1.issue_access_token("p", "s", 60).unwrap();
+        assert!(s2.verify_access_token(&tok).is_err());
     }
 
     /// `revoke_session` must drop EVERY refresh record bound to the

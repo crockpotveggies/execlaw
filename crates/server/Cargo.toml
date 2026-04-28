@@ -45,6 +45,7 @@ uuid.workspace = true
 async-trait.workspace = true
 dashmap.workspace = true
 rusqlite.workspace = true
+sha2.workspace = true
 
 # Phase 13.C — voice STT/TTS adapters POST audio to the managed
 # faster-whisper / Kokoro containers. Multipart for the WAV upload,
