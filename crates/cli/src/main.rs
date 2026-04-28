@@ -1153,40 +1153,75 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
             db.clone(),
         );
 
-    // Phase 16 — per-principal-group runner supervisor. Opt-in via
-    // `EXECLAW_RUNNERS_ENABLED=1` so operators on Docker-less hosts
-    // (or anyone who wants to keep the existing in-process chat
-    // path) can run unaffected. When enabled, we instantiate the
-    // supervisor + a Bollard launcher; the reaper task + controller
-    // prewarm spawn below.
+    // Phase 16 — per-principal-group runner supervisor. Default
+    // ON. Operators who want the legacy in-process chat path (or
+    // who run on a Docker-less host where supervised spawn would
+    // fail anyway) can opt out with `EXECLAW_RUNNERS_ENABLED=0`.
+    //
+    // We also defensively disable when:
+    //   * Docker is unreachable (operator may not have started
+    //     Docker Desktop yet), OR
+    //   * the runner image isn't built (first-run on a fresh
+    //     checkout — operator runs `docker build -f Dockerfile.runner
+    //     -t execlaw/runner:dev .` once).
+    // Either case logs a warning and falls through to in-process
+    // chat so the operator isn't stranded.
     let runners_enabled = std::env::var("EXECLAW_RUNNERS_ENABLED")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+    let runner_image = std::env::var("EXECLAW_RUNNER_IMAGE")
+        .unwrap_or_else(|_| "execlaw/runner:dev".to_owned());
     let (runner_supervisor, runner_launcher) = if runners_enabled {
-        let supervisor = execlaw_server::runner_supervisor::RunnerSupervisor::new(
-            db.clone(),
-            events.clone(),
-        );
+        // Pull the trait into scope so `launcher.image_present`
+        // resolves; the inherent method we want lives behind the
+        // trait, not on `BollardRunnerLauncher` directly.
+        use execlaw_server::runner_spawn::RunnerLauncher as _;
         match execlaw_server::runner_spawn::BollardRunnerLauncher::new() {
             Ok(launcher) => {
-                tracing::info!("runner supervisor enabled");
-                (
-                    Some(supervisor),
-                    Some(std::sync::Arc::new(launcher)
-                        as std::sync::Arc<
-                            dyn execlaw_server::runner_spawn::RunnerLauncher,
-                        >),
-                )
+                // Image-presence check. If the runner image
+                // doesn't exist, prewarm + every chat-path spawn
+                // will fail. Better to skip the supervisor
+                // entirely than to ship a hot-path failure mode.
+                if launcher.image_present(&runner_image).await {
+                    tracing::info!(
+                        image = %runner_image,
+                        "runner supervisor enabled"
+                    );
+                    let supervisor =
+                        execlaw_server::runner_supervisor::RunnerSupervisor::new(
+                            db.clone(),
+                            events.clone(),
+                        );
+                    (
+                        Some(supervisor),
+                        Some(std::sync::Arc::new(launcher)
+                            as std::sync::Arc<
+                                dyn execlaw_server::runner_spawn::RunnerLauncher,
+                            >),
+                    )
+                } else {
+                    tracing::warn!(
+                        image = %runner_image,
+                        "runner image not found locally; supervisor disabled. \
+                         Build it once with: docker build -f Dockerfile.runner \
+                         -t execlaw/runner:dev . (or override via \
+                         EXECLAW_RUNNER_IMAGE=...)"
+                    );
+                    (None, None)
+                }
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "EXECLAW_RUNNERS_ENABLED set but Docker is unreachable; supervisor disabled"
+                    "Docker unreachable; runner supervisor disabled. \
+                     Falling back to in-process chat path. Set \
+                     EXECLAW_RUNNERS_ENABLED=0 to silence this warning."
                 );
                 (None, None)
             }
         }
     } else {
+        tracing::info!("runner supervisor disabled via EXECLAW_RUNNERS_ENABLED=0");
         (None, None)
     };
 

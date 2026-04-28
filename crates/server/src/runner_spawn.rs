@@ -92,6 +92,16 @@ pub trait RunnerLauncher: Send + Sync {
     /// Returns the volume names currently tracked by the daemon
     /// that match the `execlaw-runner-` prefix.
     async fn list_runner_volumes(&self) -> Result<Vec<String>, LauncherError>;
+    /// True when the daemon already has a local image matching
+    /// `image` (e.g. `execlaw/runner:dev`). Used at boot so the
+    /// supervisor disables itself rather than failing every spawn
+    /// when the operator hasn't built the image yet. Default impl
+    /// returns true for Mock launchers (which always claim the
+    /// image is there); the bollard impl actually checks.
+    async fn image_present(&self, image: &str) -> bool {
+        let _ = image;
+        true
+    }
 }
 
 /// Volume name used by the launcher. Single source of truth.
@@ -265,6 +275,15 @@ impl RunnerLauncher for BollardRunnerLauncher {
             })
             .collect();
         Ok(names)
+    }
+
+    async fn image_present(&self, image: &str) -> bool {
+        // bollard's `inspect_image` returns Err(404) when the
+        // image isn't local. Any other error (daemon down, etc.)
+        // also surfaces as Err — we treat all errors as "not
+        // present" so the supervisor disables itself rather than
+        // crashing the boot path.
+        self.docker.inspect_image(image).await.is_ok()
     }
 }
 
