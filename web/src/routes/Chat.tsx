@@ -206,8 +206,17 @@ export function Chat() {
     }, [auth.status, getToken]);
 
     // Lazy load messages on active-thread change.
+    //
+    // Skip incognito sessions — there's no event-log row for them
+    // server-side, so a GET would just return `[]` and clobber the
+    // optimistic user_msg the SPA has in local state. Worse, the
+    // GET races the in-flight POST on the same path and on Firefox
+    // the concurrent request pair surfaces as a `NetworkError when
+    // attempting to fetch resource` on the POST side. Incognito
+    // transcripts only exist in the chat store, period.
     useEffect(() => {
         if (!activeId) return;
+        if (activeId.startsWith("incognito:")) return;
         let cancelled = false;
         (async () => {
             try {
