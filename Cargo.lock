@@ -1213,6 +1213,7 @@ dependencies = [
  "chrono",
  "criterion",
  "dashmap",
+ "directories",
  "ed25519-dalek",
  "execlaw-container-manager",
  "execlaw-core",
@@ -1224,6 +1225,7 @@ dependencies = [
  "execlaw-runner-local",
  "execlaw-vault",
  "execlaw-voice-pipeline",
+ "fs4",
  "futures",
  "hex",
  "hyper",
@@ -1387,6 +1389,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs4"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8640e34b88f7652208ce9e88b1a37a2ae95227d84abec377ccd3c5cfeb141ed4"
+dependencies = [
+ "rustix 1.1.4",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3067,7 +3079,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

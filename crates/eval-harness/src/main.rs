@@ -162,6 +162,11 @@ async fn run_one(
         stream: false,
         temperature: Some(0.0),
         max_tokens: Some(8),
+        // Eval harness wants deterministic PASS/FAIL output, never
+        // chain-of-thought.
+        chat_template_kwargs: Some(serde_json::json!({
+            "enable_thinking": false,
+        })),
     };
     let resp = client
         .chat_completions(&req)

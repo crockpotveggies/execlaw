@@ -184,6 +184,29 @@ pub trait ServiceController: Send + Sync {
         handle: &ServiceHandle,
         lines: usize,
     ) -> Result<String, ServiceError>;
+
+    /// Look up an existing container by name. Returns
+    /// `Ok(Some(handle))` when a container with that name exists
+    /// AND is currently running, so the supervisor can re-attach
+    /// to it instead of tearing it down + spawning fresh on every
+    /// binary restart.
+    ///
+    /// `host_port` is what the supervisor mints for new spawns;
+    /// the returned handle carries it forward so subsequent
+    /// `endpoint_url` calls produce the expected URL even if the
+    /// adopted container's actual port binding differs (which it
+    /// shouldn't — the same supervisor code minted both — but the
+    /// trait shape is symmetric with `spawn`).
+    ///
+    /// Returns `Ok(None)` for: container missing, container exists
+    /// but not running (we'd rather respawn cleanly), or the
+    /// daemon's response was malformed. Errors only on
+    /// protocol-level failures.
+    async fn try_adopt(
+        &self,
+        name: &str,
+        host_port: u16,
+    ) -> Result<Option<ServiceHandle>, ServiceError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +588,49 @@ impl ServiceController for BollardServiceController {
         }
     }
 
+    async fn try_adopt(
+        &self,
+        name: &str,
+        host_port: u16,
+    ) -> Result<Option<ServiceHandle>, ServiceError> {
+        use bollard::container::InspectContainerOptions;
+        match self
+            .docker
+            .inspect_container(name, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(info) => {
+                let running = info
+                    .state
+                    .as_ref()
+                    .and_then(|s| s.running)
+                    .unwrap_or(false);
+                if !running {
+                    // Container exists but is stopped / dead. Caller
+                    // proceeds to spawn fresh, which force-removes
+                    // the stale carcass anyway.
+                    return Ok(None);
+                }
+                let id = info.id.unwrap_or_else(|| name.to_owned());
+                tracing::info!(
+                    container = %id,
+                    name = %name,
+                    "adopting existing running container (binary restart, not killing it)"
+                );
+                Ok(Some(ServiceHandle {
+                    container_id: id,
+                    name: name.to_owned(),
+                    host_port,
+                }))
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                ..
+            }) => Ok(None),
+            Err(e) => Err(ServiceError::Runtime(format!("inspect (adopt): {e}"))),
+        }
+    }
+
     async fn tail_logs(
         &self,
         handle: &ServiceHandle,
@@ -762,6 +828,19 @@ impl ServiceController for MockServiceController {
             Some(s) => Ok(s.clone()),
             None => Ok(String::new()),
         }
+    }
+
+    async fn try_adopt(
+        &self,
+        name: &str,
+        host_port: u16,
+    ) -> Result<Option<ServiceHandle>, ServiceError> {
+        let state = self.inner.lock().await;
+        Ok(state.running.get(name).map(|h| ServiceHandle {
+            container_id: h.container_id.clone(),
+            name: name.to_owned(),
+            host_port,
+        }))
     }
 }
 

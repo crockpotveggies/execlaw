@@ -139,6 +139,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "hf-cache",
         sql: include_str!("../migrations/0022_hf_cache.sql"),
     },
+    Migration {
+        id: 23,
+        name: "append-v1-to-managed-endpoints",
+        sql: include_str!(
+            "../migrations/0023_append_v1_to_managed_endpoints.sql"
+        ),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -272,7 +279,7 @@ mod tests {
         let applied = runner.apply_all().unwrap();
         assert_eq!(
             applied,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
         );
 
         // Spot-check: every documented table exists.
@@ -335,7 +342,7 @@ mod tests {
         let second = runner.apply_all().unwrap();
         assert_eq!(
             first,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
         );
         assert!(
             second.is_empty(),
@@ -515,6 +522,78 @@ mod tests {
         );
         // VoiceTTS (no image field) → still no image field.
         assert!(lookup["VoiceTTS"].is_none());
+    }
+
+    #[test]
+    fn append_v1_only_touches_bare_loopback_managed_rows() {
+        // Phase 14.D regression — supervisor used to write
+        // `http://127.0.0.1:8101` to managed rows; the inference
+        // client appends `/chat/completions` to that and vLLM 404s
+        // because OpenAI routes are mounted under `/v1/...`.
+        // Migration 0023 retrofits existing rows.
+        //
+        // Verify it:
+        //   * rewrites bare loopback managed rows  → adds `/v1`
+        //   * leaves managed rows that already carry a path
+        //   * leaves external rows untouched (operator-typed URL)
+        //   * leaves null endpoints alone
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        db.with_conn(|c| {
+            for m in MIGRATIONS.iter().take_while(|m| m.id < 23) {
+                c.execute_batch(m.sql).unwrap();
+            }
+            c.execute(
+                "INSERT INTO config_backends \
+                 (purpose, inference_backend, model_spec_json, gpu_id, endpoint, \
+                  notes, reasoning_enabled, mode, created_at, updated_at) VALUES \
+                 ('Standard', 'service-vllm', '{}', '0', 'http://127.0.0.1:8101', \
+                  NULL, 0, 'managed', 100, 100), \
+                 ('Small',    'service-vllm', '{}', '0', 'http://127.0.0.1:8102/v1', \
+                  NULL, 0, 'managed', 100, 100), \
+                 ('VoiceSTT', 'service-whisper-stt', '{}', '0', 'http://192.168.1.50:8000/v1', \
+                  NULL, 0, 'external', 100, 100), \
+                 ('VoiceTTS', 'service-piper-tts', '{}', '0', NULL, \
+                  NULL, 0, 'managed', 100, 100)",
+                [],
+            ).unwrap();
+            // Apply 0023.
+            let m = MIGRATIONS.iter().find(|m| m.id == 23).unwrap();
+            c.execute_batch(m.sql).unwrap();
+            Ok(())
+        }).unwrap();
+
+        let rows = db.with_conn(|c| {
+            let mut s = c
+                .prepare("SELECT purpose, endpoint FROM config_backends ORDER BY purpose")
+                .unwrap();
+            let v = s
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                })
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect::<Vec<_>>();
+            Ok(v)
+        }).unwrap();
+        let lookup: std::collections::HashMap<_, _> = rows.into_iter().collect();
+        // Standard: bare loopback → suffixed.
+        assert_eq!(
+            lookup["Standard"].as_deref(),
+            Some("http://127.0.0.1:8101/v1")
+        );
+        // Small: already had /v1 → untouched.
+        assert_eq!(
+            lookup["Small"].as_deref(),
+            Some("http://127.0.0.1:8102/v1")
+        );
+        // VoiceSTT: external row → untouched even though it
+        // matches the "/v1 already present" predicate.
+        assert_eq!(
+            lookup["VoiceSTT"].as_deref(),
+            Some("http://192.168.1.50:8000/v1")
+        );
+        // VoiceTTS: null endpoint → still null.
+        assert_eq!(lookup["VoiceTTS"], None);
     }
 
     #[test]

@@ -36,8 +36,32 @@ impl Default for ServerConfig {
             jwt_issuer: "execlaw".to_owned(),
             access_token_ttl_secs: 15 * 60, // 15 minutes, §7.1
             refresh_token_ttl_secs: 7 * 24 * 60 * 60, // 7 days, §7.1
-            system_prompt: "You are execlaw, a self-hosted agent.".to_owned(),
+            // 2026-04-28: replaced the one-line stub with a working
+            // baseline lifted from selfhosted-claw's `buildSystemPrompt`
+            // restraint section. Without these guardrails the 27B
+            // local model wandered into infinite "let me think more"
+            // monologues and tool-call ping-pong, especially when no
+            // tools were wired up. Operators override the *voice*
+            // (DisplayName, Tone, etc.) via `config_personality`;
+            // these rules are the static base that owns concision +
+            // loop-prevention and sits AFTER personality in the
+            // assembled prompt so it has the final word on conflict.
+            system_prompt: concat!(
+                "You are execlaw, a self-hosted assistant. Follow these rules every turn:\n\n",
+                "1. Be concise. Default to 1-3 sentence replies. Expand only when the operator asks for detail.\n",
+                "2. Do not narrate your reasoning out loud (\"let me think...\", \"first I'll...\"). Just answer.\n",
+                "3. Do not repeat yourself. If you've made a point once, do not restate it later in the same reply.\n",
+                "4. Use tools only when they materially improve the answer. Prefer answering from your own knowledge.\n",
+                "5. If you've called the same tool twice with similar arguments, stop calling tools and summarise what you've learned.\n",
+                "6. If a tool keeps returning errors, stop calling it and explain the failure to the operator instead of retrying blindly.\n",
+                "7. Never call a tool just to fill space. If there's nothing useful to do, finish the turn.\n",
+                "8. When you're done answering, stop. Do not ask follow-up questions unless they are required to act.",
+            ).to_owned(),
             model_id: "QuantTrio/Qwen3.5-27B-AWQ".to_owned(),
+            // Conservative cap: most well-formed turns need 0-2 tool
+            // rounds. Past 3 the model is almost certainly looping
+            // and the runner returns MaxRounds rather than burning
+            // more inference time.
             max_tool_rounds: 3,
         }
     }
@@ -101,6 +125,11 @@ pub struct AppState {
     /// present (mock factories in tests, real Whisper/Kokoro
     /// resolver in production).
     pub voice_runtime: crate::voice_runtime::VoiceRuntime,
+    /// 2026-04-28 — per-conversation cancellation flags. The streaming
+    /// chat handler registers a flag at turn start and polls it on
+    /// every SSE chunk; `POST /api/chats/:id/stop` flips the flag.
+    /// Always present — registry is a cheap DashMap behind an Arc.
+    pub turn_cancel: crate::turn_cancel::TurnCancellationRegistry,
 }
 
 impl std::fmt::Debug for AppState {

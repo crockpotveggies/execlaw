@@ -16,6 +16,7 @@
     "size": "node scripts/bundle-size.mjs"
   },
   "dependencies": {
+    "@fontsource/fira-sans": "^5.2.7",
     "@gsap/react": "2.1.2",
     "bootstrap": "5.3.3",
     "bootstrap-icons": "1.11.3",

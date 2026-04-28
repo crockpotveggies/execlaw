@@ -7,11 +7,17 @@
 // personal chats; plugin-declared UI panels show under the "More"
 // section.
 
-import { useState, type ReactNode } from "react";
-import { Link, NavLink } from "react-router-dom";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Link, NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import type { UiPanelSummary } from "../api/endpoints";
-import { setActiveThread, useChatState } from "./store";
+import {
+    deleteThread,
+    listThreads,
+    patchThread,
+    type UiPanelSummary,
+} from "../api/endpoints";
+import { setActiveThread, setThreads, useChatState } from "./store";
+import { ThreadRowMenu } from "./ThreadRowMenu";
 
 const CONTROLLER_THREAD_PREFIX = "controller-thread:";
 
@@ -32,8 +38,15 @@ interface SidebarProps {
 
 export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
     const auth = useAuth();
+    const navigate = useNavigate();
     const threads = useChatState((s) => s.threads);
     const activeId = useChatState((s) => s.activeId);
+    // 2026-04-28 — inline-rename state. When the user clicks
+    // "Rename" in a thread's hover menu, we stash that thread's id
+    // here; the row swaps its label for an `<input>` until the user
+    // commits (Enter / blur) or cancels (Esc).
+    const [renamingId, setRenamingId] = useState<string | null>(null);
+    const getToken = () => auth.getAccessToken();
     // Pending-approvals badge — when the cold-contact flow has any
     // open approvals waiting on the controller, surface a count in
     // the sidebar so the operator notices even without an active
@@ -67,19 +80,34 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
     return (
         <aside className="execlaw-sidebar">
             <div className="execlaw-sidebar__head">
-                <h1 className="execlaw-brand h6 mb-2">execlaw</h1>
-                <button
-                    type="button"
-                    className="btn btn-primary btn-sm w-100 d-flex align-items-center justify-content-center gap-2"
-                    onClick={onNewThread}
-                    data-testid="sidebar-new-thread"
-                >
-                    <i className="bi bi-pencil-square" aria-hidden />
-                    New chat
-                </button>
+                <h1 className="execlaw-brand h6 mb-0">execlaw</h1>
             </div>
 
             <nav className="execlaw-sidebar__nav">
+                {/*
+                  "New chat" intentionally renders as a plain text
+                  row (same visual class as Routines / Contacts)
+                  rather than a filled button. Lives inside
+                  `__nav` rather than `__head` so it inherits the
+                  same horizontal padding as the other nav items —
+                  otherwise the icon column is offset and the row
+                  breaks the vertical-list rhythm.
+                */}
+                <button
+                    type="button"
+                    className="execlaw-thread-item"
+                    onClick={onNewThread}
+                    data-testid="sidebar-new-thread"
+                >
+                    <i
+                        className="bi bi-pencil-square execlaw-muted execlaw-thread-item__icon"
+                        aria-hidden
+                    />
+                    <span className="execlaw-thread-item__name">
+                        New chat
+                    </span>
+                </button>
+                <div className="execlaw-sidebar__section">Browse</div>
                 <SidebarNavLink
                     to="/settings/routines"
                     icon="bi-clock-history"
@@ -176,6 +204,7 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
             )}
 
             <div className="execlaw-sidebar__threads" data-testid="sidebar-threads">
+                <div className="execlaw-sidebar__section">Threads</div>
                 {visibleThreads.length === 0 ? (
                     <div className="execlaw-muted small px-2 pt-2">
                         No threads yet. Start a new chat to begin.
@@ -185,42 +214,105 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                         const isControl = t.conversation_id.startsWith(
                             CONTROLLER_THREAD_PREFIX,
                         );
-                        const label =
-                            t.display_name ??
-                            (isControl
-                                ? "Control thread"
-                                : `New chat · ${t.conversation_id.slice(0, 6)}`);
+                        const fallback = isControl
+                            ? "Control thread"
+                            : `New chat · ${t.conversation_id.slice(0, 6)}`;
+                        const label = t.display_name ?? fallback;
+                        const isRenaming = renamingId === t.conversation_id;
                         return (
-                            <button
-                                type="button"
+                            <ThreadRow
                                 key={t.conversation_id}
-                                className={
-                                    "execlaw-thread-item" +
-                                    (t.conversation_id === activeId
-                                        ? " is-active"
-                                        : "")
+                                conversationId={t.conversation_id}
+                                label={label}
+                                fallbackLabel={fallback}
+                                isActive={t.conversation_id === activeId}
+                                isProcessing={t.is_processing}
+                                hasUnread={t.has_unread}
+                                isPinned={t.is_pinned}
+                                isEphemeral={t.is_ephemeral}
+                                isRenaming={isRenaming}
+                                onActivate={() => {
+                                    setActiveThread(t.conversation_id);
+                                    navigate(
+                                        `/chat/${encodeURIComponent(
+                                            t.conversation_id,
+                                        )}`,
+                                    );
+                                }}
+                                onStartRename={() =>
+                                    setRenamingId(t.conversation_id)
                                 }
-                                onClick={() =>
-                                    setActiveThread(t.conversation_id)
-                                }
-                                data-testid="sidebar-thread"
-                                data-thread-id={t.conversation_id}
-                            >
-                                <ThreadStatusIcon
-                                    isProcessing={t.is_processing}
-                                    isUnread={t.has_unread}
-                                    isPinned={t.is_pinned}
-                                />
-                                <span className="execlaw-thread-item__name">
-                                    {label}
-                                </span>
-                                {t.is_ephemeral && (
-                                    <i
-                                        className="bi bi-incognito execlaw-muted"
-                                        aria-label="Incognito thread"
-                                    />
-                                )}
-                            </button>
+                                onCommitRename={async (next) => {
+                                    setRenamingId(null);
+                                    const trimmed = next.trim();
+                                    // No-op if unchanged; PATCH with
+                                    // null when cleared so the row
+                                    // falls back to the auto-label.
+                                    const send: string | null =
+                                        trimmed.length === 0 ? null : trimmed;
+                                    if ((t.display_name ?? null) === send)
+                                        return;
+                                    try {
+                                        await patchThread(
+                                            t.conversation_id,
+                                            { display_name: send },
+                                            getToken,
+                                        );
+                                        const r = await listThreads(getToken);
+                                        setThreads(r.threads);
+                                    } catch (e) {
+                                        console.warn("rename failed", e);
+                                    }
+                                }}
+                                onCancelRename={() => setRenamingId(null)}
+                                onTogglePin={async () => {
+                                    try {
+                                        await patchThread(
+                                            t.conversation_id,
+                                            { is_pinned: !t.is_pinned },
+                                            getToken,
+                                        );
+                                        const r = await listThreads(getToken);
+                                        setThreads(r.threads);
+                                    } catch (e) {
+                                        console.warn("pin toggle failed", e);
+                                    }
+                                }}
+                                onDelete={async () => {
+                                    // Defensive confirm — it's a hard
+                                    // delete with no undo. The server
+                                    // treats the call as idempotent so
+                                    // a Cancel is the only way out
+                                    // here.
+                                    if (
+                                        !window.confirm(
+                                            `Delete "${label}"? This wipes the conversation's history.`,
+                                        )
+                                    ) {
+                                        return;
+                                    }
+                                    try {
+                                        await deleteThread(
+                                            t.conversation_id,
+                                            getToken,
+                                        );
+                                        // Drop active id if we just
+                                        // deleted the active thread —
+                                        // otherwise the chat pane
+                                        // briefly flashes "no
+                                        // messages yet" before the
+                                        // list refresh clears it.
+                                        if (activeId === t.conversation_id) {
+                                            setActiveThread(null);
+                                            navigate("/chat");
+                                        }
+                                        const r = await listThreads(getToken);
+                                        setThreads(r.threads);
+                                    } catch (e) {
+                                        console.warn("delete failed", e);
+                                    }
+                                }}
+                            />
                         );
                     })
                 )}
@@ -290,6 +382,123 @@ function SidebarNavLink({ to, icon, label, testId, badge }: SidebarNavLinkProps)
                 </span>
             )}
         </NavLink>
+    );
+}
+
+interface ThreadRowProps {
+    conversationId: string;
+    label: string;
+    fallbackLabel: string;
+    isActive: boolean;
+    isProcessing: boolean;
+    hasUnread: boolean;
+    isPinned: boolean;
+    isEphemeral: boolean;
+    isRenaming: boolean;
+    onActivate: () => void;
+    onStartRename: () => void;
+    onCommitRename: (next: string) => void;
+    onCancelRename: () => void;
+    onTogglePin: () => void;
+    onDelete: () => void;
+}
+
+function ThreadRow({
+    conversationId,
+    label,
+    isActive,
+    isProcessing,
+    hasUnread,
+    isPinned,
+    isEphemeral,
+    isRenaming,
+    onActivate,
+    onStartRename,
+    onCommitRename,
+    onCancelRename,
+    onTogglePin,
+    onDelete,
+}: ThreadRowProps) {
+    // Wrapping the row in a `<div>` gives us a stable hover target
+    // for the 3-dot button reveal. Keeping the inner click handler
+    // on the body so the whole pill (minus the menu button) still
+    // selects the thread on click — same UX as the previous plain
+    // button.
+    const inputRef = useRef<HTMLInputElement | null>(null);
+    const [draft, setDraft] = useState(label);
+
+    useEffect(() => {
+        if (isRenaming) {
+            setDraft(label);
+            // Defer focus to next tick so React has actually swapped
+            // the label-span out for the input element before we
+            // call .focus()/.select().
+            queueMicrotask(() => {
+                inputRef.current?.focus();
+                inputRef.current?.select();
+            });
+        }
+    }, [isRenaming, label]);
+
+    return (
+        <div
+            className={
+                "execlaw-thread-row execlaw-thread-item" +
+                (isActive ? " is-active" : "")
+            }
+            onClick={onActivate}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    onActivate();
+                }
+            }}
+            data-testid="sidebar-thread"
+            data-thread-id={conversationId}
+        >
+            <ThreadStatusIcon
+                isProcessing={isProcessing}
+                isUnread={hasUnread}
+                isPinned={isPinned}
+            />
+            {isRenaming ? (
+                <input
+                    ref={inputRef}
+                    className="execlaw-thread-rename-input"
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    onClick={(e) => e.stopPropagation()}
+                    onBlur={() => onCommitRename(draft)}
+                    onKeyDown={(e) => {
+                        e.stopPropagation();
+                        if (e.key === "Enter") {
+                            e.preventDefault();
+                            onCommitRename(draft);
+                        } else if (e.key === "Escape") {
+                            e.preventDefault();
+                            onCancelRename();
+                        }
+                    }}
+                    data-testid="sidebar-thread-rename-input"
+                />
+            ) : (
+                <span className="execlaw-thread-item__name">{label}</span>
+            )}
+            {isEphemeral && (
+                <i
+                    className="bi bi-incognito execlaw-muted"
+                    aria-label="Incognito thread"
+                />
+            )}
+            <ThreadRowMenu
+                isPinned={isPinned}
+                onStartRename={onStartRename}
+                onTogglePin={onTogglePin}
+                onDelete={onDelete}
+            />
+        </div>
     );
 }
 

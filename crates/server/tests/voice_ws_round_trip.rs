@@ -68,6 +68,7 @@ fn build_state(transcript: &'static str) -> AppState {
             events.clone(),
         ),
         voice_runtime: VoiceRuntime::new(events, stt, tts),
+        turn_cancel: execlaw_server::turn_cancel::TurnCancellationRegistry::new(),
     }
 }
 

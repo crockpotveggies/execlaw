@@ -16,6 +16,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Button from "react-bootstrap/Button";
+import OverlayTrigger from "react-bootstrap/OverlayTrigger";
+import Tooltip from "react-bootstrap/Tooltip";
 import { codecFromMime, VoiceSession } from "./VoiceSession";
 
 interface Props {
@@ -24,8 +26,13 @@ interface Props {
      * underlying WebSocket queued the bytes; false drops the chunk
      * silently. The voice pipeline's VAD tolerates short audio gaps,
      * so dropping is safer than buffering across reconnects.
+     *
+     * `null` when the WebSocket isn't connected at all (e.g. the
+     * settings shell). The button still renders in that case so
+     * the operator sees the voice affordance, but it's muted with
+     * a "voice unavailable" tooltip.
      */
-    sendBinary: (bytes: ArrayBuffer) => boolean;
+    sendBinary: ((bytes: ArrayBuffer) => boolean) | null;
     /**
      * Phase 13.C — fire a control message upstream. Carries
      * voice_stop on mic-off (server flushes STT + runs the agent
@@ -37,6 +44,16 @@ interface Props {
      * (e.g. composer mid-submit) or when the WebSocket is offline.
      */
     disabled?: boolean;
+    /**
+     * Phase 14.D — voice backend readiness. When `ready: false`
+     * the button renders with a muted-mic icon (line through) +
+     * a tooltip explaining what's missing (STT not configured,
+     * TTS warming up, etc.). Operator clicks become no-ops.
+     *
+     * Optional so callers that already know voice can run can
+     * skip the readiness probe entirely (tests, in-memory mocks).
+     */
+    readiness?: { ready: boolean; tooltip: string; loading: boolean } | null;
     /// How often the recorder slices the audio stream into chunks.
     /// Defaults to 250ms — small enough that endpointer latency
     /// stays under the 300ms budget on the server side.
@@ -64,6 +81,7 @@ export function VoiceCaptureButton({
     sendBinary,
     sendControl,
     disabled,
+    readiness,
     timesliceMs = DEFAULT_TIMESLICE_MS,
 }: Props) {
     const [recording, setRecording] = useState(false);
@@ -206,7 +224,14 @@ export function VoiceCaptureButton({
                 // reconnects produces stale audio.
                 const sess = sessionRef.current;
                 if (!sess) return;
-                sendBinary(sess.framePayload(buf));
+                // sendBinary is null when the WebSocket isn't
+                // connected; the muted-mic gate above prevents
+                // recording from starting in that state, but be
+                // defensive — drop the chunk if we somehow ended
+                // up here without a sender.
+                if (sendBinary !== null) {
+                    sendBinary(sess.framePayload(buf));
+                }
             });
         };
         recorder.onstop = () => {
@@ -240,23 +265,75 @@ export function VoiceCaptureButton({
         }
     }, [recording, startRecording, stopRecording]);
 
+    // Determine the operator-visible state. Three exclusive cases:
+    //   * `recording`  → red mic-fill, click stops.
+    //   * `voiceUnavailable` (no WS) OR `!readiness.ready` (STT/TTS
+    //     missing or warming up) → muted-mic icon (line through),
+    //     click is a no-op, hover surfaces the tooltip explaining
+    //     the setup state.
+    //   * default → empty mic, click starts capture.
+    const voiceUnavailable = sendBinary === null;
+    const readinessKnown = readiness !== undefined && readiness !== null;
+    // When `readiness` is omitted the caller is opting out of the
+    // probe (tests, mocks); treat that as ready=true so the
+    // button behaves as the pre-Phase-14.D version did.
+    const readinessReady = readinessKnown ? readiness!.ready : true;
+    const muted = voiceUnavailable || !readinessReady;
+    const tooltipText = (() => {
+        if (recording) return "Click to stop voice capture";
+        if (voiceUnavailable)
+            return "Voice unavailable — the chat WebSocket isn't connected.";
+        if (readinessKnown && readiness!.loading)
+            return "Checking voice backend status…";
+        if (readinessKnown && !readiness!.ready) return readiness!.tooltip;
+        return "Click to start voice. Speak when the indicator turns red.";
+    })();
+
+    const iconClass = recording
+        ? "bi bi-mic-fill"
+        : muted
+        ? "bi bi-mic-mute"
+        : "bi bi-mic";
+
+    const button = (
+        <Button
+            type="button"
+            variant={
+                recording
+                    ? "danger"
+                    : muted
+                    ? "outline-secondary"
+                    : "outline-secondary"
+            }
+            onClick={muted ? undefined : onClick}
+            disabled={disabled || muted}
+            data-testid="composer-voice"
+            data-mic-state={
+                recording ? "recording" : muted ? "muted" : "ready"
+            }
+            aria-label={
+                recording
+                    ? "Stop voice capture"
+                    : muted
+                    ? `Voice unavailable: ${tooltipText}`
+                    : "Start voice capture"
+            }
+            aria-pressed={recording}
+        >
+            <i className={iconClass} aria-hidden />
+        </Button>
+    );
+
     return (
         <>
-            <Button
-                type="button"
-                variant={recording ? "danger" : "outline-secondary"}
-                onClick={onClick}
-                disabled={disabled}
-                data-testid="composer-voice"
-                aria-label={recording ? "Stop voice capture" : "Start voice capture"}
-                aria-pressed={recording}
-                title={recording ? "Stop voice capture" : "Start voice capture"}
+            <OverlayTrigger
+                placement="top"
+                overlay={
+                    <Tooltip id="composer-voice-tooltip">{tooltipText}</Tooltip>
+                }
             >
-                <i
-                    className={recording ? "bi bi-mic-fill" : "bi bi-mic"}
-                    aria-hidden
-                />
-            </Button>
+                {button}
+            </OverlayTrigger>
             {error && (
                 <div
                     className="execlaw-error-banner mt-2"

@@ -10,7 +10,7 @@
 //   - Composer → POST /api/chats/:id/messages → optimistic local push.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Navigate } from "react-router-dom";
+import { Navigate, useNavigate, useParams } from "react-router-dom";
 import { useScreenTransition } from "../anim/useScreenTransition";
 import { ApiError } from "../api/client";
 import {
@@ -20,7 +20,10 @@ import {
     listThreads,
     listUiPanels,
     patchThread,
+    postGenerateTitle,
+    postIncognitoTurn,
     postMessage,
+    postStopTurn,
     respondApproval,
     type UiPanelSummary,
 } from "../api/endpoints";
@@ -30,14 +33,19 @@ import { ApprovalCard } from "../chat/ApprovalCard";
 import { Composer } from "../chat/Composer";
 import { MessageStream } from "../chat/MessageStream";
 import { Sidebar } from "../chat/Sidebar";
+import { useVoiceReadiness } from "../chat/useVoiceReadiness";
 import { VoicePlayback, type VoiceAudioOutbound } from "../chat/VoicePlayback";
 import { VoiceStatusBar } from "../chat/VoiceStatusBar";
 import { WelcomeView } from "../chat/WelcomeView";
 import {
     appendMessage,
     appendStreamingToken,
+    clearIncognitoMessages,
     clearPendingApproval,
+    clearSendingThread,
     clearStreamingBuffer,
+    getChatState,
+    markSendingThread,
     markUnread,
     setActiveThread,
     setAlertFiringCount,
@@ -60,8 +68,44 @@ function mintConversationId(): string {
 
 export function Chat() {
     const auth = useAuth();
+    const navigate = useNavigate();
+    const { conversationId: routeConversationId } = useParams();
     const activeId = useChatState((s) => s.activeId);
     const [topError, setTopError] = useState<string | null>(null);
+
+    // 2026-04-28 — incognito mode. When true, the next send mints a
+    // client-only conversation (id prefix `incognito:`) that lives
+    // entirely in the browser; no `state_events` / `state_conversations`
+    // rows, no sidebar entry, no URL routing. Navigating away
+    // (route change) wipes the session and returns the toggle to
+    // off, matching the standard "incognito means it's gone when
+    // you close the tab" mental model.
+    const [incognito, setIncognito] = useState(false);
+
+    // 2026-04-28 — URL → store sync. The `/chat/:conversationId`
+    // route should drive the active thread, so a deep-link or
+    // browser-back lands on the right conversation. Mirrors any
+    // route change into the chat store; the inverse direction
+    // (store → URL) lives at the call sites that activate threads
+    // (sidebar click, onNewThread, onSend mint). Incognito
+    // sessions are EXEMPT — their id never lands in the URL, and
+    // a route change (back to /chat or to a real thread) tears the
+    // incognito session down rather than letting it linger as
+    // ghost state.
+    useEffect(() => {
+        const next = routeConversationId ?? null;
+        const isIncognitoActive =
+            typeof activeId === "string" && activeId.startsWith("incognito:");
+        if (isIncognitoActive && next !== activeId) {
+            // Operator navigated away from an in-flight incognito
+            // chat — drop the messages and reset the toggle.
+            clearIncognitoMessages(activeId);
+            setIncognito(false);
+        }
+        if (next !== activeId) {
+            setActiveThread(next);
+        }
+    }, [routeConversationId, activeId]);
     const [uiPanels, setUiPanels] = useState<UiPanelSummary[] | null>(null);
     const wsRef = useRef<WsClient | null>(null);
     /// Phase 13.C — VoicePlayback singleton for the chat shell.
@@ -204,11 +248,84 @@ export function Chat() {
         // back to the welcome view. The actual mint happens lazily on
         // first send so abandoned "new chat" clicks don't litter the
         // server with empty threads.
+        if (
+            typeof activeId === "string" &&
+            activeId.startsWith("incognito:")
+        ) {
+            clearIncognitoMessages(activeId);
+        }
+        setIncognito(false);
         setActiveThread(null);
-    }, []);
+        navigate("/chat");
+    }, [navigate, activeId]);
 
     const onSend = useCallback(
         async (text: string) => {
+            // 2026-04-28 — incognito branch. Skip the URL push, the
+            // event log, and the thread list — the entire
+            // conversation lives in the in-memory `messages` map
+            // until the operator navigates away.
+            if (incognito) {
+                const targetId =
+                    typeof activeId === "string" &&
+                    activeId.startsWith("incognito:")
+                        ? activeId
+                        : `incognito:${mintConversationId()}`;
+                if (targetId !== activeId) {
+                    setActiveThread(targetId);
+                }
+                // Optimistic user message. Use a monotonic seq so the
+                // message order matches insertion even though there's
+                // no server-assigned canonical seq.
+                const userSeq = Date.now();
+                appendMessage(targetId, {
+                    seq: userSeq,
+                    kind: "user_msg",
+                    text,
+                    actor: auth.user?.user_id ?? null,
+                    committed_at: Math.floor(Date.now() / 1000),
+                });
+                markSendingThread(targetId);
+                // Build the request history from the existing
+                // in-memory transcript (excluding the message we
+                // JUST appended — we send that separately as `text`).
+                // Read straight off the store snapshot rather than
+                // via the hook (this is a callback, not a render).
+                const prior = (
+                    getChatState().messages[targetId] ?? []
+                )
+                    .filter((m) => m.seq !== userSeq)
+                    .filter(
+                        (m) => m.kind === "user_msg" || m.kind === "model_turn",
+                    )
+                    .map((m) => ({
+                        role: (m.kind === "user_msg" ? "user" : "assistant") as
+                            | "user"
+                            | "assistant",
+                        content: m.text ?? "",
+                    }));
+                try {
+                    const r = await postIncognitoTurn(
+                        { messages: prior, text },
+                        getToken,
+                    );
+                    appendMessage(targetId, {
+                        seq: userSeq + 1,
+                        kind: "model_turn",
+                        text: r.text,
+                        actor: "agent",
+                        committed_at: Math.floor(Date.now() / 1000),
+                    });
+                } catch (e) {
+                    setTopError(
+                        e instanceof Error ? e.message : "incognito send failed",
+                    );
+                } finally {
+                    clearSendingThread(targetId);
+                }
+                return;
+            }
+
             // Lazy-mint a fresh ConversationId on first send when no
             // thread is active. Welcome → first message lands on a
             // brand-new thread, server-side ensure_conversation creates
@@ -216,7 +333,24 @@ export function Chat() {
             const targetId = activeId ?? mintConversationId();
             if (!activeId) {
                 setActiveThread(targetId);
+                // Push the new id into the URL so deep-link / browser
+                // back works once the thread exists. `replace: true`
+                // avoids cluttering history with the welcome view we
+                // just left.
+                navigate(`/chat/${encodeURIComponent(targetId)}`, {
+                    replace: true,
+                });
             }
+
+            // 2026-04-28 — flag the thread as "sending" in the store
+            // BEFORE the optimistic appendMessage runs. The
+            // appendMessage triggers a parent remount (WelcomeView →
+            // ActiveThreadPane swap on the first message); that new
+            // Composer reads `sendingThreads` from the store on
+            // mount, so the stop button is up immediately rather
+            // than flickering through one frame of "send" before the
+            // store flips. Cleared in the `finally` below.
+            markSendingThread(targetId);
 
             // Optimistic user_msg — the server will return the canonical
             // seq, which appendMessage de-duplicates on.
@@ -227,6 +361,13 @@ export function Chat() {
                 actor: auth.user?.user_id ?? null,
                 committed_at: Math.floor(Date.now() / 1000),
             });
+            // Capture whether THIS turn is the conversation's first
+            // — used to fire title generation after the round-trip
+            // lands. Server is idempotent so a double-fire is fine,
+            // but firing only on first-turn keeps the sidebar from
+            // momentarily flickering as the model re-titles a
+            // long-running chat.
+            const isFirstTurn = !activeId;
             try {
                 const resp = await postMessage(targetId, { text }, getToken);
                 // Reload the canonical history so seqs are correct.
@@ -237,14 +378,34 @@ export function Chat() {
                 listThreads(getToken)
                     .then((r) => setThreads(r.threads))
                     .catch(() => {});
+                // 2026-04-28 — async title generation. Fire-and-
+                // forget so the operator doesn't wait on a second
+                // model round-trip; refresh the thread list once
+                // it lands so the new label shows up in the
+                // sidebar without a manual reload.
+                if (isFirstTurn) {
+                    void postGenerateTitle(targetId, getToken)
+                        .then((r) => {
+                            if (!r.skipped) {
+                                return listThreads(getToken).then((tr) => {
+                                    setThreads(tr.threads);
+                                });
+                            }
+                        })
+                        .catch((e) => {
+                            console.warn("title generation failed", e);
+                        });
+                }
                 void resp;
             } catch (e) {
                 setTopError(
                     e instanceof Error ? e.message : "send failed",
                 );
+            } finally {
+                clearSendingThread(targetId);
             }
         },
-        [activeId, auth.user, getToken],
+        [activeId, auth.user, getToken, navigate, incognito],
     );
 
     const handleWsEvent = useCallback((ev: WsEvent) => {
@@ -302,6 +463,17 @@ export function Chat() {
                         ev.phase === "thinking" ||
                         ev.phase === "awaiting_tool";
                     setThreadProcessing(cid, processing);
+                    // 2026-04-28 — when the server transitions to a
+                    // non-processing phase (Idle, AwaitingTrustDecision,
+                    // etc.), clear our local "sending" flag too. The
+                    // `finally` in onSend already does this when the
+                    // POST resolves, but in races where the WS event
+                    // beats the HTTP response (or the request was
+                    // cancelled out-of-band) this catches the
+                    // remainder so the stop button doesn't get stuck.
+                    if (!processing) {
+                        clearSendingThread(cid);
+                    }
                 }
                 break;
             // ---- Phase 13.C — voice events --------------------------
@@ -382,6 +554,20 @@ export function Chat() {
                 <ChatPane
                     activeId={activeId}
                     onSend={onSend}
+                    incognito={incognito}
+                    onToggleIncognito={() => setIncognito((v) => !v)}
+                    onStop={() => {
+                        // 2026-04-28 — fire-and-forget stop. The
+                        // server is idempotent. WelcomeView's
+                        // composer reaches this with whatever
+                        // active thread is current at click time —
+                        // typically the one onSend just minted.
+                        const id = activeId;
+                        if (!id) return;
+                        void postStopTurn(id, getToken).catch((e) => {
+                            console.warn("stop turn failed", e);
+                        });
+                    }}
                     sendVoiceFrame={(bytes) =>
                         wsRef.current?.sendBinary(bytes) ?? false
                     }
@@ -404,12 +590,18 @@ export function Chat() {
 function ChatPane({
     activeId,
     onSend,
+    onStop,
+    incognito,
+    onToggleIncognito,
     sendVoiceFrame,
     sendVoiceControl,
     voiceTranscript,
 }: {
     activeId: string | null;
     onSend: (text: string) => Promise<void> | void;
+    onStop: () => void;
+    incognito: boolean;
+    onToggleIncognito: () => void;
     sendVoiceFrame: (bytes: ArrayBuffer) => boolean;
     sendVoiceControl: (payload: object) => boolean;
     voiceTranscript: {
@@ -423,6 +615,13 @@ function ChatPane({
     );
     const streaming = useChatState((s) =>
         activeId ? s.streamingBuffer[activeId] ?? null : null,
+    );
+    // 2026-04-28 — same store-backed sending flag the
+    // ActiveThreadPane reads, but evaluated on `activeId` so the
+    // welcome view's composer can also surface a stop button while
+    // the mint-then-send dance runs.
+    const isSendingActive = useChatState(
+        (s) => activeId !== null && !!s.sendingThreads[activeId],
     );
     const hasContent =
         activeId !== null &&
@@ -439,6 +638,10 @@ function ChatPane({
                     onSend={onSend}
                     sendVoiceFrame={sendVoiceFrame}
                     sendVoiceControl={sendVoiceControl}
+                    onStop={onStop}
+                    busy={isSendingActive}
+                    incognito={incognito}
+                    onToggleIncognito={onToggleIncognito}
                 />
             </>
         );
@@ -472,16 +675,30 @@ function ActiveThreadPane({
 }) {
     const auth = useAuth();
     const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    // Poll voice backend readiness so the composer's mic icon
+    // either un-mutes (Voice STT + TTS Healthy) or shows the
+    // muted icon + tooltip explaining what's missing.
+    const voiceReadiness = useVoiceReadiness(getToken);
 
     const thread = useChatState((s) =>
         s.threads.find((t) => t.conversation_id === conversationId),
+    );
+    // 2026-04-28 — outbound `postMessage` in flight for this thread?
+    // Drives the composer's stop-button visibility. Lives in the
+    // store rather than the Composer's local state because the
+    // first-message path remounts Composer mid-await (see chat/store.ts).
+    const isSending = useChatState(
+        (s) => !!s.sendingThreads[conversationId],
     );
     const approval = useChatState(
         (s) => s.pendingApprovals[conversationId] ?? null,
     );
     const isControl = conversationId.startsWith("controller-thread:");
+    const isIncognito = conversationId.startsWith("incognito:");
     const fallbackLabel = isControl
         ? "Control thread"
+        : isIncognito
+        ? "Incognito chat"
         : `New chat · ${conversationId.slice(0, 6)}`;
     const headerLabel = thread?.display_name ?? fallbackLabel;
 
@@ -513,35 +730,11 @@ function ActiveThreadPane({
         }
     }, [conversationId, editValue, getToken, headerLabel]);
 
-    const toggleIncognito = useCallback(async () => {
-        if (!thread) return;
-        try {
-            if (thread.is_ephemeral) {
-                await patchThread(
-                    conversationId,
-                    { is_ephemeral: false },
-                    getToken,
-                );
-            } else {
-                // Default 1-hour expiry — matches MIGRATION_PLAN §2.6.
-                const expiresAt =
-                    Math.floor(Date.now() / 1000) + 60 * 60;
-                await patchThread(
-                    conversationId,
-                    {
-                        is_ephemeral: true,
-                        ephemeral_expires_at: expiresAt,
-                    },
-                    getToken,
-                );
-            }
-            const r = await listThreads(getToken);
-            setThreads(r.threads);
-        } catch {
-            /* swallow */
-        }
-    }, [conversationId, getToken, thread]);
-
+    // 2026-04-28 — per-thread incognito toggle removed. Existing
+    // chats can no longer be flipped to incognito after-the-fact.
+    // Incognito is now a *creation-time* mode on the welcome screen
+    // (see WelcomeView's incognito toggle) — once a chat exists in
+    // the event log, it stays in the event log.
     const onApprovalRespond = useCallback(
         async (
             approvalId: string,
@@ -589,12 +782,16 @@ function ActiveThreadPane({
                 ) : (
                     <h2
                         className="h6 mb-0 execlaw-thread-rename"
-                        onClick={() => !isControl && setEditing(true)}
-                        role={!isControl ? "button" : undefined}
-                        tabIndex={isControl ? -1 : 0}
+                        onClick={() =>
+                            !isControl && !isIncognito && setEditing(true)
+                        }
+                        role={!isControl && !isIncognito ? "button" : undefined}
+                        tabIndex={isControl || isIncognito ? -1 : 0}
                         title={
                             isControl
                                 ? "Control thread title is fixed"
+                                : isIncognito
+                                ? "Incognito chats can't be renamed (nothing's saved)"
                                 : "Click to rename"
                         }
                         data-testid="thread-rename-trigger"
@@ -602,36 +799,19 @@ function ActiveThreadPane({
                         {headerLabel}
                     </h2>
                 )}
-                {thread?.is_ephemeral && (
-                    <span className="badge bg-secondary ms-2">incognito</span>
-                )}
-                {!isControl && (
-                    <button
-                        type="button"
-                        className="btn btn-link btn-sm p-1 ms-auto execlaw-muted"
-                        onClick={() => void toggleIncognito()}
-                        aria-label={
-                            thread?.is_ephemeral
-                                ? "Disable incognito"
-                                : "Make incognito"
-                        }
-                        title={
-                            thread?.is_ephemeral
-                                ? "Disable incognito"
-                                : "Make incognito (purges in ~1h)"
-                        }
-                        data-testid="thread-incognito-toggle"
-                    >
-                        <i
-                            className={
-                                "bi " +
-                                (thread?.is_ephemeral
-                                    ? "bi-incognito"
-                                    : "bi-eye-slash")
-                            }
-                            aria-hidden
-                        />
-                    </button>
+                {/* 2026-04-28 — incognito badge surfaces for
+                    client-only sessions (id prefix `incognito:`)
+                    so the operator never loses track of whether
+                    the active chat will persist. The legacy
+                    per-thread is_ephemeral toggle was removed —
+                    incognito is now strictly a creation-time
+                    choice from the welcome view. */}
+                {(thread?.is_ephemeral ||
+                    conversationId.startsWith("incognito:")) && (
+                    <span className="execlaw-incognito-banner">
+                        <i className="bi bi-incognito" aria-hidden />
+                        Incognito
+                    </span>
                 )}
             </header>
 
@@ -647,6 +827,25 @@ function ActiveThreadPane({
                     onSend={onSend}
                     sendVoiceFrame={sendVoiceFrame}
                     sendVoiceControl={sendVoiceControl}
+                    voiceReadiness={voiceReadiness}
+                    busy={isSending || (thread?.is_processing ?? false)}
+                    onStop={() => {
+                        // 2026-04-28 — POST /api/chats/:id/stop. Fire-and-
+                        // forget: server is idempotent. We DON'T clear
+                        // is_processing locally — wait for the server's
+                        // ConversationPhaseChanged{phase=idle} event to
+                        // do that, otherwise a stale "stopped" state
+                        // could overlap with a turn that finished
+                        // naturally on its own.
+                        void postStopTurn(conversationId, getToken).catch((e) => {
+                            // Swallow errors — the operator already
+                            // sees the typing indicator; if the stop
+                            // fails the turn will eventually finish
+                            // (or hit max_tool_rounds). Logging
+                            // without a banner.
+                            console.warn("stop turn failed", e);
+                        });
+                    }}
                 />
             </div>
         </>

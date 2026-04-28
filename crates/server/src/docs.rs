@@ -108,8 +108,12 @@ impl Modify for SecurityAddon {
         crate::routes::admin_hardware,
         // chats
         crate::chats::send_message,
+        crate::chats::stop_turn,
+        crate::chats::generate_title,
+        crate::chats::incognito_turn,
         crate::chats::list_messages,
         crate::chats::patch_thread,
+        crate::chats::delete_thread,
         crate::chats::list_threads,
         // plugins
         crate::plugins::list_handler,

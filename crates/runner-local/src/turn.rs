@@ -116,6 +116,12 @@ pub struct TurnConfig {
     /// `None` during tests skips publishing — the runner's behaviour
     /// is identical either way.
     pub phase_observer: Option<Arc<dyn PhaseObserver>>,
+    /// 2026-04-28 — forwarded as `chat_template_kwargs.enable_thinking`
+    /// in the OpenAI-compatible POST body. Qwen3.5 reads this knob in
+    /// its chat template; `false` suppresses the model's native
+    /// `<think>` reasoning blocks. Mirror of the operator-editable
+    /// `config_backends.reasoning_enabled` flag (defaults to false).
+    pub reasoning_enabled: bool,
 }
 
 impl std::fmt::Debug for TurnConfig {
@@ -238,6 +244,12 @@ impl TurnExecutor {
                 stream: false,
                 temperature: cfg.temperature,
                 max_tokens: cfg.max_tokens,
+                // 2026-04-28 — forward the operator's reasoning toggle
+                // into Qwen's chat template. Defaults to false on
+                // every TurnConfig — see the field doc.
+                chat_template_kwargs: Some(serde_json::json!({
+                    "enable_thinking": cfg.reasoning_enabled,
+                })),
             };
             let resp = self.inference.chat_completions(&req).await?;
             let choice = match resp.choices.first() {
@@ -521,6 +533,7 @@ mod tests {
             tools: vec![],
             event_log_hmac_key: None,
             phase_observer: None,
+            reasoning_enabled: false,
         };
 
         let summary = exec
@@ -612,6 +625,7 @@ mod tests {
             )],
             event_log_hmac_key: None,
             phase_observer: None,
+            reasoning_enabled: false,
         };
 
         let summary = exec
@@ -759,6 +773,7 @@ mod tests {
             )],
             event_log_hmac_key: None,
             phase_observer: None,
+            reasoning_enabled: false,
         };
         let _ = exec
             .run_turn(&db, &cid, "try it", None, &cfg)
@@ -832,6 +847,7 @@ mod tests {
             )],
             event_log_hmac_key: None,
             phase_observer: None,
+            reasoning_enabled: false,
         };
         let err = exec
             .run_turn(&db, &cid, "go", None, &cfg)

@@ -42,6 +42,16 @@ export interface ChatState {
      *  badge so the operator notices an active alert without having
      *  to open the page. */
     alertFiringCount: number;
+    /**
+     * 2026-04-28 — set of conversation ids whose `postMessage` is
+     * still in flight from THIS tab. Survives component remount
+     * (WelcomeView → ActiveThreadPane swap on first message), unlike
+     * the Composer's local `submitting` state. The Composer's stop
+     * button reads this so the affordance is available the whole
+     * time the operator is waiting on a reply, even before the
+     * server's first WS phase event lands.
+     */
+    sendingThreads: Record<string, true>;
 }
 
 type Listener = () => void;
@@ -54,6 +64,7 @@ let state: ChatState = {
     streamingBuffer: {},
     pendingApprovals: {},
     alertFiringCount: 0,
+    sendingThreads: {},
 };
 
 function emit() {
@@ -134,6 +145,37 @@ export function setMessages(conversationId: string, messages: MessageView[]) {
     }));
 }
 
+/// 2026-04-28 — drop ALL local state for a conversation id. Used
+/// when an incognito session is being torn down so its transcript
+/// doesn't linger in the store after the operator navigates away.
+/// Also clears the streaming buffer + sending flag since none of
+/// those should outlive the conversation either.
+export function clearIncognitoMessages(conversationId: string) {
+    setState((prev) => {
+        const {
+            [conversationId]: _msgs,
+            ...remainingMessages
+        } = prev.messages;
+        const {
+            [conversationId]: _buf,
+            ...remainingBuffer
+        } = prev.streamingBuffer;
+        const {
+            [conversationId]: _sending,
+            ...remainingSending
+        } = prev.sendingThreads;
+        void _msgs;
+        void _buf;
+        void _sending;
+        return {
+            ...prev,
+            messages: remainingMessages,
+            streamingBuffer: remainingBuffer,
+            sendingThreads: remainingSending,
+        };
+    });
+}
+
 export function appendMessage(conversationId: string, message: MessageView) {
     setState((prev) => {
         const existing = prev.messages[conversationId] ?? [];
@@ -171,6 +213,32 @@ export function appendStreamingToken(conversationId: string, token: string) {
  * works cross-tab and for inbound transport messages that this tab
  * never originated. Idempotent.
  */
+/**
+ * 2026-04-28 — mark a thread as having an outbound `postMessage` in
+ * flight. Survives a parent remount (WelcomeView → ActiveThreadPane
+ * swap when the first user message lands). Clear with
+ * `clearSendingThread` when the await resolves OR when the server's
+ * `phase=idle` event arrives, whichever lands first.
+ */
+export function markSendingThread(conversationId: string) {
+    setState((prev) => {
+        if (prev.sendingThreads[conversationId]) return prev;
+        return {
+            ...prev,
+            sendingThreads: { ...prev.sendingThreads, [conversationId]: true },
+        };
+    });
+}
+
+export function clearSendingThread(conversationId: string) {
+    setState((prev) => {
+        if (!(conversationId in prev.sendingThreads)) return prev;
+        const { [conversationId]: _drop, ...rest } = prev.sendingThreads;
+        void _drop;
+        return { ...prev, sendingThreads: rest };
+    });
+}
+
 export function setThreadProcessing(
     conversationId: string,
     processing: boolean,
@@ -257,6 +325,7 @@ export function __resetChatStore() {
         streamingBuffer: {},
         pendingApprovals: {},
         alertFiringCount: 0,
+        sendingThreads: {},
     };
     emit();
 }

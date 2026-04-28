@@ -48,6 +48,12 @@ interface ModelOption {
     /// Approximate minimum VRAM required, in MiB. The form hides
     /// entries that exceed the picked GPU's `memory_mb`.
     min_mb: number;
+    /// Approximate on-disk size of the model weights, in MiB. Used
+    /// for the disk-space preflight check — the wizard refuses to
+    /// download a model that won't fit (free space - 5 GB safety
+    /// margin). Defaults to `min_mb` when omitted, since AWQ /
+    /// INT4 model files are roughly the same size as VRAM usage.
+    disk_mb?: number;
 }
 
 const SERVING_LABEL: Record<ServingMethod, string> = {
@@ -196,6 +202,14 @@ export interface UnifiedBackendFormProps {
     /// the GPU targets are hidden and only Remote is offered (since
     /// managed mode would have nowhere to spawn).
     dockerAvailable: boolean;
+    /// Free bytes on the host's HF cache volume (from the preflight
+    /// response). When supplied + the picked model exceeds
+    /// `disk_free_bytes - 5 GB safety margin`, the form renders a
+    /// warning that running this model may fail. `null` means the
+    /// probe couldn't determine free space; we render a softer
+    /// "couldn't detect" warning instead.
+    diskFreeBytes?: number | null;
+    diskFreePath?: string | null;
     /// Called with the fully-formed UpsertBackendRequest. The parent
     /// owns the actual PUT so the form is reusable across both the
     /// first-run wizard's direct-save path and the Settings page's
@@ -213,10 +227,30 @@ export interface UnifiedBackendFormProps {
     testIdPrefix?: string;
 }
 
+/// Safety margin we leave free above the picked model's on-disk
+/// size. Covers vLLM's image cache writes, log rotations, and
+/// general "you don't want a backend deploy to fill the disk to
+/// 100%" headroom. Mirrors the supervisor's primary cache layout.
+const DISK_SAFETY_MARGIN_MB = 5 * 1024;
+
+/// Format an approximate byte count as "12.4 GB" / "850 MB".
+function fmtMb(mb: number): string {
+    if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
+    return `${Math.round(mb)} MB`;
+}
+
+function fmtBytes(b: number): string {
+    if (b >= 1024 ** 3) return `${(b / 1024 ** 3).toFixed(1)} GB`;
+    if (b >= 1024 ** 2) return `${(b / 1024 ** 2).toFixed(1)} MB`;
+    return `${b} B`;
+}
+
 export function UnifiedBackendForm({
     purpose,
     gpus,
     dockerAvailable,
+    diskFreeBytes,
+    diskFreePath,
     onSubmit,
     onSkip,
     submitLabel = "Save backend",
@@ -465,6 +499,14 @@ export function UnifiedBackendForm({
                                             : ""}
                                         .
                                     </Form.Text>
+                                    <DiskSpaceWarning
+                                        modelOption={availableModels.find(
+                                            (m) => m.id === modelId,
+                                        )}
+                                        diskFreeBytes={diskFreeBytes}
+                                        diskFreePath={diskFreePath}
+                                        testIdPrefix={testIdPrefix}
+                                    />
                                 </>
                             )}
                         </Form.Group>
@@ -631,4 +673,86 @@ export function serverVendorTag(v: DetectedGpu["vendor"]): string | undefined {
         default:
             return undefined;
     }
+}
+
+/// Disk-space preflight warning. Renders one of three states:
+///
+///   * `null`-disk-free: "couldn't detect free space" — softer
+///     yellow warning with a hint that downloads + inference may
+///     not work.
+///   * Insufficient space: hard red warning with a concrete
+///     "you need X.X GB more" message + the detected path so the
+///     operator knows which volume to free up.
+///   * Sufficient: nothing rendered. Operator gets confidence
+///     from the absence of a warning rather than a noisy "ok"
+///     check.
+function DiskSpaceWarning({
+    modelOption,
+    diskFreeBytes,
+    diskFreePath,
+    testIdPrefix,
+}: {
+    modelOption: ModelOption | undefined;
+    diskFreeBytes: number | null | undefined;
+    diskFreePath: string | null | undefined;
+    testIdPrefix: string;
+}) {
+    if (!modelOption) return null;
+    const requiredMb =
+        (modelOption.disk_mb ?? modelOption.min_mb) + DISK_SAFETY_MARGIN_MB;
+    const requiredBytes = requiredMb * 1024 * 1024;
+
+    if (diskFreeBytes === undefined || diskFreeBytes === null) {
+        // Probe failed — render a soft warning rather than block
+        // the operator. The supervisor will surface a real error
+        // at download time if disk truly runs out.
+        return (
+            <div
+                className="execlaw-error-banner mt-2"
+                style={{
+                    backgroundColor: "rgba(210, 153, 34, 0.16)",
+                    color: "#e9b94d",
+                }}
+                role="alert"
+                data-testid={`${testIdPrefix}-disk-warning-unknown`}
+            >
+                <strong>Couldn&rsquo;t detect free disk space.</strong>{" "}
+                Downloading the model{" "}
+                ({fmtMb(modelOption.disk_mb ?? modelOption.min_mb)})
+                and running it may fail if there isn&rsquo;t enough
+                room on the volume hosting the cache. Free up at
+                least{" "}
+                <strong>{fmtMb(requiredMb)}</strong> before continuing.
+            </div>
+        );
+    }
+
+    if (diskFreeBytes < requiredBytes) {
+        const shortfallBytes = requiredBytes - diskFreeBytes;
+        return (
+            <div
+                className="execlaw-error-banner mt-2"
+                role="alert"
+                data-testid={`${testIdPrefix}-disk-warning-insufficient`}
+            >
+                <strong>Not enough disk space.</strong> This model needs{" "}
+                <strong>{fmtMb(modelOption.disk_mb ?? modelOption.min_mb)}</strong>
+                {" "}for weights plus a 5 GB safety margin (
+                <strong>{fmtMb(requiredMb)}</strong> total). Free space
+                detected: <strong>{fmtBytes(diskFreeBytes)}</strong>
+                {diskFreePath ? (
+                    <>
+                        {" "}on{" "}
+                        <code style={{ color: "inherit" }}>
+                            {diskFreePath}
+                        </code>
+                    </>
+                ) : null}
+                . Free up{" "}
+                <strong>{fmtBytes(shortfallBytes)}</strong> or pick a
+                smaller model.
+            </div>
+        );
+    }
+    return null;
 }

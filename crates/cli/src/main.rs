@@ -122,6 +122,21 @@ enum Command {
         #[arg(long, default_value_t = false)]
         no_encrypt: bool,
     },
+    /// Recovery hatch: re-sign every `state_events` row under the
+    /// current HMAC key, OVERWRITING the existing tags. Use when the
+    /// keyring lost the original key and the operator has accepted
+    /// that history is now signed under a new key (tamper-evidence
+    /// for already-stored rows is destroyed).
+    ResignEvents {
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        no_encrypt: bool,
+        /// Required: confirms the operator understands this destroys
+        /// the tamper-evidence guarantee on existing rows.
+        #[arg(long, default_value_t = false)]
+        i_understand_history_will_be_resigned: bool,
+    },
     /// Phase-7 hardening: snapshot the SQLCipher DB to a destination
     /// path using `VACUUM INTO`. The destination is a self-contained
     /// SQLite file with the same encryption posture as the source.
@@ -762,6 +777,37 @@ fn cmd_backfill_events(db_path: PathBuf, no_encrypt: bool) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Recovery: re-sign every state_events row under the current HMAC
+/// key, overwriting the existing tag. Use only when the original
+/// signing key was lost (e.g. OS keyring lost the entry) and the
+/// operator accepts that the existing log is now signed under a new
+/// key — the tamper-evidence guarantee for already-stored rows is
+/// gone.
+fn cmd_resign_events(
+    db_path: PathBuf,
+    no_encrypt: bool,
+    confirmed: bool,
+) -> anyhow::Result<()> {
+    use execlaw_core::events::{EventLog, KeyRing};
+
+    if !confirmed {
+        anyhow::bail!(
+            "resign-events destroys the tamper-evidence guarantee for existing rows. \
+             Re-run with --i-understand-history-will-be-resigned to proceed."
+        );
+    }
+
+    let db = open_db(&db_path, no_encrypt)?;
+    let key = execlaw_vault::load_or_create_master_key()
+        .map_err(|e| anyhow::anyhow!("master key: {e}"))?;
+    let log = EventLog::new(&db).with_key_ring(KeyRing::single(0, key.to_vec()));
+    let report = log
+        .resign_all_with_current_key()
+        .map_err(|e| anyhow::anyhow!("resign: {e}"))?;
+    println!("resign: signed={} (overwrote existing tags)", report.signed);
+    Ok(())
+}
+
 fn cmd_backup(to: PathBuf, db_path: PathBuf, no_encrypt: bool) -> anyhow::Result<()> {
     if !db_path.exists() {
         anyhow::bail!("source db not found: {}", db_path.display());
@@ -1122,6 +1168,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         backend_supervisor,
         voice_sessions,
         voice_runtime,
+        turn_cancel: execlaw_server::turn_cancel::TurnCancellationRegistry::new(),
     };
 
     // Phase-7 background workers — run for the lifetime of the
@@ -1320,6 +1367,15 @@ fn main() -> ExitCode {
         Command::BackfillEvents { db, no_encrypt } => {
             cmd_backfill_events(db.unwrap_or_else(default_db_path), no_encrypt)
         }
+        Command::ResignEvents {
+            db,
+            no_encrypt,
+            i_understand_history_will_be_resigned,
+        } => cmd_resign_events(
+            db.unwrap_or_else(default_db_path),
+            no_encrypt,
+            i_understand_history_will_be_resigned,
+        ),
         Command::Backup { to, db, no_encrypt } => {
             cmd_backup(to, db.unwrap_or_else(default_db_path), no_encrypt)
         }

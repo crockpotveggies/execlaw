@@ -56,29 +56,104 @@ pub fn load_or_create_master_key() -> Result<[u8; 32], KeyringLoadError> {
 pub fn load_or_create_master_key_with_fallback(
     fallback_path: &Path,
 ) -> Result<[u8; 32], KeyringLoadError> {
-    // Try keyring first.
-    match try_load_from_keyring() {
-        Ok(Some(key)) => return Ok(key),
-        Ok(None) => { /* keyring reachable but no entry — try fallback file before generating */ }
-        Err(KeyringLoadError::Keyring(_)) => {
-            // Keyring unreachable (no Secret Service, headless box).
-            tracing::debug!("keyring unreachable; using passphrase-file fallback");
+    // 2026-04-28: Drift-resistance refactor.
+    //
+    // The previous policy persisted the minted key to *whichever* sink
+    // worked first (keyring preferred, file as fall-back). On Windows
+    // we hit a failure mode where:
+    //
+    //   1. First boot mints key X, keyring write succeeds, file is
+    //      never written.
+    //   2. Subsequent boots load X from keyring → events get signed
+    //      under X.
+    //   3. Some later boot, the keyring `get_password` call returns
+    //      `NoEntry` (Windows Credential Manager intermittently loses
+    //      generic credentials when the user profile is touched, when
+    //      cargo-watch spawns the process under a slightly different
+    //      session token, or when the OS has been re-imaged). The
+    //      file fallback is empty, so we mint a fresh key Y. Now
+    //      every prior event log row fails HMAC verification with
+    //      "tamper detected" — perfectly preserved chats become
+    //      unreadable through the SPA.
+    //
+    // The new policy treats the file as the durable source of truth
+    // and the keyring as an opportunistic cache. We always write to
+    // the file when we mint or read a key, and we mirror to the
+    // keyring when the file was the survivor. The keyring is still
+    // tried first (so a host-policy rotation via OS tooling still
+    // wins on first read), but we self-heal both directions.
+    let from_keyring = match try_load_from_keyring() {
+        Ok(Some(key)) => Some(key),
+        Ok(None) => None,
+        Err(KeyringLoadError::Keyring(e)) => {
+            tracing::debug!(error = %e, "keyring unreachable; falling back to file");
+            None
         }
         Err(other) => return Err(other),
-    }
+    };
+    let from_file = if fallback_path.exists() {
+        match load_from_file(fallback_path) {
+            Ok(k) => Some(k),
+            Err(e) => {
+                tracing::warn!(
+                    path = %fallback_path.display(),
+                    error = %e,
+                    "fallback key file unreadable; ignoring",
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    // Try the passphrase file.
-    if fallback_path.exists() {
-        return load_from_file(fallback_path);
+    match (from_keyring, from_file) {
+        (Some(k_ring), Some(k_file)) if k_ring == k_file => Ok(k_ring),
+        (Some(k_ring), Some(k_file)) => {
+            // Both sinks have a key but they disagree. The file wins:
+            // it has been the durable sink since this fix landed, so
+            // a divergence here means the keyring entry is stale
+            // (likely from before the fix or from an OS-level
+            // re-imaging). Re-mirror the file's key into the keyring
+            // so the next boot is unambiguous.
+            tracing::warn!(
+                "keyring + master.key disagree; preferring file and refreshing keyring",
+            );
+            let _ = try_persist_to_keyring(&k_file);
+            // Suppress the unused-binding lint.
+            let _ = k_ring;
+            Ok(k_file)
+        }
+        (Some(k_ring), None) => {
+            // Keyring has it, file doesn't. Cache to file so future
+            // boots survive a keyring loss.
+            if let Err(e) = persist_to_file(fallback_path, &k_ring) {
+                tracing::warn!(
+                    path = %fallback_path.display(),
+                    error = %e,
+                    "could not mirror keyring key to file; key drift remains possible",
+                );
+            }
+            Ok(k_ring)
+        }
+        (None, Some(k_file)) => {
+            // File has it, keyring lost it (or was never written).
+            // Re-populate the keyring opportunistically — it's a
+            // cache, so a failure here is non-fatal.
+            let _ = try_persist_to_keyring(&k_file);
+            Ok(k_file)
+        }
+        (None, None) => {
+            // First-run path: mint a fresh key and persist to BOTH
+            // sinks. The file is the durable one — its write must
+            // succeed or we propagate the error. The keyring write is
+            // best-effort.
+            let key = mint_fresh_key();
+            persist_to_file(fallback_path, &key)?;
+            let _ = try_persist_to_keyring(&key);
+            Ok(key)
+        }
     }
-
-    // Neither source — mint a fresh key and persist to whichever
-    // sink works.
-    let key = mint_fresh_key();
-    if try_persist_to_keyring(&key).is_err() {
-        persist_to_file(fallback_path, &key)?;
-    }
-    Ok(key)
 }
 
 fn try_load_from_keyring() -> Result<Option<[u8; 32]>, KeyringLoadError> {
@@ -213,6 +288,48 @@ mod tests {
         std::fs::write(&path, "this is not hex at all").unwrap();
         let err = load_from_file(&path).unwrap_err();
         assert!(matches!(err, KeyringLoadError::Hex(_)));
+    }
+
+    /// 2026-04-28 drift-resistance: the first-run path MUST always
+    /// write the file, even when the keyring also accepts the key.
+    /// Pre-fix, the file was only written when the keyring failed,
+    /// which left the file empty as the only durable sink — so a
+    /// later keyring loss meant a fresh key got minted and existing
+    /// HMAC tags failed verify.
+    #[test]
+    fn first_run_writes_the_file_unconditionally() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("master.key");
+        // Sanity: file does not exist before the call.
+        assert!(!path.exists());
+        let key = load_or_create_master_key_with_fallback(&path)
+            .expect("first-run should succeed");
+        assert!(
+            path.exists(),
+            "drift-resistance: master.key must be written even when keyring accepts the key",
+        );
+        let from_file = load_from_file(&path).unwrap();
+        assert_eq!(
+            from_file, key,
+            "the file's contents must match the key we returned",
+        );
+    }
+
+    /// 2026-04-28 drift-resistance: a second call with the same path
+    /// must return the same key. This is the invariant that the
+    /// pre-fix code violated when the keyring intermittently lost
+    /// entries — the file fallback now anchors the value across
+    /// boots.
+    #[test]
+    fn two_calls_with_same_fallback_path_return_same_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("master.key");
+        let k1 = load_or_create_master_key_with_fallback(&path).unwrap();
+        let k2 = load_or_create_master_key_with_fallback(&path).unwrap();
+        assert_eq!(
+            k1, k2,
+            "load_or_create must be idempotent across calls when the file is the durable sink",
+        );
     }
 
     /// Default path resolves under `$HOME/.execlaw/master.key`.

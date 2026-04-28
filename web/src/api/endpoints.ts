@@ -208,6 +208,27 @@ export async function postMessage(
     );
 }
 
+// ---- /api/chats/:id/stop -------------------------------------------
+
+/// Halt the in-flight turn for a conversation (chat stop button).
+/// Idempotent on the server — `cancelled` is `false` when no turn was
+/// in flight, but the SPA can fire-and-forget either way.
+export interface StopTurnResponse {
+    conversation_id: string;
+    cancelled: boolean;
+}
+
+export async function postStopTurn(
+    conversationId: string,
+    tokenAccessor: () => string | null,
+): Promise<StopTurnResponse> {
+    return apiFetch<StopTurnResponse>(
+        `/api/chats/${encodeURIComponent(conversationId)}/stop`,
+        { method: "POST" },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/me -------------------------------------------------
 
 export interface MeResponse {
@@ -269,6 +290,72 @@ export async function patchThread(
     return apiFetch<PatchThreadResponse>(
         `/api/chats/${encodeURIComponent(conversationId)}`,
         { method: "PATCH", body: req },
+        tokenAccessor,
+    );
+}
+
+/// 2026-04-28 — incognito chat. Server runs one inference turn
+/// without persisting anything. Client owns the entire transcript
+/// in memory; navigation away forgets it.
+export interface IncognitoMessage {
+    role: "user" | "assistant";
+    content: string;
+}
+
+export interface IncognitoRequest {
+    messages: IncognitoMessage[];
+    text: string;
+}
+
+export interface IncognitoResponse {
+    text: string;
+    model: string;
+    finish_reason: string | null;
+}
+
+export async function postIncognitoTurn(
+    body: IncognitoRequest,
+    tokenAccessor: () => string | null,
+): Promise<IncognitoResponse> {
+    return apiFetch<IncognitoResponse>(
+        "/api/chats/incognito",
+        { method: "POST", body },
+        tokenAccessor,
+    );
+}
+
+/// 2026-04-28 — synthesise a 3-5 word title for a conversation from
+/// the first turn. Skipped silently on the server when the row is
+/// already named or no inference backend is configured. Caller
+/// should re-fetch `listThreads` after a successful (non-skipped)
+/// response to surface the new label in the sidebar.
+export interface GenerateTitleResponse {
+    conversation_id: string;
+    title: string | null;
+    skipped: boolean;
+}
+
+export async function postGenerateTitle(
+    conversationId: string,
+    tokenAccessor: () => string | null,
+): Promise<GenerateTitleResponse> {
+    return apiFetch<GenerateTitleResponse>(
+        `/api/chats/${encodeURIComponent(conversationId)}/generate-title`,
+        { method: "POST" },
+        tokenAccessor,
+    );
+}
+
+/// 2026-04-28 — hard-delete a thread. Server idempotent (200 even if
+/// the row never existed). Caller is responsible for clearing local
+/// state (active id, message list).
+export async function deleteThread(
+    conversationId: string,
+    tokenAccessor: () => string | null,
+): Promise<{ conversation_id: string; existed: boolean }> {
+    return apiFetch<{ conversation_id: string; existed: boolean }>(
+        `/api/chats/${encodeURIComponent(conversationId)}`,
+        { method: "DELETE" },
         tokenAccessor,
     );
 }
@@ -1791,6 +1878,14 @@ export interface DetectedGpu {
 export interface PreflightResponse {
     docker: DockerStatus;
     gpus: DetectedGpu[];
+    /// Free space on the volume that hosts execlaw's HF model
+    /// cache. `null` when the platform's free-space probe failed
+    /// (rare). The setup wizard renders a "couldn't detect free
+    /// space" warning in that case.
+    disk_free_bytes?: number | null;
+    /// Path the free-space probe was run against. Surfaced in the
+    /// warning copy so the operator knows which volume to free up.
+    disk_free_path?: string | null;
 }
 
 export async function getSetupPreflight(

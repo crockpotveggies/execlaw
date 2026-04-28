@@ -687,6 +687,8 @@ function BackendStep({
 }) {
     const gpus = preflight?.gpus ?? [];
     const dockerAvailable = preflight?.docker.available ?? false;
+    const diskFreeBytes = preflight?.disk_free_bytes ?? null;
+    const diskFreePath = preflight?.disk_free_path ?? null;
 
     // First-run wizard always configures the Standard slot. Settings →
     // Backends uses the same component for all four purposes via a
@@ -713,6 +715,8 @@ function BackendStep({
                 purpose="Standard"
                 gpus={gpus}
                 dockerAvailable={dockerAvailable}
+                diskFreeBytes={diskFreeBytes}
+                diskFreePath={diskFreePath}
                 onSubmit={handleSubmit}
                 onSkip={onSkip}
                 testIdPrefix="setup-backend"

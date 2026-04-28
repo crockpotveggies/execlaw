@@ -56,6 +56,14 @@ utoipa.workspace = true
 utoipa-axum.workspace = true
 utoipa-swagger-ui.workspace = true
 
+# Phase 14.D — disk-free probe.
+# `directories` resolves the default ~/.execlaw cache path; `fs4`
+# wraps the platform-native free-space syscalls (statvfs / GetDiskFreeSpaceExW)
+# behind a safe `available_space(path)` API — needed because the
+# server crate forbids unsafe.
+directories = { workspace = true }
+fs4 = "0.13"
+
 # Phase 7e: WebAuthn second-factor for the controller login. Optional
 # feature because the underlying `webauthn-rs` pulls in `openssl-sys`,
 # which doesn't build out of the box on Windows-host dev (needs

@@ -334,6 +334,37 @@ impl<'db> ConversationStore<'db> {
         })
     }
 
+    /// 2026-04-28 — hard-delete a conversation and every row that
+    /// references it (state_events, state_outbox, state_snapshots).
+    /// Used by the SPA's sidebar 3-dot menu → Delete affordance.
+    ///
+    /// **Destructive**: drops the entire event log for the
+    /// conversation. The HMAC tags on those rows go with them, so
+    /// there's no audit trail left after this point. Suitable for
+    /// the dev-thread-cleanup ergonomics the operator asks for; if
+    /// stronger retention is needed later we can add a soft-delete
+    /// flag column instead of removing rows.
+    pub fn delete(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Result<(), DbError> {
+        self.db.with_conn(|c| {
+            // Delete dependents first to avoid FK fallout if we
+            // ever turn FKs back on. The order is conservative —
+            // events reference the conversation row, so events
+            // first.
+            c.execute(
+                "DELETE FROM state_events WHERE conversation_id = ?1",
+                params![conversation_id.as_str()],
+            )?;
+            c.execute(
+                "DELETE FROM state_conversations WHERE conversation_id = ?1",
+                params![conversation_id.as_str()],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Lightweight summary of every conversation row — enough to render
     /// the SPA sidebar without a roundtrip per thread. Pinned threads
     /// come first, then everything else by most-recent activity (we use

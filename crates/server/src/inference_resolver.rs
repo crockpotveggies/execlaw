@@ -190,18 +190,22 @@ mod tests {
     #[test]
     fn managed_row_with_endpoint_returns_supervisor_url() {
         // Steady-state happy path: supervisor wrote
-        // http://127.0.0.1:8101 back, resolver picks it up.
+        // http://127.0.0.1:8101/v1 back, resolver picks it up.
+        // The `/v1` suffix is part of the supervisor → store
+        // contract — without it the inference-api client appends
+        // `/chat/completions` to a bare base URL and vLLM 404s
+        // because the OpenAI routes are mounted under /v1.
         let db = fresh_db();
         let store = BackendStore::new(&db);
         upsert_row(
             &store,
             BackendPurpose::Standard,
             BackendMode::Managed,
-            Some("http://127.0.0.1:8101"),
+            Some("http://127.0.0.1:8101/v1"),
         );
         let resolver = InferenceResolver::new(None);
         let got = resolver.resolve(&db, BackendPurpose::Standard).unwrap();
-        assert_eq!(got.base_url, "http://127.0.0.1:8101");
+        assert_eq!(got.base_url, "http://127.0.0.1:8101/v1");
     }
 
     #[test]
@@ -238,11 +242,11 @@ mod tests {
         store
             .set_endpoint(
                 BackendPurpose::Standard,
-                Some("http://127.0.0.1:8101"),
+                Some("http://127.0.0.1:8101/v1"),
                 200,
             )
             .unwrap();
         let got = resolver.resolve(&db, BackendPurpose::Standard).unwrap();
-        assert_eq!(got.base_url, "http://127.0.0.1:8101");
+        assert_eq!(got.base_url, "http://127.0.0.1:8101/v1");
     }
 }

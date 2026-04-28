@@ -680,8 +680,18 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::chats::send_message).get(crate::chats::list_messages),
         )
         .route(
+            "/api/chats/{conversation_id}/stop",
+            post(crate::chats::stop_turn),
+        )
+        .route(
+            "/api/chats/{conversation_id}/generate-title",
+            post(crate::chats::generate_title),
+        )
+        .route("/api/chats/incognito", post(crate::chats::incognito_turn))
+        .route(
             "/api/chats/{conversation_id}",
-            axum::routing::patch(crate::chats::patch_thread),
+            axum::routing::patch(crate::chats::patch_thread)
+                .delete(crate::chats::delete_thread),
         )
         .route("/api/chats", get(crate::chats::list_threads))
         .route("/api/stream", get(crate::events::stream_handler))
@@ -767,6 +777,7 @@ pub fn test_app_state() -> AppState {
                 )
             }),
         ),
+        turn_cancel: crate::turn_cancel::TurnCancellationRegistry::new(),
     }
 }
 

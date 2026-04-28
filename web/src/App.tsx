@@ -23,8 +23,24 @@ export function App() {
                       them into a broken chat shell with no inference
                       backend (Phase 14 follow-up).
                     */}
+                    {/*
+                      `/chat` shows the welcome view; `/chat/:id`
+                      activates a specific thread. Both go through
+                      the same Chat shell so deep-linking
+                      (refresh-tolerant or sharable per-thread URLs)
+                      works without re-mounting the WebSocket /
+                      sidebar tree.
+                    */}
                     <Route
                         path="/chat"
+                        element={
+                            <RequireSetupComplete>
+                                <Chat />
+                            </RequireSetupComplete>
+                        }
+                    />
+                    <Route
+                        path="/chat/:conversationId"
                         element={
                             <RequireSetupComplete>
                                 <Chat />

@@ -46,6 +46,18 @@ pub struct PreflightResponse {
     /// `web/src/api/endpoints.ts` and stay in sync by hand.
     #[schema(value_type = serde_json::Value)]
     pub gpus: Vec<GpuDevice>,
+    /// Free space, in bytes, on the volume that hosts execlaw's HF
+    /// model cache (`~/.execlaw/hf-cache`). The setup wizard checks
+    /// this against the picked model's expected on-disk size + a
+    /// 5 GB safety margin and warns if there's not enough room.
+    /// `None` when the platform's disk-free probe failed (rare;
+    /// surfaced as a "couldn't detect free space" warning in the
+    /// SPA — better safe than silent).
+    pub disk_free_bytes: Option<u64>,
+    /// Path the disk-free probe was run against. Surfaced so the
+    /// operator knows where to free up space when they hit the
+    /// "not enough room" warning.
+    pub disk_free_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -79,10 +91,66 @@ pub async fn get_handler(
 ) -> Json<PreflightResponse> {
     let docker = detect_docker();
     let profile = detect();
+    let (disk_free_bytes, disk_free_path) = detect_disk_free();
     Json(PreflightResponse {
         docker,
         gpus: profile.gpus,
+        disk_free_bytes,
+        disk_free_path,
     })
+}
+
+/// Resolve `~/.execlaw/hf-cache` (the host's primary HF model
+/// cache) and ask the OS how much free space remains on the
+/// volume that hosts it. The wizard compares this against the
+/// picked model's expected size + a 5 GB safety margin.
+///
+/// Returns `(None, Some(path))` when the path resolution succeeded
+/// but the disk-free syscall failed — preserves the path for
+/// operator messaging. Returns `(None, None)` when even path
+/// resolution failed (e.g. no `$HOME` on a misconfigured service
+/// account) — the SPA renders "couldn't detect free space" in
+/// that case.
+fn detect_disk_free() -> (Option<u64>, Option<String>) {
+    // Match the path the supervisor uses for its primary cache.
+    // EXECLAW_HF_CACHE wins; otherwise `<data_dir>/hf-cache`.
+    let path = match std::env::var("EXECLAW_HF_CACHE") {
+        Ok(p) => Some(std::path::PathBuf::from(p)),
+        Err(_) => directories::ProjectDirs::from("", "", "execlaw")
+            .map(|d| d.data_dir().join("hf-cache")),
+    };
+    let Some(path) = path else {
+        return (None, None);
+    };
+    // Probe whichever ancestor exists — the cache dir itself may
+    // not exist yet on a fresh install. Walk upward until we find
+    // a real directory; that's the volume we'd actually write to.
+    let mut probe = path.clone();
+    while !probe.exists() {
+        match probe.parent() {
+            Some(p) => probe = p.to_path_buf(),
+            None => return (None, Some(path.to_string_lossy().into_owned())),
+        }
+    }
+    let path_str = path.to_string_lossy().into_owned();
+    match disk_free_bytes_for(&probe) {
+        Ok(b) => (Some(b), Some(path_str)),
+        Err(e) => {
+            tracing::warn!(
+                path = %probe.display(),
+                "disk-free probe failed: {e}; reporting unknown"
+            );
+            (None, Some(path_str))
+        }
+    }
+}
+
+/// Cross-platform free-space probe via the `fs4` crate, which
+/// wraps `statvfs` (POSIX) and `GetDiskFreeSpaceExW` (Windows)
+/// safely. We use this instead of hand-rolling FFI because the
+/// server crate forbids unsafe code.
+fn disk_free_bytes_for(path: &std::path::Path) -> std::io::Result<u64> {
+    fs4::available_space(path)
 }
 
 /// Probe `docker info` to determine Docker daemon availability.
@@ -314,6 +382,42 @@ mod tests {
             "expected 401/403, got {}",
             resp.status()
         );
+    }
+
+    #[tokio::test]
+    async fn preflight_includes_disk_free_fields() {
+        // Phase 14.D — wizard's disk-space preflight reads
+        // `disk_free_bytes` + `disk_free_path` from this endpoint.
+        // The probe is platform-native (`fs4`); on a working dev
+        // host both fields populate. We assert the schema, not a
+        // specific byte count.
+        let app = build_router(test_app_state());
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/admin/setup/preflight")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["disk_free_bytes"].is_number() || v["disk_free_bytes"].is_null(),
+            "expected u64 or null disk_free_bytes; got {:?}",
+            v["disk_free_bytes"]
+        );
+        assert!(
+            v["disk_free_path"].is_string() || v["disk_free_path"].is_null(),
+            "expected string or null disk_free_path; got {:?}",
+            v["disk_free_path"]
+        );
+        if let Some(b) = v["disk_free_bytes"].as_u64() {
+            // Sanity: a real probe on a dev host should return more
+            // than 1 KB. If we get exactly 0, the fs4 probe lied or
+            // the volume is genuinely full — either way worth a warn.
+            assert!(b > 0, "disk_free_bytes should be positive on a working host");
+        }
     }
 
     #[test]

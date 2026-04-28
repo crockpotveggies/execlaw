@@ -153,6 +153,15 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// 2026-04-28 — vLLM-extension knob, forwarded verbatim into the
+    /// chat-template render via the `chat_template_kwargs` field on
+    /// the OpenAI-compatible POST body. Qwen3.5 honours
+    /// `{"enable_thinking": false}` to suppress its native `<think>`
+    /// blocks; without it the local model emits a "Thinking Process:"
+    /// monologue ahead of every reply. Other models silently ignore
+    /// the field, so passing it unconditionally is safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<serde_json::Value>,
 }
 
 /// Non-streaming response shape.
@@ -396,7 +405,7 @@ struct ChatRequestStreaming<'a>(&'a ChatRequest);
 impl<'a> Serialize for ChatRequestStreaming<'a> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("ChatRequest", 6)?;
+        let mut st = s.serialize_struct("ChatRequest", 7)?;
         st.serialize_field("model", &self.0.model)?;
         st.serialize_field("messages", &self.0.messages)?;
         if let Some(tools) = &self.0.tools {
@@ -408,6 +417,9 @@ impl<'a> Serialize for ChatRequestStreaming<'a> {
         }
         if let Some(m) = &self.0.max_tokens {
             st.serialize_field("max_tokens", m)?;
+        }
+        if let Some(kw) = &self.0.chat_template_kwargs {
+            st.serialize_field("chat_template_kwargs", kw)?;
         }
         st.end()
     }
@@ -487,7 +499,7 @@ struct ChatRequestNonStreaming<'a>(&'a ChatRequest);
 impl<'a> Serialize for ChatRequestNonStreaming<'a> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("ChatRequest", 6)?;
+        let mut st = s.serialize_struct("ChatRequest", 7)?;
         st.serialize_field("model", &self.0.model)?;
         st.serialize_field("messages", &self.0.messages)?;
         if let Some(tools) = &self.0.tools {
@@ -499,6 +511,9 @@ impl<'a> Serialize for ChatRequestNonStreaming<'a> {
         }
         if let Some(m) = &self.0.max_tokens {
             st.serialize_field("max_tokens", m)?;
+        }
+        if let Some(kw) = &self.0.chat_template_kwargs {
+            st.serialize_field("chat_template_kwargs", kw)?;
         }
         st.end()
     }
@@ -529,6 +544,7 @@ mod tests {
             stream: true,
             temperature: None,
             max_tokens: Some(512),
+            chat_template_kwargs: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(s.contains("\"model\""));
@@ -628,6 +644,7 @@ mod tests {
             stream: true,
             temperature: None,
             max_tokens: None,
+            chat_template_kwargs: None,
         };
         let mut stream = client.chat_completions_stream(&req).await.unwrap();
         let mut text = String::new();
@@ -685,6 +702,7 @@ mod tests {
             stream: true,
             temperature: None,
             max_tokens: None,
+            chat_template_kwargs: None,
         };
         let mut stream = client.chat_completions_stream(&req).await.unwrap();
         let mut saw_err = false;
@@ -754,6 +772,7 @@ mod tests {
             stream: false,
             temperature: Some(0.0),
             max_tokens: Some(16),
+            chat_template_kwargs: None,
         };
         let resp = client.chat_completions(&req).await.unwrap();
         assert_eq!(resp.id, "test-1");

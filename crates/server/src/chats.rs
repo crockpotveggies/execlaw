@@ -255,6 +255,16 @@ pub async fn send_message(
         cid.as_str().to_owned(),
     );
 
+    // 2026-04-28 — register a per-turn cancellation flag. The streaming
+    // path polls this between SSE chunks and exits the loop early when
+    // `POST /api/chats/:id/stop` flips it. RAII guard guarantees the
+    // entry is removed on every exit path.
+    let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
+        state.turn_cancel.clone(),
+        cid.as_str().to_owned(),
+    );
+    let cancel_flag = cancel_guard.flag.clone();
+
     // Phase 8.5 runner-registry hookup: every turn entering this code
     // path gets a corresponding `register_turn_start`. The Settings →
     // Runners page reads from this. Controller-trust callers get the
@@ -311,6 +321,7 @@ pub async fn send_message(
                 &req.text,
                 req.sender_principal_id.clone(),
                 spotlight_content,
+                cancel_flag.clone(),
             )
             .await
             {
@@ -454,6 +465,7 @@ async fn run_real_turn(
     user_text: &str,
     sender_principal_id: Option<String>,
     spotlight_content: bool,
+    cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(i64, String, i64), String> {
     use execlaw_inference_api::{ChatMessage, ChatRequest};
     use execlaw_policy::spotlighting::Spotlight;
@@ -527,6 +539,21 @@ async fn run_real_turn(
     }
 
     // Step 3 — open stream.
+    //
+    // 2026-04-28 — read the Standard backend row's reasoning_enabled
+    // and forward it as `chat_template_kwargs.enable_thinking`. Qwen3.5
+    // honours this knob in its chat template; without it the model
+    // defaults to emitting a "Thinking Process:" monologue ahead of
+    // every reply. We always send the field (rather than omitting it
+    // when false) so the chat template's `if` branch evaluates a
+    // concrete bool — Qwen's template treats "missing" as the
+    // model-default, which on Qwen3.5 is reasoning-on.
+    let reasoning_enabled = execlaw_core::backends::BackendStore::new(&state.db)
+        .get(BackendPurpose::Standard)
+        .ok()
+        .flatten()
+        .map(|r| r.reasoning_enabled)
+        .unwrap_or(false);
     let req = ChatRequest {
         model: ModelId(state.config.model_id.clone()),
         messages,
@@ -534,6 +561,9 @@ async fn run_real_turn(
         stream: true,
         temperature: None,
         max_tokens: None,
+        chat_template_kwargs: Some(serde_json::json!({
+            "enable_thinking": reasoning_enabled,
+        })),
     };
     let mut stream = inference
         .chat_completions_stream(&req)
@@ -541,20 +571,44 @@ async fn run_real_turn(
         .map_err(|e| format!("stream open: {e}"))?;
 
     // Step 4 — consume stream, broadcasting per-chunk deltas.
+    //
+    // 2026-04-28 — also poll the cancel flag between chunks. When the
+    // operator hits the stop button, `POST /api/chats/:id/stop` flips
+    // the flag; we break out of the loop, drop the stream (which
+    // closes the underlying HTTP connection so the inference server
+    // stops generating), and commit a `model_turn` with whatever text
+    // we have plus `finish_reason = "cancelled"`. The transcript stays
+    // well-formed and the operator sees their partial reply.
     let mut assembled = String::new();
     let mut finish_reason: Option<String> = None;
     let mut model_id = state.config.model_id.clone();
+    let mut was_cancelled = false;
+    // 2026-04-28 — defensive `<think>...</think>` stripper. Even with
+    // `enable_thinking=false` in the chat template, the model can
+    // (and on Qwen3.5 occasionally does) emit `<think>` blocks in the
+    // raw stream. We track a boolean across chunks because the tag
+    // can straddle chunk boundaries; while inside, deltas are kept
+    // in the saved transcript context but suppressed from the SPA's
+    // live-token broadcast and from the assembled committed text.
+    let mut think_filter = crate::think_filter::ThinkBlockFilter::new();
     while let Some(chunk) = stream.next().await {
+        if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            was_cancelled = true;
+            break;
+        }
         let chunk = chunk.map_err(|e| format!("stream chunk: {e}"))?;
         model_id = chunk.model.clone();
         for ch in &chunk.choices {
             if let Some(t) = &ch.delta.content {
                 if !t.is_empty() {
-                    assembled.push_str(t);
-                    state.events.publish(UiEvent::ChatTokenDelta {
-                        conversation_id: cid.as_str().to_owned(),
-                        text: t.clone(),
-                    });
+                    let visible = think_filter.feed(t);
+                    if !visible.is_empty() {
+                        assembled.push_str(&visible);
+                        state.events.publish(UiEvent::ChatTokenDelta {
+                            conversation_id: cid.as_str().to_owned(),
+                            text: visible,
+                        });
+                    }
                 }
             }
             if let Some(fr) = &ch.finish_reason {
@@ -562,11 +616,38 @@ async fn run_real_turn(
             }
         }
     }
+    // Drop the stream explicitly so the HTTP connection closes ASAP
+    // when cancelled; without this the runtime would hold the body
+    // reader until the function returns, keeping the inference server
+    // generating tokens we'll never read.
+    drop(stream);
+    if was_cancelled {
+        finish_reason = Some("cancelled".into());
+    }
+    // Flush any held-back bytes from the think filter (a trailing `<`
+    // that couldn't yet be classified, or unterminated reasoning we
+    // discard). Outside-state bytes get emitted to both the assembled
+    // commit text AND the live SPA stream so the operator's UI
+    // matches what we persist.
+    let tail = think_filter.flush();
+    if !tail.is_empty() {
+        assembled.push_str(&tail);
+        state.events.publish(UiEvent::ChatTokenDelta {
+            conversation_id: cid.as_str().to_owned(),
+            text: tail,
+        });
+    }
     // Ensure the user never sees an empty reply — a model that
     // closes the stream without emitting any content still produces
     // a committed `model_turn` event so the transcript stays well-formed.
     let assistant_text = if assembled.is_empty() {
-        "(empty response)".to_owned()
+        if was_cancelled {
+            "(stopped before any output)".to_owned()
+        } else {
+            "(empty response)".to_owned()
+        }
+    } else if was_cancelled {
+        format!("{assembled} … (stopped)")
     } else {
         assembled
     };
@@ -677,6 +758,17 @@ async fn run_tool_capable_turn(
             .as_ref()
             .map(|k| (**k).clone()),
         phase_observer: Some(phase_observer),
+        // Read reasoning toggle from the Standard backend row;
+        // defaults to false when the row isn't configured. The
+        // runner forwards this into Qwen's chat template so a
+        // misconfigured reasoning bit doesn't leak `<think>` blocks
+        // into the operator's chat.
+        reasoning_enabled: execlaw_core::backends::BackendStore::new(&state.db)
+            .get(BackendPurpose::Standard)
+            .ok()
+            .flatten()
+            .map(|r| r.reasoning_enabled)
+            .unwrap_or(false),
     };
     let summary = exec
         .run_turn(&state.db, cid, user_text, sender_principal_id, &cfg)
@@ -1078,7 +1170,30 @@ pub async fn dispatch_routine_turn(
             // Spotlighting off: the prompt comes from the operator,
             // not from an external sender, so no untrusted-content
             // wrapping needed.
-            run_real_turn(state, inference.clone(), &cid, prompt, sender.clone(), false).await
+            //
+            // Routine-fired turns are cancellable too: register via the
+            // same per-conversation flag so an operator-initiated stop
+            // request from the SPA also halts a routine running on
+            // the same conversation. The guard is dropped here at the
+            // end of the match, removing the entry on every exit
+            // path.
+            let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
+                state.turn_cancel.clone(),
+                cid.as_str().to_owned(),
+            );
+            let cancel_flag = cancel_guard.flag.clone();
+            let res = run_real_turn(
+                state,
+                inference.clone(),
+                &cid,
+                prompt,
+                sender.clone(),
+                false,
+                cancel_flag,
+            )
+            .await;
+            drop(cancel_guard);
+            res
         }
         None => run_stub_turn(state, &cid, prompt, sender.clone()),
     };
@@ -1133,6 +1248,40 @@ pub(crate) fn assemble_system_prompt(
         (false, true) => p.to_owned(),
         (false, false) => format!("{p}\n\n---\n\n{b}"),
     }
+}
+
+/// `POST /api/chats/:id/stop` — flip the in-flight turn's cancel
+/// flag. The streaming chat handler observes the flag between SSE
+/// chunks and exits early; whatever has been generated so far is
+/// committed as the assistant's reply with `finish_reason=cancelled`.
+///
+/// Idempotent: stopping when no turn is in flight returns 200 with
+/// `cancelled=false` so the SPA can fire-and-forget without worrying
+/// about race conditions against the turn finishing on its own.
+#[utoipa::path(
+    post,
+    path = "/api/chats/{conversation_id}/stop",
+    params(
+        ("conversation_id" = String, Path, description = "Conversation whose in-flight turn should be cancelled"),
+    ),
+    responses(
+        (status = 200, description = "Stop signal delivered (or no turn in flight)"),
+    ),
+    tag = "chats"
+)]
+pub async fn stop_turn(
+    State(state): State<AppState>,
+    Path(conversation_id): Path<String>,
+) -> impl IntoResponse {
+    let cancelled = state.turn_cancel.cancel(&conversation_id);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "conversation_id": conversation_id,
+            "cancelled": cancelled,
+        })),
+    )
+        .into_response()
 }
 
 /// `GET /api/chats/:id/messages?before=0&limit=200`
@@ -1367,6 +1516,445 @@ pub async fn patch_thread(
             is_pinned: row.is_pinned,
             is_ephemeral: row.is_ephemeral,
             ephemeral_expires_at: row.ephemeral_expires_at,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /api/chats/incognito` — run a single inference turn without
+/// touching the event log, conversation table, or any other
+/// persistent storage. The SPA holds the entire transcript in
+/// memory and ships the relevant slice on each turn.
+///
+/// The point: an "incognito" conversation that the operator can
+/// throw away by navigating off the screen. No `state_events`
+/// rows, no `state_conversations` rows, no outbox enqueue, no
+/// audit trail. Bypasses the runner-local pipeline entirely
+/// because that path's contract is "every turn lands in the
+/// event log."
+///
+/// Trade-offs we accept for the privacy story:
+///   * No tools, no plugin host, no policy gate. Incognito is for
+///     conversational throwaway chat — running tools (which
+///     would write outbox rows) would defeat the "nothing
+///     persists" guarantee.
+///   * No streaming. We could SSE-stream the body, but chunked
+///     responses are conspicuously different from regular chat
+///     and the simpler shape gets the feature shipped. Streaming
+///     can land later without breaking the client contract.
+///   * Same Standard backend as regular chat. Routing to a
+///     different backend for incognito would be nice
+///     defence-in-depth but isn't necessary for the local-model
+///     deployment everyone runs.
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+pub struct IncognitoMessage {
+    /// "user" or "assistant" — the only two roles incognito chat
+    /// emits client-side.
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+pub struct IncognitoRequest {
+    /// Prior turns in this client-only conversation, ordered
+    /// oldest-first. Excludes the new user message — that's
+    /// passed separately in `text`.
+    #[serde(default)]
+    pub messages: Vec<IncognitoMessage>,
+    pub text: String,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct IncognitoResponse {
+    pub text: String,
+    pub model: String,
+    pub finish_reason: Option<String>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/chats/incognito",
+    request_body = IncognitoRequest,
+    responses(
+        (status = 200, description = "Assistant reply, never persisted", body = IncognitoResponse),
+        (status = 401, description = "Missing or invalid Authorization header"),
+        (status = 503, description = "No inference backend configured"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "chats"
+)]
+pub async fn incognito_turn(
+    State(state): State<AppState>,
+    _user: crate::auth_extract::AuthedUser,
+    Json(req): Json<IncognitoRequest>,
+) -> impl IntoResponse {
+    use execlaw_inference_api::{ChatMessage, ChatRequest, Role};
+
+    if req.text.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "text must not be empty"})),
+        )
+            .into_response();
+    }
+
+    let inference =
+        match state.inference.resolve(&state.db, BackendPurpose::Standard) {
+            Some(c) => c,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "no inference backend configured for incognito chat",
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+    // Compose: static system prompt (NO personality lookup — that
+    // would hit the personality table, which is fine, but the
+    // operator-editable voice isn't the point of incognito; we
+    // want the rules-only base) + prior history + new user text.
+    let system = state.config.system_prompt.clone();
+    let mut messages: Vec<ChatMessage> = Vec::with_capacity(req.messages.len() + 2);
+    messages.push(ChatMessage::system(system));
+    for m in &req.messages {
+        match m.role.as_str() {
+            "assistant" => messages.push(ChatMessage::assistant(&m.content)),
+            // Treat unknown roles as user — defensive against a
+            // bad client.
+            _ => messages.push(ChatMessage::user(&m.content)),
+        }
+    }
+    messages.push(ChatMessage {
+        role: Role::User,
+        content: Some(req.text),
+        tool_call_id: None,
+        name: None,
+        tool_calls: vec![],
+    });
+
+    let reasoning_enabled = execlaw_core::backends::BackendStore::new(&state.db)
+        .get(BackendPurpose::Standard)
+        .ok()
+        .flatten()
+        .map(|r| r.reasoning_enabled)
+        .unwrap_or(false);
+    let chat_req = ChatRequest {
+        model: ModelId(state.config.model_id.clone()),
+        messages,
+        tools: None,
+        stream: false,
+        temperature: None,
+        max_tokens: None,
+        chat_template_kwargs: Some(serde_json::json!({
+            "enable_thinking": reasoning_enabled,
+        })),
+    };
+    let resp = match inference.chat_completions(&chat_req).await {
+        Ok(r) => r,
+        Err(e) => {
+            return err_500(&format!("incognito inference: {e}"));
+        }
+    };
+    let choice = resp.choices.first().cloned();
+    let raw_text = choice
+        .as_ref()
+        .and_then(|c| c.message.content.clone())
+        .unwrap_or_default();
+    // Defensive `<think>` strip — the chat-template knob suppresses
+    // them at the source, but a model that ignores the kwarg
+    // shouldn't leak reasoning into the operator's transcript.
+    let text = strip_think_blocks(&raw_text).trim().to_owned();
+    let finish_reason = choice.and_then(|c| c.finish_reason);
+    (
+        StatusCode::OK,
+        Json(IncognitoResponse {
+            text,
+            model: resp.model,
+            finish_reason,
+        }),
+    )
+        .into_response()
+}
+
+/// `POST /api/chats/:id/generate-title` — synthesise a 3-5 word
+/// display name from the conversation's first turn. Idempotent: if
+/// the row already has an operator-set `display_name`, this is a
+/// no-op (we don't want to clobber a hand-named thread).
+///
+/// Calls the configured Standard inference backend with a tightly
+/// constrained prompt, takes the first few words of the response,
+/// strips quotes / trailing punctuation, and PATCHes the row's
+/// display_name. Failures degrade silently — the row keeps its
+/// default `New chat · <hash>` label rather than surfacing an error
+/// banner that would distract the operator from actually using the
+/// chat.
+#[utoipa::path(
+    post,
+    path = "/api/chats/{conversation_id}/generate-title",
+    params(
+        ("conversation_id" = String, Path, description = "Conversation to title"),
+    ),
+    responses(
+        (status = 200, description = "Generated (or skipped) title"),
+        (status = 401, description = "Missing or invalid Authorization header"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "chats"
+)]
+pub async fn generate_title(
+    State(state): State<AppState>,
+    _user: crate::auth_extract::AuthedUser,
+    Path(conversation_id): Path<String>,
+) -> impl IntoResponse {
+    use execlaw_inference_api::{ChatMessage, ChatRequest};
+
+    let cid = ConversationId::from(conversation_id.as_str());
+    let store = ConversationStore::new(&state.db);
+
+    // Skip if the operator (or a prior call) already named it.
+    if let Ok(Some(row)) = store.get(&cid) {
+        if row.display_name.is_some() {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "title": row.display_name,
+                    "skipped": true,
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Pull the first user message + first assistant reply from the
+    // log. Don't replay the full transcript — a single round-trip
+    // is plenty of context for a 3-5 word label and saves prompt
+    // tokens on every new chat.
+    let log = event_log(&state);
+    let history = match log.replay_since(&cid, EventSeq(0)) {
+        Ok(h) => h,
+        Err(e) => return err_500(&format!("replay: {e}")),
+    };
+    let mut user_text = String::new();
+    let mut assistant_text = String::new();
+    for ev in &history {
+        match ev.kind {
+            EventKind::UserMsg if user_text.is_empty() => {
+                if let Ok(p) = ev.decode_payload::<UserMessagePayload>() {
+                    user_text = p.text;
+                }
+            }
+            EventKind::ModelTurn if assistant_text.is_empty() => {
+                if let Ok(p) = ev.decode_payload::<RealModelTurnPayload>() {
+                    assistant_text = p.text;
+                } else if let Ok(p) = ev.decode_payload::<StubModelTurnPayload>() {
+                    assistant_text = p.text;
+                }
+            }
+            _ => {}
+        }
+        if !user_text.is_empty() && !assistant_text.is_empty() {
+            break;
+        }
+    }
+    if user_text.is_empty() {
+        // Nothing to title yet.
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "conversation_id": conversation_id,
+                "title": null,
+                "skipped": true,
+            })),
+        )
+            .into_response();
+    }
+
+    let inference =
+        match state.inference.resolve(&state.db, BackendPurpose::Standard) {
+            Some(c) => c,
+            None => {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "title": null,
+                        "skipped": true,
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+    let system = "You produce very short titles for chat conversations. \
+                  Reply with ONLY the title — 3 to 5 words, no quotes, no \
+                  punctuation, no preamble. Title-case is fine. Examples: \
+                  'Sourdough starter ratio', 'Refactoring axum routes', \
+                  'Trip to Lisbon planning'.";
+    let user_prompt = if assistant_text.is_empty() {
+        format!("First message: {user_text}\n\nTitle:")
+    } else {
+        format!(
+            "First message: {user_text}\n\nAssistant reply: {assistant_text}\n\nTitle:"
+        )
+    };
+    let req = ChatRequest {
+        model: ModelId(state.config.model_id.clone()),
+        messages: vec![
+            ChatMessage::system(system),
+            ChatMessage::user(user_prompt),
+        ],
+        tools: None,
+        stream: false,
+        temperature: Some(0.2),
+        max_tokens: Some(20),
+        // Title gen never wants chain-of-thought.
+        chat_template_kwargs: Some(serde_json::json!({
+            "enable_thinking": false,
+        })),
+    };
+    let resp = match inference.chat_completions(&req).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "title generation failed; leaving display_name unset");
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "title": null,
+                    "skipped": true,
+                })),
+            )
+                .into_response();
+        }
+    };
+    let raw = resp
+        .choices
+        .first()
+        .and_then(|c| c.message.content.clone())
+        .unwrap_or_default();
+    let title = sanitize_generated_title(&raw);
+    if title.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "conversation_id": conversation_id,
+                "title": null,
+                "skipped": true,
+            })),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = store.set_display_name(&cid, Some(&title)) {
+        return err_500(&format!("set_display_name: {e}"));
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "conversation_id": conversation_id,
+            "title": title,
+            "skipped": false,
+        })),
+    )
+        .into_response()
+}
+
+/// Trim and clean a model-generated title so the sidebar shows
+/// something presentable. Strips wrapping quotes/backticks, trailing
+/// punctuation, and `<think>` blocks the model might leak. Caps at
+/// 60 chars defensively — the `<span>` ellipsis-truncates anyway,
+/// but a 200-char "title" would blow the SPA's tooltip.
+fn sanitize_generated_title(raw: &str) -> String {
+    // Drop any think blocks the chat-template knob didn't catch.
+    let stripped = strip_think_blocks(raw);
+    let mut s = stripped.trim().to_owned();
+    // Some models prefix with "Title:" despite the system prompt.
+    for prefix in ["Title:", "title:", "TITLE:"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.trim().to_owned();
+        }
+    }
+    // Strip wrapping quotes/backticks (single or paired).
+    let trims: &[char] = &['"', '\'', '`', '*', '#'];
+    s = s.trim_matches(trims).to_owned();
+    // Take just the first non-empty line — models occasionally
+    // append a follow-up sentence.
+    if let Some(first_line) = s.lines().find(|l| !l.trim().is_empty()) {
+        s = first_line.trim().to_owned();
+    }
+    // Trailing period/comma/semicolon — strip.
+    s = s
+        .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':'))
+        .to_owned();
+    if s.chars().count() > 60 {
+        s = s.chars().take(60).collect::<String>().trim().to_owned();
+    }
+    s
+}
+
+fn strip_think_blocks(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        if let Some(open) = lower.find("<think>") {
+            out.push_str(&rest[..open]);
+            if let Some(close_rel) = lower[open..].find("</think>") {
+                let close = open + close_rel + "</think>".len();
+                rest = &rest[close..];
+            } else {
+                // Unterminated — drop the rest.
+                break;
+            }
+        } else {
+            out.push_str(rest);
+            break;
+        }
+    }
+    out
+}
+
+/// `DELETE /api/chats/:id` — hard-delete a conversation. Wipes the
+/// event log + the conversation row in one transaction. Idempotent:
+/// removing a non-existent thread returns 200 with `existed=false`.
+#[utoipa::path(
+    delete,
+    path = "/api/chats/{conversation_id}",
+    params(
+        ("conversation_id" = String, Path, description = "Conversation to delete"),
+    ),
+    responses(
+        (status = 200, description = "Thread deleted (or never existed)"),
+        (status = 401, description = "Missing or invalid Authorization header"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "chats"
+)]
+pub async fn delete_thread(
+    State(state): State<AppState>,
+    _user: crate::auth_extract::AuthedUser,
+    Path(conversation_id): Path<String>,
+) -> impl IntoResponse {
+    let cid = ConversationId::from(conversation_id.as_str());
+    let store = ConversationStore::new(&state.db);
+    let existed = matches!(store.get(&cid), Ok(Some(_)));
+    if let Err(e) = store.delete(&cid) {
+        return err_500(&format!("delete: {e}"));
+    }
+    // Also flip any in-flight cancel flag so a turn currently
+    // streaming for this thread halts cleanly rather than racing
+    // against the row going away.
+    state.turn_cancel.cancel(cid.as_str());
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "conversation_id": conversation_id,
+            "existed": existed,
         })),
     )
         .into_response()

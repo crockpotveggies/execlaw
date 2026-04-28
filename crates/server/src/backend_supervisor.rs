@@ -573,6 +573,64 @@ impl BackendSupervisor {
             // the download is in flight we surface progress in
             // `slot.download_progress` so the SPA pill shows
             // "Downloading model · 8.5 / 18.0 GB · 47%".
+            //
+            // Phase 14.E — before spawning fresh, try to adopt an
+            // existing container with the expected name. Cargo-watch
+            // restarts the binary every time a `.rs` file changes;
+            // without adoption, every restart force-removes the
+            // running vLLM container (which is in the middle of a
+            // 3–5 minute model load) and spawns a brand-new one
+            // that has to reload the same 27 GB of weights from
+            // scratch. From the operator's POV, this looks like a
+            // 5-minute restart loop. Adopting matches the operator's
+            // intuition: "the container is already running; leave
+            // it alone."
+            if slot.handle.is_none() {
+                let expected_name =
+                    format!("execlaw-backend-{}", row.purpose.as_str());
+                match self
+                    .controller
+                    .try_adopt(&expected_name, host_port_for(row.purpose))
+                    .await
+                {
+                    Ok(Some(handle)) => {
+                        info!(
+                            purpose = %key,
+                            container = %handle.container_id,
+                            "adopted existing managed container (binary restart)"
+                        );
+                        slot.handle = Some(handle);
+                        slot.status = ServiceStatus::Starting;
+                        slot.stage = LifecycleStage::ContainerStarting;
+                        // Best-effort: we don't know how long the
+                        // adopted container has been up. Set the
+                        // start time to "now" so the SPA's elapsed
+                        // counter starts from this binary's lifetime
+                        // — operators treat that as "time since I
+                        // started watching", which is the most
+                        // useful framing.
+                        slot.spawn_started_at = Some(chrono::Utc::now().timestamp());
+                        slot.restart_attempts = 0;
+                        // Fall through to the inspect+probe block
+                        // below; if /health succeeds on the next
+                        // tick, status flips to Healthy as usual.
+                    }
+                    Ok(None) => {
+                        // No running container with that name; fall
+                        // through to the existing spawn path.
+                    }
+                    Err(e) => {
+                        // Don't bail on a transient inspect error —
+                        // log + fall through to spawn. spawn() will
+                        // also clean up any stale container.
+                        warn!(
+                            purpose = %key,
+                            "try_adopt failed: {e}; will spawn fresh"
+                        );
+                    }
+                }
+            }
+
             if slot.handle.is_none() {
                 let mut spec = match spec_from_row(row) {
                     Ok(s) => s,
@@ -840,7 +898,19 @@ impl BackendSupervisor {
                             slot.last_log_tail = None;
                             slot.last_log_line = None;
                             resolve_crashloop_alert(&self.db, row.purpose);
-                            let endpoint = handle.endpoint_url("http");
+                            // Append `/v1` so the persisted endpoint
+                            // matches the OpenAI-compatible base-URL
+                            // contract every operator-supplied
+                            // external row already follows. Without
+                            // it, `inference-api` appends
+                            // `/chat/completions` to a bare
+                            // `http://127.0.0.1:8101` and vLLM
+                            // returns 404 — only `/v1/...` paths
+                            // are mounted under vLLM's OpenAPI
+                            // server. Whisper / Kokoro images use
+                            // the same convention.
+                            let endpoint =
+                                format!("{}/v1", handle.endpoint_url("http"));
                             // Write the URL back so the runner's
                             // next call picks it up. Idempotent —
                             // the row is left alone if the URL
@@ -1293,7 +1363,12 @@ mod tests {
         let row = store.get(BackendPurpose::Standard).unwrap().unwrap();
         assert_eq!(
             row.endpoint.as_deref(),
-            Some(format!("http://127.0.0.1:{}", host_port_for(BackendPurpose::Standard)).as_str())
+            // `/v1` suffix matches the OpenAI-base-URL contract the
+            // inference-api client expects.
+            Some(
+                format!("http://127.0.0.1:{}/v1", host_port_for(BackendPurpose::Standard))
+                    .as_str()
+            )
         );
         assert_eq!(mock.spawn_count().await, 1);
 
@@ -1746,6 +1821,114 @@ mod tests {
         assert_eq!(
             spec.env.iter().filter(|(k, _)| k == "HF_HUB_OFFLINE").count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_adopts_existing_running_container_on_first_reconcile() {
+        // Phase 14.E regression — every binary restart used to
+        // force-remove the running container by name and spawn a
+        // brand-new one. With 27 GB Qwen 3.5 weights, that meant
+        // a fresh 3-5 minute model reload on every cargo-watch
+        // rebuild — the "5-minute restart loop" the operator saw.
+        //
+        // Setup: pre-populate the mock controller with a container
+        // for `execlaw-backend-Standard` (simulating "previous
+        // binary instance left this running"). Then build a fresh
+        // supervisor (empty slots map) and run reconcile_once.
+        // Expect: handle adopted, NO new spawn, container survives.
+        let db = fresh_db();
+        let store = BackendStore::new(&db);
+        upsert_managed(&store, BackendPurpose::Standard, "vllm:test");
+
+        let mock = Arc::new(MockServiceController::new());
+        // Pretend a container already exists. We seed `running` by
+        // calling spawn once on a separate spec — that's the most
+        // direct way to put the mock into the "container present"
+        // state without exposing internals.
+        let pre_spec = ServiceSpec {
+            name: "execlaw-backend-Standard".into(),
+            image: "vllm:test".into(),
+            args: vec!["--model".into(), "X".into()],
+            env: vec![],
+            gpu_id: Some("0".into()),
+            gpu_vendor: None,
+            mounts: vec![],
+            host_port: 8101,
+            container_port: 8000,
+        };
+        let pre_handle = mock.spawn(&pre_spec).await.unwrap();
+        let pre_spawn_count = mock.spawn_count().await;
+
+        // Fresh supervisor — empty slots, simulating a binary restart.
+        let sup = BackendSupervisor::new(db.clone(), mock.clone());
+        sup.reconcile_once().await;
+
+        // The supervisor must NOT have called spawn again — the
+        // existing container was adopted in place. Mock health
+        // defaults to true so the second reconcile flips to Healthy
+        // without ever respawning.
+        assert_eq!(
+            mock.spawn_count().await,
+            pre_spawn_count,
+            "supervisor must adopt existing container, not respawn"
+        );
+
+        // Subsequent reconcile should observe Healthy (mock probe
+        // returns true; the adopted handle inspects as Starting,
+        // which the probe-success branch flips to Healthy).
+        sup.reconcile_once().await;
+        let snap = sup.snapshot_status().await;
+        let standard = snap
+            .iter()
+            .find(|s| s.purpose == BackendPurpose::Standard)
+            .unwrap();
+        assert_eq!(standard.status, ServiceStatus::Healthy);
+        assert_eq!(mock.stop_count().await, 0, "no stops should have fired");
+
+        // The adopted handle's name + host_port match what the
+        // supervisor expects (so endpoint_url stays stable).
+        assert_eq!(pre_handle.name, "execlaw-backend-Standard");
+    }
+
+    #[tokio::test]
+    async fn supervisor_does_not_adopt_a_stopped_container() {
+        // Defensive — if the existing container is stopped (crashed
+        // last time, or operator paused it), adoption returns None
+        // and the supervisor proceeds with a clean spawn that
+        // force-removes the stale carcass. Critical: a stopped
+        // container in the way of the new name binding would HTTP
+        // 409 the create_container call.
+        let db = fresh_db();
+        let store = BackendStore::new(&db);
+        upsert_managed(&store, BackendPurpose::Standard, "vllm:test");
+
+        let mock = Arc::new(MockServiceController::new());
+        // Seed + immediately stop, so `running` map is empty but
+        // a name has been seen (the mock collapses these into the
+        // same "no running container" state, which is exactly what
+        // the supervisor should treat as "spawn fresh").
+        let spec = ServiceSpec {
+            name: "execlaw-backend-Standard".into(),
+            image: "vllm:test".into(),
+            args: vec![],
+            env: vec![],
+            gpu_id: Some("0".into()),
+            gpu_vendor: None,
+            mounts: vec![],
+            host_port: 8101,
+            container_port: 8000,
+        };
+        let h = mock.spawn(&spec).await.unwrap();
+        mock.stop(&h).await.unwrap();
+        let baseline = mock.spawn_count().await;
+
+        let sup = BackendSupervisor::new(db, mock.clone());
+        sup.reconcile_once().await;
+        // Supervisor noticed no live container → spawned fresh.
+        assert!(
+            mock.spawn_count().await > baseline,
+            "supervisor must spawn fresh when no live container exists"
         );
     }
 

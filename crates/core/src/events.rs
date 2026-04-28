@@ -511,6 +511,78 @@ impl<'db> EventLog<'db> {
         })
     }
 
+    /// Re-sign every event in the log under the current ring key,
+    /// **overwriting** whatever tag/key_id was there before. Unlike
+    /// [`backfill_null_tags`], this clobbers existing tags too — it's
+    /// the recovery hatch for operators who lost the original HMAC key
+    /// (e.g. OS keyring lost the entry between boots) and need their
+    /// existing event log to be readable under a new key.
+    ///
+    /// **This destroys tamper-evidence for the rows it touches.** Any
+    /// row that was previously signed under a different key now looks
+    /// validly signed under the current one. Operators should only run
+    /// this after confirming via offline channels that the log
+    /// content is what they expect (or, more commonly, after losing a
+    /// dev-environment key and accepting that history is degraded).
+    pub fn resign_all_with_current_key(&self) -> Result<BackfillReport, DbError> {
+        let ring = self.key_ring.as_ref().ok_or_else(|| {
+            DbError::Config(
+                "resign_all_with_current_key requires a KeyRing".into(),
+            )
+        })?;
+        let key = ring.current_key().ok_or_else(|| {
+            DbError::Config("KeyRing has no key registered for current_id".into())
+        })?;
+        let key_id = ring.current_id;
+
+        let rows: Vec<NullTagRow> = self.db.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT conversation_id, seq, kind, payload, committed_at, actor \
+                 FROM state_events",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Vec<u8>>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+
+        let total = rows.len();
+        for (conv_id, seq, kind_str, payload, committed_at, actor) in rows {
+            let canon = crate::event_hmac::canonical_bytes(
+                &conv_id,
+                seq,
+                &kind_str,
+                committed_at,
+                actor.as_deref(),
+                &payload,
+            );
+            let tag = crate::event_hmac::sign_event(key, &canon).to_vec();
+            self.db.with_conn(|c| {
+                c.execute(
+                    "UPDATE state_events SET tag = ?1, key_id = ?2 \
+                     WHERE conversation_id = ?3 AND seq = ?4",
+                    params![tag, key_id, conv_id, seq],
+                )?;
+                Ok(())
+            })?;
+        }
+
+        Ok(BackfillReport {
+            signed: total,
+            skipped: 0,
+            null_remaining: 0,
+        })
+    }
+
     /// Append one event. Enforces `(conversation_id, seq)` uniqueness via
     /// the primary key — returns an error if the caller passed a stale seq.
     pub fn append(&self, ev: &EventRecord) -> Result<(), DbError> {
