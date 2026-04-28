@@ -154,10 +154,19 @@ impl RunnerLauncher for BollardRunnerLauncher {
             env.push(format!("{k}={v}"));
         }
 
+        // host-gateway alias: on Linux Docker, `host.docker.internal`
+        // is NOT auto-defined; on Docker Desktop (Windows / macOS)
+        // it is. Adding `host.docker.internal:host-gateway` is
+        // harmless on Desktop (the daemon already maps the name)
+        // and load-bearing on Linux (so the runner can reach
+        // vLLM / our WS endpoint on the host's loopback).
         let host_cfg = HostConfig {
             binds: Some(vec![format!("{}:/workspace", volume)]),
             memory: spec.memory_bytes,
             network_mode: spec.network.clone(),
+            extra_hosts: Some(vec![
+                "host.docker.internal:host-gateway".to_owned(),
+            ]),
             ..Default::default()
         };
 

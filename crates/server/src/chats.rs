@@ -908,6 +908,14 @@ pub(crate) async fn run_runner_turn(
         .resolve(&state.db, BackendPurpose::Standard)
         .map(|c| c.base_url.clone())
         .ok_or_else(|| "no inference backend configured".to_owned())?;
+    // The supervisor resolved the URL from the SERVER's network
+    // namespace (likely `http://127.0.0.1:8101/v1` for a local
+    // vLLM). Inside a runner container, `127.0.0.1` resolves to
+    // the container itself — so we rewrite to the host-gateway
+    // alias (`host.docker.internal`) before shipping the URL to
+    // the runner. selfhosted-claw does the same dance in its
+    // `resolveContainerOpenAIBaseUrl`.
+    let inference_url = rewrite_url_for_container(&inference_url);
     let reasoning_enabled = execlaw_core::backends::BackendStore::new(&state.db)
         .get(BackendPurpose::Standard)
         .ok()
@@ -2383,6 +2391,49 @@ pub async fn delete_thread(
         .into_response()
 }
 
+/// Rewrite a URL so a Docker container can reach a service that
+/// the host is running on its loopback. `127.0.0.1` and `localhost`
+/// inside a container point at the container itself; the host is
+/// reachable via `host.docker.internal` (Docker Desktop) or via
+/// the `host-gateway` alias on Linux Docker (the bollard launcher
+/// adds `--add-host host.docker.internal:host-gateway` for us).
+///
+/// Only rewrites the host portion of `http://localhost:...` and
+/// `http://127.0.0.1:...`. Other hosts (real DNS names, container-
+/// network names, IPs in non-loopback ranges) pass through
+/// untouched — those already resolve correctly inside the runner.
+///
+/// Operators can override entirely via the `EXECLAW_RUNNER_HOST_ALIAS`
+/// env var if their network setup uses a different name.
+pub(crate) fn rewrite_url_for_container(url: &str) -> String {
+    let alias = std::env::var("EXECLAW_RUNNER_HOST_ALIAS")
+        .unwrap_or_else(|_| "host.docker.internal".to_owned());
+    rewrite_url_with_alias(url, &alias)
+}
+
+/// Pure helper, alias supplied explicitly. Drives both the
+/// production caller (`rewrite_url_for_container`) and the unit
+/// tests so we don't have to mutate process env (which Rust
+/// 2024 marks unsafe).
+fn rewrite_url_with_alias(url: &str, alias: &str) -> String {
+    // Cheap string scan: replace `://127.0.0.1` and `://localhost`
+    // with `://<alias>` only when they appear immediately after the
+    // scheme separator. Avoids accidentally munging path segments
+    // that happen to contain "localhost".
+    let lower = url.to_ascii_lowercase();
+    if let Some(idx) = lower.find("://127.0.0.1") {
+        let prefix = &url[..idx + 3];
+        let suffix = &url[idx + 3 + "127.0.0.1".len()..];
+        return format!("{prefix}{alias}{suffix}");
+    }
+    if let Some(idx) = lower.find("://localhost") {
+        let prefix = &url[..idx + 3];
+        let suffix = &url[idx + 3 + "localhost".len()..];
+        return format!("{prefix}{alias}{suffix}");
+    }
+    url.to_owned()
+}
+
 fn ensure_conversation(store: &ConversationStore<'_>, cid: &ConversationId) {
     if matches!(store.get(cid), Ok(Some(_))) {
         return;
@@ -2626,6 +2677,50 @@ mod tests {
         assert!(
             identity_start < base_start,
             "personality must precede base in the composed prompt"
+        );
+    }
+
+    #[test]
+    #[test]
+    fn rewrite_url_swaps_loopback_for_host_gateway_alias() {
+        // 127.0.0.1 → host alias.
+        assert_eq!(
+            super::rewrite_url_with_alias(
+                "http://127.0.0.1:8101/v1",
+                "host.docker.internal",
+            ),
+            "http://host.docker.internal:8101/v1",
+        );
+        // localhost → host alias (case-insensitive on the host).
+        assert_eq!(
+            super::rewrite_url_with_alias(
+                "http://localhost:11434/v1",
+                "host.docker.internal",
+            ),
+            "http://host.docker.internal:11434/v1",
+        );
+        // Custom alias passes through to the output.
+        assert_eq!(
+            super::rewrite_url_with_alias(
+                "http://127.0.0.1:8101/v1",
+                "host.lima.internal",
+            ),
+            "http://host.lima.internal:8101/v1",
+        );
+        // Real DNS / private-net IPs untouched.
+        assert_eq!(
+            super::rewrite_url_with_alias(
+                "http://infer.execlaw.local:8000/v1",
+                "host.docker.internal",
+            ),
+            "http://infer.execlaw.local:8000/v1",
+        );
+        assert_eq!(
+            super::rewrite_url_with_alias(
+                "http://192.168.1.50:8000/v1",
+                "host.docker.internal",
+            ),
+            "http://192.168.1.50:8000/v1",
         );
     }
 
