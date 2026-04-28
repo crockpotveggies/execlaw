@@ -1641,42 +1641,115 @@ pub async fn incognito_turn(
         .flatten()
         .map(|r| r.reasoning_enabled)
         .unwrap_or(false);
+    // 2026-04-28 — STREAMING. The original implementation used
+    // `chat_completions` (non-streaming) and hung the HTTP request
+    // for the full inference duration. With a 27B local model the
+    // browser's fetch threw `NetworkError when attempting to
+    // fetch resource` because the dev-proxy / browser tore the
+    // connection down before any bytes came back. Streaming via
+    // SSE keeps the wire active throughout, matching the regular
+    // chat path.
     let chat_req = ChatRequest {
         model: ModelId(state.config.model_id.clone()),
         messages,
         tools: None,
-        stream: false,
+        stream: true,
         temperature: None,
         max_tokens: None,
         chat_template_kwargs: Some(serde_json::json!({
             "enable_thinking": reasoning_enabled,
         })),
     };
-    let resp = match inference.chat_completions(&chat_req).await {
-        Ok(r) => r,
+    let upstream = match inference.chat_completions_stream(&chat_req).await {
+        Ok(s) => s,
         Err(e) => {
-            return err_500(&format!("incognito inference: {e}"));
+            return err_500(&format!("incognito stream open: {e}"));
         }
     };
-    let choice = resp.choices.first().cloned();
-    let raw_text = choice
-        .as_ref()
-        .and_then(|c| c.message.content.clone())
-        .unwrap_or_default();
-    // Defensive `<think>` strip — the chat-template knob suppresses
-    // them at the source, but a model that ignores the kwarg
-    // shouldn't leak reasoning into the operator's transcript.
-    let text = strip_think_blocks(&raw_text).trim().to_owned();
-    let finish_reason = choice.and_then(|c| c.finish_reason);
-    (
-        StatusCode::OK,
-        Json(IncognitoResponse {
-            text,
-            model: resp.model,
-            finish_reason,
-        }),
-    )
-        .into_response()
+
+    // Aggregate + relay. We frame each emitted text chunk as one
+    // SSE `data:` line so the SPA can render incrementally; the
+    // closing `data: {"done": true, ...}` carries the final
+    // text + model + finish_reason as a single JSON record so
+    // the client doesn't have to re-assemble the deltas itself
+    // (it gets both: the per-chunk live deltas AND a canonical
+    // final payload).
+    use axum::body::Body;
+    use axum::response::Response;
+    use futures::StreamExt;
+    let body_stream = async_stream::stream! {
+        let mut stream = std::pin::pin!(upstream);
+        let mut filter = crate::think_filter::ThinkBlockFilter::new();
+        let mut assembled = String::new();
+        let mut model = String::new();
+        let mut finish: Option<String> = None;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(c) => {
+                    if model.is_empty() {
+                        model = c.model.clone();
+                    }
+                    for ch in &c.choices {
+                        if let Some(t) = &ch.delta.content {
+                            if !t.is_empty() {
+                                let visible = filter.feed(t);
+                                if !visible.is_empty() {
+                                    assembled.push_str(&visible);
+                                    let payload = serde_json::json!({
+                                        "delta": visible,
+                                    });
+                                    yield Ok::<_, std::io::Error>(
+                                        bytes::Bytes::from(format!(
+                                            "data: {}\n\n",
+                                            payload,
+                                        )),
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(fr) = &ch.finish_reason {
+                            finish = Some(fr.clone());
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Surface upstream errors to the client as a
+                    // structured SSE event so the SPA can show a
+                    // banner instead of a silent fail.
+                    let payload = serde_json::json!({
+                        "error": format!("{e}"),
+                    });
+                    yield Ok::<_, std::io::Error>(bytes::Bytes::from(format!(
+                        "data: {}\n\n",
+                        payload,
+                    )));
+                    return;
+                }
+            }
+        }
+        let tail = filter.flush();
+        if !tail.is_empty() {
+            assembled.push_str(&tail);
+        }
+        let final_payload = serde_json::json!({
+            "done": true,
+            "text": assembled.trim(),
+            "model": model,
+            "finish_reason": finish,
+        });
+        yield Ok::<_, std::io::Error>(bytes::Bytes::from(format!(
+            "data: {}\n\n",
+            final_payload,
+        )));
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(body_stream))
+        .unwrap()
 }
 
 /// `POST /api/chats/:id/generate-title` — synthesise a 3-5 word

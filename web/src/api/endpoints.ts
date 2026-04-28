@@ -297,6 +297,13 @@ export async function patchThread(
 /// 2026-04-28 — incognito chat. Server runs one inference turn
 /// without persisting anything. Client owns the entire transcript
 /// in memory; navigation away forgets it.
+///
+/// **Streaming**: the endpoint returns `text/event-stream` and
+/// emits one `data: {"delta": "..."}` per visible chunk plus a
+/// closing `data: {"done": true, "text": "...", ...}`. The
+/// streaming shape avoids the long-lived non-streaming HTTP
+/// connection that previously tripped the dev proxy / browser
+/// fetch with a `NetworkError when attempting to fetch resource`.
 export interface IncognitoMessage {
     role: "user" | "assistant";
     content: string;
@@ -313,15 +320,110 @@ export interface IncognitoResponse {
     finish_reason: string | null;
 }
 
+export interface IncognitoStreamHooks {
+    /// Called once per visible token chunk so the SPA can render
+    /// progressively. Optional — callers that don't care about
+    /// live deltas can rely on the resolved Promise's `text`.
+    onDelta?: (delta: string) => void;
+}
+
 export async function postIncognitoTurn(
     body: IncognitoRequest,
     tokenAccessor: () => string | null,
+    hooks: IncognitoStreamHooks = {},
 ): Promise<IncognitoResponse> {
-    return apiFetch<IncognitoResponse>(
-        "/api/chats/incognito",
-        { method: "POST", body },
-        tokenAccessor,
-    );
+    const token = tokenAccessor();
+    const headers: Record<string, string> = {
+        "content-type": "application/json",
+        accept: "text/event-stream",
+    };
+    if (token) headers.authorization = `Bearer ${token}`;
+
+    let resp: Response;
+    try {
+        resp = await fetch("/api/chats/incognito", {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body),
+        });
+    } catch (e) {
+        throw new ApiError(
+            "network",
+            `network error talking to /api/chats/incognito: ${
+                (e as Error).message ?? e
+            }`,
+            0,
+        );
+    }
+    if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        throw new ApiError(
+            resp.status === 401 ? "unauthorized" : "server",
+            text || resp.statusText,
+            resp.status,
+        );
+    }
+
+    if (!resp.body) {
+        throw new ApiError(
+            "server",
+            "incognito endpoint returned no body",
+            resp.status,
+        );
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let final: IncognitoResponse | null = null;
+
+    // Frame the SSE stream as `data:` lines separated by `\n\n`
+    // — same wire shape the regular streaming chat handler uses.
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let idx: number;
+        while ((idx = buffer.indexOf("\n\n")) !== -1) {
+            const block = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 2);
+            for (const line of block.split("\n")) {
+                if (!line.startsWith("data:")) continue;
+                const json = line.slice(5).trim();
+                if (!json) continue;
+                let parsed: unknown;
+                try {
+                    parsed = JSON.parse(json);
+                } catch {
+                    continue;
+                }
+                const obj = parsed as Record<string, unknown>;
+                if (typeof obj.error === "string") {
+                    throw new ApiError("server", obj.error as string, 500);
+                }
+                if (obj.done === true) {
+                    final = {
+                        text: typeof obj.text === "string" ? obj.text : "",
+                        model: typeof obj.model === "string" ? obj.model : "",
+                        finish_reason:
+                            typeof obj.finish_reason === "string"
+                                ? obj.finish_reason
+                                : null,
+                    };
+                } else if (typeof obj.delta === "string") {
+                    hooks.onDelta?.(obj.delta);
+                }
+            }
+        }
+    }
+    if (!final) {
+        throw new ApiError(
+            "server",
+            "incognito stream ended without a final payload",
+            500,
+        );
+    }
+    return final;
 }
 
 /// 2026-04-28 — synthesise a 3-5 word title for a conversation from

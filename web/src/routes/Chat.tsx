@@ -308,6 +308,18 @@ export function Chat() {
                     const r = await postIncognitoTurn(
                         { messages: prior, text },
                         getToken,
+                        {
+                            onDelta: (delta) => {
+                                // Live-stream into the per-thread
+                                // streaming buffer; the existing
+                                // MessageStream component already
+                                // renders that buffer below the
+                                // committed messages, so incognito
+                                // chats animate in just like
+                                // regular ones.
+                                appendStreamingToken(targetId, delta);
+                            },
+                        },
                     );
                     appendMessage(targetId, {
                         seq: userSeq + 1,
@@ -316,7 +328,12 @@ export function Chat() {
                         actor: "agent",
                         committed_at: Math.floor(Date.now() / 1000),
                     });
+                    clearStreamingBuffer(targetId);
                 } catch (e) {
+                    // If the stream errored mid-way, drop any
+                    // partial buffer so we don't leave half a
+                    // reply hanging under the user's message.
+                    clearStreamingBuffer(targetId);
                     setTopError(
                         e instanceof Error ? e.message : "incognito send failed",
                     );
