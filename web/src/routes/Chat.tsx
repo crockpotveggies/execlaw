@@ -86,20 +86,33 @@ export function Chat() {
     // browser-back lands on the right conversation. Mirrors any
     // route change into the chat store; the inverse direction
     // (store → URL) lives at the call sites that activate threads
-    // (sidebar click, onNewThread, onSend mint). Incognito
-    // sessions are EXEMPT — their id never lands in the URL, and
-    // a route change (back to /chat or to a real thread) tears the
-    // incognito session down rather than letting it linger as
-    // ghost state.
+    // (sidebar click, onNewThread, onSend mint).
+    //
+    // Incognito quirk: their id deliberately stays out of the URL
+    // (URL stays at `/chat`), so a naive sync would see
+    // `routeConversationId=null` vs `activeId="incognito:..."` as
+    // a disagreement and immediately clobber the in-flight
+    // session. We therefore only wipe an active incognito session
+    // when the URL points at a *different real id* (sidebar click)
+    // — bare `/chat` is a no-op while the operator is mid-chat in
+    // incognito mode.
     useEffect(() => {
         const next = routeConversationId ?? null;
         const isIncognitoActive =
             typeof activeId === "string" && activeId.startsWith("incognito:");
-        if (isIncognitoActive && next !== activeId) {
-            // Operator navigated away from an in-flight incognito
-            // chat — drop the messages and reset the toggle.
+        if (isIncognitoActive) {
+            if (next === null || next === activeId) {
+                // URL is `/chat` (or already mirrors the incognito
+                // id) — keep the session alive, don't touch the
+                // store.
+                return;
+            }
+            // URL points at a real thread; operator navigated
+            // away. Tear down the incognito session.
             clearIncognitoMessages(activeId);
             setIncognito(false);
+            setActiveThread(next);
+            return;
         }
         if (next !== activeId) {
             setActiveThread(next);
