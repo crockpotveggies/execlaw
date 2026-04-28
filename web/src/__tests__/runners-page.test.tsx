@@ -1,4 +1,4 @@
-// Tests for the Settings → Runners view-only page (Phase 8.5).
+// Tests for the Settings → Runners view (Phase 16: supervisor-tracked).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -43,7 +43,7 @@ describe("RunnersPage", () => {
     it("renders the empty hint when there are no active runners", async () => {
         fetchMock.mockImplementation(async (url: string) => {
             if (url === "/api/admin/me") return meResponse();
-            if (url === "/api/admin/runners")
+            if (url === "/api/admin/runners/groups")
                 return new Response(
                     JSON.stringify({ runners: [], idle_ttl_secs: 600 }),
                     { status: 200 },
@@ -58,36 +58,55 @@ describe("RunnersPage", () => {
         });
     });
 
-    it("renders one row per runner with controller badge + idle countdown", async () => {
+    it("shows a friendly hint when the supervisor is disabled (503)", async () => {
         fetchMock.mockImplementation(async (url: string) => {
             if (url === "/api/admin/me") return meResponse();
-            if (url === "/api/admin/runners")
+            if (url === "/api/admin/runners/groups")
+                return new Response(
+                    JSON.stringify({
+                        error: {
+                            code: "runners_disabled",
+                            message: "runner supervisor not configured",
+                        },
+                    }),
+                    { status: 503 },
+                );
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        await waitFor(() => {
+            expect(
+                screen.getByText(/Runner supervisor is disabled/i),
+            ).toBeInTheDocument();
+        });
+    });
+
+    it("renders one row per runner with controller badge + idle countdown", async () => {
+        const now = Math.floor(Date.now() / 1000);
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/runners/groups")
                 return new Response(
                     JSON.stringify({
                         runners: [
                             {
-                                conversation_id: "ctrl-conv",
-                                principal_label: "controller",
-                                modality: "Text",
+                                group_id: "g-controller-uuid-aaaa",
                                 controller_runner: true,
-                                started_at: 0,
-                                last_active_at: 0,
-                                in_flight: false,
-                                turn_count: 12,
-                                restart_pending: false,
-                                idle_secs_remaining: null,
+                                status: "ready",
+                                started_at: now - 30,
+                                last_active_at: now - 5,
+                                in_flight_turns: 0,
+                                container_id: "abc123def456",
                             },
                             {
-                                conversation_id: "earl-conv",
-                                principal_label: "signal:+1555earl",
-                                modality: "Text",
+                                group_id: "g-earl-uuid-bbbb",
                                 controller_runner: false,
-                                started_at: 0,
-                                last_active_at: 0,
-                                in_flight: false,
-                                turn_count: 3,
-                                restart_pending: false,
-                                idle_secs_remaining: 480,
+                                status: "ready",
+                                // 120s ago, idle TTL 600s → "idle in 8m00s".
+                                started_at: now - 200,
+                                last_active_at: now - 120,
+                                in_flight_turns: 0,
+                                container_id: "789xyz012abc",
                             },
                         ],
                         idle_ttl_secs: 600,
@@ -100,35 +119,63 @@ describe("RunnersPage", () => {
         await waitFor(() => {
             expect(screen.getAllByTestId("runner-row")).toHaveLength(2);
         });
-        // Controller badge appears for ctrl-conv only.
+        // Controller badge appears for the controller's group only.
         expect(
             screen.getByText(/controller · always hot/i),
         ).toBeInTheDocument();
-        // Idle countdown for earl-conv.
+        // Idle countdown shows for non-controller, non-busy runners.
         expect(screen.getByText(/idle in/i)).toBeInTheDocument();
+        // 600 - 120 = 480 = 8m00s.
         expect(screen.getByText(/8m00s/)).toBeInTheDocument();
     });
 
-    it("posts /restart and refreshes when the button is clicked", async () => {
-        const calls: Array<{ url: string; init?: RequestInit }> = [];
-        fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
-            calls.push({ url, init });
+    it("renders an in-flight badge when a turn is running", async () => {
+        const now = Math.floor(Date.now() / 1000);
+        fetchMock.mockImplementation(async (url: string) => {
             if (url === "/api/admin/me") return meResponse();
-            if (url === "/api/admin/runners")
+            if (url === "/api/admin/runners/groups")
                 return new Response(
                     JSON.stringify({
                         runners: [
                             {
-                                conversation_id: "stuck-conv",
-                                principal_label: "Alice",
-                                modality: "Text",
+                                group_id: "busy-group",
                                 controller_runner: false,
+                                status: "ready",
+                                started_at: now - 10,
+                                last_active_at: now,
+                                in_flight_turns: 2,
+                                container_id: "cid",
+                            },
+                        ],
+                        idle_ttl_secs: 600,
+                    }),
+                    { status: 200 },
+                );
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        await waitFor(() => {
+            expect(screen.getByText(/2 in flight/i)).toBeInTheDocument();
+        });
+    });
+
+    it("posts /restart with the group_id and refreshes", async () => {
+        const calls: Array<{ url: string; init?: RequestInit }> = [];
+        fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+            calls.push({ url, init });
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/runners/groups")
+                return new Response(
+                    JSON.stringify({
+                        runners: [
+                            {
+                                group_id: "stuck-group-uuid",
+                                controller_runner: false,
+                                status: "ready",
                                 started_at: 0,
                                 last_active_at: 0,
-                                in_flight: true,
-                                turn_count: 1,
-                                restart_pending: false,
-                                idle_secs_remaining: null,
+                                in_flight_turns: 1,
+                                container_id: "cid",
                             },
                         ],
                         idle_ttl_secs: 600,
@@ -136,14 +183,13 @@ describe("RunnersPage", () => {
                     { status: 200 },
                 );
             if (
-                url === "/api/admin/runners/stuck-conv/restart" &&
+                url === "/api/admin/runners/groups/stuck-group-uuid/restart" &&
                 init?.method === "POST"
             ) {
                 return new Response("{}", { status: 200 });
             }
             return new Response("{}", { status: 200 });
         });
-        // Auto-confirm the restart dialog.
         vi.spyOn(window, "confirm").mockImplementation(() => true);
         mountPage();
         await waitFor(() => {
@@ -154,31 +200,77 @@ describe("RunnersPage", () => {
             expect(
                 calls.some(
                     (c) =>
-                        c.url === "/api/admin/runners/stuck-conv/restart" &&
+                        c.url ===
+                            "/api/admin/runners/groups/stuck-group-uuid/restart" &&
                         c.init?.method === "POST",
                 ),
             ).toBe(true);
         });
     });
 
-    it("operators see no Restart button (read-only)", async () => {
-        fetchMock.mockImplementation(async (url: string) => {
-            if (url === "/api/admin/me") return meResponse("operator");
-            if (url === "/api/admin/runners")
+    it("posts /wipe with the group_id when Wipe is clicked", async () => {
+        const calls: Array<{ url: string; init?: RequestInit }> = [];
+        fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+            calls.push({ url, init });
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/runners/groups")
                 return new Response(
                     JSON.stringify({
                         runners: [
                             {
-                                conversation_id: "c",
-                                principal_label: null,
-                                modality: "Text",
+                                group_id: "g-wipe-me",
                                 controller_runner: false,
+                                status: "ready",
                                 started_at: 0,
                                 last_active_at: 0,
-                                in_flight: false,
-                                turn_count: 0,
-                                restart_pending: false,
-                                idle_secs_remaining: 600,
+                                in_flight_turns: 0,
+                                container_id: "cid",
+                            },
+                        ],
+                        idle_ttl_secs: 600,
+                    }),
+                    { status: 200 },
+                );
+            if (
+                url === "/api/admin/runners/groups/g-wipe-me/wipe" &&
+                init?.method === "POST"
+            ) {
+                return new Response("{}", { status: 200 });
+            }
+            return new Response("{}", { status: 200 });
+        });
+        vi.spyOn(window, "confirm").mockImplementation(() => true);
+        mountPage();
+        await waitFor(() => {
+            expect(screen.getByTestId("runner-wipe")).toBeInTheDocument();
+        });
+        fireEvent.click(screen.getByTestId("runner-wipe"));
+        await waitFor(() => {
+            expect(
+                calls.some(
+                    (c) =>
+                        c.url === "/api/admin/runners/groups/g-wipe-me/wipe" &&
+                        c.init?.method === "POST",
+                ),
+            ).toBe(true);
+        });
+    });
+
+    it("operators see no Restart / Wipe buttons (read-only)", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse("operator");
+            if (url === "/api/admin/runners/groups")
+                return new Response(
+                    JSON.stringify({
+                        runners: [
+                            {
+                                group_id: "g",
+                                controller_runner: false,
+                                status: "ready",
+                                started_at: 0,
+                                last_active_at: 0,
+                                in_flight_turns: 0,
+                                container_id: null,
                             },
                         ],
                         idle_ttl_secs: 600,
@@ -190,9 +282,10 @@ describe("RunnersPage", () => {
         mountPage();
         await waitFor(() => {
             expect(
-                screen.getByText(/Only Controllers can restart runners/i),
+                screen.getByText(/Only Controllers can mutate runners/i),
             ).toBeInTheDocument();
         });
         expect(screen.queryByTestId("runner-restart")).toBeNull();
+        expect(screen.queryByTestId("runner-wipe")).toBeNull();
     });
 });

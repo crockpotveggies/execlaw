@@ -1,21 +1,26 @@
-// Settings → Runners (Phase 8.5 view-only + restart).
+// Settings → Runners (Phase 16: supervisor-tracked).
 //
-// Runners are managed automatically by the control plane — one per
-// conversation, hot for ~10 minutes idle, except the Controller's
-// runner which stays hot indefinitely. There's no "create" or
-// "delete" affordance here; the operator's only mutating action is
-// **Restart**, which forces a fresh hydration on the next turn
-// (used when a runner is wedged or the operator wants to drop a
-// stale in-memory state).
+// Each row is a per-principal-group runner container. The control
+// plane manages them automatically — one container per
+// `(channel, principals)` group, hot for ~10 min idle, except the
+// Controller's runner which stays hot indefinitely.
 //
-// See docs/runner-design.md for the full lifecycle policy.
+// Operator actions:
+//   * Restart → kill + respawn, workspace volume PRESERVED.
+//   * Wipe    → kill + remove the workspace volume too. The group
+//                row stays in the DB; only scratch files are gone.
+//
+// See docs/runner-design.md (and crates/server/src/runner_supervisor.rs)
+// for the full lifecycle policy.
 
 import { useCallback, useEffect, useState } from "react";
 import Button from "react-bootstrap/Button";
+import { ApiError } from "../api/client";
 import {
-    listRunners,
-    restartRunner,
-    type RunnerView,
+    listRunnerGroups,
+    restartRunnerGroup,
+    wipeRunnerGroup,
+    type GroupRunnerView,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
 
@@ -37,10 +42,14 @@ function fmtRelative(seconds_epoch: number, now: number): string {
     return `${Math.floor(delta / 86400)}d ago`;
 }
 
+function shortGroupId(id: string): string {
+    return id.length <= 12 ? id : `${id.slice(0, 8)}…${id.slice(-3)}`;
+}
+
 export function RunnersPage() {
     const auth = useAuth();
     const getToken = useCallback(() => auth.getAccessToken(), [auth]);
-    const [runners, setRunners] = useState<RunnerView[] | null>(null);
+    const [runners, setRunners] = useState<GroupRunnerView[] | null>(null);
     const [idleTtlSecs, setIdleTtlSecs] = useState<number | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [busyId, setBusyId] = useState<string | null>(null);
@@ -50,17 +59,30 @@ export function RunnersPage() {
 
     const refresh = useCallback(async () => {
         try {
-            const r = await listRunners(getToken);
+            const r = await listRunnerGroups(getToken);
             setRunners(r.runners);
             setIdleTtlSecs(r.idle_ttl_secs);
             setError(null);
         } catch (e) {
+            // 503 = supervisor disabled (EXECLAW_RUNNERS_ENABLED=0,
+            // Docker unreachable, or runner image not built). Show a
+            // friendly hint instead of a scary stack trace.
+            if (e instanceof ApiError && e.status === 503) {
+                setRunners([]);
+                setIdleTtlSecs(null);
+                setError(
+                    "Runner supervisor is disabled. The chat path is " +
+                        "running in legacy in-process mode. Re-enable " +
+                        "via EXECLAW_RUNNERS_ENABLED=1 (and ensure the " +
+                        "execlaw/runner:dev image is built) to see " +
+                        "live runners on this page.",
+                );
+                return;
+            }
             setError(e instanceof Error ? e.message : String(e));
         }
     }, [getToken]);
 
-    // Initial load + 5s polling so countdowns + status update without
-    // requiring a manual refresh.
     useEffect(() => {
         void refresh();
         const handle = setInterval(() => {
@@ -74,16 +96,41 @@ export function RunnersPage() {
     const canMutate = meRole === "controller";
 
     const onRestart = useCallback(
-        async (r: RunnerView) => {
+        async (r: GroupRunnerView) => {
             if (
                 !confirm(
-                    `Restart the runner for "${r.principal_label ?? r.conversation_id}"? Any in-flight tool call is dropped; the next turn will rehydrate from the event log.`,
+                    `Restart the runner for group ${shortGroupId(
+                        r.group_id,
+                    )}? Any in-flight turn is dropped. The workspace volume is PRESERVED — the next message respawns onto the same scratch.`,
                 )
             )
                 return;
-            setBusyId(r.conversation_id);
+            setBusyId(r.group_id);
             try {
-                await restartRunner(r.conversation_id, getToken);
+                await restartRunnerGroup(r.group_id, getToken);
+                await refresh();
+            } catch (e) {
+                setError(e instanceof Error ? e.message : String(e));
+            } finally {
+                setBusyId(null);
+            }
+        },
+        [getToken, refresh],
+    );
+
+    const onWipe = useCallback(
+        async (r: GroupRunnerView) => {
+            if (
+                !confirm(
+                    `Wipe workspace for group ${shortGroupId(
+                        r.group_id,
+                    )}? This kills the runner AND removes the workspace volume. The conversation history (event log) is untouched.`,
+                )
+            )
+                return;
+            setBusyId(r.group_id);
+            try {
+                await wipeRunnerGroup(r.group_id, getToken);
                 await refresh();
             } catch (e) {
                 setError(e instanceof Error ? e.message : String(e));
@@ -110,21 +157,23 @@ export function RunnersPage() {
             </div>
 
             <p className="execlaw-muted small mb-3">
-                The control plane manages one runner per conversation
-                automatically. The controller's runner is always hot;
-                every other runner is reaped after{" "}
+                The control plane manages one runner container per
+                principal group automatically. The controller's runner
+                stays hot indefinitely; every other runner is reaped
+                after{" "}
                 <strong>
                     {idleTtlSecs !== null
                         ? `${Math.floor(idleTtlSecs / 60)} min`
                         : "10 min"}
                 </strong>{" "}
-                idle. Use <strong>Restart</strong> only when a runner
-                is stuck.
+                idle. Use <strong>Restart</strong> to bounce a wedged
+                runner (workspace preserved) or <strong>Wipe</strong>{" "}
+                to also clear scratch files.
             </p>
 
             {!canMutate && (
                 <div className="execlaw-muted small mb-3">
-                    Read-only view. Only Controllers can restart runners.
+                    Read-only view. Only Controllers can mutate runners.
                 </div>
             )}
 
@@ -142,66 +191,87 @@ export function RunnersPage() {
                     conversation receives a message.
                 </div>
             ) : (
-                runners.map((r) => (
-                    <div
-                        className="execlaw-card"
-                        key={r.conversation_id}
-                        data-testid="runner-row"
-                        data-conversation-id={r.conversation_id}
-                    >
-                        <div className="d-flex align-items-center gap-2 mb-1">
-                            <span className="execlaw-card__title flex-grow-1">
-                                {r.principal_label ?? (
-                                    <code>{r.conversation_id}</code>
-                                )}
-                                {r.controller_runner && (
-                                    <span className="execlaw-trust-badge ms-2 is-controller">
-                                        controller · always hot
-                                    </span>
-                                )}
-                                {r.in_flight && (
+                runners.map((r) => {
+                    const idleSecs = r.controller_runner
+                        ? null
+                        : r.in_flight_turns > 0
+                        ? null
+                        : idleTtlSecs !== null
+                        ? Math.max(0, idleTtlSecs - (now - r.last_active_at))
+                        : null;
+                    return (
+                        <div
+                            className="execlaw-card"
+                            key={r.group_id}
+                            data-testid="runner-row"
+                            data-group-id={r.group_id}
+                        >
+                            <div className="d-flex align-items-center gap-2 mb-1">
+                                <span className="execlaw-card__title flex-grow-1">
+                                    <code>{shortGroupId(r.group_id)}</code>
+                                    {r.controller_runner && (
+                                        <span className="execlaw-trust-badge ms-2 is-controller">
+                                            controller · always hot
+                                        </span>
+                                    )}
+                                    {r.in_flight_turns > 0 && (
+                                        <span className="execlaw-trust-badge ms-2 is-known">
+                                            {r.in_flight_turns} in flight
+                                        </span>
+                                    )}
                                     <span className="execlaw-trust-badge ms-2 is-known">
-                                        in flight
+                                        {r.status}
                                     </span>
-                                )}
-                                {r.restart_pending && (
-                                    <span className="execlaw-trust-badge ms-2 is-limited">
-                                        restart pending
-                                    </span>
-                                )}
-                                <span className="execlaw-trust-badge ms-2 is-known">
-                                    {r.modality}
                                 </span>
-                            </span>
-                            {canMutate && (
-                                <Button
-                                    size="sm"
-                                    variant="outline-danger"
-                                    disabled={busyId === r.conversation_id}
-                                    onClick={() => void onRestart(r)}
-                                    data-testid="runner-restart"
-                                >
-                                    Restart
-                                </Button>
-                            )}
+                                {canMutate && (
+                                    <>
+                                        <Button
+                                            size="sm"
+                                            variant="outline-secondary"
+                                            disabled={busyId === r.group_id}
+                                            onClick={() => void onRestart(r)}
+                                            data-testid="runner-restart"
+                                        >
+                                            Restart
+                                        </Button>
+                                        <Button
+                                            size="sm"
+                                            variant="outline-danger"
+                                            disabled={busyId === r.group_id}
+                                            onClick={() => void onWipe(r)}
+                                            data-testid="runner-wipe"
+                                        >
+                                            Wipe
+                                        </Button>
+                                    </>
+                                )}
+                            </div>
+                            <div className="execlaw-muted small">
+                                started {fmtRelative(r.started_at, now)}
+                                {" · last active "}
+                                {fmtRelative(r.last_active_at, now)}
+                                {!r.controller_runner &&
+                                    r.in_flight_turns === 0 &&
+                                    idleSecs !== null && (
+                                        <>
+                                            {" · idle in "}
+                                            <strong>
+                                                {fmtCountdown(idleSecs)}
+                                            </strong>
+                                        </>
+                                    )}
+                                {r.container_id && (
+                                    <>
+                                        {" · container "}
+                                        <code>
+                                            {r.container_id.slice(0, 12)}
+                                        </code>
+                                    </>
+                                )}
+                            </div>
                         </div>
-                        <div className="execlaw-muted small">
-                            <code>{r.conversation_id}</code>
-                            {" · "}
-                            {r.turn_count} turn{r.turn_count === 1 ? "" : "s"}
-                            {" · last active "}
-                            {fmtRelative(r.last_active_at, now)}
-                            {!r.controller_runner && !r.in_flight && (
-                                <>
-                                    {" · idle in "}
-                                    <strong>
-                                        {fmtCountdown(r.idle_secs_remaining)}
-                                    </strong>
-                                </>
-                            )}
-                        </div>
-                    </div>
-                ))
+                    );
+                })
             )}
         </div>
     );

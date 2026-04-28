@@ -580,6 +580,62 @@ export async function restartRunner(
     );
 }
 
+// ---- /api/admin/runners/groups (Phase 16: supervisor-tracked) ------
+//
+// Live per-principal-group runners. Replaces `/api/admin/runners` for
+// the Settings → Runners page. The legacy endpoint continues to be
+// served for backwards-compat but only reflects the in-process
+// bookkeeping registry, which loses entries 10 minutes after the last
+// turn even if the underlying container is still hot.
+
+export interface GroupRunnerView {
+    group_id: string;
+    controller_runner: boolean;
+    /// "spawning" | "ready" | "stopping" | "dead"
+    status: string;
+    started_at: number;
+    last_active_at: number;
+    in_flight_turns: number;
+    container_id: string | null;
+}
+
+export interface GroupRunnerListResponse {
+    runners: GroupRunnerView[];
+    idle_ttl_secs: number;
+}
+
+export async function listRunnerGroups(
+    tokenAccessor: () => string | null,
+): Promise<GroupRunnerListResponse> {
+    return apiFetch<GroupRunnerListResponse>(
+        "/api/admin/runners/groups",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function restartRunnerGroup(
+    groupId: string,
+    tokenAccessor: () => string | null,
+): Promise<unknown> {
+    return apiFetch(
+        `/api/admin/runners/groups/${encodeURIComponent(groupId)}/restart`,
+        { method: "POST", body: {} },
+        tokenAccessor,
+    );
+}
+
+export async function wipeRunnerGroup(
+    groupId: string,
+    tokenAccessor: () => string | null,
+): Promise<unknown> {
+    return apiFetch(
+        `/api/admin/runners/groups/${encodeURIComponent(groupId)}/wipe`,
+        { method: "POST", body: {} },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/backends (Phase 8.5; replaces "deployments" CRUD) -
 
 export type BackendPurpose = "Standard" | "Small" | "VoiceSTT" | "VoiceTTS";
