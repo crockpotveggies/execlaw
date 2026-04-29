@@ -37,8 +37,10 @@
 //   `(dx, dy)` to `(0, 0)` on the element that exists post-swap.
 //
 // REDUCED MOTION
-//   `(prefers-reduced-motion: reduce)` skips the timeline; the
-//   `onComplete` still fires so the focus-retention path runs.
+//   `(prefers-reduced-motion: reduce)` swaps the slide-tween for a
+//   short opacity fade — no translation, but the operator still
+//   gets a visual cue that the view changed. `onComplete` fires
+//   either way so the focus-retention path runs.
 //
 // 2026-04-28.
 
@@ -86,7 +88,14 @@ export function useChatTransition({
         const target = document.querySelector<HTMLElement>(
             SELECTORS.composerShell,
         );
-        if (!target) return;
+        if (!target) {
+            // eslint-disable-next-line no-console
+            console.log(
+                "[chat-transition] capture: no element matched",
+                SELECTORS.composerShell,
+            );
+            return;
+        }
         const rect = target.getBoundingClientRect();
         pendingRef.current = {
             top: rect.top,
@@ -94,15 +103,32 @@ export function useChatTransition({
             width: rect.width,
             height: rect.height,
         };
+        // eslint-disable-next-line no-console
+        console.log("[chat-transition] capture", pendingRef.current);
     }, []);
 
     useLayoutEffect(() => {
         const justFlippedTrue =
             prevHasContentRef.current === false && hasContent === true;
         prevHasContentRef.current = hasContent;
-        if (!justFlippedTrue) return;
+        if (!justFlippedTrue) {
+            // eslint-disable-next-line no-console
+            console.log("[chat-transition] effect: not a false→true flip", {
+                prev: !justFlippedTrue,
+                hasContent,
+            });
+            return;
+        }
         const saved = pendingRef.current;
-        if (!saved) return;
+        if (!saved) {
+            // eslint-disable-next-line no-console
+            console.log(
+                "[chat-transition] effect: flipped true but no saved rect — capture path didn't run",
+            );
+            return;
+        }
+        // eslint-disable-next-line no-console
+        console.log("[chat-transition] effect: starting animation", saved);
         pendingRef.current = null;
 
         const fireOnComplete = () => {
@@ -113,34 +139,61 @@ export function useChatTransition({
             }
         };
 
-        if (prefersReducedMotion()) {
-            fireOnComplete();
-            return;
-        }
-
         // Find the NEW composer (post-swap). It exists in the
         // active pane's tree, with the same data-flip-id.
         const newComposer = document.querySelector<HTMLElement>(
             SELECTORS.composerShell,
         );
         if (!newComposer) {
+            // eslint-disable-next-line no-console
+            console.log(
+                "[chat-transition] effect: new composer not found post-swap",
+            );
             fireOnComplete();
             return;
         }
 
-        // Compute the translate delta: where the OLD welcome
-        // composer was, vs where the NEW active composer is now.
-        // The new element's rect is its natural post-swap position;
-        // animating its transform from `(dx, dy)` to `(0, 0)` makes
-        // it visually start at the old position and slide to the
-        // new one without disrupting flex layout.
+        const reduced = prefersReducedMotion();
+        // eslint-disable-next-line no-console
+        console.log("[chat-transition] reduced-motion?", reduced);
+
+        if (reduced) {
+            // Honor the OS preference: no translation, but still a
+            // brief fade so the operator gets a visual cue.
+            gsap.fromTo(
+                newComposer,
+                { opacity: 0 },
+                {
+                    opacity: 1,
+                    duration: FADE_DURATION_S,
+                    ease: "power2.out",
+                    onComplete: fireOnComplete,
+                },
+            );
+            gsap.fromTo(
+                SELECTORS.activeChrome,
+                { opacity: 0 },
+                {
+                    opacity: 1,
+                    duration: FADE_DURATION_S,
+                    ease: "power2.out",
+                },
+            );
+            return;
+        }
+
+        // Compute the translate delta.
         const newRect = newComposer.getBoundingClientRect();
         const dx = saved.left - newRect.left;
         const dy = saved.top - newRect.top;
+        // eslint-disable-next-line no-console
+        console.log("[chat-transition] delta", { dx, dy, newRect });
 
-        // Bail if nothing actually moved (already at the same spot —
-        // shouldn't happen but cheap to guard).
         if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) {
+            // eslint-disable-next-line no-console
+            console.log(
+                "[chat-transition] effect: no-op — composer didn't move",
+            );
             fireOnComplete();
             return;
         }

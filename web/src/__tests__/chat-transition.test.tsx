@@ -238,7 +238,7 @@ describe("useChatTransition", () => {
         expect(fromToSpy).not.toHaveBeenCalled();
     });
 
-    it("honours prefers-reduced-motion: skips fromTo but still fires onComplete", () => {
+    it("honours prefers-reduced-motion: opacity-only fade, no translation, onComplete still fires", () => {
         const mqSpy = vi.spyOn(window, "matchMedia").mockImplementation(
             (q: string) =>
                 ({
@@ -263,7 +263,17 @@ describe("useChatTransition", () => {
         act(() => {
             fireEvent.click(screen.getByTestId("trigger-send"));
         });
-        expect(fromToSpy).not.toHaveBeenCalled();
+        // Reduced-motion path tweens opacity on the composer + chrome
+        // (two fromTo calls). Neither should include x/y translation.
+        expect(fromToSpy).toHaveBeenCalledTimes(2);
+        for (const call of fromToSpy.mock.calls) {
+            const fromVars = call[1] as Record<string, unknown>;
+            const toVars = call[2] as Record<string, unknown>;
+            expect(fromVars.x).toBeUndefined();
+            expect(fromVars.y).toBeUndefined();
+            expect(toVars.x).toBeUndefined();
+            expect(toVars.y).toBeUndefined();
+        }
         expect(onComplete).toHaveBeenCalledTimes(1);
         mqSpy.mockRestore();
     });
