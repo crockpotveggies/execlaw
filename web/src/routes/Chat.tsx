@@ -11,6 +11,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Navigate, useNavigate, useParams } from "react-router-dom";
+import { useChatTransition } from "../anim/useChatTransition";
 import { useScreenTransition } from "../anim/useScreenTransition";
 import { ApiError } from "../api/client";
 import {
@@ -675,6 +676,39 @@ function ChatPane({
     const hasContent =
         activeId !== null &&
         ((messages?.length ?? 0) > 0 || (streaming?.length ?? 0) > 0);
+
+    // 2026-04-28 — GSAP Flip transition WelcomeView → ActiveThreadPane
+    // on first send. `captureBeforeFirstSend` gets called from
+    // WelcomeView's onSend wrapper BEFORE the parent's onSend
+    // triggers the state change that flips `hasContent`. The hook's
+    // useLayoutEffect picks up the flip and animates the new
+    // composer's appearance from the welcome composer's saved
+    // position. Direct deep-link navigation (no welcome view ever
+    // mounted) makes captureBeforeFirstSend a no-op so the hook
+    // skips the timeline and the active pane mounts cleanly.
+    //
+    // After the timeline lands (or immediately under reduced-motion)
+    // we focus the new composer's textarea so the operator can
+    // keep typing — the welcome composer's textarea unmounts during
+    // the swap, which would otherwise drop focus to <body>.
+    const { captureBeforeFirstSend } = useChatTransition({
+        hasContent,
+        onComplete: () => {
+            const ta = document.querySelector<HTMLTextAreaElement>(
+                '[data-testid="composer-input"]',
+            );
+            ta?.focus();
+        },
+    });
+    const onSendWithFlipCapture = useCallback(
+        (text: string) => {
+            if (!hasContent) {
+                captureBeforeFirstSend();
+            }
+            return onSend(text);
+        },
+        [hasContent, captureBeforeFirstSend, onSend],
+    );
     // 2026-04-28 dev-only: diagnostic for the incognito flash bug.
     if (
         typeof activeId === "string" &&
@@ -701,7 +735,7 @@ function ChatPane({
                     sendVoiceControl={sendVoiceControl}
                 />
                 <WelcomeView
-                    onSend={onSend}
+                    onSend={onSendWithFlipCapture}
                     sendVoiceFrame={sendVoiceFrame}
                     sendVoiceControl={sendVoiceControl}
                     onStop={onStop}
@@ -883,7 +917,7 @@ function ActiveThreadPane({
 
             <MessageStream conversationId={conversationId} />
 
-            <div className="execlaw-composer">
+            <div className="execlaw-composer" data-flip-id="composer-shell">
                 <ApprovalCard
                     approval={approval}
                     busy={approvalBusy}

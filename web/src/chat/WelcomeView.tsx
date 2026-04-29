@@ -123,7 +123,10 @@ export function WelcomeView({
                 <span>execlaw</span>
             </div>
 
-            <div className="execlaw-welcome__composer">
+            <div
+                className="execlaw-welcome__composer"
+                data-flip-id="composer-shell"
+            >
                 <Composer
                     onSend={onSend}
                     sendVoiceFrame={sendVoiceFrame}

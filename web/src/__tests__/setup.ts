@@ -49,6 +49,38 @@ vi.mock("gsap", () => {
         if (vars && typeof vars.onComplete === "function") vars.onComplete();
         return { kill() {}, then: () => Promise.resolve() };
     };
+    // Chainable timeline stub. Every `.add/.to/.from/.fromTo` returns
+    // the same instance so the call sites can still chain. Each
+    // per-tween call fires THAT tween's `vars.onComplete` (matching
+    // the real GSAP contract); the timeline-level `cfg.onComplete`
+    // fires exactly once when the factory is called, simulating
+    // "all tweens finished" under jsdom's synchronous test loop.
+    const timeline = (cfg?: Vars) => {
+        const tl = {
+            add: (_target: unknown, _at?: number) => tl,
+            to: (_t: unknown, vars?: Vars, _at?: number) => {
+                fire(vars);
+                return tl;
+            },
+            from: (_t: unknown, vars?: Vars, _at?: number) => {
+                fire(vars);
+                return tl;
+            },
+            fromTo: (
+                _t: unknown,
+                _f: Vars | undefined,
+                vars?: Vars,
+                _at?: number,
+            ) => {
+                fire(vars);
+                return tl;
+            },
+            kill() {},
+            then: () => Promise.resolve(),
+        };
+        fire(cfg);
+        return tl;
+    };
     const gsap = {
         to: (_t: unknown, vars?: Vars) => fire(vars),
         from: (_t: unknown, vars?: Vars) => fire(vars),
@@ -63,8 +95,31 @@ vi.mock("gsap", () => {
             }
             return { kill() {}, revert() {} };
         },
+        timeline,
     };
     return { default: gsap, gsap };
+});
+
+// GSAP Flip plugin mock. `getState` returns a sentinel object; `from`
+// is treated like a regular tween — fires `onComplete` synchronously.
+// Real Flip captures DOM rects and animates transforms; tests only
+// need to confirm the call shape (was `getState` invoked? was
+// `from` invoked with the saved state?), so a stub is sufficient.
+vi.mock("gsap/Flip", () => {
+    type Vars = Record<string, unknown> & { onComplete?: () => void };
+    const Flip = {
+        getState: (_targets: unknown) => ({
+            __flipMockState: true,
+            targets: _targets,
+        }),
+        from: (_state: unknown, vars?: Vars) => {
+            if (vars && typeof vars.onComplete === "function") {
+                vars.onComplete();
+            }
+            return { kill() {}, then: () => Promise.resolve() };
+        },
+    };
+    return { default: Flip, Flip };
 });
 
 vi.mock("@gsap/react", () => ({
