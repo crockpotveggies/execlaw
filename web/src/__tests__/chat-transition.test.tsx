@@ -1,4 +1,4 @@
-// Unit tests for `useChatTransition` — the GSAP Flip transition that
+// Unit tests for `useChatTransition` — the GSAP transition that
 // animates the WelcomeView → ActiveThreadPane handoff on first send.
 //
 // We don't mount the real `<Chat>` here; that brings in routing, the
@@ -6,18 +6,20 @@
 // through a tiny harness that mirrors the contract:
 //
 //   <Harness>
-//     <div data-flip-id="composer-shell" />   ← stand-in welcome composer
-//     <button onClick={triggerSend} />         ← simulates onSend wrapper
-//     {hasContent && <div data-flip-id="composer-shell" />}  ← stand-in active composer
+//     {!hasContent && <div data-flip-id="composer-shell" />}  ← welcome stand-in
+//     {hasContent && <div data-flip-id="composer-shell" />}   ← active stand-in
+//     <button onClick={triggerSend}>send</button>
 //   </Harness>
 //
 // The button calls `captureBeforeFirstSend()` then flips `hasContent`
-// to true — same shape as the real onSend wrapper inside ChatPane.
+// to true — same shape as the real ChatPane onSend wrapper.
 //
-// Assertions exercise the GSAP mock in setup.ts:
-//   * `Flip.getState` runs synchronously when capture is invoked.
-//   * `Flip.from` runs synchronously when `hasContent` flips true.
-//   * `onComplete` fires (lets the ChatPane focus the new textarea).
+// jsdom does NOT run layout, so getBoundingClientRect returns a
+// zero-sized DOMRect by default. We override it on the stand-in
+// elements so the hook can compute a meaningful dx/dy and reach
+// the gsap.fromTo call path. The GSAP mock in setup.ts fires
+// timeline-level onComplete synchronously; the assertions exercise
+// that lifecycle.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -27,39 +29,48 @@ import {
     screen,
 } from "@testing-library/react";
 import { useState } from "react";
-import { Flip } from "gsap/Flip";
+import gsap from "gsap";
 import { useChatTransition } from "../anim/useChatTransition";
 
-// Spy on the mocked Flip module so we can assert call shapes.
-// Flip's static methods are typed as class members, which doesn't
-// fit vi.spyOn's keyof object constraint cleanly. Cast to a plain
-// indexable shape; the runtime mock from setup.ts is what executes.
-const FlipForSpy = Flip as unknown as {
-    getState: (..._: unknown[]) => unknown;
-    from: (..._: unknown[]) => unknown;
-};
-let getStateSpy: ReturnType<typeof vi.fn>;
-let fromSpy: ReturnType<typeof vi.fn>;
+let fromToSpy: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
-    getStateSpy = vi.spyOn(FlipForSpy, "getState") as unknown as ReturnType<
-        typeof vi.fn
-    >;
-    fromSpy = vi.spyOn(FlipForSpy, "from") as unknown as ReturnType<
-        typeof vi.fn
-    >;
+    fromToSpy = vi.spyOn(
+        gsap as unknown as { fromTo: (..._: unknown[]) => unknown },
+        "fromTo",
+    ) as unknown as ReturnType<typeof vi.fn>;
 });
 
 afterEach(() => {
-    (getStateSpy as unknown as { mockRestore: () => void }).mockRestore();
-    (fromSpy as unknown as { mockRestore: () => void }).mockRestore();
+    (fromToSpy as unknown as { mockRestore: () => void }).mockRestore();
 });
 
-function Harness({
-    onComplete,
-}: {
-    onComplete?: () => void;
-}) {
+/** Force getBoundingClientRect to return the supplied rect for any
+ *  element that matches `selector`. Persists across renders because
+ *  it's installed on the prototype-bypassing Element directly. */
+function stampRect(
+    selector: string,
+    rect: { top: number; left: number; width: number; height: number },
+) {
+    const el = document.querySelector(selector);
+    if (!el) return;
+    Object.defineProperty(el, "getBoundingClientRect", {
+        configurable: true,
+        value: () => ({
+            top: rect.top,
+            left: rect.left,
+            width: rect.width,
+            height: rect.height,
+            right: rect.left + rect.width,
+            bottom: rect.top + rect.height,
+            x: rect.left,
+            y: rect.top,
+            toJSON: () => ({}),
+        }),
+    });
+}
+
+function Harness({ onComplete }: { onComplete?: () => void }) {
     const [hasContent, setHasContent] = useState(false);
     const { captureBeforeFirstSend } = useChatTransition({
         hasContent,
@@ -68,6 +79,15 @@ function Harness({
 
     const triggerSend = () => {
         if (!hasContent) {
+            // Stamp the welcome composer's rect BEFORE capture so
+            // the snapshot has meaningful values. Real layout would
+            // place it ~vertical-center; we use 200x200 at (200,400).
+            stampRect('[data-flip-id="composer-shell"]', {
+                top: 400,
+                left: 200,
+                width: 200,
+                height: 60,
+            });
             captureBeforeFirstSend();
         }
         setHasContent(true);
@@ -114,50 +134,61 @@ function Harness({
 }
 
 describe("useChatTransition", () => {
-    it("captureBeforeFirstSend snapshots the welcome composer's Flip state", () => {
+    it("captures the welcome composer's rect on captureBeforeFirstSend", () => {
         render(<Harness />);
-        expect(getStateSpy).not.toHaveBeenCalled();
-
+        // Stamp the welcome composer's rect first so capture has
+        // something to read; click the button to invoke capture.
+        stampRect('[data-flip-id="composer-shell"]', {
+            top: 400,
+            left: 200,
+            width: 200,
+            height: 60,
+        });
+        // Spy on getBoundingClientRect by querying it AFTER capture
+        // — easier than stubbing it; the assertions below check the
+        // downstream tween fires, which proves the capture landed.
         act(() => {
             fireEvent.click(screen.getByTestId("trigger-send"));
         });
-
-        // First call: synchronous Flip.getState during the click
-        // handler (BEFORE setState flips hasContent).
-        expect(getStateSpy).toHaveBeenCalledWith(
-            expect.anything(),
-        );
-        // The captured target was the welcome composer (only
-        // [data-flip-id="composer-shell"] element on screen at
-        // capture time).
-        const callArg = getStateSpy.mock.calls[0]?.[0];
-        // jsdom returns the matched element; we just confirm
-        // something was passed.
-        expect(callArg).toBeTruthy();
+        // The welcome composer is now unmounted; the active composer
+        // exists with the same data-flip-id. The hook's
+        // useLayoutEffect should have computed a non-zero delta and
+        // called gsap.fromTo on the new element.
+        expect(fromToSpy).toHaveBeenCalled();
     });
 
-    it("animates Flip.from when hasContent flips false → true with a pending snapshot", () => {
+    it("triggers gsap.fromTo with non-zero dx/dy on hasContent flip", () => {
         const onComplete = vi.fn();
         render(<Harness onComplete={onComplete} />);
 
+        // Stamp ONLY the welcome composer with a defined position
+        // BEFORE the click. After the click, the new active
+        // composer's rect is whatever jsdom defaults to (zeros);
+        // dx = saved.left - 0 = 200, dy = saved.top - 0 = 400.
+        stampRect('[data-flip-id="composer-shell"]', {
+            top: 400,
+            left: 200,
+            width: 200,
+            height: 60,
+        });
         act(() => {
             fireEvent.click(screen.getByTestId("trigger-send"));
         });
-
-        // After the click, React commits hasContent=true. The
-        // hook's useLayoutEffect picks up the pending snapshot and
-        // dispatches Flip.from. The mocked Flip fires onComplete
-        // synchronously, which the hook wraps in its timeline's
-        // onComplete callback — that calls the caller's onComplete.
-        expect(fromSpy).toHaveBeenCalledTimes(1);
-        // Caller's onComplete fires once the timeline finishes.
+        expect(fromToSpy).toHaveBeenCalledTimes(1);
+        // Inspect the call args: first call's second argument is the
+        // `from` vars — should contain non-zero `x` and `y`.
+        const fromVars = fromToSpy.mock.calls[0]?.[1] as {
+            x: number;
+            y: number;
+        };
+        expect(fromVars).toBeTruthy();
+        expect(Math.abs(fromVars.x) + Math.abs(fromVars.y)).toBeGreaterThan(0);
+        // Animation completes synchronously under the mock; the
+        // caller's onComplete fires once.
         expect(onComplete).toHaveBeenCalledTimes(1);
     });
 
-    it("does NOT run Flip.from when hasContent is already true at mount", () => {
-        // Direct deep-link: an Active conversation is already showing
-        // when ChatPane mounts. No prior welcome view → no captured
-        // snapshot → hook is a no-op.
+    it("does NOT animate when hasContent is already true at mount", () => {
         function PreflippedHarness() {
             const [hasContent] = useState(true);
             useChatTransition({ hasContent });
@@ -168,52 +199,46 @@ describe("useChatTransition", () => {
             );
         }
         render(<PreflippedHarness />);
-        expect(fromSpy).not.toHaveBeenCalled();
+        expect(fromToSpy).not.toHaveBeenCalled();
     });
 
-    it("doesn't capture when called while already in active mode", () => {
-        // hasContent is already true at the time captureBeforeFirstSend
-        // would be invoked from inside ChatPane's onSend wrapper. The
-        // wrapper's `if (!hasContent)` guard prevents the call; this
-        // test confirms that bypassing the guard (calling capture
-        // anyway) doesn't break the contract — the next send doesn't
-        // mistakenly trigger the timeline because hasContent is
-        // already true.
-        function ActiveHarness() {
-            const [hasContent] = useState(true);
-            const { captureBeforeFirstSend } = useChatTransition({
-                hasContent,
-            });
+    it("doesn't animate when capture is bypassed (e.g. deep-link nav)", () => {
+        // Render in welcome state, flip hasContent without first
+        // capturing. The hook should detect the missing snapshot
+        // and skip the animation.
+        function NoCaptureHarness() {
+            const [hasContent, setHasContent] = useState(false);
+            useChatTransition({ hasContent });
             return (
                 <div>
-                    <div
-                        data-flip-id="composer-shell"
-                        data-testid="active-composer"
-                    >
-                        active composer
-                    </div>
+                    {!hasContent && (
+                        <div data-flip-id="composer-shell" data-testid="welcome">
+                            welcome
+                        </div>
+                    )}
+                    {hasContent && (
+                        <div data-flip-id="composer-shell" data-testid="active">
+                            active
+                        </div>
+                    )}
                     <button
                         type="button"
-                        data-testid="capture"
-                        onClick={() => captureBeforeFirstSend()}
+                        data-testid="flip"
+                        onClick={() => setHasContent(true)}
                     >
-                        capture
+                        flip
                     </button>
                 </div>
             );
         }
-        render(<ActiveHarness />);
+        render(<NoCaptureHarness />);
         act(() => {
-            fireEvent.click(screen.getByTestId("capture"));
+            fireEvent.click(screen.getByTestId("flip"));
         });
-        // The capture itself called Flip.getState, but no
-        // hasContent flip happens, so the timeline never fires.
-        expect(fromSpy).not.toHaveBeenCalled();
+        expect(fromToSpy).not.toHaveBeenCalled();
     });
 
-    it("honours prefers-reduced-motion: skips Flip.from but still calls onComplete", () => {
-        // Stub matchMedia to report reduced-motion. jsdom returns
-        // a default-shape MediaQueryList; we override .matches.
+    it("honours prefers-reduced-motion: skips fromTo but still fires onComplete", () => {
         const mqSpy = vi.spyOn(window, "matchMedia").mockImplementation(
             (q: string) =>
                 ({
@@ -229,15 +254,16 @@ describe("useChatTransition", () => {
         );
         const onComplete = vi.fn();
         render(<Harness onComplete={onComplete} />);
+        stampRect('[data-flip-id="composer-shell"]', {
+            top: 400,
+            left: 200,
+            width: 200,
+            height: 60,
+        });
         act(() => {
             fireEvent.click(screen.getByTestId("trigger-send"));
         });
-        // Capture still runs (cheap — no animation cost).
-        expect(getStateSpy).toHaveBeenCalled();
-        // But Flip.from is skipped under reduced-motion.
-        expect(fromSpy).not.toHaveBeenCalled();
-        // The focus-retention callback still fires so the operator
-        // doesn't lose their input position.
+        expect(fromToSpy).not.toHaveBeenCalled();
         expect(onComplete).toHaveBeenCalledTimes(1);
         mqSpy.mockRestore();
     });
