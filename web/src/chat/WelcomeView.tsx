@@ -8,6 +8,7 @@
 
 import { useAuth } from "../auth/AuthContext";
 import { Composer } from "./Composer";
+import { MascotGreeting } from "./MascotGreeting";
 import { useVoiceReadiness } from "./useVoiceReadiness";
 
 const SUGGESTIONS: ReadonlyArray<{ title: string; sub: string; prompt: string }> = [
@@ -119,8 +120,14 @@ export function WelcomeView({
                 </button>
             )}
             <div className="execlaw-welcome__brand">
-                <i className="bi bi-stars" aria-hidden />
-                <span>execlaw</span>
+                <MascotGreeting
+                    size={216}
+                    userName={
+                        auth.user?.display_name ||
+                        auth.user?.username ||
+                        "friend"
+                    }
+                />
             </div>
 
             <div

@@ -1358,6 +1358,11 @@ body {
     gap: 1.5rem;
     padding: 2rem 1.5rem;
     min-height: 0;
+    // Y scrolls when content is tall; X stays visible so the
+    // mascot greeting's morphed brackets can extend past the
+    // mascot's nominal slot without being clipped or
+    // triggering a horizontal scrollbar.
+    overflow-x: visible;
     overflow-y: auto;
 }
 
@@ -1428,6 +1433,61 @@ body {
         color: $accent;
         font-size: 2rem;
     }
+}
+
+// Mascot — vector avatar with a GSAP-driven iris that tracks the
+// cursor. The hair, beard, and parent eye inherit `currentColor`,
+// painted with the brand accent. The iris is filled with the
+// page-deep background colour so it reads as a hole punched
+// through the eye (matching the fill-rule cutout the source SVG
+// produced).
+//
+// `overflow: visible` is critical: the greeting morph slides the
+// hair / beard groups well outside the SVG's viewBox in viewBox
+// coordinates, and SVG's default `overflow: hidden` would clip
+// them at the rim.
+.execlaw-mascot {
+    color: $accent;
+    flex-shrink: 0;
+    overflow: visible;
+
+    .execlaw-mascot__iris path {
+        fill: $bg-deep;
+    }
+}
+
+// Mascot greeting stage — the host frame for the mascot SVG and
+// the welcome overlay. The SVG's own shapes morph into bracket-
+// like silhouettes via GSAP; the welcome line is a plain HTML
+// span centred over the SVG, fading in once the morph completes.
+// `overflow: visible` mirrors the SVG override above — when the
+// brackets slide outward they extend horizontally past the
+// stage's nominal `size × size` slot.
+.execlaw-mascot-stage {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    overflow: visible;
+}
+
+// Centred over the SVG, allowed to overflow horizontally so
+// longer names don't get clipped by the SVG's square slot. GSAP
+// owns the opacity/scale; the static `opacity: 0` here is just
+// the initial state before the timeline fires.
+.execlaw-mascot-stage__text {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 1.4rem;
+    font-weight: 600;
+    color: $text-primary;
+    letter-spacing: -0.005em;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
 }
 
 .execlaw-welcome__composer {

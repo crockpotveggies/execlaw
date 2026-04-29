@@ -75,6 +75,9 @@ vi.mock("gsap", () => {
                 fire(vars);
                 return tl;
             },
+            // `set` is a synchronous state set; no tween, no
+            // onComplete to fire — just chain.
+            set: (_t: unknown, _vars?: Vars, _at?: number) => tl,
             kill() {},
             then: () => Promise.resolve(),
         };
@@ -86,6 +89,13 @@ vi.mock("gsap", () => {
         from: (_t: unknown, vars?: Vars) => fire(vars),
         fromTo: (_t: unknown, _f: Vars | undefined, vars?: Vars) => fire(vars),
         set: () => ({ kill() {} }),
+        // `quickTo` returns a setter function. In production it tweens
+        // the property smoothly; under the mock we just no-op so call
+        // sites that use `xTo(value)` don't crash.
+        quickTo: (_target: unknown, _prop: string, _vars?: Vars) => {
+            const setter = (_value: number) => setter;
+            return setter;
+        },
         registerPlugin: () => {},
         context: (fn: () => void) => {
             try {
