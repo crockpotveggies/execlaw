@@ -26,6 +26,7 @@ import {
     type UpsertRoutineBody,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 
 interface FormState {
     id: string | null; // null → create mode
@@ -120,7 +121,7 @@ function formatDuration(
 
 export function RoutinesPage() {
     const auth = useAuth();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
 
     const [routines, setRoutines] = useState<RoutineView[] | null>(null);
     const [error, setError] = useState<string | null>(null);
@@ -309,11 +310,7 @@ export function RoutinesPage() {
                 Skipped) until runner-local lands.
             </p>
 
-            {error && (
-                <div className="execlaw-error-banner mb-3" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
             {form !== null && (
                 <div

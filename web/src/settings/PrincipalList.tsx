@@ -15,6 +15,7 @@ import {
     type PrincipalSummary,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 
 export type PrincipalFilter = (p: PrincipalSummary) => boolean;
 
@@ -33,7 +34,7 @@ export interface PrincipalListProps {
 
 export function PrincipalList(props: PrincipalListProps) {
     const auth = useAuth();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
 
     const [principals, setPrincipals] = useState<PrincipalSummary[] | null>(null);
     const [error, setError] = useState<string | null>(null);
@@ -83,11 +84,7 @@ export function PrincipalList(props: PrincipalListProps) {
                 <p className="execlaw-muted small mb-3">{props.subhead}</p>
             )}
 
-            {error && (
-                <div className="execlaw-error-banner mb-3" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
             {filtered === null ? (
                 <div className="execlaw-muted small">Loading principals…</div>

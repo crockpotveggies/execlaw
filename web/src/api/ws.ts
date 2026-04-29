@@ -14,6 +14,8 @@
 // for this — the surface is small and the dependency footprint stays
 // honest.
 
+import { reportWsState } from "./connection";
+
 export interface WsEvent {
     /** Event kind tag (matches server-side `UiEvent` enum). */
     kind: string;
@@ -63,19 +65,31 @@ export class WsClient {
         try {
             this.socket = new WebSocket(url);
         } catch {
+            reportWsState("reconnecting");
             this.scheduleReconnect();
             return;
         }
         this.socket.onopen = () => {
             // Reset backoff on a successful handshake.
             this.backoffMs = MIN_BACKOFF_MS;
+            reportWsState("open");
         };
         this.socket.onmessage = (ev) => {
             this.handleRawMessage(ev.data);
         };
         this.socket.onclose = () => {
             this.socket = null;
-            if (!this.closed) this.scheduleReconnect();
+            if (this.closed) {
+                // Deliberate close — caller is shutting the SPA down
+                // or navigating off the chat shell. Drop back to
+                // `idle` so the banner doesn't surface.
+                reportWsState("idle");
+                return;
+            }
+            // Auto-reconnect path: surface as `reconnecting` until
+            // the next `open` lands or the operator gives up.
+            reportWsState("reconnecting");
+            this.scheduleReconnect();
         };
         this.socket.onerror = () => {
             // No-op — `onclose` always fires after this.
@@ -135,21 +149,48 @@ export class WsClient {
     /** Close the connection permanently. Disables auto-reconnect. */
     close(): void {
         this.closed = true;
+        reportWsState("idle");
         if (this.reconnectTimer !== null) {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
-        if (this.socket) {
-            this.socket.onopen = null;
-            this.socket.onmessage = null;
-            this.socket.onclose = null;
-            this.socket.onerror = null;
-            try {
-                this.socket.close();
-            } catch {
-                /* ignore */
-            }
-            this.socket = null;
+        if (!this.socket) return;
+        const sock = this.socket;
+        this.socket = null;
+        // 2026-04-28 — StrictMode-friendly close: never yank a
+        // socket out of CONNECTING. React 18 dev mounts every
+        // effect twice (mount → cleanup → mount), and the first
+        // cleanup fires within ~1ms — well before the WS handshake
+        // can complete. Calling `close()` on a CONNECTING socket
+        // makes Firefox surface a console error
+        // ("interrupted while the page was loading" /
+        //  "can't establish a connection"). The errors are cosmetic
+        // — the second mount opens its own socket that lives — but
+        // they're noisy. Defer the close until the handshake lands;
+        // the supervisor's `handle_socket` sees a clean Close frame
+        // instead of an abort and a one-line warn-level log
+        // disappears server-side too.
+        if (sock.readyState === WebSocket.CONNECTING) {
+            sock.onopen = () => {
+                try {
+                    sock.close();
+                } catch {
+                    /* ignore */
+                }
+            };
+            sock.onmessage = null;
+            sock.onerror = null;
+            sock.onclose = null;
+            return;
+        }
+        sock.onopen = null;
+        sock.onmessage = null;
+        sock.onclose = null;
+        sock.onerror = null;
+        try {
+            sock.close();
+        } catch {
+            /* ignore */
         }
     }
 

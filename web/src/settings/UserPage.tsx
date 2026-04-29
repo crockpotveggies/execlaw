@@ -35,6 +35,7 @@ import {
     type WebauthnCredentialView,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 import {
     coerceCreationOptions,
     serializeCredential,
@@ -60,7 +61,7 @@ const EMPTY_INVITE: InviteFormState = {
 export function UserPage() {
     const auth = useAuth();
     const navigate = useNavigate();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
 
     const meRole = auth.user?.role ?? "viewer";
     const meId = auth.user?.user_id ?? null;
@@ -147,11 +148,7 @@ function ChangePasswordCard({ getToken }: { getToken: () => string | null }) {
                 are NOT signed out automatically — use the Sessions
                 section below to sign out everywhere.
             </p>
-            {error && (
-                <div className="execlaw-error-banner mb-2" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-2" />
             {notice && (
                 <div className="execlaw-muted small mb-2" role="status">
                     {notice}
@@ -354,11 +351,7 @@ function PasskeysCard({ getToken }: { getToken: () => string | null }) {
                     </div>
                 </div>
             )}
-            {error && (
-                <div className="execlaw-error-banner mb-3" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
             <div className="d-flex gap-2 mb-3">
                 <Form.Control
                     value={label}
@@ -621,11 +614,7 @@ function OperatorsCard({
                     reset other operators' passwords.
                 </div>
             )}
-            {error && (
-                <div className="execlaw-error-banner mb-2" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-2" />
 
             {inviting && (
                 <Form
@@ -633,11 +622,7 @@ function OperatorsCard({
                     onSubmit={onInvite}
                     data-testid="user-invite-form"
                 >
-                    {inviteError && (
-                        <div className="execlaw-error-banner mb-2" role="alert">
-                            {inviteError}
-                        </div>
-                    )}
+                    <ErrorBanner message={inviteError} onDismiss={() => setInviteError(null)} className="mb-2" />
                     <div className="row g-2">
                         <Form.Group className="col-sm-4">
                             <Form.Label className="execlaw-muted small mb-1">
@@ -829,11 +814,7 @@ function OperatorsCard({
                         with the new password and rotate it from their own
                         Login page.
                     </div>
-                    {resetError && (
-                        <div className="execlaw-error-banner mb-2" role="alert">
-                            {resetError}
-                        </div>
-                    )}
+                    <ErrorBanner message={resetError} onDismiss={() => setResetError(null)} className="mb-2" />
                     <div className="row g-2">
                         <Form.Group className="col-sm-6">
                             <Form.Label className="execlaw-muted small mb-1">

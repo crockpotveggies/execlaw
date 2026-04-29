@@ -74,7 +74,15 @@ export function WelcomeView({
     onToggleIncognito,
 }: Props) {
     const auth = useAuth();
-    const voiceReadiness = useVoiceReadiness(() => auth.getAccessToken());
+    // Stable accessor — passing a fresh `() => auth.getAccessToken()`
+    // arrow on every render used to force `useVoiceReadiness` to
+    // re-fire its `useEffect` on every render, which spun a loop of
+    // `listBackends` calls (1000+/sec on localhost) every time the
+    // user navigated back to /chat from a settings page. The hook
+    // itself is now defended via a token ref, but a stable accessor
+    // here keeps the contract right at the call site.
+    const getToken = auth.getAccessToken;
+    const voiceReadiness = useVoiceReadiness(getToken);
     return (
         <div className="execlaw-welcome" data-testid="welcome-view">
             {/*

@@ -16,6 +16,7 @@ import {
     type ToolView,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 
 const TRUST_CLASSES: ReadonlyArray<string> = [
     "Controller",
@@ -34,7 +35,7 @@ const SOURCE_BADGE: Record<ToolView["source"], string> = {
 
 export function ToolsPage() {
     const auth = useAuth();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
     const [tools, setTools] = useState<ToolView[] | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [busyTool, setBusyTool] = useState<string | null>(null);
@@ -121,11 +122,7 @@ export function ToolsPage() {
                 </div>
             )}
 
-            {error && (
-                <div className="execlaw-error-banner mb-3" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
             {tools === null ? (
                 <div className="execlaw-muted small">Loading tools…</div>

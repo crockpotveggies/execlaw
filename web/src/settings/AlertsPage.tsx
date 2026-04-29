@@ -19,6 +19,7 @@ import {
     type AlertView,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 
 const SEVERITY_BADGE: Record<AlertSeverity, string> = {
     Critical: "is-blocked",
@@ -42,7 +43,7 @@ function severityRank(s: AlertSeverity): number {
 
 export function AlertsPage() {
     const auth = useAuth();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
 
     const [alerts, setAlerts] = useState<AlertView[] | null>(null);
     const [firingCount, setFiringCount] = useState<number | null>(null);
@@ -130,11 +131,7 @@ export function AlertsPage() {
                 resolve when the underlying cause is fixed.
             </p>
 
-            {error && (
-                <div className="execlaw-error-banner mb-3" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
             <Form.Check
                 type="switch"

@@ -32,7 +32,6 @@ use execlaw_policy::trust::{TrustLevel, TurnPolicyInput, evaluate_turn};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::capability::issue_capability_token;
 use crate::events::UiEvent;
 use crate::state::AppState;
 
@@ -220,30 +219,14 @@ pub async fn send_message(
             .into_response();
     }
 
-    // Step 2 — mint a per-turn capability token bound to
-    // (conversation_id, next_turn_seq, policy.capability_set). In-process
-    // today; becomes the header the runner container presents on every
-    // tool-dispatch RPC once §2.8 "hot runner container" lands. We mint
-    // BEFORE the turn runs so the capability set is immutably bound to
-    // this turn's seq.
-    let principal_id = req
-        .sender_principal_id
-        .clone()
-        .unwrap_or_else(|| "controller".to_owned());
-    let next_seq = match log.last_seq(&cid) {
-        Ok(s) => s.next().0,
-        Err(e) => return err_500(&format!("last_seq: {e}")),
-    };
-    let capability_set: Vec<String> =
-        policy.capability_set.iter().map(|s| (*s).to_owned()).collect();
-    let _capability_token = issue_capability_token(
-        &state.signer,
-        &principal_id,
-        cid.as_str(),
-        next_seq,
-        capability_set,
-        None,
-    );
+    // Step 2 — capability-set is computed by `evaluate_turn` above;
+    // it's threaded into the in-process tool dispatcher as
+    // `caller_caps` below. Capability *tokens* (signed JWTs) are not
+    // minted today — the dispatch path is in-process, so the policy
+    // engine's capability_set already gates every tool. When the
+    // runner-container path supports tools (MIGRATION_PLAN: tool path
+    // in runner), the cross-process boundary may want signed bearers;
+    // see crate::tool_dispatch + MIGRATION_PLAN.md for the design.
 
     // Step 3 — run the turn (executor owns ALL event-log writes so
     // the user_msg + model_turn + tool pairs land in one atomic
@@ -309,30 +292,6 @@ pub async fn send_message(
     );
     let cancel_flag = cancel_guard.flag.clone();
 
-    // Phase 8.5 runner-registry hookup: every turn entering this code
-    // path gets a corresponding `register_turn_start`. The Settings →
-    // Runners page reads from this. Controller-trust callers get the
-    // `controller_runner = true` flag so the idle reaper never drops
-    // their entry.
-    {
-        // Operator-friendly label: the principal's first identifier
-        // handle when present (e.g. their Signal number / email),
-        // else the bare PrincipalId. Lives only in the registry —
-        // the runner itself never sees this string.
-        let principal_label = principal
-            .identifiers
-            .first()
-            .map(|id| format!("{}:{}", id.transport, id.handle))
-            .or_else(|| Some(principal.id.as_str().to_owned()));
-        let modality = crate::runner_registry::RunnerModality::Text;
-        let controller_runner = sender_trust == TrustLevel::Controller;
-        state.runner_registry.register_turn_start(
-            cid.as_str(),
-            principal_label,
-            modality,
-            controller_runner,
-        );
-    }
     // Phase 12.E — pick the inference client per turn from the
     // resolver. A managed-mode Backend whose supervisor has written
     // its endpoint back resolves here; the bootstrap URL is used
@@ -345,16 +304,18 @@ pub async fn send_message(
 
     // Phase 16: per-principal-group runner routing. Eligibility:
     //   * supervisor configured (`RUNNERS_ENABLED=1` on boot), AND
-    //   * inference backend resolved (no stub fallback in this path), AND
-    //   * no plugin tools registered (v1 runner doesn't proxy tools yet),
+    //   * inference backend resolved (no stub fallback in this path),
     //   * AND not the cold-contact / approval-pending branch
     //     (those returned early above).
-    // When all true, resolve_chat_group binds the conversation to a
-    // principal_group_id, the supervisor ensures a live runner, and
-    // run_runner_turn drains the resulting TurnEvent stream.
+    //
+    // 2026-04-28: tools are now dispatched from `run_runner_turn`
+    // via the WS `ToolCallRequest`/`ToolCallResult` round-trip, so
+    // tool-capable turns no longer need to fall back to the
+    // in-process executor. The legacy `run_tool_capable_turn` arm
+    // stays as a safety net for the supervisor-disabled config and
+    // for tests that exercise the in-process path directly.
     let runner_eligible = state.runner_supervisor.is_some()
-        && inference_for_turn.is_some()
-        && !use_tool_path;
+        && inference_for_turn.is_some();
     let runner_routed = if runner_eligible {
         match resolve_chat_group(&state, &cid, &principal).await {
             Ok(group_id) => Some(group_id),
@@ -386,6 +347,8 @@ pub async fn send_message(
                 req.sender_principal_id.clone(),
                 spotlight_content,
                 cancel_flag.clone(),
+                caller_caps.clone(),
+                sender_trust,
             )
             .await
             {
@@ -428,13 +391,6 @@ pub async fn send_message(
             Err(e) => return err_500(&format!("stub turn failed: {e}")),
         },
     };
-    // Phase 8.5: turn lifecycle finishes here on every success path
-    // (the early `return err_500(...)` arms register the start but
-    // not the end — that's intentional, the registry will leave
-    // `in_flight = true` until the next turn or restart, which gives
-    // the operator visibility into stuck runners).
-    state.runner_registry.register_turn_end(cid.as_str());
-
     // Phase 10.1 + 11 closure — leave the processing window via the
     // RAII guard. The disarm publishes Idle and then prevents Drop
     // from publishing again. Idle lands BEFORE ChatMessageOutbound
@@ -820,9 +776,12 @@ async fn resolve_chat_group(
 ///     `EventLogAppend` proposals from the runner, returning the
 ///     final `(user_seq, assistant_text, assistant_seq)`.
 ///
-/// v1 scope: streaming inference, no tools (runner doesn't yet
-/// proxy `ToolCallRequest`). The chat path that needs tools stays
-/// on `run_tool_capable_turn` until the runner-side tool RPC lands.
+/// 2026-04-28: streaming inference + WS tool-call round-trip. The
+/// runner advertises `tool_catalog` to the model; on every
+/// `tool_use`, the runner forwards `RunnerToServer::ToolCallRequest`
+/// here, we dispatch via `ChainedToolDispatch`, and we reply with
+/// `submit_tool_result`. The runner loops the model until a non-
+/// `tool_calls` finish reason lands.
 ///
 /// Cancellation: same `cancel_flag` plumbing as `run_real_turn`.
 /// The caller flips the flag (operator-driven stop button); we
@@ -836,9 +795,11 @@ pub(crate) async fn run_runner_turn(
     sender_principal_id: Option<String>,
     spotlight_content: bool,
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    caller_caps: Vec<String>,
+    caller_trust: TrustLevel,
 ) -> Result<(i64, String, i64), String> {
     use crate::runner_supervisor::TurnEvent;
-    use execlaw_inference_api::ChatMessage;
+    use execlaw_inference_api::{ChatMessage, ToolDeclaration};
     use execlaw_policy::spotlighting::Spotlight;
 
     let log = event_log(state);
@@ -923,6 +884,30 @@ pub(crate) async fn run_runner_turn(
         .map(|r| r.reasoning_enabled)
         .unwrap_or(false);
 
+    // Build the tool catalog the runner advertises to the model.
+    // Mirrors `run_tool_capable_turn`'s mapping so both code paths
+    // expose the same catalogue. The supervisor's policy engine
+    // already filtered `caller_caps` upstream; tools whose
+    // `config_tool_access` row excludes this trust class are
+    // rejected on dispatch (see ChainedToolDispatch::with_access_gate).
+    let tool_decls: Vec<ToolDeclaration> = state
+        .plugin_host
+        .registry()
+        .all_tools()
+        .iter()
+        .map(|t| {
+            ToolDeclaration::function(
+                t.tool_name.clone(),
+                format!("Plugin tool '{}' (latency: {})", t.tool_name, t.latency),
+                serde_json::json!({"type": "object"}),
+            )
+        })
+        .collect();
+
+    // Trust-class string the runner copies into log lines + the
+    // model's "from:" header. The flat policy tag is canonical.
+    let sender_trust_class = format!("{:?}", caller_trust);
+
     let req = execlaw_runner_protocol::TurnRequest {
         turn_id: turn_id.clone(),
         conversation_id: cid.as_str().to_owned(),
@@ -931,21 +916,34 @@ pub(crate) async fn run_runner_turn(
         sender_principal_id: sender_principal_id
             .clone()
             .unwrap_or_else(|| "controller".into()),
-        sender_trust_class: "Controller".into(),
+        sender_trust_class,
         system_prompt: composed_system,
         history: hist_messages,
-        tool_catalog: vec![],
+        tool_catalog: tool_decls,
         inference_url,
         model: state.config.model_id.clone(),
         temperature: None,
         max_tokens: None,
         reasoning_enabled,
-        capability_token: String::new(),
         // Send the OPEN delimiter so the runner can reconstruct
         // the wrap; the runner mirrors policy::Spotlight::wrap on
         // its side.
         spotlight: spotlight.as_ref().map(|s| s.open.clone()),
     };
+
+    // Build the tool dispatcher we'll use to honour the runner's
+    // `ToolCallRequest` frames. Same shape as `run_tool_capable_turn`
+    // so the two paths gate identically.
+    let dispatch = std::sync::Arc::new(
+        crate::tool_dispatch::ChainedToolDispatch::with_access_gate(
+            state.plugin_host.clone(),
+            caller_caps,
+            caller_trust,
+            crate::tool_dispatch::NoBuiltinTools,
+            state.db.clone(),
+        )
+        .with_mcp(state.mcp_host.clone()),
+    );
 
     // Step 3.5 — lazy-spawn the runner if it's not registered yet.
     // Prewarm covers the controller's group on boot, but every
@@ -998,18 +996,26 @@ pub(crate) async fn run_runner_turn(
             TurnEvent::Phase { .. } => {
                 // Same.
             }
-            TurnEvent::ToolCallRequest { call_id, .. } => {
-                // v1: no tools wired through the runner. Reply
-                // with an Err so the runner can either continue
-                // or surface to the model.
+            TurnEvent::ToolCallRequest { call_id, tool_name, args } => {
+                // 2026-04-28: dispatch via the same ChainedToolDispatch
+                // the in-process executor uses, so plugin/MCP/built-in
+                // tool routing + the per-tool config_tool_access gate
+                // apply identically across runner and in-process paths.
+                use execlaw_runner_local::turn::ToolDispatch;
+                let outcome = match dispatch.call(&tool_name, &args).await {
+                    Ok(value) => execlaw_runner_protocol::ToolOutcome::Ok { value },
+                    Err(message) => execlaw_runner_protocol::ToolOutcome::Err { message },
+                };
                 let result = execlaw_runner_protocol::ToolCallResult {
                     turn_id: turn_id.clone(),
                     call_id,
-                    outcome: execlaw_runner_protocol::ToolOutcome::Err {
-                        message: "tools not wired through runner in v1".into(),
-                    },
+                    outcome,
                 };
                 supervisor.submit_tool_result(group_id, result).await;
+                // The runner emits its own `tool_use`/`tool_result`
+                // events into the log via subsequent `EventLogAppend`
+                // frames once the model finalises the round; we
+                // don't pre-write them from the server here.
             }
             TurnEvent::EventLogAppend {
                 kind,

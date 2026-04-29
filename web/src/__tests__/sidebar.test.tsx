@@ -1,5 +1,11 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+    act,
+    fireEvent,
+    render,
+    screen,
+    waitFor,
+} from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Sidebar } from "../chat/Sidebar";
 import {
@@ -11,7 +17,11 @@ import {
 } from "../chat/store";
 import { AuthProvider } from "../auth/AuthContext";
 
-afterEach(() => __resetChatStore());
+afterEach(() => {
+    __resetChatStore();
+    vi.unstubAllGlobals();
+    localStorage.clear();
+});
 
 function rerender(ui: React.ReactElement) {
     // Sidebar uses react-router's <Link> for the settings gear, so
@@ -208,5 +218,201 @@ describe("Sidebar", () => {
         expect(
             screen.getByText(/no plugin panels installed/i),
         ).toBeInTheDocument();
+    });
+
+    // ---- pinning regression tests (2026-04-28) -----------------------
+    // The user reported "pinning appears to be broken and visually
+    // does nothing." These tests pin down the contract end-to-end so a
+    // future regression on the menu-click → PATCH → list-refresh →
+    // re-render chain is caught immediately.
+
+    it("clicking 'Pin to top' fires PATCH /api/chats/:id with is_pinned: true and re-fetches the list", async () => {
+        localStorage.setItem("execlaw.access_token", "tok");
+        localStorage.setItem("execlaw.refresh_token", "rtok");
+        const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+        const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+            calls.push({
+                url,
+                method: init?.method,
+                body:
+                    typeof init?.body === "string"
+                        ? JSON.parse(init.body)
+                        : undefined,
+            });
+            if (url === "/api/admin/me") {
+                return new Response(
+                    JSON.stringify({
+                        user_id: "ctrl-1",
+                        username: "ctrl",
+                        display_name: "Ctrl",
+                        email: null,
+                        role: "controller",
+                        last_login_at: null,
+                    }),
+                    { status: 200 },
+                );
+            }
+            if (
+                url === "/api/chats/conv-unpinned" &&
+                init?.method === "PATCH"
+            ) {
+                return new Response(
+                    JSON.stringify({
+                        conversation_id: "conv-unpinned",
+                        display_name: "Trip plan",
+                        is_pinned: true,
+                        is_ephemeral: false,
+                        ephemeral_expires_at: null,
+                    }),
+                    { status: 200 },
+                );
+            }
+            if (url === "/api/chats") {
+                return new Response(
+                    JSON.stringify({
+                        threads: [
+                            // After pin: server returns pinned-first.
+                            {
+                                conversation_id: "conv-unpinned",
+                                kind: "ControllerDM",
+                                phase: "idle",
+                                trust_class: "Controller",
+                                modality: "Text",
+                                display_name: "Trip plan",
+                                is_pinned: true,
+                                is_ephemeral: false,
+                                ephemeral_expires_at: null,
+                                last_seq: 6,
+                            },
+                            {
+                                conversation_id: "conv-recent",
+                                kind: "ControllerDM",
+                                phase: "idle",
+                                trust_class: "Controller",
+                                modality: "Text",
+                                display_name: "Recent",
+                                is_pinned: false,
+                                is_ephemeral: false,
+                                ephemeral_expires_at: null,
+                                last_seq: 99,
+                            },
+                        ],
+                    }),
+                    { status: 200 },
+                );
+            }
+            return new Response("{}", { status: 200 });
+        });
+        vi.stubGlobal("fetch", fetchMock);
+
+        // Seed the store with pre-pin order: recent first, target second.
+        setThreads([
+            {
+                conversation_id: "conv-recent",
+                kind: "ControllerDM",
+                phase: "idle",
+                trust_class: "Controller",
+                modality: "Text",
+                display_name: "Recent",
+                is_pinned: false,
+                is_ephemeral: false,
+                ephemeral_expires_at: null,
+                last_seq: 99,
+            },
+            {
+                conversation_id: "conv-unpinned",
+                kind: "ControllerDM",
+                phase: "idle",
+                trust_class: "Controller",
+                modality: "Text",
+                display_name: "Trip plan",
+                is_pinned: false,
+                is_ephemeral: false,
+                ephemeral_expires_at: null,
+                last_seq: 6,
+            },
+        ]);
+        rerender(<Sidebar onNewThread={() => {}} />);
+
+        // Pre-click: target sits in second position.
+        let rows = screen.getAllByTestId("sidebar-thread");
+        expect(rows[1]).toHaveAttribute("data-thread-id", "conv-unpinned");
+
+        // Open the per-row menu on the target.
+        const menuButtons = screen.getAllByTestId("thread-row-menu-btn");
+        // menuButtons[1] is the second row (conv-unpinned).
+        await act(async () => {
+            fireEvent.click(menuButtons[1]);
+        });
+        // Menu opened.
+        expect(screen.getByTestId("thread-row-menu")).toBeInTheDocument();
+
+        // Click Pin to top.
+        await act(async () => {
+            fireEvent.click(screen.getByTestId("thread-row-menu-pin"));
+        });
+
+        // Wait for the PATCH + list refresh to flush.
+        await waitFor(() => {
+            const patchCall = calls.find(
+                (c) =>
+                    c.url === "/api/chats/conv-unpinned" &&
+                    c.method === "PATCH",
+            );
+            expect(patchCall).toBeTruthy();
+            expect(patchCall?.body).toEqual({ is_pinned: true });
+        });
+        await waitFor(() => {
+            expect(
+                calls.some((c) => c.url === "/api/chats" && (c.method ?? "GET") === "GET"),
+            ).toBe(true);
+        });
+        // After the refresh, the row order reflects the server's
+        // is_pinned-DESC, last_seq-DESC ordering: pinned first, even
+        // though it has a smaller last_seq than its sibling.
+        await waitFor(() => {
+            rows = screen.getAllByTestId("sidebar-thread");
+            expect(rows[0]).toHaveAttribute(
+                "data-thread-id",
+                "conv-unpinned",
+            );
+            expect(rows[1]).toHaveAttribute("data-thread-id", "conv-recent");
+        });
+    });
+
+    it("renders the pin icon for pinned rows and the dot for unpinned rows", () => {
+        setThreads([
+            {
+                conversation_id: "pinned",
+                kind: "ControllerDM",
+                phase: "idle",
+                trust_class: "Controller",
+                modality: "Text",
+                display_name: "Pinned thread",
+                is_pinned: true,
+                is_ephemeral: false,
+                ephemeral_expires_at: null,
+                last_seq: 1,
+            },
+            {
+                conversation_id: "regular",
+                kind: "ControllerDM",
+                phase: "idle",
+                trust_class: "Controller",
+                modality: "Text",
+                display_name: "Regular thread",
+                is_pinned: false,
+                is_ephemeral: false,
+                ephemeral_expires_at: null,
+                last_seq: 99,
+            },
+        ]);
+        rerender(<Sidebar onNewThread={() => {}} />);
+        const rows = screen.getAllByTestId("sidebar-thread");
+        // Pinned row carries an icon with aria-label "Pinned".
+        expect(rows[0].querySelector('[aria-label="Pinned"]')).toBeTruthy();
+        expect(rows[0].querySelector(".bi-pin-angle-fill")).toBeTruthy();
+        // Regular row renders the read/unread dot, NOT the pin icon.
+        expect(rows[1].querySelector('[aria-label="Pinned"]')).toBeNull();
     });
 });

@@ -2,13 +2,14 @@
 // config-write routes start logging entries (Phase 7 deployment
 // editor onward).
 
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { getAuditEntries, type AuditEntry } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 
 export function AuditPage() {
     const auth = useAuth();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
 
     const [entries, setEntries] = useState<AuditEntry[] | null>(null);
     const [error, setError] = useState<string | null>(null);
@@ -33,11 +34,7 @@ export function AuditPage() {
         <div data-testid="settings-audit">
             <h3 className="h6 mb-3">Audit log</h3>
 
-            {error && (
-                <div className="execlaw-error-banner mb-3" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
             <div className="execlaw-card">
                 {entries === null ? (

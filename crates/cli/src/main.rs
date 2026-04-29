@@ -1091,10 +1091,6 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         tokio::spawn(async move { mh.reconcile().await });
     }
 
-    // Phase 8.5: in-memory runner registry. Settings → Runners
-    // reads from this; per-turn lifecycle in chats.rs registers
-    // start/end. The reaper drops idle non-controller entries.
-    let runner_registry = execlaw_server::runner_registry::RunnerRegistry::new();
     let events = execlaw_server::EventBus::new();
 
     // Phase 12.C — supervisor for managed inference backends. Best-
@@ -1286,7 +1282,6 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         plugin_host,
         webauthn,
         mcp_host,
-        runner_registry: runner_registry.clone(),
         backend_supervisor,
         voice_sessions,
         voice_runtime,
@@ -1319,15 +1314,6 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         let stop = sweep_stop.clone();
         tokio::spawn(async move { refresh_sweeper.run(stop).await });
     }
-    // Phase 8.5 — drops idle non-controller runner entries from
-    // the in-memory registry every 60s. Controller entries survive
-    // by policy (always hot).
-    {
-        let stop = sweep_stop.clone();
-        let reg = runner_registry.clone();
-        tokio::spawn(async move { reg.run_reaper(stop).await });
-    }
-
     // Phase 10 + 11.C — wall-clock-aligned cron tick that fires due
     // routines. Dispatch routes through chats::dispatch_routine_turn
     // so a routine fire is behaviourally identical to the controller

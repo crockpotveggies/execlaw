@@ -533,60 +533,11 @@ export async function getEvalFlags(
     return apiFetch<EvalFlagsResponse>(path, {}, tokenAccessor);
 }
 
-// ---- /api/admin/runners (Phase 8.5 view-only + restart) ------------
-
-export type RunnerModality = "Text" | "Voice";
-
-export interface RunnerView {
-    conversation_id: string;
-    principal_label: string | null;
-    modality: RunnerModality;
-    controller_runner: boolean;
-    started_at: number;
-    last_active_at: number;
-    in_flight: boolean;
-    turn_count: number;
-    restart_pending: boolean;
-    /// Seconds until the idle reaper drops this entry; null for the
-    /// controller runner and any in-flight runner.
-    idle_secs_remaining: number | null;
-}
-
-export interface RunnerListResponse {
-    runners: RunnerView[];
-    /// Idle TTL the reaper applies to non-controller runners. Surfaced
-    /// so the SPA can label the row's countdown.
-    idle_ttl_secs: number;
-}
-
-export async function listRunners(
-    tokenAccessor: () => string | null,
-): Promise<RunnerListResponse> {
-    return apiFetch<RunnerListResponse>(
-        "/api/admin/runners",
-        {},
-        tokenAccessor,
-    );
-}
-
-export async function restartRunner(
-    conversationId: string,
-    tokenAccessor: () => string | null,
-): Promise<unknown> {
-    return apiFetch(
-        `/api/admin/runners/${encodeURIComponent(conversationId)}/restart`,
-        { method: "POST", body: {} },
-        tokenAccessor,
-    );
-}
-
 // ---- /api/admin/runners/groups (Phase 16: supervisor-tracked) ------
 //
-// Live per-principal-group runners. Replaces `/api/admin/runners` for
-// the Settings → Runners page. The legacy endpoint continues to be
-// served for backwards-compat but only reflects the in-process
-// bookkeeping registry, which loses entries 10 minutes after the last
-// turn even if the underlying container is still hot.
+// Live per-principal-group runners. The control plane manages one
+// runner container per `(channel, principals)` group; the supervisor
+// is the single source of truth.
 
 export interface GroupRunnerView {
     group_id: string;

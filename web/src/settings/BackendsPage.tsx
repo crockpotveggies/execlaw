@@ -39,6 +39,7 @@ import {
     type UpsertBackendRequest,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 import { UnifiedBackendForm } from "./UnifiedBackendForm";
 
 const PURPOSE_HINT: Record<BackendPurpose, string> = {
@@ -173,7 +174,7 @@ function fmtElapsed(secs: number | null): string {
 
 export function BackendsPage() {
     const auth = useAuth();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
     const [entries, setEntries] = useState<BackendListEntry[] | null>(null);
     const [statuses, setStatuses] = useState<
         Record<string, BackendStatusResponse>
@@ -472,11 +473,7 @@ export function BackendsPage() {
                 </div>
             )}
 
-            {error && (
-                <div className="execlaw-error-banner mb-3" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
             {entries === null ? (
                 <div className="execlaw-muted small">Loading…</div>
@@ -984,15 +981,15 @@ export function BackendsPage() {
                                 Loading logs…
                             </div>
                         )}
-                        {logsModal.error && (
-                            <div
-                                className="execlaw-error-banner"
-                                role="alert"
-                                data-testid="backend-logs-error"
-                            >
-                                {logsModal.error}
-                            </div>
-                        )}
+                        <ErrorBanner
+                            message={logsModal.error}
+                            onDismiss={() =>
+                                setLogsModal((m) =>
+                                    m ? { ...m, error: null } : m,
+                                )
+                            }
+                            testId="backend-logs-error"
+                        />
                         {logsModal.data &&
                             !logsModal.data.supervisor_available && (
                                 <div
@@ -1060,7 +1057,7 @@ export function BackendsPage() {
 
 function HardwareSection() {
     const auth = useAuth();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
     const [profile, setProfile] = useState<HardwareProfile | null>(null);
     const [error, setError] = useState<string | null>(null);
 
@@ -1090,11 +1087,7 @@ function HardwareSection() {
                 above when configuring per-backend pinning.
             </p>
 
-            {error && (
-                <div className="execlaw-error-banner mb-2" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-2" />
 
             {profile === null ? (
                 <div className="execlaw-muted small">Probing hardware…</div>
@@ -1215,11 +1208,7 @@ function HfCacheSection({
                 <code>execlaw service restart</code>.
             </p>
 
-            {error && (
-                <div className="execlaw-error-banner mb-2" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-2" />
 
             {paths === null ? (
                 <div className="execlaw-muted small">Loading…</div>

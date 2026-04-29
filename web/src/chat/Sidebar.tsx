@@ -46,7 +46,7 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
     // here; the row swaps its label for an `<input>` until the user
     // commits (Enter / blur) or cancels (Esc).
     const [renamingId, setRenamingId] = useState<string | null>(null);
-    const getToken = () => auth.getAccessToken();
+    const getToken = auth.getAccessToken;
     // Pending-approvals badge — when the cold-contact flow has any
     // open approvals waiting on the controller, surface a count in
     // the sidebar so the operator notices even without an active

@@ -6,13 +6,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Form from "react-bootstrap/Form";
 import { getLogs, type LogEntry } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 
 const LEVELS = ["", "trace", "debug", "info", "warn", "error"] as const;
 type Level = (typeof LEVELS)[number];
 
 export function LogsPage() {
     const auth = useAuth();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
 
     const [level, setLevel] = useState<Level>("");
     const [pluginId, setPluginId] = useState("");
@@ -114,11 +115,7 @@ export function LogsPage() {
                 </Form>
             </div>
 
-            {error && (
-                <div className="execlaw-error-banner mb-3" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
             <div className="execlaw-card">
                 {entries === null ? (

@@ -310,12 +310,29 @@ impl RunnerSupervisor {
         timeout: Duration,
     ) -> Result<RunnerHandle, EnsureError> {
         if let Some(h) = self.get(group_id) {
-            // Existing runner — just bump activity. Avoids
-            // spawning a duplicate when the chat path races the
-            // prewarm.
-            let mut s = h.state.write().await;
-            s.last_active_at = Utc::now();
-            return Ok(h.clone());
+            // Existing handle — only reuse if it's actually usable.
+            // 2026-04-28: a `Stopping` or `Dead` entry is a stale
+            // tombstone (operator clicked Restart/Wipe, or the WS
+            // dropped without our close handler firing). Returning
+            // it would point the chat handler at a runner whose tx
+            // channel goes nowhere. Drop it from the registry and
+            // fall through to a fresh spawn.
+            let status = h.state.read().await.status;
+            match status {
+                RunnerStatus::Ready | RunnerStatus::Spawning => {
+                    let mut s = h.state.write().await;
+                    s.last_active_at = Utc::now();
+                    return Ok(h.clone());
+                }
+                RunnerStatus::Stopping | RunnerStatus::Dead => {
+                    info!(
+                        group_id,
+                        ?status,
+                        "ensure_for_group: dropping stale handle, will respawn"
+                    );
+                    self.inner.runners.remove(group_id);
+                }
+            }
         }
         let launcher = self
             .launcher
@@ -368,13 +385,25 @@ impl RunnerSupervisor {
         timeout: Duration,
     ) -> Result<RunnerHandle, EnsureError> {
         if let Some(h) = self.get(group_id) {
-            // Already up. Refresh last_active_at so we don't reap
-            // it mid-use. (The chat handler also calls touch on
-            // turn end; this is belt-and-suspenders for the case
-            // where the supervisor's reap pass races a new turn.)
-            let mut s = h.state.write().await;
-            s.last_active_at = Utc::now();
-            return Ok(h.clone());
+            // Same stale-handle guard as `ensure_for_group`:
+            // Stopping/Dead entries are tombstones, not live
+            // runners. Drop and respawn.
+            let status = h.state.read().await.status;
+            match status {
+                RunnerStatus::Ready | RunnerStatus::Spawning => {
+                    let mut s = h.state.write().await;
+                    s.last_active_at = Utc::now();
+                    return Ok(h.clone());
+                }
+                RunnerStatus::Stopping | RunnerStatus::Dead => {
+                    info!(
+                        group_id,
+                        ?status,
+                        "ensure_runner: dropping stale handle, will respawn"
+                    );
+                    self.inner.runners.remove(group_id);
+                }
+            }
         }
 
         let (secret, registered) = self.register_pending_spawn(group_id);
@@ -829,23 +858,39 @@ impl RunnerSupervisor {
             .map(|kv| kv.value().clone())
             .ok_or(ReapError::UnknownGroup)?;
         // Belt-and-suspenders: never reap a controller runner via
-        // this path. Operator wipe / explicit delete go through
-        // `wipe_workspace` / `delete_group` which carry the
-        // explicit policy override.
+        // an idle-reason path. Operator wipe / explicit delete
+        // carry the explicit policy override via a non-IdleReap
+        // reason.
         if handle.controller_runner && reason == ShutdownReason::IdleReap {
             return Err(ReapError::ControllerProtected);
         }
+
+        // 2026-04-28 — when a launcher is configured (production
+        // path), do the FULL reap dance: WS shutdown + drop_registration
+        // + container kill + (when reason calls for it) volume wipe.
+        // Previously this was a WS-only stub that left the entry
+        // in `Stopping` forever if the runner-binary didn't ack
+        // the Shutdown frame, with no way for the operator to
+        // recover from the SPA. The tests that didn't wire a
+        // launcher (no-Docker test fixtures) fall through to the
+        // WS-only path below.
+        if let Some(launcher) = self.launcher.clone() {
+            let _ = self
+                .reap_runner(launcher.as_ref(), group_id, reason)
+                .await
+                .map_err(|e| {
+                    warn!(group_id, error = %e, "reap_group: full reap failed");
+                });
+            return Ok(());
+        }
+
+        // Test / no-launcher fallback.
         {
             let mut s = handle.state.write().await;
             s.status = RunnerStatus::Stopping;
         }
         let frame = ServerToRunner::Shutdown { reason };
         let _ = send_to_runner(&handle, frame).await;
-        // The bollard kill + volume rm happen in
-        // `runner_spawn::reap_container` which the caller
-        // sequences after this. The registry entry stays until
-        // the WS read loop sees the close and removes it (or the
-        // operator-driven path forces it).
         Ok(())
     }
 
@@ -1390,7 +1435,6 @@ mod tests {
             temperature: None,
             max_tokens: None,
             reasoning_enabled: false,
-            capability_token: "tok".into(),
             spotlight: None,
         };
         let res = s.forward_turn("g-missing", req).await;
@@ -1576,6 +1620,72 @@ mod tests {
             .unwrap();
         assert_eq!(h.group_id, "g-1");
         assert_eq!(launcher.spawn_count().await, 0);
+    }
+
+    /// 2026-04-28 — A handle stuck in `Stopping` (operator clicked
+    /// Wipe / Restart but the runner never ack'd the Shutdown frame)
+    /// is a tombstone, not a live runner. `ensure_runner` must drop
+    /// the stale entry and spawn a fresh one — otherwise the chat
+    /// path keeps getting handed a runner whose tx channel goes
+    /// nowhere, and the operator has no escape from the SPA.
+    #[tokio::test]
+    async fn ensure_runner_drops_stopping_tombstone_and_respawns() {
+        use crate::runner_spawn::{MockRunnerLauncher, RunnerSpec};
+        let s = fresh_supervisor();
+        let launcher = MockRunnerLauncher::new();
+        // Seed a runner, then wedge it in Stopping.
+        let (sec, _) = s.register_pending_spawn("g-stuck");
+        let h = s.accept_registration("g-stuck", &sec, false).unwrap();
+        {
+            let mut state = h.state.write().await;
+            state.status = RunnerStatus::Stopping;
+        }
+        // Pre-arm the launcher so the spawn future resolves + a
+        // matching pending registration completes.
+        let spec = RunnerSpec {
+            group_id: "g-stuck".into(),
+            image: "x".into(),
+            spawn_secret_hex: "".into(),
+            rpc_url: "ws://x".into(),
+            inference_url: "http://x".into(),
+            memory_bytes: None,
+            network: None,
+            env: vec![],
+        };
+        // Race: ensure_runner will mint a fresh secret + call
+        // launcher.spawn(); we need to ack the registration on a
+        // background task so ensure_runner's await unblocks.
+        let s_clone = s.clone();
+        let ack = tokio::spawn(async move {
+            // Poll until ensure_runner posted a pending spawn.
+            for _ in 0..50 {
+                let secret = s_clone
+                    .inner
+                    .pending_spawns
+                    .get("g-stuck")
+                    .map(|p| p.value().secret);
+                if let Some(secret) = secret {
+                    let _ = s_clone.accept_registration("g-stuck", &secret, false);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let h2 = s
+            .ensure_runner(&launcher, "g-stuck", spec, Duration::from_secs(2))
+            .await
+            .expect("ensure_runner should respawn over the tombstone");
+        ack.await.unwrap();
+        let new_status = h2.state.read().await.status;
+        assert!(
+            matches!(new_status, RunnerStatus::Spawning | RunnerStatus::Ready),
+            "fresh respawn should be Spawning/Ready, got {new_status:?}"
+        );
+        assert_eq!(
+            launcher.spawn_count().await,
+            1,
+            "stale tombstone should have been replaced via a single fresh spawn"
+        );
     }
 
     #[tokio::test]

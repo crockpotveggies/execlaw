@@ -14,7 +14,7 @@
 // Drilling into a group is deferred — link out to the Tools page for
 // per-tool policy edits.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import {
     listTools,
@@ -22,6 +22,7 @@ import {
     type ToolView,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 
 interface SkillGroup {
     source: ToolSource;
@@ -87,7 +88,7 @@ function sourceIcon(source: ToolSource): string {
 
 export function SkillsPage() {
     const auth = useAuth();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
 
     const [tools, setTools] = useState<ToolView[] | null>(null);
     const [error, setError] = useState<string | null>(null);
@@ -140,11 +141,7 @@ export function SkillsPage() {
                 <Link to="/settings/mcp">MCP</Link>.
             </p>
 
-            {error && (
-                <div className="execlaw-error-banner mb-3" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
             {groups === null ? (
                 <div className="execlaw-muted small">Loading skills…</div>

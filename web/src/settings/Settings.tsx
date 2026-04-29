@@ -88,7 +88,7 @@ export function Settings() {
         exitScale: 1,
         durationMs: 220,
     });
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
     const [uiPanels, setUiPanels] = useState<UiPanelSummary[] | null>(null);
     useEffect(() => {
         if (auth.status !== "authenticated") return;

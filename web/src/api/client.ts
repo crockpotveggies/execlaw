@@ -10,6 +10,11 @@
 // Same-origin in production (rust-embed serves the bundle); same-origin-
 // like in dev because Vite proxies /api → :3030.
 
+import {
+    reportRestNetworkError,
+    reportRestSuccess,
+} from "./connection";
+
 export type ApiErrorCode =
     | "network"
     | "unauthorized"
@@ -113,12 +118,22 @@ export async function apiFetch<T>(
                       : JSON.stringify(opts.body),
         });
     } catch (e) {
+        // 2026-04-28 — connection-health surface. NetworkError is a
+        // dev-server-restart / DNS / CORS hiccup; the operator wants
+        // a "Reconnecting…" banner, not a logout. We report and
+        // rethrow; AuthContext keys off code === "network" to keep
+        // tokens warm.
+        reportRestNetworkError();
         throw new ApiError(
             "network",
             `network error talking to ${path}: ${(e as Error).message ?? e}`,
             0,
         );
     }
+    // Successful round-trip (any HTTP status) clears the offline
+    // grace window — the server is reachable, even if the response
+    // is a 4xx / 5xx.
+    reportRestSuccess();
 
     if (opts.rawText) {
         const text = await resp.text();

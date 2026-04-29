@@ -28,6 +28,7 @@ import {
 } from "../api/endpoints";
 import { WsClient, type WsEvent } from "../api/ws";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 import { ApprovalCard } from "../chat/ApprovalCard";
 import { Composer } from "../chat/Composer";
 import { MessageStream } from "../chat/MessageStream";
@@ -149,7 +150,7 @@ export function Chat() {
     }, [auth, dismiss]);
 
     // Stable accessor used by everything that needs the live access token.
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
 
     // Initial + live thread list + pending approvals + plugin UI panels
     // + firing-alert count for the sidebar badge.
@@ -240,6 +241,21 @@ export function Chat() {
         };
     }, [activeId, auth, getToken]);
 
+    // 2026-04-28 — pin the live `handleWsEvent` in a ref. The
+    // WsClient is constructed ONCE per auth-status flip; if we
+    // closed the WS handler over `handleWsEvent` directly, every
+    // inbound frame would reach the very first closure (built
+    // when `activeId === null` at chat-shell mount). That stale
+    // `activeId` was the root cause of the "active chat shows as
+    // unread when its reply arrives" bug — `cid !== activeId`
+    // was true against the stale null. Reading through this ref
+    // on each frame guarantees the handler always sees the latest
+    // `activeId` (and any other state the handler closes over).
+    // The ref starts null because `handleWsEvent` is declared
+    // later in this function (TDZ); we install the live value via
+    // useEffect below.
+    const handleWsEventRef = useRef<((ev: WsEvent) => void) | null>(null);
+
     // Live event stream. The accessor is read on every reconnect
     // so a token rotation (silent retry / background refresh)
     // propagates to the next WS handshake — without that, a
@@ -249,7 +265,9 @@ export function Chat() {
         if (auth.status !== "authenticated") return;
         const client = new WsClient({
             accessToken: getToken,
-            onEvent: (ev) => handleWsEvent(ev),
+            onEvent: (ev) => {
+                handleWsEventRef.current?.(ev);
+            },
         });
         client.open();
         wsRef.current = client;
@@ -550,6 +568,13 @@ export function Chat() {
         }
     }, [activeId, getToken]);
 
+    // Keep the WsClient's onEvent indirection pointed at the latest
+    // handler. See the long comment next to `handleWsEventRef` above
+    // for why we can't just close over `handleWsEvent` directly.
+    useEffect(() => {
+        handleWsEventRef.current = handleWsEvent;
+    }, [handleWsEvent]);
+
     if (auth.status === "loading") {
         return (
             <div className="execlaw-auth-shell">
@@ -569,15 +594,12 @@ export function Chat() {
                     uiPanels={uiPanels}
                 />
             <main className="execlaw-main">
-                {topError && (
-                    <div
-                        className="execlaw-error-banner mx-3 mt-3"
-                        role="alert"
-                        data-testid="chat-error-banner"
-                    >
-                        {topError}
-                    </div>
-                )}
+                <ErrorBanner
+                    message={topError}
+                    onDismiss={() => setTopError(null)}
+                    className="mx-3 mt-3"
+                    testId="chat-error-banner"
+                />
                 <ChatPane
                     activeId={activeId}
                     onSend={onSend}
@@ -718,7 +740,7 @@ function ActiveThreadPane({
     sendVoiceControl: (payload: object) => boolean;
 }) {
     const auth = useAuth();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
     // Poll voice backend readiness so the composer's mic icon
     // either un-mutes (Voice STT + TTS Healthy) or shows the
     // muted icon + tooltip explaining what's missing.

@@ -62,7 +62,6 @@ fn build_state(transcript: &'static str) -> AppState {
         plugin_host: PluginHost::new(db.clone(), HookRegistry::new(), stage_root),
         webauthn: None,
         mcp_host: execlaw_server::mcp_host::McpHost::new(db),
-        runner_registry: execlaw_server::runner_registry::RunnerRegistry::new(),
         backend_supervisor: None,
         voice_sessions: execlaw_server::voice_session::VoiceSessionRegistry::new(
             events.clone(),

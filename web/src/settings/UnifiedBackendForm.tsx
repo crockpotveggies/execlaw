@@ -31,6 +31,7 @@ import {
 import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
 import Spinner from "react-bootstrap/Spinner";
+import { ErrorBanner } from "../components/ErrorBanner";
 import {
     type BackendPurpose,
     type DetectedGpu,
@@ -380,15 +381,12 @@ export function UnifiedBackendForm({
 
     return (
         <div data-testid={`${testIdPrefix}-form`}>
-            {submitError && (
-                <div
-                    className="execlaw-error-banner mb-3"
-                    role="alert"
-                    data-testid={`${testIdPrefix}-error`}
-                >
-                    {submitError}
-                </div>
-            )}
+            <ErrorBanner
+                message={submitError}
+                onDismiss={() => setSubmitError(null)}
+                className="mb-3"
+                testId={`${testIdPrefix}-error`}
+            />
             <Form noValidate onSubmit={submit}>
                 <Form.Group className="mb-3">
                     <Form.Label className="execlaw-muted small mb-1">

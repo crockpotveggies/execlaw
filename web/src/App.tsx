@@ -2,6 +2,7 @@ import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { AuthProvider } from "./auth/AuthContext";
 import { AppBoot } from "./routes/AppBoot";
 import { Chat } from "./routes/Chat";
+import { ConnectionBanner } from "./routes/ConnectionBanner";
 import { Login } from "./routes/Login";
 import { RequireSetupComplete } from "./routes/RequireSetupComplete";
 import { SetupWizard } from "./routes/SetupWizard";
@@ -11,6 +12,7 @@ export function App() {
     return (
         <AuthProvider>
             <BrowserRouter>
+                <ConnectionBanner />
                 <Routes>
                     <Route path="/" element={<AppBoot />} />
                     <Route path="/setup" element={<SetupWizard />} />

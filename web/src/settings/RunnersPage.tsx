@@ -23,6 +23,7 @@ import {
     type GroupRunnerView,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 
 const POLL_INTERVAL_MS = 5_000;
 
@@ -46,9 +47,28 @@ function shortGroupId(id: string): string {
     return id.length <= 12 ? id : `${id.slice(0, 8)}…${id.slice(-3)}`;
 }
 
+/// Map the supervisor's lowercase status string to a visual class
+/// + a friendlier label so the operator can tell apart healthy
+/// runners (`ready`) from runners that are mid-shutdown (`stopping`)
+/// or already torn down but still in the registry (`dead`).
+function statusBadge(status: string): { className: string; label: string } {
+    switch (status) {
+        case "ready":
+            return { className: "is-known", label: "ready" };
+        case "spawning":
+            return { className: "is-known", label: "spawning" };
+        case "stopping":
+            return { className: "is-pending", label: "stopping…" };
+        case "dead":
+            return { className: "is-blocked", label: "dead" };
+        default:
+            return { className: "is-known", label: status };
+    }
+}
+
 export function RunnersPage() {
     const auth = useAuth();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
     const [runners, setRunners] = useState<GroupRunnerView[] | null>(null);
     const [idleTtlSecs, setIdleTtlSecs] = useState<number | null>(null);
     const [error, setError] = useState<string | null>(null);
@@ -177,11 +197,7 @@ export function RunnersPage() {
                 </div>
             )}
 
-            {error && (
-                <div className="execlaw-error-banner mb-3" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
             {runners === null ? (
                 <div className="execlaw-muted small">Loading runners…</div>
@@ -219,9 +235,17 @@ export function RunnersPage() {
                                             {r.in_flight_turns} in flight
                                         </span>
                                     )}
-                                    <span className="execlaw-trust-badge ms-2 is-known">
-                                        {r.status}
-                                    </span>
+                                    {(() => {
+                                        const b = statusBadge(r.status);
+                                        return (
+                                            <span
+                                                className={`execlaw-trust-badge ms-2 ${b.className}`}
+                                                data-status={r.status}
+                                            >
+                                                {b.label}
+                                            </span>
+                                        );
+                                    })()}
                                 </span>
                                 {canMutate && (
                                     <>

@@ -7,14 +7,32 @@
 //! `RegistrationAck`. After the handshake the WS is symmetric —
 //! either side can send `ServerToRunner` / `RunnerToServer` frames
 //! at any time.
+//!
+//! 2026-04-28 — split into a `ConnectionDriver` that owns the socket
+//! and exposes:
+//!   * `tx()` — a cloneable `ConnectionTx` that any task can use to
+//!     push `RunnerToServer` frames. A background writer task drains
+//!     the mpsc and serialises sends so multiple in-flight turn
+//!     tasks never race on the WS sink.
+//!   * `recv()` — the main loop's pull side, demuxing inbound frames
+//!     to the per-turn handlers. A background reader task feeds the
+//!     internal channel; on a closed socket the channel returns
+//!     `None`, signalling the main loop to exit.
+//!
+//! This shape is what unlocks tool-call dispatch: a turn task can
+//! send a `ToolCallRequest` and park on a per-turn `ToolCallResult`
+//! mailbox WITHOUT blocking the WS read loop, so a `CancelTurn` or
+//! a `Heartbeat` arriving mid-tool-call doesn't get dropped.
 
 use anyhow::{Context, Result, anyhow, bail};
 use execlaw_runner_protocol::{
     PROTOCOL_VERSION, RegistrationAck, RunnerToServer, ServerToRunner,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use std::env;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -71,14 +89,38 @@ impl RunnerConfig {
     }
 }
 
-/// One live WS connection. Owns the split sink + stream and the
-/// `RegistrationAck` that the supervisor sent on handshake.
-pub struct Connection {
-    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    ack: RegistrationAck,
+/// Cloneable handle for sending `RunnerToServer` frames. Backed by a
+/// single-writer mpsc to the dedicated writer task that owns the WS
+/// sink — concurrent sends from multiple turn tasks are serialised
+/// safely without explicit locks.
+#[derive(Clone)]
+pub struct ConnectionTx {
+    inner: mpsc::UnboundedSender<RunnerToServer>,
 }
 
-impl Connection {
+impl ConnectionTx {
+    pub fn send(&self, frame: RunnerToServer) -> Result<()> {
+        self.inner
+            .send(frame)
+            .map_err(|_| anyhow!("connection closed; outbound channel disconnected"))
+    }
+}
+
+/// Live WS connection to the control plane. Construct via
+/// `ConnectionDriver::connect`; pull inbound frames via `recv()`,
+/// push outbound frames via `tx()`.
+pub struct ConnectionDriver {
+    ack: RegistrationAck,
+    out_tx: ConnectionTx,
+    in_rx: mpsc::UnboundedReceiver<ServerToRunner>,
+    /// JoinHandles kept so the tasks abort if the driver is dropped
+    /// before a clean close. Tagged with `_` because we never poll
+    /// them directly — abort-on-drop is the contract.
+    _writer: JoinHandle<()>,
+    _reader: JoinHandle<()>,
+}
+
+impl ConnectionDriver {
     pub async fn connect(cfg: &RunnerConfig) -> Result<Self> {
         // Build the upgrade URL. Supervisor's route is
         // `/api/runner/register/{group_id}`.
@@ -143,60 +185,120 @@ impl Connection {
             );
         }
 
-        Ok(Self { socket, ack })
+        // Split the socket. The writer task owns the sink
+        // exclusively (no Mutex needed) and drains an mpsc. The
+        // reader task owns the stream and pushes decoded frames to
+        // the inbound mpsc. Either task ending closes its half;
+        // when both halves are closed the driver's `recv` returns
+        // `None` and the main loop exits.
+        let (sink, mut stream) = socket.split();
+        let (out_tx_inner, mut out_rx) = mpsc::unbounded_channel::<RunnerToServer>();
+        let (in_tx, in_rx) = mpsc::unbounded_channel::<ServerToRunner>();
+
+        // Writer task: serialise frames + drain the outbound mpsc.
+        // Also forwards Pong control frames received from the reader
+        // via the same channel, since SinkSplit'd halves can't share
+        // a Sink. To keep the surface small we don't model Pong as a
+        // RunnerToServer variant — instead the reader auto-pongs by
+        // ignoring Ping (relying on tungstenite's frame-level
+        // semantics; the supervisor's heartbeat is application-
+        // level, not WS Ping/Pong).
+        let writer = tokio::spawn(async move {
+            let mut sink: SplitSink<_, Message> = sink;
+            while let Some(frame) = out_rx.recv().await {
+                let txt = match serde_json::to_string(&frame) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!(error = %e, "encode RunnerToServer frame failed");
+                        continue;
+                    }
+                };
+                if let Err(e) = sink.send(Message::Text(txt.into())).await {
+                    tracing::error!(error = %e, "WS send failed; closing writer task");
+                    break;
+                }
+            }
+            // Best-effort close.
+            let _ = sink.close().await;
+        });
+
+        // Reader task: decode + forward.
+        let reader = tokio::spawn(async move {
+            while let Some(msg) = stream.next().await {
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!(error = %e, "WS read failed; closing reader task");
+                        break;
+                    }
+                };
+                match msg {
+                    Message::Text(txt) => {
+                        match serde_json::from_str::<ServerToRunner>(&txt) {
+                            Ok(frame) => {
+                                if in_tx.send(frame).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    payload = %trim(&txt, 200),
+                                    "dropping undecodable ServerToRunner frame"
+                                );
+                            }
+                        }
+                    }
+                    Message::Binary(bytes) => {
+                        match serde_json::from_slice::<ServerToRunner>(&bytes) {
+                            Ok(frame) => {
+                                if in_tx.send(frame).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "dropping undecodable binary frame");
+                            }
+                        }
+                    }
+                    Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
+                        // tungstenite handles control-frame
+                        // round-trips; the supervisor uses
+                        // application-level Heartbeat frames.
+                    }
+                    Message::Close(_) => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            ack,
+            out_tx: ConnectionTx {
+                inner: out_tx_inner,
+            },
+            in_rx,
+            _writer: writer,
+            _reader: reader,
+        })
     }
 
     pub fn ack(&self) -> &RegistrationAck {
         &self.ack
     }
 
-    /// Receive the next `ServerToRunner` frame.
-    /// Returns Ok(None) when the supervisor closes the WS cleanly.
-    pub async fn recv(&mut self) -> Result<Option<ServerToRunner>> {
-        loop {
-            let msg = match self.socket.next().await {
-                Some(Ok(m)) => m,
-                Some(Err(e)) => return Err(e.into()),
-                None => return Ok(None),
-            };
-            match msg {
-                Message::Text(txt) => {
-                    let frame: ServerToRunner = serde_json::from_str(&txt)
-                        .with_context(|| {
-                            format!("decoding ServerToRunner frame: {}", trim(&txt, 200))
-                        })?;
-                    return Ok(Some(frame));
-                }
-                Message::Binary(bytes) => {
-                    let frame: ServerToRunner = serde_json::from_slice(&bytes)
-                        .context("decoding binary ServerToRunner frame")?;
-                    return Ok(Some(frame));
-                }
-                Message::Ping(payload) => {
-                    let _ = self.socket.send(Message::Pong(payload)).await;
-                    continue;
-                }
-                Message::Pong(_) => continue,
-                Message::Close(_) => return Ok(None),
-                Message::Frame(_) => continue,
-            }
-        }
+    /// A cloneable sender. Use this from any task that needs to
+    /// push frames back to the supervisor.
+    pub fn tx(&self) -> ConnectionTx {
+        self.out_tx.clone()
     }
 
-    /// Send a frame back to the supervisor.
-    pub async fn send(&mut self, frame: &RunnerToServer) -> Result<()> {
-        let txt = serde_json::to_string(frame)
-            .context("encoding RunnerToServer frame")?;
-        self.socket
-            .send(Message::Text(txt.into()))
-            .await
-            .context("WS send")?;
-        Ok(())
-    }
-
-    pub async fn close(mut self) -> Result<()> {
-        let _ = self.socket.close(None).await;
-        Ok(())
+    /// Pull the next inbound frame. Returns `None` when the WS has
+    /// closed (clean close or error — the reader task already logged
+    /// the cause).
+    pub async fn recv(&mut self) -> Option<ServerToRunner> {
+        self.in_rx.recv().await
     }
 }
 
@@ -222,4 +324,16 @@ fn trim(s: &str, max: usize) -> String {
     } else {
         format!("{}…", &s[..max])
     }
+}
+
+/// Compile-time assertions: `WebSocketStream<MaybeTlsStream<TcpStream>>`
+/// must split into `SplitSink<_, Message>` for the writer task. If
+/// tungstenite changes the surface, we want the runner to fail to
+/// build rather than fail at runtime.
+#[allow(dead_code)]
+fn _typecheck_socket_split(
+    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+) -> SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message> {
+    let (sink, _stream) = socket.split();
+    sink
 }

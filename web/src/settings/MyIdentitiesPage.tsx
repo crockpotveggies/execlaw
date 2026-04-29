@@ -21,6 +21,7 @@ import {
     type MyIdentitiesResponse,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 
 const TRANSPORT_HINTS = [
     { value: "signal", label: "Signal", placeholder: "+15551234" },
@@ -32,7 +33,7 @@ const TRANSPORT_HINTS = [
 
 export function MyIdentitiesPage() {
     const auth = useAuth();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
 
     const [data, setData] = useState<MyIdentitiesResponse | null>(null);
     const [error, setError] = useState<string | null>(null);
@@ -116,11 +117,7 @@ export function MyIdentitiesPage() {
                 </span>
             </p>
 
-            {error && (
-                <div className="execlaw-error-banner mb-3" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
             <div
                 className="execlaw-card mb-3"

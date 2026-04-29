@@ -134,7 +134,19 @@ export function Composer({
                     value={text}
                     onChange={(e) => setText(e.target.value)}
                     onKeyDown={onKeyDown}
-                    disabled={isBusy}
+                    // 2026-04-28 — only honour the *external* disabled
+                    // prop. Previously we also disabled while the
+                    // submit await was in flight, which (a) blurred
+                    // the textarea (disabled inputs can't hold
+                    // focus) and (b) blocked the operator from
+                    // composing a follow-up while the agent was
+                    // streaming. The double-send guard lives in
+                    // `submit()` (`if (submitting) return`); the
+                    // send button itself stays disabled (see
+                    // `isBusy` below). Keeping the textarea hot
+                    // means focus survives Enter and the operator
+                    // can queue their next thought immediately.
+                    disabled={!!disabled}
                     className="execlaw-composer__input"
                     data-testid="composer-input"
                 />

@@ -219,7 +219,6 @@ async fn forward_turn_round_trips_token_delta_to_runner_and_event_bus() {
         temperature: None,
         max_tokens: None,
         reasoning_enabled: false,
-        capability_token: "tok".into(),
         spotlight: None,
     };
     let _stream = state

@@ -1,14 +1,18 @@
 // Vertically scrolling message list for the active thread.
 //
-// Auto-scrolls to the latest message on append. Long messages get a
-// fixed-height clamp + "Read more…" affordance per the Phase-6
-// truncation spec. Each bubble also renders a subtle channel-origin
-// icon (web / signal / email / voice) so the controller can see at a
-// glance which transport delivered the message — required for the
-// Control-thread merge UX (MIGRATION_PLAN §6).
+// Auto-scrolls to the latest message on append IF the operator is
+// already at the bottom. When the operator has scrolled up to read
+// history, incoming messages no longer yank the viewport — instead
+// a small ↓ button surfaces above the composer; clicking it snaps
+// to the latest. Long messages get a fixed-height clamp +
+// "Read more…" affordance per the Phase-6 truncation spec. Each
+// bubble also renders a subtle channel-origin icon (signal / email
+// / voice) so the controller can see at a glance which transport
+// delivered the message.
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { MessageView } from "../api/endpoints";
+import { MarkdownContent } from "../components/MarkdownContent";
 import { useChatState } from "./store";
 
 interface Props {
@@ -20,6 +24,11 @@ const TRUNCATE_LINES = 12;
 /** Char heuristic — fall back to length when the line count is hard to gauge. */
 const TRUNCATE_CHARS = 1200;
 
+/** Pixel slack on the at-bottom check. Browsers can leave a fractional
+ *  gap between scrollTop+clientHeight and scrollHeight even when the
+ *  user is visually at the floor; 8 px swallows that noise. */
+const AT_BOTTOM_SLACK_PX = 8;
+
 export function MessageStream({ conversationId }: Props) {
     const messages = useChatState(
         (s) => s.messages[conversationId] ?? null,
@@ -28,56 +37,108 @@ export function MessageStream({ conversationId }: Props) {
         (s) => s.streamingBuffer[conversationId] ?? null,
     );
     const scrollRef = useRef<HTMLDivElement | null>(null);
+    const [isAtBottom, setIsAtBottom] = useState(true);
 
+    // Auto-stick to the bottom only when the operator is already
+    // there. Mid-history scroll-up means "I'm reading older content,
+    // don't yank me away" — incoming messages just pile under the
+    // viewport and the ↓ button surfaces.
     useEffect(() => {
         const el = scrollRef.current;
         if (!el) return;
-        el.scrollTop = el.scrollHeight;
-    }, [messages, streaming]);
+        if (isAtBottom) {
+            el.scrollTop = el.scrollHeight;
+        }
+    }, [messages, streaming, isAtBottom]);
+
+    const onScroll = useCallback(() => {
+        const el = scrollRef.current;
+        if (!el) return;
+        const distanceFromBottom =
+            el.scrollHeight - el.scrollTop - el.clientHeight;
+        setIsAtBottom(distanceFromBottom <= AT_BOTTOM_SLACK_PX);
+    }, []);
+
+    const scrollToBottom = useCallback(() => {
+        const el = scrollRef.current;
+        if (!el) return;
+        el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    }, []);
+
+    // Re-establish at-bottom on conversation switch so the new
+    // thread starts in autoscroll mode.
+    useEffect(() => {
+        setIsAtBottom(true);
+    }, [conversationId]);
 
     if (messages === null) {
         return (
-            <div className="execlaw-stream" ref={scrollRef}>
-                <div className="execlaw-empty-state small">Loading messages…</div>
+            <div className="execlaw-stream-wrap">
+                <div className="execlaw-stream" ref={scrollRef}>
+                    <div className="execlaw-empty-state small">
+                        Loading messages…
+                    </div>
+                </div>
             </div>
         );
     }
 
     if (messages.length === 0 && !streaming) {
         return (
-            <div className="execlaw-stream" ref={scrollRef}>
-                <div className="execlaw-empty-state">
-                    <i
-                        className="bi bi-chat-square-dots"
-                        style={{ fontSize: "2rem", display: "block", marginBottom: "0.5rem" }}
-                        aria-hidden
-                    />
-                    No messages yet. Type below to start.
+            <div className="execlaw-stream-wrap">
+                <div className="execlaw-stream" ref={scrollRef}>
+                    <div className="execlaw-empty-state">
+                        <i
+                            className="bi bi-chat-square-dots"
+                            style={{
+                                fontSize: "2rem",
+                                display: "block",
+                                marginBottom: "0.5rem",
+                            }}
+                            aria-hidden
+                        />
+                        No messages yet. Type below to start.
+                    </div>
                 </div>
             </div>
         );
     }
 
     return (
-        <div
-            className="execlaw-stream"
-            ref={scrollRef}
-            data-testid="message-stream"
-        >
-            {messages.map((m) => (
-                <MessageBubble key={`${m.kind}-${m.seq}`} message={m} />
-            ))}
-            {streaming && (
-                <div className="execlaw-msg" data-testid="streaming-bubble">
-                    <div className="execlaw-msg__meta">
-                        <ChannelOriginIcon origin="web" />
-                        agent · streaming
-                        <span className="execlaw-streaming-cursor" aria-hidden>
-                            ▍
-                        </span>
+        <div className="execlaw-stream-wrap">
+            <div
+                className="execlaw-stream"
+                ref={scrollRef}
+                onScroll={onScroll}
+                data-testid="message-stream"
+            >
+                {messages.map((m) => (
+                    <MessageBubble key={`${m.kind}-${m.seq}`} message={m} />
+                ))}
+                {streaming && (
+                    <div className="execlaw-msg" data-testid="streaming-bubble">
+                        <div className="execlaw-msg__meta">
+                            agent · streaming
+                            <span className="execlaw-streaming-cursor" aria-hidden>
+                                ▍
+                            </span>
+                        </div>
+                        <div className="execlaw-msg__bubble">
+                            <MarkdownContent text={streaming} streaming />
+                        </div>
                     </div>
-                    <div className="execlaw-msg__bubble">{streaming}</div>
-                </div>
+                )}
+            </div>
+            {!isAtBottom && (
+                <button
+                    type="button"
+                    className="execlaw-scroll-to-bottom"
+                    onClick={scrollToBottom}
+                    aria-label="Scroll to latest message"
+                    data-testid="scroll-to-bottom"
+                >
+                    <i className="bi bi-arrow-down" aria-hidden />
+                </button>
             )}
         </div>
     );
@@ -93,23 +154,63 @@ function MessageBubble({ message }: { message: MessageView }) {
 
     const display = isLong && !expanded ? clamp(text, TRUNCATE_LINES, TRUNCATE_CHARS) : text;
 
+    // 2026-04-28 — meta-line cleanup:
+    //   * Hide the channel-origin icon for the default `web` origin
+    //     (adds visual noise; only useful when a non-web transport
+    //     delivered the message — Signal / email / voice / sms).
+    //   * Skip the `· {actor}` suffix when the actor is redundant
+    //     with the role — "agent · agent" was the regression we
+    //     caught here. The runner stamps `actor: "agent"` on every
+    //     `model_turn` event; collapsing that into just "agent" reads
+    //     cleaner.
+    //   * Drop the meta entirely for the common case (web-origin
+    //     user message). The right-aligned pill already telegraphs
+    //     "you said this" — a "you" label adds no info. We DO keep
+    //     the meta when a user message arrives via a non-web
+    //     transport (Signal / email / voice / sms) so the operator
+    //     can see "this came in over Signal" without inspecting the
+    //     event payload.
+    const showOriginIcon = channelOrigin !== "web";
+    const actorSuffix =
+        message.actor && message.actor !== role
+            ? ` · ${message.actor}`
+            : "";
+    const isUserMessage = message.kind === "user_msg";
+    const showMeta = !isUserMessage || channelOrigin !== "web";
+
     return (
-        <div className="execlaw-msg">
-            <div className="execlaw-msg__meta">
-                <ChannelOriginIcon origin={channelOrigin} />
-                {role}
-                {message.actor ? ` · ${message.actor}` : ""}
-            </div>
+        <div
+            className={"execlaw-msg" + (isUserMessage ? " is-user" : "")}
+        >
+            {showMeta && (
+                <div className="execlaw-msg__meta">
+                    {showOriginIcon && (
+                        <ChannelOriginIcon origin={channelOrigin} />
+                    )}
+                    {role}
+                    {actorSuffix}
+                </div>
+            )}
             <div
                 className={
                     "execlaw-msg__bubble" +
-                    (message.kind === "user_msg" ? " is-user" : "") +
+                    (isUserMessage ? " is-user" : "") +
                     (isToolKind(message.kind) ? " is-tool" : "") +
                     (isLong && !expanded ? " is-clamped" : "")
                 }
                 data-testid={isLong ? "msg-truncated" : undefined}
             >
-                {display}
+                {/* Tool messages are JSON / monospace dumps — render
+                    as raw text. Everything else (agent + user) goes
+                    through the markdown pipeline so headings, lists,
+                    code blocks, links, tables etc. render properly.
+                    Markdown inside fenced code blocks is preserved
+                    as literal text (remark's default). */}
+                {isToolKind(message.kind) ? (
+                    display
+                ) : (
+                    <MarkdownContent text={display} />
+                )}
                 {isLong && (
                     <div className="mt-2">
                         <button

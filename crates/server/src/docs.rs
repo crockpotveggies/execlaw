@@ -45,9 +45,7 @@ use crate::settings_general::{
 };
 use crate::setup_preflight::{DockerStatus, PreflightResponse};
 use crate::trust_policy::{TrustPolicyView, UpdateTrustPolicyRequest};
-use crate::runners_admin::{
-    GroupRunnerListResponse, GroupRunnerView, RunnerListResponse, RunnerView,
-};
+use crate::runners_admin::{GroupRunnerListResponse, GroupRunnerView};
 use crate::mcp_admin::{
     McpServerListResponse, McpServerView, McpServerWriteRequest,
 };
@@ -143,9 +141,7 @@ impl Modify for SecurityAddon {
         crate::backends::logs_handler,
         // backend presets (Phase 13.B.1 — managed-mode wizard library)
         crate::backends::presets_handler,
-        // runners (Phase 8.5 — view-only + restart)
-        crate::runners_admin::list_handler,
-        crate::runners_admin::restart_handler,
+        // runners (Phase 16 — supervisor-tracked per principal group)
         crate::runners_admin::list_groups_handler,
         crate::runners_admin::restart_group_handler,
         crate::runners_admin::wipe_group_handler,
@@ -232,8 +228,6 @@ impl Modify for SecurityAddon {
         PresetField,
         PresetWithFlag,
         PresetsResponse,
-        RunnerView,
-        RunnerListResponse,
         GroupRunnerView,
         GroupRunnerListResponse,
         UserView,
@@ -452,8 +446,9 @@ mod tests {
             ("/api/admin/backends/{purpose}", &["put", "delete"]),
             ("/api/admin/backends/{purpose}/status", &["get"]),
             ("/api/admin/backends/{purpose}/restart", &["post"]),
-            ("/api/admin/runners", &["get"]),
-            ("/api/admin/runners/{conversation_id}/restart", &["post"]),
+            ("/api/admin/runners/groups", &["get"]),
+            ("/api/admin/runners/groups/{group_id}/restart", &["post"]),
+            ("/api/admin/runners/groups/{group_id}/wipe", &["post"]),
             ("/api/admin/users", &["get"]),
             ("/api/admin/users/invite", &["post"]),
             ("/api/admin/users/{user_id}", &["delete"]),

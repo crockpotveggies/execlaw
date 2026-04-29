@@ -23,6 +23,7 @@ import {
     type TrustPolicyView,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 
 interface FormState {
     auto_trust_contacts: boolean;
@@ -73,7 +74,7 @@ function localValidationError(f: FormState): string | null {
 
 export function TrustPolicyPage() {
     const auth = useAuth();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
 
     const [form, setForm] = useState<FormState | null>(null);
     const [error, setError] = useState<string | null>(null);
@@ -125,9 +126,11 @@ export function TrustPolicyPage() {
         return (
             <div data-testid="settings-trust-policy">
                 {error ? (
-                    <div className="execlaw-error-banner mb-3" role="alert">
-                        {error}
-                    </div>
+                    <ErrorBanner
+                        message={error}
+                        onDismiss={() => setError(null)}
+                        className="mb-3"
+                    />
                 ) : (
                     <div className="execlaw-muted small">
                         Loading trust policy…
@@ -146,11 +149,7 @@ export function TrustPolicyPage() {
                 changes apply on save and audit.
             </p>
 
-            {error && (
-                <div className="execlaw-error-banner mb-3" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
             <div className="execlaw-card">
                 <Form.Group className="mb-3" controlId="trust-auto">

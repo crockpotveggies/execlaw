@@ -88,26 +88,39 @@ const INITIAL: VoiceReadiness = {
     loading: true,
 };
 
-/// 30s steady-state interval. The supervisor reconciles every
-/// 5 s but voice readiness is operator-facing chrome — a 30 s
-/// poll keeps the network footprint cheap while still
-/// auto-recovering when a backend finishes loading.
-const POLL_INTERVAL_MS = 30_000;
-
+/// 2026-04-28 — there is no steady-state poll. Voice-mode availability
+/// only changes when the operator configures or disables a voice
+/// backend, which is a deliberate Settings → Backends action. We check
+/// once on mount and once whenever the tab regains focus (catches the
+/// operator-edited-config-in-another-tab case). Background polling
+/// would just spam `/api/admin/backends` for nothing — see the
+/// 1000-req/sec render-loop incident in the same date for what
+/// happens when this hook misbehaves.
 export function useVoiceReadiness(
     getToken: () => string | null,
 ): VoiceReadiness {
     const [state, setState] = useState<VoiceReadiness>(INITIAL);
     const aliveRef = useRef(true);
+    // 2026-04-28 — pin the token accessor in a ref so a fresh
+    // arrow on every parent render (e.g.
+    // `useVoiceReadiness(() => auth.getAccessToken())`) doesn't
+    // invalidate `compute` and re-fire `useEffect([compute])` on
+    // every render. Symptom of the bug: 1000+ /api/admin/backends
+    // requests per second after navigating away from a settings
+    // page back into chat. The hook now reads through the ref, so
+    // its `compute` is stable for the component's lifetime.
+    const tokenRef = useRef<() => string | null>(getToken);
+    tokenRef.current = getToken;
 
     const compute = useCallback(async () => {
+        const accessor: () => string | null = () => tokenRef.current();
         try {
-            const list = await listBackends(getToken);
+            const list = await listBackends(accessor);
             const stt = list.backends.find((b) => b.purpose === "VoiceSTT");
             const tts = list.backends.find((b) => b.purpose === "VoiceTTS");
             const [sttReadiness, ttsReadiness] = await Promise.all([
-                evaluatePurpose("VoiceSTT", stt, getToken),
-                evaluatePurpose("VoiceTTS", tts, getToken),
+                evaluatePurpose("VoiceSTT", stt, accessor),
+                evaluatePurpose("VoiceTTS", tts, accessor),
             ]);
             if (!aliveRef.current) return;
             const ready = sttReadiness.ready && ttsReadiness.ready;
@@ -124,7 +137,8 @@ export function useVoiceReadiness(
             // A network blip shouldn't unmute the mic — keep the
             // last-known state but mark loading: false so the
             // button stops showing the initial probing tooltip
-            // forever. The next interval tick will retry.
+            // forever. Recovery options for the operator: switch
+            // tabs (focus listener re-runs compute) or refresh.
             setState((prev) => ({
                 ...prev,
                 loading: false,
@@ -136,17 +150,20 @@ export function useVoiceReadiness(
                           }`,
             }));
         }
-    }, [getToken]);
+    }, []);
 
     useEffect(() => {
         aliveRef.current = true;
         void compute();
-        const id = window.setInterval(() => void compute(), POLL_INTERVAL_MS);
+        // Re-check on focus so a config edit in another tab unmutes
+        // the mic without a manual refresh of THIS tab. No periodic
+        // poll — the operator's natural workflow after configuring a
+        // backend is to refresh the page anyway. Polling for a config
+        // change that the operator just made is wasted bandwidth.
         const onFocus = () => void compute();
         window.addEventListener("focus", onFocus);
         return () => {
             aliveRef.current = false;
-            window.clearInterval(id);
             window.removeEventListener("focus", onFocus);
         };
     }, [compute]);

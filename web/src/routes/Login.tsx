@@ -17,6 +17,7 @@ import Spinner from "react-bootstrap/Spinner";
 import { ApiError } from "../api/client";
 import { finishWebauthnLogin, postLoginOutcome } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 import { useScreenTransition } from "../anim/useScreenTransition";
 import { coerceRequestOptions, serializeCredential } from "../auth/webauthn";
 
@@ -165,15 +166,12 @@ export function Login() {
                 <h1 className="execlaw-brand h4 mb-1">execlaw</h1>
                 <p className="execlaw-muted small mb-4">Sign in to continue.</p>
 
-                {submitError && (
-                    <div
-                        className="execlaw-error-banner mb-3"
-                        role="alert"
-                        data-testid="login-error"
-                    >
-                        {submitError}
-                    </div>
-                )}
+                <ErrorBanner
+                    message={submitError}
+                    onDismiss={() => setSubmitError(null)}
+                    className="mb-3"
+                    testId="login-error"
+                />
 
                 {pendingChallenge && (
                     <div className="execlaw-card mb-3" data-testid="login-webauthn-pending">

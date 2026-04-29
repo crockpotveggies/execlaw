@@ -23,7 +23,15 @@ use serde::{Deserialize, Serialize};
 ///     bump needed if old runners ignore unknown variants).
 ///   * Renaming or removing a field: MAJOR (bump).
 ///   * Changing a field's semantics: MAJOR (bump).
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// 2026-04-28 — bumped 1 → 2 because `TurnRequest::capability_token`
+/// was removed. Old (v1) runner-binary images decode TurnRequest
+/// with the missing field as a hard error mid-turn ("decoding
+/// ServerToRunner frame"); the version check below catches the
+/// mismatch at handshake time and surfaces a clear error in the
+/// supervisor's spawn log instead. If you ship a new runner image,
+/// rebuild `execlaw/runner:dev` from the matching source tree.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 pub fn current_version() -> u32 {
     PROTOCOL_VERSION
@@ -154,12 +162,6 @@ pub struct TurnRequest {
     /// Forwarded into `chat_template_kwargs.enable_thinking` to
     /// suppress / unlock Qwen's `<think>` blocks.
     pub reasoning_enabled: bool,
-    /// Capability token bound to `(group_id, turn_id)`. The runner
-    /// echoes it on every `ToolCallRequest`; the server verifies
-    /// the signature + scope before dispatching the tool. Token
-    /// expires when the turn ends so a tool callback can't leak
-    /// across turns.
-    pub capability_token: String,
     /// §7.4 spotlighting delimiter for wrapping untrusted-content
     /// user messages. None = spotlighting off for this turn.
     pub spotlight: Option<String>,
@@ -291,8 +293,9 @@ mod tests {
     fn protocol_version_is_stable() {
         // Bumping this number is a wire change. Tests across the
         // workspace pin it as a tripwire — if you bump it,
-        // double-check both sides handle the bump.
-        assert_eq!(PROTOCOL_VERSION, 1);
+        // double-check both sides handle the bump AND rebuild
+        // the runner Docker image from the matching source tree.
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 
     #[test]
@@ -318,7 +321,6 @@ mod tests {
             temperature: Some(0.2),
             max_tokens: None,
             reasoning_enabled: false,
-            capability_token: "tok".into(),
             spotlight: None,
         };
         let s1 = serde_json::to_string(&req).unwrap();

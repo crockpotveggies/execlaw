@@ -760,7 +760,6 @@ pub fn test_app_state() -> AppState {
         // returns 0 and the password-only login path is exercised.
         webauthn: None,
         mcp_host: crate::mcp_host::McpHost::new(db),
-        runner_registry: crate::runner_registry::RunnerRegistry::new(),
         // Tests don't have Docker; supervisor stays None and the
         // routes report 503 if exercised. Tests that DO want a
         // mock-backed supervisor construct AppState manually.

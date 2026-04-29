@@ -18,6 +18,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Button from "react-bootstrap/Button";
 import OverlayTrigger from "react-bootstrap/OverlayTrigger";
 import Tooltip from "react-bootstrap/Tooltip";
+import { ErrorBanner } from "../components/ErrorBanner";
 import { codecFromMime, VoiceSession } from "./VoiceSession";
 
 interface Props {
@@ -334,15 +335,12 @@ export function VoiceCaptureButton({
             >
                 {button}
             </OverlayTrigger>
-            {error && (
-                <div
-                    className="execlaw-error-banner mt-2"
-                    role="alert"
-                    data-testid="composer-voice-error"
-                >
-                    {error}
-                </div>
-            )}
+            <ErrorBanner
+                message={error}
+                onDismiss={() => setError(null)}
+                className="mt-2"
+                testId="composer-voice-error"
+            />
         </>
     );
 }

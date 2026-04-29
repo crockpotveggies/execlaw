@@ -2709,6 +2709,39 @@ target.
 
 ---
 
+## 11.Z Built-but-Unwired Scaffolds — Cleanup Backlog (TODO)
+
+The 2026-04-28 dead-code audit found several crates / modules that
+compile, have tests, and are reachable from `Cargo.toml`, but are
+**not on the live chat path today**. They're not dead enough to delete
+outright — each was built deliberately for a future phase — but they
+*are* drift risk: an operator reading the code can't tell from the
+shape of the workspace which features are real.
+
+Each entry below is a "decide before next ship" TODO. Disposition is
+one of: **wire it** (turn the scaffold into a live runtime path),
+**retire it** (delete the crate + remove from `Cargo.toml`), or
+**re-scope it** (rewrite to match the current architecture). Until
+disposition lands, treat the listed code as load-bearing-for-tests-
+only and DO NOT extend it without a phase plan.
+
+| Scaffold | Crate / Path | Purpose at design time | Live runtime hook? | Disposition TBD |
+|---|---|---|---|---|
+| **Plugin host (ZIP-upload, hooks)** | `crates/plugin-host`, `crates/plugin-sdk` | Phase 4 plugin framework: ZIP upload → manifest validation → hook dispatch (transports, tools, identity providers, services). Locked decision §4.3. | Compiled into `AppState.plugin_host`. `chats.rs` reads `plugin_host.registry().all_tools()` to gate the tool-capable path, but no hooks are *fired* — there's no inbound transport, no tool plugin uploaded, no service plugin lifecycle. | Phase 4 implementation OR explicit "plugins are stubs until Phase 4" doc note + remove the `plugins.rs` admin route from the SPA so operators don't think it works. |
+| **MCP client / host** | `crates/mcp-client`, `crates/server/src/mcp_host.rs`, `crates/server/src/mcp_admin.rs` | Phase 8c: stdio MCP servers configured via `config_mcp_servers`, tools reflected into `config_tool_access` so the runner can call `mcp:<id>:<name>`. | `mcp_host.reconcile()` runs at boot; admin CRUD route exists; tool dispatch path **exists** in `tool_dispatch.rs`. *But*: locked decision 2026-04-23 says "MCP later" — there's no SPA UI past the admin CRUD, and no server has been demonstrated end-to-end. | Confirm "MCP later" still holds → add a feature flag `EXECLAW_MCP_ENABLED` defaulting off, hide the SPA admin page, OR commit to a Phase 8c integration test that exercises a real stdio MCP server. |
+| **Voice pipeline (STT/TTS/runtime)** | `crates/voice-pipeline`, `crates/server/src/voice_*` | Phase 13.B/C: WS audio session → jitter buffer → Whisper STT → agent loop → Kokoro TTS streaming back. | `voice_sessions` + `voice_runtime` + `voice_clients` are all wired into `AppState`; routes for `/api/voice/*` exist; one round-trip integration test (`voice_ws_round_trip.rs`) passes against mocks. *But*: the SPA has no voice UI; the chat path doesn't dispatch voice modality; no operator has used voice end-to-end. | Either build the SPA voice surface (Phase 9) or quarantine the voice crates behind a `voice` cargo feature so they don't add 60s to a `cargo build` for operators not using voice. |
+| **Outbox / approval flow** | `crates/server/src/approvals.rs`, `crates/server/tests/approval_flow.rs` | Axiom #4 (effects through outbox) + sideband HITL (§2.11): runner produces intent → outbox queue → approval card → controller approves/denies → relay produces effect. | Approval routes exist; `approval_flow.rs` test passes. *But*: nothing in the chat / runner path *enqueues* approvals today — every effect goes inline. The outbox table exists in migrations but is never written to. | Wire one end-to-end effect (e.g. a tool that triggers a real Signal send) through the outbox + approval card OR retire the approvals.rs surface until §2.4 lands. Currently misleading: the SPA shows an Approvals page that's always empty. |
+| **Subagent escalation** | Referenced in `docs/voice-design.md`, agent-model research (§2.9) | Voice "small-model runner + warm pool" with sub-agent escalation to a bigger model for hard problems. Default-on subagents per locked decision 2026-04-23. | **No code path exists.** The supervisor has one runner per group; there's no fan-out, no dispatch-to-bigger-model, no result merge. | Phase 9 / voice closure. Either add a §9.x sub-phase that ships subagent dispatch OR remove the locked-decision claim from `MEMORY.md` until it's real. |
+| **Capability tokens (signed JWTs)** | *Retired 2026-04-28* | Per-turn signed bearer the runner echoes on every tool call so the server verifies `(group_id, turn_id, capability_set)` before dispatching. §7.2. | ~~Module + protocol field + benches existed but nothing verified.~~ Pruned. The in-process tool dispatcher gates on `policy.capability_set` directly. | Resurrect when the runner-container path supports tools (see "runner-local TurnExecutor" item below) and the cross-process boundary needs a forgery-resistant bearer. |
+| **runner-local `TurnExecutor` tool path** | `crates/runner-local/src/lib.rs` (`TurnExecutor`), live caller `crates/server/src/chats.rs:1139` | Tool-capable agent loop: model emits `tool_use` → server dispatches via `ChainedToolDispatch` → result → next round, until the model finishes. | **Live and load-bearing**: every chat turn that has plugin/MCP tools available routes through `TurnExecutor::new()` in the in-process server, NOT through the runner container. The supervisor path bypasses tools today. | **Address now (2026-04-28).** Either teach the runner WS protocol to forward `tool_use` to the supervisor (so the runner container can use tools) OR formalize the split: runner = no-tools text turns; in-process executor = tool-capable turns. Until decided, the SPA has two parallel agent loops with different bug surfaces. See "Agent loop tool execution" tracking note at the top of `crates/runner-local/src/lib.rs`. |
+
+**Process note.** When picking up any of these, the *first* PR must
+be a phase-plan section (§11.x) that defines: scope, demo, owner crate
+boundaries, test budget. No "I'll just wire it up" PRs — those are how
+scaffolds turn into permanent half-features.
+
+---
+
 ## 12. What We're *Not* Porting
 
 - **`.env` files and process-env-based config.** Replaced by SQLite config + OS-keyring vault + CLI bootstrap flags. See §6.

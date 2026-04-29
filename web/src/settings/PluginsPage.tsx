@@ -15,10 +15,11 @@ import {
     type PluginSummary,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 
 export function PluginsPage() {
     const auth = useAuth();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
     const [plugins, setPlugins] = useState<PluginSummary[] | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [busyId, setBusyId] = useState<string | null>(null);
@@ -76,11 +77,7 @@ export function PluginsPage() {
 
             <InstallCard onInstalled={fetchList} />
 
-            {error && (
-                <div className="execlaw-error-banner mb-3" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
             {plugins === null ? (
                 <div className="execlaw-muted small">Loading plugins…</div>
@@ -137,7 +134,7 @@ export function PluginsPage() {
 
 function InstallCard({ onInstalled }: { onInstalled: () => Promise<void> }) {
     const auth = useAuth();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
     const fileRef = useRef<HTMLInputElement | null>(null);
     const [installing, setInstalling] = useState(false);
     const [installError, setInstallError] = useState<string | null>(null);
@@ -199,11 +196,7 @@ function InstallCard({ onInstalled }: { onInstalled: () => Promise<void> }) {
                     )}
                 </Button>
             </Form>
-            {installError && (
-                <div className="execlaw-error-banner mt-2" role="alert">
-                    {installError}
-                </div>
-            )}
+            <ErrorBanner message={installError} onDismiss={() => setInstallError(null)} className="mt-2" />
             {lastInstalled && !installError && (
                 <div className="execlaw-muted small mt-2">
                     Installed {lastInstalled}.

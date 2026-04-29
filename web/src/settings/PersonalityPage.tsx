@@ -22,6 +22,7 @@ import {
     type UpsertPersonalityBody,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 
 interface FormState {
     display_name: string;
@@ -65,7 +66,7 @@ function toUpsert(f: FormState): UpsertPersonalityBody {
 
 export function PersonalityPage() {
     const auth = useAuth();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
 
     const [data, setData] = useState<PersonalityListResponse | null>(null);
     const [form, setForm] = useState<FormState | null>(null);
@@ -147,9 +148,11 @@ export function PersonalityPage() {
         return (
             <div data-testid="settings-personality">
                 {error ? (
-                    <div className="execlaw-error-banner mb-3" role="alert">
-                        {error}
-                    </div>
+                    <ErrorBanner
+                        message={error}
+                        onDismiss={() => setError(null)}
+                        className="mb-3"
+                    />
                 ) : (
                     <div className="execlaw-muted small">Loading personality…</div>
                 )}
@@ -167,11 +170,7 @@ export function PersonalityPage() {
                 a per-conversation override (see below).
             </p>
 
-            {error && (
-                <div className="execlaw-error-banner mb-3" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
             <div className="execlaw-card mb-3" data-testid="personality-default-form">
                 <div className="d-flex align-items-baseline gap-2 mb-3">

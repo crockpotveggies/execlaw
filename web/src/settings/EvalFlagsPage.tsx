@@ -7,10 +7,11 @@ import { useCallback, useEffect, useState } from "react";
 import Form from "react-bootstrap/Form";
 import { getEvalFlags, type EvalFlag } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 
 export function EvalFlagsPage() {
     const auth = useAuth();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
 
     const [label, setLabel] = useState("");
     const [flags, setFlags] = useState<EvalFlag[] | null>(null);
@@ -49,11 +50,7 @@ export function EvalFlagsPage() {
                 </Form>
             </div>
 
-            {error && (
-                <div className="execlaw-error-banner mb-3" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
             <div className="execlaw-card">
                 {flags === null ? (

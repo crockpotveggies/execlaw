@@ -21,6 +21,7 @@ import {
     type McpServerWriteRequest,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 
 const TRUST_CLASSES: ReadonlyArray<string> = [
     "Controller",
@@ -103,7 +104,7 @@ function toRequest(f: FormState): McpServerWriteRequest {
 
 export function McpServersPage() {
     const auth = useAuth();
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
 
     const [servers, setServers] = useState<McpServerView[] | null>(null);
     const [error, setError] = useState<string | null>(null);
@@ -212,11 +213,7 @@ export function McpServersPage() {
                 </div>
             )}
 
-            {error && (
-                <div className="execlaw-error-banner mb-3" role="alert">
-                    {error}
-                </div>
-            )}
+            <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
             {editingId !== null && (
                 <div className="execlaw-card mb-3" data-testid="mcp-form">

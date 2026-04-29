@@ -45,6 +45,7 @@ import {
     type UpsertBackendRequest,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+import { ErrorBanner } from "../components/ErrorBanner";
 import { useScreenTransition } from "../anim/useScreenTransition";
 import {
     UnifiedBackendForm,
@@ -146,7 +147,7 @@ export function SetupWizard() {
     const [preflightLoading, setPreflightLoading] = useState(false);
     const [preflightError, setPreflightError] = useState<string | null>(null);
 
-    const getToken = useCallback(() => auth.getAccessToken(), [auth]);
+    const getToken = auth.getAccessToken;
 
     const refreshPreflight = useCallback(async () => {
         setPreflightLoading(true);
@@ -367,15 +368,12 @@ function AccountStep({ onComplete }: { onComplete: () => void }) {
                 Welcome — let&rsquo;s create your controller account.
             </p>
 
-            {submitError && (
-                <div
-                    className="execlaw-error-banner mb-3"
-                    role="alert"
-                    data-testid="setup-submit-error"
-                >
-                    {submitError}
-                </div>
-            )}
+            <ErrorBanner
+                message={submitError}
+                onDismiss={() => setSubmitError(null)}
+                className="mb-3"
+                testId="setup-submit-error"
+            />
 
             <Form noValidate onSubmit={onSubmit} data-testid="setup-account-form">
                 <Form.Group className="mb-3" controlId="setup-username">
@@ -519,6 +517,9 @@ function DockerStep({
                 <p className="execlaw-muted small mb-3">
                     Couldn&rsquo;t reach the preflight endpoint.
                 </p>
+                {/* Preflight failure is a hard error screen with a Retry
+                    button below; not a transient banner that should
+                    auto-dismiss. Keep the bare div. */}
                 <div className="execlaw-error-banner mb-3" role="alert">
                     {error}
                 </div>
