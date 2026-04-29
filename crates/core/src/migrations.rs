@@ -151,6 +151,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "principal-groups",
         sql: include_str!("../migrations/0024_principal_groups.sql"),
     },
+    Migration {
+        id: 25,
+        name: "last-activity-at",
+        sql: include_str!("../migrations/0025_last_activity_at.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -286,7 +291,7 @@ mod tests {
             applied,
             vec![
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23, 24,
+                23, 24, 25,
             ]
         );
 
@@ -352,7 +357,7 @@ mod tests {
             first,
             vec![
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23, 24,
+                23, 24, 25,
             ]
         );
         assert!(

@@ -143,6 +143,12 @@ export interface ThreadSummary {
     is_ephemeral: boolean;
     ephemeral_expires_at: number | null;
     last_seq: number;
+    /// Wall-clock unix-seconds of the last committed turn. The
+    /// server orders the list by this so most-recent-activity
+    /// floats to the top of the sidebar (under any pinned rows).
+    /// Optional only because tests + older fixtures don't supply it;
+    /// new code paths always send it.
+    last_activity_at?: number;
 }
 
 export interface ThreadListResponse {

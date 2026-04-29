@@ -206,6 +206,12 @@ pub struct ConversationRow {
     pub is_pinned: bool,
     pub is_ephemeral: bool,
     pub ephemeral_expires_at: Option<i64>,
+    /// Wall-clock seconds-since-epoch of the last committed turn.
+    /// Drives the sidebar's recency ordering. Bumped by the chat
+    /// handler (in send_message Step 5) alongside last_seq via
+    /// `set_last_activity_at`. Migration 0025 adds the column +
+    /// backfills from MAX(committed_at) of state_events.
+    pub last_activity_at: i64,
 }
 
 /// Trimmed projection of a `state_conversations` row used by the SPA
@@ -223,6 +229,10 @@ pub struct ThreadSummary {
     pub is_ephemeral: bool,
     pub ephemeral_expires_at: Option<i64>,
     pub last_seq: EventSeq,
+    /// Wall-clock seconds-since-epoch of the last committed turn.
+    /// Sidebar uses this (not last_seq) for recency ordering — see
+    /// migration 0025 for the rationale.
+    pub last_activity_at: i64,
 }
 
 /// Simple repository for `state_conversations`.
@@ -248,8 +258,9 @@ impl<'db> ConversationStore<'db> {
                 "INSERT INTO state_conversations \
                  (conversation_id, kind, last_seq, phase, controller_id, trust_class, \
                   snapshot_blob, snapshot_seq, lease_owner, lease_expires, modality, \
-                  display_name, is_pinned, is_ephemeral, ephemeral_expires_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+                  display_name, is_pinned, is_ephemeral, ephemeral_expires_at, \
+                  last_activity_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
                  ON CONFLICT(conversation_id) DO UPDATE SET \
                     kind = excluded.kind, \
                     last_seq = excluded.last_seq, \
@@ -277,6 +288,7 @@ impl<'db> ConversationStore<'db> {
                     row.is_pinned as i64,
                     row.is_ephemeral as i64,
                     row.ephemeral_expires_at,
+                    row.last_activity_at,
                 ],
             )?;
             Ok(())
@@ -295,6 +307,25 @@ impl<'db> ConversationStore<'db> {
             c.execute(
                 "UPDATE state_conversations SET display_name = ?1 WHERE conversation_id = ?2",
                 params![name, conversation_id.as_str()],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Bump the wall-clock recency timestamp the sidebar orders by.
+    /// Called after every turn commit (regardless of which path —
+    /// streaming, runner, tool-capable, stub fallback). Idempotent.
+    pub fn set_last_activity_at(
+        &self,
+        conversation_id: &ConversationId,
+        ts_unix_seconds: i64,
+    ) -> Result<(), DbError> {
+        self.db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_conversations \
+                 SET last_activity_at = ?1 \
+                 WHERE conversation_id = ?2",
+                params![ts_unix_seconds, conversation_id.as_str()],
             )?;
             Ok(())
         })
@@ -367,17 +398,20 @@ impl<'db> ConversationStore<'db> {
 
     /// Lightweight summary of every conversation row — enough to render
     /// the SPA sidebar without a roundtrip per thread. Pinned threads
-    /// come first, then everything else by most-recent activity (we use
-    /// `last_seq` as a coarse stand-in until we wire a per-row
-    /// `last_activity_at` column).
+    /// come first, then everything else by most-recent activity. The
+    /// recency proxy is `last_activity_at` (wall-clock seconds-since-
+    /// epoch of the last committed turn — migration 0025 added the
+    /// column). Earlier code ordered by `last_seq` which is the
+    /// EVENT COUNT, not recency, and made fresh-but-short chats sort
+    /// below chatty old ones.
     pub fn list_thread_summaries(&self) -> Result<Vec<ThreadSummary>, DbError> {
         self.db.with_conn(|c| {
             let mut stmt = c.prepare_cached(
                 "SELECT conversation_id, kind, phase, trust_class, modality, \
                         display_name, is_pinned, is_ephemeral, ephemeral_expires_at, \
-                        last_seq \
+                        last_seq, last_activity_at \
                  FROM state_conversations \
-                 ORDER BY is_pinned DESC, last_seq DESC, conversation_id ASC",
+                 ORDER BY is_pinned DESC, last_activity_at DESC, conversation_id ASC",
             )?;
             let rows = stmt
                 .query_map([], |r| {
@@ -401,6 +435,7 @@ impl<'db> ConversationStore<'db> {
                         is_ephemeral: is_ephemeral != 0,
                         ephemeral_expires_at: r.get(8)?,
                         last_seq: EventSeq(r.get::<_, i64>(9)?),
+                        last_activity_at: r.get(10)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -437,7 +472,8 @@ impl<'db> ConversationStore<'db> {
                 .query_row(
                     "SELECT kind, last_seq, phase, controller_id, trust_class, \
                             snapshot_blob, snapshot_seq, lease_owner, lease_expires, modality, \
-                            display_name, is_pinned, is_ephemeral, ephemeral_expires_at \
+                            display_name, is_pinned, is_ephemeral, ephemeral_expires_at, \
+                            last_activity_at \
                      FROM state_conversations WHERE conversation_id = ?1",
                     params![conversation_id.as_str()],
                     row_to_conversation,
@@ -466,6 +502,7 @@ fn row_to_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation
     let is_pinned: i64 = row.get(11)?;
     let is_ephemeral: i64 = row.get(12)?;
     let ephemeral_expires_at: Option<i64> = row.get(13)?;
+    let last_activity_at: i64 = row.get(14)?;
     Ok(ConversationRow {
         // Filled in by the caller — we don't have the typed id here.
         conversation_id: ConversationId::from(""),
@@ -483,6 +520,7 @@ fn row_to_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation
         is_pinned: is_pinned != 0,
         is_ephemeral: is_ephemeral != 0,
         ephemeral_expires_at,
+        last_activity_at,
     })
 }
 
@@ -556,6 +594,7 @@ mod tests {
             is_pinned: false,
             is_ephemeral: false,
             ephemeral_expires_at: None,
+            last_activity_at: 0,
         }
     }
 
@@ -715,13 +754,20 @@ mod tests {
         let db = fresh_db();
         let store = ConversationStore::new(&db);
 
-        // Three conversations: one pinned, two regular with different last_seq.
-        let mut a = fresh_row("conv-a"); // pinned
+        // Three conversations. The pinned one (conv-a) has a SHORTER
+        // history (last_seq=5, last_activity_at=100) than the chatty
+        // non-pinned conv-b (last_seq=20, last_activity_at=200) —
+        // pinned still wins. Among non-pinned, recency
+        // (last_activity_at) decides, NOT event count.
+        let mut a = fresh_row("conv-a");
         a.last_seq = EventSeq(5);
-        let mut b = fresh_row("conv-b"); // newest non-pinned
+        a.last_activity_at = 100;
+        let mut b = fresh_row("conv-b"); // most recently active
         b.last_seq = EventSeq(20);
-        let mut c = fresh_row("conv-c"); // older non-pinned
+        b.last_activity_at = 200;
+        let mut c = fresh_row("conv-c"); // older
         c.last_seq = EventSeq(10);
+        c.last_activity_at = 150;
         store.upsert(&a).unwrap();
         store.upsert(&b).unwrap();
         store.upsert(&c).unwrap();
@@ -736,9 +782,48 @@ mod tests {
         assert_eq!(summaries[0].conversation_id.as_str(), "conv-a");
         assert!(summaries[0].is_pinned);
         assert_eq!(summaries[0].display_name.as_deref(), Some("Control thread"));
-        // Then by last_seq DESC.
+        // Then by last_activity_at DESC (NOT last_seq DESC).
         assert_eq!(summaries[1].conversation_id.as_str(), "conv-b");
         assert_eq!(summaries[2].conversation_id.as_str(), "conv-c");
+    }
+
+    /// 2026-04-28 regression — the bug we just fixed: `last_seq` is
+    /// the event count, not recency, so a fresh chat with last_seq=2
+    /// used to sort below an older chatty chat with last_seq=20.
+    /// The new ordering uses `last_activity_at` (wall-clock) so
+    /// short-but-recent chats sort above long-but-stale ones.
+    #[test]
+    fn list_thread_summaries_orders_short_recent_above_long_stale() {
+        let db = fresh_db();
+        let store = ConversationStore::new(&db);
+
+        // Chatty old conversation: 50 events, last activity an hour ago.
+        let mut old_chatty = fresh_row("conv-old-chatty");
+        old_chatty.last_seq = EventSeq(50);
+        old_chatty.last_activity_at = 1_000;
+        // Fresh new conversation: 2 events, just now.
+        let mut new_short = fresh_row("conv-new-short");
+        new_short.last_seq = EventSeq(2);
+        new_short.last_activity_at = 5_000;
+        store.upsert(&old_chatty).unwrap();
+        store.upsert(&new_short).unwrap();
+
+        let summaries = store.list_thread_summaries().unwrap();
+        assert_eq!(summaries[0].conversation_id.as_str(), "conv-new-short");
+        assert_eq!(summaries[1].conversation_id.as_str(), "conv-old-chatty");
+    }
+
+    #[test]
+    fn set_last_activity_at_round_trips_through_get() {
+        let db = fresh_db();
+        let store = ConversationStore::new(&db);
+        let row = fresh_row("conv-stamp");
+        store.upsert(&row).unwrap();
+        store
+            .set_last_activity_at(&row.conversation_id, 1_777_400_000)
+            .unwrap();
+        let got = store.get(&row.conversation_id).unwrap().unwrap();
+        assert_eq!(got.last_activity_at, 1_777_400_000);
     }
 
     #[test]

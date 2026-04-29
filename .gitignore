@@ -30,3 +30,4 @@ web/dist/
 # Editor scratch.
 *.swp
 .DS_Store
+.git-commit-msg

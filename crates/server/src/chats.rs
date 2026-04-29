@@ -421,6 +421,10 @@ pub async fn send_message(
         };
         row.phase = Phase::Idle;
         let _ = store.upsert(&row);
+        // 2026-04-28 — recency stamp for the sidebar sort. Drives
+        // the operator-facing "most recent at top" ordering. See
+        // migration 0025 + ConversationStore::set_last_activity_at.
+        let _ = store.set_last_activity_at(&cid, chrono::Utc::now().timestamp());
     }
 
     (
@@ -1386,6 +1390,7 @@ async fn handle_cold_contact(
         row.phase = CPhase::AwaitingTrustDecision;
         row.last_seq = log.last_seq(cid).unwrap_or(row.last_seq);
         let _ = store.upsert(&row);
+        let _ = store.set_last_activity_at(cid, chrono::Utc::now().timestamp());
     }
 
     // Sideband notification via the WS bus. The UI renders this
@@ -1819,6 +1824,9 @@ pub struct ThreadSummaryView {
     pub is_ephemeral: bool,
     pub ephemeral_expires_at: Option<i64>,
     pub last_seq: i64,
+    /// Wall-clock unix-seconds of the last committed turn. Sidebar
+    /// orders by this (recency); zero for never-touched conversations.
+    pub last_activity_at: i64,
 }
 
 impl From<ThreadSummary> for ThreadSummaryView {
@@ -1834,6 +1842,7 @@ impl From<ThreadSummary> for ThreadSummaryView {
             is_ephemeral: s.is_ephemeral,
             ephemeral_expires_at: s.ephemeral_expires_at,
             last_seq: s.last_seq.0,
+            last_activity_at: s.last_activity_at,
         }
     }
 }
@@ -2470,6 +2479,12 @@ fn ensure_conversation(store: &ConversationStore<'_>, cid: &ConversationId) {
         is_pinned: false,
         is_ephemeral: false,
         ephemeral_expires_at: None,
+        // 2026-04-28 — stamp so a freshly-minted conversation lands
+        // at the TOP of the sidebar even before its first turn
+        // commits. The chat handler bumps this again after the turn
+        // completes; the first send overwrites this with whatever
+        // wall-clock the turn finishes at.
+        last_activity_at: chrono::Utc::now().timestamp(),
     };
     let _ = store.upsert(&row);
 }

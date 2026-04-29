@@ -32,6 +32,7 @@ fn fresh_db_with_conv(id: &str) -> (Database, ConversationId) {
             is_pinned: false,
             is_ephemeral: false,
             ephemeral_expires_at: None,
+            last_activity_at: 0,
         })
         .unwrap();
     (db, cid)
