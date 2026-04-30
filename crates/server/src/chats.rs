@@ -2765,7 +2765,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn rewrite_url_swaps_loopback_for_host_gateway_alias() {
         // 127.0.0.1 → host alias.
         assert_eq!(

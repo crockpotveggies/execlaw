@@ -259,6 +259,14 @@ mod tests {
         store
             .claim_next_pending("card-x", finished_at - 50)
             .unwrap();
+        let dir = workspace_root.join(id.as_str());
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("plan.json"), "{}").unwrap();
+        // set_workspace_path before finish — once a row is terminal, the
+        // status guard on set_workspace_path rejects the update.
+        store
+            .set_workspace_path(&id, &dir.to_string_lossy(), finished_at - 25)
+            .unwrap();
         if matches!(status, ResearchJobStatus::Failed) {
             store
                 .finish(&id, status, Some("boom"), None, finished_at)
@@ -268,12 +276,6 @@ mod tests {
                 .finish(&id, status, None, Some("att-x"), finished_at)
                 .unwrap();
         }
-        let dir = workspace_root.join(id.as_str());
-        std::fs::create_dir_all(dir.join("notes")).unwrap();
-        std::fs::write(dir.join("plan.json"), "{}").unwrap();
-        store
-            .set_workspace_path(&id, &dir.to_string_lossy(), finished_at)
-            .unwrap();
         (id, dir)
     }
 
@@ -350,16 +352,17 @@ mod tests {
             .insert_pending(&id, &cid, "q", "Controller", None, 0)
             .unwrap();
         store.claim_next_pending("c", 50).unwrap();
-        store
-            .finish(&id, ResearchJobStatus::Complete, None, Some("att"), 100)
-            .unwrap();
         // workspace_path stored, but the dir doesn't exist on disk.
+        // Set before finish — set_workspace_path skips terminal rows.
         store
             .set_workspace_path(
                 &id,
                 tmp.path().join("never-created").to_string_lossy().as_ref(),
-                100,
+                75,
             )
+            .unwrap();
+        store
+            .finish(&id, ResearchJobStatus::Complete, None, Some("att"), 100)
             .unwrap();
         let report = sweep_once(&db, &workspace, 1_000_000, 1).unwrap();
         assert_eq!(report.rows_deleted, 1);

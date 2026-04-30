@@ -1842,7 +1842,7 @@ mod tests {
 
     #[tokio::test]
     async fn boot_orphan_sweep_skips_non_runner_volumes() {
-        use crate::runner_spawn::{MockRunnerLauncher, RunnerLauncher};
+        use crate::runner_spawn::MockRunnerLauncher;
         let s = fresh_supervisor();
         let launcher = MockRunnerLauncher::new();
         // A volume that doesn't match the runner prefix should be

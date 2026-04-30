@@ -435,16 +435,29 @@ impl<'db> ResearchJobStore<'db> {
     ) -> Result<(), ResearchError> {
         let blob = rmp_serde::to_vec(plan).map_err(|e| ResearchError::Encoding(e.to_string()))?;
         let id_owned = id.as_str().to_owned();
+        // Status guard: a runner that's mid-planner LLM call when
+        // the operator cancels would otherwise resurrect the row by
+        // overwriting Cancelled with Planned. Same regression
+        // pattern as `finish()` (see commit d7ea494). The
+        // `WHERE status = 'planning'` predicate makes this a no-op
+        // on cancelled / failed rows; the runner observes the
+        // 0-row update and exits its phase loop without progressing
+        // (the cancel path is what handles the row's lifecycle).
         let updated = self.db.with_conn(|c| {
             let n = c.execute(
                 "UPDATE state_research_jobs \
                  SET plan_json = ?1, status = 'planned', updated_at = ?2 \
-                 WHERE id = ?3",
+                 WHERE id = ?3 AND status = 'planning'",
                 params![blob, now, id_owned],
             )?;
             Ok(n)
         })?;
         if updated == 0 {
+            // Row may have been cancelled or failed during the
+            // planner LLM call. Surface as NotFound so the runner
+            // treats it as a "row gone away during phase" condition
+            // — same code path as a row truly missing, which is
+            // the right behaviour (don't proceed to gather).
             return Err(ResearchError::NotFound(id.as_str().to_owned()));
         }
         Ok(())
@@ -483,10 +496,20 @@ impl<'db> ResearchJobStore<'db> {
     ) -> Result<(), ResearchError> {
         let blob = rmp_serde::to_vec(notes).map_err(|e| ResearchError::Encoding(e.to_string()))?;
         let id_owned = id.as_str().to_owned();
+        // Status guard: a gather worker that fired off
+        // search/fetch/subagent calls before the cancel landed
+        // would otherwise advance `updated_at` on a Cancelled row,
+        // causing the operator's `/research` list view (sorted by
+        // updated_at) to surface the cancelled job as "more
+        // recent" than it really is. Skip the write on terminal
+        // rows. NotFound on the runner side stops the phase loop
+        // gracefully — same shape as a truly missing row.
         let updated = self.db.with_conn(|c| {
             let n = c.execute(
                 "UPDATE state_research_jobs \
-                 SET notes_json = ?1, updated_at = ?2 WHERE id = ?3",
+                 SET notes_json = ?1, updated_at = ?2 \
+                 WHERE id = ?3 \
+                   AND status NOT IN ('complete', 'failed', 'cancelled')",
                 params![blob, now, id_owned],
             )?;
             Ok(n)
@@ -562,7 +585,9 @@ impl<'db> ResearchJobStore<'db> {
     }
 
     /// Set the workspace directory path on disk (the runner provisions
-    /// it during `Pending → Planning`).
+    /// it during `Pending → Planning`). Skips the write on terminal
+    /// rows so a runner that races a cancel doesn't advance
+    /// `updated_at` on a Cancelled row.
     pub fn set_workspace_path(
         &self,
         id: &ResearchJobId,
@@ -571,14 +596,23 @@ impl<'db> ResearchJobStore<'db> {
     ) -> Result<(), ResearchError> {
         let id_owned = id.as_str().to_owned();
         let path_owned = path.to_owned();
-        self.db.with_conn(|c| {
-            c.execute(
+        let updated = self.db.with_conn(|c| {
+            let n = c.execute(
                 "UPDATE state_research_jobs \
-                 SET workspace_path = ?1, updated_at = ?2 WHERE id = ?3",
+                 SET workspace_path = ?1, updated_at = ?2 \
+                 WHERE id = ?3 \
+                   AND status NOT IN ('complete', 'failed', 'cancelled')",
                 params![path_owned, now, id_owned],
             )?;
-            Ok(())
+            Ok(n)
         })?;
+        if updated == 0 {
+            // Row missing OR already terminal (a cancel that
+            // raced the runner's claim → provision sequence). The
+            // runner's phase loop treats NotFound as "exit
+            // cleanly", same shape as set_planned / set_notes.
+            return Err(ResearchError::NotFound(id.as_str().to_owned()));
+        }
         Ok(())
     }
 
@@ -1316,6 +1350,109 @@ mod tests {
             row.attachment_id.is_none(),
             "late attachment_id must NOT be stamped onto a cancelled row",
         );
+    }
+
+    #[test]
+    fn set_planned_does_not_resurrect_a_cancelled_row() {
+        // Adversarial scenario: operator cancels DURING the planner
+        // LLM call. The runner's planner returns a fresh
+        // ResearchPlan; without the status guard set_planned would
+        // overwrite the Cancelled status with Planned, silently
+        // resurrecting the job. The status guard makes this a
+        // NotFound to the runner, which is the right shape — the
+        // runner's phase loop treats NotFound as "row gone away,
+        // exit cleanly."
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(&id, &ConversationId::from("c"), "q", "Controller", None, 100)
+            .unwrap();
+        store.claim_next_pending("c", 110).unwrap();
+        // Cancel BEFORE the planner returns.
+        assert!(store.cancel_active(&id, Some("operator"), 120).unwrap());
+        // Runner's planner now lands and tries to set_planned. Must
+        // surface as NotFound (not Ok).
+        let plan = ResearchPlan {
+            thesis: "t".into(),
+            steps: vec![PlanStep {
+                query: "q".into(),
+                rationale: None,
+            }],
+        };
+        let err = store.set_planned(&id, &plan, 200).unwrap_err();
+        assert!(matches!(err, ResearchError::NotFound(_)));
+        // Critical: row stays Cancelled, plan_json is NOT written.
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(row.status, ResearchJobStatus::Cancelled);
+        assert!(row.plan_json.is_none());
+    }
+
+    #[test]
+    fn set_notes_does_not_advance_updated_at_on_cancelled_row() {
+        // Operator cancels mid-gather. A worker that already kicked
+        // off its HTTP fan-out lands its persist_one_note write
+        // afterward. Without the status guard the cancelled row's
+        // updated_at would advance, surfacing the cancelled job at
+        // the top of the operator's `/research` list (sorted by
+        // updated_at).
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(&id, &ConversationId::from("c"), "q", "Controller", None, 100)
+            .unwrap();
+        store.claim_next_pending("c", 110).unwrap();
+        store.cancel_active(&id, Some("operator"), 200).unwrap();
+        let row_before = store.get(&id).unwrap().unwrap();
+        assert_eq!(row_before.updated_at, 200);
+        let err = store
+            .set_notes(
+                &id,
+                &[ResearchNote {
+                    index: 0,
+                    sub_query: "q".into(),
+                    state: SubQueryState::Done,
+                    excerpt: "stale".into(),
+                    sources: vec![],
+                    tokens_used: None,
+                    error: None,
+                }],
+                300,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ResearchError::NotFound(_)));
+        let row_after = store.get(&id).unwrap().unwrap();
+        assert_eq!(
+            row_after.updated_at, 200,
+            "updated_at must NOT advance on a cancelled row",
+        );
+        assert!(
+            row_after.notes_json.is_none(),
+            "stale gather worker must not stamp notes_json on cancelled row",
+        );
+    }
+
+    #[test]
+    fn set_workspace_path_skips_cancelled_rows() {
+        // Mirror the `set_notes` test: a runner that races a
+        // cancel between claim and provision must not bump
+        // updated_at.
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(&id, &ConversationId::from("c"), "q", "Controller", None, 100)
+            .unwrap();
+        store.claim_next_pending("c", 110).unwrap();
+        store.cancel_active(&id, Some("operator"), 200).unwrap();
+        let err = store
+            .set_workspace_path(&id, "/tmp/whatever", 300)
+            .unwrap_err();
+        assert!(matches!(err, ResearchError::NotFound(_)));
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(row.updated_at, 200);
+        assert!(row.workspace_path.is_none());
     }
 
     #[test]
