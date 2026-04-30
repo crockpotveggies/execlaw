@@ -93,7 +93,6 @@ pub enum UiEvent {
     },
 
     // ---- Phase 13.B — voice session lifecycle ----------------
-
     /// A voice session opened — first frame for the given session
     /// id arrived. Consumed by the SPA to render a "live mic" UX.
     VoiceSessionStarted {
@@ -143,6 +142,57 @@ pub enum UiEvent {
         session: String,
         /// One of "operator_barge_in" | "vad_speech_detected".
         reason: String,
+    },
+
+    // ---- C4 — generic Card primitive (deep research, future
+    // shell-session / file-pipeline tools all share this surface) ---
+    /// A new Card is being opened on the conversation. Carries the
+    /// full opened payload so the SPA's card-store can `fromOpened`
+    /// without an extra fetch. Mirrors `EventKind::CardOpened` from
+    /// the event log; the WS surface is the live channel + the log
+    /// is the durable source of truth.
+    CardOpened {
+        conversation_id: String,
+        card_id: String,
+        /// Lowercase kind: "research" / "long_running_task" / etc.
+        card_kind: String,
+        title: String,
+        summary: String,
+        state: Option<String>,
+        details: serde_json::Value,
+        actions: serde_json::Value,
+        committed_at: i64,
+    },
+
+    /// A Card progressed — partial update (every field optional;
+    /// projection merges populated fields onto the live row). The
+    /// SPA's per-kind renderer reads `details` to paint kind-specific
+    /// state (e.g. ResearchCard reads `details.notes` for the
+    /// per-sub-query badges).
+    CardProgressed {
+        conversation_id: String,
+        card_id: String,
+        state: Option<String>,
+        progress: Option<f32>,
+        phase: Option<String>,
+        details: Option<serde_json::Value>,
+        actions: Option<serde_json::Value>,
+        summary: Option<String>,
+        committed_at: i64,
+    },
+
+    /// A Card reached its terminal state. SPA flips inline-render
+    /// from "live" to "summary + actions"; transports may invoke
+    /// `send_file` if `attachment_id` is populated (C5 wires that).
+    CardClosed {
+        conversation_id: String,
+        card_id: String,
+        state: String,
+        summary: String,
+        details: Option<serde_json::Value>,
+        attachment_id: Option<String>,
+        error: Option<String>,
+        committed_at: i64,
     },
 }
 
@@ -238,8 +288,7 @@ async fn handle_socket(
     // operator only opens one mic at a time today, so the typical
     // size is 0 or 1, but the structure supports a future
     // multi-source UX.
-    let mut owned_sessions: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut owned_sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
         tokio::select! {
@@ -348,10 +397,7 @@ pub async fn handle_voice_control(
         Err(_) => return None, // not JSON — silently ignore (could be a future text op)
     };
     let op = parsed.get("op").and_then(|v| v.as_str()).unwrap_or("");
-    let session = parsed
-        .get("session")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let session = parsed.get("session").and_then(|v| v.as_str()).unwrap_or("");
     if session.is_empty() {
         return None;
     }
@@ -397,9 +443,7 @@ pub async fn handle_voice_control(
         "voice_interrupt" => {
             // Operator (or future server-side VAD) interrupted the
             // agent's reply mid-stream.
-            runtime
-                .interrupt(session, "operator_barge_in")
-                .await;
+            runtime.interrupt(session, "operator_barge_in").await;
         }
         _ => {}
     }
@@ -488,9 +532,8 @@ mod tests {
     use std::time::Duration;
 
     fn mock_runtime(bus: EventBus) -> VoiceRuntime {
-        let stt: SttFactory = Arc::new(|| {
-            Box::new(MockStt::new(Vec::new(), "transcribed!".to_owned()))
-        });
+        let stt: SttFactory =
+            Arc::new(|| Box::new(MockStt::new(Vec::new(), "transcribed!".to_owned())));
         let tts: TtsFactory =
             Arc::new(|| (Box::new(MockTts::default()) as Box<dyn TtsClient>, None));
         VoiceRuntime::new(bus, stt, tts)
@@ -510,12 +553,7 @@ mod tests {
         let bus = EventBus::new();
         let voice = VoiceSessionRegistry::new(bus.clone());
         let runtime = mock_runtime(bus);
-        handle_voice_control(
-            r#"{"op":"voice_yodel","session":"s1"}"#,
-            &voice,
-            &runtime,
-        )
-        .await;
+        handle_voice_control(r#"{"op":"voice_yodel","session":"s1"}"#, &voice, &runtime).await;
         // No assertion target — pass if no panic + no event. The
         // shape of "did nothing" is captured by the lack of side
         // effects in subsequent tests.
@@ -577,12 +615,8 @@ mod tests {
         let bus = EventBus::new();
         let voice = VoiceSessionRegistry::new(bus.clone());
         let runtime = mock_runtime(bus);
-        let result = handle_voice_control(
-            r#"{"op":"voice_stop","session":"s99"}"#,
-            &voice,
-            &runtime,
-        )
-        .await;
+        let result =
+            handle_voice_control(r#"{"op":"voice_stop","session":"s99"}"#, &voice, &runtime).await;
         assert_eq!(result.as_deref(), Some("s99"));
     }
 
@@ -677,12 +711,7 @@ mod tests {
         };
         let outcome = voice.observe_frame(&header, &[0u8; 32]).await;
         runtime.ingest_chunks(&outcome.released).await;
-        handle_voice_control(
-            r#"{"op":"voice_stop","session":"s1"}"#,
-            &voice,
-            &runtime,
-        )
-        .await;
+        handle_voice_control(r#"{"op":"voice_stop","session":"s1"}"#, &voice, &runtime).await;
         // The voice_stop branch spawns a task; give it a moment.
         let mut saw_final_transcript = false;
         let mut saw_session_end = false;
@@ -705,7 +734,10 @@ mod tests {
                 break;
             }
         }
-        assert!(saw_final_transcript, "voice_stop must publish a final transcript");
+        assert!(
+            saw_final_transcript,
+            "voice_stop must publish a final transcript"
+        );
         assert!(saw_session_end, "voice_stop must end the registry session");
     }
 }

@@ -18,8 +18,15 @@
 //!
 //! 2026-04-29.
 
-use crate::cards::{CardEmitError, close_card, open_card, progress_card};
+use crate::cards::{
+    CardEmitError, close_card_and_broadcast, open_card_and_broadcast, progress_card_and_broadcast,
+};
+use crate::events::EventBus;
+use crate::research::gather::{GatherCtx, GatherDeps, GatherError, run_gather};
 use crate::research::workspace::{ResearchWorkspace, WorkspaceError};
+use crate::tool_apis_http::HttpWebFetchApi;
+use crate::tool_apis_search::DuckDuckGoSearchApi;
+use crate::tool_apis_subagent::InferenceSubagentApi;
 use execlaw_core::Database;
 use execlaw_core::cards::{
     CardAction, CardClosedPayload, CardKind, CardOpenedPayload, CardProgressedPayload, CardState,
@@ -29,10 +36,12 @@ use execlaw_core::research::{
     PhaseGates, PlanStep, ResearchConfigStore, ResearchError, ResearchJobRow, ResearchJobStatus,
     ResearchJobStore, ResearchPlan,
 };
+use execlaw_core::tool::{SubagentApi, WebFetchApi, WebSearchApi};
 use execlaw_inference_api::{ChatMessage, ChatRequest, InferenceClient, ModelId};
 use serde::Deserialize;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Debug, Error)]
@@ -43,6 +52,8 @@ pub enum ResearchRunnerError {
     Workspace(#[from] WorkspaceError),
     #[error(transparent)]
     CardEmit(#[from] CardEmitError),
+    #[error(transparent)]
+    Gather(#[from] GatherError),
     #[error("inference: {0}")]
     Inference(String),
     #[error("planner produced unparseable JSON: {0}")]
@@ -61,6 +72,11 @@ pub struct JobRunCtx {
     /// short-circuits to `Failed` so the supervisor doesn't hold the
     /// row in `Planning` indefinitely.
     pub inference: Option<(Arc<InferenceClient>, String)>,
+    /// Bus the runner publishes card lifecycle events to. The
+    /// commit-and-broadcast helpers in `crate::cards` write to the
+    /// log first, then publish here so a WS-side miss can always
+    /// re-project from the durable log.
+    pub events: EventBus,
 }
 
 /// System prompt for the planner LLM call. Asks for a strict JSON
@@ -95,6 +111,7 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
         job_id,
         workspace,
         inference,
+        events,
     } = ctx;
 
     // The store calls below are sync; wrap them in spawn_blocking so
@@ -142,8 +159,9 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
     // Open the card. CardOpened seeds the projection so the SPA's
     // chat-pane render starts as soon as the supervisor picked the
     // job up.
-    open_card(
+    open_card_and_broadcast(
         &db,
+        &events,
         &conv_id,
         "system",
         &CardOpenedPayload {
@@ -169,6 +187,7 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
         None => {
             mark_failed(
                 &db,
+                &events,
                 &workspace,
                 &job_id,
                 &conv_id,
@@ -185,6 +204,7 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
         Err(e) => {
             mark_failed(
                 &db,
+                &events,
                 &workspace,
                 &job_id,
                 &conv_id,
@@ -228,8 +248,9 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
     }
 
     // CardProgressed — phase=Planned, plan visible to renderer.
-    progress_card(
+    progress_card_and_broadcast(
         &db,
+        &events,
         &conv_id,
         "system",
         &CardProgressedPayload {
@@ -248,22 +269,110 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
         },
     )?;
 
-    // Phase-gate decision. C3 only knows `plan_only` (default) and
-    // `none`; `every_phase` lands in C6 alongside the approval-flow
-    // wiring. With `none`, gather would fire next — but gather
-    // itself isn't implemented until C4, so we currently log a
-    // diagnostic and stop at `Planned` either way.
+    // Phase-gate decision. The default is `plan_only` — runner stops
+    // here, the operator confirms before the (much more expensive)
+    // gather phase fires. With `none`, gather chains automatically.
+    // `every_phase` (C6) will pause for an approval between every
+    // pair of phases; for now C4 treats it identically to `plan_only`
+    // so the row sits at Planned until the C6 approval flow lands.
     let cfg = {
         let db = db.clone();
         tokio::task::spawn_blocking(move || ResearchConfigStore::new(&db).get())
             .await
             .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??
     };
-    if !matches!(cfg.phase_gates, PhaseGates::PlanOnly) {
+    if matches!(cfg.phase_gates, PhaseGates::None) {
+        // Build production-impl deps for the gather phase. Inference
+        // is the same client+model the planner used.
+        let search: Arc<dyn WebSearchApi> = Arc::new(DuckDuckGoSearchApi::new());
+        let fetch: Arc<dyn WebFetchApi> = Arc::new(HttpWebFetchApi::new());
+        let subagent: Arc<dyn SubagentApi> = Arc::new(InferenceSubagentApi::new(
+            client.clone(),
+            model.clone(),
+            db.clone(),
+            conv_id.clone(),
+        ));
+        let gather_ctx = GatherCtx {
+            db: db.clone(),
+            job_id: job_id.clone(),
+            conversation_id: conv_id.clone(),
+            card_id: card_id.clone(),
+            workspace: workspace.clone(),
+            plan: plan.clone(),
+            config: cfg.clone(),
+            deps: GatherDeps {
+                search,
+                fetch,
+                subagent: Some(subagent),
+            },
+            events: events.clone(),
+            // Cancellation wiring is C6 territory (operator-driven
+            // cancel button on the card). For now thread a fresh
+            // never-fires token so the gather code path stays
+            // cancellation-aware end-to-end.
+            cancel: CancellationToken::new(),
+        };
+        // Flip status to Gathering BEFORE the workers fire so the SPA
+        // sees the transition reflected in the row immediately.
+        {
+            let db = db.clone();
+            let id = job_id.clone();
+            let now = chrono::Utc::now().timestamp();
+            tokio::task::spawn_blocking(move || {
+                ResearchJobStore::new(&db).mark_gathering(&id, now)
+            })
+            .await
+            .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??;
+        }
+        match run_gather(gather_ctx).await {
+            Ok(_notes) => {
+                // Gather complete — flip to Synthesizing. The
+                // synthesize phase itself lands in C5; for now we
+                // emit a CardProgressed marking gather complete and
+                // stop, leaving the row in Synthesizing for C5's
+                // pickup logic.
+                let now = chrono::Utc::now().timestamp();
+                let db_for_task = db.clone();
+                let id = job_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    ResearchJobStore::new(&db_for_task).mark_synthesizing(&id, now)
+                })
+                .await
+                .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??;
+                progress_card_and_broadcast(
+                    &db,
+                    &events,
+                    &conv_id,
+                    "system",
+                    &CardProgressedPayload {
+                        card_id: card_id.clone(),
+                        state: Some(CardState::Running),
+                        progress: Some(0.85),
+                        phase: Some("Gather complete".into()),
+                        details: None,
+                        actions: None,
+                        summary: Some("Gather complete; synthesize phase lands in C5.".into()),
+                    },
+                )?;
+            }
+            Err(e) => {
+                mark_failed(
+                    &db,
+                    &events,
+                    &workspace,
+                    &job_id,
+                    &conv_id,
+                    &card_id,
+                    &format!("gather failed: {e}"),
+                )
+                .await;
+                return Err(e.into());
+            }
+        }
+    } else if matches!(cfg.phase_gates, PhaseGates::EveryPhase) {
         tracing::info!(
             job_id = job_id.as_str(),
-            gates = cfg.phase_gates.as_str(),
-            "phase_gates != plan_only — gather phase lands in C4; stopping at Planned"
+            "phase_gates == every_phase — pausing at Planned; operator approval flow lands in C6"
         );
     }
 
@@ -364,6 +473,7 @@ fn strip_fences_and_prose(raw: &str) -> String {
 
 async fn mark_failed(
     db: &Database,
+    events: &EventBus,
     workspace: &ResearchWorkspace,
     job_id: &ResearchJobId,
     conv_id: &execlaw_core::ids::ConversationId,
@@ -392,8 +502,9 @@ async fn mark_failed(
             "marking job Failed in DB hit an error; row may be stuck in Planning",
         );
     }
-    let close = close_card(
+    let close = close_card_and_broadcast(
         db,
+        events,
         conv_id,
         "system",
         &CardClosedPayload {

@@ -11,25 +11,28 @@
 //! A regression >10% on any of these blocks a merge.
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use execlaw_core::db::{Database, DbConfig};
-use execlaw_core::event_hmac::{canonical_bytes, sign_event, verify_event};
-use execlaw_core::events::{EventKind, EventLog, EventRecord, PendingEvent, ToolResultPayload, ToolUsePayload};
-use execlaw_core::ids::{ConversationId, EventSeq, IdempotencyKey, TurnSeq};
-use execlaw_core::migrations::MigrationRunner;
+use execlaw_core::backends::{BackendMode, BackendPurpose, BackendStore, BackendUpsert};
 use execlaw_core::conversation::{
     ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
 };
-use execlaw_core::backends::{BackendMode, BackendPurpose, BackendStore, BackendUpsert};
+use execlaw_core::db::{Database, DbConfig};
 use execlaw_core::ephemeral_sweeper::sweep_once;
+use execlaw_core::event_hmac::{canonical_bytes, sign_event, verify_event};
 use execlaw_core::events::EventRecord as CoreEventRecord;
-use execlaw_core::outbox::{OutboxRow, OutboxStatus, OutboxStore};
-use execlaw_core::transport_conversations::{ConversationResolver, ResolveInput};
-use execlaw_core::refresh_tokens::RefreshTokenStore;
+use execlaw_core::events::{
+    EventKind, EventLog, EventRecord, PendingEvent, ToolResultPayload, ToolUsePayload,
+};
 use execlaw_core::ids::ResearchJobId;
+use execlaw_core::ids::{ConversationId, EventSeq, IdempotencyKey, TurnSeq};
+use execlaw_core::migrations::MigrationRunner;
+use execlaw_core::outbox::{OutboxRow, OutboxStatus, OutboxStore};
+use execlaw_core::refresh_tokens::RefreshTokenStore;
 use execlaw_core::research::{
-    PhaseGates, PlanStep, ResearchConfigStore, ResearchConfigUpdate, ResearchJobStore, ResearchPlan,
+    PhaseGates, PlanStep, ResearchConfigStore, ResearchConfigUpdate, ResearchJobStore,
+    ResearchNote, ResearchPlan, ResearchSource, SubQueryState,
 };
 use execlaw_core::tool_access::{ToolAccessSeed, ToolAccessStore, ToolSource};
+use execlaw_core::transport_conversations::{ConversationResolver, ResolveInput};
 use execlaw_core::webauthn::{WebauthnCredentialRow, WebauthnStore};
 
 fn fresh_db() -> Database {
@@ -85,13 +88,7 @@ fn bench_hmac(c: &mut Criterion) {
 fn bench_idempotency_key(c: &mut Criterion) {
     let cid = ConversationId::from("conv-abc123");
     c.bench_function("idempotency_key_mint", |b| {
-        b.iter(|| {
-            IdempotencyKey::mint(
-                black_box(&cid),
-                black_box(TurnSeq(47)),
-                black_box(3),
-            )
-        })
+        b.iter(|| IdempotencyKey::mint(black_box(&cid), black_box(TurnSeq(47)), black_box(3)))
     });
 }
 
@@ -208,10 +205,16 @@ fn bench_replay_since(c: &mut Criterion) {
         log.append(&ev).unwrap();
     }
     c.bench_function("replay_since_0_of_500", |b| {
-        b.iter(|| log.replay_since(black_box(&cid), black_box(EventSeq(0))).unwrap())
+        b.iter(|| {
+            log.replay_since(black_box(&cid), black_box(EventSeq(0)))
+                .unwrap()
+        })
     });
     c.bench_function("replay_since_450_of_500", |b| {
-        b.iter(|| log.replay_since(black_box(&cid), black_box(EventSeq(450))).unwrap())
+        b.iter(|| {
+            log.replay_since(black_box(&cid), black_box(EventSeq(450)))
+                .unwrap()
+        })
     });
 }
 
@@ -322,7 +325,9 @@ fn bench_outbox(c: &mut Criterion) {
         let db = fresh_db();
         b.iter(|| {
             let store = OutboxStore::new(&db);
-            store.ready_pending(black_box(1_000_000_000), black_box(32)).unwrap()
+            store
+                .ready_pending(black_box(1_000_000_000), black_box(32))
+                .unwrap()
         })
     });
 
@@ -569,7 +574,9 @@ fn bench_ephemeral_sweeper(c: &mut Criterion) {
                                 None,
                             )
                             .unwrap();
-                            execlaw_core::events::EventLog::new(&db).append(&ev).unwrap();
+                            execlaw_core::events::EventLog::new(&db)
+                                .append(&ev)
+                                .unwrap();
                         }
                     }
                     db
@@ -642,34 +649,25 @@ fn bench_list_thread_summaries(c: &mut Criterion) {
     let mut group = c.benchmark_group("list_thread_summaries");
     group.sample_size(20);
     for n in [10usize, 100usize, 1000usize].iter() {
-        group.bench_with_input(
-            BenchmarkId::new("threads", n),
-            n,
-            |b, &n| {
-                let db = fresh_db();
-                let store = ConversationStore::new(&db);
-                for i in 0..n {
-                    let id = format!("conv-{i}");
-                    let mut row = fresh_conv_row(&id);
-                    row.last_seq = EventSeq(i as i64);
-                    store.upsert(&row).unwrap();
-                    if i % 50 == 0 {
-                        store
-                            .set_pinned(
-                                &execlaw_core::ids::ConversationId::from(
-                                    id.as_str(),
-                                ),
-                                true,
-                            )
-                            .unwrap();
-                    }
+        group.bench_with_input(BenchmarkId::new("threads", n), n, |b, &n| {
+            let db = fresh_db();
+            let store = ConversationStore::new(&db);
+            for i in 0..n {
+                let id = format!("conv-{i}");
+                let mut row = fresh_conv_row(&id);
+                row.last_seq = EventSeq(i as i64);
+                store.upsert(&row).unwrap();
+                if i % 50 == 0 {
+                    store
+                        .set_pinned(&execlaw_core::ids::ConversationId::from(id.as_str()), true)
+                        .unwrap();
                 }
-                b.iter(|| {
-                    let summaries = store.list_thread_summaries().unwrap();
-                    black_box(summaries);
-                });
-            },
-        );
+            }
+            b.iter(|| {
+                let summaries = store.list_thread_summaries().unwrap();
+                black_box(summaries);
+            });
+        });
     }
     group.finish();
 }
@@ -834,9 +832,7 @@ fn bench_refresh_token_store(c: &mut Criterion) {
         let db = fresh_db();
         let store = RefreshTokenStore::new(&db);
         b.iter(|| {
-            let tok = store
-                .issue(black_box("u"), black_box("s"), 3600)
-                .unwrap();
+            let tok = store.issue(black_box("u"), black_box("s"), 3600).unwrap();
             black_box(tok);
         });
     });
@@ -912,10 +908,7 @@ fn bench_tool_access_store(c: &mut Criterion) {
                     source_id: None,
                     description: None,
                     input_schema: None,
-                    default_allowed_classes: vec![
-                        "Controller".into(),
-                        "KnownTrusted".into(),
-                    ],
+                    default_allowed_classes: vec!["Controller".into(), "KnownTrusted".into()],
                 },
                 100,
             )
@@ -1087,38 +1080,38 @@ fn bench_research_job_store(c: &mut Criterion) {
     });
 
     for n in [4usize, 16, 64].iter() {
-        group.bench_with_input(
-            BenchmarkId::new("list_for_conversation", n),
-            n,
-            |b, &n| {
-                let db = fresh_db();
-                let cid = ConversationId::from("conv-research-list");
-                let store = ResearchJobStore::new(&db);
-                for i in 0..n {
-                    let id = ResearchJobId::new();
+        group.bench_with_input(BenchmarkId::new("list_for_conversation", n), n, |b, &n| {
+            let db = fresh_db();
+            let cid = ConversationId::from("conv-research-list");
+            let store = ResearchJobStore::new(&db);
+            for i in 0..n {
+                let id = ResearchJobId::new();
+                store
+                    .insert_pending(
+                        &id,
+                        &cid,
+                        &format!("query {i}"),
+                        "Controller",
+                        None,
+                        100 + i as i64,
+                    )
+                    .unwrap();
+                // Half of them have plans landed so the per-row
+                // decode cost is exercised.
+                if i % 2 == 0 {
                     store
-                        .insert_pending(
-                            &id,
-                            &cid,
-                            &format!("query {i}"),
-                            "Controller",
-                            None,
-                            100 + i as i64,
-                        )
+                        .claim_next_pending(&format!("card-{i}"), 200 + i as i64)
                         .unwrap();
-                    // Half of them have plans landed so the per-row
-                    // decode cost is exercised.
-                    if i % 2 == 0 {
-                        store.claim_next_pending(&format!("card-{i}"), 200 + i as i64).unwrap();
-                        store.set_planned(&id, &fixture_plan(), 250 + i as i64).unwrap();
-                    }
+                    store
+                        .set_planned(&id, &fixture_plan(), 250 + i as i64)
+                        .unwrap();
                 }
-                b.iter(|| {
-                    let rows = store.list_for_conversation(black_box(&cid)).unwrap();
-                    black_box(rows.iter().map(|r| r.to_summary()).collect::<Vec<_>>());
-                });
-            },
-        );
+            }
+            b.iter(|| {
+                let rows = store.list_for_conversation(black_box(&cid)).unwrap();
+                black_box(rows.iter().map(|r| r.to_summary()).collect::<Vec<_>>());
+            });
+        });
     }
 
     for n in [4usize, 16, 64].iter() {
@@ -1189,6 +1182,125 @@ fn bench_research_config_store(c: &mut Criterion) {
     group.finish();
 }
 
+fn fixture_notes(n: usize) -> Vec<ResearchNote> {
+    (0..n)
+        .map(|i| ResearchNote {
+            index: i as u32,
+            sub_query: format!("sub-query {i}"),
+            state: if i % 3 == 0 {
+                SubQueryState::Done
+            } else if i % 3 == 1 {
+                SubQueryState::Running
+            } else {
+                SubQueryState::Failed
+            },
+            excerpt: format!(
+                "Extracted facts for sub-query {i}: lorem ipsum dolor sit amet, \
+                 consectetur adipiscing elit. Sed do eiusmod tempor incididunt \
+                 ut labore et dolore magna aliqua. Ut enim ad minim veniam.",
+            ),
+            sources: vec![ResearchSource {
+                url: format!("https://example.com/source-{i}"),
+                title: Some(format!("Source {i}")),
+                fetched_ok: true,
+                error: None,
+            }],
+            tokens_used: Some(123),
+            error: None,
+        })
+        .collect()
+}
+
+// C4 — gather-phase JobStore hot paths.
+//
+// Budgets:
+//   * mark_gathering           ≤ 200µs (single UPDATE w/ status guard)
+//   * mark_synthesizing        ≤ 200µs (same)
+//   * set_notes/8              ≤ 300µs (encode + UPDATE)
+//   * set_notes/64             ≤ 600µs (per-row decode cost grows)
+//
+// The set_notes path runs once per worker completion in the gather
+// phase — i.e. up to `parallel_workers` times per phase. The 64-step
+// case is the worst plausible plan we'd ever ship.
+fn bench_research_gather_paths(c: &mut Criterion) {
+    let mut group = c.benchmark_group("research_gather");
+
+    group.bench_function("mark_gathering", |b| {
+        b.iter_batched(
+            || {
+                let db = fresh_db();
+                let cid = ConversationId::from("conv-gather-bench");
+                let store = ResearchJobStore::new(&db);
+                let id = ResearchJobId::new();
+                store
+                    .insert_pending(&id, &cid, "q", "Controller", None, 100)
+                    .unwrap();
+                store.claim_next_pending("card-1", 110).unwrap();
+                store.set_planned(&id, &fixture_plan(), 120).unwrap();
+                (db, id)
+            },
+            |(db, id)| {
+                let n = ResearchJobStore::new(&db)
+                    .mark_gathering(black_box(&id), 200)
+                    .unwrap();
+                black_box(n);
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+
+    group.bench_function("mark_synthesizing", |b| {
+        b.iter_batched(
+            || {
+                let db = fresh_db();
+                let cid = ConversationId::from("conv-gather-bench");
+                let store = ResearchJobStore::new(&db);
+                let id = ResearchJobId::new();
+                store
+                    .insert_pending(&id, &cid, "q", "Controller", None, 100)
+                    .unwrap();
+                store.claim_next_pending("card-1", 110).unwrap();
+                store.set_planned(&id, &fixture_plan(), 120).unwrap();
+                store.mark_gathering(&id, 130).unwrap();
+                (db, id)
+            },
+            |(db, id)| {
+                let n = ResearchJobStore::new(&db)
+                    .mark_synthesizing(black_box(&id), 200)
+                    .unwrap();
+                black_box(n);
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+
+    for n in [4usize, 8, 64].iter() {
+        group.bench_with_input(BenchmarkId::new("set_notes", n), n, |b, &n| {
+            b.iter_batched(
+                || {
+                    let db = fresh_db();
+                    let cid = ConversationId::from("conv");
+                    let store = ResearchJobStore::new(&db);
+                    let id = ResearchJobId::new();
+                    store
+                        .insert_pending(&id, &cid, "q", "Controller", None, 100)
+                        .unwrap();
+                    let notes = fixture_notes(n);
+                    (db, id, notes)
+                },
+                |(db, id, notes)| {
+                    ResearchJobStore::new(&db)
+                        .set_notes(black_box(&id), black_box(&notes), 200)
+                        .unwrap();
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_research_plan_codec(c: &mut Criterion) {
     let mut group = c.benchmark_group("research_plan_codec");
     let plan = fixture_plan();
@@ -1234,5 +1346,6 @@ criterion_group!(
     bench_research_job_store,
     bench_research_config_store,
     bench_research_plan_codec,
+    bench_research_gather_paths,
 );
 criterion_main!(benches);

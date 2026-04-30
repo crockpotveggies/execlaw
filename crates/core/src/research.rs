@@ -151,6 +151,66 @@ pub struct ResearchPlan {
     pub steps: Vec<PlanStep>,
 }
 
+/// Per-sub-query state tracked across the gather phase. Persisted
+/// inside `ResearchNote` and surfaced through the Card's
+/// `details_json` so the SPA's ResearchCard renderer can paint the
+/// per-row Pending/Running/Done/Failed badges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SubQueryState {
+    Pending,
+    Running,
+    Done,
+    Failed,
+}
+
+impl SubQueryState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Running => "Running",
+            Self::Done => "Done",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
+/// One source the gather worker pulled. The Card renderer surfaces
+/// these as a clickable link list under each sub-query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResearchSource {
+    pub url: String,
+    pub title: Option<String>,
+    /// Whether the fetch succeeded. Failed sources are kept (with a
+    /// brief `error` message) so the operator can inspect what went
+    /// wrong without digging through logs.
+    pub fetched_ok: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// One gather worker's output, persisted into
+/// `state_research_jobs.notes_json` (and as `notes/<n>.json` on
+/// disk). The runner appends one `ResearchNote` per `PlanStep` after
+/// the per-query subagent extraction returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResearchNote {
+    /// Index into the `ResearchPlan.steps` list. Stable so the SPA
+    /// can match notes back to plan rows.
+    pub index: u32,
+    pub sub_query: String,
+    pub state: SubQueryState,
+    /// Subagent-extracted facts. Empty when state == Failed.
+    pub excerpt: String,
+    pub sources: Vec<ResearchSource>,
+    /// Tokens the subagent reported. `None` when the inference
+    /// backend's usage block is missing.
+    #[serde(default)]
+    pub tokens_used: Option<u32>,
+    /// Operator-safe failure message when state == Failed.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 /// Full row as stored in `state_research_jobs`. The runner +
 /// admin endpoints + tools read/write this shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +254,12 @@ pub struct ResearchJobSummary {
     /// carries the plan because it's small (~few-hundred chars) and
     /// the operator UI / tools want to see it as soon as it lands.
     pub plan: Option<ResearchPlan>,
+    /// Decoded gather-phase notes. Populated as the gather workers
+    /// land their per-sub-query extractions; a partial list during
+    /// in-flight gather is fine — the SPA's ResearchCard reads
+    /// each note's `state` to paint per-row status badges.
+    #[serde(default)]
+    pub notes: Vec<ResearchNote>,
 }
 
 impl ResearchJobRow {
@@ -218,6 +284,11 @@ impl ResearchJobRow {
                 .plan_json
                 .as_ref()
                 .and_then(|b| rmp_serde::from_slice::<ResearchPlan>(b).ok()),
+            notes: self
+                .notes_json
+                .as_ref()
+                .and_then(|b| rmp_serde::from_slice::<Vec<ResearchNote>>(b).ok())
+                .unwrap_or_default(),
         }
     }
 }
@@ -377,6 +448,70 @@ impl<'db> ResearchJobStore<'db> {
             return Err(ResearchError::NotFound(id.as_str().to_owned()));
         }
         Ok(())
+    }
+
+    /// Flip status from `Planned` → `Gathering`. Atomic on the
+    /// status predicate so the supervisor (or a future
+    /// operator-driven advance flow) can race-safely transition the
+    /// row exactly once. Returns `Ok(false)` when the row was not
+    /// in `Planned` — callers can treat that as a no-op.
+    pub fn mark_gathering(&self, id: &ResearchJobId, now: i64) -> Result<bool, ResearchError> {
+        let id_owned = id.as_str().to_owned();
+        let n = self.db.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE state_research_jobs \
+                 SET status = 'gathering', updated_at = ?1 \
+                 WHERE id = ?2 AND status = 'planned'",
+                params![now, id_owned],
+            )?;
+            Ok(n)
+        })?;
+        Ok(n > 0)
+    }
+
+    /// Persist the (partial or final) gather-phase notes. Encoded
+    /// MessagePack into `notes_json`. Safe to call repeatedly as
+    /// per-worker results land — the SPA's ResearchCard then sees
+    /// per-sub-query state badges flip from Pending → Running →
+    /// Done in real time. Does NOT change `status`; the caller flips
+    /// to `Synthesizing` when every worker has reported.
+    pub fn set_notes(
+        &self,
+        id: &ResearchJobId,
+        notes: &[ResearchNote],
+        now: i64,
+    ) -> Result<(), ResearchError> {
+        let blob = rmp_serde::to_vec(notes).map_err(|e| ResearchError::Encoding(e.to_string()))?;
+        let id_owned = id.as_str().to_owned();
+        let updated = self.db.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE state_research_jobs \
+                 SET notes_json = ?1, updated_at = ?2 WHERE id = ?3",
+                params![blob, now, id_owned],
+            )?;
+            Ok(n)
+        })?;
+        if updated == 0 {
+            return Err(ResearchError::NotFound(id.as_str().to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Flip status from `Gathering` → `Synthesizing`. Atomic on the
+    /// status predicate. Returns `Ok(false)` when the row was not
+    /// in `Gathering`.
+    pub fn mark_synthesizing(&self, id: &ResearchJobId, now: i64) -> Result<bool, ResearchError> {
+        let id_owned = id.as_str().to_owned();
+        let n = self.db.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE state_research_jobs \
+                 SET status = 'synthesizing', updated_at = ?1 \
+                 WHERE id = ?2 AND status = 'gathering'",
+                params![now, id_owned],
+            )?;
+            Ok(n)
+        })?;
+        Ok(n > 0)
     }
 
     /// Move the row to a terminal state. `error` is required for
@@ -1018,7 +1153,14 @@ mod tests {
         let store = ResearchJobStore::new(&db);
         let id = ResearchJobId::new();
         store
-            .insert_pending(&id, &ConversationId::from("c"), "q", "Controller", None, 100)
+            .insert_pending(
+                &id,
+                &ConversationId::from("c"),
+                "q",
+                "Controller",
+                None,
+                100,
+            )
             .unwrap();
         store.claim_next_pending("card-1", 150).unwrap();
         store
@@ -1098,6 +1240,171 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.active_count_for_conversation(&cid).unwrap(), 1);
+    }
+
+    // -------------- gather-phase transitions --------------
+
+    fn note(index: u32, query: &str, state: SubQueryState) -> ResearchNote {
+        ResearchNote {
+            index,
+            sub_query: query.into(),
+            state,
+            excerpt: format!("excerpt for {query}"),
+            sources: vec![ResearchSource {
+                url: format!("https://example.com/{query}"),
+                title: Some(query.to_owned()),
+                fetched_ok: true,
+                error: None,
+            }],
+            tokens_used: Some(123),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn mark_gathering_only_advances_planned_rows() {
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(
+                &id,
+                &ConversationId::from("c"),
+                "q",
+                "Controller",
+                None,
+                100,
+            )
+            .unwrap();
+        // Pending → mark_gathering must NOT advance (status guard).
+        assert!(!store.mark_gathering(&id, 200).unwrap());
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(row.status, ResearchJobStatus::Pending);
+        // Drive to Planned, THEN mark_gathering succeeds.
+        store.claim_next_pending("card-1", 150).unwrap();
+        store
+            .set_planned(
+                &id,
+                &ResearchPlan {
+                    thesis: "t".into(),
+                    steps: vec![PlanStep {
+                        query: "q1".into(),
+                        rationale: None,
+                    }],
+                },
+                160,
+            )
+            .unwrap();
+        assert!(store.mark_gathering(&id, 200).unwrap());
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(row.status, ResearchJobStatus::Gathering);
+        assert_eq!(row.updated_at, 200);
+        // Idempotency contract: calling again is a no-op (returns
+        // false), not an error.
+        assert!(!store.mark_gathering(&id, 300).unwrap());
+    }
+
+    #[test]
+    fn set_notes_round_trips_into_summary() {
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(
+                &id,
+                &ConversationId::from("c"),
+                "q",
+                "Controller",
+                None,
+                100,
+            )
+            .unwrap();
+        let notes = vec![
+            note(0, "first", SubQueryState::Done),
+            note(1, "second", SubQueryState::Running),
+        ];
+        store.set_notes(&id, &notes, 200).unwrap();
+        let row = store.get(&id).unwrap().unwrap();
+        let summary = row.to_summary();
+        assert_eq!(summary.notes.len(), 2);
+        assert_eq!(summary.notes[0].sub_query, "first");
+        assert_eq!(summary.notes[0].state, SubQueryState::Done);
+        assert_eq!(summary.notes[1].state, SubQueryState::Running);
+    }
+
+    #[test]
+    fn set_notes_returns_not_found_for_unknown_id() {
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        let err = store
+            .set_notes(&ResearchJobId::new(), &[], 100)
+            .unwrap_err();
+        assert!(matches!(err, ResearchError::NotFound(_)));
+    }
+
+    #[test]
+    fn mark_synthesizing_only_advances_gathering_rows() {
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(
+                &id,
+                &ConversationId::from("c"),
+                "q",
+                "Controller",
+                None,
+                100,
+            )
+            .unwrap();
+        // From Pending — no advance.
+        assert!(!store.mark_synthesizing(&id, 200).unwrap());
+        store.claim_next_pending("card-1", 150).unwrap();
+        store
+            .set_planned(
+                &id,
+                &ResearchPlan {
+                    thesis: "t".into(),
+                    steps: vec![PlanStep {
+                        query: "q1".into(),
+                        rationale: None,
+                    }],
+                },
+                160,
+            )
+            .unwrap();
+        // From Planned — still no (must go through Gathering).
+        assert!(!store.mark_synthesizing(&id, 250).unwrap());
+        store.mark_gathering(&id, 300).unwrap();
+        // Now from Gathering — succeeds.
+        assert!(store.mark_synthesizing(&id, 350).unwrap());
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(row.status, ResearchJobStatus::Synthesizing);
+    }
+
+    #[test]
+    fn sub_query_state_str_round_trips_each_variant() {
+        for s in [
+            SubQueryState::Pending,
+            SubQueryState::Running,
+            SubQueryState::Done,
+            SubQueryState::Failed,
+        ] {
+            assert!(!s.as_str().is_empty());
+        }
+        // Distinct strings — guards a regression where two variants
+        // collide on the same string and the SPA badge can't tell
+        // them apart.
+        let strs: std::collections::HashSet<_> = [
+            SubQueryState::Pending,
+            SubQueryState::Running,
+            SubQueryState::Done,
+            SubQueryState::Failed,
+        ]
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+        assert_eq!(strs.len(), 4);
     }
 
     // -------------- ResearchConfigStore --------------

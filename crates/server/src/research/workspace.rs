@@ -14,7 +14,7 @@
 //! 2026-04-29.
 
 use execlaw_core::ids::ResearchJobId;
-use execlaw_core::research::ResearchPlan;
+use execlaw_core::research::{ResearchNote, ResearchPlan};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -77,6 +77,23 @@ impl ResearchWorkspace {
         Ok(path)
     }
 
+    /// Write one gather-phase note as `notes/<index>.json`. Pretty-
+    /// printed so operators can grep it directly. Idempotent —
+    /// re-writing the same index overwrites cleanly (a worker that
+    /// retries lands here without duplicate files).
+    pub fn write_note(
+        &self,
+        job_id: &ResearchJobId,
+        note: &ResearchNote,
+    ) -> Result<PathBuf, WorkspaceError> {
+        let dir = self.provision(job_id)?;
+        let path = dir.join("notes").join(format!("{}.json", note.index));
+        let body = serde_json::to_string_pretty(note)
+            .map_err(|e| WorkspaceError::Encoding(e.to_string()))?;
+        std::fs::write(&path, body)?;
+        Ok(path)
+    }
+
     /// Tear down a job's workspace. C6's retention sweeper calls this
     /// after the row's terminal `finished_at` ages past the global
     /// retention cutoff. Safe to call when the dir doesn't exist.
@@ -132,6 +149,41 @@ mod tests {
         assert!(body.contains("\"first\""));
         // Newlines mean we got the pretty-printed form.
         assert!(body.contains('\n'));
+    }
+
+    #[test]
+    fn write_note_lands_in_notes_subdir_and_overwrites_idempotently() {
+        use execlaw_core::research::{ResearchNote, ResearchSource, SubQueryState};
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = ResearchWorkspace::new(tmp.path());
+        let id = ResearchJobId::new();
+        let note = ResearchNote {
+            index: 3,
+            sub_query: "anything".into(),
+            state: SubQueryState::Done,
+            excerpt: "v1".into(),
+            sources: vec![ResearchSource {
+                url: "https://example.com".into(),
+                title: Some("ex".into()),
+                fetched_ok: true,
+                error: None,
+            }],
+            tokens_used: Some(42),
+            error: None,
+        };
+        let path = ws.write_note(&id, &note).unwrap();
+        assert!(path.ends_with("notes/3.json") || path.ends_with("notes\\3.json"));
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("\"v1\""));
+        // Re-write with a different excerpt — must overwrite, not error.
+        let note2 = ResearchNote {
+            excerpt: "v2".into(),
+            ..note
+        };
+        ws.write_note(&id, &note2).unwrap();
+        let body2 = std::fs::read_to_string(&path).unwrap();
+        assert!(body2.contains("\"v2\""));
+        assert!(!body2.contains("\"v1\""));
     }
 
     #[test]

@@ -10,8 +10,11 @@
 // / voice) so the controller can see at a glance which transport
 // delivered the message.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { MessageView } from "../api/endpoints";
+import { getCardRenderer } from "../cards/CardRenderer";
+import { useCardsForConversation } from "../cards/cardStore";
+import type { Card } from "../cards/types";
 import { MarkdownContent } from "../components/MarkdownContent";
 import { useChatState } from "./store";
 
@@ -29,6 +32,12 @@ const TRUNCATE_CHARS = 1200;
  *  user is visually at the floor; 8 px swallows that noise. */
 const AT_BOTTOM_SLACK_PX = 8;
 
+/// Discriminated union the chronological-render loop walks. Cards
+/// and messages are interleaved by their wall-clock timestamp.
+type StreamItem =
+    | { kind: "message"; message: MessageView; sortKey: number }
+    | { kind: "card"; card: Card; sortKey: number };
+
 export function MessageStream({ conversationId }: Props) {
     const messages = useChatState(
         (s) => s.messages[conversationId] ?? null,
@@ -36,6 +45,39 @@ export function MessageStream({ conversationId }: Props) {
     const streaming = useChatState(
         (s) => s.streamingBuffer[conversationId] ?? null,
     );
+    const cards = useCardsForConversation(conversationId);
+    const items: StreamItem[] = useMemo(() => {
+        const acc: StreamItem[] = [];
+        if (messages) {
+            for (const m of messages) {
+                acc.push({ kind: "message", message: m, sortKey: m.seq });
+            }
+        }
+        // Cards sort by their `opened_at` (Unix-seconds). The
+        // event-log seq is monotonic-per-conversation so a fresh
+        // card always sorts after every message that committed
+        // before it. To keep cards from sliding around when a
+        // CardProgressed bumps `updated_at`, sort by the original
+        // opened_at — that anchors the card's chat-pane position
+        // for its lifetime.
+        for (const c of cards) {
+            // Translate the card's wall-clock open time into a
+            // synthetic seq that interleaves with the message list.
+            // We don't know the exact event-log seq from the SPA
+            // side; opened_at-as-millis × 1000 produces a number
+            // that's strictly greater than any plausible message
+            // seq the conversation has, so cards land at the
+            // tail by default. Future work threads the real seq
+            // through the WS payload for tighter ordering.
+            acc.push({
+                kind: "card",
+                card: c,
+                sortKey: c.opened_at * 1_000_000,
+            });
+        }
+        acc.sort((a, b) => a.sortKey - b.sortKey);
+        return acc;
+    }, [messages, cards]);
     const scrollRef = useRef<HTMLDivElement | null>(null);
     const [isAtBottom, setIsAtBottom] = useState(true);
 
@@ -83,7 +125,7 @@ export function MessageStream({ conversationId }: Props) {
         );
     }
 
-    if (messages.length === 0 && !streaming) {
+    if (messages.length === 0 && cards.length === 0 && !streaming) {
         return (
             <div className="execlaw-stream-wrap">
                 <div className="execlaw-stream" ref={scrollRef}>
@@ -112,9 +154,24 @@ export function MessageStream({ conversationId }: Props) {
                 onScroll={onScroll}
                 data-testid="message-stream"
             >
-                {messages.map((m) => (
-                    <MessageBubble key={`${m.kind}-${m.seq}`} message={m} />
-                ))}
+                {items.map((item) => {
+                    if (item.kind === "message") {
+                        const m = item.message;
+                        return (
+                            <MessageBubble
+                                key={`msg-${m.kind}-${m.seq}`}
+                                message={m}
+                            />
+                        );
+                    }
+                    const Renderer = getCardRenderer(item.card.kind);
+                    return (
+                        <Renderer
+                            key={`card-${item.card.card_id}`}
+                            card={item.card}
+                        />
+                    );
+                })}
                 {streaming && (
                     <div className="execlaw-msg" data-testid="streaming-bubble">
                         <div className="execlaw-msg__meta">

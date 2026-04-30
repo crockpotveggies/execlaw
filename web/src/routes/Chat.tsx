@@ -28,6 +28,11 @@ import {
     type UiPanelSummary,
 } from "../api/endpoints";
 import { WsClient, type WsEvent } from "../api/ws";
+import { applyCardEvent } from "../cards/cardStore";
+// Side-effect import: registers the ResearchCard renderer for
+// `kind: "research"` cards. CardRenderer.tsx already auto-registers
+// the generic LongRunningTaskCard fallback at module-load.
+import "../cards/ResearchCard";
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
 import { ApprovalCard } from "../chat/ApprovalCard";
@@ -522,6 +527,127 @@ export function Chat() {
                     }
                 }
                 break;
+            // ---- C4 — generic Card events (research, future
+            // shell-session / file-pipeline tools all share this
+            // surface). Project the WS payload into the card store;
+            // MessageStream re-renders via the store's subscription.
+            case "card_opened": {
+                if (cid && typeof ev.card_id === "string") {
+                    applyCardEvent(cid, {
+                        kind: "card.opened",
+                        committed_at:
+                            typeof ev.committed_at === "number"
+                                ? ev.committed_at
+                                : Math.floor(Date.now() / 1000),
+                        payload: {
+                            card_id: ev.card_id,
+                            kind:
+                                typeof ev.card_kind === "string"
+                                    ? (ev.card_kind as
+                                          | "long_running_task"
+                                          | "research"
+                                          | "shell_session"
+                                          | "file_pipeline")
+                                    : "long_running_task",
+                            title: typeof ev.title === "string" ? ev.title : "",
+                            summary:
+                                typeof ev.summary === "string" ? ev.summary : "",
+                            state:
+                                typeof ev.state === "string"
+                                    ? (ev.state as
+                                          | "Pending"
+                                          | "Running"
+                                          | "Paused"
+                                          | "Completed"
+                                          | "Failed"
+                                          | "Cancelled")
+                                    : undefined,
+                            details: ev.details,
+                            actions: Array.isArray(ev.actions)
+                                ? (ev.actions as never)
+                                : [],
+                        },
+                    });
+                }
+                break;
+            }
+            case "card_progressed": {
+                if (cid && typeof ev.card_id === "string") {
+                    applyCardEvent(cid, {
+                        kind: "card.progressed",
+                        committed_at:
+                            typeof ev.committed_at === "number"
+                                ? ev.committed_at
+                                : Math.floor(Date.now() / 1000),
+                        payload: {
+                            card_id: ev.card_id,
+                            state:
+                                typeof ev.state === "string"
+                                    ? (ev.state as
+                                          | "Pending"
+                                          | "Running"
+                                          | "Paused"
+                                          | "Completed"
+                                          | "Failed"
+                                          | "Cancelled")
+                                    : undefined,
+                            progress:
+                                typeof ev.progress === "number"
+                                    ? ev.progress
+                                    : undefined,
+                            phase:
+                                typeof ev.phase === "string"
+                                    ? ev.phase
+                                    : undefined,
+                            details: ev.details,
+                            actions: Array.isArray(ev.actions)
+                                ? (ev.actions as never)
+                                : undefined,
+                            summary:
+                                typeof ev.summary === "string"
+                                    ? ev.summary
+                                    : undefined,
+                        },
+                    });
+                }
+                break;
+            }
+            case "card_closed": {
+                if (cid && typeof ev.card_id === "string") {
+                    applyCardEvent(cid, {
+                        kind: "card.closed",
+                        committed_at:
+                            typeof ev.committed_at === "number"
+                                ? ev.committed_at
+                                : Math.floor(Date.now() / 1000),
+                        payload: {
+                            card_id: ev.card_id,
+                            state:
+                                typeof ev.state === "string"
+                                    ? (ev.state as
+                                          | "Pending"
+                                          | "Running"
+                                          | "Paused"
+                                          | "Completed"
+                                          | "Failed"
+                                          | "Cancelled")
+                                    : "Completed",
+                            summary:
+                                typeof ev.summary === "string" ? ev.summary : "",
+                            details: ev.details,
+                            attachment_id:
+                                typeof ev.attachment_id === "string"
+                                    ? ev.attachment_id
+                                    : undefined,
+                            error:
+                                typeof ev.error === "string"
+                                    ? ev.error
+                                    : undefined,
+                        },
+                    });
+                }
+                break;
+            }
             // ---- Phase 13.C — voice events --------------------------
             case "voice_transcript": {
                 // The server's final transcript for this utterance.

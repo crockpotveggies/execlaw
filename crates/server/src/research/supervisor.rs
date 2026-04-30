@@ -17,6 +17,7 @@
 //!
 //! 2026-04-29.
 
+use crate::events::EventBus;
 use crate::inference_resolver::InferenceResolver;
 use crate::research::runner::{JobRunCtx, run_job};
 use crate::research::workspace::ResearchWorkspace;
@@ -40,6 +41,11 @@ pub struct ResearchSupervisor {
     pub inference: Arc<InferenceResolver>,
     pub workspace: ResearchWorkspace,
     pub model: String,
+    /// EventBus the runner publishes Card.{Opened,Progressed,Closed}
+    /// onto so the SPA's chat-pane sees lifecycle ticks live without
+    /// waiting on a re-fetch. C3 ran without one (cards committed to
+    /// the log only); C4 wires it through end-to-end.
+    pub events: EventBus,
 }
 
 impl ResearchSupervisor {
@@ -48,12 +54,14 @@ impl ResearchSupervisor {
         inference: Arc<InferenceResolver>,
         workspace: ResearchWorkspace,
         model: String,
+        events: EventBus,
     ) -> Self {
         Self {
             db,
             inference,
             workspace,
             model,
+            events,
         }
     }
 
@@ -112,6 +120,7 @@ impl ResearchSupervisor {
         let workspace = self.workspace.clone();
         let model = self.model.clone();
         let inference_resolver = self.inference.clone();
+        let events = self.events.clone();
         tokio::spawn(async move {
             let inference = inference_resolver
                 .resolve(&db, BackendPurpose::Standard)
@@ -121,6 +130,7 @@ impl ResearchSupervisor {
                 job_id: job_id.clone(),
                 workspace,
                 inference,
+                events,
             };
             if let Err(e) = run_job(ctx).await {
                 tracing::warn!(
@@ -190,7 +200,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = ResearchWorkspace::new(tmp.path());
         let resolver = Arc::new(InferenceResolver::new(None));
-        let sup = ResearchSupervisor::new(db.clone(), resolver, workspace, "test-model".into());
+        let sup = ResearchSupervisor::new(
+            db.clone(),
+            resolver,
+            workspace,
+            "test-model".into(),
+            EventBus::new(),
+        );
         sup.tick_once().await.unwrap();
 
         // Poll the row up to ~1s for the runner task to land.
@@ -232,7 +248,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = ResearchWorkspace::new(tmp.path());
         let resolver = Arc::new(InferenceResolver::new(None));
-        let sup = ResearchSupervisor::new(db.clone(), resolver, workspace, "test-model".into());
+        let sup = ResearchSupervisor::new(
+            db.clone(),
+            resolver,
+            workspace,
+            "test-model".into(),
+            EventBus::new(),
+        );
         sup.tick_once().await.unwrap();
 
         // After the tick, every row should have been claimed (status

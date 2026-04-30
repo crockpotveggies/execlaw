@@ -1339,6 +1339,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
             state.inference.clone(),
             workspace,
             state.config.model_id.clone(),
+            state.events.clone(),
         );
         let stop = sweep_stop.clone();
         tokio::spawn(async move { supervisor.run(stop).await });

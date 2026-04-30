@@ -18,12 +18,13 @@
 //!
 //! 2026-04-29.
 
+use crate::events::{EventBus, UiEvent};
+use execlaw_core::Database;
 use execlaw_core::cards::{
     Card, CardClosedPayload, CardEvent, CardOpenedPayload, CardProgressedPayload,
 };
 use execlaw_core::events::{EventKind, EventLog, EventRecord, PendingEvent};
 use execlaw_core::ids::{ConversationId, EventSeq};
-use execlaw_core::Database;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -65,6 +66,87 @@ pub fn close_card(
     commit_card_event(db, cid, actor, EventKind::CardClosed, payload)
 }
 
+/// Commit + broadcast variants. Used by the research subsystem so
+/// the SPA's chat-pane sees card lifecycle events live; legacy
+/// callers (and tests with no bus) keep using `open_card`/etc. The
+/// commit happens FIRST so the durable source of truth (the
+/// `state_events` row) lands before the SPA gets the live notification
+/// — a subscriber that loses the WS in the middle of a job can
+/// always re-project from the log.
+pub fn open_card_and_broadcast(
+    db: &Database,
+    bus: &EventBus,
+    cid: &ConversationId,
+    actor: &str,
+    payload: &CardOpenedPayload,
+) -> Result<(), CardEmitError> {
+    open_card(db, cid, actor, payload)?;
+    let now = chrono::Utc::now().timestamp();
+    let actions_json =
+        serde_json::to_value(&payload.actions).unwrap_or_else(|_| serde_json::json!([]));
+    bus.publish(UiEvent::CardOpened {
+        conversation_id: cid.as_str().to_owned(),
+        card_id: payload.card_id.clone(),
+        card_kind: payload.kind.as_str().to_owned(),
+        title: payload.title.clone(),
+        summary: payload.summary.clone(),
+        state: payload.state.map(|s| s.as_str().to_owned()),
+        details: payload.details.clone(),
+        actions: actions_json,
+        committed_at: now,
+    });
+    Ok(())
+}
+
+pub fn progress_card_and_broadcast(
+    db: &Database,
+    bus: &EventBus,
+    cid: &ConversationId,
+    actor: &str,
+    payload: &CardProgressedPayload,
+) -> Result<(), CardEmitError> {
+    progress_card(db, cid, actor, payload)?;
+    let now = chrono::Utc::now().timestamp();
+    let actions_json = payload
+        .actions
+        .as_ref()
+        .and_then(|a| serde_json::to_value(a).ok());
+    bus.publish(UiEvent::CardProgressed {
+        conversation_id: cid.as_str().to_owned(),
+        card_id: payload.card_id.clone(),
+        state: payload.state.map(|s| s.as_str().to_owned()),
+        progress: payload.progress,
+        phase: payload.phase.clone(),
+        details: payload.details.clone(),
+        actions: actions_json,
+        summary: payload.summary.clone(),
+        committed_at: now,
+    });
+    Ok(())
+}
+
+pub fn close_card_and_broadcast(
+    db: &Database,
+    bus: &EventBus,
+    cid: &ConversationId,
+    actor: &str,
+    payload: &CardClosedPayload,
+) -> Result<(), CardEmitError> {
+    close_card(db, cid, actor, payload)?;
+    let now = chrono::Utc::now().timestamp();
+    bus.publish(UiEvent::CardClosed {
+        conversation_id: cid.as_str().to_owned(),
+        card_id: payload.card_id.clone(),
+        state: payload.state.as_str().to_owned(),
+        summary: payload.summary.clone(),
+        details: payload.details.clone(),
+        attachment_id: payload.attachment_id.clone(),
+        error: payload.error.clone(),
+        committed_at: now,
+    });
+    Ok(())
+}
+
 fn commit_card_event<T: serde::Serialize>(
     db: &Database,
     cid: &ConversationId,
@@ -76,8 +158,7 @@ fn commit_card_event<T: serde::Serialize>(
     let base_seq = log.last_seq(cid)?;
     let pending = PendingEvent {
         kind,
-        payload: rmp_serde::to_vec(payload)
-            .map_err(|e| CardEmitError::Encode(e.to_string()))?,
+        payload: rmp_serde::to_vec(payload).map_err(|e| CardEmitError::Encode(e.to_string()))?,
         actor: Some(actor.to_owned()),
     };
     log.commit_turn(cid, base_seq, vec![pending])?;
@@ -139,11 +220,8 @@ pub fn project_card(
     Ok(card)
 }
 
-fn decode_payload<T: serde::de::DeserializeOwned>(
-    ev: &EventRecord,
-) -> Result<T, CardEmitError> {
-    rmp_serde::from_slice(&ev.payload)
-        .map_err(|e| CardEmitError::Encode(format!("decode: {e}")))
+fn decode_payload<T: serde::de::DeserializeOwned>(ev: &EventRecord) -> Result<T, CardEmitError> {
+    rmp_serde::from_slice(&ev.payload).map_err(|e| CardEmitError::Encode(format!("decode: {e}")))
 }
 
 #[cfg(test)]
