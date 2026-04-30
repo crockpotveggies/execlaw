@@ -544,7 +544,7 @@ pub async fn run_synthesize_phase(
             return Err(e.into());
         }
     };
-    {
+    let finish_landed = {
         let db = db.clone();
         let id = job_id.clone();
         let att = outcome.attachment_id.as_str().to_owned();
@@ -559,7 +559,21 @@ pub async fn run_synthesize_phase(
             )
         })
         .await
-        .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??;
+        .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??
+    };
+    if !finish_landed {
+        // The row was already terminal — almost always because the
+        // operator cancelled mid-LLM-call. The cancel handler
+        // already broadcast CardClosed{Cancelled}; broadcasting
+        // CardClosed{Completed} here would visually resurrect the
+        // job. Skip the close-card emit and exit silently. The
+        // workspace write + attachment row stay (harmless;
+        // operators can still read the report if they want).
+        tracing::info!(
+            job_id = job_id.as_str(),
+            "synthesize completed but row was already terminal (likely cancelled mid-LLM); skipping CardClosed{{Completed}} broadcast",
+        );
+        return Ok(());
     }
     let report_for_details = outcome.report_markdown.clone();
     close_card_and_broadcast(
@@ -691,12 +705,36 @@ async fn mark_failed(
         )
     })
     .await;
-    if let Ok(Err(e)) = finish_res {
-        tracing::warn!(
+    let landed = match &finish_res {
+        Ok(Ok(b)) => *b,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                job_id = job_id.as_str(),
+                error = %e,
+                "marking job Failed in DB hit an error; row may be stuck in Planning",
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(
+                job_id = job_id.as_str(),
+                error = %e,
+                "marking job Failed in DB join error",
+            );
+            false
+        }
+    };
+    if !landed {
+        // Row was already terminal — almost always a cancel that
+        // raced this failure path. The cancel handler already
+        // broadcast CardClosed{Cancelled}; emitting CardClosed{Failed}
+        // here would visually re-open the row in a different state
+        // for SPA subscribers.
+        tracing::info!(
             job_id = job_id.as_str(),
-            error = %e,
-            "marking job Failed in DB hit an error; row may be stuck in Planning",
+            "mark_failed: row already terminal (likely cancelled); skipping CardClosed{{Failed}} broadcast",
         );
+        return;
     }
     let close = close_card_and_broadcast(
         db,
@@ -908,5 +946,270 @@ mod tests {
         assert_eq!(row.finished_at, Some(140));
         assert_eq!(row.error.as_deref(), Some("operator"));
         assert!(row.attachment_id.is_none());
+    }
+
+    /// Adversarial race: the cancel token's pre-flight check passes
+    /// (token not yet cancelled), the synthesize LLM call runs to
+    /// completion, but the operator cancels DURING the LLM call so
+    /// by the time we hit `finish(Complete)` the row is already
+    /// Cancelled. The status guard makes finish a no-op (returns
+    /// false), but without the bool-handling fix the runner would
+    /// still broadcast CardClosed{Completed} — visually resurrecting
+    /// the job. Pre-flips the row to Cancelled in the DB while
+    /// keeping the cancel token clear, then runs the synthesize
+    /// path against a working mock LLM and asserts NO
+    /// CardClosed{Completed} event fires.
+    #[tokio::test]
+    async fn run_synthesize_phase_skips_close_card_when_row_already_cancelled() {
+        use execlaw_core::Database;
+        use execlaw_core::cards::{CardKind, CardOpenedPayload, CardState};
+        use execlaw_core::conversation::{
+            ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
+        };
+        use execlaw_core::db::DbConfig;
+        use execlaw_core::ids::{ConversationId, EventSeq};
+        use execlaw_core::migrations::MigrationRunner;
+        use execlaw_core::research::{
+            PlanStep, ResearchJobStatus, ResearchJobStore, ResearchNote, ResearchPlan,
+            SubQueryState,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Spin up a working mock LLM listener so the synthesize call
+        // succeeds end-to-end (we want to reach `finish(Complete)`,
+        // not bail out on inference error).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 16384];
+            let _ = sock.read(&mut buf).await;
+            let body = serde_json::json!({
+                "id": "syn-1",
+                "object": "chat.completion",
+                "created": 1_700_000_000,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "# Final\n\nDone."},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let cid = ConversationId::from("conv-cancel-race");
+        ConversationStore::new(&db)
+            .upsert(&ConversationRow {
+                conversation_id: cid.clone(),
+                kind: ConversationKind::ControllerDM,
+                last_seq: EventSeq(0),
+                phase: Phase::Idle,
+                controller_id: None,
+                trust_class: "Controller".into(),
+                snapshot_blob: None,
+                snapshot_seq: None,
+                lease_owner: None,
+                lease_expires: None,
+                modality: Modality::Text,
+                display_name: None,
+                is_pinned: false,
+                is_ephemeral: false,
+                ephemeral_expires_at: None,
+                last_activity_at: 0,
+            })
+            .unwrap();
+        let id = ResearchJobId::new();
+        let store = ResearchJobStore::new(&db);
+        store
+            .insert_pending(&id, &cid, "q", "Controller", None, 100)
+            .unwrap();
+        store.claim_next_pending("card-race", 110).unwrap();
+        let plan = ResearchPlan {
+            thesis: "t".into(),
+            steps: vec![PlanStep {
+                query: "q1".into(),
+                rationale: None,
+            }],
+        };
+        store.set_planned(&id, &plan, 120).unwrap();
+        store.mark_gathering(&id, 130).unwrap();
+        // Simulate the race: the operator cancel landed AFTER the
+        // pre-flight token check but before finish(Complete). Flip
+        // the row to Cancelled in the DB while leaving the local
+        // cancel token clear.
+        store.cancel_active(&id, Some("race"), 140).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        crate::cards::open_card(
+            &db,
+            &cid,
+            "system",
+            &CardOpenedPayload {
+                card_id: "card-race".into(),
+                kind: CardKind::Research,
+                title: "t".into(),
+                summary: "s".into(),
+                state: Some(CardState::Running),
+                details: serde_json::json!({}),
+                actions: vec![],
+            },
+        )
+        .unwrap();
+
+        // Subscribe BEFORE running synthesize so we capture every
+        // event the phase emits. Token is intentionally NOT
+        // cancelled so the pre-flight check at the top of
+        // run_synthesize_phase passes.
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let cancel = CancellationToken::new();
+        let deps = PhaseDeps {
+            db: db.clone(),
+            events: bus,
+            workspace: ResearchWorkspace::new(tmp.path()),
+            conversation_id: cid.clone(),
+            card_id: "card-race".into(),
+            inference: Arc::new(InferenceClient::new(format!("http://{addr}/v1"))),
+            model: "test-model".into(),
+            cancel,
+        };
+
+        let notes = vec![ResearchNote {
+            index: 0,
+            sub_query: "q1".into(),
+            state: SubQueryState::Done,
+            excerpt: "did the thing".into(),
+            sources: Vec::new(),
+            tokens_used: Some(10),
+            error: None,
+        }];
+
+        run_synthesize_phase(&deps, &id, "q", &plan, &notes)
+            .await
+            .unwrap();
+
+        // Drain the event bus and assert NO CardClosed{Completed}
+        // event fired. In-progress CardProgressed events are fine
+        // (the phase emits one for "Synthesizing"); they just don't
+        // resurrect a Cancelled row.
+        loop {
+            match rx.try_recv() {
+                Ok(crate::events::UiEvent::CardClosed { state, .. }) => {
+                    panic!(
+                        "unexpected CardClosed (state={state}) — synthesize must skip the broadcast when the row is already terminal"
+                    );
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+
+        // Row stays Cancelled — finish(Complete) was rejected by the
+        // status guard and didn't overwrite the operator's note.
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(row.status, ResearchJobStatus::Cancelled);
+        assert_eq!(row.error.as_deref(), Some("race"));
+        assert_eq!(row.finished_at, Some(140));
+    }
+
+    /// Same race, opposite path: gather fails AFTER an operator
+    /// cancel landed. mark_failed's finish(Failed) hits the status
+    /// guard and returns false; without the bool-handling fix the
+    /// helper would still emit CardClosed{Failed}, flipping a card
+    /// the cancel handler already closed as Cancelled.
+    #[tokio::test]
+    async fn mark_failed_skips_close_card_when_row_already_cancelled() {
+        use execlaw_core::Database;
+        use execlaw_core::cards::{CardKind, CardOpenedPayload, CardState};
+        use execlaw_core::conversation::{
+            ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
+        };
+        use execlaw_core::db::DbConfig;
+        use execlaw_core::ids::{ConversationId, EventSeq};
+        use execlaw_core::migrations::MigrationRunner;
+        use execlaw_core::research::{ResearchJobStatus, ResearchJobStore};
+
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let cid = ConversationId::from("conv-mark-failed-race");
+        ConversationStore::new(&db)
+            .upsert(&ConversationRow {
+                conversation_id: cid.clone(),
+                kind: ConversationKind::ControllerDM,
+                last_seq: EventSeq(0),
+                phase: Phase::Idle,
+                controller_id: None,
+                trust_class: "Controller".into(),
+                snapshot_blob: None,
+                snapshot_seq: None,
+                lease_owner: None,
+                lease_expires: None,
+                modality: Modality::Text,
+                display_name: None,
+                is_pinned: false,
+                is_ephemeral: false,
+                ephemeral_expires_at: None,
+                last_activity_at: 0,
+            })
+            .unwrap();
+        let id = ResearchJobId::new();
+        let store = ResearchJobStore::new(&db);
+        store
+            .insert_pending(&id, &cid, "q", "Controller", None, 100)
+            .unwrap();
+        store.claim_next_pending("card-mf", 110).unwrap();
+        // Pre-cancel — simulates the race where the operator cancel
+        // landed before this gather-failure path runs mark_failed.
+        store.cancel_active(&id, Some("operator note"), 120).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        crate::cards::open_card(
+            &db,
+            &cid,
+            "system",
+            &CardOpenedPayload {
+                card_id: "card-mf".into(),
+                kind: CardKind::Research,
+                title: "t".into(),
+                summary: "s".into(),
+                state: Some(CardState::Running),
+                details: serde_json::json!({}),
+                actions: vec![],
+            },
+        )
+        .unwrap();
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let workspace = ResearchWorkspace::new(tmp.path());
+
+        mark_failed(&db, &bus, &workspace, &id, &cid, "card-mf", "fetch error").await;
+
+        // No CardClosed event of any kind should have fired.
+        loop {
+            match rx.try_recv() {
+                Ok(crate::events::UiEvent::CardClosed { state, .. }) => {
+                    panic!(
+                        "unexpected CardClosed (state={state}) — mark_failed must skip when row already terminal"
+                    );
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+
+        // Row stays Cancelled with the operator's note intact.
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(row.status, ResearchJobStatus::Cancelled);
+        assert_eq!(row.error.as_deref(), Some("operator note"));
     }
 }
