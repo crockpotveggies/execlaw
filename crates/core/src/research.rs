@@ -517,6 +517,17 @@ impl<'db> ResearchJobStore<'db> {
     /// Move the row to a terminal state. `error` is required for
     /// `Failed`; for `Complete` callers should also pass the
     /// `attachment_id` for the report.
+    ///
+    /// Returns `Ok(true)` when the transition landed, `Ok(false)`
+    /// when the row was ALREADY terminal — the status guard
+    /// prevents a late `finish(Complete)` from silently
+    /// overwriting an earlier `Cancelled` (the cancel-overwrite
+    /// regression an audit caught after the C6c cancel-token
+    /// plumbing landed). Without this guard, the runner's natural
+    /// "synthesise complete → finish(Complete)" path could undo
+    /// an operator cancel that fired mid-gather, silently
+    /// resurrecting a job the operator killed and producing a
+    /// rendering-glitch CardClosed sequence on the SPA.
     pub fn finish(
         &self,
         id: &ResearchJobId,
@@ -524,7 +535,7 @@ impl<'db> ResearchJobStore<'db> {
         error: Option<&str>,
         attachment_id: Option<&str>,
         now: i64,
-    ) -> Result<(), ResearchError> {
+    ) -> Result<bool, ResearchError> {
         if !terminal.is_terminal() {
             return Err(ResearchError::Invalid(format!(
                 "{} is not a terminal status",
@@ -535,18 +546,19 @@ impl<'db> ResearchJobStore<'db> {
         let status = terminal.as_str();
         let error_owned = error.map(str::to_owned);
         let attachment_owned = attachment_id.map(str::to_owned);
-        self.db.with_conn(|c| {
-            c.execute(
+        let n = self.db.with_conn(|c| {
+            let n = c.execute(
                 "UPDATE state_research_jobs \
                  SET status = ?1, error = COALESCE(?2, error), \
                      attachment_id = COALESCE(?3, attachment_id), \
                      finished_at = ?4, updated_at = ?4 \
-                 WHERE id = ?5",
+                 WHERE id = ?5 \
+                   AND status NOT IN ('complete', 'failed', 'cancelled')",
                 params![status, error_owned, attachment_owned, now, id_owned],
             )?;
-            Ok(())
+            Ok(n)
         })?;
-        Ok(())
+        Ok(n > 0)
     }
 
     /// Set the workspace directory path on disk (the runner provisions
@@ -1250,6 +1262,83 @@ mod tests {
         assert_eq!(row.updated_at, 999);
         assert_eq!(row.finished_at, Some(999));
         assert_eq!(row.attachment_id.as_deref(), Some("att-1"));
+    }
+
+    #[test]
+    fn finish_does_not_overwrite_already_terminal_row() {
+        // Security-relevant invariant: a `finish(Complete)` after a
+        // `cancel_active` MUST NOT silently resurrect the row.
+        // Without this guard the runner's natural "synthesise
+        // complete → finish(Complete)" path would undo an operator
+        // cancel that fired mid-gather.
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(
+                &id,
+                &ConversationId::from("c"),
+                "q",
+                "Controller",
+                None,
+                100,
+            )
+            .unwrap();
+        store.claim_next_pending("c", 110).unwrap();
+        // Operator cancel lands first.
+        assert!(store.cancel_active(&id, Some("operator"), 200).unwrap());
+        let cancelled = store.get(&id).unwrap().unwrap();
+        assert_eq!(cancelled.status, ResearchJobStatus::Cancelled);
+        assert_eq!(cancelled.finished_at, Some(200));
+        assert_eq!(cancelled.error.as_deref(), Some("operator"));
+        // Runner's late "synthesise complete" finish call: must
+        // be a no-op (returns false), must NOT overwrite the
+        // Cancelled status, attachment_id, or error.
+        let advanced = store
+            .finish(
+                &id,
+                ResearchJobStatus::Complete,
+                None,
+                Some("late-attachment"),
+                300,
+            )
+            .unwrap();
+        assert!(!advanced, "finish on already-terminal row must be no-op");
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(row.status, ResearchJobStatus::Cancelled);
+        assert_eq!(row.finished_at, Some(200), "finished_at must NOT advance");
+        assert_eq!(
+            row.error.as_deref(),
+            Some("operator"),
+            "operator's cancel reason must survive",
+        );
+        assert!(
+            row.attachment_id.is_none(),
+            "late attachment_id must NOT be stamped onto a cancelled row",
+        );
+    }
+
+    #[test]
+    fn finish_returns_true_on_normal_advancement() {
+        // Round-trip the new bool return on the happy path.
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(
+                &id,
+                &ConversationId::from("c"),
+                "q",
+                "Controller",
+                None,
+                100,
+            )
+            .unwrap();
+        store.claim_next_pending("c", 110).unwrap();
+        let advanced = store
+            .finish(&id, ResearchJobStatus::Complete, None, Some("att-1"), 200)
+            .unwrap();
+        assert!(advanced);
     }
 
     #[test]

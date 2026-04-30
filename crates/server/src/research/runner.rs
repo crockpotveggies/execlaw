@@ -478,13 +478,22 @@ pub async fn run_synthesize_phase(
         card_id,
         inference: client,
         model,
-        // Synthesize is a single LLM call; we don't have a clean
-        // checkpoint to abort mid-call, so the cancel token isn't
-        // observed here. Future work: wire `tokio::select!` against
-        // the inference future. For now: gather is the high-cost
-        // phase; cancelling it is what matters.
-        cancel: _,
+        cancel,
     } = deps;
+    // Pre-flight cancel check. If the operator cancelled during
+    // gather (or between phases), the row is already Cancelled —
+    // running synthesise would burn a fresh LLM call AND call
+    // finish(Complete) which (post-status-guard) is a no-op but
+    // still triggers a CardClosed{Completed} broadcast that
+    // visually resurrects a job the operator killed. Short-circuit
+    // here so cancel actually means cancel.
+    if cancel.is_cancelled() {
+        tracing::info!(
+            card_id = %card_id,
+            "synthesize phase: cancellation observed at entry; skipping",
+        );
+        return Ok(());
+    }
     {
         let db = db.clone();
         let id = job_id.clone();
@@ -788,5 +797,116 @@ mod tests {
         let cut = truncate_to(&long, 80);
         assert!(cut.chars().count() <= 80);
         assert!(cut.ends_with('…'));
+    }
+
+    /// Adversarial: a `run_synthesize_phase` invocation whose
+    /// `PhaseDeps.cancel` is already cancelled at entry must NOT
+    /// touch the DB / make the LLM call / emit CardClosed. The
+    /// inference client points at a closed port — if we accidentally
+    /// reach the LLM call this test would fail with a connection
+    /// error rather than a clean Ok(()). The pre-flight check is
+    /// what prevents wasted token spend after an operator cancel.
+    #[tokio::test]
+    async fn run_synthesize_phase_early_exits_on_cancelled_token() {
+        use execlaw_core::Database;
+        use execlaw_core::cards::{CardKind, CardOpenedPayload, CardState};
+        use execlaw_core::conversation::{
+            ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
+        };
+        use execlaw_core::db::DbConfig;
+        use execlaw_core::ids::{ConversationId, EventSeq};
+        use execlaw_core::migrations::MigrationRunner;
+        use execlaw_core::research::{PlanStep, ResearchJobStatus, ResearchJobStore, ResearchPlan};
+
+        // In-memory DB + a seeded job in Gathering status.
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let cid = ConversationId::from("conv-cancel-synth");
+        ConversationStore::new(&db)
+            .upsert(&ConversationRow {
+                conversation_id: cid.clone(),
+                kind: ConversationKind::ControllerDM,
+                last_seq: EventSeq(0),
+                phase: Phase::Idle,
+                controller_id: None,
+                trust_class: "Controller".into(),
+                snapshot_blob: None,
+                snapshot_seq: None,
+                lease_owner: None,
+                lease_expires: None,
+                modality: Modality::Text,
+                display_name: None,
+                is_pinned: false,
+                is_ephemeral: false,
+                ephemeral_expires_at: None,
+                last_activity_at: 0,
+            })
+            .unwrap();
+        let id = ResearchJobId::new();
+        let store = ResearchJobStore::new(&db);
+        store
+            .insert_pending(&id, &cid, "q", "Controller", None, 100)
+            .unwrap();
+        store.claim_next_pending("card-1", 110).unwrap();
+        let plan = ResearchPlan {
+            thesis: "t".into(),
+            steps: vec![PlanStep {
+                query: "q1".into(),
+                rationale: None,
+            }],
+        };
+        store.set_planned(&id, &plan, 120).unwrap();
+        store.mark_gathering(&id, 130).unwrap();
+        // Operator cancel — flips row to Cancelled.
+        store.cancel_active(&id, Some("operator"), 140).unwrap();
+
+        // Open the card so the close path has a row to project from
+        // if we accidentally fall through.
+        let tmp = tempfile::tempdir().unwrap();
+        crate::cards::open_card(
+            &db,
+            &cid,
+            "system",
+            &CardOpenedPayload {
+                card_id: "card-1".into(),
+                kind: CardKind::Research,
+                title: "t".into(),
+                summary: "s".into(),
+                state: Some(CardState::Running),
+                details: serde_json::json!({}),
+                actions: vec![],
+            },
+        )
+        .unwrap();
+
+        // PhaseDeps with a CANCELLED token. The inference URL is
+        // closed (127.0.0.1:0) so any actual LLM call would error
+        // out distinguishably.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let deps = PhaseDeps {
+            db: db.clone(),
+            events: EventBus::new(),
+            workspace: ResearchWorkspace::new(tmp.path()),
+            conversation_id: cid.clone(),
+            card_id: "card-1".into(),
+            inference: Arc::new(InferenceClient::new("http://127.0.0.1:0/v1")),
+            model: "test-model".into(),
+            cancel,
+        };
+
+        // Must return Ok(()) cleanly without making the LLM call,
+        // without overwriting the Cancelled row, without emitting
+        // CardClosed{Completed}.
+        run_synthesize_phase(&deps, &id, "q", &plan, &[])
+            .await
+            .unwrap();
+
+        // Row stays Cancelled.
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(row.status, ResearchJobStatus::Cancelled);
+        assert_eq!(row.finished_at, Some(140));
+        assert_eq!(row.error.as_deref(), Some("operator"));
+        assert!(row.attachment_id.is_none());
     }
 }
