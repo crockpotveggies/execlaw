@@ -283,6 +283,7 @@ pub struct ToolCtx {
     /// `MemoryRead`/`MemoryWrite` finds `memory == None`.
     pub conversation: Option<Arc<dyn ConversationApi>>,
     pub memory: Option<Arc<dyn MemoryApi>>,
+    pub notify: Option<Arc<dyn NotifyApi>>,
 }
 
 impl ToolCtx {
@@ -300,6 +301,7 @@ impl ToolCtx {
             clock,
             conversation: None,
             memory: None,
+            notify: None,
         }
     }
 }
@@ -370,6 +372,27 @@ pub struct ThreadInfo {
     pub display_name: Option<String>,
 }
 
+/// One entry in the chat-history view returned by
+/// [`ConversationApi::read_history`]. Internal/operational events
+/// (phase markers, voice frames, alerts) are filtered out at the
+/// implementation layer — only the events the LLM legitimately
+/// wants to see when reading "what was just said" are surfaced.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryEntry {
+    /// Monotonic per-conversation sequence number.
+    pub seq: i64,
+    /// Either `"user"` (a controller / contact message) or
+    /// `"agent"` (a model reply). `tool_use` / `tool_result` are
+    /// excluded from this view; they get their own surface in a
+    /// future tool.
+    pub role: String,
+    /// Raw transcript text as committed to the event. Empty string
+    /// when the payload didn't carry one (rare; defensive).
+    pub text: String,
+    /// Unix-seconds when the event committed to the log.
+    pub committed_at: i64,
+}
+
 /// Conversation-scoped API. The implementation captures the caller's
 /// `conversation_id` + `caller_trust` at construction; method args
 /// don't take them, so a tool can't "see" another conversation by
@@ -382,6 +405,17 @@ pub trait ConversationApi: Send + Sync {
     /// Set the human-readable display name for the caller's
     /// conversation. Trimmed; empty rejected.
     async fn set_thread_name(&self, name: &str) -> Result<(), ApiError>;
+    /// Read the most recent N user / model events from the caller's
+    /// conversation, optionally paginated by `before_seq` (returns
+    /// events with `seq < before_seq`). Results are ordered newest-
+    /// first so the LLM can read them top-to-bottom for "what just
+    /// happened" context. `limit` is capped by the implementation
+    /// to prevent runaway window sizes.
+    async fn read_history(
+        &self,
+        before_seq: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<HistoryEntry>, ApiError>;
 }
 
 /// One memory key + its update timestamp. Returned by
@@ -390,6 +424,69 @@ pub trait ConversationApi: Send + Sync {
 pub struct MemoryListEntry {
     pub key: String,
     pub updated_at: i64,
+}
+
+/// Severity hint a tool sends to the operator's notification surface.
+/// `Info` is the safe default — agents shouldn't fire `Critical`
+/// without explicit operator framing because Critical alerts can
+/// route to phone-call escalation in some operator setups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub enum NotifySeverity {
+    Info,
+    Warning,
+    Error,
+    Critical,
+}
+
+impl NotifySeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "Info",
+            Self::Warning => "Warning",
+            Self::Error => "Error",
+            Self::Critical => "Critical",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "Info" => Some(Self::Info),
+            "Warning" => Some(Self::Warning),
+            "Error" => Some(Self::Error),
+            "Critical" => Some(Self::Critical),
+            _ => None,
+        }
+    }
+}
+
+/// Notification handle a tool was issued to send a message to the
+/// controller. Implementations route through whatever sideband
+/// surface the operator configured (UI dropdown, Signal, alert pill);
+/// this trait abstracts the actual transport so the tool body only
+/// has to care about what it wants to say.
+#[async_trait]
+pub trait NotifyApi: Send + Sync {
+    /// Send a notification to the controller. `title` is shown
+    /// prominently; `detail` is optional longer-form text.
+    /// Notifications are deduped by fingerprint so the same agent
+    /// shouting the same thing repeatedly doesn't drown the operator.
+    async fn notify(
+        &self,
+        severity: NotifySeverity,
+        title: &str,
+        detail: Option<&str>,
+    ) -> Result<NotifyReceipt, ApiError>;
+}
+
+/// Returned by [`NotifyApi::notify`] so the tool can echo a
+/// stable handle back to the LLM (useful for ack-tracking later).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotifyReceipt {
+    /// Stable per-(conversation,fingerprint) alert id.
+    pub alert_id: String,
+    /// Whether this notification deduplicated against an existing
+    /// firing alert (`true`) or opened a new one (`false`).
+    pub deduplicated: bool,
 }
 
 /// Memory API. Reads cascade from the caller's trust class downward

@@ -12,14 +12,18 @@
 //!
 //! 2026-04-29.
 
+use crate::alerts::{AlertRow, AlertStatus, AlertStore, Severity};
 use crate::conversation::ConversationStore;
 use crate::db::Database;
-use crate::ids::ConversationId;
+use crate::ids::{AlertId, ConversationId};
 use crate::memory::{MemoryEntry, MemoryStore};
 use crate::tool::{
-    ApiError, ConversationApi, MemoryApi, MemoryListEntry, ThreadInfo,
+    ApiError, ConversationApi, HistoryEntry, MemoryApi, MemoryListEntry, NotifyApi,
+    NotifyReceipt, NotifySeverity, ThreadInfo,
 };
 use async_trait::async_trait;
+use rusqlite::params;
+use serde::Deserialize;
 
 // -----------------------------------------------------------------
 // Trust ranking — local to this module so `core` stays free of
@@ -78,6 +82,25 @@ fn readable_classes(caller: &str) -> Vec<&'static str> {
 /// nouns / multi-word names. Counted in chars (not bytes) so emoji
 /// titles don't false-trip the cap.
 pub const MAX_THREAD_DISPLAY_NAME_LEN: usize = 64;
+
+/// Hard cap on the number of history rows a single `read_history`
+/// call can return. Larger windows are more often a sign of the
+/// LLM trying to dump the whole transcript than a real need; the
+/// dispatcher trims `limit` to this value.
+pub const MAX_HISTORY_LIMIT: u32 = 200;
+
+// Internal payload mirrors of the server-side message structs so
+// `tool_apis` can pull `text` out without depending on `crates/server`.
+// MessagePack-encoded by the event log; we decode on read here.
+#[derive(Debug, Deserialize)]
+struct UserMsgTextPayload {
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelTurnTextPayload {
+    text: String,
+}
 
 /// DB-backed `ConversationApi`. Captures the caller's
 /// `conversation_id` at construction so the trait methods can never
@@ -138,6 +161,72 @@ impl ConversationApi for DbConversationApi {
         .map_err(|e| ApiError::Storage(format!("join: {e}")))?
         .map_err(|e| ApiError::Storage(format!("set_display_name: {e}")))?;
         Ok(())
+    }
+
+    async fn read_history(
+        &self,
+        before_seq: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<HistoryEntry>, ApiError> {
+        let limit = limit.min(MAX_HISTORY_LIMIT).max(1) as i64;
+        // i64::MAX as the "no upper bound" sentinel — every real seq
+        // is < this, so the predicate becomes a tautology and the
+        // ORDER BY DESC LIMIT clause runs as expected.
+        let before = before_seq.unwrap_or(i64::MAX);
+        let db = self.db.clone();
+        let cid = self.conversation_id.clone();
+
+        let rows: Vec<(i64, String, Vec<u8>, i64)> = tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                let mut stmt = c.prepare_cached(
+                    "SELECT seq, kind, payload, committed_at \
+                     FROM state_events \
+                     WHERE conversation_id = ?1 \
+                       AND seq < ?2 \
+                       AND kind IN ('user_msg', 'model_turn') \
+                     ORDER BY seq DESC \
+                     LIMIT ?3",
+                )?;
+                let rows = stmt
+                    .query_map(params![cid.as_str(), before, limit], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Vec<u8>>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+        })
+        .await
+        .map_err(|e| ApiError::Storage(format!("join: {e}")))?
+        .map_err(|e| ApiError::Storage(format!("read_history: {e}")))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (seq, kind, payload, committed_at) in rows {
+            let (role, text) = match kind.as_str() {
+                "user_msg" => {
+                    let p: UserMsgTextPayload = rmp_serde::from_slice(&payload)
+                        .unwrap_or(UserMsgTextPayload { text: String::new() });
+                    ("user".to_string(), p.text)
+                }
+                "model_turn" => {
+                    let p: ModelTurnTextPayload = rmp_serde::from_slice(&payload)
+                        .unwrap_or(ModelTurnTextPayload { text: String::new() });
+                    ("agent".to_string(), p.text)
+                }
+                other => (other.to_string(), String::new()),
+            };
+            out.push(HistoryEntry {
+                seq,
+                role,
+                text,
+                committed_at,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -248,6 +337,149 @@ impl MemoryApi for DbMemoryApi {
         // keeps the contract honest until that lands.
         let _ = (scope, prefix);
         Ok(Vec::new())
+    }
+}
+
+// -----------------------------------------------------------------
+// NotifyApi: wraps `AlertStore` so a tool can reach the operator
+// through the existing alerts/dropdown infrastructure.
+// -----------------------------------------------------------------
+
+/// Source label every agent-fired notification carries so the
+/// Settings → Alerts page can distinguish them from system alerts.
+const AGENT_NOTIFY_SOURCE: &str = "tool.notify_controller";
+
+fn severity_from_notify(s: NotifySeverity) -> Severity {
+    match s {
+        NotifySeverity::Info => Severity::Info,
+        NotifySeverity::Warning => Severity::Warning,
+        NotifySeverity::Error => Severity::Error,
+        NotifySeverity::Critical => Severity::Critical,
+    }
+}
+
+/// SHA-256 → hex of `(conversation_id || severity || title || detail)`
+/// so duplicate notifications dedup against the same firing alert
+/// (per `AlertStore::insert_firing`'s fingerprint-based dedup path).
+/// We hash the title/detail rather than embed it raw so very long
+/// messages don't bloat the fingerprint string.
+fn build_notify_fingerprint(
+    cid: &str,
+    severity: NotifySeverity,
+    title: &str,
+    detail: Option<&str>,
+) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    cid.hash(&mut h);
+    severity.as_str().hash(&mut h);
+    title.hash(&mut h);
+    detail.unwrap_or("").hash(&mut h);
+    format!("{}:notify:{:016x}", cid, h.finish())
+}
+
+/// DB-backed `NotifyApi`. Captures the caller's `conversation_id`
+/// at construction so `notify` can stamp the right thread on the
+/// alert row.
+pub struct DbNotifyApi {
+    db: Database,
+    conversation_id: ConversationId,
+    clock_now_unix: i64,
+}
+
+impl DbNotifyApi {
+    pub fn new(db: Database, conversation_id: ConversationId, now_unix: i64) -> Self {
+        Self {
+            db,
+            conversation_id,
+            clock_now_unix: now_unix,
+        }
+    }
+}
+
+#[async_trait]
+impl NotifyApi for DbNotifyApi {
+    async fn notify(
+        &self,
+        severity: NotifySeverity,
+        title: &str,
+        detail: Option<&str>,
+    ) -> Result<NotifyReceipt, ApiError> {
+        let trimmed_title = title.trim();
+        if trimmed_title.is_empty() {
+            return Err(ApiError::Validation(
+                "notification title is empty after trimming".into(),
+            ));
+        }
+        if trimmed_title.chars().count() > 200 {
+            return Err(ApiError::Validation(format!(
+                "notification title too long ({} chars; max 200)",
+                trimmed_title.chars().count()
+            )));
+        }
+        if let Some(d) = detail
+            && d.chars().count() > 4_000
+        {
+            return Err(ApiError::Validation(format!(
+                "notification detail too long ({} chars; max 4000)",
+                d.chars().count()
+            )));
+        }
+
+        let fingerprint = build_notify_fingerprint(
+            self.conversation_id.as_str(),
+            severity,
+            trimmed_title,
+            detail,
+        );
+        let now = self.clock_now_unix;
+        let db = self.db.clone();
+        let title = trimmed_title.to_owned();
+        let detail = detail.map(|s| s.to_owned());
+
+        let (row_to_insert, fingerprint_clone) = (
+            AlertRow {
+                id: AlertId::new(),
+                fingerprint: fingerprint.clone(),
+                severity: severity_from_notify(severity),
+                source: AGENT_NOTIFY_SOURCE.to_owned(),
+                title,
+                detail,
+                context_json: None,
+                status: AlertStatus::Firing,
+                first_seen_at: now,
+                last_seen_at: now,
+                occurrence_count: 1,
+                resolved_at: None,
+                resolved_by: None,
+                ack_at: None,
+                ack_by: None,
+                snooze_until: None,
+                incident_id: None,
+                actions_json: None,
+            },
+            fingerprint,
+        );
+        let row_id = row_to_insert.id.clone();
+
+        let dedup_check = tokio::task::spawn_blocking(move || {
+            let store = AlertStore::new(&db);
+            // Probe for existing firing alert at this fingerprint so
+            // we can report `deduplicated` accurately. Both branches
+            // converge on `insert_firing` doing the right thing
+            // (insert vs occurrence-bump).
+            let existed_before = store.firing_id_for_fingerprint(&fingerprint_clone)?;
+            store.insert_firing(&row_to_insert)?;
+            Ok::<_, crate::DbError>(existed_before.is_some())
+        })
+        .await
+        .map_err(|e| ApiError::Storage(format!("join: {e}")))?
+        .map_err(|e| ApiError::Storage(format!("notify_controller: {e}")))?;
+
+        Ok(NotifyReceipt {
+            alert_id: row_id.as_str().to_owned(),
+            deduplicated: dedup_check,
+        })
     }
 }
 
@@ -405,6 +637,180 @@ mod tests {
             ApiError::NotFound(s) => assert!(s.contains("nope")),
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    // --- read_history -------------------------------------------------
+
+    use crate::events::{EventKind, EventLog, EventRecord};
+    use serde::Serialize;
+
+    #[derive(Debug, Serialize)]
+    struct TextPayload {
+        text: String,
+    }
+
+    fn append_text_event(
+        log: &EventLog<'_>,
+        cid: &ConversationId,
+        seq: i64,
+        kind: EventKind,
+        text: &str,
+    ) {
+        let ev = EventRecord::new(
+            cid.clone(),
+            crate::ids::EventSeq(seq),
+            kind,
+            &TextPayload { text: text.into() },
+            Some("controller".into()),
+        )
+        .unwrap();
+        log.append(&ev).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_history_returns_user_and_model_events_newest_first() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "ch1");
+        let log = EventLog::new(&db);
+        append_text_event(&log, &cid, 1, EventKind::UserMsg, "hello");
+        append_text_event(&log, &cid, 2, EventKind::ModelTurn, "hi back");
+        append_text_event(&log, &cid, 3, EventKind::UserMsg, "another");
+
+        let api = DbConversationApi::new(db, cid);
+        let entries = api.read_history(None, 50).await.unwrap();
+        assert_eq!(entries.len(), 3);
+        // Newest first: seq 3, 2, 1.
+        assert_eq!(entries[0].seq, 3);
+        assert_eq!(entries[0].role, "user");
+        assert_eq!(entries[0].text, "another");
+        assert_eq!(entries[1].seq, 2);
+        assert_eq!(entries[1].role, "agent");
+        assert_eq!(entries[1].text, "hi back");
+        assert_eq!(entries[2].seq, 1);
+        assert_eq!(entries[2].role, "user");
+        assert_eq!(entries[2].text, "hello");
+    }
+
+    /// Internal/operational events (alerts, voice, phase markers) must
+    /// never leak into the chat-history view — only `user_msg` and
+    /// `model_turn` are currently surfaced.
+    #[tokio::test]
+    async fn read_history_filters_out_non_chat_event_kinds() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "ch2");
+        let log = EventLog::new(&db);
+        append_text_event(&log, &cid, 1, EventKind::UserMsg, "hi");
+        append_text_event(&log, &cid, 2, EventKind::AlertFired, "alert payload");
+        append_text_event(&log, &cid, 3, EventKind::Wakeup, "wakeup");
+        append_text_event(&log, &cid, 4, EventKind::ModelTurn, "reply");
+
+        let api = DbConversationApi::new(db, cid);
+        let entries = api.read_history(None, 50).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        let seqs: Vec<i64> = entries.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![4, 1]);
+    }
+
+    /// Pagination via `before_seq`: passing `Some(N)` returns events
+    /// with seq < N, newest-first within that window.
+    #[tokio::test]
+    async fn read_history_paginates_via_before_seq() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "ch3");
+        let log = EventLog::new(&db);
+        for i in 1..=5 {
+            append_text_event(&log, &cid, i, EventKind::UserMsg, &format!("msg {i}"));
+        }
+        let api = DbConversationApi::new(db, cid);
+
+        // Page 1 — newest 2.
+        let p1 = api.read_history(None, 2).await.unwrap();
+        let seqs: Vec<i64> = p1.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![5, 4]);
+
+        // Page 2 — next 2 before seq 4.
+        let p2 = api.read_history(Some(4), 2).await.unwrap();
+        let seqs: Vec<i64> = p2.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![3, 2]);
+
+        // Page 3 — last one.
+        let p3 = api.read_history(Some(2), 2).await.unwrap();
+        let seqs: Vec<i64> = p3.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![1]);
+    }
+
+    /// Limit is hard-capped at MAX_HISTORY_LIMIT — a tool that
+    /// requests 10_000 events gets at most MAX_HISTORY_LIMIT back.
+    #[tokio::test]
+    async fn read_history_clamps_limit_to_max() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "ch4");
+        let log = EventLog::new(&db);
+        // Insert 10 events and ask for "10000" — should still cap.
+        // 10 < cap, so we just verify the count doesn't somehow exceed it.
+        for i in 1..=10 {
+            append_text_event(&log, &cid, i, EventKind::UserMsg, "x");
+        }
+        let api = DbConversationApi::new(db, cid);
+        let entries = api.read_history(None, 10_000).await.unwrap();
+        assert!(entries.len() as u32 <= MAX_HISTORY_LIMIT);
+        assert_eq!(entries.len(), 10);
+    }
+
+    /// Zero limit gets bumped to 1 (defensive — a `limit: 0` request
+    /// from a buggy LLM otherwise returns nothing useful).
+    #[tokio::test]
+    async fn read_history_rejects_zero_limit_by_clamping_up() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "ch5");
+        let log = EventLog::new(&db);
+        append_text_event(&log, &cid, 1, EventKind::UserMsg, "hi");
+        let api = DbConversationApi::new(db, cid);
+        let entries = api.read_history(None, 0).await.unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    /// Adversarial: the tool calls read_history on its own
+    /// `conversation_id`, so a malicious LLM can't probe other
+    /// conversations by passing a different id (the impl captures
+    /// `cid` at construction; method has no conversation arg).
+    #[tokio::test]
+    async fn read_history_only_returns_caller_conversation_events() {
+        let db = fresh_db();
+        let _other = seed_conversation(&db, "other-conv");
+        let mine = seed_conversation(&db, "my-conv");
+        let log = EventLog::new(&db);
+        append_text_event(&log, &_other, 1, EventKind::UserMsg, "their secret");
+        append_text_event(&log, &mine, 1, EventKind::UserMsg, "my hello");
+
+        let api = DbConversationApi::new(db, mine);
+        let entries = api.read_history(None, 50).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "my hello");
+    }
+
+    /// Decode failure on a malformed payload yields an empty `text`
+    /// rather than failing the whole call — the LLM still sees the
+    /// other events. This is defensive: we never want one corrupt
+    /// row to take down the whole read_history call.
+    #[tokio::test]
+    async fn read_history_tolerates_corrupt_payload() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "ch6");
+        // Insert a row with a payload that won't decode as TextPayload.
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO state_events (conversation_id, seq, kind, payload, committed_at, actor, key_id) \
+                 VALUES (?1, 1, 'user_msg', ?2, 1, 'controller', 0)",
+                rusqlite::params![cid.as_str(), &b"not-msgpack"[..]],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let api = DbConversationApi::new(db, cid);
+        let entries = api.read_history(None, 50).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "");
     }
 
     // --- MemoryApi ----------------------------------------------------

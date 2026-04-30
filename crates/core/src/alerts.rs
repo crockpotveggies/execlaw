@@ -249,6 +249,28 @@ impl<'db> AlertStore<'db> {
             Ok(n)
         })
     }
+
+    /// Return the id of an existing firing row matching this
+    /// fingerprint, if any. Used by callers that want to report
+    /// "did this dedup against an existing alert?" without doing
+    /// the extra row probe themselves. The reverse semantic of
+    /// `insert_firing` (which silently bumps the occurrence count
+    /// instead of telling you whether it deduped).
+    pub fn firing_id_for_fingerprint(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<String>, DbError> {
+        self.db.with_conn(|c| {
+            let got: Option<String> = c
+                .query_row(
+                    "SELECT id FROM state_alerts WHERE fingerprint = ?1 AND status = 'Firing'",
+                    params![fingerprint],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok();
+            Ok(got)
+        })
+    }
 }
 
 fn row_to_alert(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertRow> {

@@ -27,7 +27,7 @@ use execlaw_core::tool::{
     Capability, Clock, SystemClock, ToolCtx, ToolImpl, ToolOutcome,
 };
 use execlaw_core::tool_access::ToolAccessStore;
-use execlaw_core::tool_apis::{DbConversationApi, DbMemoryApi};
+use execlaw_core::tool_apis::{DbConversationApi, DbMemoryApi, DbNotifyApi};
 use execlaw_core::Database;
 use execlaw_plugin_host::{BuiltinTools, PluginHost};
 use execlaw_policy::trust::TrustLevel;
@@ -149,17 +149,21 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
         let needs_mem = caps
             .iter()
             .any(|c| matches!(c, Capability::MemoryRead | Capability::MemoryWrite));
+        let needs_notify = caps.iter().any(|c| matches!(c, Capability::Notify));
         if needs_conv {
             ctx.conversation =
-                Some(Arc::new(DbConversationApi::new(db.clone(), conv_id)));
+                Some(Arc::new(DbConversationApi::new(db.clone(), conv_id.clone())));
         }
+        let now = self.clock.now_unix();
         if needs_mem {
-            let now = self.clock.now_unix();
             ctx.memory = Some(Arc::new(DbMemoryApi::new(
-                db,
+                db.clone(),
                 self.caller_trust.as_str(),
                 now,
             )));
+        }
+        if needs_notify {
+            ctx.notify = Some(Arc::new(DbNotifyApi::new(db, conv_id, now)));
         }
         Ok(ctx)
     }
