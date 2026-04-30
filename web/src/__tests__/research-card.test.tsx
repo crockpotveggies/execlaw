@@ -225,7 +225,7 @@ describe("ResearchCard renderer", () => {
 
 // ---- cardStore -------------------------------------------------------
 
-function openedEvent(card_id: string, conv: string, ts: number): CardEvent {
+function openedEvent(card_id: string, _conv: string, ts: number): CardEvent {
     return {
         kind: "card.opened",
         committed_at: ts,

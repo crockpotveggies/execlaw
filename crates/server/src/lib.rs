@@ -34,6 +34,7 @@ pub mod observability;
 pub mod personality;
 pub mod plugins;
 pub mod research;
+pub mod research_admin;
 pub mod routes;
 pub mod routine_runner;
 pub mod routines;

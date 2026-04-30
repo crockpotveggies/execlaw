@@ -5,6 +5,7 @@ import { Chat } from "./routes/Chat";
 import { ConnectionBanner } from "./routes/ConnectionBanner";
 import { Login } from "./routes/Login";
 import { RequireSetupComplete } from "./routes/RequireSetupComplete";
+import { Research } from "./routes/Research";
 import { SetupWizard } from "./routes/SetupWizard";
 import { Settings } from "./settings/Settings";
 
@@ -54,6 +55,22 @@ export function App() {
                         element={
                             <RequireSetupComplete>
                                 <Settings />
+                            </RequireSetupComplete>
+                        }
+                    />
+                    <Route
+                        path="/research"
+                        element={
+                            <RequireSetupComplete>
+                                <Research />
+                            </RequireSetupComplete>
+                        }
+                    />
+                    <Route
+                        path="/research/:jobId"
+                        element={
+                            <RequireSetupComplete>
+                                <Research />
                             </RequireSetupComplete>
                         }
                     />

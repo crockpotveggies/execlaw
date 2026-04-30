@@ -115,6 +115,12 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                     testId="sidebar-routines"
                 />
                 <SidebarNavLink
+                    to="/research"
+                    icon="bi-binoculars"
+                    label="Research"
+                    testId="sidebar-research"
+                />
+                <SidebarNavLink
                     to="/settings/contacts"
                     icon="bi-person-lines-fill"
                     label="Contacts"

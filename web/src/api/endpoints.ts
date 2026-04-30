@@ -1940,6 +1940,121 @@ export async function updateResearchSettings(
     );
 }
 
+// ---- /api/admin/research/* (C6 — operator drill-down + badge) ----
+
+export interface ResearchPlanStepView {
+    query: string;
+    rationale?: string | null;
+}
+
+export interface ResearchPlanView {
+    thesis: string;
+    steps: ResearchPlanStepView[];
+}
+
+export interface ResearchSourceView {
+    url: string;
+    title?: string | null;
+    fetched_ok?: boolean;
+    error?: string | null;
+}
+
+export interface ResearchNoteView {
+    index: number;
+    sub_query: string;
+    state: "Pending" | "Running" | "Done" | "Failed";
+    excerpt: string;
+    sources: ResearchSourceView[];
+    tokens_used?: number | null;
+    error?: string | null;
+}
+
+export interface ResearchJobSummaryView {
+    id: string;
+    conversation_id: string;
+    query: string;
+    status:
+        | "pending"
+        | "planning"
+        | "planned"
+        | "gathering"
+        | "synthesizing"
+        | "complete"
+        | "failed"
+        | "cancelled";
+    card_id: string | null;
+    workspace_path: string | null;
+    attachment_id: string | null;
+    error: string | null;
+    created_at: number;
+    updated_at: number;
+    started_at: number | null;
+    finished_at: number | null;
+    plan: ResearchPlanView | null;
+    notes: ResearchNoteView[];
+}
+
+export interface ResearchJobsResponse {
+    jobs: ResearchJobSummaryView[];
+    count: number;
+}
+
+export interface ResearchJobReportResponse {
+    job_id: string;
+    report_markdown: string | null;
+}
+
+export interface ResearchActiveCountResponse {
+    active_count: number;
+    conversation_id: string | null;
+}
+
+export const RESEARCH_TERMINAL_STATUSES: ReadonlySet<
+    ResearchJobSummaryView["status"]
+> = new Set(["complete", "failed", "cancelled"]);
+
+export async function listResearchJobs(
+    tokenAccessor: () => string | null,
+): Promise<ResearchJobsResponse> {
+    return apiFetch<ResearchJobsResponse>(
+        "/api/admin/research/jobs",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function getResearchJob(
+    jobId: string,
+    tokenAccessor: () => string | null,
+): Promise<ResearchJobSummaryView> {
+    return apiFetch<ResearchJobSummaryView>(
+        `/api/admin/research/jobs/${encodeURIComponent(jobId)}`,
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function getResearchReport(
+    jobId: string,
+    tokenAccessor: () => string | null,
+): Promise<ResearchJobReportResponse> {
+    return apiFetch<ResearchJobReportResponse>(
+        `/api/admin/research/jobs/${encodeURIComponent(jobId)}/report`,
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function getResearchActiveCount(
+    tokenAccessor: () => string | null,
+    opts?: { conversationId?: string },
+): Promise<ResearchActiveCountResponse> {
+    const path = opts?.conversationId
+        ? `/api/admin/research/active_count?conversation_id=${encodeURIComponent(opts.conversationId)}`
+        : "/api/admin/research/active_count";
+    return apiFetch<ResearchActiveCountResponse>(path, {}, tokenAccessor);
+}
+
 // ---- /api/admin/setup/preflight (Phase 14 — first-run wizard) ----
 
 export interface DockerStatus {
