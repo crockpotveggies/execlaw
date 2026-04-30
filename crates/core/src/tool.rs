@@ -141,6 +141,15 @@ pub enum Capability {
     Notify,
     /// Spawn a sub-agent / delegated turn.
     SubagentSpawn,
+    /// Enqueue a deep-research job. Distinct from `SubagentSpawn`
+    /// because research is a long-running, persistent, operator-
+    /// visible job — not a synchronous in-turn child call.
+    ResearchSpawn,
+    /// Read research-job rows + their plan / progress / report.
+    /// Splits from `ResearchSpawn` so a low-trust caller can poll
+    /// status on a job an operator started without being able to
+    /// start new ones.
+    ResearchRead,
 }
 
 impl Capability {
@@ -158,6 +167,8 @@ impl Capability {
             Self::Search => "search",
             Self::Notify => "notify",
             Self::SubagentSpawn => "subagent_spawn",
+            Self::ResearchSpawn => "research_spawn",
+            Self::ResearchRead => "research_read",
         }
     }
 
@@ -175,6 +186,8 @@ impl Capability {
             "search" => Some(Self::Search),
             "notify" => Some(Self::Notify),
             "subagent_spawn" => Some(Self::SubagentSpawn),
+            "research_spawn" => Some(Self::ResearchSpawn),
+            "research_read" => Some(Self::ResearchRead),
             _ => None,
         }
     }
@@ -288,6 +301,7 @@ pub struct ToolCtx {
     pub web_fetch: Option<Arc<dyn WebFetchApi>>,
     pub search: Option<Arc<dyn WebSearchApi>>,
     pub subagent: Option<Arc<dyn SubagentApi>>,
+    pub research: Option<Arc<dyn ResearchApi>>,
 }
 
 impl ToolCtx {
@@ -310,6 +324,7 @@ impl ToolCtx {
             web_fetch: None,
             search: None,
             subagent: None,
+            research: None,
         }
     }
 }
@@ -572,11 +587,7 @@ pub trait ScheduleApi: Send + Sync {
     ) -> Result<RoutineSummary, ApiError>;
 
     /// Toggle a routine's `enabled` flag. Returns the updated row.
-    async fn set_enabled(
-        &self,
-        id: &str,
-        enabled: bool,
-    ) -> Result<RoutineSummary, ApiError>;
+    async fn set_enabled(&self, id: &str, enabled: bool) -> Result<RoutineSummary, ApiError>;
 
     /// Delete a routine permanently. Returns `true` if a row was
     /// actually deleted, `false` if no routine matched the id.
@@ -624,11 +635,7 @@ pub trait WebSearchApi: Send + Sync {
     /// metadata note in the tool wrapper) when no provider is
     /// configured, rather than erroring — so the catalog stays
     /// stable across operator setups.
-    async fn search(
-        &self,
-        query: &str,
-        max_results: u32,
-    ) -> Result<Vec<SearchResult>, ApiError>;
+    async fn search(&self, query: &str, max_results: u32) -> Result<Vec<SearchResult>, ApiError>;
 
     /// Identifier for the provider that ran this search (e.g.
     /// `"duckduckgo"`, `"brave"`). Surfaced to the tool result so the
@@ -679,10 +686,65 @@ pub struct SubagentResponse {
 /// for long-running tasks.
 #[async_trait]
 pub trait SubagentApi: Send + Sync {
-    async fn delegate(
+    async fn delegate(&self, req: &SubagentRequest) -> Result<SubagentResponse, ApiError>;
+}
+
+/// Compact projection of a single research-job row, suitable for
+/// returning to the LLM. Mirrors `core::research::ResearchJobSummary`
+/// but lives here so the trait surface stays in `core::tool` (the
+/// implementation in `core::tool_apis` does the conversion).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResearchJobView {
+    pub id: String,
+    pub conversation_id: String,
+    pub query: String,
+    pub status: String,
+    pub card_id: Option<String>,
+    pub workspace_path: Option<String>,
+    pub attachment_id: Option<String>,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    /// Decoded plan if present. JSON value (rather than the typed
+    /// shape) so the ResearchApi caller doesn't need a hard
+    /// dependency on `core::research::ResearchPlan`.
+    pub plan: Option<Value>,
+}
+
+/// Deep-research capability. Implementations write to
+/// `state_research_jobs` (start) and read it (status / list); the
+/// runner actor (server-side) picks Pending rows up and drives the
+/// pipeline.
+///
+/// Splitting `start` from `status` + `list` mirrors the
+/// `ResearchSpawn` / `ResearchRead` capability split — a tool that
+/// only declares `ResearchRead` will find `ctx.research`'s `start`
+/// path returns `NotAuthorized` because the impl was constructed
+/// in read-only mode.
+#[async_trait]
+pub trait ResearchApi: Send + Sync {
+    /// Enqueue a new research job for the caller's conversation.
+    /// Returns the inserted row's id and its initial summary.
+    /// Implementations that were constructed without spawn
+    /// authority must return `ApiError::NotAuthorized`.
+    async fn start(
         &self,
-        req: &SubagentRequest,
-    ) -> Result<SubagentResponse, ApiError>;
+        query: &str,
+        overrides_json: Option<Vec<u8>>,
+    ) -> Result<ResearchJobView, ApiError>;
+
+    /// Look up a single job by id. `None` when no such job. Trust
+    /// scoping: a caller below `Controller` only sees jobs belonging
+    /// to their own conversation; the impl returns `Ok(None)` rather
+    /// than `NotAuthorized` so probing for cross-thread ids leaks no
+    /// information.
+    async fn status(&self, job_id: &str) -> Result<Option<ResearchJobView>, ApiError>;
+
+    /// List jobs visible to the caller. Below-Controller callers see
+    /// only their own conversation; Controllers see every row.
+    async fn list(&self) -> Result<Vec<ResearchJobView>, ApiError>;
 }
 
 /// Outbound HTTP capability. Implementations are responsible for SSRF
@@ -709,21 +771,11 @@ pub trait WebFetchApi: Send + Sync {
 pub trait MemoryApi: Send + Sync {
     /// Read a value, scanning trust classes the caller is allowed to
     /// see. Returns `Ok(None)` if no entry is visible.
-    async fn read(&self, scope: &str, key: &str)
-        -> Result<Option<String>, ApiError>;
+    async fn read(&self, scope: &str, key: &str) -> Result<Option<String>, ApiError>;
     /// Write a value at the caller's own trust class.
-    async fn write(
-        &self,
-        scope: &str,
-        key: &str,
-        value: &str,
-    ) -> Result<(), ApiError>;
+    async fn write(&self, scope: &str, key: &str, value: &str) -> Result<(), ApiError>;
     /// List visible keys in a scope, optionally prefix-filtered.
-    async fn list(
-        &self,
-        scope: &str,
-        prefix: &str,
-    ) -> Result<Vec<MemoryListEntry>, ApiError>;
+    async fn list(&self, scope: &str, prefix: &str) -> Result<Vec<MemoryListEntry>, ApiError>;
 }
 
 #[cfg(test)]
@@ -745,6 +797,8 @@ mod tests {
             Capability::Search,
             Capability::Notify,
             Capability::SubagentSpawn,
+            Capability::ResearchSpawn,
+            Capability::ResearchRead,
         ] {
             assert_eq!(Capability::parse(c.as_str()), Some(c));
         }

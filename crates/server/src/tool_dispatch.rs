@@ -20,21 +20,19 @@
 //!    `commit_turn`'s enforce_tool_pairing, so the log stays
 //!    well-formed even when the model hallucinates a tool name.
 
-use crate::mcp_host::{McpHost, MCP_TOOL_PREFIX};
-use async_trait::async_trait;
-use execlaw_core::ids::ConversationId;
-use execlaw_core::tool::{
-    Capability, Clock, SystemClock, ToolCtx, ToolImpl, ToolOutcome,
-};
-use execlaw_core::tool_access::ToolAccessStore;
+use crate::mcp_host::{MCP_TOOL_PREFIX, McpHost};
 use crate::tool_apis_http::HttpWebFetchApi;
 use crate::tool_apis_search::DuckDuckGoSearchApi;
 use crate::tool_apis_subagent::InferenceSubagentApi;
+use async_trait::async_trait;
+use execlaw_core::Database;
+use execlaw_core::ids::ConversationId;
+use execlaw_core::tool::{Capability, Clock, SystemClock, ToolCtx, ToolImpl, ToolOutcome};
+use execlaw_core::tool_access::ToolAccessStore;
 use execlaw_core::tool_apis::{
-    DbConversationApi, DbMemoryApi, DbNotifyApi, DbScheduleApi,
+    DbConversationApi, DbMemoryApi, DbNotifyApi, DbResearchApi, DbScheduleApi,
 };
 use execlaw_inference_api::InferenceClient;
-use execlaw_core::Database;
 use execlaw_plugin_host::{BuiltinTools, PluginHost};
 use execlaw_policy::trust::TrustLevel;
 use execlaw_runner_local::turn::ToolDispatch;
@@ -173,9 +171,12 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             self.clock.clone(),
         );
         let caps = &tool.descriptor().capabilities;
-        let needs_conv = caps
-            .iter()
-            .any(|c| matches!(c, Capability::ConversationRead | Capability::ConversationWrite));
+        let needs_conv = caps.iter().any(|c| {
+            matches!(
+                c,
+                Capability::ConversationRead | Capability::ConversationWrite
+            )
+        });
         let needs_mem = caps
             .iter()
             .any(|c| matches!(c, Capability::MemoryRead | Capability::MemoryWrite));
@@ -186,9 +187,13 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
         let needs_web_fetch = caps.iter().any(|c| matches!(c, Capability::WebFetch));
         let needs_search = caps.iter().any(|c| matches!(c, Capability::Search));
         let needs_subagent = caps.iter().any(|c| matches!(c, Capability::SubagentSpawn));
+        let needs_research_spawn = caps.iter().any(|c| matches!(c, Capability::ResearchSpawn));
+        let needs_research_read = caps.iter().any(|c| matches!(c, Capability::ResearchRead));
         if needs_conv {
-            ctx.conversation =
-                Some(Arc::new(DbConversationApi::new(db.clone(), conv_id.clone())));
+            ctx.conversation = Some(Arc::new(DbConversationApi::new(
+                db.clone(),
+                conv_id.clone(),
+            )));
         }
         let now = self.clock.now_unix();
         if needs_mem {
@@ -234,6 +239,25 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             // == None` and the tool falls into its own "capability
             // not granted" denial.
         }
+        // Research API: declare `ResearchSpawn` to get a spawn-
+        // enabled api; declaring only `ResearchRead` returns a
+        // read-only impl whose `start` errors. A descriptor that
+        // declares neither leaves `ctx.research == None`.
+        if needs_research_spawn {
+            ctx.research = Some(Arc::new(DbResearchApi::with_spawn(
+                self.host.db().clone(),
+                self.caller_trust.as_str(),
+                ctx.conversation_id.clone(),
+                now,
+            )));
+        } else if needs_research_read {
+            ctx.research = Some(Arc::new(DbResearchApi::read_only(
+                self.host.db().clone(),
+                self.caller_trust.as_str(),
+                ctx.conversation_id.clone(),
+                now,
+            )));
+        }
         Ok(ctx)
     }
 
@@ -262,9 +286,7 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
         };
         Some(match tool.invoke(ctx, args.clone()).await {
             ToolOutcome::Ok(v) => Ok(v),
-            ToolOutcome::Err { code, message } => {
-                Err(format!("{code}: {message}"))
-            }
+            ToolOutcome::Err { code, message } => Err(format!("{code}: {message}")),
             ToolOutcome::Denied { reason } => Err(format!("denied: {reason}")),
         })
     }
@@ -331,9 +353,7 @@ impl<B: BuiltinTools + 'static> ToolDispatch for ChainedToolDispatch<B> {
         if tool_name.starts_with(MCP_TOOL_PREFIX) {
             return match &self.mcp_host {
                 Some(host) => host.call_tool(tool_name, args_json.clone()).await,
-                None => Err(format!(
-                    "no MCP host configured to dispatch '{tool_name}'"
-                )),
+                None => Err(format!("no MCP host configured to dispatch '{tool_name}'")),
             };
         }
 
@@ -418,8 +438,7 @@ mod tests {
     /// the TurnExecutor pairs with a cancellation tool_result.
     #[tokio::test]
     async fn unknown_tool_produces_err_not_panic() {
-        let disp =
-            ChainedToolDispatch::new(test_host(), vec!["*".into()], NoBuiltinTools);
+        let disp = ChainedToolDispatch::new(test_host(), vec!["*".into()], NoBuiltinTools);
         let err = disp
             .call("nonexistent", &serde_json::json!({}))
             .await
@@ -475,10 +494,7 @@ mod tests {
             EchoBuiltin,
             db,
         );
-        let err = disp
-            .call("echo", &serde_json::json!({}))
-            .await
-            .unwrap_err();
+        let err = disp.call("echo", &serde_json::json!({})).await.unwrap_err();
         assert!(
             err.contains("not authorized") && err.contains("KnownTrusted"),
             "expected denial mentioning trust class, got: {err}",
@@ -500,10 +516,7 @@ mod tests {
                     source_id: None,
                     description: None,
                     input_schema: None,
-                    default_allowed_classes: vec![
-                        "Controller".into(),
-                        "KnownTrusted".into(),
-                    ],
+                    default_allowed_classes: vec!["Controller".into(), "KnownTrusted".into()],
                 },
                 0,
             )
@@ -532,10 +545,7 @@ mod tests {
             EchoBuiltin,
             db,
         );
-        let v = disp
-            .call("echo", &serde_json::json!({}))
-            .await
-            .unwrap();
+        let v = disp.call("echo", &serde_json::json!({})).await.unwrap();
         assert_eq!(v["reached"], true);
     }
 
@@ -582,10 +592,7 @@ mod tests {
             EchoBuiltin,
             db,
         );
-        let err = disp
-            .call("echo", &serde_json::json!({}))
-            .await
-            .unwrap_err();
+        let err = disp.call("echo", &serde_json::json!({})).await.unwrap_err();
         assert!(err.contains("disabled"), "got: {err}");
     }
 
@@ -682,18 +689,13 @@ mod tests {
             EchoBuiltin,
             db,
         );
-        let v = disp
-            .call("echo", &serde_json::json!({}))
-            .await
-            .unwrap();
+        let v = disp.call("echo", &serde_json::json!({})).await.unwrap();
         assert_eq!(v["reached"], true);
     }
 
     // ---- New trait-based built-in dispatch tests --------------------
 
-    use execlaw_core::builtin_tools::{
-        ReadMemoryTool, SetThreadNameTool, WriteMemoryTool,
-    };
+    use execlaw_core::builtin_tools::{ReadMemoryTool, SetThreadNameTool, WriteMemoryTool};
     use execlaw_core::conversation::{
         ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
     };
@@ -780,7 +782,10 @@ mod tests {
         .await
         .unwrap();
         let v = disp
-            .call("read_memory", &serde_json::json!({"scope": "g", "key": "k"}))
+            .call(
+                "read_memory",
+                &serde_json::json!({"scope": "g", "key": "k"}),
+            )
             .await
             .unwrap();
         assert_eq!(v, serde_json::json!("v"));
@@ -833,8 +838,8 @@ mod tests {
         let db = host.db().clone();
         host.registry().register_builtin(tool).unwrap();
         let cid = seed_conv(&db, "c3");
-        let disp = ChainedToolDispatch::new(host, vec!["*".into()], NoBuiltinTools)
-            .with_conversation(cid);
+        let disp =
+            ChainedToolDispatch::new(host, vec!["*".into()], NoBuiltinTools).with_conversation(cid);
         let err = disp
             .call("needs_mem", &serde_json::json!({}))
             .await
@@ -865,8 +870,7 @@ mod tests {
                 Some(Ok(serde_json::json!({"legacy": true})))
             }
         }
-        let disp =
-            ChainedToolDispatch::new(host, vec!["*".into()], LegacyEcho); // no conversation id
+        let disp = ChainedToolDispatch::new(host, vec!["*".into()], LegacyEcho); // no conversation id
         let v = disp
             .call("set_thread_name", &serde_json::json!({"name": "n"}))
             .await
@@ -901,12 +905,8 @@ mod tests {
                 }
             }
         }
-        let disp = ChainedToolDispatch::new(
-            host,
-            vec!["*".into()],
-            LegacyShadowing,
-        )
-        .with_conversation(cid.clone());
+        let disp = ChainedToolDispatch::new(host, vec!["*".into()], LegacyShadowing)
+            .with_conversation(cid.clone());
         let v = disp
             .call("set_thread_name", &serde_json::json!({"name": "Won"}))
             .await

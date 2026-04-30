@@ -1865,6 +1865,81 @@ export async function updateGeneralSettings(
     );
 }
 
+// ---- /api/admin/settings/research (C3 — deep-research subsystem) ----
+
+/// Mirrors `core::research::PhaseGates`. The dropdown on Settings →
+/// Research uses these literal strings.
+export type ResearchPhaseGates = "none" | "plan_only" | "every_phase";
+
+export interface ResearchSettings {
+    max_wall_clock_minutes: number;
+    max_total_tokens: number;
+    max_subqueries: number;
+    parallel_workers: number;
+    max_urls_per_subquery: number;
+    max_pages_total: number;
+    auto_cancel_after_idle_secs: number;
+    phase_gates: ResearchPhaseGates;
+    /// `null` means "inherit from Settings → Search."
+    default_search_provider: string | null;
+    updated_at: number;
+}
+
+export interface UpdateResearchSettingsRequest {
+    max_wall_clock_minutes?: number;
+    max_total_tokens?: number;
+    max_subqueries?: number;
+    parallel_workers?: number;
+    max_urls_per_subquery?: number;
+    max_pages_total?: number;
+    auto_cancel_after_idle_secs?: number;
+    phase_gates?: ResearchPhaseGates;
+    /// Send `null` to clear (inherit). Omit to leave untouched.
+    default_search_provider?: string | null;
+}
+
+export const RESEARCH_PHASE_GATE_OPTIONS: ReadonlyArray<
+    { value: ResearchPhaseGates; label: string; description: string }
+> = [
+    {
+        value: "plan_only",
+        label: "Confirm after planning",
+        description:
+            "Pause once the planner finishes, before the gather phase fires. Default — gives you a one-click confirm before the expensive part.",
+    },
+    {
+        value: "none",
+        label: "No confirmations",
+        description: "Auto-advance through every phase.",
+    },
+    {
+        value: "every_phase",
+        label: "Confirm between every phase",
+        description: "Pause after planning, after gather, and before synthesize.",
+    },
+];
+
+export async function getResearchSettings(
+    tokenAccessor: () => string | null,
+): Promise<ResearchSettings> {
+    return apiFetch<ResearchSettings>(
+        "/api/admin/settings/research",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function updateResearchSettings(
+    body: UpdateResearchSettingsRequest,
+    tokenAccessor: () => string | null,
+): Promise<ResearchSettings> {
+    return apiFetch<ResearchSettings>(
+        "/api/admin/settings/research",
+        { method: "PUT", body },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/setup/preflight (Phase 14 — first-run wizard) ----
 
 export interface DockerStatus {

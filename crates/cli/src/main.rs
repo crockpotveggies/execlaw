@@ -323,8 +323,7 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
             eprintln!("execlaw: failed to create log dir {log_dir:?}: {e}");
             (None, None)
         } else {
-            let file_appender =
-                tracing_appender::rolling::daily(&log_dir, "execlaw.jsonl");
+            let file_appender = tracing_appender::rolling::daily(&log_dir, "execlaw.jsonl");
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
             let layer = tracing_subscriber::fmt::layer()
                 .json()
@@ -413,7 +412,10 @@ fn cmd_install(
     }
 
     // 3. Register the service with systemd / launchd / Windows SCM.
-    println!("--> service install ({} level)", if system { "system" } else { "user" });
+    println!(
+        "--> service install ({} level)",
+        if system { "system" } else { "user" }
+    );
     service::install(system, bind, db)?;
 
     // 4. Start it.
@@ -593,9 +595,7 @@ fn cmd_replay(
     // started this turn — replay reconstructs the turn that
     // CONTAINS the target seq.
     let mut user_msg_idx = target_idx;
-    while user_msg_idx > 0
-        && all_events[user_msg_idx].kind != EventKind::UserMsg
-    {
+    while user_msg_idx > 0 && all_events[user_msg_idx].kind != EventKind::UserMsg {
         user_msg_idx -= 1;
     }
 
@@ -611,8 +611,9 @@ fn cmd_replay(
     } else {
         let store = PrincipalStore::new(&db);
         match store.get(&execlaw_core::ids::PrincipalId::from(actor)) {
-            Ok(Some(p)) => TrustLevel::parse(p.trust_level.class_tag())
-                .unwrap_or(TrustLevel::UnknownPending),
+            Ok(Some(p)) => {
+                TrustLevel::parse(p.trust_level.class_tag()).unwrap_or(TrustLevel::UnknownPending)
+            }
             _ => {
                 // Stamp at replay time as if we were resolving fresh.
                 let _ = CoreTrust::Controller;
@@ -664,9 +665,9 @@ fn cmd_replay(
         }
     }
     println!();
-    println!("Events committed by/around the target turn (seq {} → {}):",
-        all_events[user_msg_idx].seq.0,
-        target_seq,
+    println!(
+        "Events committed by/around the target turn (seq {} → {}):",
+        all_events[user_msg_idx].seq.0, target_seq,
     );
     for ev in &all_events[user_msg_idx..=target_idx] {
         println!(
@@ -718,11 +719,7 @@ fn cmd_eval_flag(
 }
 
 /// `execlaw eval list [--label X]` — print every eval flag.
-fn cmd_eval_list(
-    label: Option<String>,
-    db_path: PathBuf,
-    no_encrypt: bool,
-) -> anyhow::Result<()> {
+fn cmd_eval_list(label: Option<String>, db_path: PathBuf, no_encrypt: bool) -> anyhow::Result<()> {
     use execlaw_core::eval::EvalFlaggedStore;
 
     let db = open_db(&db_path, no_encrypt)?;
@@ -783,11 +780,7 @@ fn cmd_backfill_events(db_path: PathBuf, no_encrypt: bool) -> anyhow::Result<()>
 /// operator accepts that the existing log is now signed under a new
 /// key — the tamper-evidence guarantee for already-stored rows is
 /// gone.
-fn cmd_resign_events(
-    db_path: PathBuf,
-    no_encrypt: bool,
-    confirmed: bool,
-) -> anyhow::Result<()> {
+fn cmd_resign_events(db_path: PathBuf, no_encrypt: bool, confirmed: bool) -> anyhow::Result<()> {
     use execlaw_core::events::{EventLog, KeyRing};
 
     if !confirmed {
@@ -838,10 +831,7 @@ fn cmd_backup(to: PathBuf, db_path: PathBuf, no_encrypt: bool) -> anyhow::Result
     // encryption posture by default, so a snapshot can be restored
     // by any process holding the master key.
     db.with_conn(|c| {
-        c.execute_batch(&format!(
-            "VACUUM INTO '{}'",
-            to_str.replace('\'', "''")
-        ))?;
+        c.execute_batch(&format!("VACUUM INTO '{}'", to_str.replace('\'', "''")))?;
         Ok(())
     })
     .map_err(|e| anyhow::anyhow!("VACUUM INTO: {e}"))?;
@@ -850,9 +840,7 @@ fn cmd_backup(to: PathBuf, db_path: PathBuf, no_encrypt: bool) -> anyhow::Result
         "backup: {} -> {} ({} bytes)",
         db_path.display(),
         to.display(),
-        std::fs::metadata(&to)
-            .map(|m| m.len())
-            .unwrap_or_default()
+        std::fs::metadata(&to).map(|m| m.len()).unwrap_or_default()
     );
     Ok(())
 }
@@ -946,10 +934,9 @@ fn cmd_restore(
 fn build_webauthn_from_env(
     bind_addr: &std::net::SocketAddr,
 ) -> Option<execlaw_server::webauthn::WebauthnSvc> {
-    let rp_id = std::env::var("EXECLAW_WEBAUTHN_RP_ID")
-        .unwrap_or_else(|_| "localhost".to_owned());
-    let origin = std::env::var("EXECLAW_WEBAUTHN_ORIGIN")
-        .unwrap_or_else(|_| format!("http://{bind_addr}"));
+    let rp_id = std::env::var("EXECLAW_WEBAUTHN_RP_ID").unwrap_or_else(|_| "localhost".to_owned());
+    let origin =
+        std::env::var("EXECLAW_WEBAUTHN_ORIGIN").unwrap_or_else(|_| format!("http://{bind_addr}"));
     match execlaw_server::webauthn::WebauthnSvc::new(&rp_id, &origin, "execlaw") {
         Ok(svc) => Some(svc),
         Err(e) => {
@@ -995,24 +982,22 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     // generator only when the keyring isn't reachable AT ALL
     // (rare; we'd already be running with a degraded vault).
     let signer = match execlaw_vault::load_or_create_master_key() {
-        Ok(master) => std::sync::Arc::new(
-            execlaw_server::auth::JwtSigner::from_master_key(&master, "execlaw".into()),
-        ),
+        Ok(master) => std::sync::Arc::new(execlaw_server::auth::JwtSigner::from_master_key(
+            &master,
+            "execlaw".into(),
+        )),
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 "could not load vault master key; JWT signing key will be ephemeral. \
                  Operators will be signed out on every restart."
             );
-            std::sync::Arc::new(execlaw_server::auth::JwtSigner::generate(
-                "execlaw".into(),
-            ))
+            std::sync::Arc::new(execlaw_server::auth::JwtSigner::generate("execlaw".into()))
         }
     };
     // Phase-7 hardening: refresh tokens persist in SQLite so a
     // server restart no longer signs every operator out.
-    let refresh_store =
-        std::sync::Arc::new(execlaw_server::auth::RefreshStore::new(db.clone()));
+    let refresh_store = std::sync::Arc::new(execlaw_server::auth::RefreshStore::new(db.clone()));
 
     // EXECLAW_INFERENCE_URL lets operators point dev servers at a local
     // vLLM / Ollama / OpenArc without editing code. Production boots
@@ -1027,9 +1012,8 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
 
     // Phase 12.E — bootstrap is the boot-time global URL; per-turn
     // resolution may override it via config_backends rows.
-    let bootstrap_inference = inference_base_url.map(|url| {
-        std::sync::Arc::new(execlaw_inference_api::InferenceClient::new(url))
-    });
+    let bootstrap_inference = inference_base_url
+        .map(|url| std::sync::Arc::new(execlaw_inference_api::InferenceClient::new(url)));
     let inference = std::sync::Arc::new(
         execlaw_server::inference_resolver::InferenceResolver::new(bootstrap_inference),
     );
@@ -1058,7 +1042,10 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         stage_root,
     );
     // Re-hydrate installed plugins from the DB so they survive restart.
-    plugin_host.hydrate().await.map_err(|e| anyhow::anyhow!("plugin hydrate: {e}"))?;
+    plugin_host
+        .hydrate()
+        .await
+        .map_err(|e| anyhow::anyhow!("plugin hydrate: {e}"))?;
 
     // 2026-04-29 — register the core trait-based built-in tools
     // (read_memory, write_memory, list_memory, set_thread_name,
@@ -1068,24 +1055,15 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     // the access sync sees them in `registry.all_builtins()`.
     {
         let now = chrono::Utc::now().timestamp();
-        match execlaw_plugin_host::register_core_builtins(
-            plugin_host.registry(),
-            &db,
-            now,
-        ) {
-            Ok(landed) => tracing::info!(
-                count = landed.len(),
-                "core built-in tools registered"
-            ),
+        match execlaw_plugin_host::register_core_builtins(plugin_host.registry(), &db, now) {
+            Ok(landed) => tracing::info!(count = landed.len(), "core built-in tools registered"),
             Err(e) => {
                 // Conflict here means an operator-installed plugin is
                 // claiming a tool name that overlaps with a core
                 // built-in — the plugin install should have rejected
                 // that, but if it slipped through we can't proceed
                 // safely with the overlap.
-                return Err(anyhow::anyhow!(
-                    "register_core_builtins failed: {e}"
-                ));
+                return Err(anyhow::anyhow!("register_core_builtins failed: {e}"));
             }
         }
     }
@@ -1099,7 +1077,9 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         let now = chrono::Utc::now().timestamp();
         match execlaw_server::tool_sync::sync_tool_access(&db, &plugin_host, now) {
             Ok(n) => tracing::info!(rows_synced = n, "tool_access sync complete"),
-            Err(e) => tracing::warn!(error = %e, "tool_access sync failed; dispatch gate will fall back to allow until next sync"),
+            Err(e) => {
+                tracing::warn!(error = %e, "tool_access sync failed; dispatch gate will fall back to allow until next sync")
+            }
         }
     }
 
@@ -1178,15 +1158,12 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
             )
         }
         Err(e) => {
-            tracing::warn!(
-                "backend supervisor disabled — Docker daemon unreachable: {e}"
-            );
+            tracing::warn!("backend supervisor disabled — Docker daemon unreachable: {e}");
             None
         }
     };
 
-    let voice_sessions =
-        execlaw_server::voice_session::VoiceSessionRegistry::new(events.clone());
+    let voice_sessions = execlaw_server::voice_session::VoiceSessionRegistry::new(events.clone());
 
     // Phase 13.C — voice runtime resolves Whisper / Kokoro endpoints
     // from `config_backends` and the voice id from `config_personality`
@@ -1196,10 +1173,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     // `voice_runtime::build_with_db` so it's exercised by unit tests
     // — this cli crate has no tests of its own.
     let voice_runtime =
-        execlaw_server::voice_runtime::VoiceRuntime::build_with_db(
-            events.clone(),
-            db.clone(),
-        );
+        execlaw_server::voice_runtime::VoiceRuntime::build_with_db(events.clone(), db.clone());
 
     // Phase 16 — per-principal-group runner supervisor. Default
     // ON. Operators who want the legacy in-process chat path (or
@@ -1217,8 +1191,8 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     let runners_enabled = std::env::var("EXECLAW_RUNNERS_ENABLED")
         .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
         .unwrap_or(true);
-    let runner_image = std::env::var("EXECLAW_RUNNER_IMAGE")
-        .unwrap_or_else(|_| "execlaw/runner:dev".to_owned());
+    let runner_image =
+        std::env::var("EXECLAW_RUNNER_IMAGE").unwrap_or_else(|_| "execlaw/runner:dev".to_owned());
     let (runner_supervisor, runner_launcher) = if runners_enabled {
         // Pull the trait into scope so `launcher.image_present`
         // resolves; the inherent method we want lives behind the
@@ -1242,9 +1216,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
                     // by `ensure_runner`; everything else is
                     // reused.
                     let rpc_url_template = std::env::var("EXECLAW_RPC_URL")
-                        .unwrap_or_else(|_| {
-                            "ws://host.docker.internal:3031".to_owned()
-                        });
+                        .unwrap_or_else(|_| "ws://host.docker.internal:3031".to_owned());
                     let runner_network = std::env::var("EXECLAW_RUNNER_NETWORK").ok();
                     let spec_template = execlaw_server::runner_spawn::RunnerSpec {
                         group_id: String::new(),
@@ -1259,21 +1231,15 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
                         inference_url: "http://host.docker.internal:8101/v1".into(),
                         memory_bytes: Some(2 * 1024 * 1024 * 1024),
                         network: runner_network,
-                        env: vec![(
-                            "RUST_LOG".into(),
-                            "info,execlaw_runner=debug".into(),
-                        )],
+                        env: vec![("RUST_LOG".into(), "info,execlaw_runner=debug".into())],
                     };
                     let launcher_arc = std::sync::Arc::new(launcher)
-                        as std::sync::Arc<
-                            dyn execlaw_server::runner_spawn::RunnerLauncher,
-                        >;
-                    let supervisor =
-                        execlaw_server::runner_supervisor::RunnerSupervisor::new(
-                            db.clone(),
-                            events.clone(),
-                        )
-                        .with_launcher(launcher_arc.clone(), spec_template);
+                        as std::sync::Arc<dyn execlaw_server::runner_spawn::RunnerLauncher>;
+                    let supervisor = execlaw_server::runner_supervisor::RunnerSupervisor::new(
+                        db.clone(),
+                        events.clone(),
+                    )
+                    .with_launcher(launcher_arc.clone(), spec_template);
                     (Some(supervisor), Some(launcher_arc))
                 } else {
                     tracing::warn!(
@@ -1323,8 +1289,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     // process. The sweepers carry their own intervals; the server
     // owns the stop signal so a SIGTERM can drain everything.
     let sweep_stop = std::sync::Arc::new(tokio::sync::Notify::new());
-    let log_sweeper =
-        execlaw_core::log_retention::LogRetentionSweeper::new(db.clone());
+    let log_sweeper = execlaw_core::log_retention::LogRetentionSweeper::new(db.clone());
     {
         let stop = sweep_stop.clone();
         tokio::spawn(async move { log_sweeper.run(stop).await });
@@ -1334,14 +1299,12 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     // Pinned + ephemeral conversations are exempt (the latter is
     // owned by EphemeralSweeper). Reads the policy live each tick so
     // a Settings change takes effect within one cadence.
-    let event_sweeper =
-        execlaw_core::event_retention::EventRetentionSweeper::new(db.clone());
+    let event_sweeper = execlaw_core::event_retention::EventRetentionSweeper::new(db.clone());
     {
         let stop = sweep_stop.clone();
         tokio::spawn(async move { event_sweeper.run(stop).await });
     }
-    let ephemeral_sweeper =
-        execlaw_core::ephemeral_sweeper::EphemeralSweeper::new(db.clone());
+    let ephemeral_sweeper = execlaw_core::ephemeral_sweeper::EphemeralSweeper::new(db.clone());
     {
         let stop = sweep_stop.clone();
         tokio::spawn(async move { ephemeral_sweeper.run(stop).await });
@@ -1349,8 +1312,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     // Phase 7 hardening — keeps `state_refresh_tokens` from growing
     // without bound. Expired rows are already rejected at consume
     // time; this just trims the table on an hourly cadence.
-    let refresh_sweeper =
-        execlaw_core::refresh_tokens::RefreshTokenSweeper::new(db.clone());
+    let refresh_sweeper = execlaw_core::refresh_tokens::RefreshTokenSweeper::new(db.clone());
     {
         let stop = sweep_stop.clone();
         tokio::spawn(async move { refresh_sweeper.run(stop).await });
@@ -1362,6 +1324,26 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     // inference backend is wired. See MIGRATION_PLAN §5.6.3.
     let _routine_runner = execlaw_server::routine_runner::spawn(state.clone());
 
+    // C3 — research subsystem supervisor. Picks up `Pending` rows
+    // from `state_research_jobs`, claims them atomically, and spawns
+    // a per-job runner that drives plan / gather / synthesize.
+    // Workspace dir defaults to `~/.execlaw/research/`. Model id
+    // mirrors the chat path's default; per-purpose routing lands
+    // when the runner grows modality-aware backend selection.
+    {
+        let workspace = execlaw_server::research::ResearchWorkspace::new(
+            execlaw_server::research::ResearchWorkspace::default_root(),
+        );
+        let supervisor = execlaw_server::research::ResearchSupervisor::new(
+            state.db.clone(),
+            state.inference.clone(),
+            workspace,
+            state.config.model_id.clone(),
+        );
+        let stop = sweep_stop.clone();
+        tokio::spawn(async move { supervisor.run(stop).await });
+    }
+
     // Phase 10 closure — purge state_routine_runs rows past the
     // 90-day retention window every hour. Mirrors the existing
     // log/ephemeral/refresh sweepers. Pending rows are preserved
@@ -1369,9 +1351,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     {
         let stop = sweep_stop.clone();
         let routine_run_sweeper =
-            execlaw_core::routine_run_retention::RoutineRunRetentionSweeper::new(
-                db.clone(),
-            );
+            execlaw_core::routine_run_retention::RoutineRunRetentionSweeper::new(db.clone());
         tokio::spawn(async move { routine_run_sweeper.run(stop).await });
     }
 
@@ -1402,9 +1382,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     // max-duration watchdog. Prewarm fires once on boot to spawn
     // the controller's runner so the first chat doesn't pay
     // cold-start latency.
-    if let (Some(sup), Some(launcher)) =
-        (runner_supervisor.as_ref(), runner_launcher.as_ref())
-    {
+    if let (Some(sup), Some(launcher)) = (runner_supervisor.as_ref(), runner_launcher.as_ref()) {
         let reaper_sup = sup.clone();
         let reaper_launcher = launcher.clone();
         let stop = sweep_stop.clone();
@@ -1412,8 +1390,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
             tracing::info!(
                 interval_secs = execlaw_server::runner_supervisor::REAP_INTERVAL.as_secs(),
                 ttl_secs = execlaw_server::runner_supervisor::IDLE_TTL.as_secs(),
-                max_turn_secs =
-                    execlaw_server::runner_supervisor::MAX_TURN_DURATION.as_secs(),
+                max_turn_secs = execlaw_server::runner_supervisor::MAX_TURN_DURATION.as_secs(),
                 "runner supervisor reaper running",
             );
             loop {
@@ -1441,9 +1418,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         let sweep_sup = sup.clone();
         let sweep_launcher = launcher.clone();
         tokio::spawn(async move {
-            sweep_sup
-                .boot_orphan_sweep(sweep_launcher.as_ref())
-                .await;
+            sweep_sup.boot_orphan_sweep(sweep_launcher.as_ref()).await;
         });
 
         // Prewarm the controller's runner. The first time anyone
@@ -1462,9 +1437,10 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
             // necessarily started by the time we get here.)
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-            let inference_url = match prewarm_inference
-                .resolve(&prewarm_db, execlaw_core::backends::BackendPurpose::Standard)
-            {
+            let inference_url = match prewarm_inference.resolve(
+                &prewarm_db,
+                execlaw_core::backends::BackendPurpose::Standard,
+            ) {
                 Some(c) => c.base_url.clone(),
                 None => {
                     tracing::info!(
@@ -1664,12 +1640,7 @@ fn main() -> ExitCode {
             db,
             force,
             no_encrypt,
-        } => cmd_restore(
-            from,
-            db.unwrap_or_else(default_db_path),
-            force,
-            no_encrypt,
-        ),
+        } => cmd_restore(from, db.unwrap_or_else(default_db_path), force, no_encrypt),
     })();
 
     match result {

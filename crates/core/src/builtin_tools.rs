@@ -28,11 +28,12 @@
 //! 2026-04-29.
 
 use crate::tool::{
-    Capability, NotifySeverity, RoutineSummary, SubagentRequest, ToolCtx,
-    ToolDescriptor, ToolImpl, ToolLatency, ToolOutcome, ToolSource,
+    Capability, NotifySeverity, RoutineSummary, SubagentRequest, ToolCtx, ToolDescriptor, ToolImpl,
+    ToolLatency, ToolOutcome, ToolSource,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -135,9 +136,7 @@ impl ToolImpl for ReadMemoryTool {
         let memory = match ctx.memory.as_ref() {
             Some(m) => m,
             None => {
-                return ToolOutcome::denied(
-                    "memory capability not granted to this tool",
-                );
+                return ToolOutcome::denied("memory capability not granted to this tool");
             }
         };
         match memory.read(&args.scope, &args.key).await {
@@ -174,10 +173,9 @@ impl WriteMemoryTool {
         Self {
             descriptor: ToolDescriptor {
                 name: "write_memory".into(),
-                description:
-                    "Write a memory value at the current conversation's trust scope. \
+                description: "Write a memory value at the current conversation's trust scope. \
                      Overwrites any previous value under the same scope + key."
-                        .into(),
+                    .into(),
                 schema: json!({
                     "type": "object",
                     "properties": {
@@ -210,9 +208,7 @@ impl ToolImpl for WriteMemoryTool {
         let memory = match ctx.memory.as_ref() {
             Some(m) => m,
             None => {
-                return ToolOutcome::denied(
-                    "memory capability not granted to this tool",
-                );
+                return ToolOutcome::denied("memory capability not granted to this tool");
             }
         };
         match memory.write(&args.scope, &args.key, &args.value).await {
@@ -283,9 +279,7 @@ impl ToolImpl for ListMemoryTool {
         let memory = match ctx.memory.as_ref() {
             Some(m) => m,
             None => {
-                return ToolOutcome::denied(
-                    "memory capability not granted to this tool",
-                );
+                return ToolOutcome::denied("memory capability not granted to this tool");
             }
         };
         match memory.list(&args.scope, &args.prefix).await {
@@ -363,9 +357,7 @@ impl ToolImpl for SetThreadNameTool {
         let conv = match ctx.conversation.as_ref() {
             Some(c) => c,
             None => {
-                return ToolOutcome::denied(
-                    "conversation capability not granted to this tool",
-                );
+                return ToolOutcome::denied("conversation capability not granted to this tool");
             }
         };
         match conv.set_thread_name(&args.name).await {
@@ -456,9 +448,7 @@ impl ToolImpl for ReadChatHistoryTool {
         let conv = match ctx.conversation.as_ref() {
             Some(c) => c,
             None => {
-                return ToolOutcome::denied(
-                    "conversation capability not granted to this tool",
-                );
+                return ToolOutcome::denied("conversation capability not granted to this tool");
             }
         };
         match conv.read_history(args.before_seq, args.limit).await {
@@ -525,9 +515,7 @@ impl ToolImpl for ListChatsTool {
         let conv = match ctx.conversation.as_ref() {
             Some(c) => c,
             None => {
-                return ToolOutcome::denied(
-                    "conversation capability not granted to this tool",
-                );
+                return ToolOutcome::denied("conversation capability not granted to this tool");
             }
         };
         match conv.list_threads().await {
@@ -592,9 +580,7 @@ impl ToolImpl for GetThreadTool {
         let conv = match ctx.conversation.as_ref() {
             Some(c) => c,
             None => {
-                return ToolOutcome::denied(
-                    "conversation capability not granted to this tool",
-                );
+                return ToolOutcome::denied("conversation capability not granted to this tool");
             }
         };
         match conv.get_thread().await {
@@ -700,9 +686,7 @@ impl ToolImpl for NotifyControllerTool {
         let notify = match ctx.notify.as_ref() {
             Some(n) => n,
             None => {
-                return ToolOutcome::denied(
-                    "notify capability not granted to this tool",
-                );
+                return ToolOutcome::denied("notify capability not granted to this tool");
             }
         };
         let severity = match args.severity.as_deref() {
@@ -845,9 +829,7 @@ impl ToolImpl for ScheduleTaskTool {
         let sched = match ctx.schedule.as_ref() {
             Some(s) => s,
             None => {
-                return ToolOutcome::denied(
-                    "schedule capability not granted to this tool",
-                );
+                return ToolOutcome::denied("schedule capability not granted to this tool");
             }
         };
         match sched
@@ -881,10 +863,9 @@ impl ListTasksTool {
         Self {
             descriptor: ToolDescriptor {
                 name: "list_tasks".into(),
-                description:
-                    "List every scheduled task (recurring routine) currently registered. \
+                description: "List every scheduled task (recurring routine) currently registered. \
                      Returns id, name, cron, target, enabled flag, and last/next-run timestamps."
-                        .into(),
+                    .into(),
                 schema: json!({
                     "type": "object",
                     "properties": {},
@@ -908,9 +889,7 @@ impl ToolImpl for ListTasksTool {
         let sched = match ctx.schedule.as_ref() {
             Some(s) => s,
             None => {
-                return ToolOutcome::denied(
-                    "schedule capability not granted to this tool",
-                );
+                return ToolOutcome::denied("schedule capability not granted to this tool");
             }
         };
         match sched.list_routines().await {
@@ -977,9 +956,7 @@ impl ToolImpl for CancelTaskTool {
         let sched = match ctx.schedule.as_ref() {
             Some(s) => s,
             None => {
-                return ToolOutcome::denied(
-                    "schedule capability not granted to this tool",
-                );
+                return ToolOutcome::denied("schedule capability not granted to this tool");
             }
         };
         match sched.delete_routine(&args.task_id).await {
@@ -1056,8 +1033,7 @@ impl ResumeTaskTool {
         Self {
             descriptor: ToolDescriptor {
                 name: "resume_task".into(),
-                description: "Re-enable a paused scheduled task."
-                    .into(),
+                description: "Re-enable a paused scheduled task.".into(),
                 schema: json!({
                     "type": "object",
                     "properties": {"task_id": {"type": "string"}},
@@ -1261,9 +1237,7 @@ impl ToolImpl for WebFetchTool {
         let api = match ctx.web_fetch.as_ref() {
             Some(a) => a,
             None => {
-                return ToolOutcome::denied(
-                    "web_fetch capability not granted to this tool",
-                );
+                return ToolOutcome::denied("web_fetch capability not granted to this tool");
             }
         };
         match api.get(&args.url).await {
@@ -1368,9 +1342,7 @@ impl ToolImpl for WebSearchTool {
         let api = match ctx.search.as_ref() {
             Some(a) => a,
             None => {
-                return ToolOutcome::denied(
-                    "search capability not granted to this tool",
-                );
+                return ToolOutcome::denied("search capability not granted to this tool");
             }
         };
         let provider = api.provider_id().to_owned();
@@ -1477,9 +1449,7 @@ impl ToolImpl for DelegateTaskTool {
         let api = match ctx.subagent.as_ref() {
             Some(a) => a,
             None => {
-                return ToolOutcome::denied(
-                    "subagent capability not granted to this tool",
-                );
+                return ToolOutcome::denied("subagent capability not granted to this tool");
             }
         };
         let req = SubagentRequest {
@@ -1492,6 +1462,259 @@ impl ToolImpl for DelegateTaskTool {
                 "task_id": resp.task_id,
                 "text": resp.text,
                 "tokens_used": resp.tokens_used,
+            })),
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// research_start / research_status / research_list
+// ---------------------------------------------------------------
+
+fn default_allowed_for_research_spawn() -> Vec<String> {
+    // Spawning a deep-research job is a meaningful resource burn —
+    // keep it Controller + Delegated by default. Operators can
+    // broaden in Settings → Tools.
+    vec!["Controller".into(), "Delegated".into()]
+}
+
+fn default_allowed_for_research_read() -> Vec<String> {
+    // Reading job status is harmless; allow every active class.
+    vec![
+        "Controller".into(),
+        "Delegated".into(),
+        "KnownTrusted".into(),
+        "KnownLimited".into(),
+        "UnknownPending".into(),
+    ]
+}
+
+fn job_view_to_json(v: &crate::tool::ResearchJobView) -> JsonValue {
+    json!({
+        "id": v.id,
+        "conversation_id": v.conversation_id,
+        "query": v.query,
+        "status": v.status,
+        "card_id": v.card_id,
+        "workspace_path": v.workspace_path,
+        "attachment_id": v.attachment_id,
+        "error": v.error,
+        "created_at": v.created_at,
+        "updated_at": v.updated_at,
+        "started_at": v.started_at,
+        "finished_at": v.finished_at,
+        "plan": v.plan,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ResearchStartArgs {
+    query: String,
+    /// Optional per-job overrides on the global config_research
+    /// defaults. JSON object; the runner reads it and clamps each
+    /// override to the operator's ceiling at start time.
+    #[serde(default)]
+    overrides: Option<JsonValue>,
+}
+
+pub struct ResearchStartTool {
+    descriptor: ToolDescriptor,
+}
+
+impl Default for ResearchStartTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ResearchStartTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "research_start".into(),
+                description:
+                    "Enqueue a deep-research job for a question. The job runs asynchronously \
+                     (minutes to hours) — this tool returns immediately with a job_id the \
+                     operator can watch, and `research_status(job_id)` lets the agent poll \
+                     for progress. For sub-minute focused work use `delegate_task` instead."
+                        .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The research question — what should the runner investigate?"
+                        },
+                        "overrides": {
+                            "type": ["object", "null"],
+                            "description": "Optional per-job overrides on the operator's defaults. Keys mirror config_research."
+                        }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Low,
+                capabilities: vec![Capability::ResearchSpawn],
+                default_allowed_classes: default_allowed_for_research_spawn(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for ResearchStartTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, args: Value) -> ToolOutcome {
+        let args: ResearchStartArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolOutcome::err("invalid_argument", e.to_string()),
+        };
+        let api = match ctx.research.as_ref() {
+            Some(a) => a,
+            None => {
+                return ToolOutcome::denied("research_spawn capability not granted to this tool");
+            }
+        };
+        let overrides_blob = match args.overrides {
+            Some(v) => match rmp_serde::to_vec(&v) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    return ToolOutcome::err("invalid_argument", format!("encode overrides: {e}"));
+                }
+            },
+            None => None,
+        };
+        match api.start(&args.query, overrides_blob).await {
+            Ok(view) => ToolOutcome::Ok(json!({
+                "job": job_view_to_json(&view),
+            })),
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ResearchStatusArgs {
+    job_id: String,
+}
+
+pub struct ResearchStatusTool {
+    descriptor: ToolDescriptor,
+}
+
+impl Default for ResearchStatusTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ResearchStatusTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "research_status".into(),
+                description:
+                    "Poll a deep-research job's status. Returns the current row including \
+                     the plan (if landed), the workspace path, the attachment id of the \
+                     final report (if complete), and any error."
+                        .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "job_id": {
+                            "type": "string",
+                            "description": "The id returned by `research_start`."
+                        }
+                    },
+                    "required": ["job_id"],
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Low,
+                capabilities: vec![Capability::ResearchRead],
+                default_allowed_classes: default_allowed_for_research_read(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for ResearchStatusTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, args: Value) -> ToolOutcome {
+        let args: ResearchStatusArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolOutcome::err("invalid_argument", e.to_string()),
+        };
+        let api = match ctx.research.as_ref() {
+            Some(a) => a,
+            None => {
+                return ToolOutcome::denied("research_read capability not granted to this tool");
+            }
+        };
+        match api.status(&args.job_id).await {
+            Ok(Some(view)) => ToolOutcome::Ok(json!({"job": job_view_to_json(&view)})),
+            Ok(None) => ToolOutcome::err("not_found", format!("no job '{}' visible", args.job_id)),
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+pub struct ResearchListTool {
+    descriptor: ToolDescriptor,
+}
+
+impl Default for ResearchListTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ResearchListTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "research_list".into(),
+                description:
+                    "List deep-research jobs visible to the caller. A Controller sees every job; \
+                     other callers see only the jobs in their own conversation. Newest first."
+                        .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Low,
+                capabilities: vec![Capability::ResearchRead],
+                default_allowed_classes: default_allowed_for_research_read(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for ResearchListTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, _args: Value) -> ToolOutcome {
+        let api = match ctx.research.as_ref() {
+            Some(a) => a,
+            None => {
+                return ToolOutcome::denied("research_read capability not granted to this tool");
+            }
+        };
+        match api.list().await {
+            Ok(views) => ToolOutcome::Ok(json!({
+                "jobs": views.iter().map(job_view_to_json).collect::<Vec<_>>(),
+                "count": views.len(),
             })),
             Err(e) => e.into_outcome(),
         }
@@ -1525,6 +1748,9 @@ pub fn core_builtin_tools() -> Vec<Arc<dyn ToolImpl>> {
         Arc::new(WebFetchTool::new()),
         Arc::new(WebSearchTool::new()),
         Arc::new(DelegateTaskTool::new()),
+        Arc::new(ResearchStartTool::new()),
+        Arc::new(ResearchStatusTool::new()),
+        Arc::new(ResearchListTool::new()),
     ]
 }
 
@@ -1604,10 +1830,7 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let mut ctx = ToolCtx::empty(cid.clone(), trust, clock.clone());
         if with_conv {
-            ctx.conversation = Some(Arc::new(DbConversationApi::new(
-                db.clone(),
-                cid.clone(),
-            )));
+            ctx.conversation = Some(Arc::new(DbConversationApi::new(db.clone(), cid.clone())));
         }
         if with_mem {
             ctx.memory = Some(Arc::new(DbMemoryApi::new(
@@ -1657,16 +1880,18 @@ mod tests {
         assert!(names.contains(&"list_chats"));
         assert!(names.contains(&"web_search"));
         assert!(names.contains(&"delegate_task"));
-        assert_eq!(names.len(), 17);
+        assert!(names.contains(&"research_start"));
+        assert!(names.contains(&"research_status"));
+        assert!(names.contains(&"research_list"));
+        assert_eq!(names.len(), 20);
     }
 
     #[test]
     fn core_builtin_tools_descriptors_declare_required_capabilities() {
-        let by_name: std::collections::HashMap<String, Arc<dyn ToolImpl>> =
-            core_builtin_tools()
-                .into_iter()
-                .map(|t| (t.descriptor().name.clone(), t))
-                .collect();
+        let by_name: std::collections::HashMap<String, Arc<dyn ToolImpl>> = core_builtin_tools()
+            .into_iter()
+            .map(|t| (t.descriptor().name.clone(), t))
+            .collect();
         assert_eq!(
             by_name["read_memory"].descriptor().capabilities,
             vec![Capability::MemoryRead]
@@ -1700,7 +1925,8 @@ mod tests {
     fn no_default_allowlist_includes_blocked() {
         for tool in core_builtin_tools() {
             assert!(
-                !tool.descriptor()
+                !tool
+                    .descriptor()
                     .default_allowed_classes
                     .iter()
                     .any(|c| c == "Blocked"),
@@ -1723,9 +1949,7 @@ mod tests {
             .unwrap();
         let tool = ReadMemoryTool::new();
         let ctx = build_ctx(&db, cid, "Controller", false, true);
-        let out = tool
-            .invoke(ctx, json!({"scope": "s", "key": "k"}))
-            .await;
+        let out = tool.invoke(ctx, json!({"scope": "s", "key": "k"})).await;
         match out {
             ToolOutcome::Ok(v) => assert_eq!(v, json!("hello")),
             other => panic!("expected Ok, got {other:?}"),
@@ -1786,7 +2010,10 @@ mod tests {
             .unwrap();
         let tool = ReadMemoryTool::new();
         let ctx = build_ctx(&db, cid, "UnknownPending", false, true);
-        match tool.invoke(ctx, json!({"scope": "global", "key": "secret"})).await {
+        match tool
+            .invoke(ctx, json!({"scope": "global", "key": "secret"}))
+            .await
+        {
             ToolOutcome::Ok(v) => assert_eq!(v, Value::Null),
             other => panic!("expected null, got {other:?}"),
         }
@@ -1881,9 +2108,7 @@ mod tests {
         let cid = seed_conversation(&db, "c10");
         let tool = SetThreadNameTool::new();
         let ctx = build_ctx(&db, cid.clone(), "Controller", true, false);
-        let out = tool
-            .invoke(ctx, json!({"name": "Q4 budget review"}))
-            .await;
+        let out = tool.invoke(ctx, json!({"name": "Q4 budget review"})).await;
         match out {
             ToolOutcome::Ok(v) => {
                 assert_eq!(v["ok"], true);
@@ -2033,7 +2258,10 @@ mod tests {
         let cid = seed_conversation(&db, "h4");
         let tool = ReadChatHistoryTool::new();
         let ctx = build_ctx(&db, cid, "Controller", true, false);
-        match tool.invoke(ctx, json!({"before_seq": "not-a-number"})).await {
+        match tool
+            .invoke(ctx, json!({"before_seq": "not-a-number"}))
+            .await
+        {
             ToolOutcome::Err { code, .. } => assert_eq!(code, "invalid_argument"),
             other => panic!("expected Err, got {other:?}"),
         }
@@ -2158,8 +2386,7 @@ mod tests {
         let db = fresh_db();
         let cid = seed_conversation(&db, "s1");
         let tool = ScheduleTaskTool::new();
-        let ctx =
-            build_ctx_full(&db, cid.clone(), "Controller", false, false, false, true);
+        let ctx = build_ctx_full(&db, cid.clone(), "Controller", false, false, false, true);
         let out = tool
             .invoke(
                 ctx,
@@ -2570,7 +2797,10 @@ mod tests {
         let db = fresh_db();
         let cid = seed_conversation(&db, "ws2");
         let ctx = ctx_with_stub_search(&db, cid, vec![]);
-        match WebSearchTool::new().invoke(ctx, json!({"query": "  "})).await {
+        match WebSearchTool::new()
+            .invoke(ctx, json!({"query": "  "}))
+            .await
+        {
             ToolOutcome::Err { code, message } => {
                 assert_eq!(code, "invalid_argument");
                 assert!(message.contains("empty"));
@@ -2743,11 +2973,210 @@ mod tests {
         let mut ctx = ToolCtx::empty(cid, "Controller", Arc::new(SystemClock));
         ctx.subagent = Some(spy.clone() as Arc<dyn SubagentApi>);
         DelegateTaskTool::new()
-            .invoke(
-                ctx,
-                json!({"task": "x", "max_tokens": 10_000}),
-            )
+            .invoke(ctx, json!({"task": "x", "max_tokens": 10_000}))
             .await;
         assert_eq!(*spy.captured.lock().unwrap(), Some(4096));
+    }
+
+    // --- research_* ---------------------------------------------------
+
+    use crate::tool_apis::DbResearchApi;
+
+    fn build_ctx_with_research_spawn(db: &Database, cid: ConversationId, trust: &str) -> ToolCtx {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let mut ctx = ToolCtx::empty(cid.clone(), trust, clock.clone());
+        ctx.research = Some(Arc::new(DbResearchApi::with_spawn(
+            db.clone(),
+            trust,
+            cid,
+            clock.now_unix(),
+        )));
+        ctx
+    }
+
+    fn build_ctx_with_research_read(db: &Database, cid: ConversationId, trust: &str) -> ToolCtx {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let mut ctx = ToolCtx::empty(cid.clone(), trust, clock.clone());
+        ctx.research = Some(Arc::new(DbResearchApi::read_only(
+            db.clone(),
+            trust,
+            cid,
+            clock.now_unix(),
+        )));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn research_start_inserts_pending_row_and_returns_job_id() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "c1");
+        let ctx = build_ctx_with_research_spawn(&db, cid.clone(), "Controller");
+        let out = ResearchStartTool::new()
+            .invoke(ctx, json!({"query": "what's new in Kokoro?"}))
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                let job_id = v["job"]["id"].as_str().unwrap();
+                assert!(!job_id.is_empty());
+                assert_eq!(v["job"]["status"], "pending");
+                assert_eq!(v["job"]["query"], "what's new in Kokoro?");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn research_start_denied_when_capability_missing() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "c1");
+        // Empty ToolCtx — no `research` populated.
+        let ctx = ToolCtx::empty(cid, "Controller", Arc::new(SystemClock));
+        let out = ResearchStartTool::new()
+            .invoke(ctx, json!({"query": "hi"}))
+            .await;
+        match out {
+            ToolOutcome::Denied { reason } => {
+                assert!(reason.contains("research_spawn"), "got: {reason}");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn research_start_denied_when_only_read_capability_granted() {
+        // Adversarial test: a tool dispatcher that wired a read-only
+        // ResearchApi (because the descriptor only declared
+        // ResearchRead) must NOT let the caller spawn a job. The
+        // DbResearchApi's `can_spawn = false` flag is what enforces
+        // this — the tool sees `Some(api)` but `start` returns
+        // NotAuthorized.
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "c1");
+        let ctx = build_ctx_with_research_read(&db, cid, "Controller");
+        let out = ResearchStartTool::new()
+            .invoke(ctx, json!({"query": "hi"}))
+            .await;
+        match out {
+            ToolOutcome::Denied { reason } => {
+                assert!(reason.contains("research_spawn"), "got: {reason}");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn research_start_rejects_empty_query() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "c1");
+        let ctx = build_ctx_with_research_spawn(&db, cid, "Controller");
+        let out = ResearchStartTool::new()
+            .invoke(ctx, json!({"query": "   "}))
+            .await;
+        match out {
+            ToolOutcome::Err { code, .. } => assert_eq!(code, "invalid_argument"),
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn research_status_returns_inserted_row() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "c1");
+        // Spawn a job first via the spawn-enabled ctx, then read it
+        // via a read-only ctx — proves the read-only path can see
+        // jobs the spawn path created.
+        let spawn_ctx = build_ctx_with_research_spawn(&db, cid.clone(), "Controller");
+        let started = ResearchStartTool::new()
+            .invoke(spawn_ctx, json!({"query": "anything"}))
+            .await;
+        let job_id = match started {
+            ToolOutcome::Ok(v) => v["job"]["id"].as_str().unwrap().to_owned(),
+            other => panic!("seed: {other:?}"),
+        };
+        let read_ctx = build_ctx_with_research_read(&db, cid, "Controller");
+        let out = ResearchStatusTool::new()
+            .invoke(read_ctx, json!({"job_id": job_id}))
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => assert_eq!(v["job"]["status"], "pending"),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn research_status_returns_not_found_for_other_conversation_when_low_trust() {
+        // Trust-scope adversarial test: a KnownTrusted caller in
+        // conversation A asks for a job id that lives in conversation
+        // B. The DbResearchApi must answer NotFound (not NotAuthorized
+        // and not Ok) so the caller learns nothing about whether the
+        // id exists.
+        let db = fresh_db();
+        let _conv_a = seed_conversation(&db, "conv-a");
+        let _conv_b = seed_conversation(&db, "conv-b");
+        // Seed a job in conversation B.
+        let spawn_ctx =
+            build_ctx_with_research_spawn(&db, ConversationId::from("conv-b"), "Controller");
+        let started = ResearchStartTool::new()
+            .invoke(spawn_ctx, json!({"query": "B's job"}))
+            .await;
+        let job_id = match started {
+            ToolOutcome::Ok(v) => v["job"]["id"].as_str().unwrap().to_owned(),
+            other => panic!("seed: {other:?}"),
+        };
+        // Now KnownTrusted caller in conversation A asks about it.
+        let read_ctx =
+            build_ctx_with_research_read(&db, ConversationId::from("conv-a"), "KnownTrusted");
+        let out = ResearchStatusTool::new()
+            .invoke(read_ctx, json!({"job_id": job_id}))
+            .await;
+        match out {
+            ToolOutcome::Err { code, .. } => assert_eq!(code, "not_found"),
+            other => panic!("expected Err(not_found), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn research_list_controller_sees_every_conversation() {
+        let db = fresh_db();
+        let _ = seed_conversation(&db, "conv-a");
+        let _ = seed_conversation(&db, "conv-b");
+        for conv in ["conv-a", "conv-b"] {
+            let ctx = build_ctx_with_research_spawn(&db, ConversationId::from(conv), "Controller");
+            let _ = ResearchStartTool::new()
+                .invoke(ctx, json!({"query": format!("q in {conv}")}))
+                .await;
+        }
+        // Controller scopes globally even when the caller is in conv-a.
+        let read_ctx =
+            build_ctx_with_research_read(&db, ConversationId::from("conv-a"), "Controller");
+        let out = ResearchListTool::new().invoke(read_ctx, json!({})).await;
+        match out {
+            ToolOutcome::Ok(v) => assert_eq!(v["count"], 2),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn research_list_low_trust_only_sees_own_conversation() {
+        let db = fresh_db();
+        let _ = seed_conversation(&db, "conv-a");
+        let _ = seed_conversation(&db, "conv-b");
+        for conv in ["conv-a", "conv-b"] {
+            let ctx = build_ctx_with_research_spawn(&db, ConversationId::from(conv), "Controller");
+            let _ = ResearchStartTool::new()
+                .invoke(ctx, json!({"query": format!("q in {conv}")}))
+                .await;
+        }
+        // KnownTrusted caller in conv-a sees only conv-a's job.
+        let read_ctx =
+            build_ctx_with_research_read(&db, ConversationId::from("conv-a"), "KnownTrusted");
+        let out = ResearchListTool::new().invoke(read_ctx, json!({})).await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                assert_eq!(v["count"], 1);
+                assert_eq!(v["jobs"][0]["conversation_id"], "conv-a");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
     }
 }

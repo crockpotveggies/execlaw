@@ -26,6 +26,7 @@ import { UserPage } from "./UserPage";
 import { ToolsPage } from "./ToolsPage";
 import { McpServersPage } from "./McpServersPage";
 import { RunnersPage } from "./RunnersPage";
+import { ResearchPage } from "./ResearchPage";
 import { RoutinesPage } from "./RoutinesPage";
 import { PersonalityPage } from "./PersonalityPage";
 import { AlertsPage } from "./AlertsPage";
@@ -60,6 +61,11 @@ const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     // also lives here so it's discoverable from Settings. Placeholder
     // page until the feature lands.
     { to: "/settings/routines", icon: "bi-clock-history", label: "Routines" },
+    {
+        to: "/settings/research",
+        icon: "bi-binoculars",
+        label: "Research",
+    },
     { to: "/settings/plugins", icon: "bi-plug", label: "Plugins" },
     { to: "/settings/tools", icon: "bi-wrench-adjustable", label: "Tools" },
     // Skills is a derived "what can my agent do" view of the tools
@@ -174,6 +180,7 @@ export function Settings() {
                         <Route path="personality" element={<PersonalityPage />} />
                         <Route path="my-identities" element={<MyIdentitiesPage />} />
                         <Route path="routines" element={<RoutinesPage />} />
+                        <Route path="research" element={<ResearchPage />} />
                         <Route path="plugins" element={<PluginsPage />} />
                         <Route path="tools" element={<ToolsPage />} />
                         <Route path="skills" element={<SkillsPage />} />

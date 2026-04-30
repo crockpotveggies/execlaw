@@ -351,7 +351,10 @@ pub async fn ping(State(state): State<AppState>) -> impl IntoResponse {
     };
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
         body,
     )
 }
@@ -370,9 +373,7 @@ pub async fn ping(State(state): State<AppState>) -> impl IntoResponse {
     security(("bearer_jwt" = [])),
     tag = "auth"
 )]
-pub async fn admin_me(
-    user: crate::auth_extract::AuthedUser,
-) -> Json<MeResponse> {
+pub async fn admin_me(user: crate::auth_extract::AuthedUser) -> Json<MeResponse> {
     Json(MeResponse {
         user_id: user.user_id,
         username: user.username,
@@ -689,8 +690,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/chats/{conversation_id}",
-            axum::routing::patch(crate::chats::patch_thread)
-                .delete(crate::chats::delete_thread),
+            axum::routing::patch(crate::chats::patch_thread).delete(crate::chats::delete_thread),
         )
         .route("/api/chats", get(crate::chats::list_threads))
         .route("/api/stream", get(crate::events::stream_handler))
@@ -718,6 +718,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::tools_admin::tools_admin_router())
         .merge(crate::mcp_admin::mcp_admin_router())
         .merge(crate::settings_general::settings_router())
+        .merge(crate::settings_research::settings_research_router())
         .merge(crate::setup_preflight::setup_preflight_router())
         .merge(crate::docs::docs_router())
         .with_state(state)
@@ -754,12 +755,10 @@ pub fn build_router(state: AppState) -> Router {
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
                 .make_span_with(
-                    tower_http::trace::DefaultMakeSpan::new()
-                        .level(tracing::Level::INFO),
+                    tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO),
                 )
                 .on_response(
-                    tower_http::trace::DefaultOnResponse::new()
-                        .level(tracing::Level::INFO),
+                    tower_http::trace::DefaultOnResponse::new().level(tracing::Level::INFO),
                 ),
         )
 }
@@ -774,10 +773,8 @@ pub fn test_app_state() -> AppState {
     // Per-test temp dir for staged plugins. Tests that exercise the
     // install path create a TempDir explicitly; the default one is
     // just a unique path under std::env::temp_dir so this fn stays sync.
-    let stage_root = std::env::temp_dir().join(format!(
-        "execlaw-test-plugins-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let stage_root =
+        std::env::temp_dir().join(format!("execlaw-test-plugins-{}", uuid::Uuid::new_v4()));
     let events = crate::events::EventBus::new();
     AppState {
         db: db.clone(),
@@ -786,9 +783,7 @@ pub fn test_app_state() -> AppState {
         refresh_store: Arc::new(RefreshStore::new(db.clone())),
         events: events.clone(),
         // Tests use a deterministic HMAC key so replay works end-to-end.
-        event_log_hmac_key: Some(Arc::new(
-            b"execlaw-test-hmac-key-32-bytes!!".to_vec(),
-        )),
+        event_log_hmac_key: Some(Arc::new(b"execlaw-test-hmac-key-32-bytes!!".to_vec())),
         // Phase 12.E — resolver with no bootstrap and no rows
         // returns None on resolve, matching the previous
         // `inference: None` semantics that drove the stub-turn
@@ -1021,13 +1016,8 @@ mod tests {
     #[tokio::test]
     async fn setup_rejects_short_password() {
         let app = build_router(test_app_state());
-        let (status, _) = send_json(
-            &app,
-            Method::POST,
-            "/api/setup",
-            setup_body("x", "Justin"),
-        )
-        .await;
+        let (status, _) =
+            send_json(&app, Method::POST, "/api/setup", setup_body("x", "Justin")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
@@ -1071,7 +1061,13 @@ mod tests {
         let body = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"setup");
 
-        let _ = send_json(&app, Method::POST, "/api/setup", setup_body("hunter2-longer", "J")).await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/api/setup",
+            setup_body("hunter2-longer", "J"),
+        )
+        .await;
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1091,12 +1087,16 @@ mod tests {
 
     #[tokio::test]
     async fn ping_flips_to_pong_when_standard_backend_configured() {
-        use execlaw_core::backends::{
-            BackendMode, BackendPurpose, BackendStore, BackendUpsert,
-        };
+        use execlaw_core::backends::{BackendMode, BackendPurpose, BackendStore, BackendUpsert};
         let state = test_app_state();
         let app = build_router(state.clone());
-        let _ = send_json(&app, Method::POST, "/api/setup", setup_body("hunter2-longer", "J")).await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/api/setup",
+            setup_body("hunter2-longer", "J"),
+        )
+        .await;
         // Configuring Standard backend (any mode) is enough.
         BackendStore::new(&state.db)
             .upsert(
@@ -1131,7 +1131,13 @@ mod tests {
         use execlaw_core::general_settings::GeneralSettingsStore;
         let state = test_app_state();
         let app = build_router(state.clone());
-        let _ = send_json(&app, Method::POST, "/api/setup", setup_body("hunter2-longer", "J")).await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/api/setup",
+            setup_body("hunter2-longer", "J"),
+        )
+        .await;
         // No Standard backend, but operator clicked Skip → ping
         // should still flip to pong.
         GeneralSettingsStore::new(&state.db)
@@ -1284,7 +1290,13 @@ mod tests {
     #[tokio::test]
     async fn login_without_webauthn_credentials_returns_tokens() {
         let app = build_router(test_app_state());
-        let _ = send_json(&app, Method::POST, "/api/setup", setup_body("hunter2-longer", "J")).await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/api/setup",
+            setup_body("hunter2-longer", "J"),
+        )
+        .await;
         let (status, body) = send_json(
             &app,
             Method::POST,
@@ -1316,7 +1328,10 @@ mod tests {
         )
         .await;
         let access1 = setup_body_json["access_token"].as_str().unwrap().to_owned();
-        let refresh1 = setup_body_json["refresh_token"].as_str().unwrap().to_owned();
+        let refresh1 = setup_body_json["refresh_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
 
         // Mint a SECOND session via /api/login (acts like the same
         // user signing in from a different browser).
@@ -1327,7 +1342,10 @@ mod tests {
             login_body("tester", "hunter2-longer"),
         )
         .await;
-        let refresh2 = login_body_json["refresh_token"].as_str().unwrap().to_owned();
+        let refresh2 = login_body_json["refresh_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
 
         // Caller is the first session. Both refresh tokens should
         // get invalidated by the single logout/all call.
@@ -1360,7 +1378,11 @@ mod tests {
                 serde_json::json!({"refresh_token": tok}),
             )
             .await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "token {tok} still works after logout/all: {body}");
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "token {tok} still works after logout/all: {body}"
+            );
             assert_eq!(body["error"]["code"], "invalid_refresh_token");
         }
     }
@@ -1371,7 +1393,13 @@ mod tests {
     #[tokio::test]
     async fn logout_all_requires_auth() {
         let app = build_router(test_app_state());
-        let _ = send_json(&app, Method::POST, "/api/setup", setup_body("hunter2-longer", "J")).await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/api/setup",
+            setup_body("hunter2-longer", "J"),
+        )
+        .await;
         let req = Request::builder()
             .method(Method::POST)
             .uri("/api/logout/all")
@@ -1397,7 +1425,13 @@ mod tests {
         use execlaw_core::webauthn::{WebauthnCredentialRow, WebauthnStore};
         let state = test_app_state();
         let app = build_router(state.clone());
-        let _ = send_json(&app, Method::POST, "/api/setup", setup_body("hunter2-longer", "J")).await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/api/setup",
+            setup_body("hunter2-longer", "J"),
+        )
+        .await;
 
         // Look up the user_id the setup just minted.
         let users = execlaw_core::users::UserStore::new(&state.db);
@@ -1428,8 +1462,8 @@ mod tests {
         // Either 200 with WebauthnChallenge OR 503 webauthn_unconfigured
         // when the svc is missing — what we must NEVER see is a Tokens
         // response with valid access + refresh tokens.
-        let issued_tokens = body["access_token"].as_str().is_some()
-            && body["refresh_token"].as_str().is_some();
+        let issued_tokens =
+            body["access_token"].as_str().is_some() && body["refresh_token"].as_str().is_some();
         assert!(
             !issued_tokens,
             "login must not issue tokens when webauthn credentials exist; status={status}, body={body}",

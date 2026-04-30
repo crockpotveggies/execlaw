@@ -15,14 +15,16 @@
 use crate::alerts::{AlertRow, AlertStatus, AlertStore, Severity};
 use crate::conversation::ConversationStore;
 use crate::db::Database;
-use crate::ids::{AlertId, ConversationId};
+use crate::ids::{AlertId, ConversationId, ResearchJobId};
 use crate::memory::{MemoryEntry, MemoryStore};
+use crate::research::{ResearchJobRow, ResearchJobStore, ResearchJobSummary};
 use crate::routines::{
-    next_fire_after, parse_cron, parse_timezone, RoutineRow, RoutineStore, RoutineUpsert,
+    RoutineRow, RoutineStore, RoutineUpsert, next_fire_after, parse_cron, parse_timezone,
 };
 use crate::tool::{
-    ApiError, ConversationApi, HistoryEntry, MemoryApi, MemoryListEntry, NotifyApi,
-    NotifyReceipt, NotifySeverity, RoutineSummary, ScheduleApi, ThreadInfo, ThreadListEntry,
+    ApiError, ConversationApi, HistoryEntry, MemoryApi, MemoryListEntry, NotifyApi, NotifyReceipt,
+    NotifySeverity, ResearchApi, ResearchJobView, RoutineSummary, ScheduleApi, ThreadInfo,
+    ThreadListEntry,
 };
 use async_trait::async_trait;
 use rusqlite::params;
@@ -132,9 +134,7 @@ impl ConversationApi for DbConversationApi {
             .await
             .map_err(|e| ApiError::Storage(format!("join: {e}")))?
             .map_err(|e| ApiError::Storage(format!("conversation get: {e}")))?
-            .ok_or_else(|| {
-                ApiError::NotFound(format!("conversation {}", cid_for_err.as_str()))
-            })?;
+            .ok_or_else(|| ApiError::NotFound(format!("conversation {}", cid_for_err.as_str())))?;
         Ok(ThreadInfo {
             conversation_id: row.conversation_id.as_str().to_owned(),
             display_name: row.display_name,
@@ -211,13 +211,17 @@ impl ConversationApi for DbConversationApi {
         for (seq, kind, payload, committed_at) in rows {
             let (role, text) = match kind.as_str() {
                 "user_msg" => {
-                    let p: UserMsgTextPayload = rmp_serde::from_slice(&payload)
-                        .unwrap_or(UserMsgTextPayload { text: String::new() });
+                    let p: UserMsgTextPayload =
+                        rmp_serde::from_slice(&payload).unwrap_or(UserMsgTextPayload {
+                            text: String::new(),
+                        });
                     ("user".to_string(), p.text)
                 }
                 "model_turn" => {
-                    let p: ModelTurnTextPayload = rmp_serde::from_slice(&payload)
-                        .unwrap_or(ModelTurnTextPayload { text: String::new() });
+                    let p: ModelTurnTextPayload =
+                        rmp_serde::from_slice(&payload).unwrap_or(ModelTurnTextPayload {
+                            text: String::new(),
+                        });
                     ("agent".to_string(), p.text)
                 }
                 other => (other.to_string(), String::new()),
@@ -279,11 +283,7 @@ impl DbMemoryApi {
 
 #[async_trait]
 impl MemoryApi for DbMemoryApi {
-    async fn read(
-        &self,
-        scope: &str,
-        key: &str,
-    ) -> Result<Option<String>, ApiError> {
+    async fn read(&self, scope: &str, key: &str) -> Result<Option<String>, ApiError> {
         let db = self.db.clone();
         let scope = scope.to_owned();
         let key = key.to_owned();
@@ -314,21 +314,14 @@ impl MemoryApi for DbMemoryApi {
             None => Ok(None),
             Some(entry) => {
                 let s = String::from_utf8(entry.value_blob).map_err(|_| {
-                    ApiError::Storage(
-                        "stored memory value is not valid utf-8".into(),
-                    )
+                    ApiError::Storage("stored memory value is not valid utf-8".into())
                 })?;
                 Ok(Some(s))
             }
         }
     }
 
-    async fn write(
-        &self,
-        scope: &str,
-        key: &str,
-        value: &str,
-    ) -> Result<(), ApiError> {
+    async fn write(&self, scope: &str, key: &str, value: &str) -> Result<(), ApiError> {
         if trust_rank(&self.caller_trust).is_none() {
             return Err(ApiError::NotAuthorized(format!(
                 "trust class {:?} cannot write memory",
@@ -351,11 +344,7 @@ impl MemoryApi for DbMemoryApi {
         Ok(())
     }
 
-    async fn list(
-        &self,
-        scope: &str,
-        prefix: &str,
-    ) -> Result<Vec<MemoryListEntry>, ApiError> {
+    async fn list(&self, scope: &str, prefix: &str) -> Result<Vec<MemoryListEntry>, ApiError> {
         // The underlying `MemoryStore` doesn't have a scan method yet
         // (Phase 1 stub). Returning an empty list with the same shape
         // keeps the contract honest until that lands.
@@ -631,12 +620,10 @@ impl ScheduleApi for DbScheduleApi {
         };
         let now = self.clock_now_unix;
         let db = self.db.clone();
-        let row = tokio::task::spawn_blocking(move || {
-            RoutineStore::new(&db).upsert(&upsert, now)
-        })
-        .await
-        .map_err(|e| ApiError::Storage(format!("join: {e}")))?
-        .map_err(map_routine_err)?;
+        let row = tokio::task::spawn_blocking(move || RoutineStore::new(&db).upsert(&upsert, now))
+            .await
+            .map_err(|e| ApiError::Storage(format!("join: {e}")))?
+            .map_err(map_routine_err)?;
         Ok(row_to_summary(&row))
     }
 
@@ -670,13 +657,12 @@ impl ScheduleApi for DbScheduleApi {
     ) -> Result<RoutineSummary, ApiError> {
         let id_owned = id.to_owned();
         let db_for_get = self.db.clone();
-        let existing = tokio::task::spawn_blocking(move || {
-            RoutineStore::new(&db_for_get).get(&id_owned)
-        })
-        .await
-        .map_err(|e| ApiError::Storage(format!("join: {e}")))?
-        .map_err(map_routine_err)?
-        .ok_or_else(|| ApiError::NotFound(format!("routine {id}")))?;
+        let existing =
+            tokio::task::spawn_blocking(move || RoutineStore::new(&db_for_get).get(&id_owned))
+                .await
+                .map_err(|e| ApiError::Storage(format!("join: {e}")))?
+                .map_err(map_routine_err)?
+                .ok_or_else(|| ApiError::NotFound(format!("routine {id}")))?;
 
         let new_name = name.unwrap_or(&existing.name).to_owned();
         if new_name.trim().is_empty() {
@@ -685,8 +671,9 @@ impl ScheduleApi for DbScheduleApi {
         let new_cron = schedule_cron.unwrap_or(&existing.schedule_cron).to_owned();
         let new_prompt = prompt.unwrap_or(&existing.prompt).to_owned();
         let new_target = match target_conversation_id {
-            Some(s) if !self.can_target_other_conversation()
-                && s != self.caller_conversation_id.as_str() =>
+            Some(s)
+                if !self.can_target_other_conversation()
+                    && s != self.caller_conversation_id.as_str() =>
             {
                 return Err(ApiError::NotAuthorized(format!(
                     "trust class {:?} cannot retarget routine to {s}",
@@ -710,23 +697,18 @@ impl ScheduleApi for DbScheduleApi {
         };
         let now = self.clock_now_unix;
         let db = self.db.clone();
-        let row = tokio::task::spawn_blocking(move || {
-            RoutineStore::new(&db).upsert(&upsert, now)
-        })
-        .await
-        .map_err(|e| ApiError::Storage(format!("join: {e}")))?
-        .map_err(map_routine_err)?;
+        let row = tokio::task::spawn_blocking(move || RoutineStore::new(&db).upsert(&upsert, now))
+            .await
+            .map_err(|e| ApiError::Storage(format!("join: {e}")))?
+            .map_err(map_routine_err)?;
         Ok(row_to_summary(&row))
     }
 
-    async fn set_enabled(
-        &self,
-        id: &str,
-        enabled: bool,
-    ) -> Result<RoutineSummary, ApiError> {
+    async fn set_enabled(&self, id: &str, enabled: bool) -> Result<RoutineSummary, ApiError> {
         // Implemented as a constrained `update_routine` so the
         // single store path enforces the same validation.
-        self.update_routine(id, None, None, None, None, Some(enabled)).await
+        self.update_routine(id, None, None, None, None, Some(enabled))
+            .await
     }
 
     async fn delete_routine(&self, id: &str) -> Result<bool, ApiError> {
@@ -745,12 +727,178 @@ fn touch_used_helper(db: &Database) {
     let _ = db;
 }
 
+// -----------------------------------------------------------------
+// ResearchApi: DB-backed
+// -----------------------------------------------------------------
+
+fn summary_to_view(s: &ResearchJobSummary) -> ResearchJobView {
+    ResearchJobView {
+        id: s.id.clone(),
+        conversation_id: s.conversation_id.clone(),
+        query: s.query.clone(),
+        status: s.status.clone(),
+        card_id: s.card_id.clone(),
+        workspace_path: s.workspace_path.clone(),
+        attachment_id: s.attachment_id.clone(),
+        error: s.error.clone(),
+        created_at: s.created_at,
+        updated_at: s.updated_at,
+        started_at: s.started_at,
+        finished_at: s.finished_at,
+        plan: s.plan.as_ref().and_then(|p| serde_json::to_value(p).ok()),
+    }
+}
+
+fn row_to_view(row: &ResearchJobRow) -> ResearchJobView {
+    summary_to_view(&row.to_summary())
+}
+
+/// DB-backed `ResearchApi`. Holds the caller's trust class +
+/// conversation id + a flag for whether spawn is allowed (driven by
+/// the descriptor's capability set: `ResearchSpawn` → `can_spawn =
+/// true`; `ResearchRead` only → `can_spawn = false`).
+pub struct DbResearchApi {
+    db: Database,
+    caller_trust: String,
+    caller_conversation_id: ConversationId,
+    can_spawn: bool,
+    clock_now_unix: i64,
+}
+
+impl DbResearchApi {
+    /// Construct an instance with `start` enabled. Use this when the
+    /// tool's descriptor declared `Capability::ResearchSpawn`.
+    pub fn with_spawn(
+        db: Database,
+        caller_trust: impl Into<String>,
+        caller_conversation_id: ConversationId,
+        now_unix: i64,
+    ) -> Self {
+        Self {
+            db,
+            caller_trust: caller_trust.into(),
+            caller_conversation_id,
+            can_spawn: true,
+            clock_now_unix: now_unix,
+        }
+    }
+
+    /// Read-only construction. `start` returns `NotAuthorized`.
+    pub fn read_only(
+        db: Database,
+        caller_trust: impl Into<String>,
+        caller_conversation_id: ConversationId,
+        now_unix: i64,
+    ) -> Self {
+        Self {
+            db,
+            caller_trust: caller_trust.into(),
+            caller_conversation_id,
+            can_spawn: false,
+            clock_now_unix: now_unix,
+        }
+    }
+
+    fn is_controller(&self) -> bool {
+        self.caller_trust == "Controller"
+    }
+}
+
+#[async_trait]
+impl ResearchApi for DbResearchApi {
+    async fn start(
+        &self,
+        query: &str,
+        overrides_json: Option<Vec<u8>>,
+    ) -> Result<ResearchJobView, ApiError> {
+        if !self.can_spawn {
+            return Err(ApiError::NotAuthorized(
+                "research_spawn capability not granted".into(),
+            ));
+        }
+        // Trim + length cap is also enforced by the JobStore — but
+        // surfacing the validation error here gives a tighter
+        // ApiError::Validation flavor instead of Storage(invalid: ...).
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Err(ApiError::Validation("query is empty".into()));
+        }
+        if trimmed.chars().count() > 8_000 {
+            return Err(ApiError::Validation(
+                "query too long (max 8000 chars)".into(),
+            ));
+        }
+        let db = self.db.clone();
+        let cid = self.caller_conversation_id.clone();
+        let trust = self.caller_trust.clone();
+        let q = trimmed.to_owned();
+        let overrides = overrides_json;
+        let now = self.clock_now_unix;
+        let id = ResearchJobId::new();
+        let id_for_task = id.clone();
+        let row = tokio::task::spawn_blocking(move || {
+            ResearchJobStore::new(&db).insert_pending(
+                &id_for_task,
+                &cid,
+                &q,
+                &trust,
+                overrides,
+                now,
+            )
+        })
+        .await
+        .map_err(|e| ApiError::Storage(format!("join: {e}")))?
+        .map_err(|e| ApiError::Storage(e.to_string()))?;
+        Ok(row_to_view(&row))
+    }
+
+    async fn status(&self, job_id: &str) -> Result<Option<ResearchJobView>, ApiError> {
+        let db = self.db.clone();
+        let id = ResearchJobId::from(job_id);
+        let row = tokio::task::spawn_blocking(move || ResearchJobStore::new(&db).get(&id))
+            .await
+            .map_err(|e| ApiError::Storage(format!("join: {e}")))?
+            .map_err(|e| ApiError::Storage(e.to_string()))?;
+        let row = match row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        // Trust-scope: hide rows that don't belong to the caller's
+        // conversation when the caller is below Controller. Returning
+        // `Ok(None)` (rather than NotAuthorized) prevents the LLM
+        // from probing for cross-thread ids and learning whether they
+        // exist.
+        if !self.is_controller()
+            && row.conversation_id.as_str() != self.caller_conversation_id.as_str()
+        {
+            return Ok(None);
+        }
+        Ok(Some(row_to_view(&row)))
+    }
+
+    async fn list(&self) -> Result<Vec<ResearchJobView>, ApiError> {
+        let db = self.db.clone();
+        let cid = self.caller_conversation_id.clone();
+        let is_ctrl = self.is_controller();
+        let rows = tokio::task::spawn_blocking(move || {
+            let store = ResearchJobStore::new(&db);
+            if is_ctrl {
+                store.list_all()
+            } else {
+                store.list_for_conversation(&cid)
+            }
+        })
+        .await
+        .map_err(|e| ApiError::Storage(format!("join: {e}")))?
+        .map_err(|e| ApiError::Storage(e.to_string()))?;
+        Ok(rows.iter().map(row_to_view).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::{
-        ConversationKind, ConversationRow, Modality, Phase,
-    };
+    use crate::conversation::{ConversationKind, ConversationRow, Modality, Phase};
     use crate::db::DbConfig;
     use crate::ids::EventSeq;
     use crate::migrations::MigrationRunner;

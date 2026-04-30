@@ -17,41 +17,20 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use utoipa::OpenApi;
 
-use crate::approvals::{
-    IdentifierSummary, PendingApprovalSummary, PendingApprovalsResponse,
-    PrincipalListResponse, PrincipalSummary,
-};
-use crate::backend_presets::{
-    BackendPreset, PresetField, PresetWithFlag, PresetsResponse,
-};
-use crate::backends::{
-    BackendListEntry, BackendListResponse, BackendLogsResponse,
-    BackendStatusResponse, BackendView, UpsertBackendRequest,
-};
 use crate::alerts::{AlertCountResponse, AlertListResponse, AlertView};
-use crate::my_identities::{
-    AddIdentifierRequest, IdentifierView, MyIdentitiesResponse,
+use crate::approvals::{
+    IdentifierSummary, PendingApprovalSummary, PendingApprovalsResponse, PrincipalListResponse,
+    PrincipalSummary,
 };
+use crate::backend_presets::{BackendPreset, PresetField, PresetWithFlag, PresetsResponse};
+use crate::backends::{
+    BackendListEntry, BackendListResponse, BackendLogsResponse, BackendStatusResponse, BackendView,
+    UpsertBackendRequest,
+};
+use crate::mcp_admin::{McpServerListResponse, McpServerView, McpServerWriteRequest};
+use crate::my_identities::{AddIdentifierRequest, IdentifierView, MyIdentitiesResponse};
 use crate::personality::{
-    PersonalityListResponse, PersonalityPreviewResponse, PersonalityView,
-    UpsertPersonalityRequest,
-};
-use crate::routines::{
-    PreviewRequest, PreviewResponse, RoutineListResponse, RoutineRunListResponse,
-    RoutineRunView, RoutineView, UpsertRoutineRequest,
-};
-use crate::settings_general::{
-    GeneralSettingsView, UpdateGeneralSettingsRequest,
-};
-use crate::setup_preflight::{DockerStatus, PreflightResponse};
-use crate::trust_policy::{TrustPolicyView, UpdateTrustPolicyRequest};
-use crate::runners_admin::{GroupRunnerListResponse, GroupRunnerView};
-use crate::mcp_admin::{
-    McpServerListResponse, McpServerView, McpServerWriteRequest,
-};
-use crate::tools_admin::{ToolListResponse, ToolView, UpdateToolPolicyRequest};
-use crate::users::{
-    ChangePasswordRequest, InviteUserRequest, ResetPasswordRequest, UserListResponse, UserView,
+    PersonalityListResponse, PersonalityPreviewResponse, PersonalityView, UpsertPersonalityRequest,
 };
 use crate::plugins::{
     InstallResponse, PluginListResponse, PluginSummary, ToolSummary, UiPanelListResponse,
@@ -60,6 +39,19 @@ use crate::plugins::{
 use crate::routes::{
     GenericOk, HealthResponse, LoginRequest, LoginResponse, LogoutAllResponse, LogoutRequest,
     MeResponse, RefreshRequest, RefreshResponse, SetupRequest, SetupResponse,
+};
+use crate::routines::{
+    PreviewRequest, PreviewResponse, RoutineListResponse, RoutineRunListResponse, RoutineRunView,
+    RoutineView, UpsertRoutineRequest,
+};
+use crate::runners_admin::{GroupRunnerListResponse, GroupRunnerView};
+use crate::settings_general::{GeneralSettingsView, UpdateGeneralSettingsRequest};
+use crate::settings_research::{ResearchSettingsView, UpdateResearchSettingsRequest};
+use crate::setup_preflight::{DockerStatus, PreflightResponse};
+use crate::tools_admin::{ToolListResponse, ToolView, UpdateToolPolicyRequest};
+use crate::trust_policy::{TrustPolicyView, UpdateTrustPolicyRequest};
+use crate::users::{
+    ChangePasswordRequest, InviteUserRequest, ResetPasswordRequest, UserListResponse, UserView,
 };
 use utoipa::Modify;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
@@ -191,6 +183,8 @@ impl Modify for SecurityAddon {
         // general settings (Phase 14 — start-on-boot, bind, ...)
         crate::settings_general::get_handler,
         crate::settings_general::put_handler,
+        crate::settings_research::get_handler,
+        crate::settings_research::put_handler,
         // setup preflight (Phase 14 — first-run wizard docker + gpu)
         crate::setup_preflight::get_handler,
         crate::setup_preflight::dismiss_handler,
@@ -262,6 +256,8 @@ impl Modify for SecurityAddon {
         PreviewResponse,
         GeneralSettingsView,
         UpdateGeneralSettingsRequest,
+        ResearchSettingsView,
+        UpdateResearchSettingsRequest,
         PreflightResponse,
         DockerStatus,
     )),

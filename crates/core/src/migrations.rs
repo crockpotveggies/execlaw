@@ -130,9 +130,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: 21,
         name: "repair-model-spec-storage-class",
-        sql: include_str!(
-            "../migrations/0021_repair_model_spec_storage_class.sql"
-        ),
+        sql: include_str!("../migrations/0021_repair_model_spec_storage_class.sql"),
     },
     Migration {
         id: 22,
@@ -142,9 +140,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: 23,
         name: "append-v1-to-managed-endpoints",
-        sql: include_str!(
-            "../migrations/0023_append_v1_to_managed_endpoints.sql"
-        ),
+        sql: include_str!("../migrations/0023_append_v1_to_managed_endpoints.sql"),
     },
     Migration {
         id: 24,
@@ -160,6 +156,11 @@ pub const MIGRATIONS: &[Migration] = &[
         id: 26,
         name: "history-retention",
         sql: include_str!("../migrations/0026_history_retention.sql"),
+    },
+    Migration {
+        id: 27,
+        name: "research-jobs",
+        sql: include_str!("../migrations/0027_research_jobs.sql"),
     },
 ];
 
@@ -295,8 +296,8 @@ mod tests {
         assert_eq!(
             applied,
             vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23, 24, 25, 26,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24, 25, 26, 27,
             ]
         );
 
@@ -322,7 +323,8 @@ mod tests {
             "config_runtime_settings",
             "config_hardware_profile_overrides",
             "principals",
-            "research_jobs",
+            "state_research_jobs",
+            "config_research",
             "memory_entries",
             "vault_secrets",
             "log_entries",
@@ -361,8 +363,8 @@ mod tests {
         assert_eq!(
             first,
             vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                23, 24, 25, 26,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24, 25, 26, 27,
             ]
         );
         assert!(
@@ -399,13 +401,15 @@ mod tests {
                    '{\"image\":\"vllm/vllm-openai:v0.6.2\",\"args\":[]}', \
                    '0', NULL, NULL, 0, 'managed', 100, 100)",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
             // Run 0020 (the buggy json_set without CAST). Now
             // model_spec_json is TEXT-affinity.
             let m20 = MIGRATIONS.iter().find(|m| m.id == 20).unwrap();
             c.execute_batch(m20.sql).unwrap();
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
         // Verify the storage class IS now TEXT (sanity: this is the
         // bug 0021 fixes).
@@ -430,7 +434,8 @@ mod tests {
             let m21 = MIGRATIONS.iter().find(|m| m.id == 21).unwrap();
             c.execute_batch(m21.sql).unwrap();
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
         // Now `typeof()` should be 'blob' and the BackendStore-style
         // read should succeed.
@@ -440,12 +445,7 @@ mod tests {
                     "SELECT typeof(model_spec_json), model_spec_json \
                      FROM config_backends WHERE purpose = 'Standard'",
                     [],
-                    |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, Vec<u8>>(1)?,
-                        ))
-                    },
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)),
                 )
                 .unwrap())
             })
@@ -494,34 +494,39 @@ mod tests {
                    '{\"args\":[]}', \
                    '0', NULL, NULL, 0, 'managed', 100, 100)",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
         // Run migration 20.
         db.with_conn(|c| {
             let m = MIGRATIONS.iter().find(|m| m.id == 20).unwrap();
             c.execute_batch(m.sql).unwrap();
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
         // Inspect each row.
-        let by_purpose = db.with_conn(|c| {
-            let mut stmt = c
-                .prepare(
-                    "SELECT purpose, json_extract(model_spec_json, '$.image') \
+        let by_purpose = db
+            .with_conn(|c| {
+                let mut stmt = c
+                    .prepare(
+                        "SELECT purpose, json_extract(model_spec_json, '$.image') \
                      FROM config_backends",
-                )
-                .unwrap();
-            let rows = stmt
-                .query_map([], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
-                })
-                .unwrap()
-                .map(|r| r.unwrap())
-                .collect::<Vec<_>>();
-            Ok(rows)
-        }).unwrap();
+                    )
+                    .unwrap();
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                    })
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect::<Vec<_>>();
+                Ok(rows)
+            })
+            .unwrap();
         let lookup: std::collections::HashMap<_, _> = by_purpose.into_iter().collect();
         // Standard (managed + legacy image) → bumped to nightly.
         assert_eq!(
@@ -576,26 +581,30 @@ mod tests {
                  ('VoiceTTS', 'service-piper-tts', '{}', '0', NULL, \
                   NULL, 0, 'managed', 100, 100)",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
             // Apply 0023.
             let m = MIGRATIONS.iter().find(|m| m.id == 23).unwrap();
             c.execute_batch(m.sql).unwrap();
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
-        let rows = db.with_conn(|c| {
-            let mut s = c
-                .prepare("SELECT purpose, endpoint FROM config_backends ORDER BY purpose")
-                .unwrap();
-            let v = s
-                .query_map([], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
-                })
-                .unwrap()
-                .map(|x| x.unwrap())
-                .collect::<Vec<_>>();
-            Ok(v)
-        }).unwrap();
+        let rows = db
+            .with_conn(|c| {
+                let mut s = c
+                    .prepare("SELECT purpose, endpoint FROM config_backends ORDER BY purpose")
+                    .unwrap();
+                let v = s
+                    .query_map([], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                    })
+                    .unwrap()
+                    .map(|x| x.unwrap())
+                    .collect::<Vec<_>>();
+                Ok(v)
+            })
+            .unwrap();
         let lookup: std::collections::HashMap<_, _> = rows.into_iter().collect();
         // Standard: bare loopback → suffixed.
         assert_eq!(
@@ -603,10 +612,7 @@ mod tests {
             Some("http://127.0.0.1:8101/v1")
         );
         // Small: already had /v1 → untouched.
-        assert_eq!(
-            lookup["Small"].as_deref(),
-            Some("http://127.0.0.1:8102/v1")
-        );
+        assert_eq!(lookup["Small"].as_deref(), Some("http://127.0.0.1:8102/v1"));
         // VoiceSTT: external row → untouched even though it
         // matches the "/v1 already present" predicate.
         assert_eq!(
@@ -651,22 +657,25 @@ mod tests {
             let m = MIGRATIONS.iter().find(|m| m.id == 19).unwrap();
             c.execute_batch(m.sql).unwrap();
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
         // Inspect every row.
-        let by_purpose = db.with_conn(|c| {
-            let mut stmt = c
-                .prepare("SELECT purpose, gpu_id FROM config_backends")
-                .unwrap();
-            let rows = stmt
-                .query_map([], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
-                })
-                .unwrap()
-                .map(|r| r.unwrap())
-                .collect::<Vec<_>>();
-            Ok(rows)
-        }).unwrap();
+        let by_purpose = db
+            .with_conn(|c| {
+                let mut stmt = c
+                    .prepare("SELECT purpose, gpu_id FROM config_backends")
+                    .unwrap();
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                    })
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect::<Vec<_>>();
+                Ok(rows)
+            })
+            .unwrap();
         let lookup: std::collections::HashMap<_, _> = by_purpose.into_iter().collect();
         // Both legacy shapes get repaired to the per-vendor ordinal "0".
         assert_eq!(lookup["Standard"].as_deref(), Some("0"));
