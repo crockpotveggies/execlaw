@@ -21,12 +21,14 @@
 //! [research handoff doc]: ../../../docs/handoffs/2026-04-29-research-subsystem.md
 
 pub mod gather;
+pub mod retention;
 pub mod runner;
 pub mod supervisor;
 pub mod synthesize;
 pub mod workspace;
 
 pub use gather::{GatherCtx, GatherDeps, GatherError, run_gather};
+pub use retention::{ResearchRetentionReport, ResearchRetentionSweeper};
 pub use runner::{ResearchRunnerError, run_job};
 pub use supervisor::ResearchSupervisor;
 pub use synthesize::{SynthesizeCtx, SynthesizeError, SynthesizeOutcome, run_synthesize};

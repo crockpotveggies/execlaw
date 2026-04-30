@@ -1337,12 +1337,20 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         let supervisor = execlaw_server::research::ResearchSupervisor::new(
             state.db.clone(),
             state.inference.clone(),
-            workspace,
+            workspace.clone(),
             state.config.model_id.clone(),
             state.events.clone(),
         );
         let stop = sweep_stop.clone();
         tokio::spawn(async move { supervisor.run(stop).await });
+
+        // C6 — research-retention sweeper. Purges terminal rows
+        // past the global `history_retention_days` cutoff and
+        // removes their workspace dirs. Hourly tick by default.
+        let retention_sweeper =
+            execlaw_server::research::ResearchRetentionSweeper::new(state.db.clone(), workspace);
+        let stop = sweep_stop.clone();
+        tokio::spawn(async move { retention_sweeper.run(stop).await });
     }
 
     // Phase 10 closure — purge state_routine_runs rows past the

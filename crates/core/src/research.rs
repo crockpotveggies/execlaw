@@ -614,6 +614,55 @@ impl<'db> ResearchJobStore<'db> {
         Ok(rows)
     }
 
+    /// Atomically delete every terminal row whose `finished_at` is
+    /// strictly less than `cutoff`, returning each deleted row's
+    /// `(id, workspace_path)` so the caller can purge the on-disk
+    /// dirs. Active rows (Pending / Planning / Planned / Gathering /
+    /// Synthesizing) and terminal rows with `finished_at >= cutoff`
+    /// are preserved.
+    ///
+    /// The DB delete and the filesystem cleanup are decoupled
+    /// intentionally: SQL atomicity guarantees the DB side; the
+    /// caller does best-effort filesystem cleanup outside the
+    /// transaction so a slow `remove_dir_all` can't keep the SQLite
+    /// write-lock held.
+    pub fn purge_terminal_older_than(
+        &self,
+        cutoff: i64,
+    ) -> Result<Vec<(ResearchJobId, Option<String>)>, ResearchError> {
+        // Two-phase: SELECT then DELETE in one transaction so a
+        // concurrent insert can't change the working set between
+        // queries. The window of "finished_at < cutoff AND status IN
+        // (terminal)" is what defines the work; we re-key it to ids
+        // for the DELETE so a row that flipped to terminal during
+        // the SELECT (impossible today; defensive) doesn't get
+        // accidentally swept.
+        let rows = self.db.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            let mut stmt = tx.prepare(
+                "SELECT id, workspace_path FROM state_research_jobs \
+                 WHERE finished_at IS NOT NULL \
+                   AND finished_at < ?1 \
+                   AND status IN ('complete', 'failed', 'cancelled')",
+            )?;
+            let collected: Vec<(String, Option<String>)> = stmt
+                .query_map(params![cutoff], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+            for (id, _path) in &collected {
+                tx.execute("DELETE FROM state_research_jobs WHERE id = ?1", params![id])?;
+            }
+            tx.commit()?;
+            Ok(collected)
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, path)| (ResearchJobId::from(id.as_str()), path))
+            .collect())
+    }
+
     /// Count rows in any of the active (non-terminal) statuses for
     /// the given conversation. Drives the chat-pane badge so the
     /// UI doesn't need to materialise + filter the full list.

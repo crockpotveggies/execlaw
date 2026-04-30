@@ -1301,6 +1301,75 @@ fn bench_research_gather_paths(c: &mut Criterion) {
     group.finish();
 }
 
+// C6 — retention purge. Runs hourly; budget is generous because
+// the sweep is a background task, but we want the cost to scale
+// linearly with the candidate set so a backlog doesn't OOM.
+//
+// Budgets:
+//   * purge/empty-db          ≤ 100µs  (fast SELECT-then-no-DELETE)
+//   * purge/16-terminal       ≤ 1ms    (txn + 16 DELETEs)
+//   * purge/256-terminal      ≤ 10ms   (txn + 256 DELETEs — backlog)
+fn bench_research_purge_terminal(c: &mut Criterion) {
+    use execlaw_core::research::{ResearchJobStatus, ResearchJobStore};
+
+    let mut group = c.benchmark_group("research_purge_terminal");
+
+    group.bench_function("empty_db", |b| {
+        b.iter_batched(
+            fresh_db,
+            |db| {
+                let store = ResearchJobStore::new(&db);
+                let n = store
+                    .purge_terminal_older_than(black_box(1_000_000_000))
+                    .unwrap();
+                black_box(n);
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+
+    for n in [16usize, 256].iter() {
+        group.bench_with_input(BenchmarkId::new("terminal_rows", n), n, |b, &n| {
+            b.iter_batched(
+                || {
+                    let db = fresh_db();
+                    let cid = ConversationId::from("conv-purge-bench");
+                    let store = ResearchJobStore::new(&db);
+                    for i in 0..n {
+                        let id = ResearchJobId::new();
+                        store
+                            .insert_pending(&id, &cid, "q", "Controller", None, i as i64)
+                            .unwrap();
+                        store
+                            .claim_next_pending(&format!("c-{i}"), i as i64 + 1)
+                            .unwrap();
+                        store
+                            .finish(
+                                &id,
+                                ResearchJobStatus::Complete,
+                                None,
+                                Some("att"),
+                                100 + i as i64,
+                            )
+                            .unwrap();
+                    }
+                    db
+                },
+                |db| {
+                    let store = ResearchJobStore::new(&db);
+                    let purged = store
+                        .purge_terminal_older_than(black_box(1_000_000))
+                        .unwrap();
+                    black_box(purged);
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_research_plan_codec(c: &mut Criterion) {
     let mut group = c.benchmark_group("research_plan_codec");
     let plan = fixture_plan();
@@ -1347,5 +1416,6 @@ criterion_group!(
     bench_research_config_store,
     bench_research_plan_codec,
     bench_research_gather_paths,
+    bench_research_purge_terminal,
 );
 criterion_main!(benches);
