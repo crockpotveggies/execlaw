@@ -1144,6 +1144,56 @@ fn bench_research_job_store(c: &mut Criterion) {
         );
     }
 
+    // Operator-dashboard tick path: how does the global active count
+    // scale as terminal-row history accumulates? Hot path must stay
+    // O(active), not O(history) — index on `status` should pin
+    // sub-µs even with thousands of terminal rows present.
+    for &history in &[64usize, 1024, 8192] {
+        group.bench_with_input(
+            BenchmarkId::new("active_count_global_with_history", history),
+            &history,
+            |b, &history| {
+                let db = fresh_db();
+                let cid = ConversationId::from("conv-research-global");
+                let store = ResearchJobStore::new(&db);
+                // Seed `history` terminal rows + 4 active rows. The
+                // SQL COUNT should care only about the active ones.
+                for i in 0..history {
+                    let id = ResearchJobId::new();
+                    store
+                        .insert_pending(&id, &cid, "old", "Controller", None, i as i64)
+                        .unwrap();
+                    store.claim_next_pending("c", i as i64 + 1).unwrap();
+                    store
+                        .finish(
+                            &id,
+                            execlaw_core::research::ResearchJobStatus::Complete,
+                            None,
+                            Some("att"),
+                            i as i64 + 2,
+                        )
+                        .unwrap();
+                }
+                for j in 0..4 {
+                    store
+                        .insert_pending(
+                            &ResearchJobId::new(),
+                            &cid,
+                            "new",
+                            "Controller",
+                            None,
+                            (history + j) as i64,
+                        )
+                        .unwrap();
+                }
+                b.iter(|| {
+                    let n = store.active_count_global().unwrap();
+                    black_box(n);
+                });
+            },
+        );
+    }
+
     group.finish();
 }
 
