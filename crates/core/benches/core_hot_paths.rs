@@ -25,6 +25,10 @@ use execlaw_core::events::EventRecord as CoreEventRecord;
 use execlaw_core::outbox::{OutboxRow, OutboxStatus, OutboxStore};
 use execlaw_core::transport_conversations::{ConversationResolver, ResolveInput};
 use execlaw_core::refresh_tokens::RefreshTokenStore;
+use execlaw_core::ids::ResearchJobId;
+use execlaw_core::research::{
+    PhaseGates, PlanStep, ResearchConfigStore, ResearchConfigUpdate, ResearchJobStore, ResearchPlan,
+};
 use execlaw_core::tool_access::{ToolAccessSeed, ToolAccessStore, ToolSource};
 use execlaw_core::webauthn::{WebauthnCredentialRow, WebauthnStore};
 
@@ -960,6 +964,254 @@ fn bench_tool_access_store(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// research JobStore + ConfigStore + plan codec hot paths.
+//
+// Budgets (single in-memory SQLite, debug build):
+//   * insert_pending           ≤ 200µs   (single INSERT + read-back)
+//   * claim_next_pending       ≤ 300µs   (txn: SELECT + UPDATE + read-back)
+//   * set_planned              ≤ 200µs   (single UPDATE + rmp encode)
+//   * list_for_conversation/64 ≤ 400µs   (scan within one conv, decode N rows)
+//   * active_count_for_conv/64 ≤ 100µs   (count over indexed conv)
+//   * config_get               ≤ 100µs   (singleton-row SELECT)
+//   * to_summary (plan decode) ≤ 50µs    (rmp_serde::from_slice on small blob)
+//
+// Anything materially over budget is a perf regression and gets fixed
+// before merge per axiom #14.
+// ---------------------------------------------------------------------------
+
+fn fixture_plan() -> ResearchPlan {
+    ResearchPlan {
+        thesis: "compare runtime quality between two open-weights models on \
+                 fast-path single-turn benchmarks across 8 sub-queries"
+            .into(),
+        steps: (0..8)
+            .map(|i| PlanStep {
+                query: format!("sub-query {i}"),
+                rationale: Some(format!("rationale for sub-query {i}")),
+            })
+            .collect(),
+    }
+}
+
+fn bench_research_job_store(c: &mut Criterion) {
+    let mut group = c.benchmark_group("research_job_store");
+
+    group.bench_function("insert_pending", |b| {
+        b.iter_batched(
+            || {
+                let db = fresh_db();
+                let cid = ConversationId::from("conv-research-bench");
+                (db, cid)
+            },
+            |(db, cid)| {
+                let store = ResearchJobStore::new(&db);
+                let id = ResearchJobId::new();
+                let row = store
+                    .insert_pending(
+                        black_box(&id),
+                        black_box(&cid),
+                        black_box("what's new in Kokoro 2026?"),
+                        black_box("Controller"),
+                        None,
+                        100,
+                    )
+                    .unwrap();
+                black_box(row);
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+
+    group.bench_function("claim_next_pending", |b| {
+        b.iter_batched(
+            || {
+                let db = fresh_db();
+                let cid = ConversationId::from("conv-research-bench");
+                let store = ResearchJobStore::new(&db);
+                store
+                    .insert_pending(
+                        &ResearchJobId::new(),
+                        &cid,
+                        "claim-bench",
+                        "Controller",
+                        None,
+                        100,
+                    )
+                    .unwrap();
+                db
+            },
+            |db| {
+                let store = ResearchJobStore::new(&db);
+                let claimed = store.claim_next_pending(black_box("card-x"), 200).unwrap();
+                black_box(claimed);
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+
+    // claim against an empty Pending queue — supervisor's no-op tick
+    // hits this path hundreds of times per hour. Should be cheap.
+    group.bench_function("claim_next_pending_empty_queue", |b| {
+        b.iter_batched(
+            fresh_db,
+            |db| {
+                let store = ResearchJobStore::new(&db);
+                let claimed = store.claim_next_pending(black_box("card-x"), 200).unwrap();
+                black_box(claimed);
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+
+    group.bench_function("set_planned", |b| {
+        b.iter_batched(
+            || {
+                let db = fresh_db();
+                let cid = ConversationId::from("conv");
+                let store = ResearchJobStore::new(&db);
+                let id = ResearchJobId::new();
+                store
+                    .insert_pending(&id, &cid, "q", "Controller", None, 100)
+                    .unwrap();
+                store.claim_next_pending("card-1", 150).unwrap();
+                (db, id, fixture_plan())
+            },
+            |(db, id, plan)| {
+                ResearchJobStore::new(&db)
+                    .set_planned(black_box(&id), black_box(&plan), 200)
+                    .unwrap();
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+
+    for n in [4usize, 16, 64].iter() {
+        group.bench_with_input(
+            BenchmarkId::new("list_for_conversation", n),
+            n,
+            |b, &n| {
+                let db = fresh_db();
+                let cid = ConversationId::from("conv-research-list");
+                let store = ResearchJobStore::new(&db);
+                for i in 0..n {
+                    let id = ResearchJobId::new();
+                    store
+                        .insert_pending(
+                            &id,
+                            &cid,
+                            &format!("query {i}"),
+                            "Controller",
+                            None,
+                            100 + i as i64,
+                        )
+                        .unwrap();
+                    // Half of them have plans landed so the per-row
+                    // decode cost is exercised.
+                    if i % 2 == 0 {
+                        store.claim_next_pending(&format!("card-{i}"), 200 + i as i64).unwrap();
+                        store.set_planned(&id, &fixture_plan(), 250 + i as i64).unwrap();
+                    }
+                }
+                b.iter(|| {
+                    let rows = store.list_for_conversation(black_box(&cid)).unwrap();
+                    black_box(rows.iter().map(|r| r.to_summary()).collect::<Vec<_>>());
+                });
+            },
+        );
+    }
+
+    for n in [4usize, 16, 64].iter() {
+        group.bench_with_input(
+            BenchmarkId::new("active_count_for_conversation", n),
+            n,
+            |b, &n| {
+                let db = fresh_db();
+                let cid = ConversationId::from("conv-research-count");
+                let store = ResearchJobStore::new(&db);
+                for i in 0..n {
+                    store
+                        .insert_pending(
+                            &ResearchJobId::new(),
+                            &cid,
+                            &format!("query {i}"),
+                            "Controller",
+                            None,
+                            100 + i as i64,
+                        )
+                        .unwrap();
+                }
+                b.iter(|| {
+                    let n = store
+                        .active_count_for_conversation(black_box(&cid))
+                        .unwrap();
+                    black_box(n);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_research_config_store(c: &mut Criterion) {
+    let mut group = c.benchmark_group("research_config_store");
+
+    group.bench_function("get_seeded_defaults", |b| {
+        let db = fresh_db();
+        let store = ResearchConfigStore::new(&db);
+        b.iter(|| {
+            let cfg = store.get().unwrap();
+            black_box(cfg);
+        });
+    });
+
+    group.bench_function("update_single_field", |b| {
+        b.iter_batched(
+            fresh_db,
+            |db| {
+                let store = ResearchConfigStore::new(&db);
+                let saved = store
+                    .update(
+                        &ResearchConfigUpdate {
+                            phase_gates: Some(PhaseGates::None),
+                            ..Default::default()
+                        },
+                        500,
+                    )
+                    .unwrap();
+                black_box(saved);
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+
+    group.finish();
+}
+
+fn bench_research_plan_codec(c: &mut Criterion) {
+    let mut group = c.benchmark_group("research_plan_codec");
+    let plan = fixture_plan();
+    let encoded = rmp_serde::to_vec(&plan).unwrap();
+    group.throughput(Throughput::Bytes(encoded.len() as u64));
+
+    group.bench_function("encode", |b| {
+        b.iter(|| {
+            let bytes = rmp_serde::to_vec(black_box(&plan)).unwrap();
+            black_box(bytes);
+        })
+    });
+
+    group.bench_function("decode", |b| {
+        b.iter(|| {
+            let plan: ResearchPlan = rmp_serde::from_slice(black_box(&encoded)).unwrap();
+            black_box(plan);
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_hmac,
@@ -979,5 +1231,8 @@ criterion_group!(
     bench_webauthn_store,
     bench_refresh_token_store,
     bench_tool_access_store,
+    bench_research_job_store,
+    bench_research_config_store,
+    bench_research_plan_codec,
 );
 criterion_main!(benches);

@@ -963,6 +963,74 @@ mod tests {
     }
 
     #[test]
+    fn claim_next_pending_skips_already_running_rows() {
+        // Adversarial: a row in `Planning` (just claimed by another
+        // supervisor instance, or by a prior tick) must NOT be
+        // re-claimed. The `WHERE status = 'pending'` predicate
+        // inside the UPDATE is what enforces this; if it ever
+        // regresses we'd silently double-claim and double-spawn
+        // runners against the same job.
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(
+                &id,
+                &ConversationId::from("c"),
+                "q",
+                "Controller",
+                None,
+                100,
+            )
+            .unwrap();
+        let claimed = store.claim_next_pending("card-a", 200).unwrap().unwrap();
+        assert_eq!(claimed.status, ResearchJobStatus::Planning);
+        // No more Pending rows exist; second claim returns None even
+        // though the row still exists in another status.
+        assert!(store.claim_next_pending("card-b", 300).unwrap().is_none());
+    }
+
+    #[test]
+    fn set_planned_returns_not_found_for_unknown_id() {
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        let plan = ResearchPlan {
+            thesis: "t".into(),
+            steps: vec![PlanStep {
+                query: "q".into(),
+                rationale: None,
+            }],
+        };
+        let err = store
+            .set_planned(&ResearchJobId::new(), &plan, 100)
+            .unwrap_err();
+        assert!(matches!(err, ResearchError::NotFound(_)));
+    }
+
+    #[test]
+    fn finish_updates_updated_at_and_finished_at_in_lockstep() {
+        // updated_at + finished_at must agree on the terminal
+        // transition timestamp — the retention sweeper (C6) keys on
+        // finished_at, the operator UI sorts by updated_at, and a
+        // skew between them would create surprising "this just
+        // updated, why is it being purged?" behaviour.
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(&id, &ConversationId::from("c"), "q", "Controller", None, 100)
+            .unwrap();
+        store.claim_next_pending("card-1", 150).unwrap();
+        store
+            .finish(&id, ResearchJobStatus::Complete, None, Some("att-1"), 999)
+            .unwrap();
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(row.updated_at, 999);
+        assert_eq!(row.finished_at, Some(999));
+        assert_eq!(row.attachment_id.as_deref(), Some("att-1"));
+    }
+
+    #[test]
     fn finish_with_non_terminal_status_errors() {
         let db = fresh_db();
         let store = ResearchJobStore::new(&db);
