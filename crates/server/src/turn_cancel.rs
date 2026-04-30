@@ -81,6 +81,12 @@ impl TurnCancellationRegistry {
     pub fn len(&self) -> usize {
         self.inner.len()
     }
+
+    /// Test helper: whether the registry is empty.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
 }
 
 /// RAII guard: registers a cancel flag on construction, removes it on

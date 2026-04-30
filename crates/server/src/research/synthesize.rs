@@ -281,7 +281,7 @@ mod tests {
                 rationale: None,
             }],
         };
-        let notes = vec![
+        let notes = [
             fixture_note(0, "q1", SubQueryState::Done),
             fixture_note(1, "q2", SubQueryState::Failed),
         ];

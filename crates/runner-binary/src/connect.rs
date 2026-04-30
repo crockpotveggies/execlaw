@@ -213,7 +213,7 @@ impl ConnectionDriver {
                         continue;
                     }
                 };
-                if let Err(e) = sink.send(Message::Text(txt.into())).await {
+                if let Err(e) = sink.send(Message::Text(txt)).await {
                     tracing::error!(error = %e, "WS send failed; closing writer task");
                     break;
                 }

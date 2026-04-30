@@ -25,7 +25,6 @@ use execlaw_runner_protocol::{
 use execlaw_server::events::{EventBus, UiEvent};
 use execlaw_server::runner_supervisor::RunnerSupervisor;
 use futures::{SinkExt, StreamExt};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -253,7 +252,7 @@ async fn forward_turn_round_trips_token_delta_to_runner_and_event_bus() {
         text: "tok-A".into(),
     };
     socket
-        .send(Message::Text(serde_json::to_string(&delta).unwrap().into()))
+        .send(Message::Text(serde_json::to_string(&delta).unwrap()))
         .await
         .unwrap();
 

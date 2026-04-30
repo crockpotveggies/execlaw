@@ -309,6 +309,13 @@ struct MockState {
 }
 
 #[cfg(any(test, feature = "test-mock"))]
+impl Default for MockRunnerLauncher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "test-mock"))]
 impl MockRunnerLauncher {
     pub fn new() -> Self {
         Self {

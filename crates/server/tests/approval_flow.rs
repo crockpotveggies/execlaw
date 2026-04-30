@@ -52,6 +52,7 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
         ),
         turn_cancel: execlaw_server::turn_cancel::TurnCancellationRegistry::new(),
         runner_supervisor: None,
+        research_supervisor: None,
     };
     (
         execlaw_server::routes::build_router(state.clone()),
