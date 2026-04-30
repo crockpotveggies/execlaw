@@ -231,17 +231,7 @@ pub async fn active_count_handler(
     let store = ResearchJobStore::new(&state.db);
     let count = match q.conversation_id.as_deref() {
         Some(cid) => store.active_count_for_conversation(&ConversationId::from(cid))?,
-        None => {
-            // Whole-DB count: list_all + filter rather than adding a
-            // fresh dedicated query. Active-job populations are tiny
-            // by construction (parallel_workers default 3), so the
-            // scan is cheap and avoids growing the JobStore surface.
-            store
-                .list_all()?
-                .iter()
-                .filter(|r| !r.status.is_terminal())
-                .count() as i64
-        }
+        None => store.active_count_global()?,
     };
     Ok(Json(ResearchActiveCountResponse {
         active_count: count,

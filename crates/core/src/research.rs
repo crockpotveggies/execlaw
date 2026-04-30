@@ -760,6 +760,25 @@ impl<'db> ResearchJobStore<'db> {
         })?;
         Ok(n)
     }
+
+    /// Count active rows across the entire DB. Drives the
+    /// `/api/admin/research/active_count` endpoint when no
+    /// conversation scope is given. SQL COUNT instead of
+    /// `list_all().filter()` so the operator dashboard's polling
+    /// stays O(active) on the index, not O(history).
+    pub fn active_count_global(&self) -> Result<i64, ResearchError> {
+        let n: i64 = self.db.with_conn(|c| {
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM state_research_jobs \
+                 WHERE status IN \
+                   ('pending', 'planning', 'planned', 'gathering', 'synthesizing')",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(n)
+        })?;
+        Ok(n)
+    }
 }
 
 fn row_to_research_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResearchJobRow> {
@@ -1453,6 +1472,82 @@ mod tests {
         let row = store.get(&id).unwrap().unwrap();
         assert_eq!(row.updated_at, 200);
         assert!(row.workspace_path.is_none());
+    }
+
+    #[test]
+    fn active_count_global_counts_only_non_terminal_rows() {
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        // Three rows: two active (Pending + Gathering after
+        // intermediate transitions), one terminal.
+        let cid = ConversationId::from("c-global");
+        let pending_id = ResearchJobId::new();
+        let active_id = ResearchJobId::new();
+        let done_id = ResearchJobId::new();
+        store
+            .insert_pending(&pending_id, &cid, "p", "Controller", None, 100)
+            .unwrap();
+        store
+            .insert_pending(&active_id, &cid, "a", "Controller", None, 110)
+            .unwrap();
+        store
+            .insert_pending(&done_id, &cid, "d", "Controller", None, 120)
+            .unwrap();
+        // Pull active_id forward into Gathering; pull done_id all
+        // the way through to a terminal row. pending_id stays in
+        // Pending.
+        store.claim_next_pending("c1", 130).unwrap();
+        store
+            .set_planned(
+                &pending_id,
+                &ResearchPlan {
+                    thesis: "t".into(),
+                    steps: vec![PlanStep {
+                        query: "q".into(),
+                        rationale: None,
+                    }],
+                },
+                131,
+            )
+            .ok();
+        store.claim_next_pending("c2", 140).unwrap();
+        store
+            .finish(&active_id, ResearchJobStatus::Complete, None, Some("a"), 150)
+            .ok();
+        store.claim_next_pending("c3", 160).unwrap();
+        store
+            .finish(&done_id, ResearchJobStatus::Failed, Some("err"), None, 170)
+            .ok();
+        // Whatever order claim_next_pending picks up these rows in,
+        // the active count should equal exactly the number of rows
+        // that haven't been driven to a terminal status. With the
+        // three transitions above, pending_id was advanced to
+        // Planned (active), and the other two reached terminal.
+        let active = store.active_count_global().unwrap();
+        assert_eq!(active, 1);
+    }
+
+    #[test]
+    fn active_count_global_zero_when_only_terminal_rows() {
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        let cid = ConversationId::from("c-only-done");
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(&id, &cid, "q", "Controller", None, 100)
+            .unwrap();
+        store.claim_next_pending("c", 110).unwrap();
+        store
+            .finish(&id, ResearchJobStatus::Complete, None, Some("att"), 200)
+            .unwrap();
+        assert_eq!(store.active_count_global().unwrap(), 0);
+    }
+
+    #[test]
+    fn active_count_global_zero_on_empty_table() {
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        assert_eq!(store.active_count_global().unwrap(), 0);
     }
 
     #[test]
