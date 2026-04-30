@@ -27,6 +27,8 @@ use execlaw_core::tool::{
     Capability, Clock, SystemClock, ToolCtx, ToolImpl, ToolOutcome,
 };
 use execlaw_core::tool_access::ToolAccessStore;
+use crate::tool_apis_http::HttpWebFetchApi;
+use crate::tool_apis_search::DuckDuckGoSearchApi;
 use execlaw_core::tool_apis::{
     DbConversationApi, DbMemoryApi, DbNotifyApi, DbScheduleApi,
 };
@@ -155,6 +157,8 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
         let needs_schedule = caps
             .iter()
             .any(|c| matches!(c, Capability::ScheduleRead | Capability::ScheduleWrite));
+        let needs_web_fetch = caps.iter().any(|c| matches!(c, Capability::WebFetch));
+        let needs_search = caps.iter().any(|c| matches!(c, Capability::Search));
         if needs_conv {
             ctx.conversation =
                 Some(Arc::new(DbConversationApi::new(db.clone(), conv_id.clone())));
@@ -177,6 +181,17 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
                 conv_id,
                 now,
             )));
+        }
+        if needs_web_fetch {
+            ctx.web_fetch = Some(Arc::new(HttpWebFetchApi::new()));
+        }
+        if needs_search {
+            // Default provider is DuckDuckGo. The forthcoming
+            // Settings → Search page will let operators pick a
+            // different provider; the dispatcher will read that
+            // selection and swap impls here without the tool body
+            // needing to change.
+            ctx.search = Some(Arc::new(DuckDuckGoSearchApi::new()));
         }
         Ok(ctx)
     }

@@ -22,7 +22,7 @@ use crate::routines::{
 };
 use crate::tool::{
     ApiError, ConversationApi, HistoryEntry, MemoryApi, MemoryListEntry, NotifyApi,
-    NotifyReceipt, NotifySeverity, RoutineSummary, ScheduleApi, ThreadInfo,
+    NotifyReceipt, NotifySeverity, RoutineSummary, ScheduleApi, ThreadInfo, ThreadListEntry,
 };
 use async_trait::async_trait;
 use rusqlite::params;
@@ -230,6 +230,27 @@ impl ConversationApi for DbConversationApi {
             });
         }
         Ok(out)
+    }
+
+    async fn list_threads(&self) -> Result<Vec<ThreadListEntry>, ApiError> {
+        let db = self.db.clone();
+        let rows = tokio::task::spawn_blocking(move || {
+            ConversationStore::new(&db).list_thread_summaries()
+        })
+        .await
+        .map_err(|e| ApiError::Storage(format!("join: {e}")))?
+        .map_err(|e| ApiError::Storage(format!("list_threads: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .filter(|s| !s.is_ephemeral)
+            .map(|s| ThreadListEntry {
+                conversation_id: s.conversation_id.as_str().to_owned(),
+                display_name: s.display_name,
+                trust_class: s.trust_class,
+                is_pinned: s.is_pinned,
+                last_activity_at: s.last_activity_at,
+            })
+            .collect())
     }
 }
 

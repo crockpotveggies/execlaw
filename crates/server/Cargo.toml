@@ -53,7 +53,9 @@ sha2.workspace = true
 # doesn't sneak back in. The `stream` feature was reserved for
 # barge-in but isn't used today; add it back if/when KokoroClient
 # ever consumes a streaming response body.
-reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls", "multipart"] }
+reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls", "multipart", "stream"] }
+url.workspace = true
+regex.workspace = true
 
 utoipa.workspace = true
 utoipa-axum.workspace = true

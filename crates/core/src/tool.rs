@@ -285,6 +285,8 @@ pub struct ToolCtx {
     pub memory: Option<Arc<dyn MemoryApi>>,
     pub notify: Option<Arc<dyn NotifyApi>>,
     pub schedule: Option<Arc<dyn ScheduleApi>>,
+    pub web_fetch: Option<Arc<dyn WebFetchApi>>,
+    pub search: Option<Arc<dyn WebSearchApi>>,
 }
 
 impl ToolCtx {
@@ -304,6 +306,8 @@ impl ToolCtx {
             memory: None,
             notify: None,
             schedule: None,
+            web_fetch: None,
+            search: None,
         }
     }
 }
@@ -374,6 +378,20 @@ pub struct ThreadInfo {
     pub display_name: Option<String>,
 }
 
+/// Compact thread summary returned by `ConversationApi::list_threads`.
+/// Mirrors the SPA sidebar's projection so the LLM-facing list and
+/// the operator-facing list stay in sync.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadListEntry {
+    pub conversation_id: String,
+    pub display_name: Option<String>,
+    pub trust_class: String,
+    pub is_pinned: bool,
+    /// Most recent activity (Unix-seconds). Lets the LLM sort
+    /// "what's been going on lately" without an extra round-trip.
+    pub last_activity_at: i64,
+}
+
 /// One entry in the chat-history view returned by
 /// [`ConversationApi::read_history`]. Internal/operational events
 /// (phase markers, voice frames, alerts) are filtered out at the
@@ -418,6 +436,12 @@ pub trait ConversationApi: Send + Sync {
         before_seq: Option<i64>,
         limit: u32,
     ) -> Result<Vec<HistoryEntry>, ApiError>;
+
+    /// List threads visible to the caller. Phase 1: returns every
+    /// non-ephemeral thread. Future trust-class scoping (a
+    /// `KnownTrusted` caller only seeing their own threads) lands in
+    /// a follow-up that goes alongside the principal-graph work.
+    async fn list_threads(&self) -> Result<Vec<ThreadListEntry>, ApiError>;
 }
 
 /// One memory key + its update timestamp. Returned by
@@ -555,6 +579,76 @@ pub trait ScheduleApi: Send + Sync {
     /// Delete a routine permanently. Returns `true` if a row was
     /// actually deleted, `false` if no routine matched the id.
     async fn delete_routine(&self, id: &str) -> Result<bool, ApiError>;
+}
+
+/// Result of a `WebFetchApi::get` — the response body capped at the
+/// implementation's size limit + the resolved final URL (in case of
+/// redirects) + the content-type the server returned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebFetchResponse {
+    pub final_url: String,
+    pub status: u16,
+    pub content_type: Option<String>,
+    /// UTF-8 lossily decoded body, truncated at the implementation's
+    /// size cap. Binary content (image/*, video/*, etc.) is rejected
+    /// before this point.
+    pub body: String,
+    /// `true` when the body was truncated at the size cap. The LLM
+    /// can decide whether to ask for the rest with a `range` arg in
+    /// a future iteration.
+    pub truncated: bool,
+}
+
+/// One search result returned by [`WebSearchApi::search`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchResult {
+    pub title: String,
+    pub url: String,
+    pub snippet: Option<String>,
+}
+
+/// Web-search capability backed by an operator-configured provider.
+///
+/// The trait is provider-agnostic by design: the implementation
+/// contains the per-vendor request shape (DuckDuckGo HTML scrape,
+/// Brave Search API, Exa, Tavily, Kagi, SearxNG, etc.) and the
+/// dispatcher swaps in whichever provider the operator chose in
+/// Settings → Search. Tools see only this trait surface.
+#[async_trait]
+pub trait WebSearchApi: Send + Sync {
+    /// Run a web search. `max_results` is a hint — the implementation
+    /// caps it to whatever the underlying provider's free-tier or
+    /// fair-use limit allows. Returns `Ok(empty)` (with a clear
+    /// metadata note in the tool wrapper) when no provider is
+    /// configured, rather than erroring — so the catalog stays
+    /// stable across operator setups.
+    async fn search(
+        &self,
+        query: &str,
+        max_results: u32,
+    ) -> Result<Vec<SearchResult>, ApiError>;
+
+    /// Identifier for the provider that ran this search (e.g.
+    /// `"duckduckgo"`, `"brave"`). Surfaced to the tool result so the
+    /// LLM can know which vendor answered.
+    fn provider_id(&self) -> &str;
+}
+
+/// Outbound HTTP capability. Implementations are responsible for SSRF
+/// defenses (reject private-network targets, file:// URLs, etc.) and
+/// for enforcing the operator's domain allowlist if one is configured.
+#[async_trait]
+pub trait WebFetchApi: Send + Sync {
+    /// Fetch a URL via HTTP GET. The implementation enforces:
+    ///   * scheme must be http or https
+    ///   * resolved IP must not be in private / loopback / link-local
+    ///     ranges (SSRF guard)
+    ///   * content-type must be text-y (text/*, application/json,
+    ///     application/xml; rejects binary)
+    ///   * response size capped (default 1 MiB; truncated body is
+    ///     flagged in the response)
+    ///   * 30s timeout
+    async fn get(&self, url: &str) -> Result<WebFetchResponse, ApiError>;
 }
 
 /// Memory API. Reads cascade from the caller's trust class downward

@@ -478,6 +478,75 @@ impl ToolImpl for ReadChatHistoryTool {
 }
 
 // ---------------------------------------------------------------
+// list_chats
+// ---------------------------------------------------------------
+
+pub struct ListChatsTool {
+    descriptor: ToolDescriptor,
+}
+
+impl Default for ListChatsTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ListChatsTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "list_chats".into(),
+                description:
+                    "List every non-ephemeral conversation thread visible to the caller, sorted \
+                     newest-first by last activity. Returns id, display name, trust class, \
+                     pinned flag, and last_activity_at. Use this to find a thread by name \
+                     before calling per-thread tools."
+                        .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Low,
+                capabilities: vec![Capability::ConversationRead],
+                default_allowed_classes: default_allowed_for_conversation_read(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for ListChatsTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, _args: Value) -> ToolOutcome {
+        let conv = match ctx.conversation.as_ref() {
+            Some(c) => c,
+            None => {
+                return ToolOutcome::denied(
+                    "conversation capability not granted to this tool",
+                );
+            }
+        };
+        match conv.list_threads().await {
+            Ok(rows) => ToolOutcome::Ok(json!({
+                "threads": rows.iter().map(|t| json!({
+                    "conversation_id": t.conversation_id,
+                    "display_name": t.display_name,
+                    "trust_class": t.trust_class,
+                    "is_pinned": t.is_pinned,
+                    "last_activity_at": t.last_activity_at,
+                })).collect::<Vec<_>>(),
+                "count": rows.len(),
+            })),
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------
 // get_thread
 // ---------------------------------------------------------------
 
@@ -1114,6 +1183,213 @@ impl ToolImpl for UpdateTaskTool {
 }
 
 // ---------------------------------------------------------------
+// web_fetch — HTTP GET against the wider internet, SSRF-guarded.
+// ---------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct WebFetchArgs {
+    url: String,
+}
+
+fn default_allowed_for_web_fetch() -> Vec<String> {
+    // Outbound HTTP touches the wider internet. Trust-class scoping
+    // here mirrors `read_chat_history` — Controller / Delegated /
+    // KnownTrusted / KnownLimited can call it; cold callers
+    // (`UnknownPending`) cannot. The implementation's SSRF guard +
+    // size cap + content-type allowlist provide the additional
+    // belt-and-braces.
+    vec![
+        "Controller".into(),
+        "Delegated".into(),
+        "KnownTrusted".into(),
+        "KnownLimited".into(),
+    ]
+}
+
+pub struct WebFetchTool {
+    descriptor: ToolDescriptor,
+}
+
+impl Default for WebFetchTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WebFetchTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "web_fetch".into(),
+                description:
+                    "Fetch a URL via HTTP GET and return the response body as text. Limited to \
+                     http(s); private/loopback/link-local addresses are rejected; binary \
+                     content types are rejected; the body is capped at 1 MiB. Useful for \
+                     reading articles, JSON APIs, RSS feeds, and other public textual content."
+                        .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "format": "uri",
+                            "description": "Absolute http or https URL to fetch."
+                        }
+                    },
+                    "required": ["url"],
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Medium,
+                capabilities: vec![Capability::WebFetch],
+                default_allowed_classes: default_allowed_for_web_fetch(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for WebFetchTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, args: Value) -> ToolOutcome {
+        let args: WebFetchArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolOutcome::err("invalid_argument", e.to_string()),
+        };
+        let api = match ctx.web_fetch.as_ref() {
+            Some(a) => a,
+            None => {
+                return ToolOutcome::denied(
+                    "web_fetch capability not granted to this tool",
+                );
+            }
+        };
+        match api.get(&args.url).await {
+            Ok(resp) => ToolOutcome::Ok(json!({
+                "final_url": resp.final_url,
+                "status": resp.status,
+                "content_type": resp.content_type,
+                "body": resp.body,
+                "truncated": resp.truncated,
+            })),
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// web_search — provider-pluggable; default DuckDuckGo (no API key).
+// ---------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct WebSearchArgs {
+    query: String,
+    #[serde(default = "default_search_max_results")]
+    max_results: u32,
+}
+
+fn default_search_max_results() -> u32 {
+    8
+}
+
+fn default_allowed_for_search() -> Vec<String> {
+    // Same allowlist semantic as web_fetch — search reaches the wider
+    // internet via whichever provider the operator chose.
+    vec![
+        "Controller".into(),
+        "Delegated".into(),
+        "KnownTrusted".into(),
+        "KnownLimited".into(),
+    ]
+}
+
+pub struct WebSearchTool {
+    descriptor: ToolDescriptor,
+}
+
+impl Default for WebSearchTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WebSearchTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "web_search".into(),
+                description:
+                    "Search the public web. Routes through the operator's configured search \
+                     provider (DuckDuckGo by default; Brave / Exa / Tavily / Kagi / SearxNG \
+                     selectable in Settings). Returns up to `max_results` items as \
+                     `[{title, url, snippet}]`."
+                        .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query."
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "default": 8,
+                            "minimum": 1,
+                            "maximum": 25
+                        }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Medium,
+                capabilities: vec![Capability::Search],
+                default_allowed_classes: default_allowed_for_search(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for WebSearchTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, args: Value) -> ToolOutcome {
+        let args: WebSearchArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolOutcome::err("invalid_argument", e.to_string()),
+        };
+        if args.query.trim().is_empty() {
+            return ToolOutcome::err("invalid_argument", "query is empty");
+        }
+        let api = match ctx.search.as_ref() {
+            Some(a) => a,
+            None => {
+                return ToolOutcome::denied(
+                    "search capability not granted to this tool",
+                );
+            }
+        };
+        let provider = api.provider_id().to_owned();
+        match api.search(&args.query, args.max_results.clamp(1, 25)).await {
+            Ok(results) => ToolOutcome::Ok(json!({
+                "provider": provider,
+                "results": results.iter().map(|r| json!({
+                    "title": r.title,
+                    "url": r.url,
+                    "snippet": r.snippet,
+                })).collect::<Vec<_>>(),
+                "count": results.len(),
+            })),
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------
 // Registrar
 // ---------------------------------------------------------------
 
@@ -1128,6 +1404,7 @@ pub fn core_builtin_tools() -> Vec<Arc<dyn ToolImpl>> {
         Arc::new(ListMemoryTool::new()),
         Arc::new(SetThreadNameTool::new()),
         Arc::new(GetThreadTool::new()),
+        Arc::new(ListChatsTool::new()),
         Arc::new(ReadChatHistoryTool::new()),
         Arc::new(NotifyControllerTool::new()),
         Arc::new(ScheduleTaskTool::new()),
@@ -1136,6 +1413,8 @@ pub fn core_builtin_tools() -> Vec<Arc<dyn ToolImpl>> {
         Arc::new(PauseTaskTool::new()),
         Arc::new(ResumeTaskTool::new()),
         Arc::new(UpdateTaskTool::new()),
+        Arc::new(WebFetchTool::new()),
+        Arc::new(WebSearchTool::new()),
     ]
 }
 
@@ -1264,7 +1543,10 @@ mod tests {
         assert!(names.contains(&"pause_task"));
         assert!(names.contains(&"resume_task"));
         assert!(names.contains(&"update_task"));
-        assert_eq!(names.len(), 13);
+        assert!(names.contains(&"web_fetch"));
+        assert!(names.contains(&"list_chats"));
+        assert!(names.contains(&"web_search"));
+        assert_eq!(names.len(), 16);
     }
 
     #[test]
@@ -1975,6 +2257,260 @@ mod tests {
         let cid = seed_conversation(&db, "s8");
         let ctx = build_ctx(&db, cid, "Controller", false, false);
         match ListTasksTool::new().invoke(ctx, json!({})).await {
+            ToolOutcome::Denied { .. } => {}
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    // --- web_fetch ----------------------------------------------------
+
+    use crate::tool::{WebFetchApi, WebFetchResponse};
+
+    /// Test stub for WebFetchApi — captures the URL the tool passed
+    /// in and lets the test inject a canned response. Avoids hitting
+    /// the network from `core`'s test suite.
+    struct StubWebFetchApi {
+        canned: WebFetchResponse,
+    }
+
+    #[async_trait]
+    impl WebFetchApi for StubWebFetchApi {
+        async fn get(&self, _url: &str) -> Result<WebFetchResponse, crate::tool::ApiError> {
+            Ok(self.canned.clone())
+        }
+    }
+
+    fn ctx_with_stub_web_fetch(
+        db: &Database,
+        cid: ConversationId,
+        canned: WebFetchResponse,
+    ) -> ToolCtx {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let mut ctx = ToolCtx::empty(cid, "Controller", clock);
+        ctx.web_fetch = Some(Arc::new(StubWebFetchApi { canned }));
+        let _ = db; // db handle isn't needed for the stub variant.
+        ctx
+    }
+
+    #[tokio::test]
+    async fn web_fetch_returns_body_on_success() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "w1");
+        let canned = WebFetchResponse {
+            final_url: "https://example.com/article".into(),
+            status: 200,
+            content_type: Some("text/html".into()),
+            body: "<html>hi</html>".into(),
+            truncated: false,
+        };
+        let ctx = ctx_with_stub_web_fetch(&db, cid, canned);
+        let out = WebFetchTool::new()
+            .invoke(ctx, json!({"url": "https://example.com/article"}))
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                assert_eq!(v["status"], 200);
+                assert_eq!(v["body"], "<html>hi</html>");
+                assert_eq!(v["truncated"], false);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_invalid_args_returns_err() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "w2");
+        let canned = WebFetchResponse {
+            final_url: "x".into(),
+            status: 0,
+            content_type: None,
+            body: "".into(),
+            truncated: false,
+        };
+        let ctx = ctx_with_stub_web_fetch(&db, cid, canned);
+        match WebFetchTool::new().invoke(ctx, json!({"u": "no"})).await {
+            ToolOutcome::Err { code, .. } => assert_eq!(code, "invalid_argument"),
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_denied_when_capability_missing() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "w3");
+        let ctx = build_ctx(&db, cid, "Controller", false, false);
+        match WebFetchTool::new()
+            .invoke(ctx, json!({"url": "https://example.com"}))
+            .await
+        {
+            ToolOutcome::Denied { reason } => {
+                assert!(reason.contains("web_fetch"));
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    // --- list_chats ---------------------------------------------------
+
+    #[tokio::test]
+    async fn list_chats_returns_every_visible_thread() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "lc1");
+        seed_conversation(&db, "lc2");
+        seed_conversation(&db, "lc3");
+        let tool = ListChatsTool::new();
+        let ctx = build_ctx(&db, cid, "Controller", true, false);
+        let out = tool.invoke(ctx, json!({})).await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                assert_eq!(v["count"], 3);
+                let ids: Vec<&str> = v["threads"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|t| t["conversation_id"].as_str())
+                    .collect();
+                assert!(ids.contains(&"lc1"));
+                assert!(ids.contains(&"lc2"));
+                assert!(ids.contains(&"lc3"));
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_chats_denied_when_capability_missing() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "lc4");
+        let ctx = build_ctx(&db, cid, "Controller", false, false);
+        match ListChatsTool::new().invoke(ctx, json!({})).await {
+            ToolOutcome::Denied { .. } => {}
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    // --- web_search ---------------------------------------------------
+
+    use crate::tool::{SearchResult, WebSearchApi};
+
+    struct StubSearchApi {
+        canned: Vec<SearchResult>,
+    }
+    #[async_trait]
+    impl WebSearchApi for StubSearchApi {
+        fn provider_id(&self) -> &str {
+            "stub"
+        }
+        async fn search(
+            &self,
+            _query: &str,
+            _max: u32,
+        ) -> Result<Vec<SearchResult>, crate::tool::ApiError> {
+            Ok(self.canned.clone())
+        }
+    }
+
+    fn ctx_with_stub_search(
+        db: &Database,
+        cid: ConversationId,
+        canned: Vec<SearchResult>,
+    ) -> ToolCtx {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let mut ctx = ToolCtx::empty(cid, "Controller", clock);
+        ctx.search = Some(Arc::new(StubSearchApi { canned }));
+        let _ = db;
+        ctx
+    }
+
+    #[tokio::test]
+    async fn web_search_returns_results_with_provider_label() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "ws1");
+        let canned = vec![
+            SearchResult {
+                title: "First".into(),
+                url: "https://example.com/1".into(),
+                snippet: Some("snippet 1".into()),
+            },
+            SearchResult {
+                title: "Second".into(),
+                url: "https://example.org/2".into(),
+                snippet: None,
+            },
+        ];
+        let ctx = ctx_with_stub_search(&db, cid, canned);
+        let out = WebSearchTool::new()
+            .invoke(ctx, json!({"query": "foo"}))
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                assert_eq!(v["provider"], "stub");
+                assert_eq!(v["count"], 2);
+                assert_eq!(v["results"][0]["title"], "First");
+                assert_eq!(v["results"][1]["snippet"], Value::Null);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_search_rejects_empty_query() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "ws2");
+        let ctx = ctx_with_stub_search(&db, cid, vec![]);
+        match WebSearchTool::new().invoke(ctx, json!({"query": "  "})).await {
+            ToolOutcome::Err { code, message } => {
+                assert_eq!(code, "invalid_argument");
+                assert!(message.contains("empty"));
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_search_clamps_max_results_to_25() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "ws3");
+        // Stub returns whatever the tool asked for so we can verify
+        // clamping by inspecting what reaches the trait.
+        struct ClampSpy {
+            captured: std::sync::Mutex<u32>,
+        }
+        #[async_trait]
+        impl WebSearchApi for ClampSpy {
+            fn provider_id(&self) -> &str {
+                "clamp"
+            }
+            async fn search(
+                &self,
+                _q: &str,
+                max: u32,
+            ) -> Result<Vec<SearchResult>, crate::tool::ApiError> {
+                *self.captured.lock().unwrap() = max;
+                Ok(vec![])
+            }
+        }
+        let spy = Arc::new(ClampSpy {
+            captured: std::sync::Mutex::new(0),
+        });
+        let mut ctx = ToolCtx::empty(cid, "Controller", Arc::new(SystemClock));
+        ctx.search = Some(spy.clone() as Arc<dyn WebSearchApi>);
+        WebSearchTool::new()
+            .invoke(ctx, json!({"query": "x", "max_results": 100}))
+            .await;
+        assert_eq!(*spy.captured.lock().unwrap(), 25);
+    }
+
+    #[tokio::test]
+    async fn web_search_denied_when_capability_missing() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "ws4");
+        let ctx = build_ctx(&db, cid, "Controller", false, false);
+        match WebSearchTool::new()
+            .invoke(ctx, json!({"query": "x"}))
+            .await
+        {
             ToolOutcome::Denied { .. } => {}
             other => panic!("expected Denied, got {other:?}"),
         }
