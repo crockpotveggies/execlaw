@@ -781,8 +781,11 @@ impl RunnerSupervisor {
             );
         }
 
-        // Push the Turn frame onto the runner's send queue.
-        let frame = ServerToRunner::Turn(request.clone());
+        // Push the Turn frame onto the runner's send queue. Box
+        // wrap matches the variant's signature post-2026-04-30
+        // (avoids inflating the enum past 312 bytes for every
+        // ServerToRunner value passing through tokio channels).
+        let frame = ServerToRunner::Turn(Box::new(request.clone()));
         send_to_runner(&handle, frame)
             .await
             .map_err(|_| ForwardError::RunnerGone)?;

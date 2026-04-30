@@ -71,8 +71,13 @@ pub struct RegistrationAck {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ServerToRunner {
     /// Run one turn. The runner streams progress back via
-    /// `RunnerToServer` frames keyed on the same `turn_id`.
-    Turn(TurnRequest),
+    /// `RunnerToServer` frames keyed on the same `turn_id`. Boxed
+    /// because `TurnRequest` carries 300+ bytes of context every
+    /// other variant doesn't — without indirection the enum
+    /// inflates every channel + Vec it passes through. Heap
+    /// allocation cost per Turn frame is negligible vs the JSON
+    /// encode + IPC the supervisor performs anyway.
+    Turn(Box<TurnRequest>),
 
     /// Cancel an in-flight turn. The runner aborts its current
     /// model+tool loop and emits a final `Error { reason:

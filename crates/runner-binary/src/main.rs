@@ -169,7 +169,7 @@ async fn handle_frame(
             let cancel_flags_for_drop = cancel_flags.clone();
             let tool_routes_for_drop = tool_routes.clone();
             tokio::spawn(async move {
-                let result = turn_loop::run_turn(tx.clone(), cancel, tool_rx, req).await;
+                let result = turn_loop::run_turn(tx.clone(), cancel, tool_rx, *req).await;
                 if let Err(e) = result {
                     tracing::error!(turn_id = %turn_id, error = %e, "turn failed");
                     let _ = tx.send(RunnerToServer::Error {
