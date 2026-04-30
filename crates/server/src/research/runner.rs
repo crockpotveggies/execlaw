@@ -125,6 +125,26 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
         cancel,
     } = ctx;
 
+    // Earliest pre-flight cancel check. The supervisor spawns this
+    // task fire-and-forget after claim_next_pending, so the gap
+    // between claim and runner pick-up can be milliseconds — long
+    // enough for an operator cancel to land. Short-circuit before
+    // we provision a workspace dir or hit the JobStore (the
+    // status-guarded set_workspace_path would also reject the
+    // cancelled row, but with a less-readable NotFound surface).
+    if cancel.is_cancelled() {
+        let final_row = {
+            let db = db.clone();
+            let id = job_id.clone();
+            tokio::task::spawn_blocking(move || ResearchJobStore::new(&db).get(&id))
+                .await
+                .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??
+        };
+        return final_row.ok_or_else(|| {
+            ResearchRunnerError::Store(ResearchError::NotFound(job_id.as_str().to_owned()))
+        });
+    }
+
     // The store calls below are sync; wrap them in spawn_blocking so
     // we don't stall the tokio executor on disk I/O. Cheap clone of
     // Database (it's Arc-wrapped internally).
@@ -209,6 +229,35 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
             return Err(ResearchRunnerError::NoInference);
         }
     };
+
+    // Pre-flight cancel check. Mirrors the synthesize phase: if the
+    // operator cancelled between supervisor.tick_once claiming the
+    // row and the planner picking it up (the supervisor spawns its
+    // task fire-and-forget, so the gap can be milliseconds), running
+    // the planner just burns tokens for a row whose card was
+    // already broadcast as Cancelled. Short-circuit silently — the
+    // cancel handler already did the bookkeeping.
+    if cancel.is_cancelled() {
+        tracing::info!(
+            job_id = job_id.as_str(),
+            card_id = %card_id,
+            "planner phase: cancellation observed at entry; skipping LLM call",
+        );
+        // Re-read the row so the caller still gets the (Cancelled)
+        // terminal state — the supervisor's spawn_runner_for treats
+        // Err returns as failures and logs them, so we want a clean
+        // Ok here.
+        let final_row = {
+            let db = db.clone();
+            let id = job_id.clone();
+            tokio::task::spawn_blocking(move || ResearchJobStore::new(&db).get(&id))
+                .await
+                .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??
+        };
+        return final_row.ok_or_else(|| {
+            ResearchRunnerError::Store(ResearchError::NotFound(job_id.as_str().to_owned()))
+        });
+    }
 
     let plan = match call_planner(&client, &model, &row.query).await {
         Ok(p) => p,
@@ -1211,5 +1260,105 @@ mod tests {
         let row = store.get(&id).unwrap().unwrap();
         assert_eq!(row.status, ResearchJobStatus::Cancelled);
         assert_eq!(row.error.as_deref(), Some("operator note"));
+    }
+
+    /// Adversarial: an operator cancel that lands BEFORE run_job
+    /// reaches the planner LLM call must short-circuit — the
+    /// supervisor's tick spawns the runner fire-and-forget, so an
+    /// immediate cancel can land in that window. Without the
+    /// pre-flight check the planner would still run the LLM call
+    /// (multi-second token spend) for a row whose card was already
+    /// broadcast as Cancelled.
+    ///
+    /// Wires the inference client at a closed port so a missed
+    /// pre-flight check would surface as a connect error instead of
+    /// a clean Ok.
+    #[tokio::test]
+    async fn run_job_short_circuits_when_cancelled_before_planner_call() {
+        use crate::events::EventBus;
+        use crate::research::workspace::ResearchWorkspace;
+        use execlaw_core::Database;
+        use execlaw_core::cards::{CardKind, CardOpenedPayload, CardState};
+        use execlaw_core::conversation::{
+            ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
+        };
+        use execlaw_core::db::DbConfig;
+        use execlaw_core::ids::{ConversationId, EventSeq};
+        use execlaw_core::migrations::MigrationRunner;
+        use execlaw_core::research::{ResearchJobStatus, ResearchJobStore};
+
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let cid = ConversationId::from("conv-pre-planner-cancel");
+        ConversationStore::new(&db)
+            .upsert(&ConversationRow {
+                conversation_id: cid.clone(),
+                kind: ConversationKind::ControllerDM,
+                last_seq: EventSeq(0),
+                phase: Phase::Idle,
+                controller_id: None,
+                trust_class: "Controller".into(),
+                snapshot_blob: None,
+                snapshot_seq: None,
+                lease_owner: None,
+                lease_expires: None,
+                modality: Modality::Text,
+                display_name: None,
+                is_pinned: false,
+                is_ephemeral: false,
+                ephemeral_expires_at: None,
+                last_activity_at: 0,
+            })
+            .unwrap();
+        let id = ResearchJobId::new();
+        let store = ResearchJobStore::new(&db);
+        store
+            .insert_pending(&id, &cid, "q", "Controller", None, 100)
+            .unwrap();
+        // Mirror the supervisor: claim the row + cancel before the
+        // runner picks it up.
+        store.claim_next_pending("card-pre-cancel", 110).unwrap();
+        store.cancel_active(&id, Some("operator"), 120).unwrap();
+
+        // Open the card so the early-exit's row re-read finds an
+        // intact projection.
+        crate::cards::open_card(
+            &db,
+            &cid,
+            "system",
+            &CardOpenedPayload {
+                card_id: "card-pre-cancel".into(),
+                kind: CardKind::Research,
+                title: "t".into(),
+                summary: "s".into(),
+                state: Some(CardState::Running),
+                details: serde_json::json!({}),
+                actions: vec![],
+            },
+        )
+        .unwrap();
+
+        // Inference client at port 0 — any LLM call would error
+        // distinguishably. The pre-flight check must fire before
+        // we reach this address.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = JobRunCtx {
+            db: db.clone(),
+            job_id: id.clone(),
+            workspace: ResearchWorkspace::new(tmp.path()),
+            inference: Some((
+                Arc::new(InferenceClient::new("http://127.0.0.1:0/v1")),
+                "test-model".into(),
+            )),
+            events: EventBus::new(),
+            cancel,
+        };
+
+        let row = run_job(ctx).await.expect("must short-circuit cleanly");
+        assert_eq!(row.status, ResearchJobStatus::Cancelled);
+        assert_eq!(row.error.as_deref(), Some("operator"));
+        assert!(row.attachment_id.is_none());
     }
 }
