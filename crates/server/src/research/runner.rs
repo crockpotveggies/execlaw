@@ -230,13 +230,13 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
         }
     };
 
-    // Pre-flight cancel check. Mirrors the synthesize phase: if the
-    // operator cancelled between supervisor.tick_once claiming the
-    // row and the planner picking it up (the supervisor spawns its
-    // task fire-and-forget, so the gap can be milliseconds), running
-    // the planner just burns tokens for a row whose card was
-    // already broadcast as Cancelled. Short-circuit silently — the
-    // cancel handler already did the bookkeeping.
+    // Second pre-flight cancel check (the first is at the top of
+    // run_job). Catches a cancel that races the workspace
+    // provision + open_card_and_broadcast block above — those are
+    // all sub-millisecond, but a cancel observably ordered after
+    // the first check is still possible. Skipping here saves the
+    // multi-second planner LLM call against a row whose card was
+    // already broadcast as Cancelled.
     if cancel.is_cancelled() {
         tracing::info!(
             job_id = job_id.as_str(),
