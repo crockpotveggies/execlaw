@@ -868,11 +868,11 @@ pub(crate) async fn run_runner_turn(
 
     // Step 3 — build TurnRequest.
     let turn_id = supervisor.mint_turn_id();
-    let inference_url = state
+    let inference_client_for_subagents = state
         .inference
         .resolve(&state.db, BackendPurpose::Standard)
-        .map(|c| c.base_url.clone())
         .ok_or_else(|| "no inference backend configured".to_owned())?;
+    let inference_url = inference_client_for_subagents.base_url.clone();
     // The supervisor resolved the URL from the SERVER's network
     // namespace (likely `http://127.0.0.1:8101/v1` for a local
     // vLLM). Inside a runner container, `127.0.0.1` resolves to
@@ -963,7 +963,14 @@ pub(crate) async fn run_runner_turn(
             state.db.clone(),
         )
         .with_mcp(state.mcp_host.clone())
-        .with_conversation(cid.clone()),
+        .with_conversation(cid.clone())
+        // 2026-04-29 — wire the per-turn inference client + model
+        // so subagent-spawning tools (`delegate_task`) can fire
+        // child LLM calls against the parent's backend.
+        .with_inference(
+            inference_client_for_subagents.clone(),
+            state.config.model_id.clone(),
+        ),
     );
 
     // Step 3.5 — lazy-spawn the runner if it's not registered yet.
@@ -1164,7 +1171,11 @@ async fn run_tool_capable_turn(
         .with_mcp(state.mcp_host.clone())
         // 2026-04-29 — let registry-based built-ins resolve a
         // capability-scoped ToolCtx from this conversation.
-        .with_conversation(cid.clone()),
+        .with_conversation(cid.clone())
+        // 2026-04-29 — wire the inference client + model so
+        // `delegate_task` and any future SubagentSpawn-capability
+        // tools have a live child-LLM path for this turn.
+        .with_inference(inference.clone(), state.config.model_id.clone()),
     );
     let exec = TurnExecutor::new((*inference).clone(), dispatch);
     // Phase 11.A — wire a phase observer that fans the runner's

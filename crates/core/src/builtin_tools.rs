@@ -28,8 +28,8 @@
 //! 2026-04-29.
 
 use crate::tool::{
-    Capability, NotifySeverity, RoutineSummary, ToolCtx, ToolDescriptor, ToolImpl,
-    ToolLatency, ToolOutcome, ToolSource,
+    Capability, NotifySeverity, RoutineSummary, SubagentRequest, ToolCtx,
+    ToolDescriptor, ToolImpl, ToolLatency, ToolOutcome, ToolSource,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -1390,6 +1390,115 @@ impl ToolImpl for WebSearchTool {
 }
 
 // ---------------------------------------------------------------
+// delegate_task — synchronous subagent call (child LLM turn).
+// ---------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct DelegateTaskArgs {
+    task: String,
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+}
+
+fn default_allowed_for_subagent_spawn() -> Vec<String> {
+    // Subagent spawning is a model-loop multiplier — allow only
+    // trusted callers. Operator can broaden in Settings → Tools if
+    // a workflow needs it.
+    vec!["Controller".into(), "Delegated".into()]
+}
+
+pub struct DelegateTaskTool {
+    descriptor: ToolDescriptor,
+}
+
+impl Default for DelegateTaskTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DelegateTaskTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "delegate_task".into(),
+                description:
+                    "Spawn a subagent (child LLM call) for a focused sub-task. The parent's \
+                     turn pauses until the subagent returns its text reply. Use this to \
+                     delegate work that benefits from context isolation — drafting, summarising \
+                     a long excerpt, formatting structured output. For multi-minute background \
+                     work use the research tools instead."
+                        .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "description": "What the subagent should do (the prompt)."
+                        },
+                        "context": {
+                            "type": ["string", "null"],
+                            "description": "Optional context attached verbatim ahead of the task."
+                        },
+                        "max_tokens": {
+                            "type": ["integer", "null"],
+                            "minimum": 1,
+                            "maximum": 4096,
+                            "description": "Cap on the subagent's reply length."
+                        }
+                    },
+                    "required": ["task"],
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::High,
+                capabilities: vec![Capability::SubagentSpawn],
+                default_allowed_classes: default_allowed_for_subagent_spawn(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for DelegateTaskTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, args: Value) -> ToolOutcome {
+        let args: DelegateTaskArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolOutcome::err("invalid_argument", e.to_string()),
+        };
+        if args.task.trim().is_empty() {
+            return ToolOutcome::err("invalid_argument", "task is empty");
+        }
+        let api = match ctx.subagent.as_ref() {
+            Some(a) => a,
+            None => {
+                return ToolOutcome::denied(
+                    "subagent capability not granted to this tool",
+                );
+            }
+        };
+        let req = SubagentRequest {
+            task: args.task,
+            context: args.context,
+            max_tokens: args.max_tokens.map(|n| n.min(4096)),
+        };
+        match api.delegate(&req).await {
+            Ok(resp) => ToolOutcome::Ok(json!({
+                "task_id": resp.task_id,
+                "text": resp.text,
+                "tokens_used": resp.tokens_used,
+            })),
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------
 // Registrar
 // ---------------------------------------------------------------
 
@@ -1415,6 +1524,7 @@ pub fn core_builtin_tools() -> Vec<Arc<dyn ToolImpl>> {
         Arc::new(UpdateTaskTool::new()),
         Arc::new(WebFetchTool::new()),
         Arc::new(WebSearchTool::new()),
+        Arc::new(DelegateTaskTool::new()),
     ]
 }
 
@@ -1546,7 +1656,8 @@ mod tests {
         assert!(names.contains(&"web_fetch"));
         assert!(names.contains(&"list_chats"));
         assert!(names.contains(&"web_search"));
-        assert_eq!(names.len(), 16);
+        assert!(names.contains(&"delegate_task"));
+        assert_eq!(names.len(), 17);
     }
 
     #[test]
@@ -2514,5 +2625,129 @@ mod tests {
             ToolOutcome::Denied { .. } => {}
             other => panic!("expected Denied, got {other:?}"),
         }
+    }
+
+    // --- delegate_task ------------------------------------------------
+
+    use crate::tool::{SubagentApi, SubagentRequest, SubagentResponse};
+
+    struct StubSubagentApi {
+        canned: SubagentResponse,
+    }
+
+    #[async_trait]
+    impl SubagentApi for StubSubagentApi {
+        async fn delegate(
+            &self,
+            _req: &SubagentRequest,
+        ) -> Result<SubagentResponse, crate::tool::ApiError> {
+            Ok(self.canned.clone())
+        }
+    }
+
+    fn ctx_with_stub_subagent(
+        db: &Database,
+        cid: ConversationId,
+        canned: SubagentResponse,
+    ) -> ToolCtx {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let mut ctx = ToolCtx::empty(cid, "Controller", clock);
+        ctx.subagent = Some(Arc::new(StubSubagentApi { canned }));
+        let _ = db;
+        ctx
+    }
+
+    #[tokio::test]
+    async fn delegate_task_returns_text_with_task_id() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "d1");
+        let canned = SubagentResponse {
+            text: "draft body here".into(),
+            task_id: "abc-123".into(),
+            tokens_used: Some(42),
+        };
+        let ctx = ctx_with_stub_subagent(&db, cid, canned);
+        let out = DelegateTaskTool::new()
+            .invoke(ctx, json!({"task": "draft an email"}))
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                assert_eq!(v["text"], "draft body here");
+                assert_eq!(v["task_id"], "abc-123");
+                assert_eq!(v["tokens_used"], 42);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_task_rejects_empty_task() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "d2");
+        let canned = SubagentResponse {
+            text: "".into(),
+            task_id: "x".into(),
+            tokens_used: None,
+        };
+        let ctx = ctx_with_stub_subagent(&db, cid, canned);
+        match DelegateTaskTool::new()
+            .invoke(ctx, json!({"task": "  "}))
+            .await
+        {
+            ToolOutcome::Err { code, .. } => assert_eq!(code, "invalid_argument"),
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_task_denied_when_capability_missing() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "d3");
+        let ctx = build_ctx(&db, cid, "Controller", false, false);
+        match DelegateTaskTool::new()
+            .invoke(ctx, json!({"task": "x"}))
+            .await
+        {
+            ToolOutcome::Denied { reason } => {
+                assert!(reason.contains("subagent"));
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_task_caps_max_tokens_to_4096() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "d4");
+        // Spy that captures the request's max_tokens.
+        struct CaptureSpy {
+            captured: std::sync::Mutex<Option<u32>>,
+        }
+        #[async_trait]
+        impl SubagentApi for CaptureSpy {
+            async fn delegate(
+                &self,
+                req: &SubagentRequest,
+            ) -> Result<SubagentResponse, crate::tool::ApiError> {
+                *self.captured.lock().unwrap() = req.max_tokens;
+                Ok(SubagentResponse {
+                    text: "ok".into(),
+                    task_id: "id".into(),
+                    tokens_used: None,
+                })
+            }
+        }
+        let spy = Arc::new(CaptureSpy {
+            captured: std::sync::Mutex::new(None),
+        });
+        let mut ctx = ToolCtx::empty(cid, "Controller", Arc::new(SystemClock));
+        ctx.subagent = Some(spy.clone() as Arc<dyn SubagentApi>);
+        DelegateTaskTool::new()
+            .invoke(
+                ctx,
+                json!({"task": "x", "max_tokens": 10_000}),
+            )
+            .await;
+        assert_eq!(*spy.captured.lock().unwrap(), Some(4096));
     }
 }

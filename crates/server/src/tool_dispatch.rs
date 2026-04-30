@@ -29,9 +29,11 @@ use execlaw_core::tool::{
 use execlaw_core::tool_access::ToolAccessStore;
 use crate::tool_apis_http::HttpWebFetchApi;
 use crate::tool_apis_search::DuckDuckGoSearchApi;
+use crate::tool_apis_subagent::InferenceSubagentApi;
 use execlaw_core::tool_apis::{
     DbConversationApi, DbMemoryApi, DbNotifyApi, DbScheduleApi,
 };
+use execlaw_inference_api::InferenceClient;
 use execlaw_core::Database;
 use execlaw_plugin_host::{BuiltinTools, PluginHost};
 use execlaw_policy::trust::TrustLevel;
@@ -65,6 +67,13 @@ pub struct ChainedToolDispatch<B: BuiltinTools> {
     /// Clock for `ToolCtx`. Defaults to `SystemClock`; tests can
     /// override via [`Self::with_clock`].
     pub clock: Arc<dyn Clock>,
+    /// 2026-04-29 — inference client + model id used to construct
+    /// `InferenceSubagentApi` when a tool's descriptor declares
+    /// `Capability::SubagentSpawn`. `None` means "no subagent
+    /// capability available this turn" — the dispatcher omits
+    /// `ctx.subagent` and the tool falls into the standard
+    /// "capability not granted" denial.
+    pub inference: Option<(Arc<InferenceClient>, String)>,
 }
 
 impl<B: BuiltinTools> ChainedToolDispatch<B> {
@@ -81,6 +90,7 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             mcp_host: None,
             conversation_id: None,
             clock: Arc::new(SystemClock),
+            inference: None,
         }
     }
 
@@ -103,6 +113,7 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             mcp_host: None,
             conversation_id: None,
             clock: Arc::new(SystemClock),
+            inference: None,
         }
     }
 
@@ -130,11 +141,26 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
         self
     }
 
+    /// Attach the per-turn inference client + model so subagent-
+    /// spawning tools (`delegate_task`) can fire child LLM calls
+    /// against the parent's backend. Without this, the dispatcher
+    /// omits `ctx.subagent` and any subagent tool returns a
+    /// `Denied("subagent capability not granted")`.
+    pub fn with_inference(
+        mut self,
+        client: Arc<InferenceClient>,
+        model: impl Into<String>,
+    ) -> Self {
+        self.inference = Some((client, model.into()));
+        self
+    }
+
     /// Build a `ToolCtx` populated with exactly the capability APIs
     /// the tool's descriptor declared. A tool that didn't request
     /// `MemoryRead`/`Write` gets `ctx.memory == None` and either
     /// returns `Denied` from its own body or simply never reaches a
     /// memory call.
+    #[allow(clippy::too_many_lines)]
     fn build_ctx_for(&self, tool: &Arc<dyn ToolImpl>) -> Result<ToolCtx, String> {
         let conv_id = self
             .conversation_id
@@ -159,6 +185,7 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             .any(|c| matches!(c, Capability::ScheduleRead | Capability::ScheduleWrite));
         let needs_web_fetch = caps.iter().any(|c| matches!(c, Capability::WebFetch));
         let needs_search = caps.iter().any(|c| matches!(c, Capability::Search));
+        let needs_subagent = caps.iter().any(|c| matches!(c, Capability::SubagentSpawn));
         if needs_conv {
             ctx.conversation =
                 Some(Arc::new(DbConversationApi::new(db.clone(), conv_id.clone())));
@@ -192,6 +219,20 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             // selection and swap impls here without the tool body
             // needing to change.
             ctx.search = Some(Arc::new(DuckDuckGoSearchApi::new()));
+        }
+        if needs_subagent {
+            if let Some((client, model)) = self.inference.as_ref() {
+                ctx.subagent = Some(Arc::new(InferenceSubagentApi::new(
+                    client.clone(),
+                    model.clone(),
+                    self.host.db().clone(),
+                    ctx.conversation_id.clone(),
+                )));
+            }
+            // When `inference` isn't wired (test fixture / no
+            // backend resolved this turn), we leave `ctx.subagent
+            // == None` and the tool falls into its own "capability
+            // not granted" denial.
         }
         Ok(ctx)
     }

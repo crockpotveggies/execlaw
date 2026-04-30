@@ -45,6 +45,7 @@ pub mod setup_preflight;
 pub mod state;
 pub mod tool_apis_http;
 pub mod tool_apis_search;
+pub mod tool_apis_subagent;
 pub mod tool_dispatch;
 pub mod tool_sync;
 pub mod tools_admin;

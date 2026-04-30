@@ -69,6 +69,12 @@ pub enum EventKind {
     CardOpened,
     CardProgressed,
     CardClosed,
+    /// 2026-04-29 — subagent lifecycle (synchronous in-turn child
+    /// LLM call). The SPA's typing-indicator pill subscribes to
+    /// these so the operator sees "subagent: <task>" while the
+    /// parent is mid-turn waiting for the child.
+    SubagentStarted,
+    SubagentCompleted,
     /// Escape hatch for future additions that predate this enum. The payload
     /// contains the original kind string.
     Other,
@@ -118,6 +124,8 @@ impl EventKind {
             EventKind::CardOpened => "card.opened",
             EventKind::CardProgressed => "card.progressed",
             EventKind::CardClosed => "card.closed",
+            EventKind::SubagentStarted => "subagent.started",
+            EventKind::SubagentCompleted => "subagent.completed",
             EventKind::Other => "other",
         }
     }
@@ -164,6 +172,8 @@ impl EventKind {
             "card.opened" => EventKind::CardOpened,
             "card.progressed" => EventKind::CardProgressed,
             "card.closed" => EventKind::CardClosed,
+            "subagent.started" => EventKind::SubagentStarted,
+            "subagent.completed" => EventKind::SubagentCompleted,
             _ => EventKind::Other,
         }
     }

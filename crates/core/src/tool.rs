@@ -287,6 +287,7 @@ pub struct ToolCtx {
     pub schedule: Option<Arc<dyn ScheduleApi>>,
     pub web_fetch: Option<Arc<dyn WebFetchApi>>,
     pub search: Option<Arc<dyn WebSearchApi>>,
+    pub subagent: Option<Arc<dyn SubagentApi>>,
 }
 
 impl ToolCtx {
@@ -308,6 +309,7 @@ impl ToolCtx {
             schedule: None,
             web_fetch: None,
             search: None,
+            subagent: None,
         }
     }
 }
@@ -632,6 +634,55 @@ pub trait WebSearchApi: Send + Sync {
     /// `"duckduckgo"`, `"brave"`). Surfaced to the tool result so the
     /// LLM can know which vendor answered.
     fn provider_id(&self) -> &str;
+}
+
+/// One subagent turn — a child LLM call the parent agent fires off
+/// for a bounded sub-task. Synchronous: the parent's turn blocks
+/// until the subagent returns. Use [`crate::cards`] + a job runner
+/// for async work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentRequest {
+    /// The sub-task prompt — what the parent wants the child to do.
+    pub task: String,
+    /// Optional context the parent attaches verbatim ahead of the
+    /// task prompt (relevant excerpts, prior decisions, etc.).
+    pub context: Option<String>,
+    /// Token budget for the child's reply. Implementations cap to a
+    /// reasonable upper bound regardless.
+    pub max_tokens: Option<u32>,
+}
+
+/// Result of a [`SubagentApi::delegate`] call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentResponse {
+    /// Plain text the child produced.
+    pub text: String,
+    /// Stable id the runtime emits to the WS event bus alongside
+    /// `SubagentStarted` / `SubagentCompleted`. Lets the SPA's
+    /// typing-indicator pill show "subagent: <task>" while the
+    /// parent waits.
+    pub task_id: String,
+    /// Tokens consumed (best-effort — the inference backend's
+    /// usage block may be missing).
+    pub tokens_used: Option<u32>,
+}
+
+/// Subagent-spawn capability. Implementation makes a child LLM call
+/// against the parent's inference backend with a focused prompt
+/// (system prompt + optional context + task), waits for the
+/// completion, and returns the text. Synchronous; the parent's
+/// turn is paused for the duration.
+///
+/// For async / multi-minute work that the operator should be able
+/// to inspect mid-flight, use a job-system path (see
+/// `crate::cards`) instead — subagents are NOT the right primitive
+/// for long-running tasks.
+#[async_trait]
+pub trait SubagentApi: Send + Sync {
+    async fn delegate(
+        &self,
+        req: &SubagentRequest,
+    ) -> Result<SubagentResponse, ApiError>;
 }
 
 /// Outbound HTTP capability. Implementations are responsible for SSRF
