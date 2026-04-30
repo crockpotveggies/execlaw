@@ -1267,6 +1267,22 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         (None, None)
     };
 
+    // Construct the research supervisor BEFORE AppState so the
+    // admin endpoints (which carry an `AppState` clone) can reach
+    // its `cancel_tokens` registry. C6c — this is what closes the
+    // gap where the cancel admin endpoint flipped the DB row but
+    // the gather phase kept burning tokens.
+    let research_workspace = execlaw_server::research::ResearchWorkspace::new(
+        execlaw_server::research::ResearchWorkspace::default_root(),
+    );
+    let research_supervisor = execlaw_server::research::ResearchSupervisor::new(
+        db.clone(),
+        inference.clone(),
+        research_workspace.clone(),
+        config.model_id.clone(),
+        events.clone(),
+    );
+
     let state = execlaw_server::AppState {
         db: db.clone(),
         config: config.clone(),
@@ -1283,6 +1299,7 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         voice_runtime,
         turn_cancel: execlaw_server::turn_cancel::TurnCancellationRegistry::new(),
         runner_supervisor: runner_supervisor.clone(),
+        research_supervisor: Some(research_supervisor.clone()),
     };
 
     // Phase-7 background workers — run for the lifetime of the
@@ -1331,24 +1348,17 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     // mirrors the chat path's default; per-purpose routing lands
     // when the runner grows modality-aware backend selection.
     {
-        let workspace = execlaw_server::research::ResearchWorkspace::new(
-            execlaw_server::research::ResearchWorkspace::default_root(),
-        );
-        let supervisor = execlaw_server::research::ResearchSupervisor::new(
-            state.db.clone(),
-            state.inference.clone(),
-            workspace.clone(),
-            state.config.model_id.clone(),
-            state.events.clone(),
-        );
         let stop = sweep_stop.clone();
+        let supervisor = research_supervisor.clone();
         tokio::spawn(async move { supervisor.run(stop).await });
 
         // C6 — research-retention sweeper. Purges terminal rows
         // past the global `history_retention_days` cutoff and
         // removes their workspace dirs. Hourly tick by default.
-        let retention_sweeper =
-            execlaw_server::research::ResearchRetentionSweeper::new(state.db.clone(), workspace);
+        let retention_sweeper = execlaw_server::research::ResearchRetentionSweeper::new(
+            state.db.clone(),
+            research_workspace,
+        );
         let stop = sweep_stop.clone();
         tokio::spawn(async move { retention_sweeper.run(stop).await });
     }

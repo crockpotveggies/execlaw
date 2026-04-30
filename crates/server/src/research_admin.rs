@@ -314,6 +314,17 @@ pub async fn cancel_job_handler(
         now,
     )?;
     if cancelled {
+        // C6c — short-circuit any in-flight gather phase. Without
+        // this signal the row flips to Cancelled but the spawned
+        // runner keeps spending tokens until its phase finishes.
+        // The token lookup goes through the supervisor's registry
+        // — `None` is fine (job already finished, or the
+        // supervisor isn't wired in this fixture).
+        if let Some(supervisor) = state.research_supervisor.as_ref()
+            && let Some(token) = supervisor.cancel_token_for(id.as_str())
+        {
+            token.cancel();
+        }
         // Mirror the runner's lifecycle by closing the card so the
         // SPA flips inline-render from live to the final summary
         // and the WS subscribers see the terminal state.
@@ -421,6 +432,18 @@ pub async fn advance_job_handler(
 
     // Spawn the next phase off the request handler — the LLM call
     // is multi-second and the operator's UI shouldn't block on it.
+    // Mint + register a cancellation token so a subsequent
+    // /cancel call can short-circuit the gather phase. The token
+    // lands on the live `ResearchSupervisor`'s registry; the
+    // /cancel handler looks it up by job id and `.cancel()`s it.
+    // Without registration, the cancel endpoint flips the row but
+    // the gather phase keeps spending tokens.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    if let Some(supervisor) = state.research_supervisor.as_ref() {
+        supervisor
+            .cancel_tokens
+            .insert(id.as_str().to_owned(), cancel.clone());
+    }
     let phase_deps = crate::research::runner::PhaseDeps {
         db: state.db.clone(),
         events: state.events.clone(),
@@ -429,6 +452,7 @@ pub async fn advance_job_handler(
         card_id,
         inference,
         model,
+        cancel: cancel.clone(),
     };
     let db_for_notes = state.db.clone();
     let id_for_task = id.clone();
@@ -821,6 +845,88 @@ mod tests {
             execlaw_core::research::ResearchJobStatus::Cancelled,
         );
         assert_eq!(row.error.as_deref(), Some("test cancel"));
+    }
+
+    #[tokio::test]
+    async fn cancel_endpoint_fires_live_cancel_token_when_present() {
+        // C6c invariant: an active row's cancel call must propagate
+        // .cancel() to the supervisor's registered token so the
+        // gather phase actually short-circuits (rather than just
+        // flipping the DB row while the runner keeps spending
+        // tokens). Test a synthesized supervisor + token rather
+        // than driving a full runner: insert a row in Planning,
+        // register a token in the supervisor's cancel_tokens map,
+        // hit /cancel, assert the token is now cancelled.
+        use crate::research::ResearchSupervisor;
+        use crate::research::ResearchWorkspace;
+        let mut state = test_app_state();
+        let cid = seed_conv(&state, "conv-cancel-fires");
+        let store = ResearchJobStore::new(&state.db);
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(&id, &cid, "q", "Controller", None, 100)
+            .unwrap();
+        store.claim_next_pending("c", 110).unwrap();
+        // Build a supervisor + register a token under this job.
+        let tmp = tempfile::tempdir().unwrap();
+        let supervisor = ResearchSupervisor::new(
+            state.db.clone(),
+            state.inference.clone(),
+            ResearchWorkspace::new(tmp.path()),
+            "test-model".into(),
+            state.events.clone(),
+        );
+        let token = tokio_util::sync::CancellationToken::new();
+        supervisor
+            .cancel_tokens
+            .insert(id.as_str().to_owned(), token.clone());
+        state.research_supervisor = Some(supervisor.clone());
+        // Pre-cancel: token is NOT cancelled.
+        assert!(!token.is_cancelled());
+        let app = build_router(state);
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/admin/research/jobs/{}/cancel", id.as_str()))
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({}).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Token is now cancelled — gather workers checking
+        // `cancel.is_cancelled()` will exit at their next checkpoint.
+        assert!(
+            token.is_cancelled(),
+            "cancel endpoint must fire the registered token",
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_endpoint_no_op_on_token_when_no_supervisor_wired() {
+        // Defensive: when state.research_supervisor is None (test
+        // fixture, or a future runtime mode that disables the
+        // supervisor), the cancel endpoint must still flip the DB
+        // row cleanly. The token-fire branch is just skipped.
+        let state = test_app_state();
+        // No research_supervisor wired (matches test_app_state
+        // default). The endpoint should still succeed.
+        let cid = seed_conv(&state, "conv-cancel-no-sup");
+        let id = ResearchJobId::new();
+        ResearchJobStore::new(&state.db)
+            .insert_pending(&id, &cid, "q", "Controller", None, 100)
+            .unwrap();
+        let app = build_router(state);
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/admin/research/jobs/{}/cancel", id.as_str()))
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({}).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

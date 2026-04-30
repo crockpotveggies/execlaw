@@ -129,6 +129,12 @@ pub struct AppState {
     /// the chat path forwards turns to the runner instead of
     /// running them in-process.
     pub runner_supervisor: Option<crate::runner_supervisor::RunnerSupervisor>,
+    /// C6c — handle to the deep-research supervisor so the
+    /// `/api/admin/research/jobs/{id}/cancel` endpoint can reach
+    /// `cancel_tokens` and short-circuit the live gather phase.
+    /// `None` only in test fixtures that don't construct the
+    /// supervisor (production cmd_serve always wires this up).
+    pub research_supervisor: Option<crate::research::ResearchSupervisor>,
 }
 
 impl std::fmt::Debug for AppState {

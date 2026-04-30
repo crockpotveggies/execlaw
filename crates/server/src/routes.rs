@@ -823,6 +823,10 @@ pub fn test_app_state() -> AppState {
         ),
         turn_cancel: crate::turn_cancel::TurnCancellationRegistry::new(),
         runner_supervisor: None,
+        // Test fixtures don't drive a live research supervisor —
+        // tests that exercise the cancel-token registry construct
+        // a mock supervisor and inject it manually.
+        research_supervisor: None,
     }
 }
 

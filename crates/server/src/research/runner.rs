@@ -80,6 +80,13 @@ pub struct JobRunCtx {
     /// log first, then publish here so a WS-side miss can always
     /// re-project from the durable log.
     pub events: EventBus,
+    /// Cancellation token the supervisor minted + registered in
+    /// `ResearchSupervisor::cancel_tokens`. The cancel admin
+    /// endpoint calls `.cancel()` on the same token, which makes
+    /// the gather workers exit cooperatively at their next
+    /// checkpoint (between sub-queries / between HTTP calls /
+    /// before the subagent call).
+    pub cancel: CancellationToken,
 }
 
 /// System prompt for the planner LLM call. Asks for a strict JSON
@@ -115,6 +122,7 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
         workspace,
         inference,
         events,
+        cancel,
     } = ctx;
 
     // The store calls below are sync; wrap them in spawn_blocking so
@@ -295,10 +303,16 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
             card_id: card_id.clone(),
             inference: client.clone(),
             model: model.clone(),
+            cancel: cancel.clone(),
         };
-        let notes =
-            run_gather_phase(&phase_deps, &job_id, &plan, &cfg, /* halt_after_gather = */ false)
-                .await?;
+        let notes = run_gather_phase(
+            &phase_deps,
+            &job_id,
+            &plan,
+            &cfg,
+            /* halt_after_gather = */ false,
+        )
+        .await?;
         run_synthesize_phase(&phase_deps, &job_id, &row.query, &plan, &notes).await?;
     }
     // PlanOnly + EveryPhase both halt at Planned. The C6c
@@ -337,6 +351,11 @@ pub struct PhaseDeps {
     pub card_id: String,
     pub inference: Arc<InferenceClient>,
     pub model: String,
+    /// Cancellation token threaded into the gather phase's per-
+    /// worker checkpoints. Defaults to a never-fires token when
+    /// the caller has no real token to provide (advance endpoint
+    /// for synthesize-only paths, tests, etc.).
+    pub cancel: CancellationToken,
 }
 
 /// Run the gather phase end-to-end: mark_gathering → run_gather →
@@ -365,6 +384,7 @@ pub async fn run_gather_phase(
         card_id,
         inference: client,
         model,
+        cancel,
     } = deps;
     let search: Arc<dyn WebSearchApi> = Arc::new(DuckDuckGoSearchApi::new());
     let fetch: Arc<dyn WebFetchApi> = Arc::new(HttpWebFetchApi::new());
@@ -388,7 +408,7 @@ pub async fn run_gather_phase(
             subagent: Some(subagent),
         },
         events: events.clone(),
-        cancel: CancellationToken::new(),
+        cancel: cancel.clone(),
     };
     {
         let db = db.clone();
@@ -458,6 +478,12 @@ pub async fn run_synthesize_phase(
         card_id,
         inference: client,
         model,
+        // Synthesize is a single LLM call; we don't have a clean
+        // checkpoint to abort mid-call, so the cancel token isn't
+        // observed here. Future work: wire `tokio::select!` against
+        // the inference future. For now: gather is the high-cost
+        // phase; cancelling it is what matters.
+        cancel: _,
     } = deps;
     {
         let db = db.clone();
