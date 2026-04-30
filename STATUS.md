@@ -1,13 +1,13 @@
 # execlaw build STATUS
 
-Last update: 2026-04-30, after a hardening pass on the deep-research subsystem — status guards on every JobStore setter (cancel-resurrection prevention), CardClosed-broadcast skip when a row was cancelled mid-LLM, supervisor cancel-token registry leak fix on the advance() path, and an O(active) SQL COUNT for the operator dashboard's global active-jobs poller. C3-C6 had already closed end-to-end (plan / gather / synthesise pipeline, retention sweeper, `/research` operator drill-down, every-phase advance flow, cards primitive + synchronous subagents underneath).
+Last update: 2026-04-30, after a hardening pass closed six bugs spanning the deep-research subsystem and the runner-supervisor: status guards on every JobStore setter (cancel-resurrection prevention), CardClosed-broadcast skip when a row was cancelled mid-LLM, supervisor cancel-token registry leak on the advance() path, an O(active) SQL COUNT for the operator dashboard's global active-jobs poller, an earliest-pre-flight cancel check in run_job (saves a planner LLM call when cancel races runner pick-up), and a forward_turn bookkeeping rollback so a runner that vanishes between supervisor.get() and the send_to_runner call no longer leaks a turn_id forever. C3-C6 had already closed end-to-end (plan / gather / synthesise pipeline, retention sweeper, `/research` operator drill-down, every-phase advance flow, cards primitive + synchronous subagents underneath).
 
 ## TL;DR
 
 - `cargo build --workspace` — **clean** (stub mode; webauthn-rs gated behind `--features webauthn` for the Linux/Docker production build)
 - `cargo clippy --workspace --all-targets` — **zero warnings**, zero errors
-- `cargo test --workspace --lib` — **1061 passing, 0 failing**
-- `cargo test --workspace --tests` — **1103 passing, 0 failing** across lib + integration (approval_flow, plugin_lifecycle, runner_round_trip, voice_ws_round_trip; runner_e2e_docker is `#[ignore]` by design)
+- `cargo test --workspace --lib` — **1063 passing, 0 failing**
+- `cargo test --workspace --tests` — **1105 passing, 0 failing** across lib + integration (approval_flow, plugin_lifecycle, runner_round_trip, voice_ws_round_trip; runner_e2e_docker is `#[ignore]` by design)
 - `cargo bench --workspace --no-run` — **clean** (≈71 benches; new active_count_global_with_history bench pins the operator dashboard at ~3.3 µs flat regardless of terminal-row history depth, confirming the SQL COUNT is O(active) on idx_state_research_jobs_pending)
 - `cd web && npm test` — **318 passing**
 - `cd web && npm run build` — **clean** (≈674 KB JS / 335 KB CSS — first successful production build since the C1b cards-primitive regression fixed in `spa: define $radius-md` 2026-04-30)
