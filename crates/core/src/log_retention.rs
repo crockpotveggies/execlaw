@@ -2,12 +2,13 @@
 //! retention window (Phase 7 §7-Hardening: "log retention + privacy
 //! controls").
 //!
-//! The default retention is 30 days. Sweeps every ~30 minutes in a
-//! background tokio task; pure-function entry point [`sweep_once`] is
-//! what tests exercise.
-//!
-//! Mirrors `EphemeralSweeper` in shape so operators can reason about
-//! both with the same mental model.
+//! 2026-04-29 — retention is now driven by the global Settings →
+//! General `history_retention_days` choice (`crate::retention::
+//! RetentionPolicy`), not a hardcoded 30 days. The sweeper loads the
+//! policy on each tick so a Settings change takes effect within one
+//! sweep cadence. `Infinite` (operator picked "never delete") makes
+//! the sweep a no-op for the tick. Tests still pin retention via
+//! `with_config` for determinism.
 
 use crate::db::{Database, DbError};
 use crate::logs::LogStore;
@@ -18,9 +19,9 @@ use tracing::{debug, info, warn};
 
 /// Default sweep cadence.
 pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(30 * 60);
-/// Default retention window — 30 days. The control plane's audit
-/// posture (§10) wants long-tail visibility for incident postmortems
-/// without unbounded SQLite growth.
+/// Default retention window — 30 days. Used only by `with_config`
+/// fixtures that explicitly want the historical default; production
+/// uses the operator-configured `history_retention_days` value.
 pub const DEFAULT_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Outcome of one sweep pass.
@@ -51,15 +52,28 @@ pub fn sweep_once(
 pub struct LogRetentionSweeper {
     db: Database,
     interval: Duration,
-    retention: Duration,
+    /// `Some(d)` pins retention regardless of operator policy
+    /// (tests + the legacy `with_config` constructor). `None` means
+    /// "load the live policy on each tick" — the production path,
+    /// so Settings changes take effect within one sweep cadence.
+    static_retention: Option<Duration>,
     kick: Arc<Notify>,
 }
 
 impl LogRetentionSweeper {
+    /// Production constructor: read retention live from the operator's
+    /// `history_retention_days` setting on every tick.
     pub fn new(db: Database) -> Self {
-        Self::with_config(db, DEFAULT_SWEEP_INTERVAL, DEFAULT_RETENTION)
+        Self {
+            db,
+            interval: DEFAULT_SWEEP_INTERVAL,
+            static_retention: None,
+            kick: Arc::new(Notify::new()),
+        }
     }
 
+    /// Pin a static retention duration (tests + fixtures that want
+    /// deterministic behaviour without consulting the DB row).
     pub fn with_config(
         db: Database,
         interval: Duration,
@@ -68,7 +82,7 @@ impl LogRetentionSweeper {
         Self {
             db,
             interval,
-            retention,
+            static_retention: Some(retention),
             kick: Arc::new(Notify::new()),
         }
     }
@@ -84,7 +98,10 @@ impl LogRetentionSweeper {
     pub async fn run(&self, stop: Arc<Notify>) {
         info!(
             interval_secs = self.interval.as_secs(),
-            retention_secs = self.retention.as_secs(),
+            retention = match self.static_retention {
+                Some(d) => format!("static:{}s", d.as_secs()),
+                None => "policy".into(),
+            },
             "log retention sweeper running"
         );
         loop {
@@ -106,7 +123,18 @@ impl LogRetentionSweeper {
 
     fn sweep_now(&self) -> Result<LogSweepReport, DbError> {
         let now_ms = chrono::Utc::now().timestamp_millis();
-        sweep_once(&self.db, now_ms, self.retention.as_millis() as i64)
+        let retention_ms = match self.static_retention {
+            Some(d) => d.as_millis() as i64,
+            None => {
+                let policy = crate::retention::RetentionPolicy::load(&self.db)?;
+                if policy.is_infinite() {
+                    // Operator chose "never delete" — no-op tick.
+                    return Ok(LogSweepReport::default());
+                }
+                policy.days as i64 * 86_400 * 1_000
+            }
+        };
+        sweep_once(&self.db, now_ms, retention_ms)
     }
 }
 

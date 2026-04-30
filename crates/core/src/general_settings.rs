@@ -29,6 +29,11 @@ pub struct GeneralSettings {
     /// this together with `config_backends` to decide between
     /// `wizard` and `pong`.
     pub setup_wizard_dismissed_at: Option<i64>,
+    /// 2026-04-29 — global history-retention window in days. `0`
+    /// means infinite (never delete). Other legal values are 30 /
+    /// 60 / 90 / 120 (see `crate::retention::ALLOWED_RETENTION_DAYS`).
+    /// Sweepers consume via [`crate::retention::RetentionPolicy::load`].
+    pub history_retention_days: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -39,6 +44,12 @@ pub struct GeneralSettingsUpdate {
     /// the current timestamp; `Some(false)` clears it (re-arms the
     /// wizard for testing). `None` leaves the column alone.
     pub setup_wizard_dismissed: Option<bool>,
+    /// 2026-04-29 — operator's choice from the Settings → General
+    /// retention dropdown. `Some(0)` = infinite; `Some(30/60/90/120)`
+    /// = finite window; `None` leaves the column alone. Values
+    /// outside that set are rejected by the API layer (validate
+    /// before calling [`GeneralSettingsStore::update`]).
+    pub history_retention_days: Option<u32>,
 }
 
 #[derive(Debug, Error)]
@@ -67,16 +78,18 @@ impl<'a> GeneralSettingsStore<'a> {
         self.db.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT start_on_boot, bind_address, updated_at, \
-                        setup_wizard_dismissed_at \
+                        setup_wizard_dismissed_at, history_retention_days \
                  FROM config_general WHERE id = 1",
             )?;
             let row = stmt
                 .query_row([], |r| {
+                    let raw_retention: i64 = r.get(4)?;
                     Ok(GeneralSettings {
                         start_on_boot: r.get::<_, i64>(0)? != 0,
                         bind_address: r.get(1)?,
                         updated_at: r.get(2)?,
                         setup_wizard_dismissed_at: r.get(3)?,
+                        history_retention_days: raw_retention.max(0) as u32,
                     })
                 })
                 .ok();
@@ -191,9 +204,8 @@ impl<'a> GeneralSettingsStore<'a> {
     ) -> Result<GeneralSettings, GeneralSettingsError> {
         self.update(
             &GeneralSettingsUpdate {
-                start_on_boot: None,
-                bind_address: None,
                 setup_wizard_dismissed: Some(true),
+                ..GeneralSettingsUpdate::default()
             },
             now,
         )
@@ -210,21 +222,30 @@ impl<'a> GeneralSettingsStore<'a> {
         if let Some(addr) = &upd.bind_address {
             validate_bind_address(addr)?;
         }
+        if let Some(retention) = upd.history_retention_days {
+            validate_retention_days(retention)?;
+        }
         let upd = upd.clone();
         let saved = self.db.with_conn(|c| {
             // Read-modify-write so a partial update preserves
             // siblings. Singleton row → no contention concerns
             // beyond the connection pool's serialization.
-            let current: Option<(i64, String, Option<i64>)> = c
+            let current: Option<(i64, String, Option<i64>, i64)> = c
                 .query_row(
-                    "SELECT start_on_boot, bind_address, setup_wizard_dismissed_at \
+                    "SELECT start_on_boot, bind_address, setup_wizard_dismissed_at, \
+                            history_retention_days \
                      FROM config_general WHERE id = 1",
                     [],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .ok();
-            let (cur_boot, cur_bind, cur_dismissed) =
-                current.unwrap_or((1, "127.0.0.1:3030".to_owned(), None));
+            let (cur_boot, cur_bind, cur_dismissed, cur_retention) = current
+                .unwrap_or((
+                    1,
+                    "127.0.0.1:3030".to_owned(),
+                    None,
+                    crate::retention::DEFAULT_RETENTION_DAYS as i64,
+                ));
             let new_boot = upd.start_on_boot.map(|b| b as i64).unwrap_or(cur_boot);
             let new_bind = upd.bind_address.clone().unwrap_or(cur_bind);
             let new_dismissed: Option<i64> = match upd.setup_wizard_dismissed {
@@ -232,26 +253,50 @@ impl<'a> GeneralSettingsStore<'a> {
                 Some(false) => None,
                 None => cur_dismissed,
             };
+            let new_retention: i64 = upd
+                .history_retention_days
+                .map(|d| d as i64)
+                .unwrap_or(cur_retention);
             c.execute(
                 "INSERT INTO config_general \
-                    (id, start_on_boot, bind_address, updated_at, setup_wizard_dismissed_at) \
-                 VALUES (1, ?1, ?2, ?3, ?4) \
+                    (id, start_on_boot, bind_address, updated_at, setup_wizard_dismissed_at, \
+                     history_retention_days) \
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5) \
                  ON CONFLICT(id) DO UPDATE SET \
                     start_on_boot = excluded.start_on_boot, \
                     bind_address = excluded.bind_address, \
                     updated_at = excluded.updated_at, \
-                    setup_wizard_dismissed_at = excluded.setup_wizard_dismissed_at",
-                params![new_boot, new_bind, now, new_dismissed],
+                    setup_wizard_dismissed_at = excluded.setup_wizard_dismissed_at, \
+                    history_retention_days = excluded.history_retention_days",
+                params![new_boot, new_bind, now, new_dismissed, new_retention],
             )?;
             Ok(GeneralSettings {
                 start_on_boot: new_boot != 0,
                 bind_address: new_bind,
                 updated_at: now,
                 setup_wizard_dismissed_at: new_dismissed,
+                history_retention_days: new_retention.max(0) as u32,
             })
         })?;
         Ok(saved)
     }
+}
+
+/// Reject retention-days values that aren't `0` (infinite) or one of
+/// the legal `ALLOWED_RETENTION_DAYS` choices. The Settings UI
+/// dropdown enforces this client-side; the server enforces it again
+/// so a malformed API call can't slip a 45 or a 1000 into the column.
+fn validate_retention_days(days: u32) -> Result<(), GeneralSettingsError> {
+    if days == crate::retention::INFINITE_RETENTION
+        || crate::retention::ALLOWED_RETENTION_DAYS.contains(&days)
+    {
+        return Ok(());
+    }
+    Err(GeneralSettingsError::InvalidBindAddress(format!(
+        "history_retention_days={days} is not a legal option; \
+         expected 0 (infinite) or one of {:?}",
+        crate::retention::ALLOWED_RETENTION_DAYS
+    )))
 }
 
 /// Sanity-check a `host:port` string. We don't resolve DNS here —
@@ -400,6 +445,68 @@ mod tests {
         assert!(store.wizard_dismissed().unwrap());
         let s = store.get().unwrap().unwrap();
         assert_eq!(s.setup_wizard_dismissed_at, Some(9999));
+    }
+
+    #[test]
+    fn fresh_db_seeds_default_history_retention() {
+        let db = open();
+        let store = GeneralSettingsStore::new(&db);
+        let s = store.get().unwrap().unwrap();
+        assert_eq!(s.history_retention_days, 30);
+    }
+
+    #[test]
+    fn update_writes_history_retention_days() {
+        let db = open();
+        let store = GeneralSettingsStore::new(&db);
+        store
+            .update(
+                &GeneralSettingsUpdate {
+                    history_retention_days: Some(90),
+                    ..Default::default()
+                },
+                100,
+            )
+            .unwrap();
+        let s = store.get().unwrap().unwrap();
+        assert_eq!(s.history_retention_days, 90);
+    }
+
+    #[test]
+    fn update_accepts_infinite_retention_zero() {
+        let db = open();
+        let store = GeneralSettingsStore::new(&db);
+        store
+            .update(
+                &GeneralSettingsUpdate {
+                    history_retention_days: Some(0),
+                    ..Default::default()
+                },
+                100,
+            )
+            .unwrap();
+        let s = store.get().unwrap().unwrap();
+        assert_eq!(s.history_retention_days, 0);
+    }
+
+    /// API-level guard: writes outside the legal option set are
+    /// rejected even though the column would technically accept any
+    /// integer. Defense against a malformed Settings save.
+    #[test]
+    fn update_rejects_illegal_retention_value() {
+        let db = open();
+        let store = GeneralSettingsStore::new(&db);
+        let r = store.update(
+            &GeneralSettingsUpdate {
+                history_retention_days: Some(45),
+                ..Default::default()
+            },
+            100,
+        );
+        assert!(matches!(
+            r,
+            Err(GeneralSettingsError::InvalidBindAddress(_))
+        ));
     }
 
     #[test]

@@ -1819,12 +1819,30 @@ export interface GeneralSettings {
     /// this flag rather than hardcoding the message so a future
     /// in-process rebind can flip it without an SPA change.
     bind_address_requires_restart: boolean;
+    /// 2026-04-29 — global history retention. `0` = infinite (never
+    /// delete). Other legal values are 30 / 60 / 90 / 120. Sweepers
+    /// across the workspace consume this on each tick.
+    history_retention_days: number;
 }
 
 export interface UpdateGeneralSettingsRequest {
     start_on_boot?: boolean;
     bind_address?: string;
+    history_retention_days?: number;
 }
+
+/// Legal values for the history-retention dropdown. Mirrors the
+/// `ALLOWED_RETENTION_DAYS` list in core's `retention.rs` plus `0`
+/// for the "Infinite" option. Adding a value requires updating both.
+export const HISTORY_RETENTION_OPTIONS: ReadonlyArray<
+    { value: number; label: string }
+> = [
+    { value: 30, label: "30 days" },
+    { value: 60, label: "60 days" },
+    { value: 90, label: "90 days" },
+    { value: 120, label: "120 days" },
+    { value: 0, label: "Infinite (never delete)" },
+];
 
 export async function getGeneralSettings(
     tokenAccessor: () => string | null,

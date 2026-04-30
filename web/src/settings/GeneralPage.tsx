@@ -22,6 +22,7 @@ import Form from "react-bootstrap/Form";
 import {
     getGeneralSettings,
     updateGeneralSettings,
+    HISTORY_RETENTION_OPTIONS,
     type GeneralSettings,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
@@ -35,6 +36,7 @@ export function GeneralPage() {
     const [busy, setBusy] = useState(false);
     const [bindAddress, setBindAddress] = useState("");
     const [startOnBoot, setStartOnBoot] = useState(true);
+    const [retentionDays, setRetentionDays] = useState(30);
     /// Tracks whether the operator has changed bind_address since
     /// the last load — drives the "service restart required" hint.
     const [bindDirty, setBindDirty] = useState(false);
@@ -43,6 +45,9 @@ export function GeneralPage() {
     /// `execlaw service install` run, so the toggle persists to the
     /// DB but doesn't immediately re-register.
     const [bootDirty, setBootDirty] = useState(false);
+    /// Whether the operator changed retention since load. Used so
+    /// the "narrowing window" warning only renders on a real edit.
+    const [retentionDirty, setRetentionDirty] = useState(false);
 
     const refresh = useCallback(async () => {
         try {
@@ -50,8 +55,10 @@ export function GeneralPage() {
             setSettings(r);
             setBindAddress(r.bind_address);
             setStartOnBoot(r.start_on_boot);
+            setRetentionDays(r.history_retention_days);
             setBindDirty(false);
             setBootDirty(false);
+            setRetentionDirty(false);
             setError(null);
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e));
@@ -69,12 +76,19 @@ export function GeneralPage() {
         setBusy(true);
         setError(null);
         try {
-            const body: { start_on_boot?: boolean; bind_address?: string } = {};
+            const body: {
+                start_on_boot?: boolean;
+                bind_address?: string;
+                history_retention_days?: number;
+            } = {};
             if (settings && settings.start_on_boot !== startOnBoot) {
                 body.start_on_boot = startOnBoot;
             }
             if (settings && settings.bind_address !== bindAddress.trim()) {
                 body.bind_address = bindAddress.trim();
+            }
+            if (settings && settings.history_retention_days !== retentionDays) {
+                body.history_retention_days = retentionDays;
             }
             if (Object.keys(body).length === 0) {
                 setBusy(false);
@@ -84,19 +98,33 @@ export function GeneralPage() {
             setSettings(r);
             setBindAddress(r.bind_address);
             setStartOnBoot(r.start_on_boot);
+            setRetentionDays(r.history_retention_days);
             setBindDirty(false);
             setBootDirty(false);
+            setRetentionDirty(false);
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e));
         } finally {
             setBusy(false);
         }
-    }, [settings, startOnBoot, bindAddress, getToken]);
+    }, [settings, startOnBoot, bindAddress, retentionDays, getToken]);
 
     const dirty =
         !!settings &&
         (settings.start_on_boot !== startOnBoot ||
-            settings.bind_address !== bindAddress.trim());
+            settings.bind_address !== bindAddress.trim() ||
+            settings.history_retention_days !== retentionDays);
+
+    /// Whether the operator's pending change shrinks the retention
+    /// window. Drives a confirm-style warning since shorter retention
+    /// triggers a one-time bulk delete on the next sweep tick.
+    const retentionNarrowing =
+        !!settings &&
+        retentionDirty &&
+        // 0 (Infinite) is the widest possible — never narrowing.
+        retentionDays !== 0 &&
+        (settings.history_retention_days === 0 ||
+            retentionDays < settings.history_retention_days);
 
     return (
         <div data-testid="settings-general">
@@ -191,6 +219,52 @@ export function GeneralPage() {
                                 />
                                 Bind address takes effect on the next{" "}
                                 <code>execlaw service restart</code>.
+                            </div>
+                        )}
+                    </Form.Group>
+
+                    <Form.Group className="mb-3">
+                        <Form.Label
+                            className="execlaw-muted small mb-1"
+                            htmlFor="general-history-retention"
+                        >
+                            History retention
+                        </Form.Label>
+                        <Form.Select
+                            id="general-history-retention"
+                            value={retentionDays}
+                            disabled={!canMutate || busy}
+                            onChange={(e) => {
+                                setRetentionDays(Number(e.target.value));
+                                setRetentionDirty(true);
+                            }}
+                            data-testid="general-history-retention"
+                        >
+                            {HISTORY_RETENTION_OPTIONS.map((opt) => (
+                                <option key={opt.value} value={opt.value}>
+                                    {opt.label}
+                                </option>
+                            ))}
+                        </Form.Select>
+                        <Form.Text className="execlaw-muted">
+                            How long conversation history, scheduled-task runs,
+                            structured logs, and (forthcoming) research jobs
+                            stick around before automatic deletion. Memory
+                            entries and the audit log are not affected.
+                        </Form.Text>
+                        {retentionNarrowing && (
+                            <div
+                                className="execlaw-muted small mt-2"
+                                data-testid="general-retention-narrowing-hint"
+                            >
+                                <i
+                                    className="bi bi-exclamation-triangle me-1"
+                                    aria-hidden
+                                />
+                                This is a shorter window. Saving will trigger
+                                a one-time bulk deletion of older history on
+                                the next sweep tick (within ~30 minutes).
+                                This cannot be undone.
                             </div>
                         )}
                     </Form.Group>

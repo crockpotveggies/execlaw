@@ -42,6 +42,10 @@ pub struct GeneralSettingsView {
     /// `service restart`. Always true today; the field documents the
     /// contract for the SPA's "restart required" hint.
     pub bind_address_requires_restart: bool,
+    /// 2026-04-29 — global history retention. `0` = infinite (never
+    /// delete); other legal values are 30 / 60 / 90 / 120. Surfaced
+    /// to the SPA's Settings → General dropdown.
+    pub history_retention_days: u32,
 }
 
 impl From<GeneralSettings> for GeneralSettingsView {
@@ -51,6 +55,7 @@ impl From<GeneralSettings> for GeneralSettingsView {
             bind_address: s.bind_address,
             updated_at: s.updated_at,
             bind_address_requires_restart: true,
+            history_retention_days: s.history_retention_days,
         }
     }
 }
@@ -63,6 +68,12 @@ pub struct UpdateGeneralSettingsRequest {
     pub start_on_boot: Option<bool>,
     #[serde(default)]
     pub bind_address: Option<String>,
+    /// Optional. Legal values: 0 (infinite), 30, 60, 90, 120. The
+    /// store rejects anything else with `InvalidBindAddress` (the
+    /// shared validation-error variant — message names the actual
+    /// reason).
+    #[serde(default)]
+    pub history_retention_days: Option<u32>,
 }
 
 impl From<GeneralSettingsError> for ApiError {
@@ -139,6 +150,7 @@ pub async fn put_handler(
                 // can't accidentally clear it from the General
                 // settings page.
                 setup_wizard_dismissed: None,
+                history_retention_days: req.history_retention_days,
             },
             now,
         )

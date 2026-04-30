@@ -1329,6 +1329,17 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         let stop = sweep_stop.clone();
         tokio::spawn(async move { log_sweeper.run(stop).await });
     }
+    // 2026-04-29 — event retention: deletes `state_events` rows past
+    // the operator-configured `history_retention_days` window.
+    // Pinned + ephemeral conversations are exempt (the latter is
+    // owned by EphemeralSweeper). Reads the policy live each tick so
+    // a Settings change takes effect within one cadence.
+    let event_sweeper =
+        execlaw_core::event_retention::EventRetentionSweeper::new(db.clone());
+    {
+        let stop = sweep_stop.clone();
+        tokio::spawn(async move { event_sweeper.run(stop).await });
+    }
     let ephemeral_sweeper =
         execlaw_core::ephemeral_sweeper::EphemeralSweeper::new(db.clone());
     {

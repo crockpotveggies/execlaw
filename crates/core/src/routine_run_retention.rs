@@ -54,15 +54,27 @@ pub fn sweep_once(
 pub struct RoutineRunRetentionSweeper {
     db: Database,
     interval: Duration,
-    retention: Duration,
+    /// `Some(d)` pins retention regardless of operator policy
+    /// (tests + the `with_config` constructor). `None` means "load
+    /// the live `RetentionPolicy` on each tick" — the production path
+    /// since 2026-04-29 / migration 0026.
+    static_retention: Option<Duration>,
     kick: Arc<Notify>,
 }
 
 impl RoutineRunRetentionSweeper {
+    /// Production constructor: read retention live from the operator's
+    /// `history_retention_days` setting on every tick.
     pub fn new(db: Database) -> Self {
-        Self::with_config(db, DEFAULT_SWEEP_INTERVAL, DEFAULT_RETENTION)
+        Self {
+            db,
+            interval: DEFAULT_SWEEP_INTERVAL,
+            static_retention: None,
+            kick: Arc::new(Notify::new()),
+        }
     }
 
+    /// Pin a static retention duration (tests + fixtures).
     pub fn with_config(
         db: Database,
         interval: Duration,
@@ -71,7 +83,7 @@ impl RoutineRunRetentionSweeper {
         Self {
             db,
             interval,
-            retention,
+            static_retention: Some(retention),
             kick: Arc::new(Notify::new()),
         }
     }
@@ -86,7 +98,10 @@ impl RoutineRunRetentionSweeper {
     pub async fn run(&self, stop: Arc<Notify>) {
         info!(
             interval_secs = self.interval.as_secs(),
-            retention_secs = self.retention.as_secs(),
+            retention = match self.static_retention {
+                Some(d) => format!("static:{}s", d.as_secs()),
+                None => "policy".into(),
+            },
             "routine-run retention sweeper running"
         );
         loop {
@@ -108,7 +123,17 @@ impl RoutineRunRetentionSweeper {
 
     fn sweep_now(&self) -> Result<RoutineRunSweepReport, DbError> {
         let now_unix = chrono::Utc::now().timestamp();
-        sweep_once(&self.db, now_unix, self.retention.as_secs() as i64).map_err(|e| match e {
+        let retention_secs = match self.static_retention {
+            Some(d) => d.as_secs() as i64,
+            None => {
+                let policy = crate::retention::RetentionPolicy::load(&self.db)?;
+                if policy.is_infinite() {
+                    return Ok(RoutineRunSweepReport::default());
+                }
+                policy.days as i64 * 86_400
+            }
+        };
+        sweep_once(&self.db, now_unix, retention_secs).map_err(|e| match e {
             RoutineError::Db(db) => db,
             RoutineError::Sqlite(s) => DbError::Sqlite(s),
             // Invalid / NotFound are logically programmer errors at

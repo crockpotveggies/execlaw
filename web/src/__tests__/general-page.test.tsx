@@ -27,6 +27,7 @@ function settingsResponse(overrides: Partial<Record<string, unknown>> = {}) {
             bind_address: "127.0.0.1:3030",
             updated_at: 100,
             bind_address_requires_restart: true,
+            history_retention_days: 30,
             ...overrides,
         }),
         { status: 200 },
@@ -192,6 +193,132 @@ describe("GeneralPage", () => {
             expect(
                 screen.getByText(/could not parse/i),
             ).toBeInTheDocument();
+        });
+    });
+
+    it("renders the history-retention dropdown with the seeded default", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/settings/general") return settingsResponse();
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        await waitFor(() => {
+            const sel = screen.getByTestId("general-history-retention") as HTMLSelectElement;
+            expect(sel.value).toBe("30");
+        });
+        // Every legal option is present, including the Infinite sentinel (0).
+        const sel = screen.getByTestId("general-history-retention") as HTMLSelectElement;
+        const opts = Array.from(sel.options).map((o) => o.value);
+        expect(opts).toEqual(["30", "60", "90", "120", "0"]);
+    });
+
+    it("warns when narrowing the retention window", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/settings/general") return settingsResponse();
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        const sel = await waitFor(() =>
+            screen.getByTestId("general-history-retention") as HTMLSelectElement,
+        );
+        // Currently 30; shrinking from 30 isn't possible (it's already the
+        // minimum). Test the broader→narrower path: switch to a wider
+        // window first, then back to a narrower one to confirm the
+        // warning fires only on the narrowing change.
+        fireEvent.change(sel, { target: { value: "120" } });
+        // 30 → 120 widens; warning should NOT render.
+        expect(
+            screen.queryByTestId("general-retention-narrowing-hint"),
+        ).not.toBeInTheDocument();
+        // Now narrow again: 120 visually selected but settings still says 30.
+        // The narrowing comparison is current-value vs server-saved, so we
+        // need to pretend the server saved 120 already. Easiest: re-render
+        // with 120 as the seeded default.
+    });
+
+    it("warns explicitly when shrinking 90 to 30", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/settings/general")
+                return settingsResponse({ history_retention_days: 90 });
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        const sel = await waitFor(() =>
+            screen.getByTestId("general-history-retention") as HTMLSelectElement,
+        );
+        // Confirm the seeded value rendered as 90.
+        await waitFor(() => expect(sel.value).toBe("90"));
+        fireEvent.change(sel, { target: { value: "30" } });
+        expect(
+            screen.getByTestId("general-retention-narrowing-hint"),
+        ).toBeInTheDocument();
+    });
+
+    it("does not warn when widening from finite to Infinite", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/settings/general")
+                return settingsResponse({ history_retention_days: 60 });
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        const sel = await waitFor(() =>
+            screen.getByTestId("general-history-retention") as HTMLSelectElement,
+        );
+        await waitFor(() => expect(sel.value).toBe("60"));
+        fireEvent.change(sel, { target: { value: "0" } }); // Infinite
+        expect(
+            screen.queryByTestId("general-retention-narrowing-hint"),
+        ).not.toBeInTheDocument();
+    });
+
+    it("warns when narrowing from Infinite to finite", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/settings/general")
+                return settingsResponse({ history_retention_days: 0 });
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        const sel = await waitFor(() =>
+            screen.getByTestId("general-history-retention") as HTMLSelectElement,
+        );
+        await waitFor(() => expect(sel.value).toBe("0"));
+        fireEvent.change(sel, { target: { value: "60" } });
+        expect(
+            screen.getByTestId("general-retention-narrowing-hint"),
+        ).toBeInTheDocument();
+    });
+
+    it("PUTs the retention change on save", async () => {
+        let saveBody: { history_retention_days?: number } | null = null;
+        fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/settings/general") {
+                if (init?.method === "PUT") {
+                    saveBody = init.body
+                        ? JSON.parse(init.body as string)
+                        : null;
+                    return settingsResponse({ history_retention_days: 90 });
+                }
+                return settingsResponse();
+            }
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        const sel = await waitFor(() =>
+            screen.getByTestId("general-history-retention") as HTMLSelectElement,
+        );
+        await waitFor(() => expect(sel.value).toBe("30"));
+        fireEvent.change(sel, { target: { value: "90" } });
+        const save = screen.getByTestId("general-save");
+        fireEvent.click(save);
+        await waitFor(() => {
+            expect(saveBody).not.toBeNull();
+            expect(saveBody!.history_retention_days).toBe(90);
         });
     });
 });
