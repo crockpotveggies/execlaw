@@ -20,6 +20,7 @@ pub mod attachments;
 pub mod audit;
 pub mod backends;
 pub mod builtin_tools;
+pub mod cards;
 pub mod config;
 pub mod conversation;
 pub mod db;

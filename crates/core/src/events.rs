@@ -58,6 +58,17 @@ pub enum EventKind {
     InterruptRescinded,
     InterruptConfirmed,
     ResearchProgressUpdated,
+    /// 2026-04-29 — generic card primitive for long-running operator-
+    /// visible tasks. `CardOpened` introduces the card with a kind +
+    /// initial state; `CardProgressed` updates progress / phase /
+    /// details; `CardClosed` flips it to a terminal state and may
+    /// reference an attachment. The card's persistent shape is the
+    /// projection of its sequence of events; renderers (web SPA) and
+    /// transports (Signal / WhatsApp / SMS / voice) compose the live
+    /// view. See `crate::cards` for the helpers + tests.
+    CardOpened,
+    CardProgressed,
+    CardClosed,
     /// Escape hatch for future additions that predate this enum. The payload
     /// contains the original kind string.
     Other,
@@ -104,6 +115,9 @@ impl EventKind {
             EventKind::InterruptRescinded => "interrupt.rescinded",
             EventKind::InterruptConfirmed => "interrupt.confirmed",
             EventKind::ResearchProgressUpdated => "research_progress_updated",
+            EventKind::CardOpened => "card.opened",
+            EventKind::CardProgressed => "card.progressed",
+            EventKind::CardClosed => "card.closed",
             EventKind::Other => "other",
         }
     }
@@ -147,6 +161,9 @@ impl EventKind {
             "interrupt.rescinded" => EventKind::InterruptRescinded,
             "interrupt.confirmed" => EventKind::InterruptConfirmed,
             "research_progress_updated" => EventKind::ResearchProgressUpdated,
+            "card.opened" => EventKind::CardOpened,
+            "card.progressed" => EventKind::CardProgressed,
+            "card.closed" => EventKind::CardClosed,
             _ => EventKind::Other,
         }
     }

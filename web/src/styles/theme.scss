@@ -1476,6 +1476,100 @@ body {
 // longer names don't get clipped by the SVG's square slot. GSAP
 // owns the opacity/scale; the static `opacity: 0` here is just
 // the initial state before the timeline fires.
+// 2026-04-29 — generic card primitive. Long-running tools
+// (research, future shell-session, etc.) emit cards over the WS
+// event stream; this is the fallback `LongRunningTask` renderer
+// styling. Per-kind renderers may extend or replace these classes.
+.execlaw-card-task {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    background-color: $bg-elev;
+    border-radius: $radius-md;
+    padding: 0.85rem 1rem;
+    margin: 0.4rem 0;
+
+    &__head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 0.75rem;
+    }
+
+    &__title {
+        font-weight: 600;
+        font-size: 0.95rem;
+        color: $text-primary;
+    }
+
+    &__state {
+        font-size: 0.75rem;
+        color: $text-muted;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+
+    &__phase {
+        font-size: 0.85rem;
+        color: $text-muted;
+    }
+
+    &__progress {
+        position: relative;
+        height: 0.5rem;
+        background-color: rgba($text-primary, 0.08);
+        border-radius: $radius-pill;
+        overflow: hidden;
+    }
+
+    &__progress-bar {
+        height: 100%;
+        background-color: $accent;
+        border-radius: inherit;
+        transition: width 0.3s ease-out;
+    }
+
+    &__progress-label {
+        position: absolute;
+        top: -1.4rem;
+        right: 0;
+        font-size: 0.75rem;
+        color: $text-muted;
+    }
+
+    &__summary {
+        font-size: 0.9rem;
+        color: $text-primary;
+    }
+
+    &__error {
+        font-size: 0.85rem;
+        color: $danger;
+        background-color: rgba($danger, 0.08);
+        padding: 0.4rem 0.6rem;
+        border-radius: $radius-md;
+    }
+
+    &__actions {
+        display: flex;
+        gap: 0.4rem;
+    }
+
+    &__action {
+        background-color: rgba($text-primary, 0.06);
+        color: $text-primary;
+        border: none;
+        padding: 0.3rem 0.7rem;
+        border-radius: $radius-pill;
+        font-size: 0.8rem;
+        cursor: pointer;
+
+        &:hover {
+            background-color: rgba($text-primary, 0.12);
+        }
+    }
+}
+
 .execlaw-mascot-stage__text {
     position: absolute;
     top: 50%;
