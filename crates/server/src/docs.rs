@@ -36,6 +36,11 @@ use crate::plugins::{
     InstallResponse, PluginListResponse, PluginSummary, ToolSummary, UiPanelListResponse,
     UiPanelSummary,
 };
+use crate::research_admin::{
+    ResearchActiveCountResponse, ResearchAdvanceResponse, ResearchCancelRequest,
+    ResearchCancelResponse, ResearchJobReportResponse, ResearchJobSummaryView,
+    ResearchJobsResponse,
+};
 use crate::routes::{
     GenericOk, HealthResponse, LoginRequest, LoginResponse, LogoutAllResponse, LogoutRequest,
     MeResponse, RefreshRequest, RefreshResponse, SetupRequest, SetupResponse,
@@ -47,10 +52,6 @@ use crate::routines::{
 use crate::runners_admin::{GroupRunnerListResponse, GroupRunnerView};
 use crate::settings_general::{GeneralSettingsView, UpdateGeneralSettingsRequest};
 use crate::settings_research::{ResearchSettingsView, UpdateResearchSettingsRequest};
-use crate::research_admin::{
-    ResearchActiveCountResponse, ResearchJobReportResponse, ResearchJobSummaryView,
-    ResearchJobsResponse,
-};
 use crate::setup_preflight::{DockerStatus, PreflightResponse};
 use crate::tools_admin::{ToolListResponse, ToolView, UpdateToolPolicyRequest};
 use crate::trust_policy::{TrustPolicyView, UpdateTrustPolicyRequest};
@@ -193,6 +194,8 @@ impl Modify for SecurityAddon {
         crate::research_admin::get_job_handler,
         crate::research_admin::get_report_handler,
         crate::research_admin::active_count_handler,
+        crate::research_admin::cancel_job_handler,
+        crate::research_admin::advance_job_handler,
         // setup preflight (Phase 14 — first-run wizard docker + gpu)
         crate::setup_preflight::get_handler,
         crate::setup_preflight::dismiss_handler,
@@ -270,6 +273,9 @@ impl Modify for SecurityAddon {
         ResearchJobSummaryView,
         ResearchJobReportResponse,
         ResearchActiveCountResponse,
+        ResearchAdvanceResponse,
+        ResearchCancelResponse,
+        ResearchCancelRequest,
         PreflightResponse,
         DockerStatus,
     )),

@@ -14,6 +14,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Navigate, useNavigate, useParams } from "react-router-dom";
 import {
+    advanceResearchJob,
+    cancelResearchJob,
     getResearchReport,
     listResearchJobs,
     RESEARCH_TERMINAL_STATUSES,
@@ -220,6 +222,42 @@ function ResearchJobDetail({ job }: { job: ResearchJobSummaryView }) {
     const getToken = auth.getAccessToken;
     const [report, setReport] = useState<string | null>(null);
     const [reportLoaded, setReportLoaded] = useState(false);
+    const [busy, setBusy] = useState<"advance" | "cancel" | null>(null);
+    const [actionError, setActionError] = useState<string | null>(null);
+
+    /// `Planned` and `Gathering` rows have an Approve button; any
+    /// non-terminal row has a Cancel button. The Approve copy
+    /// switches between "Run gather" / "Run synthesize" based on
+    /// the prior status so the operator's mental model stays clear.
+    const canAdvance =
+        job.status === "planned" || job.status === "gathering";
+    const canCancel = !RESEARCH_TERMINAL_STATUSES.has(job.status);
+
+    const onAdvance = useCallback(async () => {
+        setBusy("advance");
+        setActionError(null);
+        try {
+            await advanceResearchJob(job.id, getToken);
+        } catch (e) {
+            setActionError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setBusy(null);
+        }
+    }, [job.id, getToken]);
+
+    const onCancel = useCallback(async () => {
+        // Native confirm — terminal action, worth the friction.
+        if (!window.confirm(`Cancel research job?\n\n${job.query}`)) return;
+        setBusy("cancel");
+        setActionError(null);
+        try {
+            await cancelResearchJob(job.id, getToken, "operator cancelled");
+        } catch (e) {
+            setActionError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setBusy(null);
+        }
+    }, [job.id, job.query, getToken]);
 
     useEffect(() => {
         // Only fetch the report when the job has actually completed —
@@ -260,6 +298,47 @@ function ResearchJobDetail({ job }: { job: ResearchJobSummaryView }) {
                 Job <code>{job.id}</code> · conversation{" "}
                 <code>{job.conversation_id}</code>
             </div>
+            {(canAdvance || canCancel) && (
+                <div
+                    className="d-flex gap-2 mb-3"
+                    data-testid="research-detail-actions"
+                >
+                    {canAdvance && (
+                        <button
+                            type="button"
+                            className="btn btn-primary btn-sm"
+                            disabled={busy !== null}
+                            onClick={() => void onAdvance()}
+                            data-testid="research-detail-advance"
+                        >
+                            {busy === "advance"
+                                ? "Approving…"
+                                : job.status === "planned"
+                                  ? "Approve · run gather"
+                                  : "Approve · run synthesize"}
+                        </button>
+                    )}
+                    {canCancel && (
+                        <button
+                            type="button"
+                            className="btn btn-outline-danger btn-sm"
+                            disabled={busy !== null}
+                            onClick={() => void onCancel()}
+                            data-testid="research-detail-cancel"
+                        >
+                            {busy === "cancel" ? "Cancelling…" : "Cancel"}
+                        </button>
+                    )}
+                </div>
+            )}
+            {actionError && (
+                <div
+                    className="execlaw-card-task__error mb-3"
+                    data-testid="research-detail-action-error"
+                >
+                    {actionError}
+                </div>
+            )}
             {job.error && (
                 <div
                     className="execlaw-card-task__error mb-3"

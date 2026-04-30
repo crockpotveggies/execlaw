@@ -614,6 +614,37 @@ impl<'db> ResearchJobStore<'db> {
         Ok(rows)
     }
 
+    /// Atomic cancel — flips any non-terminal row to `Cancelled`,
+    /// stamping `finished_at = now`. Returns `Ok(true)` when the
+    /// row transitioned, `Ok(false)` when the row was already
+    /// terminal (idempotent — a duplicate cancel is a no-op rather
+    /// than an error). Used by the C6 admin endpoint and by the
+    /// future operator-driven cancel button on the ResearchCard.
+    pub fn cancel_active(
+        &self,
+        id: &ResearchJobId,
+        reason: Option<&str>,
+        now: i64,
+    ) -> Result<bool, ResearchError> {
+        let id_owned = id.as_str().to_owned();
+        let reason_owned = reason.map(str::to_owned);
+        let n = self.db.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE state_research_jobs \
+                 SET status = 'cancelled', \
+                     error = COALESCE(?1, error), \
+                     finished_at = ?2, \
+                     updated_at = ?2 \
+                 WHERE id = ?3 \
+                   AND status IN ('pending', 'planning', 'planned', \
+                                  'gathering', 'synthesizing')",
+                params![reason_owned, now, id_owned],
+            )?;
+            Ok(n)
+        })?;
+        Ok(n > 0)
+    }
+
     /// Atomically delete every terminal row whose `finished_at` is
     /// strictly less than `cutoff`, returning each deleted row's
     /// `(id, workspace_path)` so the caller can purge the on-disk
@@ -1240,6 +1271,90 @@ mod tests {
             .finish(&id, ResearchJobStatus::Planning, None, None, 200)
             .unwrap_err();
         assert!(matches!(err, ResearchError::Invalid(_)));
+    }
+
+    #[test]
+    fn cancel_active_flips_any_non_terminal_status() {
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        // From Pending.
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(
+                &id,
+                &ConversationId::from("c"),
+                "q",
+                "Controller",
+                None,
+                100,
+            )
+            .unwrap();
+        assert!(store.cancel_active(&id, Some("operator"), 200).unwrap());
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(row.status, ResearchJobStatus::Cancelled);
+        assert_eq!(row.error.as_deref(), Some("operator"));
+        assert_eq!(row.finished_at, Some(200));
+
+        // From Planned.
+        let id2 = ResearchJobId::new();
+        store
+            .insert_pending(
+                &id2,
+                &ConversationId::from("c"),
+                "q",
+                "Controller",
+                None,
+                100,
+            )
+            .unwrap();
+        store.claim_next_pending("c", 110).unwrap();
+        store
+            .set_planned(
+                &id2,
+                &ResearchPlan {
+                    thesis: "t".into(),
+                    steps: vec![PlanStep {
+                        query: "q".into(),
+                        rationale: None,
+                    }],
+                },
+                120,
+            )
+            .unwrap();
+        assert!(store.cancel_active(&id2, None, 200).unwrap());
+        assert_eq!(
+            store.get(&id2).unwrap().unwrap().status,
+            ResearchJobStatus::Cancelled,
+        );
+    }
+
+    #[test]
+    fn cancel_active_idempotent_on_terminal_rows() {
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(
+                &id,
+                &ConversationId::from("c"),
+                "q",
+                "Controller",
+                None,
+                100,
+            )
+            .unwrap();
+        store.claim_next_pending("c", 110).unwrap();
+        store
+            .finish(&id, ResearchJobStatus::Complete, None, Some("att"), 200)
+            .unwrap();
+        // Already terminal — cancel is a no-op (returns false, not
+        // an error). Critical: must not flip Complete back to
+        // Cancelled and lose the attachment_id.
+        assert!(!store.cancel_active(&id, Some("late"), 300).unwrap());
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(row.status, ResearchJobStatus::Complete);
+        assert_eq!(row.attachment_id.as_deref(), Some("att"));
+        assert_eq!(row.finished_at, Some(200));
     }
 
     #[test]

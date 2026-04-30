@@ -24,9 +24,12 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
-use axum::routing::get;
+use axum::routing::{get, post};
+use execlaw_core::cards::{CardClosedPayload, CardState};
 use execlaw_core::ids::{ConversationId, ResearchJobId};
-use execlaw_core::research::{ResearchJobStore, ResearchJobSummary};
+use execlaw_core::research::{
+    PhaseGates, ResearchConfigStore, ResearchJobStatus, ResearchJobStore, ResearchJobSummary,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -181,11 +184,13 @@ pub async fn get_report_handler(
 ) -> Result<Json<ResearchJobReportResponse>, ApiError> {
     require_controller(&state, &user)?;
     let id = ResearchJobId::from(job_id.as_str());
-    let row = ResearchJobStore::new(&state.db).get(&id)?.ok_or_else(|| ApiError {
-        status: StatusCode::NOT_FOUND,
-        code: "research_not_found",
-        message: format!("no research job '{job_id}'"),
-    })?;
+    let row = ResearchJobStore::new(&state.db)
+        .get(&id)?
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "research_not_found",
+            message: format!("no research job '{job_id}'"),
+        })?;
     let body = match row.workspace_path.as_deref() {
         Some(path) => {
             let report_path = std::path::PathBuf::from(path).join("report.md");
@@ -244,6 +249,279 @@ pub async fn active_count_handler(
     }))
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ResearchAdvanceResponse {
+    pub job_id: String,
+    /// New status after the advance. For PlanOnly + Planned this is
+    /// `complete`; for EveryPhase + Planned this is `gathering`; for
+    /// EveryPhase + Gathering this is `complete`. Set to the prior
+    /// status when the request was a no-op (job not in an
+    /// advanceable state).
+    pub status: String,
+    /// Whether the request actually triggered a phase. `false` for
+    /// idempotent no-ops (job already terminal, or in a state the
+    /// advance flow doesn't handle from).
+    pub advanced: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ResearchCancelResponse {
+    pub job_id: String,
+    /// Whether the cancel actually flipped the row. `false` for
+    /// idempotent no-ops on already-terminal jobs.
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Deserialize, Default, ToSchema)]
+pub struct ResearchCancelRequest {
+    /// Operator-supplied note saved into `state_research_jobs.error`.
+    /// Optional; the column already coerces null to "operator
+    /// cancelled" defaultless.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/admin/research/jobs/{job_id}/cancel",
+    request_body = ResearchCancelRequest,
+    responses(
+        (status = 200, description = "Cancel recorded", body = ResearchCancelResponse),
+        (status = 404, description = "No job with that id"),
+        (status = 403, description = "Caller is not a Controller"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "research"
+)]
+pub async fn cancel_job_handler(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path(job_id): Path<String>,
+    Json(req): Json<ResearchCancelRequest>,
+) -> Result<Json<ResearchCancelResponse>, ApiError> {
+    require_controller(&state, &user)?;
+    let id = ResearchJobId::from(job_id.as_str());
+    let store = ResearchJobStore::new(&state.db);
+    let row = store.get(&id)?.ok_or_else(|| ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "research_not_found",
+        message: format!("no research job '{job_id}'"),
+    })?;
+    let now = chrono::Utc::now().timestamp();
+    let cancelled = store.cancel_active(
+        &id,
+        req.reason.as_deref().or(Some("operator cancelled")),
+        now,
+    )?;
+    if cancelled {
+        // Mirror the runner's lifecycle by closing the card so the
+        // SPA flips inline-render from live to the final summary
+        // and the WS subscribers see the terminal state.
+        let card_id = row
+            .card_id
+            .clone()
+            .unwrap_or_else(|| format!("research-{}", row.id.as_str()));
+        let summary = req
+            .reason
+            .clone()
+            .map(|r| format!("Research cancelled: {r}"))
+            .unwrap_or_else(|| "Research cancelled by operator.".into());
+        let _ = crate::cards::close_card_and_broadcast(
+            &state.db,
+            &state.events,
+            &row.conversation_id,
+            "system",
+            &CardClosedPayload {
+                card_id,
+                state: CardState::Cancelled,
+                summary,
+                details: None,
+                attachment_id: None,
+                error: req.reason.clone(),
+            },
+        );
+    }
+    Ok(Json(ResearchCancelResponse { job_id, cancelled }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/admin/research/jobs/{job_id}/advance",
+    responses(
+        (status = 200, description = "Advance request accepted", body = ResearchAdvanceResponse),
+        (status = 404, description = "No job with that id"),
+        (status = 409, description = "Job not in an advanceable state"),
+        (status = 503, description = "No inference backend wired"),
+        (status = 403, description = "Caller is not a Controller"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "research"
+)]
+pub async fn advance_job_handler(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Path(job_id): Path<String>,
+) -> Result<Json<ResearchAdvanceResponse>, ApiError> {
+    require_controller(&state, &user)?;
+    let id = ResearchJobId::from(job_id.as_str());
+    let store = ResearchJobStore::new(&state.db);
+    let row = store.get(&id)?.ok_or_else(|| ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "research_not_found",
+        message: format!("no research job '{job_id}'"),
+    })?;
+    // The advance endpoint exists to drive the operator-confirm
+    // flows: PlanOnly + Planned → run gather + synthesise; EveryPhase
+    // + Planned → run gather only; EveryPhase + Gathering → run
+    // synthesise. None auto-chains via the runner so it's never
+    // advanceable here. Other statuses (Pending / Planning /
+    // Synthesizing / terminal) → 409, idempotent.
+    let cfg = ResearchConfigStore::new(&state.db).get()?;
+    let prior = row.status;
+    if !matches!(
+        prior,
+        ResearchJobStatus::Planned | ResearchJobStatus::Gathering
+    ) {
+        return Ok(Json(ResearchAdvanceResponse {
+            job_id,
+            status: prior.as_str().to_owned(),
+            advanced: false,
+        }));
+    }
+
+    // Resolve the inference backend the runner was using. If none is
+    // available we can't run further phases; fail loud so the
+    // operator notices.
+    let inference = state
+        .inference
+        .resolve(&state.db, execlaw_core::backends::BackendPurpose::Standard)
+        .ok_or_else(|| ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "no_inference_backend",
+            message: "no inference backend configured; cannot advance research phase".into(),
+        })?;
+    let model = state.config.model_id.clone();
+    let workspace =
+        crate::research::ResearchWorkspace::new(crate::research::ResearchWorkspace::default_root());
+    let plan = row
+        .plan_json
+        .as_ref()
+        .and_then(|b| rmp_serde::from_slice::<execlaw_core::research::ResearchPlan>(b).ok())
+        .ok_or_else(|| ApiError {
+            status: StatusCode::CONFLICT,
+            code: "research_no_plan",
+            message: "job has no plan persisted; cannot advance".into(),
+        })?;
+    let card_id = row
+        .card_id
+        .clone()
+        .unwrap_or_else(|| format!("research-{}", row.id.as_str()));
+    let conv_id = row.conversation_id.clone();
+    let query = row.query.clone();
+
+    // Spawn the next phase off the request handler — the LLM call
+    // is multi-second and the operator's UI shouldn't block on it.
+    let db = state.db.clone();
+    let events = state.events.clone();
+    let id_for_task = id.clone();
+    let next_status_str = match (cfg.phase_gates, prior) {
+        (PhaseGates::EveryPhase, ResearchJobStatus::Planned) => "gathering".to_owned(),
+        _ => "complete".to_owned(),
+    };
+    tokio::spawn(async move {
+        if matches!(prior, ResearchJobStatus::Planned) {
+            let halt_after_gather = matches!(cfg.phase_gates, PhaseGates::EveryPhase);
+            let notes = match crate::research::runner::run_gather_phase(
+                &db,
+                &events,
+                &workspace,
+                &id_for_task,
+                &conv_id,
+                &card_id,
+                &plan,
+                &cfg,
+                &inference,
+                &model,
+                halt_after_gather,
+            )
+            .await
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(
+                        job_id = id_for_task.as_str(),
+                        error = %e,
+                        "advance(Planned) gather phase failed",
+                    );
+                    return;
+                }
+            };
+            if !halt_after_gather {
+                if let Err(e) = crate::research::runner::run_synthesize_phase(
+                    &db,
+                    &events,
+                    &workspace,
+                    &id_for_task,
+                    &conv_id,
+                    &card_id,
+                    &query,
+                    &plan,
+                    &notes,
+                    &inference,
+                    &model,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        job_id = id_for_task.as_str(),
+                        error = %e,
+                        "advance(Planned→synthesize) failed",
+                    );
+                }
+            }
+        } else {
+            // prior == Gathering; pull the persisted notes back.
+            let notes_row = match ResearchJobStore::new(&db).get(&id_for_task) {
+                Ok(Some(r)) => r,
+                _ => return,
+            };
+            let notes = notes_row
+                .notes_json
+                .as_ref()
+                .and_then(|b| {
+                    rmp_serde::from_slice::<Vec<execlaw_core::research::ResearchNote>>(b).ok()
+                })
+                .unwrap_or_default();
+            if let Err(e) = crate::research::runner::run_synthesize_phase(
+                &db,
+                &events,
+                &workspace,
+                &id_for_task,
+                &conv_id,
+                &card_id,
+                &query,
+                &plan,
+                &notes,
+                &inference,
+                &model,
+            )
+            .await
+            {
+                tracing::warn!(
+                    job_id = id_for_task.as_str(),
+                    error = %e,
+                    "advance(Gathering→synthesize) failed",
+                );
+            }
+        }
+    });
+    Ok(Json(ResearchAdvanceResponse {
+        job_id,
+        status: next_status_str,
+        advanced: true,
+    }))
+}
+
 fn require_controller(state: &AppState, user: &AuthedUser) -> Result<(), ApiError> {
     use execlaw_core::users::{UserRole, UserStore};
     let row = UserStore::new(&state.db)
@@ -275,6 +553,14 @@ pub fn research_admin_router() -> Router<AppState> {
         .route(
             "/api/admin/research/active_count",
             get(active_count_handler),
+        )
+        .route(
+            "/api/admin/research/jobs/{job_id}/cancel",
+            post(cancel_job_handler),
+        )
+        .route(
+            "/api/admin/research/jobs/{job_id}/advance",
+            post(advance_job_handler),
         )
 }
 
@@ -515,6 +801,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_endpoint_flips_active_row_to_cancelled() {
+        let state = test_app_state();
+        let cid = seed_conv(&state, "conv-cancel");
+        let id = ResearchJobId::new();
+        ResearchJobStore::new(&state.db)
+            .insert_pending(&id, &cid, "q", "Controller", None, 100)
+            .unwrap();
+        let app = build_router(state.clone());
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/admin/research/jobs/{}/cancel", id.as_str()))
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"reason": "test cancel"}).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["cancelled"], true);
+        // DB side: row is now Cancelled with the operator's reason.
+        let row = ResearchJobStore::new(&state.db).get(&id).unwrap().unwrap();
+        assert_eq!(
+            row.status,
+            execlaw_core::research::ResearchJobStatus::Cancelled,
+        );
+        assert_eq!(row.error.as_deref(), Some("test cancel"));
+    }
+
+    #[tokio::test]
+    async fn cancel_endpoint_idempotent_on_completed_row() {
+        let state = test_app_state();
+        let cid = seed_conv(&state, "conv-cancel-done");
+        let store = ResearchJobStore::new(&state.db);
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(&id, &cid, "q", "Controller", None, 100)
+            .unwrap();
+        store.claim_next_pending("c", 110).unwrap();
+        store
+            .finish(
+                &id,
+                execlaw_core::research::ResearchJobStatus::Complete,
+                None,
+                Some("att-1"),
+                200,
+            )
+            .unwrap();
+        let app = build_router(state.clone());
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/admin/research/jobs/{}/cancel", id.as_str()))
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({}).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["cancelled"], false);
+        // Row stays Complete with attachment intact.
+        let row = ResearchJobStore::new(&state.db).get(&id).unwrap().unwrap();
+        assert_eq!(
+            row.status,
+            execlaw_core::research::ResearchJobStatus::Complete,
+        );
+        assert_eq!(row.attachment_id.as_deref(), Some("att-1"));
+    }
+
+    #[tokio::test]
+    async fn advance_endpoint_returns_503_when_no_inference_backend() {
+        // Production-like setup: row in Planned, but the test
+        // app_state has no inference backend. Advance must surface a
+        // structured 503 rather than silently spawning a task that
+        // panics later.
+        let state = test_app_state();
+        let cid = seed_conv(&state, "conv-advance-503");
+        let store = ResearchJobStore::new(&state.db);
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(&id, &cid, "q", "Controller", None, 100)
+            .unwrap();
+        store.claim_next_pending("c", 110).unwrap();
+        store
+            .set_planned(
+                &id,
+                &execlaw_core::research::ResearchPlan {
+                    thesis: "t".into(),
+                    steps: vec![execlaw_core::research::PlanStep {
+                        query: "q".into(),
+                        rationale: None,
+                    }],
+                },
+                120,
+            )
+            .unwrap();
+        let app = build_router(state);
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/admin/research/jobs/{}/advance", id.as_str()))
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn advance_endpoint_no_op_for_pending_or_terminal_rows() {
+        // Pending: never advances (gather requires a plan).
+        let state = test_app_state();
+        let cid = seed_conv(&state, "conv-advance-noop");
+        let id = ResearchJobId::new();
+        ResearchJobStore::new(&state.db)
+            .insert_pending(&id, &cid, "q", "Controller", None, 100)
+            .unwrap();
+        let app = build_router(state);
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/admin/research/jobs/{}/advance", id.as_str()))
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // 200 with advanced=false is the idempotent contract.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["advanced"], false);
+        assert_eq!(v["status"], "pending");
+    }
+
+    #[tokio::test]
     async fn list_jobs_rejects_non_controller_caller() {
         // Non-controller users (admin, operator, viewer roles) get
         // 403; matches the strict-controller posture the Audit and
@@ -530,8 +956,7 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert!(
-            resp.status() == StatusCode::UNAUTHORIZED
-                || resp.status() == StatusCode::FORBIDDEN,
+            resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN,
         );
     }
 }

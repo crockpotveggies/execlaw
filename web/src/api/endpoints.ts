@@ -2055,6 +2055,48 @@ export async function getResearchActiveCount(
     return apiFetch<ResearchActiveCountResponse>(path, {}, tokenAccessor);
 }
 
+export interface ResearchAdvanceResponse {
+    job_id: string;
+    /// New status after the advance.
+    status: ResearchJobSummaryView["status"];
+    /// `true` when the request triggered a phase. `false` when the
+    /// row was in a non-advanceable state (idempotent no-op).
+    advanced: boolean;
+}
+
+export interface ResearchCancelResponse {
+    job_id: string;
+    /// `true` when the row flipped to Cancelled. `false` for
+    /// already-terminal rows.
+    cancelled: boolean;
+}
+
+export async function advanceResearchJob(
+    jobId: string,
+    tokenAccessor: () => string | null,
+): Promise<ResearchAdvanceResponse> {
+    return apiFetch<ResearchAdvanceResponse>(
+        `/api/admin/research/jobs/${encodeURIComponent(jobId)}/advance`,
+        { method: "POST" },
+        tokenAccessor,
+    );
+}
+
+export async function cancelResearchJob(
+    jobId: string,
+    tokenAccessor: () => string | null,
+    reason?: string,
+): Promise<ResearchCancelResponse> {
+    return apiFetch<ResearchCancelResponse>(
+        `/api/admin/research/jobs/${encodeURIComponent(jobId)}/cancel`,
+        {
+            method: "POST",
+            body: { reason: reason ?? null },
+        },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/setup/preflight (Phase 14 — first-run wizard) ----
 
 export interface DockerStatus {

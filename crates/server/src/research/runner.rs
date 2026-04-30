@@ -285,173 +285,23 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
             .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??
     };
     if matches!(cfg.phase_gates, PhaseGates::None) {
-        // Build production-impl deps for the gather phase. Inference
-        // is the same client+model the planner used.
-        let search: Arc<dyn WebSearchApi> = Arc::new(DuckDuckGoSearchApi::new());
-        let fetch: Arc<dyn WebFetchApi> = Arc::new(HttpWebFetchApi::new());
-        let subagent: Arc<dyn SubagentApi> = Arc::new(InferenceSubagentApi::new(
-            client.clone(),
-            model.clone(),
-            db.clone(),
-            conv_id.clone(),
-        ));
-        let gather_ctx = GatherCtx {
-            db: db.clone(),
-            job_id: job_id.clone(),
-            conversation_id: conv_id.clone(),
-            card_id: card_id.clone(),
-            workspace: workspace.clone(),
-            plan: plan.clone(),
-            config: cfg.clone(),
-            deps: GatherDeps {
-                search,
-                fetch,
-                subagent: Some(subagent),
-            },
-            events: events.clone(),
-            // Cancellation wiring is C6 territory (operator-driven
-            // cancel button on the card). For now thread a fresh
-            // never-fires token so the gather code path stays
-            // cancellation-aware end-to-end.
-            cancel: CancellationToken::new(),
-        };
-        // Flip status to Gathering BEFORE the workers fire so the SPA
-        // sees the transition reflected in the row immediately.
-        {
-            let db = db.clone();
-            let id = job_id.clone();
-            let now = chrono::Utc::now().timestamp();
-            tokio::task::spawn_blocking(move || {
-                ResearchJobStore::new(&db).mark_gathering(&id, now)
-            })
-            .await
-            .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??;
-        }
-        let notes = match run_gather(gather_ctx).await {
-            Ok(notes) => notes,
-            Err(e) => {
-                mark_failed(
-                    &db,
-                    &events,
-                    &workspace,
-                    &job_id,
-                    &conv_id,
-                    &card_id,
-                    &format!("gather failed: {e}"),
-                )
-                .await;
-                return Err(e.into());
-            }
-        };
-
-        // Gather → Synthesizing transition (status guard ensures
-        // exactly-once advancement).
-        {
-            let db = db.clone();
-            let id = job_id.clone();
-            let now = chrono::Utc::now().timestamp();
-            tokio::task::spawn_blocking(move || {
-                ResearchJobStore::new(&db).mark_synthesizing(&id, now)
-            })
-            .await
-            .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??;
-        }
-        progress_card_and_broadcast(
-            &db,
-            &events,
-            &conv_id,
-            "system",
-            &CardProgressedPayload {
-                card_id: card_id.clone(),
-                state: Some(CardState::Running),
-                progress: Some(0.85),
-                phase: Some("Synthesizing".into()),
-                details: None,
-                actions: None,
-                summary: Some("Composing the final report.".into()),
-            },
-        )?;
-
-        // C5 — synthesize phase. One LLM call given (query + plan +
-        // gather notes) → report.md. Writes the report to the
-        // workspace, registers an AttachmentRow, and emits
-        // `CardClosed{Completed}` with the attachment id +
-        // report_url in details so the SPA's ResearchCard renders
-        // it inline and transport plugins can `send_file` on
-        // TextOnly channels.
-        let synth_ctx = SynthesizeCtx {
-            db: db.clone(),
-            job_id: job_id.clone(),
-            conversation_id: conv_id.clone(),
-            workspace: workspace.clone(),
-            query: row.query.clone(),
-            plan: plan.clone(),
-            notes,
-            inference: client.clone(),
-            model: model.clone(),
-        };
-        let outcome = match run_synthesize(synth_ctx).await {
-            Ok(o) => o,
-            Err(e) => {
-                mark_failed(
-                    &db,
-                    &events,
-                    &workspace,
-                    &job_id,
-                    &conv_id,
-                    &card_id,
-                    &format!("synthesize failed: {e}"),
-                )
-                .await;
-                return Err(e.into());
-            }
-        };
-
-        // Persist attachment_id + flip to terminal Complete.
-        {
-            let db = db.clone();
-            let id = job_id.clone();
-            let att = outcome.attachment_id.as_str().to_owned();
-            let now = chrono::Utc::now().timestamp();
-            tokio::task::spawn_blocking(move || {
-                ResearchJobStore::new(&db).finish(
-                    &id,
-                    ResearchJobStatus::Complete,
-                    None,
-                    Some(&att),
-                    now,
-                )
-            })
-            .await
-            .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??;
-        }
-
-        let report_for_details = outcome.report_markdown.clone();
-        close_card_and_broadcast(
-            &db,
-            &events,
-            &conv_id,
-            "system",
-            &CardClosedPayload {
-                card_id: card_id.clone(),
-                state: CardState::Completed,
-                summary: "Research complete. Report ready.".into(),
-                details: Some(serde_json::json!({
-                    "job_id": job_id.as_str(),
-                    "phase": "Complete",
-                    "report_markdown": report_for_details,
-                    "report_url": format!("/research/{}", job_id.as_str()),
-                })),
-                attachment_id: Some(outcome.attachment_id.as_str().to_owned()),
-                error: None,
-            },
-        )?;
-    } else if matches!(cfg.phase_gates, PhaseGates::EveryPhase) {
-        tracing::info!(
-            job_id = job_id.as_str(),
-            "phase_gates == every_phase — pausing at Planned; operator approval flow lands in C6"
-        );
+        // None: chain plan → gather → synthesize → complete in one
+        // run_job invocation.
+        let notes = run_gather_phase(
+            &db, &events, &workspace, &job_id, &conv_id, &card_id, &plan, &cfg, &client, &model,
+            /* halt_after_gather = */ false,
+        )
+        .await?;
+        run_synthesize_phase(
+            &db, &events, &workspace, &job_id, &conv_id, &card_id, &row.query, &plan, &notes,
+            &client, &model,
+        )
+        .await?;
     }
+    // PlanOnly + EveryPhase both halt at Planned. The C6c
+    // `/api/admin/research/jobs/:id/advance` endpoint is what kicks
+    // the next phase for either; the runner stays a one-shot for
+    // the plan phase only when phase_gates != None.
 
     // Re-read so the caller sees the final row state.
     let final_row = {
@@ -463,6 +313,210 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
     }
     .ok_or_else(|| ResearchError::NotFound(job_id.as_str().to_owned()))?;
     Ok(final_row)
+}
+
+/// Run the gather phase end-to-end: mark_gathering → run_gather →
+/// emit a CardProgressed reflecting the gather completion. When
+/// `halt_after_gather` is true (EveryPhase + advance from Planned),
+/// the row stays at `Gathering` so the operator's next advance
+/// click can fire synthesise; the CardProgressed reports the pause
+/// and surfaces an `Approve` action. When false, the caller is
+/// expected to chain into `run_synthesize_phase` immediately
+/// (None auto-chain + PlanOnly advance from Planned).
+///
+/// On gather failure the row is marked Failed and CardClosed{Failed}
+/// is emitted via `mark_failed` before returning Err.
+pub async fn run_gather_phase(
+    db: &Database,
+    events: &EventBus,
+    workspace: &ResearchWorkspace,
+    job_id: &ResearchJobId,
+    conv_id: &execlaw_core::ids::ConversationId,
+    card_id: &str,
+    plan: &ResearchPlan,
+    cfg: &execlaw_core::research::ResearchConfig,
+    client: &Arc<InferenceClient>,
+    model: &str,
+    halt_after_gather: bool,
+) -> Result<Vec<execlaw_core::research::ResearchNote>, ResearchRunnerError> {
+    let search: Arc<dyn WebSearchApi> = Arc::new(DuckDuckGoSearchApi::new());
+    let fetch: Arc<dyn WebFetchApi> = Arc::new(HttpWebFetchApi::new());
+    let subagent: Arc<dyn SubagentApi> = Arc::new(InferenceSubagentApi::new(
+        client.clone(),
+        model.to_owned(),
+        db.clone(),
+        conv_id.clone(),
+    ));
+    let gather_ctx = GatherCtx {
+        db: db.clone(),
+        job_id: job_id.clone(),
+        conversation_id: conv_id.clone(),
+        card_id: card_id.to_owned(),
+        workspace: workspace.clone(),
+        plan: plan.clone(),
+        config: cfg.clone(),
+        deps: GatherDeps {
+            search,
+            fetch,
+            subagent: Some(subagent),
+        },
+        events: events.clone(),
+        cancel: CancellationToken::new(),
+    };
+    {
+        let db = db.clone();
+        let id = job_id.clone();
+        let now = chrono::Utc::now().timestamp();
+        tokio::task::spawn_blocking(move || ResearchJobStore::new(&db).mark_gathering(&id, now))
+            .await
+            .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??;
+    }
+    let notes = match run_gather(gather_ctx).await {
+        Ok(notes) => notes,
+        Err(e) => {
+            mark_failed(
+                db,
+                events,
+                workspace,
+                job_id,
+                conv_id,
+                card_id,
+                &format!("gather failed: {e}"),
+            )
+            .await;
+            return Err(e.into());
+        }
+    };
+    if halt_after_gather {
+        // EveryPhase: leave the row at Gathering, surface an
+        // Approve action so the operator can advance to synthesise.
+        progress_card_and_broadcast(
+            db,
+            events,
+            conv_id,
+            "system",
+            &CardProgressedPayload {
+                card_id: card_id.to_owned(),
+                state: Some(CardState::Running),
+                progress: Some(0.85),
+                phase: Some("GatherComplete".into()),
+                details: None,
+                actions: Some(vec![CardAction::OpenDetail {
+                    href: format!("/research/{}", job_id.as_str()),
+                }]),
+                summary: Some("Gather complete. Approve to compose the final report.".into()),
+            },
+        )?;
+    }
+    Ok(notes)
+}
+
+/// Run the synthesise phase end-to-end: mark_synthesizing →
+/// run_synthesize → finish(Complete) → CardClosed{Completed} with
+/// the attachment + report markdown inline. On synthesise failure
+/// the row is marked Failed and CardClosed{Failed} is emitted via
+/// `mark_failed` before returning Err.
+pub async fn run_synthesize_phase(
+    db: &Database,
+    events: &EventBus,
+    workspace: &ResearchWorkspace,
+    job_id: &ResearchJobId,
+    conv_id: &execlaw_core::ids::ConversationId,
+    card_id: &str,
+    query: &str,
+    plan: &ResearchPlan,
+    notes: &[execlaw_core::research::ResearchNote],
+    client: &Arc<InferenceClient>,
+    model: &str,
+) -> Result<(), ResearchRunnerError> {
+    {
+        let db = db.clone();
+        let id = job_id.clone();
+        let now = chrono::Utc::now().timestamp();
+        tokio::task::spawn_blocking(move || ResearchJobStore::new(&db).mark_synthesizing(&id, now))
+            .await
+            .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??;
+    }
+    progress_card_and_broadcast(
+        db,
+        events,
+        conv_id,
+        "system",
+        &CardProgressedPayload {
+            card_id: card_id.to_owned(),
+            state: Some(CardState::Running),
+            progress: Some(0.9),
+            phase: Some("Synthesizing".into()),
+            details: None,
+            actions: None,
+            summary: Some("Composing the final report.".into()),
+        },
+    )?;
+    let synth_ctx = SynthesizeCtx {
+        db: db.clone(),
+        job_id: job_id.clone(),
+        conversation_id: conv_id.clone(),
+        workspace: workspace.clone(),
+        query: query.to_owned(),
+        plan: plan.clone(),
+        notes: notes.to_vec(),
+        inference: client.clone(),
+        model: model.to_owned(),
+    };
+    let outcome = match run_synthesize(synth_ctx).await {
+        Ok(o) => o,
+        Err(e) => {
+            mark_failed(
+                db,
+                events,
+                workspace,
+                job_id,
+                conv_id,
+                card_id,
+                &format!("synthesize failed: {e}"),
+            )
+            .await;
+            return Err(e.into());
+        }
+    };
+    {
+        let db = db.clone();
+        let id = job_id.clone();
+        let att = outcome.attachment_id.as_str().to_owned();
+        let now = chrono::Utc::now().timestamp();
+        tokio::task::spawn_blocking(move || {
+            ResearchJobStore::new(&db).finish(
+                &id,
+                ResearchJobStatus::Complete,
+                None,
+                Some(&att),
+                now,
+            )
+        })
+        .await
+        .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??;
+    }
+    let report_for_details = outcome.report_markdown.clone();
+    close_card_and_broadcast(
+        db,
+        events,
+        conv_id,
+        "system",
+        &CardClosedPayload {
+            card_id: card_id.to_owned(),
+            state: CardState::Completed,
+            summary: "Research complete. Report ready.".into(),
+            details: Some(serde_json::json!({
+                "job_id": job_id.as_str(),
+                "phase": "Complete",
+                "report_markdown": report_for_details,
+                "report_url": format!("/research/{}", job_id.as_str()),
+            })),
+            attachment_id: Some(outcome.attachment_id.as_str().to_owned()),
+            error: None,
+        },
+    )?;
+    Ok(())
 }
 
 async fn call_planner(
