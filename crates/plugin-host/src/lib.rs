@@ -9,13 +9,18 @@
 
 #![forbid(unsafe_code)]
 
+pub mod builtin_registrar;
 pub mod hook_registry;
 pub mod host;
 pub mod subprocess;
 
+pub use builtin_registrar::{
+    register_builtins, register_core_builtins, RegisterBuiltinsError,
+};
 pub use hook_registry::{
-    HookRegistry, RegisteredAlertSource, RegisteredEventSubscription, RegisteredIdentityProvider,
-    RegisteredTool, RegisteredTransport, RegisteredUiPanel,
+    HookRegistry, RegisteredAlertSource, RegisteredAny, RegisteredBuiltin,
+    RegisteredEventSubscription, RegisteredIdentityProvider, RegisteredTool,
+    RegisteredTransport, RegisteredUiPanel,
 };
 pub use host::{BuiltinTools, PluginHost, PluginHostError, PluginRow};
 pub use subprocess::{RpcError, RpcRequest, RpcResponse, SubprocessPlugin, SubprocessSpec};

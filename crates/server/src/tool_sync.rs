@@ -19,25 +19,18 @@ use execlaw_core::tool_access::{ToolAccessSeed, ToolAccessStore, ToolSource};
 use execlaw_core::Database;
 use execlaw_plugin_host::PluginHost;
 
-/// Default allowlist for every built-in tool. Built-ins existed
-/// before Phase 8a so they ship "open" (every trust class can call
-/// them) — operators tighten via Settings → Tools. The Controller
-/// is always present.
-fn default_builtin_classes() -> Vec<String> {
+/// Default allowlist for plugin-supplied tools. Plugins ship "open"
+/// on first install (every trust class can call them) — operators
+/// tighten per-tool via Settings. Built-ins now carry their own
+/// `default_allowed_classes` on the descriptor so they no longer
+/// need a hard-coded helper here.
+fn default_plugin_classes() -> Vec<String> {
     vec![
         "Controller".into(),
         "Delegated".into(),
         "KnownTrusted".into(),
         "KnownLimited".into(),
     ]
-}
-
-/// Default allowlist for plugin-supplied tools. Same "open" semantic
-/// as builtins on first install: behaviour matches Phase-2 dispatch
-/// (capability-set + latency band) so wiring the gate doesn't change
-/// any existing flow. Operators tighten per-tool via Settings.
-fn default_plugin_classes() -> Vec<String> {
-    default_builtin_classes()
 }
 
 /// Default allowlist for MCP-sourced tools. Per the locked decision
@@ -53,19 +46,15 @@ pub fn default_mcp_classes_for(row: &McpServerRow) -> Vec<String> {
     }
 }
 
-/// Bare-name list of every built-in tool the runner crate registers.
-/// Kept as a const so adding a new built-in elsewhere will fail to
-/// build until this list catches up — that's intentional.
-const BUILTIN_TOOLS: &[(&str, &str)] = &[
-    ("read_memory", "Read a value from the conversation's memory store."),
-    ("write_memory", "Write a value into the conversation's memory store."),
-    ("list_memory", "List keys in the conversation's memory store."),
-    ("set_thread_name", "Rename the current conversation thread."),
-];
-
 /// Idempotently sync builtins + every currently-registered plugin
 /// tool into `config_tool_access`. Returns the number of rows
 /// upserted (mainly for telemetry / tests).
+///
+/// Built-ins are pulled live from the registry's `all_builtins()`
+/// rather than a hard-coded list — the descriptor on each tool is
+/// the single source of truth for name, description, schema, and
+/// default trust-class allowlist. Adding a new built-in is one
+/// `register_builtin` call and the row appears here automatically.
 pub fn sync_tool_access(
     db: &Database,
     host: &PluginHost,
@@ -74,15 +63,16 @@ pub fn sync_tool_access(
     let store = ToolAccessStore::new(db);
     let mut n = 0;
 
-    for (name, desc) in BUILTIN_TOOLS {
+    for tool in host.registry().all_builtins() {
+        let d = tool.descriptor();
         store.upsert_seen(
             &ToolAccessSeed {
-                tool_name: (*name).into(),
+                tool_name: d.name.clone(),
                 source: ToolSource::Builtin,
                 source_id: None,
-                description: Some((*desc).into()),
-                input_schema: None,
-                default_allowed_classes: default_builtin_classes(),
+                description: Some(d.description.clone()),
+                input_schema: Some(d.schema.to_string()),
+                default_allowed_classes: d.default_allowed_classes.clone(),
             },
             now,
         )?;
@@ -147,7 +137,14 @@ mod tests {
     use execlaw_core::migrations::MigrationRunner;
     use execlaw_plugin_host::HookRegistry;
 
-    fn fresh_host() -> (Database, PluginHost) {
+    /// Helper that returns a fresh DB + plugin host with the core
+    /// trait-based built-ins already registered. `register_now`
+    /// becomes the `first_seen_at` value the registrar stamps; tests
+    /// that exercise idempotency pass a marker timestamp here so
+    /// follow-on sync calls can prove they preserved it.
+    fn fresh_host_with_core_builtins(
+        register_now: i64,
+    ) -> (Database, PluginHost, usize) {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
         MigrationRunner::new(&db).apply_all().unwrap();
         let stage = std::env::temp_dir().join(format!(
@@ -155,28 +152,34 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let host = PluginHost::new(db.clone(), HookRegistry::new(), stage);
-        (db, host)
+        let landed = execlaw_plugin_host::register_core_builtins(
+            host.registry(),
+            &db,
+            register_now,
+        )
+        .unwrap();
+        let count = landed.len();
+        (db, host, count)
     }
 
     #[test]
-    fn sync_seeds_every_builtin() {
-        let (db, host) = fresh_host();
+    fn sync_seeds_every_builtin_from_registry() {
+        let (db, host, expected) = fresh_host_with_core_builtins(100);
         let n = sync_tool_access(&db, &host, 100).unwrap();
-        assert_eq!(n, BUILTIN_TOOLS.len());
+        assert_eq!(n, expected);
         let store = ToolAccessStore::new(&db);
-        for (name, _) in BUILTIN_TOOLS {
-            let row = store.get(name).unwrap().unwrap();
+        for tool in host.registry().all_builtins() {
+            let row = store.get(&tool.descriptor().name).unwrap().unwrap();
             assert_eq!(row.source, ToolSource::Builtin);
             assert!(row.enabled);
-            // Default allowlist includes Controller through KnownLimited.
+            assert!(!row.allowed_classes.is_empty());
             assert!(row.allowed_classes.iter().any(|c| c == "Controller"));
-            assert!(row.allowed_classes.iter().any(|c| c == "KnownLimited"));
         }
     }
 
     #[test]
     fn sync_is_idempotent_and_preserves_operator_policy() {
-        let (db, host) = fresh_host();
+        let (db, host, _) = fresh_host_with_core_builtins(100);
         sync_tool_access(&db, &host, 100).unwrap();
         let store = ToolAccessStore::new(&db);
         // Operator restricts read_memory to Controller-only.
@@ -189,5 +192,21 @@ mod tests {
         assert_eq!(row.allowed_classes, vec!["Controller"]);
         assert_eq!(row.last_seen_at, 200);
         assert_eq!(row.first_seen_at, 100);
+    }
+
+    /// New built-ins added to the core catalog (via
+    /// `register_core_builtins`) appear in the sync output without a
+    /// code change here — single source of truth verified.
+    #[test]
+    fn sync_picks_up_every_descriptor_field_from_registry() {
+        let (db, host, _) = fresh_host_with_core_builtins(100);
+        sync_tool_access(&db, &host, 100).unwrap();
+        let store = ToolAccessStore::new(&db);
+        // Spot-check that the descriptor's input_schema landed —
+        // proving the new path is using the descriptor, not a stub.
+        let row = store.get("read_memory").unwrap().unwrap();
+        assert!(row.input_schema.is_some());
+        let schema_str = row.input_schema.as_ref().unwrap();
+        assert!(schema_str.contains("scope") && schema_str.contains("key"));
     }
 }

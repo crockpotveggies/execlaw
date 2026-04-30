@@ -22,7 +22,12 @@
 
 use crate::mcp_host::{McpHost, MCP_TOOL_PREFIX};
 use async_trait::async_trait;
+use execlaw_core::ids::ConversationId;
+use execlaw_core::tool::{
+    Capability, Clock, SystemClock, ToolCtx, ToolImpl, ToolOutcome,
+};
 use execlaw_core::tool_access::ToolAccessStore;
+use execlaw_core::tool_apis::{DbConversationApi, DbMemoryApi};
 use execlaw_core::Database;
 use execlaw_plugin_host::{BuiltinTools, PluginHost};
 use execlaw_policy::trust::TrustLevel;
@@ -45,6 +50,17 @@ pub struct ChainedToolDispatch<B: BuiltinTools> {
     /// `mcp:<server>:<tool>` prefix route to the connection manager
     /// instead of the builtin/plugin layer.
     pub mcp_host: Option<McpHost>,
+    /// 2026-04-29 — conversation context for the new
+    /// `Arc<dyn ToolImpl>` built-in tier. When the dispatcher is
+    /// constructed with a known conversation id, registry-resolved
+    /// built-ins (`HookRegistry::builtin`) get invoked through their
+    /// trait impl with a capability-scoped `ToolCtx`. When `None`,
+    /// the new tier short-circuits and we fall back to the legacy
+    /// `BuiltinTools::call` path so older fixtures keep working.
+    pub conversation_id: Option<ConversationId>,
+    /// Clock for `ToolCtx`. Defaults to `SystemClock`; tests can
+    /// override via [`Self::with_clock`].
+    pub clock: Arc<dyn Clock>,
 }
 
 impl<B: BuiltinTools> ChainedToolDispatch<B> {
@@ -59,6 +75,8 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             builtins,
             access_db: None,
             mcp_host: None,
+            conversation_id: None,
+            clock: Arc::new(SystemClock),
         }
     }
 
@@ -79,6 +97,8 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             builtins,
             access_db: Some(access_db),
             mcp_host: None,
+            conversation_id: None,
+            clock: Arc::new(SystemClock),
         }
     }
 
@@ -87,6 +107,93 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
     pub fn with_mcp(mut self, mcp_host: McpHost) -> Self {
         self.mcp_host = Some(mcp_host);
         self
+    }
+
+    /// Attach a conversation id so registry-resolved `Arc<dyn
+    /// ToolImpl>` built-ins receive a capability-scoped `ToolCtx`.
+    /// Without this, the new built-in tier short-circuits and the
+    /// dispatcher falls back to the legacy `BuiltinTools::call` path.
+    pub fn with_conversation(mut self, conversation_id: ConversationId) -> Self {
+        self.conversation_id = Some(conversation_id);
+        self
+    }
+
+    /// Override the wall clock. Tests use this to drive deterministic
+    /// memory `updated_at` values; production code uses the default
+    /// `SystemClock`.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Build a `ToolCtx` populated with exactly the capability APIs
+    /// the tool's descriptor declared. A tool that didn't request
+    /// `MemoryRead`/`Write` gets `ctx.memory == None` and either
+    /// returns `Denied` from its own body or simply never reaches a
+    /// memory call.
+    fn build_ctx_for(&self, tool: &Arc<dyn ToolImpl>) -> Result<ToolCtx, String> {
+        let conv_id = self
+            .conversation_id
+            .clone()
+            .ok_or_else(|| "no conversation_id on dispatcher".to_string())?;
+        let db = self.host.db().clone();
+        let mut ctx = ToolCtx::empty(
+            conv_id.clone(),
+            self.caller_trust.as_str(),
+            self.clock.clone(),
+        );
+        let caps = &tool.descriptor().capabilities;
+        let needs_conv = caps
+            .iter()
+            .any(|c| matches!(c, Capability::ConversationRead | Capability::ConversationWrite));
+        let needs_mem = caps
+            .iter()
+            .any(|c| matches!(c, Capability::MemoryRead | Capability::MemoryWrite));
+        if needs_conv {
+            ctx.conversation =
+                Some(Arc::new(DbConversationApi::new(db.clone(), conv_id)));
+        }
+        if needs_mem {
+            let now = self.clock.now_unix();
+            ctx.memory = Some(Arc::new(DbMemoryApi::new(
+                db,
+                self.caller_trust.as_str(),
+                now,
+            )));
+        }
+        Ok(ctx)
+    }
+
+    /// Dispatch a tool name through the new `Arc<dyn ToolImpl>` tier
+    /// if the registry has a built-in for it. Returns `Some(result)`
+    /// when the registry owns the name (success or tool error);
+    /// returns `None` when no built-in is registered, so the caller
+    /// can fall through to the legacy `BuiltinTools::call` path or
+    /// the plugin host.
+    async fn try_registry_builtin(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Option<Result<serde_json::Value, String>> {
+        let tool = self.host.registry().builtin(tool_name)?;
+        if self.conversation_id.is_none() {
+            // The descriptor declared capabilities the new path
+            // needs to populate, but we don't have a conversation id
+            // to scope them to. Fall through so the legacy
+            // `BuiltinTools` impl (if any) gets a chance.
+            return None;
+        }
+        let ctx = match self.build_ctx_for(&tool) {
+            Ok(c) => c,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(match tool.invoke(ctx, args.clone()).await {
+            ToolOutcome::Ok(v) => Ok(v),
+            ToolOutcome::Err { code, message } => {
+                Err(format!("{code}: {message}"))
+            }
+            ToolOutcome::Denied { reason } => Err(format!("denied: {reason}")),
+        })
     }
 
     pub fn into_arc(self) -> Arc<dyn ToolDispatch>
@@ -157,6 +264,13 @@ impl<B: BuiltinTools + 'static> ToolDispatch for ChainedToolDispatch<B> {
             };
         }
 
+        // 2026-04-29 — registry-based built-in tier (new
+        // `Arc<dyn ToolImpl>` path). Runs before the legacy
+        // `BuiltinTools::call` so refactored built-ins hit the
+        // capability-scoped path and uncrefactored ones still work.
+        if let Some(r) = self.try_registry_builtin(tool_name, args_json).await {
+            return r;
+        }
         if let Some(r) = self.builtins.call(tool_name, args_json).await {
             return r;
         }
@@ -500,5 +614,233 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v["reached"], true);
+    }
+
+    // ---- New trait-based built-in dispatch tests --------------------
+
+    use execlaw_core::builtin_tools::{
+        ReadMemoryTool, SetThreadNameTool, WriteMemoryTool,
+    };
+    use execlaw_core::conversation::{
+        ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
+    };
+    use execlaw_core::ids::{ConversationId, EventSeq};
+    use std::sync::Arc;
+
+    fn seed_conv(db: &execlaw_core::Database, id: &str) -> ConversationId {
+        let cid = ConversationId::from(id);
+        ConversationStore::new(db)
+            .upsert(&ConversationRow {
+                conversation_id: cid.clone(),
+                kind: ConversationKind::ControllerDM,
+                last_seq: EventSeq(0),
+                phase: Phase::Idle,
+                controller_id: None,
+                trust_class: "Controller".into(),
+                snapshot_blob: None,
+                snapshot_seq: None,
+                lease_owner: None,
+                lease_expires: None,
+                modality: Modality::Text,
+                display_name: None,
+                is_pinned: false,
+                is_ephemeral: false,
+                ephemeral_expires_at: None,
+                last_activity_at: 0,
+            })
+            .unwrap();
+        cid
+    }
+
+    /// A registry-resolved built-in (`Arc<dyn ToolImpl>`) is invoked
+    /// through the new path with a capability-scoped `ToolCtx`. The
+    /// underlying conversation store reflects the write — proving
+    /// the entire chain (registry lookup → cap construction →
+    /// invoke → store mutation) is wired.
+    #[tokio::test]
+    async fn registry_builtin_set_thread_name_writes_through_dispatcher() {
+        let host = test_host();
+        let db = host.db().clone();
+        host.registry()
+            .register_builtin(Arc::new(SetThreadNameTool::new()))
+            .unwrap();
+        let cid = seed_conv(&db, "c1");
+        let disp = ChainedToolDispatch::new(host, vec!["*".into()], NoBuiltinTools)
+            .with_conversation(cid.clone());
+        let out = disp
+            .call("set_thread_name", &serde_json::json!({"name": "Branding"}))
+            .await
+            .unwrap();
+        assert_eq!(out["ok"], true);
+        let row = ConversationStore::new(&db).get(&cid).unwrap().unwrap();
+        assert_eq!(row.display_name.as_deref(), Some("Branding"));
+    }
+
+    /// `write_memory` registered through the new path, then
+    /// `read_memory` reads it back — both at Controller trust. Proves
+    /// the per-call `MemoryApi` is constructed correctly with
+    /// caller_trust baked in.
+    #[tokio::test]
+    async fn registry_builtin_memory_round_trip_via_dispatcher() {
+        let host = test_host();
+        let db = host.db().clone();
+        host.registry()
+            .register_builtin(Arc::new(WriteMemoryTool::new()))
+            .unwrap();
+        host.registry()
+            .register_builtin(Arc::new(ReadMemoryTool::new()))
+            .unwrap();
+        let cid = seed_conv(&db, "c2");
+        let disp = ChainedToolDispatch::with_access_gate(
+            host,
+            vec!["*".into()],
+            TrustLevel::Controller,
+            NoBuiltinTools,
+            db,
+        )
+        .with_conversation(cid);
+
+        disp.call(
+            "write_memory",
+            &serde_json::json!({"scope": "g", "key": "k", "value": "v"}),
+        )
+        .await
+        .unwrap();
+        let v = disp
+            .call("read_memory", &serde_json::json!({"scope": "g", "key": "k"}))
+            .await
+            .unwrap();
+        assert_eq!(v, serde_json::json!("v"));
+    }
+
+    /// A capability the descriptor didn't declare must surface as a
+    /// `Denied` outcome. Here the dispatcher picks `set_thread_name`
+    /// (declares `ConversationWrite` only) and the test calls a
+    /// no-args invocation of `read_memory` against an unregistered
+    /// name to assert the no-op fallthrough — and then registers
+    /// `read_memory` and triggers the missing-capability branch by
+    /// stripping `MemoryApi` via a dispatcher with no conversation
+    /// id (which short-circuits the new path).
+    #[tokio::test]
+    async fn registry_builtin_denied_when_capability_unmet() {
+        struct PartialMemoryTool {
+            d: execlaw_core::tool::ToolDescriptor,
+        }
+        #[async_trait]
+        impl execlaw_core::tool::ToolImpl for PartialMemoryTool {
+            fn descriptor(&self) -> &execlaw_core::tool::ToolDescriptor {
+                &self.d
+            }
+            async fn invoke(
+                &self,
+                ctx: execlaw_core::tool::ToolCtx,
+                _args: serde_json::Value,
+            ) -> execlaw_core::tool::ToolOutcome {
+                if ctx.memory.is_some() {
+                    execlaw_core::tool::ToolOutcome::ok(serde_json::json!({"ok": true}))
+                } else {
+                    execlaw_core::tool::ToolOutcome::denied("memory missing")
+                }
+            }
+        }
+        let tool = Arc::new(PartialMemoryTool {
+            d: execlaw_core::tool::ToolDescriptor {
+                name: "needs_mem".into(),
+                description: "x".into(),
+                schema: serde_json::json!({"type": "object"}),
+                source: execlaw_core::tool::ToolSource::Builtin,
+                latency: execlaw_core::tool::ToolLatency::Low,
+                // Intentionally empty — the dispatcher must NOT
+                // populate `ctx.memory` even though we'd need it.
+                capabilities: vec![],
+                default_allowed_classes: vec!["Controller".into()],
+            },
+        });
+        let host = test_host();
+        let db = host.db().clone();
+        host.registry().register_builtin(tool).unwrap();
+        let cid = seed_conv(&db, "c3");
+        let disp = ChainedToolDispatch::new(host, vec!["*".into()], NoBuiltinTools)
+            .with_conversation(cid);
+        let err = disp
+            .call("needs_mem", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("denied"));
+        assert!(err.contains("memory missing"));
+    }
+
+    /// When the dispatcher has no `conversation_id`, the new path
+    /// short-circuits and the legacy `BuiltinTools::call` chain runs.
+    /// This preserves the pre-2026-04-29 contract for fixtures that
+    /// don't construct conversations.
+    #[tokio::test]
+    async fn registry_builtin_no_conversation_falls_through_to_legacy() {
+        let host = test_host();
+        host.registry()
+            .register_builtin(Arc::new(SetThreadNameTool::new()))
+            .unwrap();
+
+        struct LegacyEcho;
+        #[async_trait]
+        impl BuiltinTools for LegacyEcho {
+            async fn call(
+                &self,
+                _: &str,
+                _: &serde_json::Value,
+            ) -> Option<Result<serde_json::Value, String>> {
+                Some(Ok(serde_json::json!({"legacy": true})))
+            }
+        }
+        let disp =
+            ChainedToolDispatch::new(host, vec!["*".into()], LegacyEcho); // no conversation id
+        let v = disp
+            .call("set_thread_name", &serde_json::json!({"name": "n"}))
+            .await
+            .unwrap();
+        assert_eq!(v["legacy"], true);
+    }
+
+    /// The new built-in tier runs BEFORE the legacy `BuiltinTools`
+    /// path. If both are configured for the same name, the
+    /// trait-based one wins.
+    #[tokio::test]
+    async fn registry_builtin_takes_precedence_over_legacy_builtins() {
+        let host = test_host();
+        let db = host.db().clone();
+        host.registry()
+            .register_builtin(Arc::new(SetThreadNameTool::new()))
+            .unwrap();
+        let cid = seed_conv(&db, "c4");
+
+        struct LegacyShadowing;
+        #[async_trait]
+        impl BuiltinTools for LegacyShadowing {
+            async fn call(
+                &self,
+                name: &str,
+                _: &serde_json::Value,
+            ) -> Option<Result<serde_json::Value, String>> {
+                if name == "set_thread_name" {
+                    Some(Ok(serde_json::json!({"from_legacy": true})))
+                } else {
+                    None
+                }
+            }
+        }
+        let disp = ChainedToolDispatch::new(
+            host,
+            vec!["*".into()],
+            LegacyShadowing,
+        )
+        .with_conversation(cid.clone());
+        let v = disp
+            .call("set_thread_name", &serde_json::json!({"name": "Won"}))
+            .await
+            .unwrap();
+        assert_eq!(v["ok"], true); // from registry, not legacy
+        assert!(v.get("from_legacy").is_none());
+        let row = ConversationStore::new(&db).get(&cid).unwrap().unwrap();
+        assert_eq!(row.display_name.as_deref(), Some("Won"));
     }
 }

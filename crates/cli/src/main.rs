@@ -1060,6 +1060,36 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
     // Re-hydrate installed plugins from the DB so they survive restart.
     plugin_host.hydrate().await.map_err(|e| anyhow::anyhow!("plugin hydrate: {e}"))?;
 
+    // 2026-04-29 — register the core trait-based built-in tools
+    // (read_memory, write_memory, list_memory, set_thread_name,
+    // get_thread) into the host's HookRegistry and seed their
+    // `config_tool_access` rows from each descriptor's
+    // `default_allowed_classes`. Must run BEFORE sync_tool_access so
+    // the access sync sees them in `registry.all_builtins()`.
+    {
+        let now = chrono::Utc::now().timestamp();
+        match execlaw_plugin_host::register_core_builtins(
+            plugin_host.registry(),
+            &db,
+            now,
+        ) {
+            Ok(landed) => tracing::info!(
+                count = landed.len(),
+                "core built-in tools registered"
+            ),
+            Err(e) => {
+                // Conflict here means an operator-installed plugin is
+                // claiming a tool name that overlaps with a core
+                // built-in — the plugin install should have rejected
+                // that, but if it slipped through we can't proceed
+                // safely with the overlap.
+                return Err(anyhow::anyhow!(
+                    "register_core_builtins failed: {e}"
+                ));
+            }
+        }
+    }
+
     // Phase 8a: reflect every built-in + persisted plugin tool into
     // `config_tool_access` so the per-tool trust-class allowlist gate
     // has a row for everything. Idempotent — operator policy from

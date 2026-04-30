@@ -9,11 +9,16 @@
 //! Phase 1 (see §Phase 1 in MIGRATION_PLAN.md).
 //!
 //! **No cloud-vendor SDKs. Ever.** See §0 axiom #1.
+//!
+//! 2026-04-29 — the legacy `memory_tool` / `thread_tool` modules
+//! moved to `execlaw_core::builtin_tools` as first-class
+//! `ToolImpl`-based built-ins registered through the host's
+//! `HookRegistry`. The dispatch layer in `execlaw_server` now reaches
+//! them via the registry, so the duplicate `MemoryToolDispatcher` /
+//! `ThreadToolDispatcher` types here were pruned.
 
 #![forbid(unsafe_code)]
 
-pub mod memory_tool;
-pub mod thread_tool;
 pub mod turn;
 
 use execlaw_inference_api::InferenceClient;

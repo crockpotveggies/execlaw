@@ -1,0 +1,543 @@
+//! Tool-implementation trait + capability-scoped runtime context.
+//!
+//! This is the contract every executable tool — built-in, plugin, MCP —
+//! eventually satisfies. The runtime hands a tool an `invoke(ctx, args)`
+//! call where `ctx` exposes ONLY the capability APIs the tool's
+//! descriptor declared. There is intentionally **no `db: Database`
+//! handle** in `ToolCtx`: a tool that wants to read messages calls
+//! `ctx.conversation.read_events(...)` and gets a trust-filtered view;
+//! a tool that wants to read memory calls `ctx.memory.read(...)` and
+//! gets a trust-class-scoped lookup. The implementations of those API
+//! traits hold the underlying `Database` privately.
+//!
+//! ## Why no raw DB handle
+//!
+//! Passing a `Database` to a tool would let any tool — built-in or
+//! plugin — read every table: users, refresh tokens, vault blobs,
+//! every conversation's events. That's ambient authority and a textbook
+//! prompt-injection blast-radius problem. The capability-scoped APIs
+//! are the security boundary: a tool can only do what its declared
+//! capability set allows, the implementation enforces caller-trust and
+//! caller-conversation scoping internally, and a buggy tool's worst
+//! case is bounded by what its capabilities expose.
+//!
+//! ## Where this fits
+//!
+//! - `ToolImpl` — the trait every tool implements. Stateless; one
+//!   `Arc<dyn ToolImpl>` per tool, registered into the host's
+//!   `HookRegistry`. The dispatch layer constructs a `ToolCtx` per call.
+//! - `ToolDescriptor` — the metadata the registry stores: name, schema,
+//!   capability set, default allowed trust classes. The LLM sees the
+//!   `name` + `description` + `schema`.
+//! - `Capability` — the enum a descriptor lists. Each variant maps 1:1
+//!   to an `Option<Arc<dyn FooApi>>` field on `ToolCtx`. The runtime
+//!   populates a field if and only if the descriptor declared that
+//!   capability — so a tool that didn't declare `WebFetch` finds
+//!   `ctx.web_fetch == None` and can't even construct a call.
+//! - Capability API traits (`ConversationApi`, `MemoryApi`, …) — narrow
+//!   façades over the underlying stores. Methods take only what's
+//!   intrinsic to the operation (e.g. `read_events(before, limit)`)
+//!   because caller-trust and caller-conversation are baked into the
+//!   trait-object impl at construction time.
+//!
+//! 2026-04-29.
+
+use crate::ids::ConversationId;
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::sync::Arc;
+
+// -----------------------------------------------------------------
+// Descriptor + invocation contract
+// -----------------------------------------------------------------
+
+/// Latency hint the LLM (and the SPA's tool list) reads to decide
+/// when calling the tool feels appropriate. Hard timeouts are
+/// enforced separately by the dispatch layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub enum ToolLatency {
+    /// <100 ms expected — pure DB read, in-memory transform.
+    Low,
+    /// <1 s expected — local network call, small file read.
+    Medium,
+    /// Multi-second — outbound API, model call, long aggregation.
+    High,
+}
+
+impl ToolLatency {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+}
+
+/// Where the tool's implementation lives. The Settings → Tools page
+/// uses this to badge rows; the dispatch layer treats all sources
+/// uniformly once the access gate has cleared the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub enum ToolSource {
+    /// Compiled into the binary. Registered at server boot.
+    Builtin,
+    /// Lives in a plugin subprocess. Registered at plugin install.
+    Plugin,
+    /// Reflected from a connected MCP server.
+    Mcp,
+}
+
+impl ToolSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Plugin => "plugin",
+            Self::Mcp => "mcp",
+        }
+    }
+}
+
+/// Capability requested by a tool, populated as a corresponding
+/// `Option<Arc<dyn FooApi>>` field on `ToolCtx` when the runtime
+/// builds the context for an invocation.
+///
+/// New capabilities get added here when new tool families land — a
+/// closed enum keeps the runtime/tool contract grep-able and prevents
+/// plugins from inventing capabilities that the host doesn't actually
+/// have a corresponding API for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Capability {
+    /// Read this conversation's metadata (display name, kind, phase).
+    ConversationRead,
+    /// Mutate this conversation's metadata. Set thread name, etc.
+    ConversationWrite,
+    /// Read memory entries at the caller's trust class or below.
+    MemoryRead,
+    /// Write memory entries — always at the caller's own trust class.
+    MemoryWrite,
+    /// Read scheduled tasks visible to the caller.
+    TaskRead,
+    /// Create / mutate scheduled tasks.
+    TaskWrite,
+    /// Read recurring schedules / routines.
+    ScheduleRead,
+    /// Create / mutate recurring schedules / routines.
+    ScheduleWrite,
+    /// Outbound HTTP GET, allowlist-gated.
+    WebFetch,
+    /// Web search via the configured provider.
+    Search,
+    /// Send a notification to the controller (alerts / sideband).
+    Notify,
+    /// Spawn a sub-agent / delegated turn.
+    SubagentSpawn,
+}
+
+impl Capability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConversationRead => "conversation_read",
+            Self::ConversationWrite => "conversation_write",
+            Self::MemoryRead => "memory_read",
+            Self::MemoryWrite => "memory_write",
+            Self::TaskRead => "task_read",
+            Self::TaskWrite => "task_write",
+            Self::ScheduleRead => "schedule_read",
+            Self::ScheduleWrite => "schedule_write",
+            Self::WebFetch => "web_fetch",
+            Self::Search => "search",
+            Self::Notify => "notify",
+            Self::SubagentSpawn => "subagent_spawn",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "conversation_read" => Some(Self::ConversationRead),
+            "conversation_write" => Some(Self::ConversationWrite),
+            "memory_read" => Some(Self::MemoryRead),
+            "memory_write" => Some(Self::MemoryWrite),
+            "task_read" => Some(Self::TaskRead),
+            "task_write" => Some(Self::TaskWrite),
+            "schedule_read" => Some(Self::ScheduleRead),
+            "schedule_write" => Some(Self::ScheduleWrite),
+            "web_fetch" => Some(Self::WebFetch),
+            "search" => Some(Self::Search),
+            "notify" => Some(Self::Notify),
+            "subagent_spawn" => Some(Self::SubagentSpawn),
+            _ => None,
+        }
+    }
+}
+
+/// Static metadata for a single tool. Cheap to clone (every field
+/// except `schema` is a small string or enum, and `schema` is wrapped
+/// in `Arc` inside `Value` after the first parse).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDescriptor {
+    /// Globally-unique name. The LLM uses this in its tool-call
+    /// payload; the dispatch layer keys on it.
+    pub name: String,
+    /// One- or two-sentence description shown to the LLM.
+    pub description: String,
+    /// JSON Schema for the args the LLM is expected to send.
+    pub schema: Value,
+    /// Where the implementation lives.
+    pub source: ToolSource,
+    /// Latency hint shown to the LLM and the operator.
+    pub latency: ToolLatency,
+    /// Capabilities the tool needs. The runtime populates the
+    /// corresponding `ToolCtx` field for each — if you don't declare
+    /// `MemoryRead`, `ctx.memory` is `None` at invocation time.
+    pub capabilities: Vec<Capability>,
+    /// Default trust classes that should be allowed when this tool's
+    /// `config_tool_access` row is first inserted. Operator overrides
+    /// via Settings persist; the seed only fires on first sight.
+    pub default_allowed_classes: Vec<String>,
+}
+
+/// Outcome of a `ToolImpl::invoke` call. `Denied` is distinct from
+/// `Err` so the dispatch layer can surface "the tool exists but the
+/// runtime/capability layer refused the call" without conflating it
+/// with a runtime error inside the tool body.
+#[derive(Debug, Clone)]
+pub enum ToolOutcome {
+    /// The tool ran to completion and produced a JSON value to return
+    /// to the model.
+    Ok(Value),
+    /// The tool body errored. `code` is a stable short string for
+    /// programmatic handling; `message` is human-facing.
+    Err { code: String, message: String },
+    /// The dispatch refused the call (capability mismatch, trust gate,
+    /// approval rejection). Bubbles to the model as a structured
+    /// `tool_result` with `denied = true` so it can self-correct.
+    Denied { reason: String },
+}
+
+impl ToolOutcome {
+    pub fn ok(v: Value) -> Self {
+        Self::Ok(v)
+    }
+    pub fn err(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Err {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+    pub fn denied(reason: impl Into<String>) -> Self {
+        Self::Denied {
+            reason: reason.into(),
+        }
+    }
+}
+
+/// The trait every tool implements. Stateless: one `Arc<dyn ToolImpl>`
+/// per tool, kept in the registry, called concurrently across turns.
+#[async_trait]
+pub trait ToolImpl: Send + Sync + 'static {
+    /// Static metadata. The registry caches this; the LLM-facing
+    /// catalog is built from it; the access gate compares the caller's
+    /// trust class against `default_allowed_classes` (on first install).
+    fn descriptor(&self) -> &ToolDescriptor;
+
+    /// Run the tool. The `ctx` carries only the capability APIs the
+    /// descriptor declared; the args are the raw JSON the LLM sent.
+    async fn invoke(&self, ctx: ToolCtx, args: Value) -> ToolOutcome;
+}
+
+// -----------------------------------------------------------------
+// Capability-scoped runtime context
+// -----------------------------------------------------------------
+
+/// Per-call runtime context handed to `ToolImpl::invoke`. The presence
+/// of each `Option<Arc<dyn FooApi>>` field tracks the descriptor's
+/// declared `Capability` set: declared → `Some`, undeclared → `None`.
+///
+/// `ToolCtx` is intentionally NOT `Clone` — a tool gets one per call.
+/// It IS cheap to construct (each field is a refcount bump) so the
+/// dispatcher creates fresh instances rather than sharing.
+pub struct ToolCtx {
+    /// The conversation this turn belongs to. Used by capability impls
+    /// to scope their reads/writes; tools should treat this as
+    /// read-only metadata.
+    pub conversation_id: ConversationId,
+    /// Caller's trust class as a string. Stays as `String` here so
+    /// `core` doesn't depend on `execlaw-policy`'s `TrustLevel` enum;
+    /// the capability impls parse it as needed.
+    pub caller_trust: String,
+    /// Wall-clock provider, abstracted for tests.
+    pub clock: Arc<dyn Clock>,
+
+    /// Capability APIs. Populated iff the tool's descriptor declared
+    /// the corresponding `Capability`. A tool that did NOT declare
+    /// `MemoryRead`/`MemoryWrite` finds `memory == None`.
+    pub conversation: Option<Arc<dyn ConversationApi>>,
+    pub memory: Option<Arc<dyn MemoryApi>>,
+}
+
+impl ToolCtx {
+    /// Construct a context with no capabilities populated. Tests use
+    /// this and then attach the specific APIs they want; production
+    /// code uses the dispatch-layer builder.
+    pub fn empty(
+        conversation_id: ConversationId,
+        caller_trust: impl Into<String>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            conversation_id,
+            caller_trust: caller_trust.into(),
+            clock,
+            conversation: None,
+            memory: None,
+        }
+    }
+}
+
+/// Wall-clock abstraction. Production code uses `SystemClock`; tests
+/// use a fixed-time stub.
+pub trait Clock: Send + Sync + 'static {
+    /// Unix-seconds wall clock.
+    fn now_unix(&self) -> i64;
+}
+
+/// Default `Clock` impl using `chrono::Utc::now()`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_unix(&self) -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+}
+
+// -----------------------------------------------------------------
+// Capability API traits
+// -----------------------------------------------------------------
+
+/// Errors a capability API can return. Each variant maps to a
+/// `ToolOutcome` flavor at the dispatch layer.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ApiError {
+    #[error("not authorized: {0}")]
+    NotAuthorized(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("invalid argument: {0}")]
+    Validation(String),
+    #[error("storage error: {0}")]
+    Storage(String),
+}
+
+impl ApiError {
+    /// Convert this error into a `ToolOutcome` for tool implementations
+    /// that want to surface it as a tool error rather than handle it
+    /// specifically.
+    pub fn into_outcome(self) -> ToolOutcome {
+        match self {
+            Self::NotAuthorized(reason) => ToolOutcome::Denied { reason },
+            Self::NotFound(s) => ToolOutcome::Err {
+                code: "not_found".into(),
+                message: s,
+            },
+            Self::Validation(s) => ToolOutcome::Err {
+                code: "invalid_argument".into(),
+                message: s,
+            },
+            Self::Storage(s) => ToolOutcome::Err {
+                code: "storage_error".into(),
+                message: s,
+            },
+        }
+    }
+}
+
+/// Read-only thread / conversation metadata visible to the caller.
+/// Mutations go through `ConversationApi::set_thread_name`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadInfo {
+    pub conversation_id: String,
+    pub display_name: Option<String>,
+}
+
+/// Conversation-scoped API. The implementation captures the caller's
+/// `conversation_id` + `caller_trust` at construction; method args
+/// don't take them, so a tool can't "see" another conversation by
+/// passing a different id.
+#[async_trait]
+pub trait ConversationApi: Send + Sync {
+    /// Get thread metadata (display name, etc.) for the caller's
+    /// conversation.
+    async fn get_thread(&self) -> Result<ThreadInfo, ApiError>;
+    /// Set the human-readable display name for the caller's
+    /// conversation. Trimmed; empty rejected.
+    async fn set_thread_name(&self, name: &str) -> Result<(), ApiError>;
+}
+
+/// One memory key + its update timestamp. Returned by
+/// `MemoryApi::list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryListEntry {
+    pub key: String,
+    pub updated_at: i64,
+}
+
+/// Memory API. Reads cascade from the caller's trust class downward
+/// (you can read at-or-below your level). Writes always land at your
+/// own trust class — there's no escalation.
+#[async_trait]
+pub trait MemoryApi: Send + Sync {
+    /// Read a value, scanning trust classes the caller is allowed to
+    /// see. Returns `Ok(None)` if no entry is visible.
+    async fn read(&self, scope: &str, key: &str)
+        -> Result<Option<String>, ApiError>;
+    /// Write a value at the caller's own trust class.
+    async fn write(
+        &self,
+        scope: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(), ApiError>;
+    /// List visible keys in a scope, optionally prefix-filtered.
+    async fn list(
+        &self,
+        scope: &str,
+        prefix: &str,
+    ) -> Result<Vec<MemoryListEntry>, ApiError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_parse_roundtrips_every_variant() {
+        for c in [
+            Capability::ConversationRead,
+            Capability::ConversationWrite,
+            Capability::MemoryRead,
+            Capability::MemoryWrite,
+            Capability::TaskRead,
+            Capability::TaskWrite,
+            Capability::ScheduleRead,
+            Capability::ScheduleWrite,
+            Capability::WebFetch,
+            Capability::Search,
+            Capability::Notify,
+            Capability::SubagentSpawn,
+        ] {
+            assert_eq!(Capability::parse(c.as_str()), Some(c));
+        }
+        assert_eq!(Capability::parse("not_a_real_capability"), None);
+    }
+
+    #[test]
+    fn tool_latency_parse_roundtrips() {
+        for l in [ToolLatency::Low, ToolLatency::Medium, ToolLatency::High] {
+            assert_eq!(ToolLatency::parse(l.as_str()), Some(l));
+        }
+        assert_eq!(ToolLatency::parse("instant"), None);
+    }
+
+    #[test]
+    fn tool_source_str_and_parse_match_constants() {
+        assert_eq!(ToolSource::Builtin.as_str(), "builtin");
+        assert_eq!(ToolSource::Plugin.as_str(), "plugin");
+        assert_eq!(ToolSource::Mcp.as_str(), "mcp");
+    }
+
+    #[test]
+    fn tool_outcome_constructors() {
+        match ToolOutcome::ok(serde_json::json!({"x": 1})) {
+            ToolOutcome::Ok(v) => assert_eq!(v["x"], 1),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match ToolOutcome::err("bad", "no") {
+            ToolOutcome::Err { code, message } => {
+                assert_eq!(code, "bad");
+                assert_eq!(message, "no");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match ToolOutcome::denied("nope") {
+            ToolOutcome::Denied { reason } => assert_eq!(reason, "nope"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn api_error_maps_into_outcome_correctly() {
+        match ApiError::NotAuthorized("trust too low".into()).into_outcome() {
+            ToolOutcome::Denied { reason } => assert!(reason.contains("trust")),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        match ApiError::NotFound("event 42".into()).into_outcome() {
+            ToolOutcome::Err { code, .. } => assert_eq!(code, "not_found"),
+            other => panic!("expected Err, got {other:?}"),
+        }
+        match ApiError::Validation("nope".into()).into_outcome() {
+            ToolOutcome::Err { code, .. } => assert_eq!(code, "invalid_argument"),
+            other => panic!("expected Err, got {other:?}"),
+        }
+        match ApiError::Storage("io".into()).into_outcome() {
+            ToolOutcome::Err { code, .. } => assert_eq!(code, "storage_error"),
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_ctx_empty_has_no_capabilities_populated() {
+        let ctx = ToolCtx::empty(
+            ConversationId::from("c1"),
+            "Controller",
+            Arc::new(SystemClock),
+        );
+        assert!(ctx.conversation.is_none());
+        assert!(ctx.memory.is_none());
+        assert_eq!(ctx.caller_trust, "Controller");
+        assert_eq!(ctx.conversation_id.as_str(), "c1");
+    }
+
+    /// Stateless `ToolImpl`s satisfy the trait via simple structs.
+    /// This regression guards against accidentally requiring `'a`
+    /// lifetimes or other awkwardness in the trait shape.
+    #[test]
+    fn tool_impl_can_be_constructed_as_arc_dyn() {
+        struct Echo {
+            descriptor: ToolDescriptor,
+        }
+
+        #[async_trait]
+        impl ToolImpl for Echo {
+            fn descriptor(&self) -> &ToolDescriptor {
+                &self.descriptor
+            }
+            async fn invoke(&self, _ctx: ToolCtx, args: Value) -> ToolOutcome {
+                ToolOutcome::ok(args)
+            }
+        }
+
+        let tool: Arc<dyn ToolImpl> = Arc::new(Echo {
+            descriptor: ToolDescriptor {
+                name: "echo".into(),
+                description: "echoes args".into(),
+                schema: serde_json::json!({"type": "object"}),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Low,
+                capabilities: vec![],
+                default_allowed_classes: vec!["Controller".into()],
+            },
+        });
+        assert_eq!(tool.descriptor().name, "echo");
+    }
+}

@@ -889,24 +889,40 @@ pub(crate) async fn run_runner_turn(
         .unwrap_or(false);
 
     // Build the tool catalog the runner advertises to the model.
-    // Mirrors `run_tool_capable_turn`'s mapping so both code paths
-    // expose the same catalogue. The supervisor's policy engine
-    // already filtered `caller_caps` upstream; tools whose
-    // `config_tool_access` row excludes this trust class are
-    // rejected on dispatch (see ChainedToolDispatch::with_access_gate).
-    let tool_decls: Vec<ToolDeclaration> = state
+    // Includes BOTH the trait-based built-in tier (registered at
+    // boot via `register_core_builtins`) AND every plugin-supplied
+    // tool. Tools whose `config_tool_access` row excludes this
+    // trust class are rejected on dispatch — the catalogue itself
+    // doesn't filter, so the LLM still sees the name and can read
+    // its schema even if it can't call it.
+    let mut tool_decls: Vec<ToolDeclaration> = state
         .plugin_host
         .registry()
-        .all_tools()
+        .all_builtins()
         .iter()
         .map(|t| {
+            let d = t.descriptor();
             ToolDeclaration::function(
-                t.tool_name.clone(),
-                format!("Plugin tool '{}' (latency: {})", t.tool_name, t.latency),
-                serde_json::json!({"type": "object"}),
+                d.name.clone(),
+                d.description.clone(),
+                d.schema.clone(),
             )
         })
         .collect();
+    tool_decls.extend(
+        state
+            .plugin_host
+            .registry()
+            .all_tools()
+            .iter()
+            .map(|t| {
+                ToolDeclaration::function(
+                    t.tool_name.clone(),
+                    format!("Plugin tool '{}' (latency: {})", t.tool_name, t.latency),
+                    serde_json::json!({"type": "object"}),
+                )
+            }),
+    );
 
     // Trust-class string the runner copies into log lines + the
     // model's "from:" header. The flat policy tag is canonical.
@@ -946,7 +962,8 @@ pub(crate) async fn run_runner_turn(
             crate::tool_dispatch::NoBuiltinTools,
             state.db.clone(),
         )
-        .with_mcp(state.mcp_host.clone()),
+        .with_mcp(state.mcp_host.clone())
+        .with_conversation(cid.clone()),
     );
 
     // Step 3.5 — lazy-spawn the runner if it's not registered yet.
@@ -1144,7 +1161,10 @@ async fn run_tool_capable_turn(
             state.db.clone(),
         )
         // Phase-8d: prefix-routed MCP tools land here.
-        .with_mcp(state.mcp_host.clone()),
+        .with_mcp(state.mcp_host.clone())
+        // 2026-04-29 — let registry-based built-ins resolve a
+        // capability-scoped ToolCtx from this conversation.
+        .with_conversation(cid.clone()),
     );
     let exec = TurnExecutor::new((*inference).clone(), dispatch);
     // Phase 11.A — wire a phase observer that fans the runner's
