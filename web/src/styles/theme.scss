@@ -40,6 +40,15 @@ $sidebar-width:  16rem;
 // edge AND between sidebar + content).
 $main-offset:    calc(#{$sidebar-width} + #{$shell-gutter} * 2);
 $radius-card:    1rem;     // 16 px — sidebar wrapper, dialogs
+// 2026-04-30 — `$radius-md` was referenced by the card primitive
+// (`.execlaw-card-task` wrapper + its `__error` inline block) but
+// never defined; production `npm run build` failed with
+// "Undefined variable" for ~5 days. Added here to land the
+// intended in-between rounding (12 px is the standard intermediate
+// between pill 8 px and card 16 px). The card-task wrapper isn't a
+// sidebar (would want $radius-card) and isn't a button (would want
+// $radius-pill) — soft 12 px reads cleanly for both.
+$radius-md:      0.75rem;  // 12 px — card-task wrapper, inline errors
 $radius-pill:    0.5rem;   // 8 px — nav items, buttons, inputs
 // 2026-04-28 — chat thread column max-width. Matches ChatGPT's
 // `--max-thread-content-width: 48rem` so message + composer line
