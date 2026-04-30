@@ -721,6 +721,47 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::setup_preflight::setup_preflight_router())
         .merge(crate::docs::docs_router())
         .with_state(state)
+        // Diagnostic layers, applied last so they wrap everything.
+        //
+        // CatchPanicLayer converts a panic in any handler into a
+        // 500 response WITH a JSON body naming the panic — without
+        // it, panics bubble to Hyper which closes the connection
+        // emitting an empty body (the silent 500 we hit).
+        //
+        // TraceLayer logs request + response status at INFO so the
+        // server stdout shows every API hit and its outcome —
+        // critical for catching cases where a route is reached but
+        // the handler never tracing!s anything itself.
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+            |err: Box<dyn std::any::Any + Send + 'static>| {
+                let msg = if let Some(s) = err.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = err.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "<panic payload was not a string>".to_string()
+                };
+                tracing::error!(panic = %msg, "handler panicked");
+                let body = serde_json::json!({
+                    "error": {
+                        "code": "internal_panic",
+                        "message": msg,
+                    }
+                });
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+            },
+        ))
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http()
+                .make_span_with(
+                    tower_http::trace::DefaultMakeSpan::new()
+                        .level(tracing::Level::INFO),
+                )
+                .on_response(
+                    tower_http::trace::DefaultOnResponse::new()
+                        .level(tracing::Level::INFO),
+                ),
+        )
 }
 
 /// Build a fresh `AppState` for a unit test (in-memory DB, freshly

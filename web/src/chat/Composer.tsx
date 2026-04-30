@@ -130,7 +130,7 @@ export function Composer({
                     ref={textareaRef}
                     as="textarea"
                     rows={1}
-                    placeholder="Ask anything"
+                    placeholder="How can I help?"
                     value={text}
                     onChange={(e) => setText(e.target.value)}
                     onKeyDown={onKeyDown}

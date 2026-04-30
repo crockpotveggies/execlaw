@@ -44,4 +44,30 @@ export default defineConfig({
         // explicit ceiling.
         chunkSizeWarningLimit: 500,
     },
+    css: {
+        preprocessorOptions: {
+            scss: {
+                // Sass 1.77+ defaults the legacy JS API and started
+                // emitting a deprecation warning for it. Vite still
+                // wires through the legacy API by default; opt into
+                // the modern compiler so the warning goes away and
+                // we get the (much faster) sass-embedded path.
+                api: "modern-compiler",
+                // Bootstrap 5.3 still uses `@import`, the old global
+                // colour functions (`red()`/`green()`/`blue()`/
+                // `mix()`/`unit()`), and ships rules where plain
+                // declarations follow nested rules. Those won't be
+                // fixed until Bootstrap 6. Silence those specific
+                // deprecation channels so a real new warning in our
+                // own SCSS still surfaces in the dev-server log.
+                silenceDeprecations: [
+                    "import",
+                    "global-builtin",
+                    "color-functions",
+                    "mixed-decls",
+                    "legacy-js-api",
+                ],
+            },
+        },
+    },
 });

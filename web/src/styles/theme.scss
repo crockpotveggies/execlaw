@@ -60,20 +60,20 @@ $primary:                 $accent;
 // Type — slightly tighter line-height than Bootstrap default for
 // chat density without sacrificing readability.
 //
-// 2026-04-28 — typography split:
+// 2026-04-29 — typography split:
 //   * `$font-system` (system stack) — sidebar, brand mark, badges,
 //     dense chrome where the OS font's tighter rhythm reads better.
-//   * `$font-fira` (Fira Sans, self-hosted via @fontsource) —
+//   * `$font-body` (IBM Plex Sans, self-hosted via @fontsource) —
 //     chat body (agent + user bubbles) and chat / page titles.
 //     Imported in `main.tsx`. Fall back to the system stack if the
 //     woff2 fails to load.
 $font-system: -apple-system, BlinkMacSystemFont, "Segoe UI",
               Roboto, "Helvetica Neue", Arial, sans-serif;
-$font-fira:   "Fira Sans", #{$font-system};
+$font-body:   "IBM Plex Sans", #{$font-system};
 // Bootstrap's $font-family-sans-serif drives the body default.
 // Keep the system stack here so global controls (forms, buttons,
-// non-chat pages) don't all jump to Fira; we opt-in per surface
-// further down.
+// non-chat pages) don't all jump to the body font; we opt-in per
+// surface further down.
 $font-family-sans-serif: $font-system;
 $font-size-base:         0.95rem;
 $line-height-base:       1.5;
@@ -694,12 +694,12 @@ body {
     align-items: center;
     gap: 0.5rem;
 
-    // 2026-04-28 — page/chat title in Fira Sans.
+    // 2026-04-29 — page/chat title in IBM Plex Sans.
     h1,
     h2,
     h3,
     .execlaw-thread-rename {
-        font-family: $font-fira;
+        font-family: $font-body;
         font-weight: 500;
     }
 }
@@ -810,10 +810,10 @@ body {
     padding: 0;
     word-wrap: break-word;
     color: $text-primary;
-    // Fira Sans for chat body. Set on the bubble itself rather
-    // than on `body` so settings pages, forms, and chrome stay
-    // on the system stack.
-    font-family: $font-fira;
+    // IBM Plex Sans for chat body. Set on the bubble itself
+    // rather than on `body` so settings pages, forms, and chrome
+    // stay on the system stack.
+    font-family: $font-body;
     font-size: 0.92rem;
     line-height: 1.5;
 
@@ -857,7 +857,7 @@ body {
     }
 
     h1, h2, h3, h4, h5, h6 {
-        font-family: $font-fira;
+        font-family: $font-body;
         font-weight: 600;
         margin: 0.75rem 0 0.4rem;
         line-height: 1.3;
@@ -1165,11 +1165,11 @@ body {
     gap: 0.75rem;
     margin-bottom: 1rem;
 
-    // Page titles in Fira Sans (matches chat header).
+    // Page titles in IBM Plex Sans (matches chat header).
     h1,
     h2,
     h3 {
-        font-family: $font-fira;
+        font-family: $font-body;
         font-weight: 500;
     }
 }

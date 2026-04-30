@@ -523,7 +523,7 @@ export function MascotGreeting({
                 className="execlaw-mascot-stage__text"
                 data-testid="welcome-greeting-text"
             >
-                welcome {userName}
+                Welcome, {userName}!
             </span>
         </div>
     );
