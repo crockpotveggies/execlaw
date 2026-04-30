@@ -171,7 +171,7 @@ impl ConversationApi for DbConversationApi {
         before_seq: Option<i64>,
         limit: u32,
     ) -> Result<Vec<HistoryEntry>, ApiError> {
-        let limit = limit.min(MAX_HISTORY_LIMIT).max(1) as i64;
+        let limit = limit.clamp(1, MAX_HISTORY_LIMIT) as i64;
         // i64::MAX as the "no upper bound" sentinel — every real seq
         // is < this, so the predicate becomes a tautology and the
         // ORDER BY DESC LIMIT clause runs as expected.

@@ -273,13 +273,11 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
         args: &serde_json::Value,
     ) -> Option<Result<serde_json::Value, String>> {
         let tool = self.host.registry().builtin(tool_name)?;
-        if self.conversation_id.is_none() {
-            // The descriptor declared capabilities the new path
-            // needs to populate, but we don't have a conversation id
-            // to scope them to. Fall through so the legacy
-            // `BuiltinTools` impl (if any) gets a chance.
-            return None;
-        }
+        // The descriptor declared capabilities the new path needs
+        // to populate, but we don't have a conversation id to scope
+        // them to. Fall through (return None) so the legacy
+        // `BuiltinTools` impl (if any) gets a chance.
+        self.conversation_id.as_ref()?;
         let ctx = match self.build_ctx_for(&tool) {
             Ok(c) => c,
             Err(e) => return Some(Err(e)),

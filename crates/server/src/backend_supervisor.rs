@@ -871,10 +871,11 @@ impl BackendSupervisor {
                     // CrashLooping arm captures a fresh tail for
                     // the alert detail.
                     if !matches!(slot.stage, LifecycleStage::Healthy) {
-                        let tail = match self.controller.tail_logs(&handle, 40).await {
-                            Ok(s) => s,
-                            Err(_) => String::new(),
-                        };
+                        let tail = self
+                            .controller
+                            .tail_logs(&handle, 40)
+                            .await
+                            .unwrap_or_default();
                         if !tail.trim().is_empty() {
                             slot.last_log_line = tail
                                 .lines()

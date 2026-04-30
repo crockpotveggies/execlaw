@@ -2376,7 +2376,7 @@ fn sanitize_generated_title(raw: &str) -> String {
     }
     // Trailing period/comma/semicolon — strip.
     s = s
-        .trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':'))
+        .trim_end_matches(['.', ',', ';', ':'])
         .to_owned();
     if s.chars().count() > 60 {
         s = s.chars().take(60).collect::<String>().trim().to_owned();
