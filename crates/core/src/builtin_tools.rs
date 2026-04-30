@@ -1722,6 +1722,85 @@ impl ToolImpl for ResearchListTool {
 }
 
 // ---------------------------------------------------------------
+// research_get_report — fetch a completed job's synthesized markdown.
+// ---------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ResearchGetReportArgs {
+    job_id: String,
+}
+
+pub struct ResearchGetReportTool {
+    descriptor: ToolDescriptor,
+}
+
+impl Default for ResearchGetReportTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ResearchGetReportTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "research_get_report".into(),
+                description:
+                    "Fetch the synthesized markdown report for a completed deep-research job. \
+                     Returns the report text or null if the job exists but has no report yet \
+                     (still gathering / synthesizing / failed)."
+                        .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "job_id": {
+                            "type": "string",
+                            "description": "The id returned by `research_start`."
+                        }
+                    },
+                    "required": ["job_id"],
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Low,
+                capabilities: vec![Capability::ResearchRead],
+                default_allowed_classes: default_allowed_for_research_read(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for ResearchGetReportTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, args: Value) -> ToolOutcome {
+        let args: ResearchGetReportArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolOutcome::err("invalid_argument", e.to_string()),
+        };
+        let api = match ctx.research.as_ref() {
+            Some(a) => a,
+            None => {
+                return ToolOutcome::denied("research_read capability not granted to this tool");
+            }
+        };
+        match api.get_report(&args.job_id).await {
+            Ok(Some(report)) => ToolOutcome::Ok(json!({
+                "job_id": args.job_id,
+                "report_markdown": report,
+            })),
+            Ok(None) => ToolOutcome::Ok(json!({
+                "job_id": args.job_id,
+                "report_markdown": Value::Null,
+            })),
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------
 // Registrar
 // ---------------------------------------------------------------
 
@@ -1751,6 +1830,7 @@ pub fn core_builtin_tools() -> Vec<Arc<dyn ToolImpl>> {
         Arc::new(ResearchStartTool::new()),
         Arc::new(ResearchStatusTool::new()),
         Arc::new(ResearchListTool::new()),
+        Arc::new(ResearchGetReportTool::new()),
     ]
 }
 
@@ -1883,7 +1963,8 @@ mod tests {
         assert!(names.contains(&"research_start"));
         assert!(names.contains(&"research_status"));
         assert!(names.contains(&"research_list"));
-        assert_eq!(names.len(), 20);
+        assert!(names.contains(&"research_get_report"));
+        assert_eq!(names.len(), 21);
     }
 
     #[test]
@@ -3153,6 +3234,114 @@ mod tests {
         match out {
             ToolOutcome::Ok(v) => assert_eq!(v["count"], 2),
             other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn research_get_report_returns_null_when_no_workspace_yet() {
+        // A freshly-spawned job has no workspace_path on the row
+        // until the runner provisions it. The tool must return
+        // a `null` report rather than erroring so the caller can
+        // poll cleanly.
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "conv-report-null");
+        // Spawn a job (status: Pending, workspace_path: NULL).
+        let spawn_ctx = build_ctx_with_research_spawn(&db, cid.clone(), "Controller");
+        let started = ResearchStartTool::new()
+            .invoke(spawn_ctx, json!({"query": "anything"}))
+            .await;
+        let job_id = match started {
+            ToolOutcome::Ok(v) => v["job"]["id"].as_str().unwrap().to_owned(),
+            other => panic!("seed: {other:?}"),
+        };
+        let read_ctx = build_ctx_with_research_read(&db, cid, "Controller");
+        match ResearchGetReportTool::new()
+            .invoke(read_ctx, json!({"job_id": job_id}))
+            .await
+        {
+            ToolOutcome::Ok(v) => {
+                assert!(v["report_markdown"].is_null());
+            }
+            other => panic!("expected Ok with null report, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn research_get_report_reads_workspace_when_report_exists() {
+        // Simulate a completed job: insert pending → set workspace
+        // path to a temp dir → drop a report.md → ask the tool.
+        use crate::research::ResearchJobStore;
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "conv-report-have");
+        let store = ResearchJobStore::new(&db);
+        let id = crate::ids::ResearchJobId::new();
+        store
+            .insert_pending(&id, &cid, "q", "Controller", None, 100)
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_dir = tmp.path().join(id.as_str());
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        std::fs::write(
+            workspace_dir.join("report.md"),
+            "# Final report\n\nFindings.\n",
+        )
+        .unwrap();
+        store
+            .set_workspace_path(&id, &workspace_dir.to_string_lossy(), 200)
+            .unwrap();
+        let read_ctx = build_ctx_with_research_read(&db, cid, "Controller");
+        match ResearchGetReportTool::new()
+            .invoke(read_ctx, json!({"job_id": id.as_str()}))
+            .await
+        {
+            ToolOutcome::Ok(v) => {
+                let body = v["report_markdown"].as_str().unwrap();
+                assert!(body.contains("Final report"));
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn research_get_report_denies_low_trust_caller_in_other_conversation() {
+        // Adversarial — a KnownTrusted caller in conv-A asks for
+        // the report belonging to conv-B. Must NOT leak the report.
+        use crate::research::ResearchJobStore;
+        let db = fresh_db();
+        let _ = seed_conversation(&db, "conv-A");
+        let _ = seed_conversation(&db, "conv-B");
+        let cid_b = ConversationId::from("conv-B");
+        let store = ResearchJobStore::new(&db);
+        let id = crate::ids::ResearchJobId::new();
+        store
+            .insert_pending(&id, &cid_b, "q", "Controller", None, 100)
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_dir = tmp.path().join(id.as_str());
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        std::fs::write(
+            workspace_dir.join("report.md"),
+            "secret report belonging to conv-B",
+        )
+        .unwrap();
+        store
+            .set_workspace_path(&id, &workspace_dir.to_string_lossy(), 200)
+            .unwrap();
+        let read_ctx =
+            build_ctx_with_research_read(&db, ConversationId::from("conv-A"), "KnownTrusted");
+        match ResearchGetReportTool::new()
+            .invoke(read_ctx, json!({"job_id": id.as_str()}))
+            .await
+        {
+            ToolOutcome::Ok(v) => {
+                // Must surface as null (job hidden from caller's
+                // view), not the real report.
+                assert!(
+                    v["report_markdown"].is_null(),
+                    "leaked cross-conversation report: {v}",
+                );
+            }
+            other => panic!("expected Ok with null report, got {other:?}"),
         }
     }
 

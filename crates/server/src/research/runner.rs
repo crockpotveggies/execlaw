@@ -23,6 +23,7 @@ use crate::cards::{
 };
 use crate::events::EventBus;
 use crate::research::gather::{GatherCtx, GatherDeps, GatherError, run_gather};
+use crate::research::synthesize::{SynthesizeCtx, SynthesizeError, run_synthesize};
 use crate::research::workspace::{ResearchWorkspace, WorkspaceError};
 use crate::tool_apis_http::HttpWebFetchApi;
 use crate::tool_apis_search::DuckDuckGoSearchApi;
@@ -54,6 +55,8 @@ pub enum ResearchRunnerError {
     CardEmit(#[from] CardEmitError),
     #[error(transparent)]
     Gather(#[from] GatherError),
+    #[error(transparent)]
+    Synthesize(#[from] SynthesizeError),
     #[error("inference: {0}")]
     Inference(String),
     #[error("planner produced unparseable JSON: {0}")]
@@ -324,37 +327,8 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
             .await
             .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??;
         }
-        match run_gather(gather_ctx).await {
-            Ok(_notes) => {
-                // Gather complete — flip to Synthesizing. The
-                // synthesize phase itself lands in C5; for now we
-                // emit a CardProgressed marking gather complete and
-                // stop, leaving the row in Synthesizing for C5's
-                // pickup logic.
-                let now = chrono::Utc::now().timestamp();
-                let db_for_task = db.clone();
-                let id = job_id.clone();
-                tokio::task::spawn_blocking(move || {
-                    ResearchJobStore::new(&db_for_task).mark_synthesizing(&id, now)
-                })
-                .await
-                .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??;
-                progress_card_and_broadcast(
-                    &db,
-                    &events,
-                    &conv_id,
-                    "system",
-                    &CardProgressedPayload {
-                        card_id: card_id.clone(),
-                        state: Some(CardState::Running),
-                        progress: Some(0.85),
-                        phase: Some("Gather complete".into()),
-                        details: None,
-                        actions: None,
-                        summary: Some("Gather complete; synthesize phase lands in C5.".into()),
-                    },
-                )?;
-            }
+        let notes = match run_gather(gather_ctx).await {
+            Ok(notes) => notes,
             Err(e) => {
                 mark_failed(
                     &db,
@@ -368,7 +342,110 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
                 .await;
                 return Err(e.into());
             }
+        };
+
+        // Gather → Synthesizing transition (status guard ensures
+        // exactly-once advancement).
+        {
+            let db = db.clone();
+            let id = job_id.clone();
+            let now = chrono::Utc::now().timestamp();
+            tokio::task::spawn_blocking(move || {
+                ResearchJobStore::new(&db).mark_synthesizing(&id, now)
+            })
+            .await
+            .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??;
         }
+        progress_card_and_broadcast(
+            &db,
+            &events,
+            &conv_id,
+            "system",
+            &CardProgressedPayload {
+                card_id: card_id.clone(),
+                state: Some(CardState::Running),
+                progress: Some(0.85),
+                phase: Some("Synthesizing".into()),
+                details: None,
+                actions: None,
+                summary: Some("Composing the final report.".into()),
+            },
+        )?;
+
+        // C5 — synthesize phase. One LLM call given (query + plan +
+        // gather notes) → report.md. Writes the report to the
+        // workspace, registers an AttachmentRow, and emits
+        // `CardClosed{Completed}` with the attachment id +
+        // report_url in details so the SPA's ResearchCard renders
+        // it inline and transport plugins can `send_file` on
+        // TextOnly channels.
+        let synth_ctx = SynthesizeCtx {
+            db: db.clone(),
+            job_id: job_id.clone(),
+            conversation_id: conv_id.clone(),
+            workspace: workspace.clone(),
+            query: row.query.clone(),
+            plan: plan.clone(),
+            notes,
+            inference: client.clone(),
+            model: model.clone(),
+        };
+        let outcome = match run_synthesize(synth_ctx).await {
+            Ok(o) => o,
+            Err(e) => {
+                mark_failed(
+                    &db,
+                    &events,
+                    &workspace,
+                    &job_id,
+                    &conv_id,
+                    &card_id,
+                    &format!("synthesize failed: {e}"),
+                )
+                .await;
+                return Err(e.into());
+            }
+        };
+
+        // Persist attachment_id + flip to terminal Complete.
+        {
+            let db = db.clone();
+            let id = job_id.clone();
+            let att = outcome.attachment_id.as_str().to_owned();
+            let now = chrono::Utc::now().timestamp();
+            tokio::task::spawn_blocking(move || {
+                ResearchJobStore::new(&db).finish(
+                    &id,
+                    ResearchJobStatus::Complete,
+                    None,
+                    Some(&att),
+                    now,
+                )
+            })
+            .await
+            .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??;
+        }
+
+        let report_for_details = outcome.report_markdown.clone();
+        close_card_and_broadcast(
+            &db,
+            &events,
+            &conv_id,
+            "system",
+            &CardClosedPayload {
+                card_id: card_id.clone(),
+                state: CardState::Completed,
+                summary: "Research complete. Report ready.".into(),
+                details: Some(serde_json::json!({
+                    "job_id": job_id.as_str(),
+                    "phase": "Complete",
+                    "report_markdown": report_for_details,
+                    "report_url": format!("/research/{}", job_id.as_str()),
+                })),
+                attachment_id: Some(outcome.attachment_id.as_str().to_owned()),
+                error: None,
+            },
+        )?;
     } else if matches!(cfg.phase_gates, PhaseGates::EveryPhase) {
         tracing::info!(
             job_id = job_id.as_str(),

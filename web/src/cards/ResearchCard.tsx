@@ -51,6 +51,12 @@ interface ResearchDetails {
     query?: string;
     plan?: ResearchPlanView;
     notes?: ResearchNoteView[];
+    /// Final synthesized report — populated on the CardClosed event
+    /// when status flips to `Completed`. The renderer surfaces it
+    /// inline below the plan tree so the operator never has to
+    /// click an "Open" button to read the conclusion.
+    report_markdown?: string;
+    report_url?: string;
 }
 
 function readDetails(raw: unknown): ResearchDetails | null {
@@ -164,6 +170,22 @@ export function ResearchCard({ card, onAction }: CardRendererProps) {
             )}
 
             <div className="execlaw-card-task__summary">{card.summary}</div>
+
+            {details?.report_markdown && (
+                <details
+                    className="execlaw-card-research__report"
+                    data-testid="card-research-report"
+                    open={card.state === "Completed"}
+                >
+                    <summary>Report</summary>
+                    <pre
+                        className="execlaw-card-research__report-body"
+                        data-testid="card-research-report-body"
+                    >
+                        {details.report_markdown}
+                    </pre>
+                </details>
+            )}
 
             {card.error && (
                 <div

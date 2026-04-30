@@ -94,6 +94,34 @@ impl ResearchWorkspace {
         Ok(path)
     }
 
+    /// Write the synthesized report to `report.md` (C5). Returns the
+    /// absolute path; callers register that path with the
+    /// `AttachmentStore` so transport plugins can `send_file` it on
+    /// the CardClosed event.
+    pub fn write_report(
+        &self,
+        job_id: &ResearchJobId,
+        markdown: &str,
+    ) -> Result<PathBuf, WorkspaceError> {
+        let dir = self.provision(job_id)?;
+        let path = dir.join("report.md");
+        std::fs::write(&path, markdown)?;
+        Ok(path)
+    }
+
+    /// Read the synthesized report back. Used by the
+    /// `research_get_report` tool. Returns `Ok(None)` when the file
+    /// hasn't been written yet (gather phase still running, or job
+    /// failed before synthesize). Other I/O errors propagate.
+    pub fn read_report(&self, job_id: &ResearchJobId) -> Result<Option<String>, WorkspaceError> {
+        let path = self.root.join(job_id.as_str()).join("report.md");
+        match std::fs::read_to_string(&path) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(WorkspaceError::Io(e)),
+        }
+    }
+
     /// Tear down a job's workspace. C6's retention sweeper calls this
     /// after the row's terminal `finished_at` ages past the global
     /// retention cutoff. Safe to call when the dir doesn't exist.

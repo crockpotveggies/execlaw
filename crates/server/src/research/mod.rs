@@ -23,9 +23,11 @@
 pub mod gather;
 pub mod runner;
 pub mod supervisor;
+pub mod synthesize;
 pub mod workspace;
 
 pub use gather::{GatherCtx, GatherDeps, GatherError, run_gather};
 pub use runner::{ResearchRunnerError, run_job};
 pub use supervisor::ResearchSupervisor;
+pub use synthesize::{SynthesizeCtx, SynthesizeError, SynthesizeOutcome, run_synthesize};
 pub use workspace::{ResearchWorkspace, WorkspaceError};

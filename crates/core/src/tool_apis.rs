@@ -893,6 +893,30 @@ impl ResearchApi for DbResearchApi {
         .map_err(|e| ApiError::Storage(e.to_string()))?;
         Ok(rows.iter().map(row_to_view).collect())
     }
+
+    async fn get_report(&self, job_id: &str) -> Result<Option<String>, ApiError> {
+        // Reuse `status`'s trust-scoped lookup so a below-Controller
+        // caller can't read another conversation's report by guessing
+        // job ids.
+        let view = self.status(job_id).await?;
+        let Some(view) = view else {
+            return Ok(None);
+        };
+        let Some(workspace_path) = view.workspace_path.clone() else {
+            return Ok(None);
+        };
+        // Reading report.md is sync I/O — push to spawn_blocking.
+        let path = std::path::PathBuf::from(workspace_path).join("report.md");
+        let body = tokio::task::spawn_blocking(move || match std::fs::read_to_string(&path) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.to_string()),
+        })
+        .await
+        .map_err(|e| ApiError::Storage(format!("join: {e}")))?
+        .map_err(ApiError::Storage)?;
+        Ok(body)
+    }
 }
 
 #[cfg(test)]

@@ -177,6 +177,45 @@ describe("ResearchCard renderer", () => {
         expect(screen.getByTestId("card-research")).toBeTruthy();
     });
 
+    it("renders the synthesized report inline when details.report_markdown is set", () => {
+        const card = makeResearchCard({
+            state: "Completed",
+            progress: 1,
+            details: {
+                job_id: "job-1",
+                phase: "Complete",
+                plan: {
+                    thesis: "test",
+                    steps: [{ query: "q", rationale: null }],
+                },
+                notes: [
+                    {
+                        index: 0,
+                        sub_query: "q",
+                        state: "Done",
+                        excerpt: "ok",
+                        sources: [],
+                    },
+                ],
+                report_markdown: "# Final report\n\nKey findings.",
+                report_url: "/research/job-1",
+            },
+        });
+        render(<ResearchCard card={card} />);
+        const body = screen.getByTestId("card-research-report-body");
+        expect(body.textContent).toContain("Final report");
+        // Open by default on Completed.
+        const wrapper = screen.getByTestId("card-research-report");
+        expect((wrapper as HTMLDetailsElement).open).toBe(true);
+    });
+
+    it("does not render a report block when details.report_markdown is absent", () => {
+        // Mid-gather — no report yet. The block should be missing
+        // entirely rather than rendering an empty <details>.
+        render(<ResearchCard card={makeResearchCard()} />);
+        expect(screen.queryByTestId("card-research-report")).toBeNull();
+    });
+
     it("never includes a progress bar when state is Completed", () => {
         const card = makeResearchCard({ state: "Completed", progress: 1 });
         render(<ResearchCard card={card} />);

@@ -745,6 +745,13 @@ pub trait ResearchApi: Send + Sync {
     /// List jobs visible to the caller. Below-Controller callers see
     /// only their own conversation; Controllers see every row.
     async fn list(&self) -> Result<Vec<ResearchJobView>, ApiError>;
+
+    /// Read the synthesized report for a completed job. Returns
+    /// `Ok(None)` when the job exists but has no report yet (still
+    /// gathering / synthesizing / failed) or when the job isn't
+    /// visible to the caller. Trust scoping mirrors `status` —
+    /// below-Controller callers see only their own conversation.
+    async fn get_report(&self, job_id: &str) -> Result<Option<String>, ApiError>;
 }
 
 /// Outbound HTTP capability. Implementations are responsible for SSRF
