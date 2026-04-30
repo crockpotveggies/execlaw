@@ -199,7 +199,7 @@ fn build_synthesize_prompt(query: &str, plan: &ResearchPlan, notes: &[&ResearchN
         ));
         if !note.excerpt.trim().is_empty() {
             buf.push_str(&note.excerpt);
-            buf.push_str("\n");
+            buf.push('\n');
         }
         let ok_sources: Vec<&_> = note.sources.iter().filter(|s| s.fetched_ok).collect();
         if !ok_sources.is_empty() {

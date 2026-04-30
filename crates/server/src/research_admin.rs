@@ -421,8 +421,16 @@ pub async fn advance_job_handler(
 
     // Spawn the next phase off the request handler — the LLM call
     // is multi-second and the operator's UI shouldn't block on it.
-    let db = state.db.clone();
-    let events = state.events.clone();
+    let phase_deps = crate::research::runner::PhaseDeps {
+        db: state.db.clone(),
+        events: state.events.clone(),
+        workspace,
+        conversation_id: conv_id,
+        card_id,
+        inference,
+        model,
+    };
+    let db_for_notes = state.db.clone();
     let id_for_task = id.clone();
     let next_status_str = match (cfg.phase_gates, prior) {
         (PhaseGates::EveryPhase, ResearchJobStatus::Planned) => "gathering".to_owned(),
@@ -432,16 +440,10 @@ pub async fn advance_job_handler(
         if matches!(prior, ResearchJobStatus::Planned) {
             let halt_after_gather = matches!(cfg.phase_gates, PhaseGates::EveryPhase);
             let notes = match crate::research::runner::run_gather_phase(
-                &db,
-                &events,
-                &workspace,
+                &phase_deps,
                 &id_for_task,
-                &conv_id,
-                &card_id,
                 &plan,
                 &cfg,
-                &inference,
-                &model,
                 halt_after_gather,
             )
             .await
@@ -458,17 +460,11 @@ pub async fn advance_job_handler(
             };
             if !halt_after_gather {
                 if let Err(e) = crate::research::runner::run_synthesize_phase(
-                    &db,
-                    &events,
-                    &workspace,
+                    &phase_deps,
                     &id_for_task,
-                    &conv_id,
-                    &card_id,
                     &query,
                     &plan,
                     &notes,
-                    &inference,
-                    &model,
                 )
                 .await
                 {
@@ -481,7 +477,7 @@ pub async fn advance_job_handler(
             }
         } else {
             // prior == Gathering; pull the persisted notes back.
-            let notes_row = match ResearchJobStore::new(&db).get(&id_for_task) {
+            let notes_row = match ResearchJobStore::new(&db_for_notes).get(&id_for_task) {
                 Ok(Some(r)) => r,
                 _ => return,
             };
@@ -493,17 +489,11 @@ pub async fn advance_job_handler(
                 })
                 .unwrap_or_default();
             if let Err(e) = crate::research::runner::run_synthesize_phase(
-                &db,
-                &events,
-                &workspace,
+                &phase_deps,
                 &id_for_task,
-                &conv_id,
-                &card_id,
                 &query,
                 &plan,
                 &notes,
-                &inference,
-                &model,
             )
             .await
             {

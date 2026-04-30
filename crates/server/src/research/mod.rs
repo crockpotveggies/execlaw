@@ -29,7 +29,7 @@ pub mod workspace;
 
 pub use gather::{GatherCtx, GatherDeps, GatherError, run_gather};
 pub use retention::{ResearchRetentionReport, ResearchRetentionSweeper};
-pub use runner::{ResearchRunnerError, run_job};
+pub use runner::{PhaseDeps, ResearchRunnerError, run_job};
 pub use supervisor::ResearchSupervisor;
 pub use synthesize::{SynthesizeCtx, SynthesizeError, SynthesizeOutcome, run_synthesize};
 pub use workspace::{ResearchWorkspace, WorkspaceError};

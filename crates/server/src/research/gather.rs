@@ -444,6 +444,11 @@ fn gather_progress_for(plan: &ResearchPlan, base: f32) -> f32 {
     base
 }
 
+// 8 args is past clippy's threshold but every arg is heterogeneous
+// (db handle, bus, ids, mutex, plan ref) and the helper is called
+// from one site only. Bundling into a struct just to silence the
+// lint adds churn without clarity; allow it.
+#[allow(clippy::too_many_arguments)]
 async fn persist_one_note_and_emit_card(
     db: &Database,
     events: &EventBus,
@@ -499,6 +504,9 @@ async fn persist_one_note_and_emit_card(
     Ok(())
 }
 
+// Same allow as persist_one_note — single call site, heterogeneous
+// args that don't cluster well.
+#[allow(clippy::too_many_arguments)]
 async fn persist_notes_and_emit_card(
     db: &Database,
     events: &EventBus,

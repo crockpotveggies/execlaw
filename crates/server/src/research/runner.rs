@@ -287,16 +287,19 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
     if matches!(cfg.phase_gates, PhaseGates::None) {
         // None: chain plan → gather → synthesize → complete in one
         // run_job invocation.
-        let notes = run_gather_phase(
-            &db, &events, &workspace, &job_id, &conv_id, &card_id, &plan, &cfg, &client, &model,
-            /* halt_after_gather = */ false,
-        )
-        .await?;
-        run_synthesize_phase(
-            &db, &events, &workspace, &job_id, &conv_id, &card_id, &row.query, &plan, &notes,
-            &client, &model,
-        )
-        .await?;
+        let phase_deps = PhaseDeps {
+            db: db.clone(),
+            events: events.clone(),
+            workspace: workspace.clone(),
+            conversation_id: conv_id.clone(),
+            card_id: card_id.clone(),
+            inference: client.clone(),
+            model: model.clone(),
+        };
+        let notes =
+            run_gather_phase(&phase_deps, &job_id, &plan, &cfg, /* halt_after_gather = */ false)
+                .await?;
+        run_synthesize_phase(&phase_deps, &job_id, &row.query, &plan, &notes).await?;
     }
     // PlanOnly + EveryPhase both halt at Planned. The C6c
     // `/api/admin/research/jobs/:id/advance` endpoint is what kicks
@@ -315,6 +318,27 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
     Ok(final_row)
 }
 
+/// Shared inputs the two public phase entry points
+/// (`run_gather_phase`, `run_synthesize_phase`) need. Extracted into
+/// a struct so the function signatures stay under clippy's
+/// too-many-arguments threshold and a future phase addition (e.g.
+/// `run_review_phase`) lands by adding one method, not by
+/// retrofitting another caller's argument list.
+///
+/// Cheap to clone — every field is `Arc`-backed (Database is
+/// internally Arc, EventBus + ResearchWorkspace are shallow Arc
+/// wrappers, InferenceClient is Arc, the rest are plain string /
+/// id types).
+pub struct PhaseDeps {
+    pub db: Database,
+    pub events: EventBus,
+    pub workspace: ResearchWorkspace,
+    pub conversation_id: execlaw_core::ids::ConversationId,
+    pub card_id: String,
+    pub inference: Arc<InferenceClient>,
+    pub model: String,
+}
+
 /// Run the gather phase end-to-end: mark_gathering → run_gather →
 /// emit a CardProgressed reflecting the gather completion. When
 /// `halt_after_gather` is true (EveryPhase + advance from Planned),
@@ -327,18 +351,21 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
 /// On gather failure the row is marked Failed and CardClosed{Failed}
 /// is emitted via `mark_failed` before returning Err.
 pub async fn run_gather_phase(
-    db: &Database,
-    events: &EventBus,
-    workspace: &ResearchWorkspace,
+    deps: &PhaseDeps,
     job_id: &ResearchJobId,
-    conv_id: &execlaw_core::ids::ConversationId,
-    card_id: &str,
     plan: &ResearchPlan,
     cfg: &execlaw_core::research::ResearchConfig,
-    client: &Arc<InferenceClient>,
-    model: &str,
     halt_after_gather: bool,
 ) -> Result<Vec<execlaw_core::research::ResearchNote>, ResearchRunnerError> {
+    let PhaseDeps {
+        db,
+        events,
+        workspace,
+        conversation_id: conv_id,
+        card_id,
+        inference: client,
+        model,
+    } = deps;
     let search: Arc<dyn WebSearchApi> = Arc::new(DuckDuckGoSearchApi::new());
     let fetch: Arc<dyn WebFetchApi> = Arc::new(HttpWebFetchApi::new());
     let subagent: Arc<dyn SubagentApi> = Arc::new(InferenceSubagentApi::new(
@@ -417,18 +444,21 @@ pub async fn run_gather_phase(
 /// the row is marked Failed and CardClosed{Failed} is emitted via
 /// `mark_failed` before returning Err.
 pub async fn run_synthesize_phase(
-    db: &Database,
-    events: &EventBus,
-    workspace: &ResearchWorkspace,
+    deps: &PhaseDeps,
     job_id: &ResearchJobId,
-    conv_id: &execlaw_core::ids::ConversationId,
-    card_id: &str,
     query: &str,
     plan: &ResearchPlan,
     notes: &[execlaw_core::research::ResearchNote],
-    client: &Arc<InferenceClient>,
-    model: &str,
 ) -> Result<(), ResearchRunnerError> {
+    let PhaseDeps {
+        db,
+        events,
+        workspace,
+        conversation_id: conv_id,
+        card_id,
+        inference: client,
+        model,
+    } = deps;
     {
         let db = db.clone();
         let id = job_id.clone();
