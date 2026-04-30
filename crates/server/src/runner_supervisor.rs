@@ -786,9 +786,20 @@ impl RunnerSupervisor {
         // (avoids inflating the enum past 312 bytes for every
         // ServerToRunner value passing through tokio channels).
         let frame = ServerToRunner::Turn(Box::new(request.clone()));
-        send_to_runner(&handle, frame)
-            .await
-            .map_err(|_| ForwardError::RunnerGone)?;
+        if let Err(send_err) = send_to_runner(&handle, frame).await {
+            // The runner just went away between our get() and the
+            // send. Roll back the bookkeeping we already inserted
+            // so the turn_id doesn't leak forever — without this,
+            // turn_streams holds a never-drained sender + the
+            // in_flight_turns set keeps reap_idle from ever
+            // reclaiming the dead runner.
+            handle.turn_streams.remove(&request.turn_id);
+            let mut s = handle.state.write().await;
+            s.in_flight_turns.remove(&request.turn_id);
+            s.turn_deadlines.remove(&request.turn_id);
+            let _ = send_err;
+            return Err(ForwardError::RunnerGone);
+        }
 
         Ok(rx)
     }
@@ -1442,6 +1453,60 @@ mod tests {
         };
         let res = s.forward_turn("g-missing", req).await;
         assert!(matches!(res, Err(ForwardError::NoRunner)));
+    }
+
+    /// Adversarial: the runner went away (its outbound tx is None
+    /// or the receiver is dropped) between supervisor.get() and
+    /// the actual send. forward_turn must surface RunnerGone AND
+    /// roll back its bookkeeping (turn_streams entry, in_flight
+    /// turn id, deadline). Without rollback the turn_id leaks
+    /// forever — turn_streams holds a never-drained sender, and
+    /// reap_idle never reclaims the dead runner because its
+    /// in_flight_turns set is non-empty.
+    #[tokio::test]
+    async fn forward_turn_rolls_back_bookkeeping_when_send_fails() {
+        let s = fresh_supervisor();
+        // Register a runner with NO outbound tx — send_to_runner
+        // will fail at the "no tx attached" check.
+        let h = RunnerHandle::test_handle("g-dead", false);
+        // Explicitly leave h.tx set to None.
+        s.inner.runners.insert("g-dead".into(), h.clone());
+
+        let req = TurnRequest {
+            turn_id: "t-leak".into(),
+            conversation_id: "c".into(),
+            group_id: "g-dead".into(),
+            user_text: "hi".into(),
+            sender_principal_id: "x".into(),
+            sender_trust_class: "Controller".into(),
+            system_prompt: "".into(),
+            history: vec![],
+            tool_catalog: vec![],
+            inference_url: "http://infer".into(),
+            model: "m".into(),
+            temperature: None,
+            max_tokens: None,
+            reasoning_enabled: false,
+            spotlight: None,
+        };
+        let res = s.forward_turn("g-dead", req).await;
+        assert!(matches!(res, Err(ForwardError::RunnerGone)));
+
+        // Bookkeeping has been rolled back — none of the per-turn
+        // entries should still be present.
+        assert!(
+            !h.turn_streams.contains_key("t-leak"),
+            "turn_streams must be cleaned up when send fails",
+        );
+        let state = h.state.read().await;
+        assert!(
+            !state.in_flight_turns.contains("t-leak"),
+            "in_flight_turns must be cleaned up when send fails",
+        );
+        assert!(
+            !state.turn_deadlines.contains_key("t-leak"),
+            "turn_deadlines must be cleaned up when send fails",
+        );
     }
 
     #[tokio::test]
