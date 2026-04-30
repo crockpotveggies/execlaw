@@ -333,23 +333,22 @@ pub async fn send_message(
         runner_routed.as_deref(),
     ) {
         (Some(_inference), Some(group_id)) => {
-            let supervisor = state
-                .runner_supervisor
-                .as_ref()
-                .expect("runner_eligible implies Some")
-                .clone();
-            match run_runner_turn(
-                &state,
-                &supervisor,
+            // The supervisor is fetched from `state` inside
+            // `run_runner_turn` now (the prior signature passed it
+            // redundantly). We still gate the branch on
+            // `runner_eligible` upstream so the function's
+            // `ok_or_else` should never fire here.
+            match run_runner_turn(RunnerTurnCtx {
+                state: &state,
                 group_id,
-                &cid,
-                &req.text,
-                req.sender_principal_id.clone(),
+                cid: &cid,
+                user_text: &req.text,
+                sender_principal_id: req.sender_principal_id.clone(),
                 spotlight_content,
-                cancel_flag.clone(),
-                caller_caps.clone(),
-                sender_trust,
-            )
+                cancel_flag: cancel_flag.clone(),
+                caller_caps: caller_caps.clone(),
+                caller_trust: sender_trust,
+            })
             .await
             {
                 Ok(out) => out,
@@ -790,18 +789,41 @@ async fn resolve_chat_group(
 /// Cancellation: same `cancel_flag` plumbing as `run_real_turn`.
 /// The caller flips the flag (operator-driven stop button); we
 /// translate by sending a `CancelTurn` frame to the runner.
+/// Per-turn inputs to `run_runner_turn`. Borrows the heavy stuff
+/// (state, ids, text) from the request handler's scope; owns the
+/// values that have to outlive a `.clone()`. The runner supervisor
+/// is fetched from `state` inside the function rather than being
+/// passed redundantly.
+pub(crate) struct RunnerTurnCtx<'a> {
+    pub state: &'a AppState,
+    pub group_id: &'a str,
+    pub cid: &'a ConversationId,
+    pub user_text: &'a str,
+    pub sender_principal_id: Option<String>,
+    pub spotlight_content: bool,
+    pub cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub caller_caps: Vec<String>,
+    pub caller_trust: TrustLevel,
+}
+
 pub(crate) async fn run_runner_turn(
-    state: &AppState,
-    supervisor: &crate::runner_supervisor::RunnerSupervisor,
-    group_id: &str,
-    cid: &ConversationId,
-    user_text: &str,
-    sender_principal_id: Option<String>,
-    spotlight_content: bool,
-    cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    caller_caps: Vec<String>,
-    caller_trust: TrustLevel,
+    ctx: RunnerTurnCtx<'_>,
 ) -> Result<(i64, String, i64), String> {
+    let RunnerTurnCtx {
+        state,
+        group_id,
+        cid,
+        user_text,
+        sender_principal_id,
+        spotlight_content,
+        cancel_flag,
+        caller_caps,
+        caller_trust,
+    } = ctx;
+    let supervisor = state
+        .runner_supervisor
+        .as_ref()
+        .ok_or_else(|| "runner_supervisor missing on state".to_owned())?;
     use crate::runner_supervisor::TurnEvent;
     use execlaw_inference_api::{ChatMessage, ToolDeclaration};
     use execlaw_policy::spotlighting::Spotlight;
