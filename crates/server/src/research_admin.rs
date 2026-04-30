@@ -439,11 +439,11 @@ pub async fn advance_job_handler(
     // Without registration, the cancel endpoint flips the row but
     // the gather phase keeps spending tokens.
     let cancel = tokio_util::sync::CancellationToken::new();
-    if let Some(supervisor) = state.research_supervisor.as_ref() {
-        supervisor
-            .cancel_tokens
+    let cancel_cleanup = state.research_supervisor.as_ref().map(|sup| {
+        sup.cancel_tokens
             .insert(id.as_str().to_owned(), cancel.clone());
-    }
+        sup.cancel_tokens.clone()
+    });
     let phase_deps = crate::research::runner::PhaseDeps {
         db: state.db.clone(),
         events: state.events.clone(),
@@ -456,6 +456,7 @@ pub async fn advance_job_handler(
     };
     let db_for_notes = state.db.clone();
     let id_for_task = id.clone();
+    let id_key_for_cleanup = id.as_str().to_owned();
     let next_status_str = match (cfg.phase_gates, prior) {
         (PhaseGates::EveryPhase, ResearchJobStatus::Planned) => "gathering".to_owned(),
         _ => "complete".to_owned(),
@@ -527,6 +528,13 @@ pub async fn advance_job_handler(
                     "advance(Gathering→synthesize) failed",
                 );
             }
+        }
+        // Drop the registry entry on exit (success, failure, halt).
+        // Mirrors what `ResearchSupervisor::spawn_runner_for` does on
+        // its happy + sad paths so the DashMap can't leak entries
+        // across the supervisor's lifetime.
+        if let Some(tokens) = cancel_cleanup {
+            tokens.remove(&id_key_for_cleanup);
         }
     });
     Ok(Json(ResearchAdvanceResponse {
@@ -1034,6 +1042,102 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["advanced"], false);
         assert_eq!(v["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn advance_endpoint_cleans_up_cancel_token_after_spawned_task_exits() {
+        // C6c invariant: every code path that REGISTERS a cancel
+        // token in the supervisor's DashMap must remove it on exit
+        // — otherwise long-lived control-plane processes leak an
+        // entry per advance(). The runner-spawn path already does
+        // this (supervisor.rs `spawn_runner_for`); this test pins
+        // the same parity for advance_job_handler's spawned task.
+        //
+        // Wire an unreachable backend so the gather phase fails
+        // fast (the OpenAI client raises a connect error within
+        // milliseconds against port 1). The cleanup must happen on
+        // the failure path too.
+        use crate::research::{ResearchSupervisor, ResearchWorkspace};
+        use execlaw_core::backends::{
+            BackendMode, BackendPurpose, BackendStore, BackendUpsert,
+        };
+        let mut state = test_app_state();
+        let cid = seed_conv(&state, "conv-advance-leak");
+        let store = ResearchJobStore::new(&state.db);
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(&id, &cid, "q", "Controller", None, 100)
+            .unwrap();
+        store.claim_next_pending("c", 110).unwrap();
+        store
+            .set_planned(
+                &id,
+                &execlaw_core::research::ResearchPlan {
+                    thesis: "t".into(),
+                    steps: vec![execlaw_core::research::PlanStep {
+                        query: "q".into(),
+                        rationale: None,
+                    }],
+                },
+                120,
+            )
+            .unwrap();
+        // Seed an inference backend pointing at an unreachable port.
+        // The gather phase will fail immediately on connect; the
+        // spawned task must still hit the cleanup branch.
+        BackendStore::new(&state.db)
+            .upsert(
+                &BackendUpsert {
+                    purpose: BackendPurpose::Standard,
+                    inference_backend: "service-vllm".into(),
+                    model_spec_json: serde_json::json!({}),
+                    gpu_id: None,
+                    endpoint: Some("http://127.0.0.1:1/v1".into()),
+                    notes: None,
+                    reasoning_enabled: false,
+                    mode: BackendMode::External,
+                },
+                130,
+            )
+            .unwrap();
+        // Wire a real supervisor so advance_job_handler registers
+        // its token in a registry we can observe.
+        let tmp = tempfile::tempdir().unwrap();
+        let supervisor = ResearchSupervisor::new(
+            state.db.clone(),
+            state.inference.clone(),
+            ResearchWorkspace::new(tmp.path()),
+            "test-model".into(),
+            state.events.clone(),
+        );
+        let registry = supervisor.cancel_tokens.clone();
+        state.research_supervisor = Some(supervisor);
+        let app = build_router(state);
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/admin/research/jobs/{}/advance", id.as_str()))
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Advance returned; the spawned task is racing the cleanup.
+        // Poll the registry briefly — without the fix, the entry
+        // would linger forever; with the fix, it's gone within a
+        // few hundred ms (gather connect-error + cleanup).
+        let mut cleared = false;
+        for _ in 0..80 {
+            if !registry.contains_key(id.as_str()) {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            cleared,
+            "advance handler must remove the supervisor cancel-token entry after its spawned task exits",
+        );
     }
 
     #[tokio::test]
