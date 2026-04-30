@@ -27,7 +27,9 @@ use execlaw_core::tool::{
     Capability, Clock, SystemClock, ToolCtx, ToolImpl, ToolOutcome,
 };
 use execlaw_core::tool_access::ToolAccessStore;
-use execlaw_core::tool_apis::{DbConversationApi, DbMemoryApi, DbNotifyApi};
+use execlaw_core::tool_apis::{
+    DbConversationApi, DbMemoryApi, DbNotifyApi, DbScheduleApi,
+};
 use execlaw_core::Database;
 use execlaw_plugin_host::{BuiltinTools, PluginHost};
 use execlaw_policy::trust::TrustLevel;
@@ -150,6 +152,9 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             .iter()
             .any(|c| matches!(c, Capability::MemoryRead | Capability::MemoryWrite));
         let needs_notify = caps.iter().any(|c| matches!(c, Capability::Notify));
+        let needs_schedule = caps
+            .iter()
+            .any(|c| matches!(c, Capability::ScheduleRead | Capability::ScheduleWrite));
         if needs_conv {
             ctx.conversation =
                 Some(Arc::new(DbConversationApi::new(db.clone(), conv_id.clone())));
@@ -163,7 +168,15 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             )));
         }
         if needs_notify {
-            ctx.notify = Some(Arc::new(DbNotifyApi::new(db, conv_id, now)));
+            ctx.notify = Some(Arc::new(DbNotifyApi::new(db.clone(), conv_id.clone(), now)));
+        }
+        if needs_schedule {
+            ctx.schedule = Some(Arc::new(DbScheduleApi::new(
+                db,
+                self.caller_trust.as_str(),
+                conv_id,
+                now,
+            )));
         }
         Ok(ctx)
     }

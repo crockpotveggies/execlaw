@@ -284,6 +284,7 @@ pub struct ToolCtx {
     pub conversation: Option<Arc<dyn ConversationApi>>,
     pub memory: Option<Arc<dyn MemoryApi>>,
     pub notify: Option<Arc<dyn NotifyApi>>,
+    pub schedule: Option<Arc<dyn ScheduleApi>>,
 }
 
 impl ToolCtx {
@@ -302,6 +303,7 @@ impl ToolCtx {
             conversation: None,
             memory: None,
             notify: None,
+            schedule: None,
         }
     }
 }
@@ -487,6 +489,72 @@ pub struct NotifyReceipt {
     /// Whether this notification deduplicated against an existing
     /// firing alert (`true`) or opened a new one (`false`).
     pub deduplicated: bool,
+}
+
+/// Compact summary of a scheduled-task / routine row, suitable for
+/// returning to the LLM. Drops bookkeeping fields the agent doesn't
+/// need (created_at, updated_at) but keeps every field operators
+/// would want to inspect.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutineSummary {
+    pub id: String,
+    pub name: String,
+    pub schedule_cron: String,
+    pub timezone: String,
+    pub prompt: String,
+    pub target_conversation_id: Option<String>,
+    pub enabled: bool,
+    pub last_run_at: Option<i64>,
+    pub last_run_status: Option<String>,
+    pub next_run_at: Option<i64>,
+}
+
+/// Schedule API: backed by the `RoutineStore`. The implementation
+/// captures the caller's `caller_trust` at construction so it can
+/// reject privileged writes (e.g. cross-conversation scheduling)
+/// from low-trust callers.
+#[async_trait]
+pub trait ScheduleApi: Send + Sync {
+    /// Create a recurring task. Returns the new routine's id.
+    async fn create_routine(
+        &self,
+        name: &str,
+        schedule_cron: &str,
+        prompt: &str,
+        target_conversation_id: Option<&str>,
+        timezone: Option<&str>,
+    ) -> Result<RoutineSummary, ApiError>;
+
+    /// List every routine visible to the caller. Phase 1 returns all
+    /// routines; future trust-class scoping (a `KnownTrusted` caller
+    /// only seeing their own thread's routines) lands in a follow-up.
+    async fn list_routines(&self) -> Result<Vec<RoutineSummary>, ApiError>;
+
+    /// Look up a single routine by id. `None` if no such routine.
+    async fn get_routine(&self, id: &str) -> Result<Option<RoutineSummary>, ApiError>;
+
+    /// Update an existing routine. All fields besides `id` are
+    /// optional — pass `None` to keep the existing value.
+    async fn update_routine(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        schedule_cron: Option<&str>,
+        prompt: Option<&str>,
+        target_conversation_id: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<RoutineSummary, ApiError>;
+
+    /// Toggle a routine's `enabled` flag. Returns the updated row.
+    async fn set_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<RoutineSummary, ApiError>;
+
+    /// Delete a routine permanently. Returns `true` if a row was
+    /// actually deleted, `false` if no routine matched the id.
+    async fn delete_routine(&self, id: &str) -> Result<bool, ApiError>;
 }
 
 /// Memory API. Reads cascade from the caller's trust class downward

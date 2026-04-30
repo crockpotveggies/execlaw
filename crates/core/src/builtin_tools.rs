@@ -28,8 +28,8 @@
 //! 2026-04-29.
 
 use crate::tool::{
-    Capability, NotifySeverity, ToolCtx, ToolDescriptor, ToolImpl, ToolLatency,
-    ToolOutcome, ToolSource,
+    Capability, NotifySeverity, RoutineSummary, ToolCtx, ToolDescriptor, ToolImpl,
+    ToolLatency, ToolOutcome, ToolSource,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -662,6 +662,458 @@ impl ToolImpl for NotifyControllerTool {
 }
 
 // ---------------------------------------------------------------
+// schedule_task family — wraps RoutineStore via ScheduleApi.
+// ---------------------------------------------------------------
+
+fn default_allowed_for_schedule_read() -> Vec<String> {
+    vec![
+        "Controller".into(),
+        "Delegated".into(),
+        "KnownTrusted".into(),
+        "KnownLimited".into(),
+    ]
+}
+
+fn default_allowed_for_schedule_write() -> Vec<String> {
+    // Writes mutate operator-visible scheduling state — restrict to
+    // Controller + Delegated by default. Operator can broaden via
+    // the Settings → Tools page if a particular workflow needs it.
+    vec!["Controller".into(), "Delegated".into()]
+}
+
+fn summary_to_json(s: &RoutineSummary) -> Value {
+    json!({
+        "id": s.id,
+        "name": s.name,
+        "schedule_cron": s.schedule_cron,
+        "timezone": s.timezone,
+        "prompt": s.prompt,
+        "target_conversation_id": s.target_conversation_id,
+        "enabled": s.enabled,
+        "last_run_at": s.last_run_at,
+        "last_run_status": s.last_run_status,
+        "next_run_at": s.next_run_at,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleTaskArgs {
+    name: String,
+    schedule_cron: String,
+    prompt: String,
+    #[serde(default)]
+    target_conversation_id: Option<String>,
+    #[serde(default)]
+    timezone: Option<String>,
+}
+
+pub struct ScheduleTaskTool {
+    descriptor: ToolDescriptor,
+}
+
+impl Default for ScheduleTaskTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ScheduleTaskTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "schedule_task".into(),
+                description:
+                    "Create a recurring task. The cron expression is in standard 5-field form \
+                     (minute hour day-of-month month day-of-week). The routine fires `prompt` \
+                     into the target conversation (caller's thread by default) on each schedule \
+                     tick. Returns the new routine's id."
+                        .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Human-readable label."},
+                        "schedule_cron": {
+                            "type": "string",
+                            "description": "5-field cron, e.g. '0 9 * * MON-FRI'."
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "Prompt that fires into the target conversation."
+                        },
+                        "target_conversation_id": {
+                            "type": ["string", "null"],
+                            "description": "Optional. Defaults to the caller's own thread. \
+                                            Only Controller can target another thread."
+                        },
+                        "timezone": {
+                            "type": "string",
+                            "default": "UTC",
+                            "description": "IANA timezone, e.g. 'America/Los_Angeles'."
+                        }
+                    },
+                    "required": ["name", "schedule_cron", "prompt"],
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Low,
+                capabilities: vec![Capability::ScheduleWrite],
+                default_allowed_classes: default_allowed_for_schedule_write(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for ScheduleTaskTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, args: Value) -> ToolOutcome {
+        let args: ScheduleTaskArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolOutcome::err("invalid_argument", e.to_string()),
+        };
+        let sched = match ctx.schedule.as_ref() {
+            Some(s) => s,
+            None => {
+                return ToolOutcome::denied(
+                    "schedule capability not granted to this tool",
+                );
+            }
+        };
+        match sched
+            .create_routine(
+                &args.name,
+                &args.schedule_cron,
+                &args.prompt,
+                args.target_conversation_id.as_deref(),
+                args.timezone.as_deref(),
+            )
+            .await
+        {
+            Ok(s) => ToolOutcome::Ok(summary_to_json(&s)),
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+pub struct ListTasksTool {
+    descriptor: ToolDescriptor,
+}
+
+impl Default for ListTasksTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ListTasksTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "list_tasks".into(),
+                description:
+                    "List every scheduled task (recurring routine) currently registered. \
+                     Returns id, name, cron, target, enabled flag, and last/next-run timestamps."
+                        .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Low,
+                capabilities: vec![Capability::ScheduleRead],
+                default_allowed_classes: default_allowed_for_schedule_read(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for ListTasksTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, _args: Value) -> ToolOutcome {
+        let sched = match ctx.schedule.as_ref() {
+            Some(s) => s,
+            None => {
+                return ToolOutcome::denied(
+                    "schedule capability not granted to this tool",
+                );
+            }
+        };
+        match sched.list_routines().await {
+            Ok(rows) => ToolOutcome::Ok(json!({
+                "tasks": rows.iter().map(summary_to_json).collect::<Vec<_>>(),
+                "count": rows.len(),
+            })),
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskIdArgs {
+    task_id: String,
+}
+
+pub struct CancelTaskTool {
+    descriptor: ToolDescriptor,
+}
+
+impl Default for CancelTaskTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancelTaskTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "cancel_task".into(),
+                description:
+                    "Permanently delete a scheduled task. Returns `{deleted: true}` on success, \
+                     `{deleted: false}` if no task matched."
+                        .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string"}
+                    },
+                    "required": ["task_id"],
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Low,
+                capabilities: vec![Capability::ScheduleWrite],
+                default_allowed_classes: default_allowed_for_schedule_write(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for CancelTaskTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, args: Value) -> ToolOutcome {
+        let args: TaskIdArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolOutcome::err("invalid_argument", e.to_string()),
+        };
+        let sched = match ctx.schedule.as_ref() {
+            Some(s) => s,
+            None => {
+                return ToolOutcome::denied(
+                    "schedule capability not granted to this tool",
+                );
+            }
+        };
+        match sched.delete_routine(&args.task_id).await {
+            Ok(deleted) => ToolOutcome::Ok(json!({"deleted": deleted})),
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+pub struct PauseTaskTool {
+    descriptor: ToolDescriptor,
+}
+impl Default for PauseTaskTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl PauseTaskTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "pause_task".into(),
+                description: "Pause a scheduled task without deleting it. The task stops firing \
+                              until `resume_task` re-enables it."
+                    .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {"task_id": {"type": "string"}},
+                    "required": ["task_id"],
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Low,
+                capabilities: vec![Capability::ScheduleWrite],
+                default_allowed_classes: default_allowed_for_schedule_write(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for PauseTaskTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, args: Value) -> ToolOutcome {
+        let args: TaskIdArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolOutcome::err("invalid_argument", e.to_string()),
+        };
+        let sched = match ctx.schedule.as_ref() {
+            Some(s) => s,
+            None => {
+                return ToolOutcome::denied("schedule capability not granted to this tool");
+            }
+        };
+        match sched.set_enabled(&args.task_id, false).await {
+            Ok(s) => ToolOutcome::Ok(summary_to_json(&s)),
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+pub struct ResumeTaskTool {
+    descriptor: ToolDescriptor,
+}
+impl Default for ResumeTaskTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl ResumeTaskTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "resume_task".into(),
+                description: "Re-enable a paused scheduled task."
+                    .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {"task_id": {"type": "string"}},
+                    "required": ["task_id"],
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Low,
+                capabilities: vec![Capability::ScheduleWrite],
+                default_allowed_classes: default_allowed_for_schedule_write(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for ResumeTaskTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, args: Value) -> ToolOutcome {
+        let args: TaskIdArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolOutcome::err("invalid_argument", e.to_string()),
+        };
+        let sched = match ctx.schedule.as_ref() {
+            Some(s) => s,
+            None => {
+                return ToolOutcome::denied("schedule capability not granted to this tool");
+            }
+        };
+        match sched.set_enabled(&args.task_id, true).await {
+            Ok(s) => ToolOutcome::Ok(summary_to_json(&s)),
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateTaskArgs {
+    task_id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    schedule_cron: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    target_conversation_id: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+pub struct UpdateTaskTool {
+    descriptor: ToolDescriptor,
+}
+impl Default for UpdateTaskTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl UpdateTaskTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "update_task".into(),
+                description: "Update a scheduled task. Pass only the fields you want to change; \
+                              omitted fields stay at their current value."
+                    .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string"},
+                        "name": {"type": ["string", "null"]},
+                        "schedule_cron": {"type": ["string", "null"]},
+                        "prompt": {"type": ["string", "null"]},
+                        "target_conversation_id": {"type": ["string", "null"]},
+                        "enabled": {"type": ["boolean", "null"]}
+                    },
+                    "required": ["task_id"],
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Low,
+                capabilities: vec![Capability::ScheduleWrite],
+                default_allowed_classes: default_allowed_for_schedule_write(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for UpdateTaskTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, args: Value) -> ToolOutcome {
+        let args: UpdateTaskArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolOutcome::err("invalid_argument", e.to_string()),
+        };
+        let sched = match ctx.schedule.as_ref() {
+            Some(s) => s,
+            None => {
+                return ToolOutcome::denied("schedule capability not granted to this tool");
+            }
+        };
+        match sched
+            .update_routine(
+                &args.task_id,
+                args.name.as_deref(),
+                args.schedule_cron.as_deref(),
+                args.prompt.as_deref(),
+                args.target_conversation_id.as_deref(),
+                args.enabled,
+            )
+            .await
+        {
+            Ok(s) => ToolOutcome::Ok(summary_to_json(&s)),
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------
 // Registrar
 // ---------------------------------------------------------------
 
@@ -678,6 +1130,12 @@ pub fn core_builtin_tools() -> Vec<Arc<dyn ToolImpl>> {
         Arc::new(GetThreadTool::new()),
         Arc::new(ReadChatHistoryTool::new()),
         Arc::new(NotifyControllerTool::new()),
+        Arc::new(ScheduleTaskTool::new()),
+        Arc::new(ListTasksTool::new()),
+        Arc::new(CancelTaskTool::new()),
+        Arc::new(PauseTaskTool::new()),
+        Arc::new(ResumeTaskTool::new()),
+        Arc::new(UpdateTaskTool::new()),
     ]
 }
 
@@ -691,7 +1149,7 @@ mod tests {
     use crate::ids::{ConversationId, EventSeq};
     use crate::migrations::MigrationRunner;
     use crate::tool::{Clock, MemoryApi, SystemClock};
-    use crate::tool_apis::{DbConversationApi, DbMemoryApi, DbNotifyApi};
+    use crate::tool_apis::{DbConversationApi, DbMemoryApi, DbNotifyApi, DbScheduleApi};
 
     fn fresh_db() -> Database {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
@@ -742,6 +1200,18 @@ mod tests {
         with_mem: bool,
         with_notify: bool,
     ) -> ToolCtx {
+        build_ctx_full(db, cid, trust, with_conv, with_mem, with_notify, false)
+    }
+
+    fn build_ctx_full(
+        db: &Database,
+        cid: ConversationId,
+        trust: &str,
+        with_conv: bool,
+        with_mem: bool,
+        with_notify: bool,
+        with_schedule: bool,
+    ) -> ToolCtx {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let mut ctx = ToolCtx::empty(cid.clone(), trust, clock.clone());
         if with_conv {
@@ -760,6 +1230,14 @@ mod tests {
         if with_notify {
             ctx.notify = Some(Arc::new(DbNotifyApi::new(
                 db.clone(),
+                cid.clone(),
+                clock.now_unix(),
+            )));
+        }
+        if with_schedule {
+            ctx.schedule = Some(Arc::new(DbScheduleApi::new(
+                db.clone(),
+                trust,
                 cid,
                 clock.now_unix(),
             )));
@@ -780,7 +1258,13 @@ mod tests {
         assert!(names.contains(&"get_thread"));
         assert!(names.contains(&"read_chat_history"));
         assert!(names.contains(&"notify_controller"));
-        assert_eq!(names.len(), 7);
+        assert!(names.contains(&"schedule_task"));
+        assert!(names.contains(&"list_tasks"));
+        assert!(names.contains(&"cancel_task"));
+        assert!(names.contains(&"pause_task"));
+        assert!(names.contains(&"resume_task"));
+        assert!(names.contains(&"update_task"));
+        assert_eq!(names.len(), 13);
     }
 
     #[test]
@@ -1269,6 +1753,228 @@ mod tests {
         // No `with_notify` cap.
         let ctx = build_ctx(&db, cid, "Controller", false, false);
         match tool.invoke(ctx, json!({"title": "x"})).await {
+            ToolOutcome::Denied { .. } => {}
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    // --- schedule_task family -----------------------------------------
+
+    #[tokio::test]
+    async fn schedule_task_creates_routine_with_required_fields() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "s1");
+        let tool = ScheduleTaskTool::new();
+        let ctx =
+            build_ctx_full(&db, cid.clone(), "Controller", false, false, false, true);
+        let out = tool
+            .invoke(
+                ctx,
+                json!({
+                    "name": "morning brief",
+                    "schedule_cron": "0 9 * * *",
+                    "prompt": "summarise overnight events"
+                }),
+            )
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                assert!(v["id"].is_string());
+                assert_eq!(v["name"], "morning brief");
+                assert_eq!(v["enabled"], true);
+                // Defaults to caller's conversation when target unset.
+                assert_eq!(v["target_conversation_id"], cid.as_str());
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_task_rejects_invalid_cron() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "s2");
+        let tool = ScheduleTaskTool::new();
+        let ctx = build_ctx_full(&db, cid, "Controller", false, false, false, true);
+        let out = tool
+            .invoke(
+                ctx,
+                json!({
+                    "name": "bad",
+                    "schedule_cron": "not actually cron",
+                    "prompt": "p"
+                }),
+            )
+            .await;
+        match out {
+            ToolOutcome::Err { code, .. } => assert_eq!(code, "invalid_argument"),
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    /// Adversarial: a non-Controller caller cannot target a different
+    /// conversation than their own — the API rejects with NotAuthorized.
+    #[tokio::test]
+    async fn schedule_task_low_trust_cannot_target_other_conversation() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "s3");
+        let _other = seed_conversation(&db, "other-conv");
+        let tool = ScheduleTaskTool::new();
+        let ctx = build_ctx_full(&db, cid, "KnownTrusted", false, false, false, true);
+        let out = tool
+            .invoke(
+                ctx,
+                json!({
+                    "name": "x",
+                    "schedule_cron": "0 9 * * *",
+                    "prompt": "p",
+                    "target_conversation_id": "other-conv"
+                }),
+            )
+            .await;
+        match out {
+            ToolOutcome::Denied { reason } => {
+                assert!(reason.contains("KnownTrusted"));
+                assert!(reason.contains("other-conv"));
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_tasks_returns_every_routine() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "s4");
+        let mk_ctx = || build_ctx_full(&db, cid.clone(), "Controller", false, false, false, true);
+        ScheduleTaskTool::new()
+            .invoke(
+                mk_ctx(),
+                json!({"name": "a", "schedule_cron": "* * * * *", "prompt": "x"}),
+            )
+            .await;
+        ScheduleTaskTool::new()
+            .invoke(
+                mk_ctx(),
+                json!({"name": "b", "schedule_cron": "* * * * *", "prompt": "y"}),
+            )
+            .await;
+        let out = ListTasksTool::new().invoke(mk_ctx(), json!({})).await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                assert_eq!(v["count"], 2);
+                let tasks = v["tasks"].as_array().unwrap();
+                let names: Vec<&str> = tasks.iter().filter_map(|t| t["name"].as_str()).collect();
+                assert!(names.contains(&"a"));
+                assert!(names.contains(&"b"));
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// Pause flips enabled to false; resume flips it back.
+    #[tokio::test]
+    async fn pause_then_resume_round_trip() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "s5");
+        let mk_ctx = || build_ctx_full(&db, cid.clone(), "Controller", false, false, false, true);
+
+        let created = ScheduleTaskTool::new()
+            .invoke(
+                mk_ctx(),
+                json!({"name": "x", "schedule_cron": "* * * * *", "prompt": "p"}),
+            )
+            .await;
+        let id = match created {
+            ToolOutcome::Ok(v) => v["id"].as_str().unwrap().to_owned(),
+            _ => panic!("create failed"),
+        };
+
+        let paused = PauseTaskTool::new()
+            .invoke(mk_ctx(), json!({"task_id": &id}))
+            .await;
+        match paused {
+            ToolOutcome::Ok(v) => assert_eq!(v["enabled"], false),
+            _ => panic!("pause failed"),
+        }
+        let resumed = ResumeTaskTool::new()
+            .invoke(mk_ctx(), json!({"task_id": &id}))
+            .await;
+        match resumed {
+            ToolOutcome::Ok(v) => assert_eq!(v["enabled"], true),
+            _ => panic!("resume failed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_task_deletes_existing_and_returns_false_on_missing() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "s6");
+        let mk_ctx = || build_ctx_full(&db, cid.clone(), "Controller", false, false, false, true);
+
+        let created = ScheduleTaskTool::new()
+            .invoke(
+                mk_ctx(),
+                json!({"name": "x", "schedule_cron": "* * * * *", "prompt": "p"}),
+            )
+            .await;
+        let id = match created {
+            ToolOutcome::Ok(v) => v["id"].as_str().unwrap().to_owned(),
+            _ => panic!("create failed"),
+        };
+
+        let del = CancelTaskTool::new()
+            .invoke(mk_ctx(), json!({"task_id": &id}))
+            .await;
+        match del {
+            ToolOutcome::Ok(v) => assert_eq!(v["deleted"], true),
+            _ => panic!("delete failed"),
+        }
+        // Second call: id no longer exists.
+        let del2 = CancelTaskTool::new()
+            .invoke(mk_ctx(), json!({"task_id": &id}))
+            .await;
+        match del2 {
+            ToolOutcome::Ok(v) => assert_eq!(v["deleted"], false),
+            _ => panic!("delete-second failed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_task_changes_only_supplied_fields() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "s7");
+        let mk_ctx = || build_ctx_full(&db, cid.clone(), "Controller", false, false, false, true);
+
+        let created = ScheduleTaskTool::new()
+            .invoke(
+                mk_ctx(),
+                json!({"name": "old", "schedule_cron": "0 9 * * *", "prompt": "p"}),
+            )
+            .await;
+        let id = match created {
+            ToolOutcome::Ok(v) => v["id"].as_str().unwrap().to_owned(),
+            _ => panic!("create failed"),
+        };
+
+        // Rename only.
+        let updated = UpdateTaskTool::new()
+            .invoke(mk_ctx(), json!({"task_id": &id, "name": "new"}))
+            .await;
+        match updated {
+            ToolOutcome::Ok(v) => {
+                assert_eq!(v["name"], "new");
+                // Cron stayed.
+                assert_eq!(v["schedule_cron"], "0 9 * * *");
+            }
+            _ => panic!("update failed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_tools_denied_when_capability_missing() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "s8");
+        let ctx = build_ctx(&db, cid, "Controller", false, false);
+        match ListTasksTool::new().invoke(ctx, json!({})).await {
             ToolOutcome::Denied { .. } => {}
             other => panic!("expected Denied, got {other:?}"),
         }

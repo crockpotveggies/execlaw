@@ -17,9 +17,12 @@ use crate::conversation::ConversationStore;
 use crate::db::Database;
 use crate::ids::{AlertId, ConversationId};
 use crate::memory::{MemoryEntry, MemoryStore};
+use crate::routines::{
+    next_fire_after, parse_cron, parse_timezone, RoutineRow, RoutineStore, RoutineUpsert,
+};
 use crate::tool::{
     ApiError, ConversationApi, HistoryEntry, MemoryApi, MemoryListEntry, NotifyApi,
-    NotifyReceipt, NotifySeverity, ThreadInfo,
+    NotifyReceipt, NotifySeverity, RoutineSummary, ScheduleApi, ThreadInfo,
 };
 use async_trait::async_trait;
 use rusqlite::params;
@@ -481,6 +484,244 @@ impl NotifyApi for DbNotifyApi {
             deduplicated: dedup_check,
         })
     }
+}
+
+// -----------------------------------------------------------------
+// ScheduleApi: wraps `RoutineStore` so the agent can manage recurring
+// tasks through the same store the operator's Settings UI uses.
+// -----------------------------------------------------------------
+
+fn row_to_summary(row: &RoutineRow) -> RoutineSummary {
+    RoutineSummary {
+        id: row.id.clone(),
+        name: row.name.clone(),
+        schedule_cron: row.schedule_cron.clone(),
+        timezone: row.timezone.clone(),
+        prompt: row.prompt.clone(),
+        target_conversation_id: row.target_conversation_id.clone(),
+        enabled: row.enabled,
+        last_run_at: row.last_run_at,
+        last_run_status: row.last_run_status.map(|s| s.as_str().to_owned()),
+        next_run_at: row.next_run_at,
+    }
+}
+
+fn map_routine_err(e: crate::routines::RoutineError) -> ApiError {
+    use crate::routines::RoutineError;
+    match e {
+        RoutineError::Invalid(s) => ApiError::Validation(s),
+        RoutineError::NotFound(s) => ApiError::NotFound(s),
+        RoutineError::Db(e) => ApiError::Storage(e.to_string()),
+        RoutineError::Sqlite(e) => ApiError::Storage(e.to_string()),
+    }
+}
+
+/// DB-backed `ScheduleApi`. Captures the caller's `caller_trust` +
+/// `conversation_id` at construction so the implementation can reject
+/// privileged operations from low-trust callers (e.g. scheduling a
+/// routine to fire into a different conversation).
+pub struct DbScheduleApi {
+    db: Database,
+    caller_trust: String,
+    caller_conversation_id: ConversationId,
+    clock_now_unix: i64,
+}
+
+impl DbScheduleApi {
+    pub fn new(
+        db: Database,
+        caller_trust: impl Into<String>,
+        caller_conversation_id: ConversationId,
+        now_unix: i64,
+    ) -> Self {
+        Self {
+            db,
+            caller_trust: caller_trust.into(),
+            caller_conversation_id,
+            clock_now_unix: now_unix,
+        }
+    }
+
+    /// Whether the caller is allowed to target a different
+    /// conversation than their own. Controllers can; everyone else
+    /// gets clamped to their own thread.
+    fn can_target_other_conversation(&self) -> bool {
+        self.caller_trust == "Controller"
+    }
+}
+
+#[async_trait]
+impl ScheduleApi for DbScheduleApi {
+    async fn create_routine(
+        &self,
+        name: &str,
+        schedule_cron: &str,
+        prompt: &str,
+        target_conversation_id: Option<&str>,
+        timezone: Option<&str>,
+    ) -> Result<RoutineSummary, ApiError> {
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
+            return Err(ApiError::Validation("routine name is empty".into()));
+        }
+        if trimmed_name.chars().count() > 200 {
+            return Err(ApiError::Validation(
+                "routine name too long (max 200 chars)".into(),
+            ));
+        }
+        if prompt.trim().is_empty() {
+            return Err(ApiError::Validation("routine prompt is empty".into()));
+        }
+        if prompt.chars().count() > 8_000 {
+            return Err(ApiError::Validation(
+                "routine prompt too long (max 8000 chars)".into(),
+            ));
+        }
+        // Validate cron + tz before hitting the DB so the error
+        // surfaces with the right ApiError variant.
+        let tz_str = timezone.unwrap_or("UTC");
+        parse_cron(schedule_cron).map_err(map_routine_err)?;
+        parse_timezone(tz_str).map_err(map_routine_err)?;
+
+        // Trust scoping: only the controller can target another
+        // conversation. Everyone else is forced to their own.
+        let target = match target_conversation_id {
+            Some(other)
+                if other != self.caller_conversation_id.as_str()
+                    && !self.can_target_other_conversation() =>
+            {
+                return Err(ApiError::NotAuthorized(format!(
+                    "trust class {:?} cannot target conversation {other} for scheduling",
+                    self.caller_trust
+                )));
+            }
+            Some(other) => Some(other.to_owned()),
+            None => Some(self.caller_conversation_id.as_str().to_owned()),
+        };
+
+        let upsert = RoutineUpsert {
+            id: None,
+            name: trimmed_name.to_owned(),
+            schedule_cron: schedule_cron.to_owned(),
+            timezone: tz_str.to_owned(),
+            prompt: prompt.to_owned(),
+            target_conversation_id: target,
+            enabled: true,
+        };
+        let now = self.clock_now_unix;
+        let db = self.db.clone();
+        let row = tokio::task::spawn_blocking(move || {
+            RoutineStore::new(&db).upsert(&upsert, now)
+        })
+        .await
+        .map_err(|e| ApiError::Storage(format!("join: {e}")))?
+        .map_err(map_routine_err)?;
+        Ok(row_to_summary(&row))
+    }
+
+    async fn list_routines(&self) -> Result<Vec<RoutineSummary>, ApiError> {
+        let db = self.db.clone();
+        let rows = tokio::task::spawn_blocking(move || RoutineStore::new(&db).list_all())
+            .await
+            .map_err(|e| ApiError::Storage(format!("join: {e}")))?
+            .map_err(map_routine_err)?;
+        Ok(rows.iter().map(row_to_summary).collect())
+    }
+
+    async fn get_routine(&self, id: &str) -> Result<Option<RoutineSummary>, ApiError> {
+        let db = self.db.clone();
+        let id = id.to_owned();
+        let row = tokio::task::spawn_blocking(move || RoutineStore::new(&db).get(&id))
+            .await
+            .map_err(|e| ApiError::Storage(format!("join: {e}")))?
+            .map_err(map_routine_err)?;
+        Ok(row.as_ref().map(row_to_summary))
+    }
+
+    async fn update_routine(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        schedule_cron: Option<&str>,
+        prompt: Option<&str>,
+        target_conversation_id: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<RoutineSummary, ApiError> {
+        let id_owned = id.to_owned();
+        let db_for_get = self.db.clone();
+        let existing = tokio::task::spawn_blocking(move || {
+            RoutineStore::new(&db_for_get).get(&id_owned)
+        })
+        .await
+        .map_err(|e| ApiError::Storage(format!("join: {e}")))?
+        .map_err(map_routine_err)?
+        .ok_or_else(|| ApiError::NotFound(format!("routine {id}")))?;
+
+        let new_name = name.unwrap_or(&existing.name).to_owned();
+        if new_name.trim().is_empty() {
+            return Err(ApiError::Validation("routine name is empty".into()));
+        }
+        let new_cron = schedule_cron.unwrap_or(&existing.schedule_cron).to_owned();
+        let new_prompt = prompt.unwrap_or(&existing.prompt).to_owned();
+        let new_target = match target_conversation_id {
+            Some(s) if !self.can_target_other_conversation()
+                && s != self.caller_conversation_id.as_str() =>
+            {
+                return Err(ApiError::NotAuthorized(format!(
+                    "trust class {:?} cannot retarget routine to {s}",
+                    self.caller_trust
+                )));
+            }
+            Some(s) => Some(s.to_owned()),
+            None => existing.target_conversation_id.clone(),
+        };
+        let new_enabled = enabled.unwrap_or(existing.enabled);
+        parse_cron(&new_cron).map_err(map_routine_err)?;
+
+        let upsert = RoutineUpsert {
+            id: Some(existing.id.clone()),
+            name: new_name,
+            schedule_cron: new_cron,
+            timezone: existing.timezone.clone(),
+            prompt: new_prompt,
+            target_conversation_id: new_target,
+            enabled: new_enabled,
+        };
+        let now = self.clock_now_unix;
+        let db = self.db.clone();
+        let row = tokio::task::spawn_blocking(move || {
+            RoutineStore::new(&db).upsert(&upsert, now)
+        })
+        .await
+        .map_err(|e| ApiError::Storage(format!("join: {e}")))?
+        .map_err(map_routine_err)?;
+        Ok(row_to_summary(&row))
+    }
+
+    async fn set_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<RoutineSummary, ApiError> {
+        // Implemented as a constrained `update_routine` so the
+        // single store path enforces the same validation.
+        self.update_routine(id, None, None, None, None, Some(enabled)).await
+    }
+
+    async fn delete_routine(&self, id: &str) -> Result<bool, ApiError> {
+        let db = self.db.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || RoutineStore::new(&db).delete(&id))
+            .await
+            .map_err(|e| ApiError::Storage(format!("join: {e}")))?
+            .map_err(map_routine_err)
+    }
+}
+
+#[allow(dead_code)] // referenced by future scheduler-execution wiring
+fn touch_used_helper(db: &Database) {
+    let _ = next_fire_after;
+    let _ = db;
 }
 
 #[cfg(test)]
