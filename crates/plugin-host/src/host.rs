@@ -377,7 +377,7 @@ impl PluginHost {
         }
         let subs = self.inner.subprocesses.read().await;
         let mut matches = Vec::new();
-        let params = serde_json::json!({
+        let base_params = serde_json::json!({
             "transport": transport,
             "handle": handle,
         });
@@ -388,7 +388,11 @@ impl PluginHost {
                 // runtime. Skip quietly.
                 continue;
             };
-            match plugin.call("identity.resolve", params.clone()).await {
+            // Per-provider clone so the OAuth injection stays
+            // scoped to each plugin's own accounts.
+            let mut params = base_params.clone();
+            self.inject_oauth_tokens(&provider.plugin_id, &mut params);
+            match plugin.call("identity.resolve", params).await {
                 Ok(value) => {
                     // Provider shape: {"match": {...}} or {"match": null}.
                     if let Some(m) = value.get("match") {
@@ -449,11 +453,70 @@ impl PluginHost {
             ));
         };
 
-        let rpc_params = serde_json::json!({
+        let mut rpc_params = serde_json::json!({
             "tool": tool_name,
             "args": args,
         });
+        self.inject_oauth_tokens(&registered.plugin_id, &mut rpc_params);
         plugin.call("tool.call", rpc_params).await
+    }
+
+    /// Look up every `[[oauth_accounts]]` declared by `plugin_id`'s
+    /// manifest, fetch the current access_token from
+    /// `state_oauth_tokens`. Returns a map of account_name →
+    /// access_token. Empty when the plugin declares no accounts,
+    /// is uninstalled / disabled, or none of its accounts have
+    /// tokens persisted.
+    pub fn oauth_tokens_for(&self, plugin_id: &str) -> serde_json::Map<String, serde_json::Value> {
+        let manifest_toml: Option<String> = self
+            .inner
+            .db
+            .with_conn(|c| {
+                let r = c
+                    .query_row(
+                        "SELECT manifest_toml FROM state_plugins WHERE plugin_id = ?1 AND enabled != 0",
+                        params![plugin_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok();
+                Ok(r)
+            })
+            .ok()
+            .flatten();
+        let Some(toml_str) = manifest_toml else {
+            return serde_json::Map::new();
+        };
+        let manifest = match PluginManifest::parse(&toml_str) {
+            Ok(m) => m,
+            Err(_) => return serde_json::Map::new(),
+        };
+        if manifest.oauth_accounts.is_empty() {
+            return serde_json::Map::new();
+        }
+        let store = execlaw_core::oauth::OauthTokenStore::new(&self.inner.db);
+        let mut tokens_map = serde_json::Map::new();
+        for acc in &manifest.oauth_accounts {
+            if let Ok(Some(t)) = store.get(plugin_id, &acc.name) {
+                tokens_map.insert(
+                    acc.name.clone(),
+                    serde_json::Value::String(t.access_token),
+                );
+            }
+        }
+        tokens_map
+    }
+
+    /// Stitch `oauth_tokens_for(plugin_id)` into `params` under the
+    /// reserved `_oauth` key. Plugins read their token from there
+    /// without ever seeing the refresh_token or client_secret.
+    fn inject_oauth_tokens(&self, plugin_id: &str, params: &mut serde_json::Value) {
+        let tokens_map = self.oauth_tokens_for(plugin_id);
+        if tokens_map.is_empty() {
+            return;
+        }
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert("_oauth".into(), serde_json::Value::Object(tokens_map));
+        }
     }
 
     // ---- DB row helpers (pure SQLite plumbing) --------------------
@@ -601,4 +664,183 @@ pub trait BuiltinTools: Send + Sync {
         tool_name: &str,
         args: &serde_json::Value,
     ) -> Option<Result<serde_json::Value, String>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use execlaw_core::db::DbConfig;
+    use execlaw_core::migrations::MigrationRunner;
+    use execlaw_core::oauth::{OauthClient, OauthClientStore, OauthTokenStore, OauthTokens};
+
+    fn fresh_db() -> Database {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        db
+    }
+
+    /// Insert an enabled plugin row with the given manifest TOML —
+    /// skips the ZIP/spawn dance so we can test the read path
+    /// directly.
+    fn install_manifest(db: &Database, plugin_id: &str, manifest_toml: &str) {
+        let now = chrono::Utc::now().timestamp();
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO state_plugins(plugin_id, version, manifest_toml, stage_path, enabled, installed_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)",
+                params![plugin_id, "0.1.0", manifest_toml, "/nonexistent", now],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn oauth_tokens_for_returns_empty_when_plugin_has_no_oauth_accounts() {
+        let db = fresh_db();
+        install_manifest(
+            &db,
+            "no-oauth",
+            "[plugin]\nid=\"no-oauth\"\nname=\"No OAuth\"\nversion=\"0.1.0\"\ndescription=\"x\"\nauthor=\"a\"\nlicense=\"x\"\n\n[runtime]\ntier=\"subprocess\"\nexecutable=\"./bin\"\n",
+        );
+        let host = PluginHost::new(db, HookRegistry::new(), PathBuf::from("/tmp"));
+        let map = host.oauth_tokens_for("no-oauth");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn oauth_tokens_for_returns_empty_when_no_tokens_persisted() {
+        // Manifest declares accounts but the operator hasn't
+        // connected any of them yet.
+        let db = fresh_db();
+        let manifest = r#"
+[plugin]
+id = "p-google"
+name = "Google"
+version = "0.1.0"
+description = "x"
+author = "a"
+license = "x"
+
+[[oauth_accounts]]
+name = "controller"
+provider = "google"
+scopes = ["https://www.googleapis.com/auth/contacts.readonly"]
+
+[runtime]
+tier = "subprocess"
+executable = "./bin"
+"#;
+        install_manifest(&db, "p-google", manifest);
+        let host = PluginHost::new(db, HookRegistry::new(), PathBuf::from("/tmp"));
+        assert!(host.oauth_tokens_for("p-google").is_empty());
+    }
+
+    #[test]
+    fn oauth_tokens_for_returns_access_tokens_keyed_by_account_name() {
+        let db = fresh_db();
+        let manifest = r#"
+[plugin]
+id = "p-google"
+name = "Google"
+version = "0.1.0"
+description = "x"
+author = "a"
+license = "x"
+
+[[oauth_accounts]]
+name = "controller"
+provider = "google"
+scopes = ["https://www.googleapis.com/auth/contacts.readonly"]
+
+[[oauth_accounts]]
+name = "team"
+provider = "google"
+scopes = ["https://www.googleapis.com/auth/contacts.readonly"]
+
+[runtime]
+tier = "subprocess"
+executable = "./bin"
+"#;
+        install_manifest(&db, "p-google", manifest);
+        let now = chrono::Utc::now().timestamp();
+        // Seed client + tokens for both accounts.
+        for acc in &["controller", "team"] {
+            OauthClientStore::new(&db)
+                .upsert(&OauthClient {
+                    plugin_id: "p-google".into(),
+                    account_name: (*acc).into(),
+                    provider: "google".into(),
+                    client_id: "cid".into(),
+                    client_secret: "secret".into(),
+                    redirect_uri: "http://x".into(),
+                    scopes_json: "[]".into(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .unwrap();
+            OauthTokenStore::new(&db)
+                .upsert(&OauthTokens {
+                    plugin_id: "p-google".into(),
+                    account_name: (*acc).into(),
+                    access_token: format!("ya29.{acc}"),
+                    refresh_token: Some("rt".into()),
+                    token_expires_at: now + 3600,
+                    scopes_granted: "[]".into(),
+                    account_email: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .unwrap();
+        }
+        let host = PluginHost::new(db, HookRegistry::new(), PathBuf::from("/tmp"));
+        let map = host.oauth_tokens_for("p-google");
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get("controller").and_then(|v| v.as_str()),
+            Some("ya29.controller"),
+        );
+        assert_eq!(
+            map.get("team").and_then(|v| v.as_str()),
+            Some("ya29.team"),
+        );
+    }
+
+    #[test]
+    fn oauth_tokens_for_skips_disabled_plugin() {
+        // Disabled plugins should not have their tokens read out
+        // (the subprocess isn't running anyway).
+        let db = fresh_db();
+        let manifest = r#"
+[plugin]
+id = "p-google"
+name = "Google"
+version = "0.1.0"
+description = "x"
+author = "a"
+license = "x"
+
+[[oauth_accounts]]
+name = "controller"
+provider = "google"
+scopes = ["https://www.googleapis.com/auth/contacts.readonly"]
+
+[runtime]
+tier = "subprocess"
+executable = "./bin"
+"#;
+        let now = chrono::Utc::now().timestamp();
+        // Insert disabled (enabled = 0).
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO state_plugins(plugin_id, version, manifest_toml, stage_path, enabled, installed_at, updated_at) \
+                 VALUES ('p-google', '0.1.0', ?1, '/x', 0, ?2, ?2)",
+                params![manifest, now],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let host = PluginHost::new(db, HookRegistry::new(), PathBuf::from("/tmp"));
+        assert!(host.oauth_tokens_for("p-google").is_empty());
+    }
 }
