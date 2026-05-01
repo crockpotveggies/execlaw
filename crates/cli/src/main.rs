@@ -1334,6 +1334,16 @@ async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::
         let stop = sweep_stop.clone();
         tokio::spawn(async move { refresh_sweeper.run(stop).await });
     }
+    // Phase 9 — OAuth proactive token refresh + pending-CSRF GC for
+    // every plugin-configured `[[oauth_accounts]]` entry. Runs every
+    // 60 s; refreshes tokens within 10 min of expiry; purges
+    // expired authorize-flow CSRF rows. No-op when no clients are
+    // configured.
+    let oauth_sweeper = execlaw_server::oauth_sweeper::OauthSweeper::new(db.clone());
+    {
+        let stop = sweep_stop.clone();
+        tokio::spawn(async move { oauth_sweeper.run(stop).await });
+    }
     // Phase 10 + 11.C — wall-clock-aligned cron tick that fires due
     // routines. Dispatch routes through chats::dispatch_routine_turn
     // so a routine fire is behaviourally identical to the controller
