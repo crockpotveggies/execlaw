@@ -36,6 +36,7 @@ pub mod logs;
 pub mod mcp_servers;
 pub mod memory;
 pub mod migrations;
+pub mod oauth;
 pub mod outbox;
 pub mod personality;
 pub mod principal;

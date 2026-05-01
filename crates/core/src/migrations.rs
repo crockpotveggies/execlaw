@@ -162,6 +162,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "research-jobs",
         sql: include_str!("../migrations/0027_research_jobs.sql"),
     },
+    Migration {
+        id: 28,
+        name: "oauth-accounts",
+        sql: include_str!("../migrations/0028_oauth_accounts.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -297,7 +302,7 @@ mod tests {
             applied,
             vec![
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27,
+                24, 25, 26, 27, 28,
             ]
         );
 
@@ -337,6 +342,9 @@ mod tests {
             "config_routines",
             "state_routine_runs",
             "config_general",
+            "state_oauth_clients",
+            "state_oauth_tokens",
+            "state_oauth_pending",
         ];
         db.with_conn(|c| {
             for t in &tables {
@@ -364,7 +372,7 @@ mod tests {
             first,
             vec![
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27,
+                24, 25, 26, 27, 28,
             ]
         );
         assert!(
