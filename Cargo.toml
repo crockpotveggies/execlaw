@@ -19,6 +19,7 @@ members = [
     "crates/server",
     "crates/cli",
     "crates/mcp-client",
+    "plugins/google-contacts",
     "plugins/hello",
     "plugins/identity-local-address-book",
     "crates/eval-harness",
