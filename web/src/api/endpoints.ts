@@ -2148,3 +2148,109 @@ export async function getSetupPreflight(
         tokenAccessor,
     );
 }
+
+// ---- /api/admin/oauth (Phase 9 — generic OAuth client + token mgmt) ----
+
+export interface OauthClientView {
+    plugin_id: string;
+    account_name: string;
+    provider: string;
+    client_id: string;
+    redirect_uri: string;
+    scopes: string[];
+    created_at: number;
+    updated_at: number;
+    /// True when tokens are present + non-expired.
+    connected: boolean;
+    account_email: string | null;
+    /// Unix-seconds expiry of the current access_token, when present.
+    token_expires_at: number | null;
+}
+
+export interface OauthClientsResponse {
+    clients: OauthClientView[];
+}
+
+export interface UpsertOauthClientRequest {
+    provider: string;
+    client_id: string;
+    /// Empty string preserves the persisted secret (form pre-population).
+    client_secret: string;
+    redirect_uri: string;
+    scopes: string[];
+}
+
+export interface ConnectOauthResponse {
+    authorize_url: string;
+}
+
+export async function listOauthClients(
+    tokenAccessor: () => string | null,
+): Promise<OauthClientsResponse> {
+    return apiFetch<OauthClientsResponse>(
+        "/api/admin/oauth/clients",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function getOauthClient(
+    pluginId: string,
+    accountName: string,
+    tokenAccessor: () => string | null,
+): Promise<OauthClientView> {
+    return apiFetch<OauthClientView>(
+        `/api/admin/oauth/clients/${encodeURIComponent(pluginId)}/${encodeURIComponent(accountName)}`,
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function upsertOauthClient(
+    pluginId: string,
+    accountName: string,
+    req: UpsertOauthClientRequest,
+    tokenAccessor: () => string | null,
+): Promise<OauthClientView> {
+    return apiFetch<OauthClientView>(
+        `/api/admin/oauth/clients/${encodeURIComponent(pluginId)}/${encodeURIComponent(accountName)}`,
+        { method: "PUT", body: req },
+        tokenAccessor,
+    );
+}
+
+export async function deleteOauthClient(
+    pluginId: string,
+    accountName: string,
+    tokenAccessor: () => string | null,
+): Promise<void> {
+    await apiFetch<unknown>(
+        `/api/admin/oauth/clients/${encodeURIComponent(pluginId)}/${encodeURIComponent(accountName)}`,
+        { method: "DELETE" },
+        tokenAccessor,
+    );
+}
+
+export async function connectOauth(
+    pluginId: string,
+    accountName: string,
+    tokenAccessor: () => string | null,
+): Promise<ConnectOauthResponse> {
+    return apiFetch<ConnectOauthResponse>(
+        `/api/admin/oauth/clients/${encodeURIComponent(pluginId)}/${encodeURIComponent(accountName)}/connect`,
+        { method: "POST" },
+        tokenAccessor,
+    );
+}
+
+export async function disconnectOauth(
+    pluginId: string,
+    accountName: string,
+    tokenAccessor: () => string | null,
+): Promise<void> {
+    await apiFetch<unknown>(
+        `/api/admin/oauth/clients/${encodeURIComponent(pluginId)}/${encodeURIComponent(accountName)}/disconnect`,
+        { method: "POST" },
+        tokenAccessor,
+    );
+}
