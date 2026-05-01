@@ -98,6 +98,16 @@ pub struct RegisteredAlertSource {
     pub fingerprint_prefix: String,
 }
 
+/// One `[[oauth_accounts]]` declaration cached in the registry so
+/// the hot dispatch path can skip a manifest TOML re-parse on every
+/// tool.call / identity.resolve.
+#[derive(Debug, Clone)]
+pub struct RegisteredOauthAccount {
+    pub plugin_id: String,
+    pub account_name: String,
+    pub provider: String,
+}
+
 /// Result of [`HookRegistry::lookup_any`]. The dispatch layer pattern-
 /// matches on this so it can either invoke a built-in directly or
 /// drop into the plugin RPC path with the metadata.
@@ -144,6 +154,11 @@ struct HookRegistryInner {
     identity_providers: BTreeMap<String, RegisteredIdentityProvider>,
     event_subs: HashMap<String, Vec<RegisteredEventSubscription>>,
     alert_sources: Vec<RegisteredAlertSource>,
+    /// Per-plugin `[[oauth_accounts]]` cache. The dispatch layer
+    /// reads this on every RPC to know which account_names to
+    /// fetch tokens for; without the cache it would re-parse the
+    /// manifest TOML on every call.
+    oauth_accounts: BTreeMap<String, Vec<RegisteredOauthAccount>>,
     enabled_plugins: BTreeSet<String>,
 }
 
@@ -262,6 +277,18 @@ impl HookRegistry {
                 fingerprint_prefix: src.fingerprint_prefix.clone(),
             });
         }
+        if !manifest.oauth_accounts.is_empty() {
+            let cached: Vec<RegisteredOauthAccount> = manifest
+                .oauth_accounts
+                .iter()
+                .map(|a| RegisteredOauthAccount {
+                    plugin_id: plugin_id.clone(),
+                    account_name: a.name.clone(),
+                    provider: a.provider.clone(),
+                })
+                .collect();
+            w.oauth_accounts.insert(plugin_id.clone(), cached);
+        }
         w.enabled_plugins.insert(plugin_id.clone());
         Ok(())
     }
@@ -278,6 +305,7 @@ impl HookRegistry {
         }
         w.event_subs.retain(|_, v| !v.is_empty());
         w.alert_sources.retain(|s| s.plugin_id != plugin_id);
+        w.oauth_accounts.remove(plugin_id);
         w.enabled_plugins.remove(plugin_id);
     }
 
@@ -387,6 +415,20 @@ impl HookRegistry {
             .values()
             .cloned()
             .collect()
+    }
+
+    /// `[[oauth_accounts]]` declared by `plugin_id`'s manifest.
+    /// Empty when the plugin declares none, isn't enabled, or
+    /// hasn't been registered yet. Returned by clone — caller is
+    /// expected to walk it once per RPC.
+    pub fn oauth_accounts_for(&self, plugin_id: &str) -> Vec<RegisteredOauthAccount> {
+        self.inner
+            .read()
+            .unwrap()
+            .oauth_accounts
+            .get(plugin_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn ui_panels(&self) -> Vec<RegisteredUiPanel> {

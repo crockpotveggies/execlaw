@@ -467,38 +467,22 @@ impl PluginHost {
     /// access_token. Empty when the plugin declares no accounts,
     /// is uninstalled / disabled, or none of its accounts have
     /// tokens persisted.
+    ///
+    /// Hot path on every tool.call / identity.resolve. The
+    /// HookRegistry caches the manifest's [[oauth_accounts]] at
+    /// enable-time so this method only does a sub-µs registry read
+    /// + one indexed SQL SELECT per account.
     pub fn oauth_tokens_for(&self, plugin_id: &str) -> serde_json::Map<String, serde_json::Value> {
-        let manifest_toml: Option<String> = self
-            .inner
-            .db
-            .with_conn(|c| {
-                let r = c
-                    .query_row(
-                        "SELECT manifest_toml FROM state_plugins WHERE plugin_id = ?1 AND enabled != 0",
-                        params![plugin_id],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .ok();
-                Ok(r)
-            })
-            .ok()
-            .flatten();
-        let Some(toml_str) = manifest_toml else {
-            return serde_json::Map::new();
-        };
-        let manifest = match PluginManifest::parse(&toml_str) {
-            Ok(m) => m,
-            Err(_) => return serde_json::Map::new(),
-        };
-        if manifest.oauth_accounts.is_empty() {
+        let accounts = self.inner.registry.oauth_accounts_for(plugin_id);
+        if accounts.is_empty() {
             return serde_json::Map::new();
         }
         let store = execlaw_core::oauth::OauthTokenStore::new(&self.inner.db);
         let mut tokens_map = serde_json::Map::new();
-        for acc in &manifest.oauth_accounts {
-            if let Ok(Some(t)) = store.get(plugin_id, &acc.name) {
+        for acc in &accounts {
+            if let Ok(Some(t)) = store.get(plugin_id, &acc.account_name) {
                 tokens_map.insert(
-                    acc.name.clone(),
+                    acc.account_name.clone(),
                     serde_json::Value::String(t.access_token),
                 );
             }
@@ -679,10 +663,15 @@ mod tests {
         db
     }
 
-    /// Insert an enabled plugin row with the given manifest TOML —
-    /// skips the ZIP/spawn dance so we can test the read path
-    /// directly.
-    fn install_manifest(db: &Database, plugin_id: &str, manifest_toml: &str) {
+    /// Insert an enabled plugin row + register hooks with the
+    /// given registry. Skips the ZIP/spawn dance so we can test
+    /// the read path directly.
+    fn install_manifest(
+        db: &Database,
+        registry: &HookRegistry,
+        plugin_id: &str,
+        manifest_toml: &str,
+    ) {
         let now = chrono::Utc::now().timestamp();
         db.with_conn(|c| {
             c.execute(
@@ -693,17 +682,21 @@ mod tests {
             Ok(())
         })
         .unwrap();
+        let manifest = PluginManifest::parse(manifest_toml).unwrap();
+        registry.enable(&manifest).unwrap();
     }
 
     #[test]
     fn oauth_tokens_for_returns_empty_when_plugin_has_no_oauth_accounts() {
         let db = fresh_db();
+        let registry = HookRegistry::new();
         install_manifest(
             &db,
+            &registry,
             "no-oauth",
             "[plugin]\nid=\"no-oauth\"\nname=\"No OAuth\"\nversion=\"0.1.0\"\ndescription=\"x\"\nauthor=\"a\"\nlicense=\"x\"\n\n[runtime]\ntier=\"subprocess\"\nexecutable=\"./bin\"\n",
         );
-        let host = PluginHost::new(db, HookRegistry::new(), PathBuf::from("/tmp"));
+        let host = PluginHost::new(db, registry, PathBuf::from("/tmp"));
         let map = host.oauth_tokens_for("no-oauth");
         assert!(map.is_empty());
     }
@@ -713,6 +706,7 @@ mod tests {
         // Manifest declares accounts but the operator hasn't
         // connected any of them yet.
         let db = fresh_db();
+        let registry = HookRegistry::new();
         let manifest = r#"
 [plugin]
 id = "p-google"
@@ -731,8 +725,8 @@ scopes = ["https://www.googleapis.com/auth/contacts.readonly"]
 tier = "subprocess"
 executable = "./bin"
 "#;
-        install_manifest(&db, "p-google", manifest);
-        let host = PluginHost::new(db, HookRegistry::new(), PathBuf::from("/tmp"));
+        install_manifest(&db, &registry, "p-google", manifest);
+        let host = PluginHost::new(db, registry, PathBuf::from("/tmp"));
         assert!(host.oauth_tokens_for("p-google").is_empty());
     }
 
@@ -762,7 +756,8 @@ scopes = ["https://www.googleapis.com/auth/contacts.readonly"]
 tier = "subprocess"
 executable = "./bin"
 "#;
-        install_manifest(&db, "p-google", manifest);
+        let registry = HookRegistry::new();
+        install_manifest(&db, &registry, "p-google", manifest);
         let now = chrono::Utc::now().timestamp();
         // Seed client + tokens for both accounts.
         for acc in &["controller", "team"] {
@@ -793,7 +788,7 @@ executable = "./bin"
                 })
                 .unwrap();
         }
-        let host = PluginHost::new(db, HookRegistry::new(), PathBuf::from("/tmp"));
+        let host = PluginHost::new(db, registry, PathBuf::from("/tmp"));
         let map = host.oauth_tokens_for("p-google");
         assert_eq!(map.len(), 2);
         assert_eq!(
@@ -807,10 +802,13 @@ executable = "./bin"
     }
 
     #[test]
-    fn oauth_tokens_for_skips_disabled_plugin() {
-        // Disabled plugins should not have their tokens read out
-        // (the subprocess isn't running anyway).
+    fn oauth_tokens_for_drops_after_registry_disable() {
+        // Disabling a plugin removes its [[oauth_accounts]] from the
+        // registry cache; oauth_tokens_for should immediately return
+        // empty even if the underlying tokens are still in the
+        // database.
         let db = fresh_db();
+        let registry = HookRegistry::new();
         let manifest = r#"
 [plugin]
 id = "p-google"
@@ -829,18 +827,41 @@ scopes = ["https://www.googleapis.com/auth/contacts.readonly"]
 tier = "subprocess"
 executable = "./bin"
 "#;
+        install_manifest(&db, &registry, "p-google", manifest);
         let now = chrono::Utc::now().timestamp();
-        // Insert disabled (enabled = 0).
-        db.with_conn(|c| {
-            c.execute(
-                "INSERT INTO state_plugins(plugin_id, version, manifest_toml, stage_path, enabled, installed_at, updated_at) \
-                 VALUES ('p-google', '0.1.0', ?1, '/x', 0, ?2, ?2)",
-                params![manifest, now],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-        let host = PluginHost::new(db, HookRegistry::new(), PathBuf::from("/tmp"));
+        OauthClientStore::new(&db)
+            .upsert(&OauthClient {
+                plugin_id: "p-google".into(),
+                account_name: "controller".into(),
+                provider: "google".into(),
+                client_id: "cid".into(),
+                client_secret: "secret".into(),
+                redirect_uri: "http://x".into(),
+                scopes_json: "[]".into(),
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        OauthTokenStore::new(&db)
+            .upsert(&OauthTokens {
+                plugin_id: "p-google".into(),
+                account_name: "controller".into(),
+                access_token: "ya29.tok".into(),
+                refresh_token: Some("rt".into()),
+                token_expires_at: now + 3600,
+                scopes_granted: "[]".into(),
+                account_email: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        // Enabled: token shows up.
+        let host = PluginHost::new(db, registry.clone(), PathBuf::from("/tmp"));
+        assert_eq!(host.oauth_tokens_for("p-google").len(), 1);
+        // Disable: same database, but registry no longer caches the
+        // accounts; token lookup is empty without a state_plugins
+        // re-read.
+        registry.disable("p-google");
         assert!(host.oauth_tokens_for("p-google").is_empty());
     }
 }

@@ -224,6 +224,41 @@ fn bench_lookup_any(c: &mut Criterion) {
     group.finish();
 }
 
+/// `oauth_accounts_for(plugin_id)` runs on every tool.call and
+/// every identity.resolve dispatched to a plugin. Used to read the
+/// manifest's TOML on every call (~µs); now reads from the
+/// registry cache (~ns). Budget: ≤ 200 ns p99 even for plugins
+/// with multiple accounts.
+fn bench_oauth_accounts_lookup(c: &mut Criterion) {
+    fn build_with_oauth(n_accounts: usize) -> HookRegistry {
+        let mut body = String::from(
+            "[plugin]\nid = \"bench-oauth\"\nname = \"bench\"\nversion = \"1.0.0\"\n",
+        );
+        for i in 0..n_accounts {
+            body.push_str(&format!(
+                "\n[[oauth_accounts]]\nname = \"acc_{i}\"\nprovider = \"google\"\nscopes = [\"x\"]\n"
+            ));
+        }
+        let manifest = PluginManifest::parse(&body).unwrap();
+        let reg = HookRegistry::new();
+        reg.enable(&manifest).unwrap();
+        reg
+    }
+
+    let mut group = c.benchmark_group("hook_registry_oauth_accounts");
+    for n in [1usize, 4, 16] {
+        let reg = build_with_oauth(n);
+        group.bench_function(format!("hit_n={n}"), |b| {
+            b.iter(|| reg.oauth_accounts_for(black_box("bench-oauth")))
+        });
+    }
+    let reg = build_with_oauth(4);
+    group.bench_function("miss", |b| {
+        b.iter(|| reg.oauth_accounts_for(black_box("nonexistent")))
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_tool_lookup,
@@ -231,5 +266,6 @@ criterion_group!(
     bench_builtin_lookup,
     bench_builtin_invoke_noop,
     bench_lookup_any,
+    bench_oauth_accounts_lookup,
 );
 criterion_main!(benches);
