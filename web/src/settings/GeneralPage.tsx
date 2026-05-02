@@ -21,12 +21,18 @@ import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
 import {
     getGeneralSettings,
+    postFactoryReset,
     updateGeneralSettings,
     HISTORY_RETENTION_OPTIONS,
     type GeneralSettings,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
+
+/// Literal the operator must type into the danger-zone input. Kept
+/// in sync with `factory_reset::CONFIRM_TOKEN` server-side; if these
+/// drift the server returns 400 and the SPA surfaces the error.
+const FACTORY_RESET_CONFIRM = "RESET";
 
 export function GeneralPage() {
     const auth = useAuth();
@@ -293,6 +299,123 @@ export function GeneralPage() {
                     )}
                 </div>
             )}
+
+            {canMutate && <DangerZone />}
+        </div>
+    );
+}
+
+/// Bottom-of-page card that wipes every persistent table and signs the
+/// operator out. Two-step confirm: (1) operator types the literal
+/// `RESET` into the input — only then is the button enabled —, then
+/// (2) a native `window.confirm()` blocks the destructive call. After
+/// a 200, we sign-out and route to /login; the AppBoot guard there
+/// detects the missing controller user and bounces to /setup.
+function DangerZone() {
+    const auth = useAuth();
+    const getToken = auth.getAccessToken;
+    const [confirmText, setConfirmText] = useState("");
+    const [busy, setBusy] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+
+    const armed = confirmText === FACTORY_RESET_CONFIRM;
+
+    const onReset = useCallback(async () => {
+        if (!armed) return;
+        const ok = window.confirm(
+            "Wipe ALL data and factory-reset the service?\n\n" +
+                "This deletes every conversation, plugin, contact, " +
+                "routine, oauth token, and operator account. The " +
+                "service stays running but you'll be signed out and " +
+                "the next visit will start the setup wizard.\n\n" +
+                "This cannot be undone.",
+        );
+        if (!ok) return;
+        setBusy(true);
+        setError(null);
+        try {
+            await postFactoryReset(FACTORY_RESET_CONFIRM, getToken);
+            // Clear local auth state then hard-reload to "/" so
+            // every cached selector / store / WS resets. The AppBoot
+            // guard sees no controller user and routes to /setup.
+            // Hard reload (instead of useNavigate) is deliberate:
+            // after a destructive wipe we want a clean React tree
+            // and a fresh WebSocket handshake.
+            await auth.signOut();
+            window.location.assign("/login");
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+            setBusy(false);
+        }
+    }, [armed, auth, getToken]);
+
+    return (
+        <div
+            className="execlaw-card mt-4 border border-danger-subtle"
+            data-testid="general-danger-zone"
+        >
+            <div className="execlaw-card__title text-danger">
+                <i className="bi bi-exclamation-triangle me-2" aria-hidden />
+                Danger zone
+            </div>
+            <div className="execlaw-muted small mb-2">
+                Erases every conversation, plugin, contact, routine,
+                stored token, and operator account, then signs you
+                out. The service keeps running but the next visit
+                starts at the setup wizard. Filesystem artifacts
+                (research workspaces, attachments) are not removed;
+                restart the host service for a truly clean slate.
+            </div>
+            <ErrorBanner
+                message={error}
+                onDismiss={() => setError(null)}
+                className="mb-2"
+            />
+            <Form.Group className="mb-2">
+                <Form.Label
+                    className="execlaw-muted small mb-1"
+                    htmlFor="general-danger-confirm"
+                >
+                    Type{" "}
+                    <code data-testid="general-danger-token">
+                        {FACTORY_RESET_CONFIRM}
+                    </code>{" "}
+                    to enable the button.
+                </Form.Label>
+                <Form.Control
+                    id="general-danger-confirm"
+                    size="sm"
+                    value={confirmText}
+                    onChange={(e) => setConfirmText(e.target.value)}
+                    placeholder={FACTORY_RESET_CONFIRM}
+                    disabled={busy}
+                    autoComplete="off"
+                    spellCheck={false}
+                    data-testid="general-danger-confirm-input"
+                />
+            </Form.Group>
+            <Button
+                variant="outline-danger"
+                size="sm"
+                disabled={!armed || busy}
+                onClick={() => void onReset()}
+                data-testid="general-danger-reset"
+            >
+                {busy ? (
+                    <>
+                        <i
+                            className="bi bi-hourglass-split me-1"
+                            aria-hidden
+                        />
+                        Wiping…
+                    </>
+                ) : (
+                    <>
+                        <i className="bi bi-trash3 me-1" aria-hidden />
+                        Erase all data and factory reset
+                    </>
+                )}
+            </Button>
         </div>
     );
 }

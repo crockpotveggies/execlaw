@@ -1869,6 +1869,29 @@ export async function updateGeneralSettings(
     );
 }
 
+// ---- /api/admin/factory-reset ---------------------------------------
+
+export interface FactoryResetResponse {
+    tables_wiped: number;
+    restart_recommended: boolean;
+}
+
+/// POSTs the literal `confirm` string the operator typed into the
+/// danger-zone input. The server compares it against its own
+/// constant — currently `"RESET"` — and 400s anything else. After a
+/// 200, the SPA must sign-out immediately because the controller
+/// row backing the JWT is gone.
+export async function postFactoryReset(
+    confirm: string,
+    tokenAccessor: () => string | null,
+): Promise<FactoryResetResponse> {
+    return apiFetch<FactoryResetResponse>(
+        "/api/admin/factory-reset",
+        { method: "POST", body: { confirm } },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/settings/research (C3 — deep-research subsystem) ----
 
 /// Mirrors `core::research::PhaseGates`. The dropdown on Settings →
