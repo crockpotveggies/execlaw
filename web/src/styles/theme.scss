@@ -1229,6 +1229,15 @@ body {
     margin-bottom: 0.4rem;
 }
 
+// Plugins-page row title-and-description column. The container
+// MUST have `min-width: 0` so the inner description's
+// nowrap+ellipsis can actually constrain — without it, the column
+// expands to the description's natural width and pushes the
+// version/badge/icons off the row.
+.execlaw-plugin-row__title-col {
+    min-width: 0;
+}
+
 // Plugins-page row description (manifest's `[plugin].description`).
 // Single-line ellipsis truncation — long descriptions stay on one
 // row so the list reads as a tidy table; the operator can hover
@@ -1237,7 +1246,6 @@ body {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    min-width: 0; // lets the ellipsis kick in inside flex parents
 }
 
 .execlaw-card__row {

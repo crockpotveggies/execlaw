@@ -75,20 +75,39 @@ export function PluginsPage() {
                 plugins.map((p) => (
                     <div className="execlaw-card" key={p.plugin_id}>
                         <div className="d-flex align-items-center gap-2 mb-2">
-                            {p.has_settings_ui ? (
-                                <Link
-                                    to={`/settings/plugins/${encodeURIComponent(p.plugin_id)}`}
-                                    className="execlaw-card__title flex-grow-1 text-decoration-none text-body"
-                                    data-testid="plugin-title-link"
-                                    data-plugin-id={p.plugin_id}
-                                >
-                                    {p.plugin_id}
-                                </Link>
-                            ) : (
-                                <span className="execlaw-card__title flex-grow-1">
-                                    {p.plugin_id}
-                                </span>
-                            )}
+                            {/* Title + description stack as a single
+                                flex column. `min-width: 0` is what
+                                lets the description's
+                                nowrap+ellipsis actually take effect
+                                inside a flex parent — without it,
+                                the column expands to fit the full
+                                description string and pushes the
+                                version/badge/icons off the row. */}
+                            <div className="execlaw-plugin-row__title-col flex-grow-1">
+                                {p.has_settings_ui ? (
+                                    <Link
+                                        to={`/settings/plugins/${encodeURIComponent(p.plugin_id)}`}
+                                        className="execlaw-card__title text-decoration-none text-body d-block"
+                                        data-testid="plugin-title-link"
+                                        data-plugin-id={p.plugin_id}
+                                    >
+                                        {p.plugin_id}
+                                    </Link>
+                                ) : (
+                                    <span className="execlaw-card__title d-block">
+                                        {p.plugin_id}
+                                    </span>
+                                )}
+                                {p.description && (
+                                    <div
+                                        className="execlaw-plugin-row__desc execlaw-muted small"
+                                        title={p.description}
+                                        data-testid="plugin-description"
+                                    >
+                                        {p.description}
+                                    </div>
+                                )}
+                            </div>
                             <span className="execlaw-muted small">
                                 v{p.version}
                             </span>
@@ -138,15 +157,6 @@ export function PluginsPage() {
                                 />
                             </Button>
                         </div>
-                        {p.description && (
-                            <div
-                                className="execlaw-plugin-row__desc execlaw-muted small"
-                                title={p.description}
-                                data-testid="plugin-description"
-                            >
-                                {p.description}
-                            </div>
-                        )}
                     </div>
                 ))
             )}
