@@ -259,6 +259,75 @@ fn bench_oauth_accounts_lookup(c: &mut Criterion) {
     group.finish();
 }
 
+/// Per-turn catalogue assembly — `chats.rs` clones the description
+/// + JSON Schema for every plugin tool on every chat turn so the
+/// runner can ship a fresh `tools: [...]` to vLLM. Pre-fix the
+/// schema was a static `{"type":"object"}`; post-fix it's a real
+/// JSON Schema parsed at install time and cloned per turn. Budget:
+/// ≤ 50 µs for 32 tools (the tool catalogue size we expect when
+/// the full plugin set lands), measured end-to-end (clone + walk).
+fn bench_per_turn_catalogue_clone(c: &mut Criterion) {
+    fn build_with_loaded_schemas(n: usize) -> HookRegistry {
+        let stage = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(stage.path().join("schemas")).unwrap();
+        let mut body = String::from(
+            "[plugin]\nid = \"bench-cat\"\nname = \"bench\"\nversion = \"1.0.0\"\n",
+        );
+        // Realistic schema shape: a small object with two typed
+        // properties and a required field. Mirrors the calendar /
+        // contacts plugin schemas.
+        let schema = r#"{"type":"object","properties":{"q":{"type":"string","description":"search terms"},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["q"]}"#;
+        for i in 0..n {
+            std::fs::write(
+                stage.path().join(format!("schemas/tool_{i}.json")),
+                schema,
+            )
+            .unwrap();
+            body.push_str(&format!(
+                "\n[[tools]]\nname = \"tool_{i}\"\ndescription = \"Tool number {i}. Use when the operator asks about topic {i}; returns up to 10 matching items.\"\nschema = \"schemas/tool_{i}.json\"\nlatency = \"low\"\nrequired_capabilities = []\n"
+            ));
+        }
+        let manifest = PluginManifest::parse(&body).unwrap();
+        let reg = HookRegistry::new();
+        reg.enable_with_stage(&manifest, Some(stage.path()))
+            .unwrap();
+        // The tempdir drops here, but the loaded schemas already
+        // live in the registry's `Arc<RegisteredTool>`s — the
+        // catalogue assembly bench measures clone-from-Arc cost,
+        // not file IO.
+        std::mem::forget(stage);
+        reg
+    }
+
+    let mut group = c.benchmark_group("per_turn_catalogue_clone");
+    for n in [4usize, 32, 128] {
+        let reg = build_with_loaded_schemas(n);
+        group.bench_function(format!("n={n}"), |b| {
+            b.iter(|| {
+                // Mirror the chats.rs loop: walk all_tools, build a
+                // tuple of (name, description, schema) per entry.
+                let tools = reg.all_tools();
+                let cat: Vec<(String, String, serde_json::Value)> = tools
+                    .iter()
+                    .map(|t| {
+                        let desc = t
+                            .description
+                            .clone()
+                            .unwrap_or_else(|| t.tool_name.clone());
+                        let schema = t
+                            .schema_json
+                            .clone()
+                            .unwrap_or_else(|| serde_json::json!({"type":"object"}));
+                        (t.tool_name.clone(), desc, schema)
+                    })
+                    .collect();
+                black_box(cat);
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_tool_lookup,
@@ -267,5 +336,6 @@ criterion_group!(
     bench_builtin_invoke_noop,
     bench_lookup_any,
     bench_oauth_accounts_lookup,
+    bench_per_turn_catalogue_clone,
 );
 criterion_main!(benches);

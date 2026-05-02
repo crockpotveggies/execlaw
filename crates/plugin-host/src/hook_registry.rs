@@ -26,7 +26,22 @@ pub struct RegisteredTool {
     pub tool_name: String,
     pub latency: String,
     pub required_capabilities: Vec<String>,
+    /// Manifest's `[[tools]].schema` field — relative path to a JSON
+    /// Schema file inside the plugin stage. Kept for diagnostics
+    /// even when the loaded `schema_json` below is `None`.
     pub schema_path: Option<String>,
+    /// Manifest's `[[tools]].description` — operator-facing prose
+    /// the agent uses to pick which tool to call. Critical for
+    /// model tool-pick quality; pre-fix this was dropped on the
+    /// floor and the model saw `format!("Plugin tool '{name}'
+    /// (latency: {l})")` as the only description.
+    pub description: Option<String>,
+    /// JSON Schema parsed from the file at `schema_path`, loaded at
+    /// `enable` time so per-turn catalogue construction doesn't have
+    /// to re-read disk. `None` when the manifest didn't supply a
+    /// schema file, or when load failed (logged warn, falls back to
+    /// `{"type":"object"}` at dispatch time).
+    pub schema_json: Option<serde_json::Value>,
 }
 
 /// A built-in tool registered via [`HookRegistry::register_builtin`].
@@ -173,6 +188,19 @@ impl HookRegistry {
     /// panel mount / transport id is already owned by another plugin.
     /// The registry is left untouched on error (all-or-nothing).
     pub fn enable(&self, manifest: &PluginManifest) -> Result<(), String> {
+        self.enable_with_stage(manifest, None)
+    }
+
+    /// Same as [`enable`] but with the plugin's on-disk stage path,
+    /// used to load per-tool JSON Schema files at register time.
+    /// Production install / hydrate / upgrade paths pass
+    /// `Some(stage_path)`; tests that don't care about schemas can
+    /// keep using the no-arg form.
+    pub fn enable_with_stage(
+        &self,
+        manifest: &PluginManifest,
+        stage_path: Option<&std::path::Path>,
+    ) -> Result<(), String> {
         let mut w = self.inner.write().unwrap();
         let plugin_id = &manifest.plugin.id;
 
@@ -219,6 +247,43 @@ impl HookRegistry {
                 execlaw_plugin_sdk::manifest::ToolLatency::Medium => "medium",
                 execlaw_plugin_sdk::manifest::ToolLatency::High => "high",
             };
+            // Best-effort schema load. Resolution rules:
+            //   * Manifest didn't declare a schema → None.
+            //   * No stage_path provided (test path) → None.
+            //   * File missing or unparseable → log warn, store None
+            //     so the catalogue falls back to {"type":"object"}
+            //     rather than failing the whole install.
+            let schema_json = match (stage_path, t.schema.as_deref()) {
+                (Some(stage), Some(rel)) => {
+                    let abs = stage.join(rel);
+                    match std::fs::read_to_string(&abs) {
+                        Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
+                            Ok(v) => Some(v),
+                            Err(e) => {
+                                tracing::warn!(
+                                    plugin_id = %plugin_id,
+                                    tool = %t.name,
+                                    schema = %abs.display(),
+                                    error = %e,
+                                    "tool schema is not valid JSON; falling back to empty object",
+                                );
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(
+                                plugin_id = %plugin_id,
+                                tool = %t.name,
+                                schema = %abs.display(),
+                                error = %e,
+                                "tool schema file unreadable; falling back to empty object",
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
             w.tools_by_name.insert(
                 t.name.clone(),
                 Arc::new(RegisteredTool {
@@ -227,6 +292,8 @@ impl HookRegistry {
                     latency: latency.to_owned(),
                     required_capabilities: t.required_capabilities.clone(),
                     schema_path: t.schema.clone(),
+                    description: t.description.clone(),
+                    schema_json,
                 }),
             );
         }
@@ -474,6 +541,135 @@ mod tests {
         assert!(reg.tool("b").is_some());
         assert_eq!(reg.all_tools().len(), 2);
         assert!(reg.is_enabled("p1"));
+    }
+
+    #[test]
+    fn enable_carries_manifest_description_through_to_registered_tool() {
+        // Pre-fix the description was dropped on the floor and the
+        // model saw `Plugin tool 'X' (latency: Y)` instead. This
+        // pins the regression.
+        let manifest = PluginManifest::parse(
+            r#"
+[plugin]
+id = "desc-test"
+name = "Description Test"
+version = "1.0.0"
+
+[[tools]]
+name = "search.things"
+description = "Find a thing the operator asked about. Use when the user names a topic without enough context to answer directly."
+latency = "low"
+"#,
+        )
+        .unwrap();
+        let reg = HookRegistry::new();
+        reg.enable(&manifest).unwrap();
+        let t = reg.tool("search.things").expect("tool registered");
+        assert_eq!(
+            t.description.as_deref(),
+            Some(
+                "Find a thing the operator asked about. Use when the user names a topic without enough context to answer directly."
+            ),
+        );
+    }
+
+    #[test]
+    fn enable_with_stage_loads_json_schema_file_into_registered_tool() {
+        // Manifest declares `schema = "schemas/search.json"`; the
+        // file lives under the stage path. After enable the parsed
+        // JSON Schema MUST be on the RegisteredTool so chats.rs can
+        // hand it to vLLM verbatim instead of an empty object.
+        let stage = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(stage.path().join("schemas")).unwrap();
+        std::fs::write(
+            stage.path().join("schemas/search.json"),
+            r#"{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}"#,
+        )
+        .unwrap();
+        let manifest = PluginManifest::parse(
+            r#"
+[plugin]
+id = "schema-test"
+name = "Schema Test"
+version = "1.0.0"
+
+[[tools]]
+name = "search"
+description = "Search."
+schema = "schemas/search.json"
+latency = "low"
+"#,
+        )
+        .unwrap();
+        let reg = HookRegistry::new();
+        reg.enable_with_stage(&manifest, Some(stage.path()))
+            .unwrap();
+        let t = reg.tool("search").expect("tool registered");
+        let schema = t
+            .schema_json
+            .as_ref()
+            .expect("schema must be loaded into the registry");
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["q"]["type"], "string");
+        assert_eq!(schema["required"][0], "q");
+    }
+
+    #[test]
+    fn enable_with_stage_falls_back_when_schema_file_missing() {
+        // A manifest pointing at a non-existent schema path must NOT
+        // fail the install — it logs and falls through to None so
+        // chats.rs can use the {"type":"object"} fallback.
+        let stage = tempfile::tempdir().unwrap();
+        let manifest = PluginManifest::parse(
+            r#"
+[plugin]
+id = "missing-schema"
+name = "Missing Schema"
+version = "1.0.0"
+
+[[tools]]
+name = "x"
+description = "x"
+schema = "schemas/does_not_exist.json"
+latency = "low"
+"#,
+        )
+        .unwrap();
+        let reg = HookRegistry::new();
+        reg.enable_with_stage(&manifest, Some(stage.path()))
+            .expect("enable must succeed even when a schema file is missing");
+        let t = reg.tool("x").expect("tool still registered");
+        assert!(t.schema_json.is_none(), "missing file → schema_json None");
+        // schema_path is preserved for diagnostics.
+        assert_eq!(t.schema_path.as_deref(), Some("schemas/does_not_exist.json"));
+    }
+
+    #[test]
+    fn enable_with_no_stage_path_skips_schema_loading() {
+        // Test path / hydrate-without-disk path: enable() (no stage)
+        // returns the same shape but with schema_json = None even
+        // when the manifest declared a schema. Description still
+        // carries through.
+        let manifest = PluginManifest::parse(
+            r#"
+[plugin]
+id = "no-stage"
+name = "No Stage"
+version = "1.0.0"
+
+[[tools]]
+name = "x"
+description = "still here"
+schema = "schemas/x.json"
+latency = "low"
+"#,
+        )
+        .unwrap();
+        let reg = HookRegistry::new();
+        reg.enable(&manifest).unwrap();
+        let t = reg.tool("x").expect("tool registered");
+        assert_eq!(t.description.as_deref(), Some("still here"));
+        assert!(t.schema_json.is_none());
     }
 
     #[test]

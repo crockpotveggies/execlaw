@@ -168,10 +168,13 @@ impl PluginHost {
             return Err(PluginHostError::AlreadyInstalled(plugin_id));
         }
 
-        // Step 1 — register hooks.
+        // Step 1 — register hooks. Pass the stage path so any
+        // declared `[[tools]].schema` files get loaded into the
+        // registered tool's `schema_json` (the model needs the real
+        // schema to call the tool with the right args).
         self.inner
             .registry
-            .enable(&manifest)
+            .enable_with_stage(&manifest, Some(stage_path))
             .map_err(PluginHostError::HookConflict)?;
 
         // Step 2 — spin up the per-tier runtime (subprocess child or
@@ -423,7 +426,7 @@ impl PluginHost {
             .map_err(|e| PluginHostError::Manifest(e.to_string()))?;
         self.inner
             .registry
-            .enable(&manifest)
+            .enable_with_stage(&manifest, Some(std::path::Path::new(&row.stage_path)))
             .map_err(PluginHostError::HookConflict)?;
 
         let needs_runtime = !manifest.tools.is_empty()
@@ -495,7 +498,11 @@ impl PluginHost {
                     continue;
                 }
             };
-            if let Err(e) = self.inner.registry.enable(&manifest) {
+            if let Err(e) = self
+                .inner
+                .registry
+                .enable_with_stage(&manifest, Some(std::path::Path::new(&row.stage_path)))
+            {
                 warn!(plugin_id = %row.plugin_id, error = %e, "skipping plugin with hook conflict on hydrate");
                 continue;
             }

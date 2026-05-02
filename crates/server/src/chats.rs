@@ -978,11 +978,26 @@ pub(crate) async fn run_runner_turn(
             .all_tools()
             .iter()
             .map(|t| {
-                ToolDeclaration::function(
-                    t.tool_name.clone(),
-                    format!("Plugin tool '{}' (latency: {})", t.tool_name, t.latency),
-                    serde_json::json!({"type": "object"}),
-                )
+                // Pre-fix this advertised every plugin tool as
+                // `Plugin tool 'X' (latency: Y)` with an empty
+                // `{"type":"object"}` schema — the model couldn't
+                // tell what any of them did. Now we ship the
+                // manifest's `description` + the JSON Schema loaded
+                // at register time. Falls back only when the plugin
+                // itself omitted them.
+                let description = t.description.clone().unwrap_or_else(|| {
+                    format!(
+                        "Plugin tool '{}' from '{}' (latency: {}). \
+                         The plugin manifest did not supply a description; \
+                         ask the operator to add one for better tool selection.",
+                        t.tool_name, t.plugin_id, t.latency,
+                    )
+                });
+                let schema = t
+                    .schema_json
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+                ToolDeclaration::function(t.tool_name.clone(), description, schema)
             }),
     );
 

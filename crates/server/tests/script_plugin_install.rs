@@ -385,6 +385,110 @@ async fn install_with_if_existing_upgrade_replaces_old_version() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn install_propagates_manifest_tool_descriptions_to_registry() {
+    // Regression: pre-fix, every plugin tool's description was lost
+    // between manifest parse and the registered tool, so chats.rs
+    // synthesized "Plugin tool 'X' (latency: Y)" before shipping to
+    // vLLM. Confirm the manifest description survives.
+    const MANIFEST_WITH_RICH_TOOL: &str = r#"
+[plugin]
+id = "rich-tool-test"
+name = "Rich Tool Test"
+version = "0.1.0"
+description = "tests that descriptions plumb through"
+author = "execlaw-test"
+license = "AGPL-3.0-or-later"
+
+[[tools]]
+name = "rt.search"
+description = "Search the operator's notes for a topic. Use when the user asks 'do I have anything about X' — returns up to 10 matching note ids + first-line excerpts."
+latency = "low"
+
+[runtime]
+tier = "script"
+source = "main.rhai"
+"#;
+    let stage_dir = tempfile::tempdir().unwrap();
+    let (app, state) = build_app(stage_dir.path().to_path_buf());
+    let zip = build_zip(&[
+        ("plugin.toml", MANIFEST_WITH_RICH_TOOL.as_bytes()),
+        ("main.rhai", TINY_SCRIPT.as_bytes()),
+    ]);
+    let (status, body) = post_zip_with_query(app, zip, "").await;
+    assert_eq!(status, StatusCode::OK, "install body: {body}");
+
+    let tool = state
+        .plugin_host
+        .registry()
+        .tool("rt.search")
+        .expect("tool registered");
+    assert_eq!(
+        tool.description.as_deref(),
+        Some(
+            "Search the operator's notes for a topic. Use when the user asks 'do I have anything about X' — returns up to 10 matching note ids + first-line excerpts."
+        ),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn install_loads_per_tool_json_schema_into_the_registry() {
+    // The schema file ships in the ZIP at the path the manifest's
+    // `[[tools]].schema` field references; after install it must be
+    // parsed and present on the RegisteredTool so chats.rs can
+    // forward the real shape to vLLM.
+    const MANIFEST_WITH_SCHEMA: &str = r#"
+[plugin]
+id = "schema-test"
+name = "Schema Test"
+version = "0.1.0"
+description = "tests JSON schema loading"
+author = "execlaw-test"
+license = "AGPL-3.0-or-later"
+
+[[tools]]
+name = "st.search"
+description = "Search."
+schema = "schemas/st_search.json"
+latency = "low"
+
+[runtime]
+tier = "script"
+source = "main.rhai"
+"#;
+    let schema_json = r#"{
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "search terms"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50}
+        },
+        "required": ["query"]
+    }"#;
+    let stage_dir = tempfile::tempdir().unwrap();
+    let (app, state) = build_app(stage_dir.path().to_path_buf());
+    let zip = build_zip(&[
+        ("plugin.toml", MANIFEST_WITH_SCHEMA.as_bytes()),
+        ("main.rhai", TINY_SCRIPT.as_bytes()),
+        ("schemas/st_search.json", schema_json.as_bytes()),
+    ]);
+    let (status, body) = post_zip_with_query(app, zip, "").await;
+    assert_eq!(status, StatusCode::OK, "install body: {body}");
+
+    let tool = state
+        .plugin_host
+        .registry()
+        .tool("st.search")
+        .expect("tool registered");
+    let schema = tool
+        .schema_json
+        .as_ref()
+        .expect("schema_json must be loaded after install");
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["properties"]["query"]["type"], "string");
+    assert_eq!(schema["properties"]["limit"]["maximum"], 50);
+    assert_eq!(schema["required"][0], "query");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upgrade_refreshes_config_tool_access_so_settings_tools_isnt_stale() {
     // Regression: lifecycle handlers used to skip the
     // `sync_tool_access` + `mark_plugin_tools_removed` calls, so an
