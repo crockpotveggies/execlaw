@@ -58,11 +58,21 @@ impl Default for ServerConfig {
                 "8. When you're done answering, stop. Do not ask follow-up questions unless they are required to act.",
             ).to_owned(),
             model_id: "QuantTrio/Qwen3.5-27B-AWQ".to_owned(),
-            // Conservative cap: most well-formed turns need 0-2 tool
-            // rounds. Past 3 the model is almost certainly looping
-            // and the runner returns MaxRounds rather than burning
-            // more inference time.
-            max_tool_rounds: 3,
+            // 2026-05 — bumped 3 → 8 alongside the agent-prompting
+            // audit's #5. The old cap was set when plugin tool
+            // descriptions were placeholders ("Plugin tool 'X'
+            // (latency: Y)"), so the model wasted rounds rummaging
+            // around blindly and we wanted to bail it out fast.
+            // With real descriptions + schemas (#1) and routing
+            // prose (#2) the model's first 1-2 calls are usually
+            // correct, but multi-step flows like
+            // "search → fetch → summarise" or
+            // "list_calendars → list_events → check_availability →
+            // create_event" need 4-6 rounds to complete cleanly.
+            // 8 leaves headroom for one retry per step. The runner
+            // hard ceiling stays at `RUNNER_MAX_TOOL_ROUNDS = 16`
+            // so an in-process bug here can never burn past that.
+            max_tool_rounds: 8,
         }
     }
 }
