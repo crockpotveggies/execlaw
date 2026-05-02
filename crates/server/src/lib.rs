@@ -23,6 +23,7 @@ pub mod backend_presets;
 pub mod backend_supervisor;
 pub mod backends;
 pub mod cards;
+pub mod chat_alert;
 pub mod chats;
 pub mod docs;
 pub mod events;

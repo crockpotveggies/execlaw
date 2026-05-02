@@ -352,7 +352,16 @@ pub async fn send_message(
             .await
             {
                 Ok(out) => out,
-                Err(e) => return err_500(&format!("runner turn failed: {e:#}")),
+                Err(e) => {
+                    let chain = format!("{e:#}");
+                    crate::chat_alert::fire_turn_failure(
+                        &state.db,
+                        "runner",
+                        crate::chat_alert::extract_root_cause(&chain),
+                        cid.as_str(),
+                    );
+                    return err_500(&format!("runner turn failed: {chain}"));
+                }
             }
         }
         (Some(inference), None) if use_tool_path => match run_tool_capable_turn(
@@ -367,7 +376,16 @@ pub async fn send_message(
         .await
         {
             Ok(out) => out,
-            Err(e) => return err_500(&format!("tool-capable turn failed: {e}")),
+            Err(e) => {
+                let chain = format!("{e:#}");
+                crate::chat_alert::fire_turn_failure(
+                    &state.db,
+                    "tool",
+                    crate::chat_alert::extract_root_cause(&chain),
+                    cid.as_str(),
+                );
+                return err_500(&format!("tool-capable turn failed: {chain}"));
+            }
         },
         (Some(inference), None) => {
             match run_real_turn(
@@ -382,14 +400,36 @@ pub async fn send_message(
             .await
             {
                 Ok(out) => out,
-                Err(e) => return err_500(&format!("turn failed: {e}")),
+                Err(e) => {
+                    let chain = format!("{e:#}");
+                    crate::chat_alert::fire_turn_failure(
+                        &state.db,
+                        "real",
+                        crate::chat_alert::extract_root_cause(&chain),
+                        cid.as_str(),
+                    );
+                    return err_500(&format!("turn failed: {chain}"));
+                }
             }
         }
         (None, _) => match run_stub_turn(&state, &cid, &req.text, req.sender_principal_id.clone()) {
             Ok(out) => out,
-            Err(e) => return err_500(&format!("stub turn failed: {e}")),
+            Err(e) => {
+                let chain = format!("{e:#}");
+                crate::chat_alert::fire_turn_failure(
+                    &state.db,
+                    "stub",
+                    crate::chat_alert::extract_root_cause(&chain),
+                    cid.as_str(),
+                );
+                return err_500(&format!("stub turn failed: {chain}"));
+            }
         },
     };
+    // Reaching here means the turn succeeded — clear any open
+    // chat-failure alerts so the operator's badge resets without a
+    // manual ack. Cheap when there's nothing firing (one DB SELECT).
+    crate::chat_alert::resolve_turn_failure_alerts(&state.db);
     // Phase 10.1 + 11 closure — leave the processing window via the
     // RAII guard. The disarm publishes Idle and then prevents Drop
     // from publishing again. Idle lands BEFORE ChatMessageOutbound
