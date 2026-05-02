@@ -671,7 +671,8 @@ async fn run_real_turn(
         // the most user-visible. selfhosted-claw set this via
         // OPENAI_TEMPERATURE in env; we centralise it here.
         temperature: Some(0.3),
-        max_tokens: None,
+        // Explicit cap — see runner-tier comment above.
+        max_tokens: Some(4096),
         chat_template_kwargs: Some(serde_json::json!({
             "enable_thinking": reasoning_enabled,
         })),
@@ -1073,7 +1074,15 @@ pub(crate) async fn run_runner_turn(
         // which then chewed through max_tool_rounds. 0.3 trades
         // a touch of diversity for argument correctness.
         temperature: Some(0.3),
-        max_tokens: None,
+        // 2026-05-02 — explicit cap. With `None`, vLLM's
+        // chunked-prefill + tool-grammar pipeline computed
+        // "you requested 0 output tokens" and rejected the
+        // request as exceeding max_model_len by 1 (bizarre
+        // off-by-one in vLLM's budget math). 4096 is plenty for
+        // a single agent turn and leaves the rest of
+        // max_model_len (262K on Qwen3.5) for prompt + tool
+        // grammar overhead.
+        max_tokens: Some(4096),
         reasoning_enabled,
         // Send the OPEN delimiter so the runner can reconstruct
         // the wrap; the runner mirrors policy::Spotlight::wrap on
@@ -1112,6 +1121,38 @@ pub(crate) async fn run_runner_turn(
         .ensure_for_group(group_id, std::time::Duration::from_secs(30))
         .await
         .map_err(|e| format!("ensure runner: {e}"))?;
+
+    // Visibility into prompt budget. When vLLM rejects the
+    // request as too long, the server log shows what we shipped
+    // — system prompt size, history-message count, total
+    // history chars, tool count, sum of tool description +
+    // schema chars. Cheap (just .len() walks) so we always log it
+    // at debug; an operator chasing a 400 from vLLM bumps
+    // RUST_LOG=execlaw_server::chats=debug to surface it.
+    let history_chars: usize = req
+        .history
+        .iter()
+        .map(|m| m.content.as_deref().map(|s| s.len()).unwrap_or(0))
+        .sum();
+    let tool_chars: usize = req
+        .tool_catalog
+        .iter()
+        .map(|t| {
+            t.function.name.len()
+                + t.function.description.len()
+                + t.function.parameters.to_string().len()
+        })
+        .sum();
+    tracing::debug!(
+        turn_id = %req.turn_id,
+        system_prompt_chars = req.system_prompt.len(),
+        history_msg_count = req.history.len(),
+        history_chars,
+        tool_count = req.tool_catalog.len(),
+        tool_catalog_chars = tool_chars,
+        approx_total_chars = req.system_prompt.len() + history_chars + tool_chars,
+        "shipping turn to runner — prompt budget snapshot",
+    );
 
     // Step 4 — forward + drain.
     let mut rx = supervisor
@@ -1370,7 +1411,10 @@ async fn run_tool_capable_turn(
         // Delta #6 — explicit 0.3 (was None → vLLM default 1.0).
         // Same rationale as the runner-tier path above.
         temperature: Some(0.3),
-        max_tokens: None,
+        // Same explicit cap as the runner-tier path — guards
+        // against vLLM's "you requested 0 output tokens" math
+        // bug when max_tokens is omitted.
+        max_tokens: Some(4096),
         max_tool_rounds: state.config.max_tool_rounds,
         tools: tool_decls,
         event_log_hmac_key: state
@@ -2463,7 +2507,8 @@ async fn run_incognito_send(
         stream: true,
         // Delta #6 — same 0.3 default as the persisted-chat path.
         temperature: Some(0.3),
-        max_tokens: None,
+        // Explicit cap (see runner-tier comment above).
+        max_tokens: Some(4096),
         chat_template_kwargs: Some(serde_json::json!({
             "enable_thinking": reasoning_enabled,
         })),
