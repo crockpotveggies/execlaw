@@ -601,10 +601,12 @@ async fn run_real_turn(
     // Phase 11.B — same personality+base composition as the
     // tool-capable path so the streaming-only run_real_turn picks
     // up operator personality edits without an extra round trip.
+    // No routing prose: this path doesn't ship a tool catalogue.
     let composed_system = assemble_system_prompt(
         &state.db,
         Some(cid.as_str()),
         &state.config.system_prompt,
+        "",
     );
     let mut messages: Vec<ChatMessage> = vec![ChatMessage::system(&composed_system)];
     for ev in &history {
@@ -896,10 +898,29 @@ pub(crate) async fn run_runner_turn(
     } else {
         None
     };
+    // Collect tool-name lists upfront so the system prompt can carry
+    // the routing-prose block (delta #2 — the model needs a "which
+    // family handles which task" map BEFORE the per-tool descriptions).
+    let builtin_names: Vec<String> = state
+        .plugin_host
+        .registry()
+        .all_builtins()
+        .iter()
+        .map(|t| t.descriptor().name.clone())
+        .collect();
+    let plugin_tool_names: Vec<String> = state
+        .plugin_host
+        .registry()
+        .all_tools()
+        .iter()
+        .map(|t| t.tool_name.clone())
+        .collect();
+    let routing_prose = build_tool_routing_prose(&builtin_names, &plugin_tool_names);
     let composed_system = assemble_system_prompt(
         &state.db,
         Some(cid.as_str()),
         &state.config.system_prompt,
+        &routing_prose,
     );
     let mut hist_messages: Vec<ChatMessage> = Vec::new();
     for ev in &history {
@@ -1215,17 +1236,27 @@ async fn run_tool_capable_turn(
     use execlaw_inference_api::ToolDeclaration;
     use execlaw_runner_local::turn::{TurnConfig, TurnExecutor};
 
+    // Same description/schema plumbing fix as the runner-turn path
+    // (delta #1) — without this the in-process tool-capable path
+    // shipped `Plugin tool 'X' (latency: Y)` + an empty schema.
     let tool_decls: Vec<ToolDeclaration> = state
         .plugin_host
         .registry()
         .all_tools()
         .iter()
         .map(|t| {
-            ToolDeclaration::function(
-                t.tool_name.clone(),
-                format!("Plugin tool '{}' (latency: {})", t.tool_name, t.latency),
-                serde_json::json!({"type": "object"}),
-            )
+            let description = t.description.clone().unwrap_or_else(|| {
+                format!(
+                    "Plugin tool '{}' from '{}' (latency: {}). The plugin manifest did not \
+                     supply a description; ask the operator to add one for better tool selection.",
+                    t.tool_name, t.plugin_id, t.latency,
+                )
+            });
+            let schema = t
+                .schema_json
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+            ToolDeclaration::function(t.tool_name.clone(), description, schema)
         })
         .collect();
 
@@ -1266,12 +1297,36 @@ async fn run_tool_capable_turn(
             events: state.events.clone(),
             conversation_id: cid.as_str().to_owned(),
         });
+    // The in-process tool-capable path doesn't have built-ins
+    // wired into `tool_decls` above (NoBuiltinTools below), so the
+    // routing prose only needs the plugin tool names. Built-ins
+    // are still in the registry though; pass them so the model
+    // gets routing hints for the families it can use via the
+    // dispatch chain (read_memory etc. land via `with_builtins`
+    // wiring later — for now this matches what the runner path
+    // exposes).
+    let routing_builtins: Vec<String> = state
+        .plugin_host
+        .registry()
+        .all_builtins()
+        .iter()
+        .map(|t| t.descriptor().name.clone())
+        .collect();
+    let routing_plugins: Vec<String> = state
+        .plugin_host
+        .registry()
+        .all_tools()
+        .iter()
+        .map(|t| t.tool_name.clone())
+        .collect();
+    let routing_prose = build_tool_routing_prose(&routing_builtins, &routing_plugins);
     let cfg = TurnConfig {
         model: ModelId(state.config.model_id.clone()),
         system_prompt: assemble_system_prompt(
             &state.db,
             Some(cid.as_str()),
             &state.config.system_prompt,
+            &routing_prose,
         ),
         temperature: None,
         max_tokens: None,
@@ -1741,7 +1796,7 @@ pub async fn dispatch_routine_turn(
     mapped
 }
 
-/// Phase 11.B — assemble the turn's system prompt. Two halves:
+/// Phase 11.B — assemble the turn's system prompt. Three halves:
 ///
 ///   1. **Operator-editable personality** (§5.5). Pulled from
 ///      `config_personality` via `compose_system_prompt`. Includes
@@ -1753,13 +1808,23 @@ pub async fn dispatch_routine_turn(
 ///      refusal behaviour, etc. that operators don't tweak. Comes
 ///      from `state.config.system_prompt`. Sits *after* the
 ///      personality so it has the final word on conflict.
+///   3. **Tool routing prose** (delta #2 from the agent-prompting
+///      audit, 2026-05). Built dynamically from the live tool
+///      catalogue so the model gets a "Quick reference: which tool
+///      family handles which kind of task" map BEFORE it scans the
+///      individual descriptions. Mirrors what selfhosted-claw's
+///      `buildSystemPrompt` baked in statically; here the prefixes
+///      we recognise drive emission so newly-installed plugins
+///      light up automatically without a code change.
 ///
 /// Operators override "agent voice"; the static base owns
-/// non-negotiable safety rules.
+/// non-negotiable safety rules; the routing block teaches the
+/// model when to reach for which family.
 pub(crate) fn assemble_system_prompt(
     db: &execlaw_core::Database,
     conversation_id: Option<&str>,
     static_base: &str,
+    routing_prose: &str,
 ) -> String {
     let store = execlaw_core::personality::PersonalityStore::new(db);
     let personality_chunk =
@@ -1767,12 +1832,175 @@ pub(crate) fn assemble_system_prompt(
             .unwrap_or_default();
     let p = personality_chunk.trim();
     let b = static_base.trim();
-    match (p.is_empty(), b.is_empty()) {
-        (true, true) => String::new(),
-        (true, false) => b.to_owned(),
-        (false, true) => p.to_owned(),
-        (false, false) => format!("{p}\n\n---\n\n{b}"),
+    let r = routing_prose.trim();
+    let mut out = String::new();
+    let mut sep = |s: &mut String| {
+        if !s.is_empty() {
+            s.push_str("\n\n---\n\n");
+        }
+    };
+    if !p.is_empty() {
+        out.push_str(p);
     }
+    if !b.is_empty() {
+        sep(&mut out);
+        out.push_str(b);
+    }
+    if !r.is_empty() {
+        sep(&mut out);
+        out.push_str(r);
+    }
+    out
+}
+
+/// Build the per-turn tool-routing block from the live tool
+/// catalogue. The prose is grouped by tool-name prefix:
+///
+///   * known prefixes from the built-in catalogue get a curated
+///     one-liner that tells the model when to reach for that
+///     family;
+///   * plugin namespaces (anything containing a `.`) get a generic
+///     "tools prefixed `X.` come from the X plugin — read each
+///     tool's description for usage" line so newly-installed
+///     plugins are surfaced automatically;
+///   * the block is empty when no tools are registered (defensive
+///     — a turn with zero tools shouldn't read like the model is
+///     forgetting capabilities).
+///
+/// This runs once per turn; it allocates a few small strings and
+/// walks the catalogue once. Cheap relative to the LLM call.
+pub(crate) fn build_tool_routing_prose(
+    builtin_names: &[String],
+    plugin_names: &[String],
+) -> String {
+    use std::collections::BTreeSet;
+
+    // Sentences keyed by tool-family prefix. Hand-tuned to mirror
+    // the routing prose selfhosted-claw used to bake into its
+    // system prompt — the model needs WHEN, not just WHAT.
+    let routing_lines: &[(&str, &str)] = &[
+        (
+            "memory",
+            "* `read_memory` / `list_memory` / `write_memory` — durable per-controller notes. \
+             Read BEFORE answering questions about prior conversations or operator preferences. \
+             Write only when the operator explicitly says \"remember\" or shares a stable fact \
+             (preferences, recurring contacts, ongoing projects). Do NOT write summaries of \
+             every chat.",
+        ),
+        (
+            "web",
+            "* `web_search` + `web_fetch` — use as a PAIR for facts you don't know or that may \
+             have changed since training. Search to find URLs, then fetch the most-promising 1-3 \
+             to read. Don't fetch arbitrary URLs the operator didn't ask about.",
+        ),
+        (
+            "research",
+            "* `research_*` — multi-step deep-research jobs that run in the background. Use ONLY \
+             when the operator asks for a written report or comparative analysis; for a quick \
+             question, prefer `web_search` + `web_fetch` directly.",
+        ),
+        (
+            "routine",
+            "* `routine_*` — schedule recurring agent work (cron-shaped). Use when the operator \
+             says \"every Monday\", \"each morning\", or describes anything that should fire \
+             repeatedly without re-prompting. Do NOT use for one-shot reminders.",
+        ),
+        (
+            "chat",
+            "* `read_chat_history` / `list_chats` / `get_thread` / `set_thread_name` — inspect \
+             other conversations the operator is having. Use when the user references \"that \
+             thread\", \"the conversation about X\", or to find a thread to rename.",
+        ),
+        (
+            "controller",
+            "* `notify_controller` — sends a private message to the operator on their highest-\
+             priority channel. Use ONLY when (a) you need approval before acting, (b) you hit a \
+             blocker that needs a human decision, or (c) the operator told you to follow up out-\
+             of-band. Do NOT use for normal answers in this thread.",
+        ),
+        (
+            "delegate",
+            "* `delegate_task` — spin up a sub-agent for a self-contained task you can finish \
+             in the background. Use sparingly: it costs a fresh inference round and an isolated \
+             context.",
+        ),
+    ];
+
+    // Bucket every tool by its family prefix.
+    let mut present: BTreeSet<&str> = BTreeSet::new();
+    let mut plugin_namespaces: BTreeSet<String> = BTreeSet::new();
+    for name in builtin_names.iter().chain(plugin_names.iter()) {
+        if let Some(dot) = name.find('.') {
+            // `calendar.list_events` → namespace `calendar`.
+            plugin_namespaces.insert(name[..dot].to_owned());
+            continue;
+        }
+        let prefix = name.split('_').next().unwrap_or(name);
+        match prefix {
+            "read" | "write" | "list" => {
+                if name.contains("memory") {
+                    present.insert("memory");
+                } else if name.contains("chat") || name == "list_chats" {
+                    present.insert("chat");
+                }
+            }
+            "web" => {
+                present.insert("web");
+            }
+            "research" => {
+                present.insert("research");
+            }
+            "routine" => {
+                present.insert("routine");
+            }
+            "set" if name.contains("thread") => {
+                present.insert("chat");
+            }
+            "get" if name.contains("thread") => {
+                present.insert("chat");
+            }
+            "notify" => {
+                present.insert("controller");
+            }
+            "delegate" => {
+                present.insert("delegate");
+            }
+            _ => {}
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    for (key, prose) in routing_lines {
+        if present.contains(*key) {
+            lines.push((*prose).to_owned());
+        }
+    }
+    for ns in &plugin_namespaces {
+        lines.push(format!(
+            "* Tools prefixed `{ns}.` come from the `{ns}` plugin — read each tool's \
+             description for usage hints. The plugin's OAuth account (if any) is already \
+             connected when these tools appear in your catalogue.",
+        ));
+    }
+
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from(
+        "## Tool routing — quick reference\n\n\
+         Match the operator's request to the right tool family BEFORE scanning individual \
+         descriptions:\n\n",
+    );
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str(
+        "\nWhen multiple families could apply, prefer the most specific one. If no tool helps, \
+         answer from your own knowledge.",
+    );
+    out
 }
 
 /// `POST /api/chats/:id/stop` — flip the in-flight turn's cancel
@@ -2794,6 +3022,74 @@ mod tests {
     }
 
     #[test]
+    fn build_tool_routing_prose_lists_only_present_families() {
+        // Only mention groups whose tools are actually registered;
+        // an install with NO routine tools shouldn't get a routine
+        // bullet (model would chase a hallucinated capability).
+        let prose = super::build_tool_routing_prose(
+            &[
+                "read_memory".into(),
+                "write_memory".into(),
+                "web_search".into(),
+                "web_fetch".into(),
+            ],
+            &[],
+        );
+        assert!(prose.contains("memory"));
+        assert!(prose.contains("web_search"));
+        assert!(!prose.contains("routine"));
+        assert!(!prose.contains("research_"));
+    }
+
+    #[test]
+    fn build_tool_routing_prose_emits_generic_line_per_plugin_namespace() {
+        // Plugin namespaces (anything with a `.`) get a generic
+        // "tools prefixed `X.` come from the X plugin" line so
+        // newly-installed plugins surface without a code change.
+        let prose = super::build_tool_routing_prose(
+            &[],
+            &[
+                "calendar.list_events".into(),
+                "calendar.create_event".into(),
+                "contacts.list".into(),
+            ],
+        );
+        assert!(prose.contains("`calendar.`"));
+        assert!(prose.contains("`contacts.`"));
+        // Each namespace mentioned exactly once even with multiple
+        // tools sharing it.
+        assert_eq!(prose.matches("`calendar.`").count(), 1);
+    }
+
+    #[test]
+    fn build_tool_routing_prose_empty_when_no_tools_present() {
+        // A turn with zero tools shouldn't read like the model is
+        // forgetting capabilities — emit nothing.
+        let prose = super::build_tool_routing_prose(&[], &[]);
+        assert!(prose.is_empty());
+    }
+
+    #[test]
+    fn assemble_system_prompt_appends_routing_block_after_static_base() {
+        // Routing prose is the LAST chunk so individual tool
+        // descriptions (which the model sees later in the request)
+        // can refine the routing hints without contradicting them.
+        let state = test_app_state();
+        let prompt = super::assemble_system_prompt(
+            &state.db,
+            None,
+            "STATIC BASE GOES HERE",
+            "ROUTING PROSE GOES HERE",
+        );
+        let base_at = prompt.find("STATIC BASE GOES HERE").unwrap();
+        let routing_at = prompt.find("ROUTING PROSE GOES HERE").unwrap();
+        assert!(
+            base_at < routing_at,
+            "routing block must follow the static base: {prompt}",
+        );
+    }
+
+    #[test]
     fn assemble_system_prompt_concatenates_personality_then_base() {
         // Phase 11.B: personality chunk is rendered above the static
         // base, separated by `---`. The seeded default personality
@@ -2803,6 +3099,7 @@ mod tests {
             &state.db,
             None, // no per-conversation override
             "You are a helpful agent. Refuse unsafe requests.",
+            "",
         );
         assert!(
             prompt.contains("# Identity"),
@@ -2872,7 +3169,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let prompt = super::assemble_system_prompt(&state.db, None, "STATIC ONLY");
+        let prompt = super::assemble_system_prompt(&state.db, None, "STATIC ONLY", "");
         assert_eq!(prompt, "STATIC ONLY");
     }
 
@@ -2910,8 +3207,9 @@ mod tests {
             &state.db,
             Some("conv-pirate"),
             "BASE",
+            "",
         );
-        let plain = super::assemble_system_prompt(&state.db, None, "BASE");
+        let plain = super::assemble_system_prompt(&state.db, None, "BASE", "");
         assert!(pirate.contains("# Tone\nPirate"));
         assert!(!plain.contains("Pirate"));
     }
