@@ -166,6 +166,16 @@ export function MascotGreeting({
     const beardPathRef = useRef<SVGPathElement | null>(null);
     const eyeOuterRef = useRef<SVGGElement | null>(null);
     const eyeInnerRef = useRef<SVGGElement | null>(null);
+    // Bracket overlays. The original hair/beard rotate + scale
+    // into vertical ribbons at the canvas centre; on Phase B these
+    // overlays fade in (replacing the rotated blobs) and slide
+    // outward to flank the welcome text, reading as `<` `>`. On
+    // the reverse leg they slide back + fade out, then the
+    // hair/beard inner groups unwind to their resting state.
+    const leftBracketOuterRef = useRef<SVGGElement | null>(null);
+    const leftBracketRef = useRef<SVGPathElement | null>(null);
+    const rightBracketOuterRef = useRef<SVGGElement | null>(null);
+    const rightBracketRef = useRef<SVGPathElement | null>(null);
 
     // Welcome text (HTML overlay, sits above the SVG centre).
     const welcomeRef = useRef<HTMLSpanElement | null>(null);
@@ -232,6 +242,10 @@ export function MascotGreeting({
         const eyeOuter = eyeOuterRef.current;
         const eyeInner = eyeInnerRef.current;
         const welcome = welcomeRef.current;
+        const leftBracketOuter = leftBracketOuterRef.current;
+        const leftBracket = leftBracketRef.current;
+        const rightBracketOuter = rightBracketOuterRef.current;
+        const rightBracket = rightBracketRef.current;
         if (
             !svg ||
             !hairOuter ||
@@ -242,7 +256,11 @@ export function MascotGreeting({
             !beardPath ||
             !eyeOuter ||
             !eyeInner ||
-            !welcome
+            !welcome ||
+            !leftBracketOuter ||
+            !leftBracket ||
+            !rightBracketOuter ||
+            !rightBracket
         ) {
             return;
         }
@@ -293,6 +311,34 @@ export function MascotGreeting({
         const beardSlide =
             textWidthVb / 2 + marginVb + beardHalfWidthVb;
 
+        // ---- Bracket geometry --------------------------------
+        // Brackets are stroked chevrons drawn at the canvas
+        // centre, sized to the welcome text height. Their outer
+        // groups inherit the same `hairSlide` / `beardSlide`
+        // distances the rotated blobs target — so the bracket
+        // emerges right where the rotated original disappears.
+        const bracketHalfH = targetHeightVb / 2;
+        const bracketHalfW = targetHeightVb * 0.28; // chevron aspect
+        const bracketStrokeVb = Math.max(targetHeightVb * 0.10, 18);
+        const bcx = CANVAS_CENTER;
+        const bcy = CANVAS_CENTER;
+        // `<` — point on the left, opens to the right.
+        const leftBracketD =
+            `M ${bcx + bracketHalfW} ${bcy - bracketHalfH} ` +
+            `L ${bcx - bracketHalfW} ${bcy} ` +
+            `L ${bcx + bracketHalfW} ${bcy + bracketHalfH}`;
+        // `>` — point on the right, opens to the left.
+        const rightBracketD =
+            `M ${bcx - bracketHalfW} ${bcy - bracketHalfH} ` +
+            `L ${bcx + bracketHalfW} ${bcy} ` +
+            `L ${bcx - bracketHalfW} ${bcy + bracketHalfH}`;
+        leftBracket.setAttribute("d", leftBracketD);
+        leftBracket.setAttribute("stroke-width", `${bracketStrokeVb}`);
+        rightBracket.setAttribute("d", rightBracketD);
+        rightBracket.setAttribute("stroke-width", `${bracketStrokeVb}`);
+        // Brackets start invisible at the canvas centre.
+        gsap.set([leftBracketOuter, rightBracketOuter], { opacity: 0, x: 0 });
+
         // Welcome line starts hidden.
         gsap.set(welcome, { opacity: 0, scale: 0.95 });
 
@@ -334,21 +380,34 @@ export function MascotGreeting({
             "<",
         );
 
-        // Phase B — slide outward to the calibrated positions so
-        // the text + margin fits exactly between the brackets.
-        // Eye fades to clear the centre.
+        // Phase B — bracket morph. The rotated hair/beard blobs
+        // fade out at the canvas centre while the bracket
+        // overlays fade in at the same spot and slide outward to
+        // their calibrated flanking positions. Eye fades too,
+        // clearing the centre for the welcome text.
         tl.to(
-            hairOuter,
+            [hairInner, beardInner],
             {
-                x: hairSlide,
-                duration: MORPH_SLIDE_S,
-                ease: "power2.out",
+                opacity: 0,
+                duration: FADE_S,
+                ease: "power2.in",
             },
             "-=0.45",
         );
         tl.to(
-            beardOuter,
+            leftBracketOuter,
             {
+                opacity: 1,
+                x: hairSlide,
+                duration: MORPH_SLIDE_S,
+                ease: "power2.out",
+            },
+            "<",
+        );
+        tl.to(
+            rightBracketOuter,
+            {
+                opacity: 1,
                 x: beardSlide,
                 duration: MORPH_SLIDE_S,
                 ease: "power2.out",
@@ -390,11 +449,13 @@ export function MascotGreeting({
             ease: "power2.in",
         });
 
-        // Phase F — slide hair / beard back to centre and fade
-        // the eye back in (overlapping for a smooth return).
+        // Phase F — brackets slide back to centre + fade out;
+        // hair/beard fade back in at the centre (still rotated
+        // from Phase A — Phase G unwinds that). Eye fades back.
         tl.to(
-            hairOuter,
+            leftBracketOuter,
             {
+                opacity: 0,
                 x: 0,
                 duration: MORPH_SLIDE_S,
                 ease: "power2.inOut",
@@ -402,11 +463,21 @@ export function MascotGreeting({
             "-=0.2",
         );
         tl.to(
-            beardOuter,
+            rightBracketOuter,
             {
+                opacity: 0,
                 x: 0,
                 duration: MORPH_SLIDE_S,
                 ease: "power2.inOut",
+            },
+            "<",
+        );
+        tl.to(
+            [hairInner, beardInner],
+            {
+                opacity: 1,
+                duration: FADE_S,
+                ease: "power2.out",
             },
             "<",
         );
@@ -516,6 +587,32 @@ export function MascotGreeting({
                             <path d={IRIS_PATH} />
                         </g>
                     </g>
+                </g>
+                {/* Bracket overlays — d / stroke-width set at
+                    runtime from the welcome line's measured
+                    height (see useEffect). Initially hidden;
+                    fade in as the rotated hair/beard fades out. */}
+                <g ref={leftBracketOuterRef} opacity="0">
+                    <path
+                        ref={leftBracketRef}
+                        d=""
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth={20}
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                    />
+                </g>
+                <g ref={rightBracketOuterRef} opacity="0">
+                    <path
+                        ref={rightBracketRef}
+                        d=""
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth={20}
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                    />
                 </g>
             </svg>
             <span

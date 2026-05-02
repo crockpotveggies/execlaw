@@ -698,7 +698,10 @@ body {
 }
 
 .execlaw-main__head {
-    padding: 0.85rem 1.25rem;
+    // Top padding matches `.execlaw-sidebar__head` (1.1rem) so the
+    // page-header h2 sits at the same Y as the sidebar's
+    // `.execlaw-brand`. Bottom kept at 0.85rem.
+    padding: 1.1rem 1.25rem 0.85rem;
     display: flex;
     align-items: center;
     gap: 0.5rem;
@@ -1584,10 +1587,15 @@ body {
     top: 50%;
     left: 50%;
     transform: translate(-50%, -50%);
+    // Match `.execlaw-brand` — same monospace stack, same weight,
+    // same tight letter-spacing. The welcome greeting reads as a
+    // continuation of the brand identity rather than a separate
+    // typographic register.
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     font-size: 1.4rem;
     font-weight: 600;
     color: $text-primary;
-    letter-spacing: -0.005em;
+    letter-spacing: -0.02em;
     white-space: nowrap;
     pointer-events: none;
     opacity: 0;
