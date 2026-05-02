@@ -32,7 +32,6 @@ import { PersonalityPage } from "./PersonalityPage";
 import { AlertsPage } from "./AlertsPage";
 import { SkillsPage } from "./SkillsPage";
 import { TrustPolicyPage } from "./TrustPolicyPage";
-import { MyIdentitiesPage } from "./MyIdentitiesPage";
 
 const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     // General first (Phase 14 bare-metal pivot) — host-service knobs
@@ -52,11 +51,9 @@ const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
         icon: "bi-chat-square-quote",
         label: "Personality",
     },
-    {
-        to: "/settings/my-identities",
-        icon: "bi-person-badge",
-        label: "My identities",
-    },
+    // My identities used to be its own tab; merged into the User
+    // page (Phase 14, 2026-05-02). A redirect below keeps old
+    // bookmarks pointed at `/settings/my-identities` working.
     // Routines used to live here too (Phase 10) but it's a feature,
     // not a setting — it now sits at the top-level `/routines` route
     // with its own sidebar entry. A back-compat redirect below keeps
@@ -178,7 +175,12 @@ export function Settings() {
                         <Route path="general" element={<GeneralPage />} />
                         <Route path="user" element={<UserPage />} />
                         <Route path="personality" element={<PersonalityPage />} />
-                        <Route path="my-identities" element={<MyIdentitiesPage />} />
+                        {/* Legacy: my-identities is now a panel
+                            inside the User page. */}
+                        <Route
+                            path="my-identities"
+                            element={<Navigate to="/settings/user" replace />}
+                        />
                         {/* Legacy: routines is now a top-level page. */}
                         <Route
                             path="routines"

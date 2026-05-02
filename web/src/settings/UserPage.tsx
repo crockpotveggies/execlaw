@@ -40,6 +40,7 @@ import {
     coerceCreationOptions,
     serializeCredential,
 } from "../auth/webauthn";
+import { MyIdentitiesCard } from "./MyIdentitiesPage";
 
 const ROLES: ReadonlyArray<UserRole> = ["operator", "viewer", "controller"];
 
@@ -85,6 +86,14 @@ export function UserPage() {
             />
             <ChangePasswordCard getToken={getToken} />
             <PasskeysCard getToken={getToken} />
+            {/* My identities — formerly its own Settings tab; merged
+                here so transport-handle management lives next to the
+                rest of the operator-account surface. Sits above
+                Sessions because identifiers are about *who you are*,
+                not *where you're signed in*. */}
+            <div className="mt-4">
+                <MyIdentitiesCard />
+            </div>
             <SessionsCard
                 signOutEverywhere={auth.signOutEverywhere}
                 navigate={navigate}
