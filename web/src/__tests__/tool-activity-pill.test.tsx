@@ -19,7 +19,7 @@ describe("ToolActivityPill", () => {
         expect(container.firstChild).toBeNull();
     });
 
-    it("shows the label with a spinner once an activity is set", () => {
+    it("shows the label and the mini-mascot SVG once an activity is set", () => {
         render(<ToolActivityPill conversationId="c-2" />);
         act(() => {
             setToolActivity("c-2", {
@@ -32,7 +32,14 @@ describe("ToolActivityPill", () => {
         expect(pill.textContent ?? "").toContain(
             "Searching the web for “paris weather”",
         );
-        expect(pill.textContent ?? "").toContain("🔎");
+        // Mini mascot is the spinner now (replaces the old emoji
+        // icon + CSS ring). Asserting on the SVG class hooks
+        // catches accidental regressions of the structure that
+        // the rotor + iris-tracking logic depend on.
+        const svg = pill.querySelector("svg.execlaw-mini-mascot");
+        expect(svg).not.toBeNull();
+        expect(svg?.querySelector(".execlaw-mini-mascot__rotor")).not.toBeNull();
+        expect(svg?.querySelector(".execlaw-mini-mascot__iris")).not.toBeNull();
     });
 
     it("disappears once the activity is cleared", () => {
@@ -61,7 +68,7 @@ describe("ToolActivityPill", () => {
         expect(screen.queryByTestId("tool-activity-pill")).toBeNull();
     });
 
-    it("renders a generic title for tools with no curated icon entry", () => {
+    it("renders a generic label for tools with no curated entry — mascot still spins", () => {
         render(<ToolActivityPill conversationId="c-fallback" />);
         act(() => {
             setToolActivity("c-fallback", {
@@ -71,5 +78,8 @@ describe("ToolActivityPill", () => {
         });
         const pill = screen.getByTestId("tool-activity-pill");
         expect(pill.textContent ?? "").toContain("Frobnicate widget");
+        // Mascot is independent of the tool family — every
+        // activity gets the same spinner, only the label changes.
+        expect(pill.querySelector("svg.execlaw-mini-mascot")).not.toBeNull();
     });
 });

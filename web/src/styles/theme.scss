@@ -995,53 +995,58 @@ body {
     background-color: $bg-deep;
 }
 
-// 2026-05-02 — loader pill that surfaces the agent's current
-// tool activity ("Searching the web for X…") above the composer
-// chip. Driven by `agent_tool_activity` WS events from the chat
-// handler. Centered to the same max-width as the composer +
-// message column so it visually anchors to the chat shell.
-.execlaw-tool-activity-pill {
+// 2026-05-02 — inline loader that surfaces the agent's current
+// tool activity ("Searching the web for X…") inside the
+// MessageStream where the next assistant message will land.
+// Reuses `.execlaw-msg`'s grid + max-width layout so it sits in
+// the same column as the surrounding bubbles; the override
+// modifier just swaps the bubble background for transparent
+// muted text and tucks a tiny mascot SVG to the left.
+.execlaw-msg.execlaw-tool-activity {
+    // No bubble background — render as plain greyed-out inline text.
+    // Spacing matches `.execlaw-msg__bubble`'s vertical rhythm so
+    // it doesn't jump the scroll position when it appears/disappears.
+    padding-block: 0.25rem;
+}
+
+.execlaw-tool-activity__row {
     display: inline-flex;
     align-items: center;
     gap: 0.5rem;
-    margin-inline: auto;
-    margin-bottom: 0.5rem;
-    padding: 0.4rem 0.75rem;
-    max-width: $thread-max-width;
-    background-color: $bg-elev;
-    border-radius: $radius-pill;
     color: $text-muted;
-    font-size: 0.85rem;
-    line-height: 1.2;
-    width: fit-content;
-    // Show in the column-flex of `.execlaw-composer` so the pill
-    // sits cleanly above RunningJobsBadge / ApprovalCard / Composer.
-    display: flex;
-    justify-content: flex-start;
+    font-size: 0.9rem;
+    line-height: 1.4;
 }
 
-.execlaw-tool-activity-pill__spinner {
-    // Reuse the thread-row spinner geometry but render in the
-    // accent colour so the pill reads as "live" not "loading".
-    display: inline-block;
-    width: 0.85rem;
-    height: 0.85rem;
-    border: 2px solid currentColor;
-    border-top-color: transparent;
-    border-radius: 50%;
-    animation: execlaw-tool-activity-spin 0.8s linear infinite;
-    flex-shrink: 0;
-    opacity: 0.65;
-}
-
-.execlaw-tool-activity-pill__label {
+.execlaw-tool-activity__label {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     max-width: 60ch;
+    font-style: italic;
+    opacity: 0.85;
 }
 
-@keyframes execlaw-tool-activity-spin {
+// Mini mascot used by the loader. The outer rotor group spins
+// at a leisurely pace; the iris stays put visually because its
+// `transform` is set per-frame from the cursor-tracking JS.
+.execlaw-mini-mascot {
+    color: $text-muted;
+    flex-shrink: 0;
+    display: inline-block;
+    vertical-align: middle;
+}
+
+.execlaw-mini-mascot__rotor {
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: execlaw-mini-mascot-spin 1.6s linear infinite;
+}
+
+@keyframes execlaw-mini-mascot-spin {
+    from {
+        transform: rotate(0deg);
+    }
     to {
         transform: rotate(360deg);
     }

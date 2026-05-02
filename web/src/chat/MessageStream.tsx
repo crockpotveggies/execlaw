@@ -16,6 +16,7 @@ import { getCardRenderer } from "../cards/CardRenderer";
 import { useCardsForConversation } from "../cards/cardStore";
 import type { Card } from "../cards/types";
 import { MarkdownContent } from "../components/MarkdownContent";
+import { ToolActivityPill } from "./ToolActivityPill";
 import { useChatState } from "./store";
 
 interface Props {
@@ -172,6 +173,12 @@ export function MessageStream({ conversationId }: Props) {
                         />
                     );
                 })}
+                {/* Live "what's the agent doing" pulse, mounted
+                    inside the message stream where the next
+                    assistant message will land. Shows nothing
+                    when there's no active tool — only renders
+                    while a `tool_call` round-trip is in flight. */}
+                <ToolActivityPill conversationId={conversationId} />
                 {streaming && (
                     <div className="execlaw-msg" data-testid="streaming-bubble">
                         <div className="execlaw-msg__meta">
