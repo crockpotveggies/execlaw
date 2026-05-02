@@ -80,8 +80,14 @@ enum Command {
     ///
     /// Production uses `execlaw up` which spawns the container.
     Serve {
-        #[arg(long, default_value = "127.0.0.1:3030")]
-        bind: String,
+        /// Override the configured bind address for this run. When
+        /// omitted, the value falls back to
+        /// `config_general.bind_address` (set in Settings → General),
+        /// then to the hardcoded `127.0.0.1:3030`. Passing `--bind`
+        /// is intended for one-off dev runs; persistent changes
+        /// should go through the SPA.
+        #[arg(long)]
+        bind: Option<String>,
         /// Database file. Defaults to `~/.execlaw/execlaw.db`.
         #[arg(long)]
         db: Option<PathBuf>,
@@ -206,11 +212,15 @@ enum ServiceOp {
     },
     /// Hidden — invoked by the service unit / SCM. Operators don't
     /// run this directly; `service install` registers it as the
-    /// program path.
+    /// program path. Bind address is read from
+    /// `config_general.bind_address` so SPA edits take effect on the
+    /// next service restart without needing to rewrite the unit.
     #[command(hide = true)]
     Run {
-        #[arg(long, default_value = "127.0.0.1:3030")]
-        bind: String,
+        /// Hidden override for testing — production service units
+        /// don't pass this; the binary reads bind from the DB.
+        #[arg(long)]
+        bind: Option<String>,
         #[arg(long)]
         db: Option<PathBuf>,
         #[arg(long, default_value_t = false)]
@@ -366,7 +376,7 @@ fn default_db_path() -> PathBuf {
     default_data_dir().join("execlaw.db")
 }
 
-fn open_db(db_path: &Path, no_encrypt: bool) -> anyhow::Result<execlaw_core::Database> {
+pub(crate) fn open_db(db_path: &Path, no_encrypt: bool) -> anyhow::Result<execlaw_core::Database> {
     use execlaw_core::db::SqlCipherKey;
 
     let key = if no_encrypt {
@@ -969,9 +979,45 @@ fn parse_range(s: &str) -> anyhow::Result<(i64, i64)> {
     Ok((from, to))
 }
 
-async fn cmd_serve(bind: String, db_path: PathBuf, no_encrypt: bool) -> anyhow::Result<()> {
+/// Pick the bind address the listener will use. Precedence:
+///
+///   1. The `--bind` CLI flag, if passed (one-off overrides for dev).
+///   2. `config_general.bind_address` from the DB, if a row exists
+///      (the SPA's Settings → General writes here).
+///   3. `127.0.0.1:3030` — the install-time hardcoded default.
+///
+/// Returns the resolved value plus a short source label suitable for
+/// the boot log, so an operator chasing "why am I bound to X" has a
+/// breadcrumb.
+fn resolve_bind(cli: Option<String>, db: Option<String>) -> (String, &'static str) {
+    if let Some(s) = cli {
+        return (s, "cli");
+    }
+    if let Some(s) = db.filter(|s| !s.trim().is_empty()) {
+        return (s, "config_general");
+    }
+    ("127.0.0.1:3030".to_string(), "default")
+}
+
+async fn cmd_serve(
+    bind: Option<String>,
+    db_path: PathBuf,
+    no_encrypt: bool,
+) -> anyhow::Result<()> {
     let db = open_db(&db_path, no_encrypt)?;
     execlaw_core::MigrationRunner::new(&db).apply_all()?;
+
+    // Bind address resolution (precedence: CLI flag > DB > default).
+    // The DB-stored value comes from Settings → General; making it
+    // authoritative here is what allows the SPA's "takes effect on
+    // next restart" hint to be true.
+    let db_bind = execlaw_core::general_settings::GeneralSettingsStore::new(&db)
+        .get()
+        .ok()
+        .flatten()
+        .map(|s| s.bind_address);
+    let (bind, bind_source) = resolve_bind(bind, db_bind);
+    tracing::info!(addr = %bind, source = bind_source, "resolved bind address");
 
     // 2026-04-28 — derive the JWT signing key from the vault's
     // master key. Pre-fix this was `JwtSigner::generate(...)` which
@@ -1682,5 +1728,45 @@ fn main() -> ExitCode {
             eprintln!("execlaw: error: {e:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_bind_prefers_cli_over_db() {
+        let (bind, src) = resolve_bind(
+            Some("0.0.0.0:9000".into()),
+            Some("127.0.0.1:3030".into()),
+        );
+        assert_eq!(bind, "0.0.0.0:9000");
+        assert_eq!(src, "cli");
+    }
+
+    #[test]
+    fn resolve_bind_falls_back_to_db_when_no_cli() {
+        let (bind, src) = resolve_bind(None, Some("0.0.0.0:8080".into()));
+        assert_eq!(bind, "0.0.0.0:8080");
+        assert_eq!(src, "config_general");
+    }
+
+    #[test]
+    fn resolve_bind_falls_back_to_default_when_neither_provided() {
+        let (bind, src) = resolve_bind(None, None);
+        assert_eq!(bind, "127.0.0.1:3030");
+        assert_eq!(src, "default");
+    }
+
+    #[test]
+    fn resolve_bind_treats_blank_db_value_as_missing() {
+        // Defensive — `config_general.bind_address` is NOT NULL in
+        // the schema, but a future migration / hand-edit could leave
+        // it as whitespace; bind to the safe loopback default rather
+        // than passing `""` to TcpListener::bind.
+        let (bind, src) = resolve_bind(None, Some("   ".into()));
+        assert_eq!(bind, "127.0.0.1:3030");
+        assert_eq!(src, "default");
     }
 }

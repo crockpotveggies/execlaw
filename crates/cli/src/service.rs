@@ -94,12 +94,15 @@ fn current_binary() -> anyhow::Result<PathBuf> {
 /// Build the args list the service unit will invoke. We use the
 /// hidden `execlaw service run` subcommand so the binary can pick
 /// the right OS-service dispatch on Windows.
-fn service_run_args(db_path: &PathBuf, bind: &str) -> Vec<OsString> {
+///
+/// The bind address is intentionally NOT baked into the unit — the
+/// binary reads it from `config_general.bind_address` at boot, so
+/// changes saved in Settings → General take effect on the next
+/// `execlaw service restart` without needing to rewrite the unit.
+fn service_run_args(db_path: &PathBuf) -> Vec<OsString> {
     vec![
         OsString::from("service"),
         OsString::from("run"),
-        OsString::from("--bind"),
-        OsString::from(bind),
         OsString::from("--db"),
         OsString::from(db_path),
     ]
@@ -119,10 +122,19 @@ fn service_run_args(db_path: &PathBuf, bind: &str) -> Vec<OsString> {
 /// errno.
 pub fn install(system: bool, bind: Option<String>, db: Option<PathBuf>) -> anyhow::Result<()> {
     let mgr = manager(system)?;
-    let bind = bind.unwrap_or_else(|| SERVICE_BIND.to_owned());
     let db_path = db.unwrap_or_else(|| default_data_dir().join("execlaw.db"));
+
+    // If the operator passed `--bind`, persist it to
+    // config_general.bind_address. The unit doesn't carry the bind
+    // anymore — the binary reads it from the DB on every start, so
+    // SPA edits and CLI install both flow through the same row.
+    if let Some(b) = bind.as_deref() {
+        write_bind_to_db(&db_path, b)
+            .with_context(|| format!("save --bind={b} to {}", db_path.display()))?;
+    }
+
     let program = current_binary()?;
-    let args = service_run_args(&db_path, &bind);
+    let args = service_run_args(&db_path);
 
     let ctx = ServiceInstallCtx {
         label: label(),
@@ -144,9 +156,39 @@ pub fn install(system: bool, bind: Option<String>, db: Option<PathBuf>) -> anyho
         program.display(),
         if system { "system" } else { "user" }
     );
-    println!("    bind = {bind}");
+    if let Some(b) = bind.as_deref() {
+        println!("    bind = {b} (saved to config_general)");
+    } else {
+        println!("    bind = (read from config_general at start)");
+    }
     println!("    db   = {}", db_path.display());
     println!("    Use `execlaw service start` to launch.");
+    Ok(())
+}
+
+/// Open the DB long enough to write `bind` to the
+/// `config_general.bind_address` column, then close it. Used during
+/// `service install --bind X` so the value persists across service
+/// restarts and matches what Settings → General would write.
+fn write_bind_to_db(db_path: &PathBuf, bind: &str) -> anyhow::Result<()> {
+    use execlaw_core::general_settings::{
+        GeneralSettingsStore, GeneralSettingsUpdate,
+    };
+    let db = crate::open_db(db_path, false)
+        .with_context(|| format!("open {}", db_path.display()))?;
+    execlaw_core::MigrationRunner::new(&db).apply_all()?;
+    let store = GeneralSettingsStore::new(&db);
+    store
+        .update(
+            &GeneralSettingsUpdate {
+                start_on_boot: None,
+                bind_address: Some(bind.to_owned()),
+                setup_wizard_dismissed: None,
+                history_retention_days: None,
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .map_err(|e| anyhow::anyhow!("save bind_address: {e}"))?;
     Ok(())
 }
 
@@ -321,7 +363,7 @@ fn is_access_denied(err: &std::io::Error) -> bool {
 /// us to stop OR when `cmd_serve` returns (e.g. fatal init error).
 #[cfg(windows)]
 pub fn windows_runtime_run(
-    bind: String,
+    bind: Option<String>,
     db: PathBuf,
     no_encrypt: bool,
 ) -> anyhow::Result<()> {
@@ -356,7 +398,7 @@ mod windows_runtime {
     /// runs in a separate thread the SCM owns; the args are passed
     /// through a shared `OnceLock` instead of as fn parameters.
     struct ServiceArgs {
-        bind: String,
+        bind: Option<String>,
         db: PathBuf,
         no_encrypt: bool,
     }
@@ -438,7 +480,7 @@ mod windows_runtime {
         result
     }
 
-    pub fn run(bind: String, db: PathBuf, no_encrypt: bool) -> anyhow::Result<()> {
+    pub fn run(bind: Option<String>, db: PathBuf, no_encrypt: bool) -> anyhow::Result<()> {
         ARGS.set(ServiceArgs {
             bind,
             db,
