@@ -343,4 +343,5 @@ describe("PluginsPage", () => {
         // No "Uninstall" text either.
         expect(screen.queryByText(/Uninstall/i)).toBeNull();
     });
+
 });

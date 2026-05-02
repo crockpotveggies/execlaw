@@ -422,13 +422,22 @@ export interface InstallPluginResponse {
 }
 
 /**
- * Install a plugin from a ZIP `File` (browser File API). Sends raw
- * `application/zip` bytes — the Phase-2 backend handler accepts that
+ * Install (or upgrade) a plugin from a ZIP `File`. Sends raw
+ * `application/zip` bytes — the backend handler accepts that
  * directly while multipart support lands later.
+ *
+ * `ifExisting`:
+ *   * `"reject"` (default) — server returns 409 if a plugin with
+ *     the same id is already installed. The SPA catches it and
+ *     prompts the operator to replace.
+ *   * `"upgrade"` — operator confirmed; tear down the old runtime
+ *     and install the new ZIP in place. Per-plugin OAuth client +
+ *     tokens (in `state_oauth_*`) survive untouched.
  */
 export async function installPlugin(
     file: File,
     tokenAccessor: () => string | null,
+    ifExisting: "reject" | "upgrade" = "reject",
 ): Promise<InstallPluginResponse> {
     const buf = await file.arrayBuffer();
     const headers: Record<string, string> = {
@@ -436,7 +445,11 @@ export async function installPlugin(
     };
     const token = tokenAccessor();
     if (token) headers.authorization = `Bearer ${token}`;
-    const resp = await fetch("/api/admin/plugins/install", {
+    const url =
+        ifExisting === "upgrade"
+            ? "/api/admin/plugins/install?if_existing=upgrade"
+            : "/api/admin/plugins/install";
+    const resp = await fetch(url, {
         method: "POST",
         headers,
         body: buf,
@@ -449,11 +462,13 @@ export async function installPlugin(
         } catch {
             /* ignore */
         }
-        throw new ApiError(
-            resp.status === 401 ? "unauthorized" : "bad_request",
-            message,
-            resp.status,
-        );
+        const code: "unauthorized" | "conflict" | "bad_request" =
+            resp.status === 401
+                ? "unauthorized"
+                : resp.status === 409
+                  ? "conflict"
+                  : "bad_request";
+        throw new ApiError(code, message, resp.status);
     }
     return (await resp.json()) as InstallPluginResponse;
 }

@@ -14,6 +14,7 @@ import {
     listPlugins,
     type PluginSummary,
 } from "../api/endpoints";
+import { ApiError } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
 
@@ -172,6 +173,20 @@ function InstallCard({ onInstalled }: { onInstalled: () => Promise<void> }) {
     const [installError, setInstallError] = useState<string | null>(null);
     const [lastInstalled, setLastInstalled] = useState<string | null>(null);
 
+    const runInstall = useCallback(
+        async (
+            file: File,
+            ifExisting: "reject" | "upgrade",
+        ): Promise<void> => {
+            const r = await installPlugin(file, getToken, ifExisting);
+            const verb = ifExisting === "upgrade" ? "Upgraded" : "Installed";
+            setLastInstalled(`${verb} ${r.plugin_id} v${r.version}`);
+            if (fileRef.current) fileRef.current.value = "";
+            await onInstalled();
+        },
+        [getToken, onInstalled],
+    );
+
     const onSubmit = useCallback(
         async (e: React.FormEvent<HTMLFormElement>) => {
             e.preventDefault();
@@ -183,17 +198,47 @@ function InstallCard({ onInstalled }: { onInstalled: () => Promise<void> }) {
             setInstalling(true);
             setInstallError(null);
             try {
-                const r = await installPlugin(file, getToken);
-                setLastInstalled(`${r.plugin_id} v${r.version}`);
-                if (fileRef.current) fileRef.current.value = "";
-                await onInstalled();
-            } catch (e) {
-                setInstallError(e instanceof Error ? e.message : String(e));
+                await runInstall(file, "reject");
+            } catch (err) {
+                // 409 means a plugin with the same id is already
+                // installed. Ask the operator to confirm an upgrade,
+                // then retry with `if_existing=upgrade` so the
+                // backend tears down the old runtime and replaces it
+                // (per-plugin OAuth client + tokens survive the
+                // upgrade — they live in `state_oauth_*`, not
+                // `state_plugins`).
+                const isConflict =
+                    err instanceof ApiError && err.code === "conflict";
+                if (isConflict) {
+                    const ok = window.confirm(
+                        "A plugin with this id is already installed. " +
+                            "Replace it with the new ZIP? Your OAuth " +
+                            "connection (client + granted tokens) " +
+                            "will be preserved.",
+                    );
+                    if (!ok) {
+                        setInstallError("Install cancelled.");
+                    } else {
+                        try {
+                            await runInstall(file, "upgrade");
+                        } catch (err2) {
+                            setInstallError(
+                                err2 instanceof Error
+                                    ? err2.message
+                                    : String(err2),
+                            );
+                        }
+                    }
+                } else {
+                    setInstallError(
+                        err instanceof Error ? err.message : String(err),
+                    );
+                }
             } finally {
                 setInstalling(false);
             }
         },
-        [getToken, onInstalled],
+        [runInstall],
     );
 
     return (

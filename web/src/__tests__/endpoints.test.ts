@@ -155,5 +155,54 @@ describe("endpoints", () => {
                 installPlugin(file, () => null),
             ).rejects.toBeInstanceOf(ApiError);
         });
+
+        it("surfaces 409 as ApiError(conflict) so the SPA can show a replace-confirm", async () => {
+            fetchMock.mockResolvedValueOnce(
+                new Response(
+                    JSON.stringify({
+                        error: {
+                            code: "already_installed",
+                            message: "plugin 'foo' already installed",
+                        },
+                    }),
+                    { status: 409 },
+                ),
+            );
+            const file = fakeFile([0x50, 0x4b]);
+            const err = await installPlugin(file, () => "tok").catch(
+                (e) => e,
+            );
+            expect(err).toBeInstanceOf(ApiError);
+            expect((err as ApiError).code).toBe("conflict");
+            expect((err as ApiError).status).toBe(409);
+        });
+
+        it("appends ?if_existing=upgrade when invoked in upgrade mode", async () => {
+            fetchMock.mockResolvedValueOnce(
+                new Response(
+                    JSON.stringify({ plugin_id: "alpha", version: "0.2.0" }),
+                    { status: 200 },
+                ),
+            );
+            const file = fakeFile([0x50, 0x4b]);
+            await installPlugin(file, () => "tok", "upgrade");
+            const [url] = fetchMock.mock.calls[0];
+            expect(url).toBe(
+                "/api/admin/plugins/install?if_existing=upgrade",
+            );
+        });
+
+        it("omits the query string in the default reject mode", async () => {
+            fetchMock.mockResolvedValueOnce(
+                new Response(
+                    JSON.stringify({ plugin_id: "alpha", version: "1.0.0" }),
+                    { status: 200 },
+                ),
+            );
+            const file = fakeFile([0x50]);
+            await installPlugin(file, () => "tok");
+            const [url] = fetchMock.mock.calls[0];
+            expect(url).toBe("/api/admin/plugins/install");
+        });
     });
 });

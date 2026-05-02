@@ -15,16 +15,40 @@
 
 use crate::state::AppState;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{Json, Router};
 use axum::routing::{delete, get, post};
 use execlaw_plugin_host::PluginHostError;
 use execlaw_plugin_sdk::zip_stage::{StageError, stage_zip};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::path::PathBuf;
+
+/// `?if_existing=` query param on /install. Drives whether an
+/// already-installed plugin id is rejected (default — safer; the
+/// SPA catches the 409 and shows a replace-confirm dialog) or
+/// upgraded in place (preserves OAuth client config + tokens).
+#[derive(Debug, Default, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IfExisting {
+    /// Return 409 when a plugin with the same id already exists.
+    /// Default — keeps a stray re-upload from silently replacing
+    /// a working plugin.
+    #[default]
+    Reject,
+    /// Tear down the old runtime + state_plugins row, then install
+    /// the new ZIP. Per-plugin OAuth client + token rows survive
+    /// because they live in `state_oauth_*`, not `state_plugins`.
+    Upgrade,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct InstallQuery {
+    #[serde(default)]
+    pub if_existing: IfExisting,
+}
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct PluginSummary {
@@ -84,6 +108,7 @@ pub struct ToolSummary {
 )]
 pub async fn install_handler(
     State(state): State<AppState>,
+    Query(q): Query<InstallQuery>,
     body: Bytes,
 ) -> impl IntoResponse {
     if body.is_empty() {
@@ -112,12 +137,29 @@ pub async fn install_handler(
         "{}-{}",
         staged.manifest.plugin.id, staged.manifest.plugin.version
     ));
-    if target.exists() {
+    // If the new ZIP is the same version as the install we're
+    // about to replace, the stage path is identical to the old
+    // one — that's fine and the host's `upgrade()` notices and
+    // skips the "remove old stage dir" step. Reject only when the
+    // operator is doing a fresh install (Reject mode) since that
+    // would otherwise clobber an unrelated stage.
+    if target.exists() && matches!(q.if_existing, IfExisting::Reject) {
         return error_response(
             StatusCode::CONFLICT,
             "already_staged",
             &format!("a staged dir already exists at {}", target.display()),
         );
+    }
+    // For an Upgrade where the same-version stage already exists,
+    // tear it down so the rename below succeeds.
+    if target.exists() && matches!(q.if_existing, IfExisting::Upgrade) {
+        if let Err(e) = std::fs::remove_dir_all(&target) {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "stage_clear",
+                &format!("could not clear existing stage dir: {e}"),
+            );
+        }
     }
     if let Err(e) = std::fs::create_dir_all(target.parent().unwrap()) {
         return error_response(
@@ -143,9 +185,31 @@ pub async fn install_handler(
         let _ = std::fs::remove_dir_all(&released);
     }
 
-    // Install into the host (parses manifest, registers hooks,
-    // spawns subprocess, persists row).
-    let row = match state.plugin_host.install(&target).await {
+    // Drive install vs upgrade based on the operator's choice.
+    let result = match q.if_existing {
+        IfExisting::Reject => state.plugin_host.install(&target).await,
+        IfExisting::Upgrade => {
+            // Upgrade only makes sense if a row already exists; if
+            // not, fall through to install so an "upgrade or
+            // install" SPA flow works without two round-trips.
+            let exists = state
+                .plugin_host
+                .list_rows()
+                .ok()
+                .and_then(|rows| {
+                    rows.into_iter()
+                        .find(|r| r.plugin_id == staged.manifest.plugin.id)
+                        .map(|_| ())
+                })
+                .is_some();
+            if exists {
+                state.plugin_host.upgrade(&target).await
+            } else {
+                state.plugin_host.install(&target).await
+            }
+        }
+    };
+    let row = match result {
         Ok(r) => r,
         Err(e) => {
             // Best-effort cleanup of the staged dir on failure so we

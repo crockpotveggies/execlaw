@@ -227,3 +227,179 @@ async fn install_rejects_script_manifest_without_source_file_in_zip() {
         "install must fail when manifest source path is missing; body: {body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Upgrade flow: ?if_existing=upgrade preserves OAuth rows; default 409s.
+
+const MANIFEST_V1: &str = r#"
+[plugin]
+id = "upgrade-test"
+name = "Upgrade Test"
+version = "0.1.0"
+description = "v1"
+author = "execlaw-test"
+license = "AGPL-3.0-or-later"
+
+[[oauth_accounts]]
+name = "controller"
+provider = "google"
+scopes = ["scope-a"]
+
+[runtime]
+tier = "script"
+source = "main.rhai"
+"#;
+
+const MANIFEST_V2: &str = r#"
+[plugin]
+id = "upgrade-test"
+name = "Upgrade Test"
+version = "0.2.0"
+description = "v2"
+author = "execlaw-test"
+license = "AGPL-3.0-or-later"
+
+[[oauth_accounts]]
+name = "controller"
+provider = "google"
+scopes = ["scope-a", "scope-b"]
+
+[runtime]
+tier = "script"
+source = "main.rhai"
+"#;
+
+const TINY_SCRIPT: &str = "fn tool_call(name, args, oauth) { #{} }\n";
+
+async fn post_zip_with_query(
+    app: axum::Router,
+    bytes: Vec<u8>,
+    query: &str,
+) -> (StatusCode, serde_json::Value) {
+    let uri = if query.is_empty() {
+        "/api/admin/plugins/install".to_string()
+    } else {
+        format!("/api/admin/plugins/install?{query}")
+    };
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/zip")
+        .body(Body::from(bytes))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body_bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let value: serde_json::Value =
+        serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn install_a_second_time_without_if_existing_returns_409() {
+    let stage_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = build_app(stage_dir.path().to_path_buf());
+
+    let v1_zip = build_zip(&[
+        ("plugin.toml", MANIFEST_V1.as_bytes()),
+        ("main.rhai", TINY_SCRIPT.as_bytes()),
+    ]);
+    let (status, _) = post_zip_with_query(app.clone(), v1_zip.clone(), "").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Second install with the SAME ZIP must 409 — the safer
+    // default protects against typo replacements.
+    let (status, body) = post_zip_with_query(app, v1_zip, "").await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "default mode must reject re-install; body: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn install_with_if_existing_upgrade_replaces_old_version() {
+    use execlaw_core::oauth::{OauthClient, OauthClientStore, OauthTokenStore, OauthTokens};
+
+    let stage_dir = tempfile::tempdir().unwrap();
+    let (app, state) = build_app(stage_dir.path().to_path_buf());
+
+    // Install v0.1 normally.
+    let v1_zip = build_zip(&[
+        ("plugin.toml", MANIFEST_V1.as_bytes()),
+        ("main.rhai", TINY_SCRIPT.as_bytes()),
+    ]);
+    let (status, body) = post_zip_with_query(app.clone(), v1_zip, "").await;
+    assert_eq!(status, StatusCode::OK, "v1 install body: {body}");
+    assert_eq!(body["version"], "0.1.0");
+
+    // Operator connected the OAuth account on v0.1.
+    let now = chrono::Utc::now().timestamp();
+    OauthClientStore::new(&state.db)
+        .upsert(&OauthClient {
+            plugin_id: "upgrade-test".into(),
+            account_name: "controller".into(),
+            provider: "google".into(),
+            client_id: "cid-survives".into(),
+            client_secret: "secret-survives".into(),
+            redirect_uri: "http://localhost/cb".into(),
+            scopes_json: r#"["scope-a"]"#.into(),
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+    OauthTokenStore::new(&state.db)
+        .upsert(&OauthTokens {
+            plugin_id: "upgrade-test".into(),
+            account_name: "controller".into(),
+            access_token: "ya29.survives".into(),
+            refresh_token: Some("refresh-survives".into()),
+            token_expires_at: now + 3600,
+            scopes_granted: r#"["scope-a"]"#.into(),
+            account_email: Some("op@example.com".into()),
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+
+    // Upgrade to v0.2 via ?if_existing=upgrade.
+    let v2_zip = build_zip(&[
+        ("plugin.toml", MANIFEST_V2.as_bytes()),
+        ("main.rhai", TINY_SCRIPT.as_bytes()),
+    ]);
+    let (status, body) = post_zip_with_query(app, v2_zip, "if_existing=upgrade").await;
+    assert_eq!(status, StatusCode::OK, "upgrade body: {body}");
+    assert_eq!(body["version"], "0.2.0");
+
+    // OAuth client + token rows survived.
+    let client = OauthClientStore::new(&state.db)
+        .get("upgrade-test", "controller")
+        .unwrap()
+        .expect("oauth client must survive upgrade");
+    assert_eq!(client.client_id, "cid-survives");
+    let token = OauthTokenStore::new(&state.db)
+        .get("upgrade-test", "controller")
+        .unwrap()
+        .expect("oauth token must survive upgrade");
+    assert_eq!(token.access_token, "ya29.survives");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn if_existing_upgrade_falls_through_to_install_when_no_existing_row() {
+    // Operator's SPA flow: hit install with ?if_existing=upgrade
+    // unconditionally on the second attempt after a 409. If the
+    // operator had meanwhile uninstalled the plugin manually, the
+    // upgrade call should NOT 404 — it should install fresh.
+    let stage_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = build_app(stage_dir.path().to_path_buf());
+    let v1_zip = build_zip(&[
+        ("plugin.toml", MANIFEST_V1.as_bytes()),
+        ("main.rhai", TINY_SCRIPT.as_bytes()),
+    ]);
+    let (status, body) = post_zip_with_query(app, v1_zip, "if_existing=upgrade").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "upgrade-on-empty must fall through to install; body: {body}"
+    );
+}

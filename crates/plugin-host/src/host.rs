@@ -257,6 +257,87 @@ impl PluginHost {
         Ok(row)
     }
 
+    /// Replace an installed plugin with a newer version from
+    /// `stage_path`. Used for graceful upgrades — the operator
+    /// drops a v0.2 ZIP onto a v0.1 install and the per-plugin
+    /// OAuth client config + granted tokens (which live in
+    /// `state_oauth_clients` / `state_oauth_tokens`, NOT in
+    /// `state_plugins`) survive untouched.
+    ///
+    /// Steps:
+    ///
+    /// 1. Parse the new manifest. Reject if its `plugin_id` doesn't
+    ///    match an existing row — operators must use `install` for
+    ///    a fresh plugin and `upgrade` only for an in-place version
+    ///    bump. (Mismatched ids would silently drop the old install
+    ///    and create a new one, which is a footgun.)
+    /// 2. Tear down the old runtime: disable hooks, drop the
+    ///    subprocess / script engine, remove the staged dir.
+    /// 3. Delete the old `state_plugins` row.
+    /// 4. Run the install pipeline against the new stage_path.
+    ///
+    /// Failure semantics: if step 4's hook registration or
+    /// subprocess spawn fails, the operator is left in
+    /// "uninstalled" state (their OAuth rows still survive in the
+    /// other tables). This is acceptable — the new ZIP is broken;
+    /// the operator can either fix it and retry, re-upload the
+    /// old version, or reconnect their OAuth account if they want
+    /// to start fresh. Restoring the old runtime mid-failure adds
+    /// a lot of edge-case surface for a path that should be rare.
+    pub async fn upgrade(&self, stage_path: &Path) -> Result<PluginRow, PluginHostError> {
+        let manifest_path = stage_path.join("plugin.toml");
+        let manifest_toml = std::fs::read_to_string(&manifest_path)
+            .map_err(|e| PluginHostError::Manifest(format!("read plugin.toml: {e}")))?;
+        let manifest = PluginManifest::parse(&manifest_toml)
+            .map_err(|e| PluginHostError::Manifest(e.to_string()))?;
+        let new_id = manifest.plugin.id.clone();
+
+        let existing = self
+            .get_row(&new_id)?
+            .ok_or_else(|| PluginHostError::NotInstalled(new_id.clone()))?;
+
+        info!(
+            plugin_id = %new_id,
+            from = %existing.version,
+            to = %manifest.plugin.version,
+            "upgrading plugin",
+        );
+
+        // Tear down old runtime + DB row in the same shape as
+        // `uninstall`, except we keep the OAuth rows + we drive
+        // the new install ourselves below.
+        self.inner.registry.disable(&new_id);
+        if let Some(plugin) = self.inner.subprocesses.write().await.remove(&new_id) {
+            plugin.shutdown().await;
+        }
+        let _ = self.inner.script_plugins.write().await.remove(&new_id);
+        self.delete_row(&new_id)?;
+        // Best-effort remove the OLD staged directory. If it
+        // happens to be the SAME path as the new one (operator
+        // re-extracted in place), skip — we'd nuke the source.
+        let new_stage_canon = stage_path.canonicalize().ok();
+        let old_stage_canon = std::path::Path::new(&existing.stage_path)
+            .canonicalize()
+            .ok();
+        let same_dir = matches!((&new_stage_canon, &old_stage_canon), (Some(a), Some(b)) if a == b);
+        if !same_dir {
+            if let Err(e) = std::fs::remove_dir_all(&existing.stage_path) {
+                warn!(
+                    plugin_id = %new_id,
+                    path = %existing.stage_path,
+                    error = %e,
+                    "failed to remove old staged dir during upgrade",
+                );
+            }
+        }
+
+        // Now run the standard install pipeline against the new
+        // stage. This will register hooks + spawn runtime + insert
+        // a fresh state_plugins row. If it fails the operator is
+        // in uninstalled state (see method-level docs).
+        self.install(stage_path).await
+    }
+
     /// Uninstall: disable hooks, kill subprocess, remove DB row +
     /// staged directory. Idempotent — missing plugin returns
     /// `NotInstalled`.
@@ -1062,5 +1143,182 @@ executable = "./bin"
         // re-read.
         registry.disable("p-google");
         assert!(host.oauth_tokens_for("p-google").is_empty());
+    }
+
+    // ---- upgrade ---------------------------------------------------
+
+    /// Build a real on-disk staged plugin dir containing
+    /// `plugin.toml` + `main.rhai`. Returns the TempDir (caller
+    /// must keep it alive) plus the stage path inside it.
+    fn stage_script_plugin(
+        plugin_id: &str,
+        version: &str,
+        scope: &str,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join(format!("{plugin_id}-{version}"));
+        std::fs::create_dir_all(&stage).unwrap();
+        let manifest = format!(
+            r#"
+[plugin]
+id = "{plugin_id}"
+name = "Upgrade Test"
+version = "{version}"
+description = "test"
+author = "a"
+license = "x"
+
+[[oauth_accounts]]
+name = "controller"
+provider = "google"
+scopes = ["{scope}"]
+
+[runtime]
+tier = "script"
+source = "main.rhai"
+"#
+        );
+        std::fs::write(stage.join("plugin.toml"), manifest).unwrap();
+        // Minimal Rhai source — declare the entry point the host
+        // will compile but never call in these tests.
+        std::fs::write(
+            stage.join("main.rhai"),
+            "fn tool_call(name, args, oauth) { #{} }\n",
+        )
+        .unwrap();
+        (dir, stage)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upgrade_replaces_version_and_preserves_oauth_client_and_tokens() {
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(
+            db.clone(),
+            registry,
+            stage_root.path().to_path_buf(),
+        );
+
+        let (_v1_keep, v1_stage) = stage_script_plugin(
+            "test-google",
+            "0.1.0",
+            "https://www.googleapis.com/auth/calendar.readonly",
+        );
+        let row = host.install(&v1_stage).await.unwrap();
+        assert_eq!(row.version, "0.1.0");
+
+        // Operator connected the OAuth account on v0.1: pretend
+        // they entered a client + we cached a token.
+        let now = chrono::Utc::now().timestamp();
+        OauthClientStore::new(&db)
+            .upsert(&OauthClient {
+                plugin_id: "test-google".into(),
+                account_name: "controller".into(),
+                provider: "google".into(),
+                client_id: "client-xyz".into(),
+                client_secret: "secret-abc".into(),
+                redirect_uri: "http://localhost/cb".into(),
+                scopes_json: r#"["scope-a"]"#.into(),
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        OauthTokenStore::new(&db)
+            .upsert(&OauthTokens {
+                plugin_id: "test-google".into(),
+                account_name: "controller".into(),
+                access_token: "ya29.preserve-me".into(),
+                refresh_token: Some("refresh-preserve".into()),
+                token_expires_at: now + 3600,
+                scopes_granted: r#"["scope-a"]"#.into(),
+                account_email: Some("op@example.com".into()),
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+
+        // Upgrade to v0.2 with an expanded scope (mirrors the
+        // calendar-plugin readonly → events bump that motivated
+        // this feature).
+        let (_v2_keep, v2_stage) = stage_script_plugin(
+            "test-google",
+            "0.2.0",
+            "https://www.googleapis.com/auth/calendar.events",
+        );
+        let row = host.upgrade(&v2_stage).await.unwrap();
+        assert_eq!(row.version, "0.2.0");
+
+        // OAuth client survived intact — same id + secret + scopes.
+        let client = OauthClientStore::new(&db)
+            .get("test-google", "controller")
+            .unwrap()
+            .expect("oauth client must survive upgrade");
+        assert_eq!(client.client_id, "client-xyz");
+        assert_eq!(client.client_secret, "secret-abc");
+
+        // Token survived — operator doesn't need to re-authenticate
+        // for the basic case (scope-narrowed callers WILL fail on
+        // first use; that's surfaced separately by the provider).
+        let token = OauthTokenStore::new(&db)
+            .get("test-google", "controller")
+            .unwrap()
+            .expect("oauth token must survive upgrade");
+        assert_eq!(token.access_token, "ya29.preserve-me");
+        assert_eq!(token.refresh_token.as_deref(), Some("refresh-preserve"));
+        assert_eq!(token.account_email.as_deref(), Some("op@example.com"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upgrade_rejects_when_no_existing_install() {
+        // Operators have to use install (or `if_existing=upgrade`
+        // which falls through to install). Calling upgrade
+        // directly on a clean DB is a programming error.
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db, registry, stage_root.path().to_path_buf());
+
+        let (_keep, stage) = stage_script_plugin(
+            "ghost",
+            "0.1.0",
+            "https://www.googleapis.com/auth/x",
+        );
+        let err = host.upgrade(&stage).await.unwrap_err();
+        assert!(
+            matches!(err, PluginHostError::NotInstalled(ref id) if id == "ghost"),
+            "got: {err:?}",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upgrade_writes_new_version_string_to_state_plugins() {
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(
+            db.clone(),
+            registry,
+            stage_root.path().to_path_buf(),
+        );
+
+        let (_v1, v1_stage) = stage_script_plugin(
+            "v-test",
+            "0.1.0",
+            "https://www.googleapis.com/auth/x",
+        );
+        host.install(&v1_stage).await.unwrap();
+        let (_v2, v2_stage) = stage_script_plugin(
+            "v-test",
+            "1.4.7",
+            "https://www.googleapis.com/auth/x",
+        );
+        host.upgrade(&v2_stage).await.unwrap();
+
+        let row = host
+            .get_row("v-test")
+            .unwrap()
+            .expect("row must exist post-upgrade");
+        assert_eq!(row.version, "1.4.7");
     }
 }
