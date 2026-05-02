@@ -665,7 +665,12 @@ async fn run_real_turn(
         messages,
         tools: None,
         stream: true,
-        temperature: None,
+        // Delta #6 — explicit 0.3 (was None → vLLM default 1.0).
+        // Qwen3.5-AWQ at 1.0 over-explores word choice on
+        // single-shot generations and the streaming path here is
+        // the most user-visible. selfhosted-claw set this via
+        // OPENAI_TEMPERATURE in env; we centralise it here.
+        temperature: Some(0.3),
         max_tokens: None,
         chat_template_kwargs: Some(serde_json::json!({
             "enable_thinking": reasoning_enabled,
@@ -1061,7 +1066,13 @@ pub(crate) async fn run_runner_turn(
         tool_catalog: tool_decls,
         inference_url,
         model: state.config.model_id.clone(),
-        temperature: None,
+        // Delta #6 — explicit 0.3 (was None → vLLM default 1.0).
+        // Critical on the runner path because it carries multi-
+        // round tool-calling: at temp 1.0 Qwen3.5-AWQ frequently
+        // hallucinated tool argument values and mis-named tools,
+        // which then chewed through max_tool_rounds. 0.3 trades
+        // a touch of diversity for argument correctness.
+        temperature: Some(0.3),
         max_tokens: None,
         reasoning_enabled,
         // Send the OPEN delimiter so the runner can reconstruct
@@ -1356,7 +1367,9 @@ async fn run_tool_capable_turn(
             &routing_prose,
             &turn_context,
         ),
-        temperature: None,
+        // Delta #6 — explicit 0.3 (was None → vLLM default 1.0).
+        // Same rationale as the runner-tier path above.
+        temperature: Some(0.3),
         max_tokens: None,
         max_tool_rounds: state.config.max_tool_rounds,
         tools: tool_decls,
@@ -2448,7 +2461,8 @@ async fn run_incognito_send(
         messages,
         tools: None,
         stream: true,
-        temperature: None,
+        // Delta #6 — same 0.3 default as the persisted-chat path.
+        temperature: Some(0.3),
         max_tokens: None,
         chat_template_kwargs: Some(serde_json::json!({
             "enable_thinking": reasoning_enabled,
