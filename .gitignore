@@ -24,6 +24,10 @@ target
 node_modules/
 web/dist/
 
+# Built plugin install ZIPs (generated; rebuild with the
+# zip-plugin commands in CONTRIBUTING).
+/dist/
+
 # Claude Code local session state — user-specific, never committed.
 .claude/
 
