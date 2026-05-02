@@ -394,6 +394,7 @@ pub async fn send_message(
                 &cid,
                 &req.text,
                 req.sender_principal_id.clone(),
+                sender_trust,
                 spotlight_content,
                 cancel_flag.clone(),
             )
@@ -557,6 +558,7 @@ async fn run_real_turn(
     cid: &ConversationId,
     user_text: &str,
     sender_principal_id: Option<String>,
+    sender_trust: TrustLevel,
     spotlight_content: bool,
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(i64, String, i64), String> {
@@ -577,7 +579,7 @@ async fn run_real_turn(
             text: user_text.to_owned(),
             sender_principal_id: sender_principal_id.clone(),
         },
-        sender_principal_id,
+        sender_principal_id.clone(),
     )
     .map_err(|e| format!("encode user_msg: {e}"))?;
     log.append(&user_event)
@@ -602,11 +604,20 @@ async fn run_real_turn(
     // tool-capable path so the streaming-only run_real_turn picks
     // up operator personality edits without an extra round trip.
     // No routing prose: this path doesn't ship a tool catalogue.
+    // Turn context still helps — even a no-tool answer benefits
+    // from "what time is it" awareness.
+    let turn_context = build_turn_context_prose(
+        chrono::Utc::now(),
+        cid.as_str(),
+        sender_principal_id.as_deref(),
+        sender_trust.as_str(),
+    );
     let composed_system = assemble_system_prompt(
         &state.db,
         Some(cid.as_str()),
         &state.config.system_prompt,
         "",
+        &turn_context,
     );
     let mut messages: Vec<ChatMessage> = vec![ChatMessage::system(&composed_system)];
     for ev in &history {
@@ -916,11 +927,21 @@ pub(crate) async fn run_runner_turn(
         .map(|t| t.tool_name.clone())
         .collect();
     let routing_prose = build_tool_routing_prose(&builtin_names, &plugin_tool_names);
+    // Per-turn context — wall-clock + identity facts the model
+    // would otherwise have to ask a tool for. Always emitted; cost
+    // is negligible vs. the LLM round-trip (delta #3).
+    let turn_context = build_turn_context_prose(
+        chrono::Utc::now(),
+        cid.as_str(),
+        sender_principal_id.as_deref(),
+        caller_trust.as_str(),
+    );
     let composed_system = assemble_system_prompt(
         &state.db,
         Some(cid.as_str()),
         &state.config.system_prompt,
         &routing_prose,
+        &turn_context,
     );
     let mut hist_messages: Vec<ChatMessage> = Vec::new();
     for ev in &history {
@@ -1320,6 +1341,12 @@ async fn run_tool_capable_turn(
         .map(|t| t.tool_name.clone())
         .collect();
     let routing_prose = build_tool_routing_prose(&routing_builtins, &routing_plugins);
+    let turn_context = build_turn_context_prose(
+        chrono::Utc::now(),
+        cid.as_str(),
+        sender_principal_id.as_deref(),
+        caller_trust.as_str(),
+    );
     let cfg = TurnConfig {
         model: ModelId(state.config.model_id.clone()),
         system_prompt: assemble_system_prompt(
@@ -1327,6 +1354,7 @@ async fn run_tool_capable_turn(
             Some(cid.as_str()),
             &state.config.system_prompt,
             &routing_prose,
+            &turn_context,
         ),
         temperature: None,
         max_tokens: None,
@@ -1768,6 +1796,7 @@ pub async fn dispatch_routine_turn(
                 &cid,
                 prompt,
                 sender.clone(),
+                caller_trust,
                 false,
                 cancel_flag,
             )
@@ -1796,7 +1825,44 @@ pub async fn dispatch_routine_turn(
     mapped
 }
 
-/// Phase 11.B — assemble the turn's system prompt. Three halves:
+/// Build the per-turn context block — runtime facts the model
+/// needs to answer recency- and identity-sensitive questions
+/// without round-tripping a tool. Selfhosted-claw baked these
+/// into every turn; pre-fix execlaw shipped none of them.
+///
+/// Includes:
+///   * current UTC time (RFC 3339) — answers "what time is it",
+///     drives "today / this week" comparisons, lets the model
+///     pick reasonable default windows for `calendar.list_events`
+///     etc;
+///   * conversation id — handy when the operator asks the agent
+///     to "use this thread's id" in a tool call;
+///   * caller's principal id — usually `controller`, sometimes a
+///     plugin-resolved contact id;
+///   * caller's trust class — drives the model's posture for
+///     approval-gated tools and confidential output.
+///
+/// Pure function — caller assembles the inputs.
+pub(crate) fn build_turn_context_prose(
+    now_utc: chrono::DateTime<chrono::Utc>,
+    conversation_id: &str,
+    sender_principal_id: Option<&str>,
+    sender_trust: &str,
+) -> String {
+    let mut out = String::from("## Turn context\n\n");
+    out.push_str(&format!(
+        "* Current UTC time: {}\n",
+        now_utc.format("%Y-%m-%dT%H:%M:%SZ"),
+    ));
+    out.push_str(&format!("* Conversation id: `{conversation_id}`\n"));
+    if let Some(p) = sender_principal_id {
+        out.push_str(&format!("* From principal: `{p}`\n"));
+    }
+    out.push_str(&format!("* Trust class: `{sender_trust}`\n"));
+    out
+}
+
+/// Phase 11.B — assemble the turn's system prompt. Four halves:
 ///
 ///   1. **Operator-editable personality** (§5.5). Pulled from
 ///      `config_personality` via `compose_system_prompt`. Includes
@@ -1825,6 +1891,7 @@ pub(crate) fn assemble_system_prompt(
     conversation_id: Option<&str>,
     static_base: &str,
     routing_prose: &str,
+    turn_context: &str,
 ) -> String {
     let store = execlaw_core::personality::PersonalityStore::new(db);
     let personality_chunk =
@@ -1833,6 +1900,7 @@ pub(crate) fn assemble_system_prompt(
     let p = personality_chunk.trim();
     let b = static_base.trim();
     let r = routing_prose.trim();
+    let c = turn_context.trim();
     let mut out = String::new();
     let mut sep = |s: &mut String| {
         if !s.is_empty() {
@@ -1849,6 +1917,13 @@ pub(crate) fn assemble_system_prompt(
     if !r.is_empty() {
         sep(&mut out);
         out.push_str(r);
+    }
+    // Turn context is LAST so the most-recent runtime facts are
+    // closest to the user message in the request order — recency
+    // bias generally helps the model pick them up.
+    if !c.is_empty() {
+        sep(&mut out);
+        out.push_str(c);
     }
     out
 }
@@ -3080,6 +3155,7 @@ mod tests {
             None,
             "STATIC BASE GOES HERE",
             "ROUTING PROSE GOES HERE",
+            "",
         );
         let base_at = prompt.find("STATIC BASE GOES HERE").unwrap();
         let routing_at = prompt.find("ROUTING PROSE GOES HERE").unwrap();
@@ -3087,6 +3163,60 @@ mod tests {
             base_at < routing_at,
             "routing block must follow the static base: {prompt}",
         );
+    }
+
+    #[test]
+    fn assemble_system_prompt_appends_turn_context_block_last() {
+        // Turn context goes LAST so the most-recent runtime facts
+        // (time, sender, trust) sit closest to the user message.
+        let state = test_app_state();
+        let prompt = super::assemble_system_prompt(
+            &state.db,
+            None,
+            "BASE",
+            "ROUTING",
+            "TURN_CONTEXT_HERE",
+        );
+        let routing_at = prompt.find("ROUTING").unwrap();
+        let ctx_at = prompt.find("TURN_CONTEXT_HERE").unwrap();
+        assert!(
+            routing_at < ctx_at,
+            "turn context must follow routing: {prompt}",
+        );
+    }
+
+    #[test]
+    fn build_turn_context_prose_includes_time_conv_principal_trust() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-02T10:23:45Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let prose = super::build_turn_context_prose(
+            now,
+            "conv-abc",
+            Some("controller"),
+            "Controller",
+        );
+        assert!(prose.contains("2026-05-02T10:23:45Z"));
+        assert!(prose.contains("conv-abc"));
+        assert!(prose.contains("controller"));
+        assert!(prose.contains("Controller"));
+    }
+
+    #[test]
+    fn build_turn_context_prose_omits_principal_line_when_unknown() {
+        // Routine-fired turns may not have a principal id resolved
+        // yet; the line just disappears rather than emitting "From
+        // principal: `none`" which the model could misread.
+        let now = chrono::Utc::now();
+        let prose = super::build_turn_context_prose(
+            now,
+            "conv-x",
+            None,
+            "Controller",
+        );
+        assert!(!prose.contains("From principal"));
+        assert!(prose.contains("conv-x"));
+        assert!(prose.contains("Controller"));
     }
 
     #[test]
@@ -3099,6 +3229,7 @@ mod tests {
             &state.db,
             None, // no per-conversation override
             "You are a helpful agent. Refuse unsafe requests.",
+            "",
             "",
         );
         assert!(
@@ -3169,7 +3300,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let prompt = super::assemble_system_prompt(&state.db, None, "STATIC ONLY", "");
+        let prompt = super::assemble_system_prompt(&state.db, None, "STATIC ONLY", "", "");
         assert_eq!(prompt, "STATIC ONLY");
     }
 
@@ -3208,8 +3339,9 @@ mod tests {
             Some("conv-pirate"),
             "BASE",
             "",
+            "",
         );
-        let plain = super::assemble_system_prompt(&state.db, None, "BASE", "");
+        let plain = super::assemble_system_prompt(&state.db, None, "BASE", "", "");
         assert!(pirate.contains("# Tone\nPirate"));
         assert!(!plain.contains("Pirate"));
     }
