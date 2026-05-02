@@ -52,6 +52,27 @@ export interface ChatState {
      * server's first WS phase event lands.
      */
     sendingThreads: Record<string, true>;
+    /**
+     * 2026-05-02 — per-conversation "agent is currently doing X" pulse
+     * driven by `agent_tool_activity` WS events. The chat shell
+     * renders this as a transient pill ("Searching the web for
+     * 'paris weather…'"); cleared when the matching `finished`
+     * event lands or when a new tool's `started` event arrives.
+     * Cleared on `chat_message_outbound` too so the loader doesn't
+     * outlive the reply.
+     */
+    toolActivity: Record<string, ToolActivity>;
+}
+
+/// Live status of the agent's most recent tool call on a
+/// conversation. Drives the loader pill above the composer.
+export interface ToolActivity {
+    /// Raw tool name (e.g. `web_search`, `calendar.list_events`).
+    /// Drives icon selection on the SPA side.
+    tool_name: string;
+    /// Operator-facing label generated server-side by
+    /// `humanise_tool_call` (e.g. `Searching the web for "paris weather"`).
+    label: string;
 }
 
 type Listener = () => void;
@@ -65,6 +86,7 @@ let state: ChatState = {
     pendingApprovals: {},
     alertFiringCount: 0,
     sendingThreads: {},
+    toolActivity: {},
 };
 
 function emit() {
@@ -326,6 +348,32 @@ export function setAlertFiringCount(count: number) {
     );
 }
 
+/// Set the agent's current activity for a conversation (e.g.
+/// "Searching the web for 'paris weather'"). The chat shell shows
+/// it as a transient loader pill until the next call clears or
+/// replaces it.
+export function setToolActivity(
+    conversationId: string,
+    activity: ToolActivity,
+) {
+    setState((prev) => ({
+        ...prev,
+        toolActivity: { ...prev.toolActivity, [conversationId]: activity },
+    }));
+}
+
+/// Drop the per-conversation activity entry. Called when the
+/// matching `finished` WS event lands or when the agent reply
+/// arrives.
+export function clearToolActivity(conversationId: string) {
+    setState((prev) => {
+        if (!(conversationId in prev.toolActivity)) return prev;
+        const { [conversationId]: _drop, ...rest } = prev.toolActivity;
+        void _drop;
+        return { ...prev, toolActivity: rest };
+    });
+}
+
 /** Test seam: reset the entire store. Production code never calls this. */
 export function __resetChatStore() {
     state = {
@@ -336,6 +384,7 @@ export function __resetChatStore() {
         pendingApprovals: {},
         alertFiringCount: 0,
         sendingThreads: {},
+        toolActivity: {},
     };
     emit();
 }

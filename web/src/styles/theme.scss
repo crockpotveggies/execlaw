@@ -995,6 +995,58 @@ body {
     background-color: $bg-deep;
 }
 
+// 2026-05-02 — loader pill that surfaces the agent's current
+// tool activity ("Searching the web for X…") above the composer
+// chip. Driven by `agent_tool_activity` WS events from the chat
+// handler. Centered to the same max-width as the composer +
+// message column so it visually anchors to the chat shell.
+.execlaw-tool-activity-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-inline: auto;
+    margin-bottom: 0.5rem;
+    padding: 0.4rem 0.75rem;
+    max-width: $thread-max-width;
+    background-color: $bg-elev;
+    border-radius: $radius-pill;
+    color: $text-muted;
+    font-size: 0.85rem;
+    line-height: 1.2;
+    width: fit-content;
+    // Show in the column-flex of `.execlaw-composer` so the pill
+    // sits cleanly above RunningJobsBadge / ApprovalCard / Composer.
+    display: flex;
+    justify-content: flex-start;
+}
+
+.execlaw-tool-activity-pill__spinner {
+    // Reuse the thread-row spinner geometry but render in the
+    // accent colour so the pill reads as "live" not "loading".
+    display: inline-block;
+    width: 0.85rem;
+    height: 0.85rem;
+    border: 2px solid currentColor;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: execlaw-tool-activity-spin 0.8s linear infinite;
+    flex-shrink: 0;
+    opacity: 0.65;
+}
+
+.execlaw-tool-activity-pill__label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 60ch;
+}
+
+@keyframes execlaw-tool-activity-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
 .execlaw-composer__form {
     // Center the composer chip at the same max-width as the
     // message column so the input lines up vertically with the

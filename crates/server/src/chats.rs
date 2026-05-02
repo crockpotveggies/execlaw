@@ -1201,10 +1201,37 @@ pub(crate) async fn run_runner_turn(
                 // tool routing + the per-tool config_tool_access gate
                 // apply identically across runner and in-process paths.
                 use execlaw_runner_local::turn::ToolDispatch;
+
+                // Surface a "what's the agent doing right now"
+                // pulse to the UI BEFORE we block on dispatch.
+                // Lets the SPA render "Searching the web for X…"
+                // with a spinner instead of leaving the operator
+                // staring at "thinking" for the full tool round
+                // trip.
+                let label = humanise_tool_call(&tool_name, &args);
+                state.events.publish(UiEvent::AgentToolActivity {
+                    conversation_id: cid.as_str().to_owned(),
+                    tool_name: tool_name.clone(),
+                    label,
+                    status: "started".into(),
+                });
+
                 let outcome = match dispatch.call(&tool_name, &args).await {
                     Ok(value) => execlaw_runner_protocol::ToolOutcome::Ok { value },
                     Err(message) => execlaw_runner_protocol::ToolOutcome::Err { message },
                 };
+                // Emit the matching "finished" pulse so the SPA's
+                // loader can clear (or replace with the next tool's
+                // started-pulse). Status mirrors success/failure for
+                // future UX (today the SPA just dismisses on either).
+                let ok = matches!(outcome, execlaw_runner_protocol::ToolOutcome::Ok { .. });
+                state.events.publish(UiEvent::AgentToolActivity {
+                    conversation_id: cid.as_str().to_owned(),
+                    tool_name: tool_name.clone(),
+                    label: humanise_tool_call(&tool_name, &args),
+                    status: if ok { "finished".into() } else { "failed".into() },
+                });
+
                 let result = execlaw_runner_protocol::ToolCallResult {
                     turn_id: turn_id.clone(),
                     call_id,
@@ -1943,6 +1970,104 @@ pub(crate) fn build_turn_context_prose(
 /// Operators override "agent voice"; the static base owns
 /// non-negotiable safety rules; the routing block teaches the
 /// model when to reach for which family.
+/// Turn `(tool_name, args)` into a one-liner the operator can
+/// read while the agent works. Mirrors the "Searching for X…" UX
+/// selfhosted-claw used to surface in its activity pill, but
+/// generated server-side so the SPA stays a dumb subscriber.
+///
+/// The mapping is a hand-tuned table for the families execlaw
+/// ships today; tools without a match get a generic fallback so a
+/// freshly-installed plugin's tool still surfaces something
+/// readable instead of a raw symbol name.
+///
+/// Args are inspected with `serde_json::Value::get` — every lookup
+/// returns `Option`, so a missing or wrongly-shaped arg never
+/// panics; we just fall back to the no-arg form of the verb.
+pub(crate) fn humanise_tool_call(tool_name: &str, args: &serde_json::Value) -> String {
+    let s = |key: &str| args.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+    let truncate = |opt: Option<String>, max: usize| -> Option<String> {
+        opt.map(|v| {
+            if v.chars().count() > max {
+                let mut t = v.chars().take(max).collect::<String>();
+                t.push('…');
+                t
+            } else {
+                v
+            }
+        })
+    };
+    match tool_name {
+        "web_search" => match truncate(s("query"), 60) {
+            Some(q) => format!("Searching the web for “{q}”"),
+            None => "Searching the web".into(),
+        },
+        "web_fetch" => match truncate(s("url"), 80) {
+            Some(u) => format!("Reading {u}"),
+            None => "Fetching a page".into(),
+        },
+        "read_memory" => match s("key") {
+            Some(k) => format!("Looking up note ‘{k}’"),
+            None => "Looking through saved notes".into(),
+        },
+        "list_memory" => "Listing saved notes".into(),
+        "write_memory" => match s("key") {
+            Some(k) => format!("Saving note ‘{k}’"),
+            None => "Saving a note".into(),
+        },
+        "read_chat_history" => "Reviewing the conversation".into(),
+        "list_chats" => "Listing your chats".into(),
+        "get_thread" => "Inspecting a chat thread".into(),
+        "set_thread_name" => "Renaming this thread".into(),
+        "notify_controller" => "Pinging you on your priority channel".into(),
+        "delegate_task" => "Spinning up a sub-agent".into(),
+        "research_start" => match truncate(s("query"), 60) {
+            Some(q) => format!("Kicking off research on “{q}”"),
+            None => "Starting a research job".into(),
+        },
+        "research_status" => "Checking research status".into(),
+        "research_list" => "Listing research jobs".into(),
+        "research_get_report" => "Reading a research report".into(),
+        "routine_create" => match s("name") {
+            Some(n) => format!("Creating routine ‘{n}’"),
+            None => "Creating a routine".into(),
+        },
+        "routine_list" => "Listing routines".into(),
+        "routine_get" | "routine_pause" | "routine_resume" | "routine_update" | "routine_delete" => {
+            // routine_<verb> — fold them into one phrasing.
+            let verb = tool_name.trim_start_matches("routine_");
+            let pretty = match verb {
+                "get" => "checking",
+                "pause" => "pausing",
+                "resume" => "resuming",
+                "update" => "updating",
+                "delete" => "deleting",
+                _ => verb,
+            };
+            format!("{} a routine", pretty.chars().next().map(|c| c.to_uppercase().collect::<String>() + &pretty[c.len_utf8()..]).unwrap_or_else(|| pretty.into()))
+        }
+        // Plugin-namespaced tools (`google.calendar.list_events`
+        // etc) get a "<verb> via <namespace>" rendering. Operators
+        // have plugin descriptions in the catalogue; the loader
+        // just needs to read like English.
+        n if n.contains('.') => {
+            let parts: Vec<&str> = n.splitn(2, '.').collect();
+            let ns = parts[0];
+            let verb = parts.get(1).copied().unwrap_or("call").replace('_', " ");
+            format!("{verb} via {ns}")
+        }
+        // Last-resort fallback. `read_chat_history` style
+        // snake_case becomes "Read chat history".
+        _ => {
+            let pretty = tool_name.replace('_', " ");
+            let mut chars = pretty.chars();
+            match chars.next() {
+                Some(c) => c.to_uppercase().chain(chars).collect(),
+                None => "Working".into(),
+            }
+        }
+    }
+}
+
 pub(crate) fn assemble_system_prompt(
     db: &execlaw_core::Database,
     conversation_id: Option<&str>,
@@ -3153,6 +3278,91 @@ mod tests {
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0]["kind"].as_str().unwrap(), "user_msg");
         assert_eq!(msgs[1]["kind"].as_str().unwrap(), "model_turn");
+    }
+
+    #[test]
+    fn humanise_tool_call_renders_friendly_labels_for_known_tools() {
+        // The chat shell shows these strings to the operator — the
+        // labels here are part of the user-facing UX surface, not
+        // just internal log lines. Pin a representative sample.
+        assert_eq!(
+            super::humanise_tool_call(
+                "web_search",
+                &serde_json::json!({"query": "paris weather forecast today"}),
+            ),
+            "Searching the web for “paris weather forecast today”",
+        );
+        assert_eq!(
+            super::humanise_tool_call(
+                "web_fetch",
+                &serde_json::json!({"url": "https://example.com/article"}),
+            ),
+            "Reading https://example.com/article",
+        );
+        assert_eq!(
+            super::humanise_tool_call("list_memory", &serde_json::json!({})),
+            "Listing saved notes",
+        );
+        assert_eq!(
+            super::humanise_tool_call(
+                "routine_create",
+                &serde_json::json!({"name": "morning brief"}),
+            ),
+            "Creating routine ‘morning brief’",
+        );
+    }
+
+    #[test]
+    fn humanise_tool_call_truncates_long_query_strings() {
+        // 200-char query becomes "first 60 chars…" so the loader
+        // pill stays one line.
+        let long: String = "a".repeat(200);
+        let label = super::humanise_tool_call(
+            "web_search",
+            &serde_json::json!({"query": long}),
+        );
+        let inside = label
+            .trim_start_matches("Searching the web for “")
+            .trim_end_matches("”");
+        assert!(
+            inside.chars().count() <= 61,
+            "expected ≤61 chars (60 + ellipsis), got {}",
+            inside.chars().count(),
+        );
+        assert!(inside.ends_with('…'));
+    }
+
+    #[test]
+    fn humanise_tool_call_falls_back_to_titlecase_for_unknown_tool() {
+        // A freshly-installed plugin's tool with no humaniser entry
+        // still surfaces something readable.
+        assert_eq!(
+            super::humanise_tool_call("frobnicate_widget", &serde_json::json!({})),
+            "Frobnicate widget",
+        );
+    }
+
+    #[test]
+    fn humanise_tool_call_renders_plugin_namespaced_tools() {
+        // `calendar.list_events` → "list events via calendar".
+        assert_eq!(
+            super::humanise_tool_call(
+                "calendar.list_events",
+                &serde_json::json!({"calendar_id": "primary"}),
+            ),
+            "list events via calendar",
+        );
+    }
+
+    #[test]
+    fn humanise_tool_call_no_panic_on_missing_args() {
+        // Missing `query` → fall back to no-arg form. Pre-fix a
+        // wrongly-shaped args payload would have crashed the
+        // dispatch loop.
+        assert_eq!(
+            super::humanise_tool_call("web_search", &serde_json::json!({})),
+            "Searching the web",
+        );
     }
 
     #[test]

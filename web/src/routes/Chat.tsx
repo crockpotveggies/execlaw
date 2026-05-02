@@ -38,6 +38,7 @@ import { ErrorBanner } from "../components/ErrorBanner";
 import { ApprovalCard } from "../chat/ApprovalCard";
 import { Composer } from "../chat/Composer";
 import { RunningJobsBadge } from "../chat/RunningJobsBadge";
+import { ToolActivityPill } from "../chat/ToolActivityPill";
 import { MessageStream } from "../chat/MessageStream";
 import { Sidebar } from "../chat/Sidebar";
 import { useVoiceReadiness } from "../chat/useVoiceReadiness";
@@ -51,6 +52,7 @@ import {
     clearPendingApproval,
     clearSendingThread,
     clearStreamingBuffer,
+    clearToolActivity,
     getChatState,
     markSendingThread,
     markUnread,
@@ -60,6 +62,7 @@ import {
     setPendingApprovals,
     setThreadProcessing,
     setThreads,
+    setToolActivity,
     useChatState,
 } from "../chat/store";
 
@@ -466,6 +469,9 @@ export function Chat() {
             case "chat_message_inbound":
                 if (cid) {
                     clearStreamingBuffer(cid);
+                    // Reply / inbound message lands → loader is
+                    // unconditionally over for this turn.
+                    clearToolActivity(cid);
                     // Incognito: nothing on the server to refetch.
                     // Skipping prevents the GET-then-empty-set-
                     // messages race that would clobber the local
@@ -525,6 +531,38 @@ export function Chat() {
                     // remainder so the stop button doesn't get stuck.
                     if (!processing) {
                         clearSendingThread(cid);
+                        // Tool activity is meaningless once the
+                        // agent has handed back to idle — clear the
+                        // pill in case the matching `finished` pulse
+                        // got dropped or arrived out-of-order.
+                        clearToolActivity(cid);
+                    }
+                }
+                break;
+            case "agent_tool_activity":
+                // Loader pulse — generated server-side when the
+                // runner emits a tool-call request and again when
+                // the result is back. Drives the "Searching the
+                // web for X…" pill above the composer so the
+                // operator knows what's happening during multi-
+                // round flows.
+                if (
+                    cid &&
+                    typeof ev.tool_name === "string" &&
+                    typeof ev.label === "string" &&
+                    typeof ev.status === "string"
+                ) {
+                    if (ev.status === "started") {
+                        setToolActivity(cid, {
+                            tool_name: ev.tool_name,
+                            label: ev.label,
+                        });
+                    } else {
+                        // "finished" or "failed" — drop the entry
+                        // so the loader clears unless the next
+                        // tool's started-pulse beats the agent's
+                        // final reply.
+                        clearToolActivity(cid);
                     }
                 }
                 break;
@@ -1045,6 +1083,7 @@ function ActiveThreadPane({
             <MessageStream conversationId={conversationId} />
 
             <div className="execlaw-composer" data-flip-id="composer-shell">
+                <ToolActivityPill conversationId={conversationId} />
                 <RunningJobsBadge conversationId={conversationId} />
                 <ApprovalCard
                     approval={approval}
