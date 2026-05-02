@@ -85,7 +85,10 @@ fn load_script_against_mock(mock_url: &str) -> String {
 }
 
 fn build_plugin(mock_url: &str) -> ScriptPlugin {
-    let factory = ScriptEngine::new();
+    // Test mocks are on 127.0.0.1, so we have to bypass the SSRF
+    // guard for this test only — production constructs via
+    // ScriptEngine::new() which keeps loopback locked out.
+    let factory = ScriptEngine::with_loopback_allowed_for_tests();
     let source = load_script_against_mock(mock_url);
     ScriptPlugin::from_source("google-contacts", &source, &factory)
         .expect("real google-contacts/main.rhai must parse cleanly")

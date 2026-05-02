@@ -91,7 +91,12 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
         inference: Arc::new(
             execlaw_server::inference_resolver::InferenceResolver::new(None),
         ),
-        plugin_host: PluginHost::new(db.clone(), HookRegistry::new(), stage_root),
+        plugin_host: PluginHost::with_script_engine(
+            db.clone(),
+            HookRegistry::new(),
+            stage_root,
+            execlaw_script::ScriptEngine::with_loopback_allowed_for_tests(),
+        ),
         webauthn: None,
         mcp_host: execlaw_server::mcp_host::McpHost::new(db),
         backend_supervisor: None,

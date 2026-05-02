@@ -25,17 +25,21 @@
 use crate::cache::{HttpCache, cache_key};
 use rhai::{Dynamic, Engine, EvalAltResult, ImmutableString, Map};
 use sha2::{Digest, Sha256};
+use std::net::IpAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Register every primitive against `engine`, capturing
 /// `plugin_id` for log lines + the shared HTTP agent + a
-/// per-plugin cache.
+/// per-plugin cache + the SSRF allow_loopback flag (false in
+/// production; true only for tests against 127.0.0.1 mocks).
 pub(crate) fn register(
     engine: &mut Engine,
     plugin_id: &str,
     http_agent: ureq::Agent,
     cache: Arc<HttpCache>,
+    allow_loopback: bool,
 ) {
     let pid_for_logs = plugin_id.to_owned();
 
@@ -49,7 +53,7 @@ pub(crate) fn register(
             "http_get",
             move |url: ImmutableString, query: Map, bearer: ImmutableString|
                   -> Result<Dynamic, Box<EvalAltResult>> {
-                http_get_impl(&agent, &pid, &url, &query, &bearer)
+                http_get_impl(&agent, &pid, &url, &query, &bearer, allow_loopback)
             },
         );
     }
@@ -62,7 +66,7 @@ pub(crate) fn register(
             "http_post",
             move |url: ImmutableString, body: Dynamic, bearer: ImmutableString|
                   -> Result<Dynamic, Box<EvalAltResult>> {
-                http_post_impl(&agent, &pid, &url, body, &bearer)
+                http_post_impl(&agent, &pid, &url, body, &bearer, allow_loopback)
             },
         );
     }
@@ -76,7 +80,7 @@ pub(crate) fn register(
             "http_get_cached",
             move |url: ImmutableString, query: Map, bearer: ImmutableString, ttl_secs: i64|
                   -> Result<Dynamic, Box<EvalAltResult>> {
-                http_get_cached_impl(&agent, &cache, &pid, &url, &query, &bearer, ttl_secs)
+                http_get_cached_impl(&agent, &cache, &pid, &url, &query, &bearer, ttl_secs, allow_loopback)
             },
         );
     }
@@ -159,7 +163,9 @@ fn http_get_impl(
     url: &str,
     query: &Map,
     bearer: &str,
+    allow_loopback: bool,
 ) -> Result<Dynamic, Box<EvalAltResult>> {
+    validate_url(plugin_id, "http_get", url, allow_loopback)?;
     let mut req = agent.get(url);
     for (k, v) in map_to_query_iter(query) {
         req = req.query(&k, &v);
@@ -177,7 +183,9 @@ fn http_post_impl(
     url: &str,
     body: Dynamic,
     bearer: &str,
+    allow_loopback: bool,
 ) -> Result<Dynamic, Box<EvalAltResult>> {
+    validate_url(plugin_id, "http_post", url, allow_loopback)?;
     let body_json = rhai_to_json(body)
         .map_err(|e| EvalAltResult::ErrorRuntime(e.into(), rhai::Position::NONE))?;
     let mut req = agent.post(url);
@@ -190,6 +198,125 @@ fn http_post_impl(
     decode_response(plugin_id, url, resp)
 }
 
+/// SSRF guard for the script-tier HTTP primitives. Mirrors the
+/// validation in `crates/server/src/tool_apis_http.rs::validate_url`
+/// — a script must not have MORE permissive HTTP than the native
+/// `web_fetch` tool. Rejected:
+///
+///   * non-http(s) schemes (file://, gopher://, …)
+///   * loopback (127/8, ::1, "localhost")
+///   * private IPv4 ranges (10/8, 172.16/12, 192.168/16)
+///   * link-local (169.254/16, fe80::/10) — incl. cloud metadata
+///   * carrier-grade NAT (100.64/10)
+///   * ULA (fc00::/7), multicast, broadcast, unspecified, documentation
+///   * weird encodings: a hostname that parses as a private IP
+///
+/// Tests should opt out via `with_http_agent` + a different
+/// loopback-allowed primitives module if they need to point at
+/// 127.0.0.1 mocks. The existing test pattern uses an in-process
+/// `127.0.0.1:0` listener — those tests construct the
+/// `ScriptEngine` test-side (see `engine.rs::with_http_agent`)
+/// but rely on the loopback-allowance flag. Keep that in sync.
+fn validate_url(
+    plugin_id: &str,
+    op: &str,
+    url_str: &str,
+    allow_loopback: bool,
+) -> Result<(), Box<EvalAltResult>> {
+    let url = url::Url::parse(url_str).map_err(|e| {
+        EvalAltResult::ErrorRuntime(
+            format!("{op} [{plugin_id}] invalid URL '{url_str}': {e}").into(),
+            rhai::Position::NONE,
+        )
+    })?;
+    match url.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(EvalAltResult::ErrorRuntime(
+                format!("{op} [{plugin_id}] scheme '{other}' not allowed; only http(s)").into(),
+                rhai::Position::NONE,
+            )
+            .into());
+        }
+    }
+    let host = url.host().ok_or_else(|| {
+        Box::new(EvalAltResult::ErrorRuntime(
+            format!("{op} [{plugin_id}] URL has no host: {url_str}").into(),
+            rhai::Position::NONE,
+        ))
+    })?;
+    use url::Host;
+    let bad = |reason: &str| -> Box<EvalAltResult> {
+        EvalAltResult::ErrorRuntime(
+            format!("{op} [{plugin_id}] {reason}: {url_str}").into(),
+            rhai::Position::NONE,
+        )
+        .into()
+    };
+    match host {
+        Host::Domain(d) => {
+            let lower = d.to_ascii_lowercase();
+            if !allow_loopback
+                && (lower == "localhost" || lower.ends_with(".localhost"))
+            {
+                return Err(bad("loopback hostname not allowed"));
+            }
+            // Defense-in-depth: a hostname that's actually a
+            // dotted-quad in unusual encoding ("0177.0.0.1" etc.)
+            // gets a final IpAddr parse attempt.
+            if let Ok(ip) = IpAddr::from_str(d)
+                && !allow_loopback
+                && is_private_or_local_ip(&ip)
+            {
+                return Err(bad("private/loopback/link-local IP not allowed"));
+            }
+        }
+        Host::Ipv4(v4) => {
+            let ip = IpAddr::V4(v4);
+            if !allow_loopback && is_private_or_local_ip(&ip) {
+                return Err(bad("private/loopback/link-local IP not allowed"));
+            }
+        }
+        Host::Ipv6(v6) => {
+            let ip = IpAddr::V6(v6);
+            if !allow_loopback && is_private_or_local_ip(&ip) {
+                return Err(bad("private/loopback/link-local IP not allowed"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Mirror of `tool_apis_http::is_private_or_local_ip`. Stays in
+/// sync by hand — duplicated rather than depended-on because
+/// extracting to a shared crate would create a server → script
+/// dep going the wrong direction, and the function is small +
+/// stable.
+fn is_private_or_local_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.octets()[0] & 0xfe) == 0xfc
+                || (v6.octets()[0] == 0xfe && (v6.octets()[1] & 0xc0) == 0x80)
+        }
+    }
+}
+
+// Eight homogeneous args, single call site — bundling into a
+// struct just to silence the lint adds churn without clarity.
+#[allow(clippy::too_many_arguments)]
 fn http_get_cached_impl(
     agent: &ureq::Agent,
     cache: &HttpCache,
@@ -198,6 +325,7 @@ fn http_get_cached_impl(
     query: &Map,
     bearer: &str,
     ttl_secs: i64,
+    allow_loopback: bool,
 ) -> Result<Dynamic, Box<EvalAltResult>> {
     let pairs: Vec<(String, String)> = map_to_query_iter(query).collect();
     let query_repr = serde_json::to_string(&pairs).unwrap_or_default();
@@ -205,7 +333,7 @@ fn http_get_cached_impl(
     if let Some(hit) = cache.get(&key) {
         return Ok(json_to_rhai(&hit));
     }
-    let body = http_get_impl(agent, plugin_id, url, query, bearer)?;
+    let body = http_get_impl(agent, plugin_id, url, query, bearer, allow_loopback)?;
     let body_json = rhai_to_json(body.clone())
         .map_err(|e| EvalAltResult::ErrorRuntime(e.into(), rhai::Position::NONE))?;
     let ttl = Duration::from_secs(ttl_secs.clamp(1, 86_400) as u64);
@@ -467,7 +595,9 @@ mod tests {
             );
             let _ = sock.write_all(resp.as_bytes());
         });
-        let factory = ScriptEngine::new();
+        // Test mock is on 127.0.0.1, so opt out of the SSRF guard
+        // for this test only — production never uses this constructor.
+        let factory = ScriptEngine::with_loopback_allowed_for_tests();
         let engine = factory.build_for_plugin("http-test");
         let script = format!(
             r#"
@@ -481,7 +611,9 @@ mod tests {
 
     /// Adversarial: an http_get against an unreachable port must
     /// surface a Rhai runtime error the caller can `try { } catch`.
-    /// Without this, a network hiccup wedges the script.
+    /// With the SSRF guard ON (default), 127.0.0.1 is rejected
+    /// BEFORE the connect — the error message still names http_get
+    /// + the plugin id, so the contract holds either way.
     #[test]
     fn http_get_to_closed_port_surfaces_runtime_error() {
         let factory = ScriptEngine::new();
@@ -490,5 +622,84 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("http_get"), "got: {err}");
         assert!(err.contains("http-fail"), "got: {err}");
+    }
+
+    /// SSRF guard pins: production constructor rejects loopback /
+    /// private / link-local + non-http schemes BEFORE any network
+    /// call. Mirrors the contract in tool_apis_http::validate_url
+    /// — a script must not have MORE permissive HTTP than the
+    /// native web_fetch tool.
+    #[test]
+    fn ssrf_guard_rejects_loopback_in_production_default() {
+        let factory = ScriptEngine::new();
+        let engine = factory.build_for_plugin("ssrf-test");
+        for url in [
+            "http://127.0.0.1/",
+            "http://localhost/",
+            "http://10.0.0.1/",
+            "http://192.168.1.1/",
+            "http://169.254.169.254/", // AWS metadata
+            "http://[::1]/",
+            "http://[fe80::1]/",
+        ] {
+            let script = format!(r#"http_get("{url}", #{{ }}, "")"#);
+            let err = engine
+                .eval::<Dynamic>(&script)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("not allowed"),
+                "URL {url} should be SSRF-rejected; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_guard_rejects_non_http_schemes() {
+        let factory = ScriptEngine::new();
+        let engine = factory.build_for_plugin("ssrf-test");
+        for url in ["file:///etc/passwd", "gopher://x/", "ftp://x/"] {
+            let script = format!(r#"http_get("{url}", #{{ }}, "")"#);
+            let err = engine
+                .eval::<Dynamic>(&script)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("not allowed") && err.contains("http"),
+                "URL {url} should be scheme-rejected; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_guard_allows_public_addresses() {
+        let factory = ScriptEngine::new();
+        let engine = factory.build_for_plugin("ssrf-test");
+        // No DNS resolution happens at validate-time — we just
+        // accept the hostname. Confirm parsing + validation pass
+        // for the realistic public-API hostnames a plugin uses.
+        // (Actual connection would fail in a sealed test env, so
+        // we wrap in try/catch and look at where it failed.)
+        let script = r#"
+            try {
+                http_get("https://people.googleapis.com/v1/people/me/connections", #{ }, "")
+            } catch(e) {
+                // Connect error / TLS error / DNS error from ureq
+                // is fine — we just want to confirm the SSRF guard
+                // didn't fire FIRST.
+                "passed-ssrf:" + e
+            }
+        "#;
+        let result = engine.eval::<Dynamic>(script).unwrap();
+        let s = result.to_string();
+        // Either the call returned successfully (unlikely in
+        // sandboxed CI) OR our catch fired with an error from
+        // BEYOND the SSRF guard.
+        if s.starts_with("passed-ssrf:") {
+            assert!(
+                !s.contains("not allowed"),
+                "public hostname should pass SSRF guard; got: {s}"
+            );
+        }
     }
 }

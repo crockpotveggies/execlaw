@@ -26,6 +26,12 @@ const MAX_MAP_LEN: usize = 100_000;
 #[derive(Clone)]
 pub struct ScriptEngine {
     http_agent: ureq::Agent,
+    /// When true, the script tier's SSRF guard accepts loopback /
+    /// private / link-local destinations. **Tests only** — the
+    /// production path constructs via `new()` which sets this to
+    /// false. Mirrors the same flag in tool_apis_http's
+    /// `HttpWebFetchApi::with_loopback_allowed`.
+    allow_loopback: bool,
 }
 
 impl ScriptEngine {
@@ -38,11 +44,27 @@ impl ScriptEngine {
                 .timeout(Duration::from_secs(30))
                 .user_agent("execlaw/script-runtime/0.1")
                 .build(),
+            allow_loopback: false,
         }
     }
 
     pub fn with_http_agent(http_agent: ureq::Agent) -> Self {
-        Self { http_agent }
+        Self {
+            http_agent,
+            allow_loopback: false,
+        }
+    }
+
+    /// Test-only: skip the SSRF guard so the engine can talk to
+    /// `127.0.0.1:0`-bound mock servers. Production callers
+    /// **must not** use this constructor — a script that hits
+    /// loopback can reach Redis, the host's own admin endpoints,
+    /// cloud metadata services on link-local, etc.
+    pub fn with_loopback_allowed_for_tests() -> Self {
+        Self {
+            allow_loopback: true,
+            ..Self::new()
+        }
     }
 
     /// Build a fresh `rhai::Engine` configured with the sandbox
@@ -61,7 +83,13 @@ impl ScriptEngine {
         // `import` / file I/O, but explicit deny is cheap.
         engine.disable_symbol("eval");
         let cache = Arc::new(HttpCache::new());
-        primitives::register(&mut engine, plugin_id, self.http_agent.clone(), cache);
+        primitives::register(
+            &mut engine,
+            plugin_id,
+            self.http_agent.clone(),
+            cache,
+            self.allow_loopback,
+        );
         engine
     }
 }

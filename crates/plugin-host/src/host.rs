@@ -93,13 +93,32 @@ struct PluginHostInner {
 
 impl PluginHost {
     pub fn new(db: Database, registry: HookRegistry, stage_root: PathBuf) -> Self {
+        Self::with_script_engine(
+            db,
+            registry,
+            stage_root,
+            execlaw_script::ScriptEngine::new(),
+        )
+    }
+
+    /// Construct with a caller-provided script engine. Tests use
+    /// this to inject a `ScriptEngine::with_loopback_allowed_for_tests()`
+    /// so a mock HTTP server on `127.0.0.1` gets past the SSRF
+    /// guard. Production paths call `new()` which always uses the
+    /// production-default engine (SSRF on).
+    pub fn with_script_engine(
+        db: Database,
+        registry: HookRegistry,
+        stage_root: PathBuf,
+        script_engine: execlaw_script::ScriptEngine,
+    ) -> Self {
         Self {
             inner: Arc::new(PluginHostInner {
                 db,
                 registry,
                 subprocesses: RwLock::new(BTreeMap::new()),
                 script_plugins: RwLock::new(BTreeMap::new()),
-                script_engine: execlaw_script::ScriptEngine::new(),
+                script_engine,
                 stage_root,
             }),
         }

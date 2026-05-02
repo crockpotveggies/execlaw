@@ -1259,6 +1259,7 @@ name = "execlaw-script"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "criterion",
  "rhai",
  "serde",
  "serde_json",
@@ -1269,6 +1270,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ureq",
+ "url",
 ]
 
 [[package]]
@@ -1294,6 +1296,7 @@ dependencies = [
  "execlaw-policy",
  "execlaw-runner-local",
  "execlaw-runner-protocol",
+ "execlaw-script",
  "execlaw-vault",
  "execlaw-voice-pipeline",
  "fs4",
