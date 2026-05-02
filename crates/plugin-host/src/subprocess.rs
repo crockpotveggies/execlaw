@@ -141,6 +141,26 @@ impl SubprocessPlugin {
                     }
                 }
             }
+            // Reader exited (stdout EOF or read error). Drain the
+            // pending map so any in-flight `call().await` errors out
+            // with "plugin dropped before responding" instead of
+            // hanging forever. Without this, a plugin whose
+            // `shutdown` handler does `std::process::exit(0)` before
+            // writing a response wedges the calling task indefinitely
+            // — the reader's clone of the Arc gets dropped here, but
+            // SubprocessPlugin still holds the strong ref + the live
+            // oneshot::Senders, so rx.await never resolves.
+            let mut p = pending_for_reader.lock().await;
+            let dropped = std::mem::take(&mut *p);
+            if !dropped.is_empty() {
+                debug!(
+                    plugin_id = %plugin_id,
+                    count = dropped.len(),
+                    "draining in-flight RPCs after plugin stdout closed",
+                );
+            }
+            // Senders drop here → every parked rx.await resolves Err.
+            drop(dropped);
         });
 
         Ok(Self {
@@ -194,13 +214,29 @@ impl SubprocessPlugin {
 
     /// Ask the child to exit. Best-effort; the `kill_on_drop` guarantee
     /// still holds if this fails.
+    ///
+    /// Hard-bounded by [`SHUTDOWN_TIMEOUT`] so a plugin whose
+    /// shutdown handler exits before writing a response (or hangs
+    /// outright) can't wedge the caller. The reader-task drain in
+    /// `spawn` makes the `call` resolve cleanly on plugin exit, and
+    /// the timeout is the second layer of defense.
     pub async fn shutdown(&self) {
-        // Best-effort graceful shutdown; any error just falls through to kill.
-        let _ = self.call("shutdown", serde_json::Value::Null).await;
+        let _ = tokio::time::timeout(
+            SHUTDOWN_TIMEOUT,
+            self.call("shutdown", serde_json::Value::Null),
+        )
+        .await;
         let mut child = self.child.lock().await;
         let _ = child.start_kill();
     }
 }
+
+/// Cap on the graceful-shutdown RPC. The reader-task drain
+/// usually resolves the call within a tick of the plugin
+/// exiting; this is a backstop for "plugin's shutdown handler
+/// hangs without ever exiting." After the timeout, kill_on_drop
+/// + start_kill takes over.
+const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[cfg(test)]
 mod tests {
@@ -269,5 +305,89 @@ done
             .unwrap();
         assert_eq!(result, serde_json::json!({"echo": "ok"}));
         plugin.shutdown().await;
+    }
+
+    /// Adversarial: a plugin whose `shutdown` handler exits BEFORE
+    /// writing a JSON-RPC response (the shape used by every
+    /// existing subprocess plugin: `"shutdown" => exit 0`) used to
+    /// wedge the host's `shutdown()` call forever — the reader
+    /// task dropped its Arc clone of `pending` on EOF but
+    /// SubprocessPlugin still held the strong ref + the live
+    /// `oneshot::Sender`, so `rx.await` never resolved.
+    ///
+    /// The fix drains the pending map when the reader exits;
+    /// every parked `rx.await` resolves Err. This test pins that
+    /// shutdown returns within ~100 ms even when the plugin
+    /// behaves the way every existing one does.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shutdown_does_not_deadlock_when_plugin_exits_without_responding() {
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *shutdown*) exit 0 ;;
+    *) id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+       printf '{"id":%s,"result":null}\n' "$id" ;;
+  esac
+done
+"#;
+        let spec = SubprocessSpec {
+            plugin_id: "exit-no-reply".into(),
+            executable: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            cwd: None,
+        };
+        let plugin = SubprocessPlugin::spawn(spec).await.unwrap();
+        // Sanity: regular call works first.
+        let _ = plugin.call("ping", serde_json::Value::Null).await.unwrap();
+        // The bug: shutdown used to hang until the test runner
+        // killed it. With the fix, it returns within the
+        // SHUTDOWN_TIMEOUT (500 ms) — but actually within a tick
+        // because the reader-task drain resolves the parked rx
+        // immediately on EOF.
+        let started = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(2), plugin.shutdown())
+            .await
+            .expect("shutdown must return within 2s — deadlock if it doesn't");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(800),
+            "shutdown should resolve quickly via reader-task drain; took {elapsed:?}",
+        );
+    }
+
+    /// A second-order check: when the plugin exits unexpectedly
+    /// while a normal RPC is in flight, the call resolves Err
+    /// instead of hanging.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn pending_call_resolves_err_when_plugin_dies_mid_request() {
+        // Plugin sleeps 200ms then dies. The first `call` is in
+        // flight when stdin closes.
+        let script = r#"
+read line
+sleep 0.2
+exit 1
+"#;
+        let spec = SubprocessSpec {
+            plugin_id: "die-mid-call".into(),
+            executable: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            cwd: None,
+        };
+        let plugin = SubprocessPlugin::spawn(spec).await.unwrap();
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            plugin.call("anything", serde_json::Value::Null),
+        )
+        .await
+        .expect("call must not hang past plugin exit");
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("dropped"),
+            "expected drop-error from reader drain; got {err:?}",
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }
