@@ -19,6 +19,7 @@ members = [
     "crates/server",
     "crates/cli",
     "crates/mcp-client",
+    "crates/script",
     "plugins/hello",
     "plugins/identity-local-address-book",
     "crates/eval-harness",
@@ -127,6 +128,18 @@ tempfile = "3"
 dashmap = "6"
 bytes = "1"
 async-stream = "0.3"
+
+# Embedded scripting engine for the script-tier plugin runtime.
+# Pure-Rust (no C deps), pinned to its built-in sandbox features
+# (operations limit, max function call depth) so a misbehaving
+# script can't wedge the host. ~250 KB compiled, no runtime install.
+rhai = { version = "1.21", default-features = false, features = ["std", "sync", "serde"] }
+serde_json_path = "0.7"
+# Pure-sync HTTP client for the script tier. reqwest::blocking
+# spins up its own tokio runtime per request which conflicts with
+# the host's runtime — ureq has no runtime, just blocking sockets,
+# safe to call from inside spawn_blocking.
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 
 # --- testing ---
 tempdir = "0.3"
