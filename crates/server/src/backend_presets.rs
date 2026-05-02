@@ -194,6 +194,12 @@ pub fn all_presets() -> Vec<BackendPreset> {
                 // silently fails on them (sets finish_reason but
                 // extracts zero tool_calls).
                 "--tool-call-parser=qwen3_xml".into(),
+                // Caches the system-prompt + tool-catalogue prefix
+                // across rounds of a multi-step turn, dropping a
+                // 3-round web_search → web_fetch → synthesise from
+                // ~25s to ~10s. Off by default in vLLM; mandatory
+                // for execlaw's chat path.
+                "--enable-prefix-caching".into(),
             ],
             fields: vec![vllm_model_field("QuantTrio/Qwen3.5-27B-AWQ", "Model")],
         },
@@ -213,6 +219,7 @@ pub fn all_presets() -> Vec<BackendPreset> {
             default_args: vec![
                 "--enable-auto-tool-choice".into(),
                 "--tool-call-parser=qwen3_xml".into(),
+                "--enable-prefix-caching".into(),
             ],
             fields: vec![vllm_model_field("QuantTrio/Qwen3.5-27B-AWQ", "Model")],
         },
@@ -230,6 +237,7 @@ pub fn all_presets() -> Vec<BackendPreset> {
                 "--gpu-memory-utilization=0.5".into(),
                 "--enable-auto-tool-choice".into(),
                 "--tool-call-parser=hermes".into(),
+                "--enable-prefix-caching".into(),
             ],
             fields: vec![vllm_model_field("Qwen/Qwen2.5-3B-Instruct-AWQ", "Model")],
         },
@@ -245,6 +253,7 @@ pub fn all_presets() -> Vec<BackendPreset> {
             default_args: vec![
                 "--enable-auto-tool-choice".into(),
                 "--tool-call-parser=hermes".into(),
+                "--enable-prefix-caching".into(),
             ],
             fields: vec![vllm_model_field("Qwen/Qwen2.5-3B-Instruct-AWQ", "Model")],
         },

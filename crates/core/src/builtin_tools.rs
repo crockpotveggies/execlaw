@@ -1225,6 +1225,20 @@ impl ToolImpl for UpdateRoutineTool {
 #[derive(Debug, Deserialize)]
 struct WebFetchArgs {
     url: String,
+    /// Truncate the returned body to this many characters before
+    /// handing it to the model. Default 3000 (~750 tokens) — keeps
+    /// a typical fetched-page from blowing the context window
+    /// across multiple tool rounds. The HTTP-layer cap of 1 MiB
+    /// still applies; this is the *agent-visible* cap on top.
+    /// 2026-05-02 — pre-fix the agent would consume entire pages
+    /// (50-200KB ≈ 12-50K tokens), making 3-round web_search →
+    /// web_fetch → synthesise turns hit the model's context.
+    #[serde(default = "default_web_fetch_max_chars")]
+    max_chars: usize,
+}
+
+fn default_web_fetch_max_chars() -> usize {
+    3000
 }
 
 fn default_allowed_for_web_fetch() -> Vec<String> {
@@ -1260,8 +1274,10 @@ impl WebFetchTool {
                 description:
                     "Fetch a URL via HTTP GET and return the response body as text. Limited to \
                      http(s); private/loopback/link-local addresses are rejected; binary \
-                     content types are rejected; the body is capped at 1 MiB. Useful for \
-                     reading articles, JSON APIs, RSS feeds, and other public textual content."
+                     content types are rejected. The agent-visible body is capped at 3000 chars \
+                     by default (override with `max_chars`, up to 50000) to keep multi-step \
+                     research flows from blowing the model's context window. Useful for reading \
+                     articles, JSON APIs, RSS feeds, and other public textual content."
                         .into(),
                 schema: json!({
                     "type": "object",
@@ -1270,6 +1286,13 @@ impl WebFetchTool {
                             "type": "string",
                             "format": "uri",
                             "description": "Absolute http or https URL to fetch."
+                        },
+                        "max_chars": {
+                            "type": "integer",
+                            "default": 3000,
+                            "minimum": 256,
+                            "maximum": 50000,
+                            "description": "Cap on the returned body length (chars). Default 3000 (~750 tokens). Bump if the page is long and you need more — the response sets `truncated: true` when this fires."
                         }
                     },
                     "required": ["url"],
@@ -1300,14 +1323,35 @@ impl ToolImpl for WebFetchTool {
                 return ToolOutcome::denied("web_fetch capability not granted to this tool");
             }
         };
+        // Cap the agent-visible body at `max_chars`. We slice on
+        // char boundaries — naive byte slicing would corrupt UTF-8
+        // mid-codepoint and the JSON serialisation downstream
+        // would error.
+        let cap = args.max_chars.clamp(256, 50_000);
         match api.get(&args.url).await {
-            Ok(resp) => ToolOutcome::Ok(json!({
-                "final_url": resp.final_url,
-                "status": resp.status,
-                "content_type": resp.content_type,
-                "body": resp.body,
-                "truncated": resp.truncated,
-            })),
+            Ok(resp) => {
+                let (body, truncated_by_agent_cap) = if resp.body.chars().count() > cap {
+                    let mut s = String::with_capacity(cap + 8);
+                    for ch in resp.body.chars().take(cap) {
+                        s.push(ch);
+                    }
+                    s.push_str("\n…");
+                    (s, true)
+                } else {
+                    (resp.body, false)
+                };
+                ToolOutcome::Ok(json!({
+                    "final_url": resp.final_url,
+                    "status": resp.status,
+                    "content_type": resp.content_type,
+                    "body": body,
+                    // `truncated` is true if EITHER the HTTP-layer
+                    // cap (1 MiB) OR the agent-visible cap fired.
+                    // The agent doesn't need to distinguish — both
+                    // mean "request more via max_chars to see more".
+                    "truncated": resp.truncated || truncated_by_agent_cap,
+                }))
+            }
             Err(e) => e.into_outcome(),
         }
     }
@@ -2793,6 +2837,112 @@ mod tests {
                 assert_eq!(v["status"], 200);
                 assert_eq!(v["body"], "<html>hi</html>");
                 assert_eq!(v["truncated"], false);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_truncates_long_body_to_default_3000_chars() {
+        // Pre-fix the agent could consume entire pages (50-200KB ≈
+        // 12-50K tokens), making 3-round web_search → web_fetch →
+        // synthesise turns blow the model's context. The default
+        // 3000-char cap keeps a typical fetched-page at ~750 tokens.
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "w-trunc");
+        let long_body: String = "a".repeat(20_000);
+        let canned = WebFetchResponse {
+            final_url: "https://example.com/long".into(),
+            status: 200,
+            content_type: Some("text/plain".into()),
+            body: long_body,
+            truncated: false,
+        };
+        let ctx = ctx_with_stub_web_fetch(&db, cid, canned);
+        let out = WebFetchTool::new()
+            .invoke(ctx, json!({"url": "https://example.com/long"}))
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                let body = v["body"].as_str().unwrap();
+                // 3000 chars + the "\n…" marker we append.
+                assert!(
+                    body.chars().count() <= 3002,
+                    "body must be capped, got {} chars",
+                    body.chars().count(),
+                );
+                assert!(body.ends_with('…'));
+                assert_eq!(v["truncated"], true);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_honours_max_chars_override() {
+        // Operator wants more — explicit max_chars wins (clamped at
+        // 50000).
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "w-bigger");
+        let body: String = "x".repeat(10_000);
+        let canned = WebFetchResponse {
+            final_url: "https://example.com/x".into(),
+            status: 200,
+            content_type: Some("text/plain".into()),
+            body,
+            truncated: false,
+        };
+        let ctx = ctx_with_stub_web_fetch(&db, cid, canned);
+        let out = WebFetchTool::new()
+            .invoke(
+                ctx,
+                json!({"url": "https://example.com/x", "max_chars": 8000}),
+            )
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                let body = v["body"].as_str().unwrap();
+                assert!(body.chars().count() <= 8002);
+                assert!(body.chars().count() > 3000);
+                assert_eq!(v["truncated"], true);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_does_not_split_a_multibyte_codepoint() {
+        // Defensive: char-iterator slicing keeps UTF-8 boundaries
+        // intact even when the cap lands mid-codepoint of a wide
+        // glyph. A naive byte slice would corrupt the trailing
+        // bytes and JSON serialisation downstream would fail.
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "w-utf8");
+        // Each emoji is 4 bytes / 1 char. 1000 of them = 4000
+        // bytes, 1000 chars — well over the 256 minimum cap.
+        let emoji_body: String = "🦀".repeat(1000);
+        let canned = WebFetchResponse {
+            final_url: "https://example.com/emoji".into(),
+            status: 200,
+            content_type: Some("text/plain".into()),
+            body: emoji_body,
+            truncated: false,
+        };
+        let ctx = ctx_with_stub_web_fetch(&db, cid, canned);
+        let out = WebFetchTool::new()
+            .invoke(
+                ctx,
+                json!({"url": "https://example.com/emoji", "max_chars": 500}),
+            )
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                let body = v["body"].as_str().unwrap();
+                // Char count is 500 emoji + the "\n…" suffix (2
+                // chars). Byte count would be 2000 + 4 if naive
+                // slicing was used; we assert the cap as char
+                // boundary not byte to make the intent explicit.
+                assert_eq!(body.chars().filter(|c| *c == '🦀').count(), 500);
             }
             other => panic!("expected Ok, got {other:?}"),
         }

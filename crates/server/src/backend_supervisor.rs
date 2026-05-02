@@ -387,6 +387,21 @@ fn inject_required_vllm_tool_args(image: &str, original: &[String], out: &mut Ve
         let parser = default_tool_parser_for_args(original);
         out.push(format!("--tool-call-parser={parser}"));
     }
+    // 2026-05-02 — prefix caching is OFF by default in vLLM v1, but
+    // execlaw's chat path benefits enormously: the system prompt +
+    // tool catalogue (~7KB / ~2K tokens) is byte-for-byte identical
+    // across every round of a multi-step turn, so caching the
+    // common prefix saves the prompt-prefill cost on rounds 2+.
+    // Per the engine logs (Avg prompt throughput: 1627 tok/s vs
+    // generation 8.5 tok/s), prefill is the dominant cost — a
+    // 3-round web_search → web_fetch → synthesise turn drops from
+    // ~25s to ~10s with this enabled.
+    let has_prefix = original
+        .iter()
+        .any(|a| a == "--enable-prefix-caching" || a == "--no-enable-prefix-caching");
+    if !has_prefix {
+        out.push("--enable-prefix-caching".into());
+    }
 }
 
 fn is_vllm_image(image: &str) -> bool {
@@ -1407,20 +1422,25 @@ mod tests {
         // Qwen3 + Qwen3.5 → qwen3_xml (the model emits XML-shaped
         // tool calls, not Hermes JSON).
         assert!(out.contains(&"--tool-call-parser=qwen3_xml".into()));
+        // Prefix caching is mandatory for tool-loop performance —
+        // see the doc comment on inject_required_vllm_tool_args.
+        assert!(out.contains(&"--enable-prefix-caching".into()));
     }
 
     #[test]
     fn inject_tool_args_respects_existing_operator_overrides() {
         // If the operator hand-set the parser (e.g. to llama3_json),
-        // we leave it alone and don't double up.
+        // we leave it alone and don't double up. Same goes for
+        // --no-enable-prefix-caching (operator opt-out).
         let original = vec![
             "--model=meta-llama/Llama-3-8B".into(),
             "--enable-auto-tool-choice".into(),
             "--tool-call-parser=llama3_json".into(),
+            "--no-enable-prefix-caching".into(),
         ];
         let mut out = original.clone();
         inject_required_vllm_tool_args("vllm/vllm-openai:nightly", &original, &mut out);
-        assert_eq!(out.len(), 3, "no duplicates added: {out:?}");
+        assert_eq!(out.len(), 4, "no duplicates added: {out:?}");
     }
 
     #[test]
@@ -1499,13 +1519,14 @@ mod tests {
         };
         let spec = spec_from_row(&row).unwrap();
         assert_eq!(spec.image, "vllm/vllm-openai:v0.6.2");
-        // Original 4 args + the two tool-call flags injected by
-        // `inject_required_vllm_tool_args` (mandatory for vLLM since
-        // the runner always sends `tools: [...]`).
-        assert_eq!(spec.args.len(), 6);
+        // Original 4 args + three injected by
+        // `inject_required_vllm_tool_args`: --enable-auto-tool-choice,
+        // --tool-call-parser=qwen3_xml, --enable-prefix-caching.
+        assert_eq!(spec.args.len(), 7);
         assert!(spec.args.contains(&"--enable-auto-tool-choice".into()));
         // Qwen3.5 → qwen3_xml (see default_tool_parser_for_args).
         assert!(spec.args.contains(&"--tool-call-parser=qwen3_xml".into()));
+        assert!(spec.args.contains(&"--enable-prefix-caching".into()));
         assert_eq!(spec.env.len(), 2);
         assert_eq!(spec.host_port, host_port_for(BackendPurpose::Standard));
         assert_eq!(spec.container_port, 8000);
