@@ -366,6 +366,11 @@ export interface PluginSummary {
     /// renders a settings page for (today: any [[oauth_accounts]]).
     /// Drives the gear icon on the Plugins page row.
     has_settings_ui: boolean;
+    /// Operator-facing one-liner from `[plugin].description` in the
+    /// manifest. The Plugins page row renders this under the title
+    /// with a single-line ellipsis truncation. May be omitted by
+    /// older plugins that didn't fill it in.
+    description?: string | null;
 }
 
 export interface PluginListResponse {

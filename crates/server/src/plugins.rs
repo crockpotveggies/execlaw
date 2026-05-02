@@ -41,6 +41,12 @@ pub struct PluginSummary {
     /// `[[settings_fields]]` lands later and flips this true for
     /// plugins with operator-editable knobs but no OAuth.
     pub has_settings_ui: bool,
+    /// Operator-facing one-liner from `[plugin].description`. The
+    /// SPA renders this under the row title (single line, ellipsis
+    /// truncated). `None` when the manifest omits the field or the
+    /// stored manifest_toml is unparseable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -181,9 +187,16 @@ pub async fn list_handler(State(state): State<AppState>) -> impl IntoResponse {
                     // path. If parsing fails (corrupt persisted
                     // row), default to no settings UI rather than
                     // failing the whole list.
-                    let has_settings_ui = execlaw_plugin_sdk::PluginManifest::parse(&r.manifest_toml)
+                    let parsed = execlaw_plugin_sdk::PluginManifest::parse(&r.manifest_toml).ok();
+                    let has_settings_ui = parsed
+                        .as_ref()
                         .map(|m| !m.oauth_accounts.is_empty())
                         .unwrap_or(false);
+                    let description = parsed
+                        .as_ref()
+                        .and_then(|m| m.plugin.description.clone())
+                        .map(|s| s.trim().to_owned())
+                        .filter(|s| !s.is_empty());
                     PluginSummary {
                         plugin_id: r.plugin_id,
                         version: r.version,
@@ -191,6 +204,7 @@ pub async fn list_handler(State(state): State<AppState>) -> impl IntoResponse {
                         installed_at: r.installed_at,
                         updated_at: r.updated_at,
                         has_settings_ui,
+                        description,
                     }
                 })
                 .collect();

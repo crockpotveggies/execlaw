@@ -1229,6 +1229,17 @@ body {
     margin-bottom: 0.4rem;
 }
 
+// Plugins-page row description (manifest's `[plugin].description`).
+// Single-line ellipsis truncation — long descriptions stay on one
+// row so the list reads as a tidy table; the operator can hover
+// the row to see the full string via the `title` attribute.
+.execlaw-plugin-row__desc {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0; // lets the ellipsis kick in inside flex parents
+}
+
 .execlaw-card__row {
     display: flex;
     justify-content: space-between;

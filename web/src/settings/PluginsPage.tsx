@@ -138,6 +138,15 @@ export function PluginsPage() {
                                 />
                             </Button>
                         </div>
+                        {p.description && (
+                            <div
+                                className="execlaw-plugin-row__desc execlaw-muted small"
+                                title={p.description}
+                                data-testid="plugin-description"
+                            >
+                                {p.description}
+                            </div>
+                        )}
                     </div>
                 ))
             )}
