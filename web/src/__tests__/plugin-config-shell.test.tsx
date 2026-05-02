@@ -195,6 +195,41 @@ describe("PluginConfigShell", () => {
         expect(screen.queryByTestId("plugins-list-page")).toBeNull();
     });
 
+    it("rejects malformed routes (literal 'undefined'/'null') without firing requests", async () => {
+        // Defensive guard: a stale upstream link can generate
+        // /settings/plugins/undefined when an undefined value
+        // gets stringified by encodeURIComponent. The shell
+        // must show a clear error and refuse to mount the
+        // inner Component (which would otherwise fire
+        // /api/admin/oauth/clients/undefined/controller).
+        const calls: string[] = [];
+        fetchMock.mockImplementation(async (url: string) => {
+            calls.push(url);
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/plugins")
+                return new Response(
+                    JSON.stringify({ plugins: [] }),
+                    { status: 200 },
+                );
+            return new Response("{}", { status: 200 });
+        });
+        mountAt("/settings/plugins/undefined");
+        await waitFor(() => {
+            expect(
+                screen.getByText(/Invalid plugin id in URL/i),
+            ).toBeInTheDocument();
+        });
+        // The dangerous request never fires.
+        expect(
+            calls.some((c) =>
+                c.includes("/api/admin/oauth/clients/undefined/"),
+            ),
+        ).toBe(false);
+        // Danger zone IS still rendered (operator can still
+        // attempt uninstall on a misrouted page).
+        expect(screen.getByTestId("plugin-config-danger-zone")).toBeInTheDocument();
+    });
+
     it("renders the Back to Plugins link", async () => {
         fetchMock.mockImplementation(async (url: string) => {
             if (url === "/api/admin/me") return meResponse();

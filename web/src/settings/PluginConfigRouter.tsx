@@ -44,7 +44,13 @@ export function PluginConfigRouter() {
     const navigate = useNavigate();
     const { getAccessToken } = useAuth();
     const id = plugin_id ?? "";
-    const Component = KNOWN_CONFIGS[id];
+    // Don't fall through to the Component when id is empty or
+    // the literal string "undefined" — both are misrouting
+    // signals (URL was constructed from an undefined value
+    // upstream) and would cause the inner component to fire
+    // /api/admin/oauth/clients/undefined/controller requests.
+    const idLooksValid = id.length > 0 && id !== "undefined" && id !== "null";
+    const Component = idLooksValid ? KNOWN_CONFIGS[id] : undefined;
 
     const [summary, setSummary] = useState<PluginSummary | "loading" | null>(
         "loading",
@@ -119,7 +125,21 @@ export function PluginConfigRouter() {
             </div>
 
             {/* Plugin-supplied content. */}
-            {Component ? (
+            {!idLooksValid ? (
+                <div className="execlaw-card border border-warning-subtle">
+                    <div className="execlaw-card__title text-warning">
+                        <i className="bi bi-exclamation-triangle me-2" aria-hidden />
+                        Invalid plugin id in URL
+                    </div>
+                    <div className="execlaw-muted small">
+                        The route <code>/settings/plugins/{id || "(empty)"}</code>{" "}
+                        is malformed — likely a stale link generated from an
+                        undefined value. Go back to{" "}
+                        <Link to="/settings/plugins">Plugins</Link> and try
+                        again.
+                    </div>
+                </div>
+            ) : Component ? (
                 <Component
                     pluginId={id}
                     pluginVersion={

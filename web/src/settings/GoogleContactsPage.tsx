@@ -80,6 +80,18 @@ export function GoogleContactsPage(props: PluginConfigProps) {
 
     const refresh = useCallback(async () => {
         setError(null);
+        // Defensive: a stale shell that mounts us without props
+        // would leave pluginId as the JS value `undefined`, which
+        // encodeURIComponent stringifies to "undefined" — fires
+        // a real /api/admin/oauth/clients/undefined/controller
+        // request and gets a 404. Bail out clearly instead.
+        if (!pluginId) {
+            setError(
+                "Plugin id missing from page props — restart the SPA dev server (vite cache may be stale).",
+            );
+            setClient(null);
+            return;
+        }
         try {
             const c = await getOauthClient(
                 pluginId,
