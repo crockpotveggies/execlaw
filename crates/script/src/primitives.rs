@@ -138,6 +138,39 @@ pub(crate) fn register(
 
     engine.register_fn("now", || -> i64 { chrono::Utc::now().timestamp() });
 
+    // unix_to_rfc3339(unix_secs: i64) -> "YYYY-MM-DDTHH:MM:SSZ"
+    // — formatted UTC. Date math is gnarly to do in Rhai; lean
+    // on chrono so plugins don't have to ship a Hinnant
+    // civil-from-days implementation in script.
+    engine.register_fn("unix_to_rfc3339", |unix: i64| -> ImmutableString {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(unix, 0)
+            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            .unwrap_or_default()
+            .into()
+    });
+
+    // ---- URL encoding -------------------------------------------
+
+    // url_encode(s) -> percent-encoded RFC 3986 path segment.
+    // For Calendar-API-style ids that contain '@' / ':' / '/'
+    // when interpolated into a URL path. Same as JS
+    // encodeURIComponent for the typical case.
+    engine.register_fn("url_encode", |s: ImmutableString| -> ImmutableString {
+        // Allowed unreserved per RFC 3986: ALPHA / DIGIT / -._~
+        let mut out = String::with_capacity(s.len());
+        for b in s.as_bytes() {
+            let c = *b;
+            let unreserved = c.is_ascii_alphanumeric()
+                || c == b'-' || c == b'.' || c == b'_' || c == b'~';
+            if unreserved {
+                out.push(c as char);
+            } else {
+                out.push_str(&format!("%{c:02X}"));
+            }
+        }
+        out.into()
+    });
+
     // ---- Logging -------------------------------------------------
 
     {
@@ -515,6 +548,35 @@ mod tests {
         assert_ne!(a, c);
         // 16 hex chars (8 bytes).
         assert_eq!(a.len(), 16);
+    }
+
+    #[test]
+    fn unix_to_rfc3339_formats_known_timestamp() {
+        let factory = ScriptEngine::new();
+        let engine = factory.build_for_plugin("test");
+        // 1700000000 = 2023-11-14T22:13:20Z
+        let s: ImmutableString = engine
+            .eval("unix_to_rfc3339(1700000000)")
+            .unwrap();
+        assert_eq!(s.as_str(), "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn url_encode_percent_encodes_reserved_characters() {
+        let factory = ScriptEngine::new();
+        let engine = factory.build_for_plugin("test");
+        let cases: &[(&str, &str)] = &[
+            ("user@example.com", "user%40example.com"),
+            ("a/b:c", "a%2Fb%3Ac"),
+            ("hello world", "hello%20world"),
+            ("plain", "plain"),
+            ("a-b.c_d~e", "a-b.c_d~e"),
+        ];
+        for (input, want) in cases {
+            let script = format!(r#"url_encode("{input}")"#);
+            let got: ImmutableString = engine.eval(&script).unwrap();
+            assert_eq!(got.as_str(), *want, "input={input}");
+        }
     }
 
     #[test]

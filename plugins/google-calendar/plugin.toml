@@ -1,0 +1,32 @@
+[plugin]
+id = "google-calendar"
+name = "Google Calendar"
+version = "0.1.0"
+description = "Google Calendar API tools — list the operator's calendars and events. Read-only for now; write/RSVP support lands when the operator-confirm flow for outbound calendar mutations is wired."
+author = "execlaw"
+license = "AGPL-3.0-or-later"
+
+[[oauth_accounts]]
+name = "controller"
+provider = "google"
+scopes = [
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "openid",
+    "email",
+]
+proactive_refresh_window = "10m"
+warn_before_expiry = ["7d", "3d", "1d"]
+
+[[tools]]
+name = "calendar.list_calendars"
+description = "List the operator's Google calendars (id, summary, time zone, primary flag)."
+latency = "medium"
+
+[[tools]]
+name = "calendar.list_events"
+description = "List events on a calendar within a time window. Args: { calendar_id?: string (default 'primary'), time_min?: RFC3339, time_max?: RFC3339, max_results?: integer (default 25, cap 100) }."
+latency = "medium"
+
+[runtime]
+tier = "script"
+source = "main.rhai"
