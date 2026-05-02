@@ -80,6 +80,12 @@ struct PluginHostInner {
     db: Database,
     registry: HookRegistry,
     subprocesses: RwLock<BTreeMap<String, Arc<SubprocessPlugin>>>,
+    /// Per-plugin Rhai scripts. Empty for subprocess-tier plugins;
+    /// populated at enable / hydrate time for `tier = "script"`.
+    script_plugins: RwLock<BTreeMap<String, execlaw_script::ScriptPlugin>>,
+    /// Shared engine factory — cheap to clone, builds a fresh
+    /// per-plugin Rhai engine on demand.
+    script_engine: execlaw_script::ScriptEngine,
     /// Root directory for staged plugin ZIPs. Per-install directories
     /// land under `<root>/<plugin_id>-<version>/`.
     stage_root: PathBuf,
@@ -92,6 +98,8 @@ impl PluginHost {
                 db,
                 registry,
                 subprocesses: RwLock::new(BTreeMap::new()),
+                script_plugins: RwLock::new(BTreeMap::new()),
+                script_engine: execlaw_script::ScriptEngine::new(),
                 stage_root,
             }),
         }
@@ -147,39 +155,72 @@ impl PluginHost {
             .enable(&manifest)
             .map_err(PluginHostError::HookConflict)?;
 
-        // Step 2 — spawn subprocess when the manifest needs one. If
-        // spawn fails, we un-register the hooks so the registry
-        // doesn't leak a plugin that can't actually serve calls.
-        let needs_subprocess = !manifest.tools.is_empty()
+        // Step 2 — spin up the per-tier runtime (subprocess child or
+        // script engine) when the manifest declares a hook that
+        // needs one. If launch fails we un-register the hooks so
+        // the registry doesn't leak a plugin that can't serve.
+        let needs_runtime = !manifest.tools.is_empty()
             || manifest.transport.is_some()
             || manifest.identity_provider.is_some();
-        if needs_subprocess {
+        if needs_runtime {
             let runtime = manifest
                 .runtime
                 .as_ref()
                 .ok_or(PluginHostError::MissingRuntime)?;
-            if runtime.tier != "subprocess" {
+            let tier = runtime.parsed_tier().ok_or_else(|| {
                 self.inner.registry.disable(&plugin_id);
-                return Err(PluginHostError::UnsupportedTier(runtime.tier.clone()));
-            }
-            let spec = SubprocessSpec {
-                plugin_id: plugin_id.clone(),
-                executable: resolve_executable(stage_path, runtime_executable_or_err(runtime)?),
-                args: runtime.args.clone(),
-                cwd: Some(stage_path.to_path_buf()),
-            };
-            let plugin = match SubprocessPlugin::spawn(spec).await {
-                Ok(p) => p,
-                Err(e) => {
-                    self.inner.registry.disable(&plugin_id);
-                    return Err(PluginHostError::Spawn(e));
+                PluginHostError::UnsupportedTier(runtime.tier.clone())
+            })?;
+            match tier {
+                execlaw_plugin_sdk::manifest::RuntimeTier::Subprocess => {
+                    let spec = SubprocessSpec {
+                        plugin_id: plugin_id.clone(),
+                        executable: resolve_executable(
+                            stage_path,
+                            runtime_executable_or_err(runtime)?,
+                        ),
+                        args: runtime.args.clone(),
+                        cwd: Some(stage_path.to_path_buf()),
+                    };
+                    let plugin = match SubprocessPlugin::spawn(spec).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            self.inner.registry.disable(&plugin_id);
+                            return Err(PluginHostError::Spawn(e));
+                        }
+                    };
+                    self.inner
+                        .subprocesses
+                        .write()
+                        .await
+                        .insert(plugin_id.clone(), Arc::new(plugin));
                 }
-            };
-            self.inner
-                .subprocesses
-                .write()
-                .await
-                .insert(plugin_id.clone(), Arc::new(plugin));
+                execlaw_plugin_sdk::manifest::RuntimeTier::Script => {
+                    let source_rel = runtime_source_or_err(runtime).map_err(|e| {
+                        self.inner.registry.disable(&plugin_id);
+                        e
+                    })?;
+                    let source_path = stage_path.join(source_rel);
+                    let script = match execlaw_script::ScriptPlugin::from_file(
+                        &plugin_id,
+                        &source_path,
+                        &self.inner.script_engine,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            self.inner.registry.disable(&plugin_id);
+                            return Err(PluginHostError::Spawn(format!(
+                                "script load: {e}"
+                            )));
+                        }
+                    };
+                    self.inner
+                        .script_plugins
+                        .write()
+                        .await
+                        .insert(plugin_id.clone(), script);
+                }
+            }
         }
 
         // Step 3 — persist install row.
@@ -217,6 +258,12 @@ impl PluginHost {
         {
             plugin.shutdown().await;
         }
+        let _ = self
+            .inner
+            .script_plugins
+            .write()
+            .await
+            .remove(plugin_id);
 
         self.delete_row(plugin_id)?;
 
@@ -248,6 +295,14 @@ impl PluginHost {
         {
             plugin.shutdown().await;
         }
+        // Drop the script plugin (if any). No subprocess to kill —
+        // the rhai::Engine is just memory.
+        let _ = self
+            .inner
+            .script_plugins
+            .write()
+            .await
+            .remove(plugin_id);
         row.enabled = false;
         row.updated_at = chrono::Utc::now().timestamp();
         self.update_row(&row)?;
@@ -272,29 +327,53 @@ impl PluginHost {
             .enable(&manifest)
             .map_err(PluginHostError::HookConflict)?;
 
-        let needs_subprocess = !manifest.tools.is_empty()
+        let needs_runtime = !manifest.tools.is_empty()
             || manifest.transport.is_some()
             || manifest.identity_provider.is_some();
-        if needs_subprocess {
+        if needs_runtime {
             let runtime = manifest
                 .runtime
                 .as_ref()
                 .ok_or(PluginHostError::MissingRuntime)?;
+            let tier = runtime
+                .parsed_tier()
+                .ok_or_else(|| PluginHostError::UnsupportedTier(runtime.tier.clone()))?;
             let stage = PathBuf::from(&row.stage_path);
-            let spec = SubprocessSpec {
-                plugin_id: plugin_id.to_owned(),
-                executable: resolve_executable(&stage, runtime_executable_or_err(runtime)?),
-                args: runtime.args.clone(),
-                cwd: Some(stage),
-            };
-            let plugin = SubprocessPlugin::spawn(spec)
-                .await
-                .map_err(PluginHostError::Spawn)?;
-            self.inner
-                .subprocesses
-                .write()
-                .await
-                .insert(plugin_id.to_owned(), Arc::new(plugin));
+            match tier {
+                execlaw_plugin_sdk::manifest::RuntimeTier::Subprocess => {
+                    let spec = SubprocessSpec {
+                        plugin_id: plugin_id.to_owned(),
+                        executable: resolve_executable(
+                            &stage,
+                            runtime_executable_or_err(runtime)?,
+                        ),
+                        args: runtime.args.clone(),
+                        cwd: Some(stage),
+                    };
+                    let plugin = SubprocessPlugin::spawn(spec)
+                        .await
+                        .map_err(PluginHostError::Spawn)?;
+                    self.inner
+                        .subprocesses
+                        .write()
+                        .await
+                        .insert(plugin_id.to_owned(), Arc::new(plugin));
+                }
+                execlaw_plugin_sdk::manifest::RuntimeTier::Script => {
+                    let source_path = stage.join(runtime_source_or_err(runtime)?);
+                    let script = execlaw_script::ScriptPlugin::from_file(
+                        plugin_id,
+                        &source_path,
+                        &self.inner.script_engine,
+                    )
+                    .map_err(|e| PluginHostError::Spawn(format!("script load: {e}")))?;
+                    self.inner
+                        .script_plugins
+                        .write()
+                        .await
+                        .insert(plugin_id.to_owned(), script);
+                }
+            }
         }
 
         row.enabled = true;
@@ -321,41 +400,66 @@ impl PluginHost {
                 warn!(plugin_id = %row.plugin_id, error = %e, "skipping plugin with hook conflict on hydrate");
                 continue;
             }
-            let needs_subprocess = !manifest.tools.is_empty()
+            let needs_runtime = !manifest.tools.is_empty()
             || manifest.transport.is_some()
             || manifest.identity_provider.is_some();
-            if needs_subprocess {
+            if needs_runtime {
                 if let Some(runtime) = &manifest.runtime {
-                    let exe = match runtime_executable_or_err(runtime) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            // Skip silently — best-effort hydrate.
-                            // Probably a script-tier plugin that
-                            // got rolled into needs_subprocess
-                            // before script-tier dispatch landed;
-                            // the script-tier branch handles it.
-                            continue;
-                        }
-                    };
                     let stage = PathBuf::from(&row.stage_path);
-                    let spec = SubprocessSpec {
-                        plugin_id: row.plugin_id.clone(),
-                        executable: resolve_executable(&stage, exe),
-                        args: runtime.args.clone(),
-                        cwd: Some(stage),
-                    };
-                    match SubprocessPlugin::spawn(spec).await {
-                        Ok(p) => {
-                            self.inner
-                                .subprocesses
-                                .write()
-                                .await
-                                .insert(row.plugin_id.clone(), Arc::new(p));
-                            debug!(plugin_id = %row.plugin_id, "hydrated subprocess plugin");
+                    match runtime.parsed_tier() {
+                        Some(execlaw_plugin_sdk::manifest::RuntimeTier::Subprocess) => {
+                            let exe = match runtime_executable_or_err(runtime) {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
+                            let spec = SubprocessSpec {
+                                plugin_id: row.plugin_id.clone(),
+                                executable: resolve_executable(&stage, exe),
+                                args: runtime.args.clone(),
+                                cwd: Some(stage),
+                            };
+                            match SubprocessPlugin::spawn(spec).await {
+                                Ok(p) => {
+                                    self.inner
+                                        .subprocesses
+                                        .write()
+                                        .await
+                                        .insert(row.plugin_id.clone(), Arc::new(p));
+                                    debug!(plugin_id = %row.plugin_id, "hydrated subprocess plugin");
+                                }
+                                Err(e) => {
+                                    warn!(plugin_id = %row.plugin_id, error = %e, "failed to respawn subprocess on hydrate");
+                                    self.inner.registry.disable(&row.plugin_id);
+                                }
+                            }
                         }
-                        Err(e) => {
-                            warn!(plugin_id = %row.plugin_id, error = %e, "failed to respawn subprocess on hydrate");
-                            self.inner.registry.disable(&row.plugin_id);
+                        Some(execlaw_plugin_sdk::manifest::RuntimeTier::Script) => {
+                            let src = match runtime_source_or_err(runtime) {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
+                            let path = stage.join(src);
+                            match execlaw_script::ScriptPlugin::from_file(
+                                &row.plugin_id,
+                                &path,
+                                &self.inner.script_engine,
+                            ) {
+                                Ok(s) => {
+                                    self.inner
+                                        .script_plugins
+                                        .write()
+                                        .await
+                                        .insert(row.plugin_id.clone(), s);
+                                    debug!(plugin_id = %row.plugin_id, "hydrated script plugin");
+                                }
+                                Err(e) => {
+                                    warn!(plugin_id = %row.plugin_id, error = %e, "failed to load script on hydrate");
+                                    self.inner.registry.disable(&row.plugin_id);
+                                }
+                            }
+                        }
+                        None => {
+                            warn!(plugin_id = %row.plugin_id, tier = %runtime.tier, "unknown tier; skipping hydrate");
                         }
                     }
                 }
@@ -386,26 +490,40 @@ impl PluginHost {
         if providers.is_empty() {
             return Vec::new();
         }
-        let subs = self.inner.subprocesses.read().await;
         let mut matches = Vec::new();
         let base_params = serde_json::json!({
             "transport": transport,
             "handle": handle,
         });
+        // Take both maps once at the top — drop the locks before
+        // we await on any plugin call so the dispatch path stays
+        // re-entrant.
+        let subs = {
+            let g = self.inner.subprocesses.read().await;
+            g.clone()
+        };
+        let scripts = {
+            let g = self.inner.script_plugins.read().await;
+            g.clone()
+        };
         for provider in &providers {
-            let Some(plugin) = subs.get(&provider.plugin_id) else {
-                // Provider is registered but its subprocess isn't
-                // running — likely because the plugin declares no
-                // runtime. Skip quietly.
-                continue;
-            };
-            // Per-provider clone so the OAuth injection stays
-            // scoped to each plugin's own accounts.
             let mut params = base_params.clone();
             self.inject_oauth_tokens(&provider.plugin_id, &mut params);
-            match plugin.call("identity.resolve", params).await {
+            let result = if let Some(plugin) = subs.get(&provider.plugin_id) {
+                plugin.call("identity.resolve", params).await
+            } else if let Some(script) = scripts.get(&provider.plugin_id) {
+                let oauth = oauth_map_from_params(&params);
+                script
+                    .identity_resolve(transport, handle, oauth)
+                    .await
+                    .map_err(|e| e.to_string())
+            } else {
+                // Provider registered but no live runtime —
+                // declares-no-runtime plugin or hydration race.
+                continue;
+            };
+            match result {
                 Ok(value) => {
-                    // Provider shape: {"match": {...}} or {"match": null}.
                     if let Some(m) = value.get("match") {
                         if !m.is_null() {
                             matches.push(m.clone());
@@ -452,24 +570,34 @@ impl PluginHost {
             }
         }
 
-        // Dispatch to the plugin's subprocess.
+        // Dispatch by tier: try subprocess first, then script.
+        let mut rpc_params = serde_json::json!({
+            "tool": tool_name,
+            "args": args.clone(),
+        });
+        self.inject_oauth_tokens(&registered.plugin_id, &mut rpc_params);
         let plugin = {
             let subs = self.inner.subprocesses.read().await;
             subs.get(&registered.plugin_id).cloned()
         };
-        let Some(plugin) = plugin else {
-            return Err(format!(
-                "plugin '{}' is registered but its subprocess is not running",
-                registered.plugin_id
-            ));
+        if let Some(plugin) = plugin {
+            return plugin.call("tool.call", rpc_params).await;
+        }
+        let script = {
+            let scripts = self.inner.script_plugins.read().await;
+            scripts.get(&registered.plugin_id).cloned()
         };
-
-        let mut rpc_params = serde_json::json!({
-            "tool": tool_name,
-            "args": args,
-        });
-        self.inject_oauth_tokens(&registered.plugin_id, &mut rpc_params);
-        plugin.call("tool.call", rpc_params).await
+        if let Some(script) = script {
+            let oauth = oauth_map_from_params(&rpc_params);
+            return script
+                .tool_call(tool_name, args, oauth)
+                .await
+                .map_err(|e| e.to_string());
+        }
+        Err(format!(
+            "plugin '{}' is registered but no runtime is loaded",
+            registered.plugin_id
+        ))
     }
 
     /// Look up every `[[oauth_accounts]]` declared by `plugin_id`'s
@@ -637,6 +765,33 @@ fn runtime_executable_or_err(
         .as_deref()
         .filter(|s| !s.trim().is_empty())
         .ok_or(PluginHostError::MissingRuntime)
+}
+
+/// Mirror of `runtime_executable_or_err` for the script tier's
+/// `source` field. Validation enforces presence at parse time;
+/// this exists so `enable` / `hydrate` give a clean error if a
+/// row sneaks through with NULL.
+fn runtime_source_or_err(
+    runtime: &execlaw_plugin_sdk::manifest::RuntimeDecl,
+) -> Result<&str, PluginHostError> {
+    runtime
+        .source
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or(PluginHostError::MissingRuntime)
+}
+
+/// Pull the `_oauth` map out of the JSON params the host injected
+/// for subprocess plugins. Script plugins receive it as a typed
+/// `serde_json::Map`. Empty map when no OAuth accounts apply.
+fn oauth_map_from_params(
+    params: &serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
+    params
+        .get("_oauth")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn resolve_executable(stage: &Path, declared: &str) -> String {

@@ -11,6 +11,7 @@ description = "Plugin host: discovery, lifecycle, isolation tiers."
 [dependencies]
 execlaw-core = { path = "../core" }
 execlaw-plugin-sdk = { path = "../plugin-sdk" }
+execlaw-script = { path = "../script" }
 tokio = { workspace = true, features = ["full", "macros", "process", "io-util", "sync"] }
 serde.workspace = true
 serde_json.workspace = true

@@ -1161,6 +1161,7 @@ dependencies = [
  "criterion",
  "execlaw-core",
  "execlaw-plugin-sdk",
+ "execlaw-script",
  "rusqlite",
  "serde",
  "serde_json",
