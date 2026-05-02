@@ -15,7 +15,6 @@ import { useNavigate } from "react-router-dom";
 import { listUiPanels, type UiPanelSummary } from "../api/endpoints";
 
 import { GeneralPage } from "./GeneralPage";
-import { GoogleContactsPage } from "./GoogleContactsPage";
 import { PluginsPage } from "./PluginsPage";
 import { LogsPage } from "./LogsPage";
 import { EvalFlagsPage } from "./EvalFlagsPage";
@@ -68,11 +67,6 @@ const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
         label: "Research",
     },
     { to: "/settings/plugins", icon: "bi-plug", label: "Plugins" },
-    {
-        to: "/settings/google-contacts",
-        icon: "bi-person-vcard",
-        label: "Google Contacts",
-    },
     { to: "/settings/tools", icon: "bi-wrench-adjustable", label: "Tools" },
     // Skills is a derived "what can my agent do" view of the tools
     // registry, grouped by source (Built-in / Plugin / MCP).
@@ -188,10 +182,6 @@ export function Settings() {
                         <Route path="routines" element={<RoutinesPage />} />
                         <Route path="research" element={<ResearchPage />} />
                         <Route path="plugins" element={<PluginsPage />} />
-                        <Route
-                            path="google-contacts"
-                            element={<GoogleContactsPage />}
-                        />
                         <Route path="tools" element={<ToolsPage />} />
                         <Route path="skills" element={<SkillsPage />} />
                         <Route path="mcp" element={<McpServersPage />} />
