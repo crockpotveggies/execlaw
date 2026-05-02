@@ -698,10 +698,11 @@ body {
 }
 
 .execlaw-main__head {
-    // Top padding matches `.execlaw-sidebar__head` (1.1rem) so the
-    // page-header h2 sits at the same Y as the sidebar's
-    // `.execlaw-brand`. Bottom kept at 0.85rem.
-    padding: 1.1rem 1.25rem 0.85rem;
+    // The sidebar is `position: fixed; top: $shell-gutter` and then
+    // adds 1.1rem of its own __head padding, so its `.execlaw-brand`
+    // sits `$shell-gutter + 1.1rem` from the viewport top. The main
+    // pane is in normal flow, so we have to cover the gutter here.
+    padding: calc(#{$shell-gutter} + 1.1rem) 1.25rem 0.85rem;
     display: flex;
     align-items: center;
     gap: 0.5rem;
