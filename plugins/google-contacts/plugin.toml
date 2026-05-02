@@ -1,0 +1,28 @@
+[plugin]
+id = "google-contacts"
+name = "Google Contacts"
+version = "0.1.0"
+description = "Google People-API-backed identity provider + contacts.list tool. Resolves email and phone identifiers against the operator's connected Google account so saved contacts auto-trust as Contact-class principals."
+author = "execlaw"
+license = "AGPL-3.0-or-later"
+
+[[oauth_accounts]]
+name = "controller"
+provider = "google"
+scopes = ["https://www.googleapis.com/auth/contacts.readonly"]
+proactive_refresh_window = "10m"
+warn_before_expiry = ["7d", "3d", "1d"]
+
+[identity_provider]
+resolves = ["email", "phone"]
+trust_hint_default = "Contact"
+confidence_ceiling = 0.95
+
+[[tools]]
+name = "contacts.list"
+description = "List the operator's Google contacts. Returns name, email addresses, and phone numbers per contact."
+latency = "medium"
+
+[runtime]
+tier = "script"
+source = "main.rhai"
