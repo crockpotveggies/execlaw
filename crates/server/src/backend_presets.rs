@@ -182,7 +182,16 @@ pub fn all_presets() -> Vec<BackendPreset> {
             image: "vllm/vllm-openai:nightly".into(),
             container_port: 8000,
             vendor: PresetVendor::Nvidia.as_str().to_owned(),
-            default_args: vec!["--gpu-memory-utilization=0.9".into()],
+            // Tool-call args are required: the runner ALWAYS sends
+            // `tools: [...]` (built-in tools register at boot) and
+            // vLLM 400s without these. The supervisor also injects
+            // them defensively at launch — listing them here keeps
+            // the SPA's "advanced args" view accurate.
+            default_args: vec![
+                "--gpu-memory-utilization=0.9".into(),
+                "--enable-auto-tool-choice".into(),
+                "--tool-call-parser=hermes".into(),
+            ],
             fields: vec![vllm_model_field("QuantTrio/Qwen3.5-27B-AWQ", "Model")],
         },
         BackendPreset {
@@ -198,7 +207,10 @@ pub fn all_presets() -> Vec<BackendPreset> {
             image: "execlaw/service-vllm-cpu:v1".into(),
             container_port: 8000,
             vendor: PresetVendor::Cpu.as_str().to_owned(),
-            default_args: vec![],
+            default_args: vec![
+                "--enable-auto-tool-choice".into(),
+                "--tool-call-parser=hermes".into(),
+            ],
             fields: vec![vllm_model_field("QuantTrio/Qwen3.5-27B-AWQ", "Model")],
         },
         // ---------- Small (fast-path LLM) ----------
@@ -211,7 +223,11 @@ pub fn all_presets() -> Vec<BackendPreset> {
             image: "vllm/vllm-openai:nightly".into(),
             container_port: 8000,
             vendor: PresetVendor::Nvidia.as_str().to_owned(),
-            default_args: vec!["--gpu-memory-utilization=0.5".into()],
+            default_args: vec![
+                "--gpu-memory-utilization=0.5".into(),
+                "--enable-auto-tool-choice".into(),
+                "--tool-call-parser=hermes".into(),
+            ],
             fields: vec![vllm_model_field("Qwen/Qwen2.5-3B-Instruct-AWQ", "Model")],
         },
         BackendPreset {
@@ -223,7 +239,10 @@ pub fn all_presets() -> Vec<BackendPreset> {
             image: "execlaw/service-vllm-cpu:v1".into(),
             container_port: 8000,
             vendor: PresetVendor::Cpu.as_str().to_owned(),
-            default_args: vec![],
+            default_args: vec![
+                "--enable-auto-tool-choice".into(),
+                "--tool-call-parser=hermes".into(),
+            ],
             fields: vec![vllm_model_field("Qwen/Qwen2.5-3B-Instruct-AWQ", "Model")],
         },
         // ---------- VoiceSTT (Whisper) ----------

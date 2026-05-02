@@ -275,7 +275,7 @@ fn spec_from_row(row: &BackendRow) -> Result<ServiceSpec, String> {
         .get("image")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "managed model_spec_json must include `image`".to_string())?;
-    let args = obj
+    let mut args = obj
         .get("args")
         .and_then(|v| v.as_array())
         .map(|a| {
@@ -284,6 +284,7 @@ fn spec_from_row(row: &BackendRow) -> Result<ServiceSpec, String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    inject_required_vllm_tool_args(image, &args.clone(), &mut args);
     let env = obj
         .get("env")
         .and_then(|v| v.as_array())
@@ -349,6 +350,78 @@ fn spec_from_row(row: &BackendRow) -> Result<ServiceSpec, String> {
         host_port: host_port_for(row.purpose),
         container_port,
     })
+}
+
+/// vLLM rejects any request that carries a `tools` array unless the
+/// server was launched with `--enable-auto-tool-choice` and a
+/// `--tool-call-parser=<parser>` matching the model's tool-call
+/// format (400: `"auto" tool choice requires --enable-auto-tool-choice
+/// and --tool-call-parser to be set`). The runner ALWAYS sends a tool
+/// catalogue (built-in tools register at boot), so without these
+/// flags every chat fires "opening inference stream" and 500s.
+///
+/// We inject the missing flags here rather than in the preset library
+/// so existing operator rows (`config_backends.model_spec_json`)
+/// recover automatically — the supervisor recreates the container on
+/// the next reconcile pass and picks up the new args.
+///
+/// Operator overrides win: if the existing args already specify
+/// `--enable-auto-tool-choice` or `--tool-call-parser`, we don't
+/// touch them. The parser default is `hermes` (Qwen3 + Qwen2.5 ship
+/// with a Hermes-shaped tool grammar). Non-Qwen models that need a
+/// different parser should set it explicitly in the wizard.
+fn inject_required_vllm_tool_args(image: &str, original: &[String], out: &mut Vec<String>) {
+    if !is_vllm_image(image) {
+        return;
+    }
+    let has_enable = original
+        .iter()
+        .any(|a| a == "--enable-auto-tool-choice" || a.starts_with("--enable-auto-tool-choice="));
+    if !has_enable {
+        out.push("--enable-auto-tool-choice".into());
+    }
+    let has_parser = original
+        .iter()
+        .any(|a| a == "--tool-call-parser" || a.starts_with("--tool-call-parser="));
+    if !has_parser {
+        let parser = default_tool_parser_for_args(original);
+        out.push(format!("--tool-call-parser={parser}"));
+    }
+}
+
+fn is_vllm_image(image: &str) -> bool {
+    let lower = image.to_ascii_lowercase();
+    lower.contains("vllm")
+}
+
+/// Pick a tool-call parser based on the model id present in `args`.
+/// Today we only ship Qwen-family presets, so the default is
+/// `hermes`. Adding more presets means extending this match.
+fn default_tool_parser_for_args(args: &[String]) -> &'static str {
+    let model = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--model="))
+        .or_else(|| {
+            // Tolerate the `["--model", "X"]` shape too.
+            let mut iter = args.iter();
+            while let Some(a) = iter.next() {
+                if a == "--model" {
+                    return iter.next().map(|s| s.as_str());
+                }
+            }
+            None
+        })
+        .unwrap_or("");
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("llama-3") || lower.contains("llama3") {
+        "llama3_json"
+    } else if lower.contains("mistral") {
+        "mistral"
+    } else {
+        // Qwen + everything else default — Hermes is the broadest
+        // grammar and matches the locked-decisions Standard model.
+        "hermes"
+    }
 }
 
 fn parse_gpu_vendor(s: &str) -> Option<GpuVendor> {
@@ -1303,6 +1376,69 @@ mod tests {
     }
 
     #[test]
+    fn inject_tool_args_appends_when_missing_on_vllm_image() {
+        let original = vec!["--model=Qwen3.5".into()];
+        let mut out = original.clone();
+        inject_required_vllm_tool_args("vllm/vllm-openai:nightly", &original, &mut out);
+        assert!(out.contains(&"--enable-auto-tool-choice".into()));
+        assert!(out.contains(&"--tool-call-parser=hermes".into()));
+    }
+
+    #[test]
+    fn inject_tool_args_respects_existing_operator_overrides() {
+        // If the operator hand-set the parser (e.g. to llama3_json),
+        // we leave it alone and don't double up.
+        let original = vec![
+            "--model=meta-llama/Llama-3-8B".into(),
+            "--enable-auto-tool-choice".into(),
+            "--tool-call-parser=llama3_json".into(),
+        ];
+        let mut out = original.clone();
+        inject_required_vllm_tool_args("vllm/vllm-openai:nightly", &original, &mut out);
+        assert_eq!(out.len(), 3, "no duplicates added: {out:?}");
+    }
+
+    #[test]
+    fn inject_tool_args_skips_non_vllm_images() {
+        // Whisper STT / Kokoro TTS shouldn't get LLM tool flags.
+        let original = vec!["--model=base.en".into()];
+        let mut out = original.clone();
+        inject_required_vllm_tool_args(
+            "ghcr.io/fedirz/faster-whisper-server:latest",
+            &original,
+            &mut out,
+        );
+        assert_eq!(out, original);
+    }
+
+    #[test]
+    fn parser_default_picks_llama_for_llama_models() {
+        assert_eq!(
+            default_tool_parser_for_args(&["--model=meta-llama/Llama-3-8B".into()]),
+            "llama3_json",
+        );
+        assert_eq!(
+            default_tool_parser_for_args(&[
+                "--model".into(),
+                "meta-llama/Meta-Llama-3-70B".into(),
+            ]),
+            "llama3_json",
+        );
+    }
+
+    #[test]
+    fn parser_default_picks_hermes_for_qwen_and_unknown() {
+        assert_eq!(
+            default_tool_parser_for_args(&["--model=QuantTrio/Qwen3.5-27B-AWQ".into()]),
+            "hermes",
+        );
+        assert_eq!(
+            default_tool_parser_for_args(&["--model=mystery/model".into()]),
+            "hermes",
+        );
+    }
+
+    #[test]
     fn spec_from_row_extracts_image_args_env() {
         let row = BackendRow {
             purpose: BackendPurpose::Standard,
@@ -1323,7 +1459,12 @@ mod tests {
         };
         let spec = spec_from_row(&row).unwrap();
         assert_eq!(spec.image, "vllm/vllm-openai:v0.6.2");
-        assert_eq!(spec.args.len(), 4);
+        // Original 4 args + the two tool-call flags injected by
+        // `inject_required_vllm_tool_args` (mandatory for vLLM since
+        // the runner always sends `tools: [...]`).
+        assert_eq!(spec.args.len(), 6);
+        assert!(spec.args.contains(&"--enable-auto-tool-choice".into()));
+        assert!(spec.args.contains(&"--tool-call-parser=hermes".into()));
         assert_eq!(spec.env.len(), 2);
         assert_eq!(spec.host_port, host_port_for(BackendPurpose::Standard));
         assert_eq!(spec.container_port, 8000);

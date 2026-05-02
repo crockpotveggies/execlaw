@@ -171,11 +171,19 @@ async fn handle_frame(
             tokio::spawn(async move {
                 let result = turn_loop::run_turn(tx.clone(), cancel, tool_rx, *req).await;
                 if let Err(e) = result {
-                    tracing::error!(turn_id = %turn_id, error = %e, "turn failed");
+                    // `{e:#}` walks the full anyhow context chain
+                    // ("opening inference stream: 400 Bad Request: …")
+                    // — `{e}` would only show the topmost label and
+                    // hide the actual root cause.
+                    tracing::error!(
+                        turn_id = %turn_id,
+                        error = %format!("{e:#}"),
+                        "turn failed",
+                    );
                     let _ = tx.send(RunnerToServer::Error {
                         turn_id: turn_id.clone(),
                         conversation_id,
-                        message: format!("{e}"),
+                        message: format!("{e:#}"),
                         cancelled: false,
                     });
                 }

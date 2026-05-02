@@ -352,7 +352,7 @@ pub async fn send_message(
             .await
             {
                 Ok(out) => out,
-                Err(e) => return err_500(&format!("runner turn failed: {e}")),
+                Err(e) => return err_500(&format!("runner turn failed: {e:#}")),
             }
         }
         (Some(inference), None) if use_tool_path => match run_tool_capable_turn(
