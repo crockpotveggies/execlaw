@@ -190,7 +190,10 @@ pub fn all_presets() -> Vec<BackendPreset> {
             default_args: vec![
                 "--gpu-memory-utilization=0.9".into(),
                 "--enable-auto-tool-choice".into(),
-                "--tool-call-parser=hermes".into(),
+                // Qwen3.5 emits XML-shaped tool calls; hermes
+                // silently fails on them (sets finish_reason but
+                // extracts zero tool_calls).
+                "--tool-call-parser=qwen3_xml".into(),
             ],
             fields: vec![vllm_model_field("QuantTrio/Qwen3.5-27B-AWQ", "Model")],
         },
@@ -209,7 +212,7 @@ pub fn all_presets() -> Vec<BackendPreset> {
             vendor: PresetVendor::Cpu.as_str().to_owned(),
             default_args: vec![
                 "--enable-auto-tool-choice".into(),
-                "--tool-call-parser=hermes".into(),
+                "--tool-call-parser=qwen3_xml".into(),
             ],
             fields: vec![vllm_model_field("QuantTrio/Qwen3.5-27B-AWQ", "Model")],
         },

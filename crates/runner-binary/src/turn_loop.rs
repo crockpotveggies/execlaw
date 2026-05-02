@@ -189,6 +189,28 @@ pub async fn run_turn(
 
         let finish = finish_reason.clone().unwrap_or_default();
 
+        // Defensive: vLLM occasionally returns finish_reason="tool_calls"
+        // with `tool_calls: []` when the chosen `--tool-call-parser`
+        // doesn't match the model's emitted format (e.g. running
+        // Qwen3-XML output through the hermes parser). Pre-fix the
+        // runner fell through to "non-tool finish" with empty
+        // text_acc and committed "(empty response)" — invisible to
+        // the operator beyond the SPA placeholder. Log loudly so the
+        // root cause (parser mismatch, prompt-template breakage) is
+        // findable in the runner journal.
+        if finish == "tool_calls" && tool_calls.is_empty() {
+            tracing::warn!(
+                turn_id = %req.turn_id,
+                conversation_id = %req.conversation_id,
+                text_acc_len = text_acc.len(),
+                text_acc_preview = %text_acc.chars().take(200).collect::<String>(),
+                "model emitted finish_reason=tool_calls with zero parsed calls — \
+                 the vLLM tool-call parser likely doesn't match the model's tool-call format. \
+                 Check `--tool-call-parser` against the model's native output (Qwen3 → qwen3_xml, \
+                 Qwen2.5 → hermes, Llama-3 → llama3_json)."
+            );
+        }
+
         if finish == "tool_calls" && !tool_calls.is_empty() {
             // Append the assistant's tool_calls turn to the
             // history. content stays Some(text_acc) so the model

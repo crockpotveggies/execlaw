@@ -395,8 +395,25 @@ fn is_vllm_image(image: &str) -> bool {
 }
 
 /// Pick a tool-call parser based on the model id present in `args`.
-/// Today we only ship Qwen-family presets, so the default is
-/// `hermes`. Adding more presets means extending this match.
+///
+/// 2026-05-02 — flipped Qwen's default from `hermes` to
+/// `qwen3_xml`. Empirically Qwen3.5-AWQ emits its tool calls in the
+/// native Qwen3 XML form:
+///
+/// ```text
+/// <tool_call>
+/// <function=web_search>
+///   <parameter=query>Paris weather forecast today</parameter>
+/// </function>
+/// </tool_call>
+/// ```
+///
+/// vLLM's hermes parser, which expects `<tool_call>{json}</tool_call>`,
+/// sets `finish_reason=tool_calls` on the response (the closing tag
+/// triggers it) but extracts zero structured tool_calls — and the
+/// runner then commits "(empty response)" because its `tool_calls`
+/// vec is empty. The `qwen3_xml` parser ships with vLLM 0.20+ and
+/// handles the native format directly.
 fn default_tool_parser_for_args(args: &[String]) -> &'static str {
     let model = args
         .iter()
@@ -417,9 +434,15 @@ fn default_tool_parser_for_args(args: &[String]) -> &'static str {
         "llama3_json"
     } else if lower.contains("mistral") {
         "mistral"
+    } else if lower.contains("qwen3") {
+        // Qwen3 + Qwen3.5 emit XML-shaped tool calls; hermes
+        // silently fails on them.
+        "qwen3_xml"
+    } else if lower.contains("qwen") {
+        // Qwen 2.5 and earlier are Hermes-shaped.
+        "hermes"
     } else {
-        // Qwen + everything else default — Hermes is the broadest
-        // grammar and matches the locked-decisions Standard model.
+        // Conservative default for any unknown model.
         "hermes"
     }
 }
@@ -1381,7 +1404,9 @@ mod tests {
         let mut out = original.clone();
         inject_required_vllm_tool_args("vllm/vllm-openai:nightly", &original, &mut out);
         assert!(out.contains(&"--enable-auto-tool-choice".into()));
-        assert!(out.contains(&"--tool-call-parser=hermes".into()));
+        // Qwen3 + Qwen3.5 → qwen3_xml (the model emits XML-shaped
+        // tool calls, not Hermes JSON).
+        assert!(out.contains(&"--tool-call-parser=qwen3_xml".into()));
     }
 
     #[test]
@@ -1427,9 +1452,24 @@ mod tests {
     }
 
     #[test]
-    fn parser_default_picks_hermes_for_qwen_and_unknown() {
+    fn parser_default_picks_qwen3_xml_for_qwen3_models() {
+        // Qwen3.5-AWQ emits the native XML format vLLM ships a
+        // dedicated parser for. Hermes silently fails on it
+        // (sets finish_reason=tool_calls but extracts zero calls).
         assert_eq!(
             default_tool_parser_for_args(&["--model=QuantTrio/Qwen3.5-27B-AWQ".into()]),
+            "qwen3_xml",
+        );
+        assert_eq!(
+            default_tool_parser_for_args(&["--model=Qwen/Qwen3-32B".into()]),
+            "qwen3_xml",
+        );
+    }
+
+    #[test]
+    fn parser_default_picks_hermes_for_qwen2_and_unknown() {
+        assert_eq!(
+            default_tool_parser_for_args(&["--model=Qwen/Qwen2.5-3B-Instruct-AWQ".into()]),
             "hermes",
         );
         assert_eq!(
@@ -1464,7 +1504,8 @@ mod tests {
         // the runner always sends `tools: [...]`).
         assert_eq!(spec.args.len(), 6);
         assert!(spec.args.contains(&"--enable-auto-tool-choice".into()));
-        assert!(spec.args.contains(&"--tool-call-parser=hermes".into()));
+        // Qwen3.5 → qwen3_xml (see default_tool_parser_for_args).
+        assert!(spec.args.contains(&"--tool-call-parser=qwen3_xml".into()));
         assert_eq!(spec.env.len(), 2);
         assert_eq!(spec.host_port, host_port_for(BackendPurpose::Standard));
         assert_eq!(spec.container_port, 8000);
