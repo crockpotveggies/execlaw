@@ -29,6 +29,7 @@ import {
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
+import { GoogleCalendarPage } from "./GoogleCalendarPage";
 import { GoogleContactsPage } from "./GoogleContactsPage";
 import type { PluginConfigComponent } from "./PluginConfigBase";
 
@@ -37,6 +38,7 @@ const KNOWN_CONFIGS: Record<string, PluginConfigComponent> = {
     // The component is wrapped by the shell below — it can't
     // remove the danger zone or back button.
     "google-contacts": GoogleContactsPage,
+    "google-calendar": GoogleCalendarPage,
 };
 
 export function PluginConfigRouter() {

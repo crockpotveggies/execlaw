@@ -62,23 +62,32 @@ fn bench_script_parse(c: &mut Criterion) {
         });
     });
 
-    // Real shipped plugin — the budget should comfortably
+    // Real shipped plugins — the budget should comfortably
     // contain a 200-line .rhai parse.
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.pop();
-    path.push("plugins/google-contacts/main.rhai");
-    if let Ok(real) = std::fs::read_to_string(&path) {
-        c.bench_function("script_plugin_parse_google_contacts", |b| {
-            b.iter(|| {
-                let _ = ScriptPlugin::from_source(
-                    black_box("google-contacts"),
-                    black_box(&real),
-                    &factory,
-                )
-                .unwrap();
+    let workspace_root = {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.pop();
+        p.pop();
+        p
+    };
+    for (name, rel) in [
+        ("google_contacts", "plugins/google-contacts/main.rhai"),
+        ("google_calendar", "plugins/google-calendar/main.rhai"),
+    ] {
+        let path = workspace_root.join(rel);
+        if let Ok(real) = std::fs::read_to_string(&path) {
+            let bench_name = format!("script_plugin_parse_{name}");
+            c.bench_function(&bench_name, |b| {
+                b.iter(|| {
+                    let _ = ScriptPlugin::from_source(
+                        black_box(name),
+                        black_box(&real),
+                        &factory,
+                    )
+                    .unwrap();
+                });
             });
-        });
+        }
     }
 }
 

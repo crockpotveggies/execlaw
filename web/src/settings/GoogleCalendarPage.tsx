@@ -1,24 +1,20 @@
-// Settings → Google Contacts plugin config (Phase 9, plugin-google-contacts).
+// Settings → Google Calendar plugin config (Phase 9, plugin-google-calendar).
 //
-// Mounted by `PluginConfigRouter` inside `PluginConfigShell`,
-// which owns the page header (back button + title + version
-// badge) and the danger-zone footer (Uninstall) — this component
-// renders ONLY the middle slot.
-//
-// All the heavy lifting (OAuth client form, Connect/Disconnect,
-// state machine) lives in the shared `OauthClientConfig`
-// component. This file just supplies the plugin-specific copy.
+// Same shape as GoogleContactsPage — both delegate to the shared
+// OauthClientConfig component. Plugin-specific differences:
+// scopes, title/icon, description copy, Cloud Console setup
+// steps (Calendar API, not People API).
 
 import type { PluginConfigProps } from "./PluginConfigBase";
 import { OauthClientConfig } from "./OauthClientConfig";
 
 const SCOPES = [
-    "https://www.googleapis.com/auth/contacts.readonly",
+    "https://www.googleapis.com/auth/calendar.readonly",
     "openid",
     "email",
 ];
 
-export function GoogleContactsPage({
+export function GoogleCalendarPage({
     pluginId,
     onConfigChanged,
 }: PluginConfigProps) {
@@ -27,14 +23,16 @@ export function GoogleContactsPage({
             pluginId={pluginId}
             provider="google"
             defaultScopes={SCOPES}
-            title="Google Contacts"
-            icon="bi-person-vcard"
+            title="Google Calendar"
+            icon="bi-calendar3"
             description={
                 <>
                     Connects the <code>{pluginId}</code> plugin to your Google
-                    account. Saved contacts auto-trust as Contact-class
-                    principals; the <code>contacts.list</code> tool becomes
-                    available on chat turns.
+                    account. The <code>calendar.list_calendars</code> and{" "}
+                    <code>calendar.list_events</code> tools become available
+                    on chat turns. Read-only — write operations land when the
+                    operator-confirm flow for outbound calendar mutations is
+                    wired.
                 </>
             }
             setupSteps={
@@ -53,17 +51,20 @@ export function GoogleContactsPage({
                     <li>
                         Enable the{" "}
                         <a
-                            href="https://console.cloud.google.com/apis/library/people.googleapis.com"
+                            href="https://console.cloud.google.com/apis/library/calendar-json.googleapis.com"
                             target="_blank"
                             rel="noopener noreferrer"
                         >
-                            People API
+                            Google Calendar API
                         </a>{" "}
                         for the project.
                     </li>
                     <li>
                         Create an OAuth 2.0 Client ID of type{" "}
-                        <strong>Web application</strong>.
+                        <strong>Web application</strong>. (If you already
+                        have one for another Google plugin like
+                        google-contacts, you can reuse it — Google scopes
+                        accumulate per OAuth client.)
                     </li>
                     <li>
                         Under Authorized redirect URIs, add this server's
@@ -71,7 +72,9 @@ export function GoogleContactsPage({
                     </li>
                     <li>
                         Paste the resulting client ID + secret above and
-                        click Save, then Connect Account.
+                        click Save, then Connect Account. The consent screen
+                        will request the{" "}
+                        <code>calendar.readonly</code> scope.
                     </li>
                 </ol>
             }

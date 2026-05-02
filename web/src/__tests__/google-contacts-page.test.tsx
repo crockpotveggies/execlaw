@@ -115,7 +115,7 @@ describe("GoogleContactsPage", () => {
         mountPage();
         await waitFor(() => {
             expect(
-                screen.getByTestId("google-contacts-needs-connect"),
+                screen.getByTestId("oauth-needs-connect"),
             ).toBeInTheDocument();
         });
         expect(screen.getByTestId("connect-button")).toBeInTheDocument();
@@ -163,7 +163,7 @@ describe("GoogleContactsPage", () => {
         mountPage();
         await waitFor(() => {
             expect(
-                screen.getByTestId("google-contacts-connected"),
+                screen.getByTestId("oauth-connected"),
             ).toBeInTheDocument();
         });
         expect(screen.getByText(/alice@example\.com/)).toBeInTheDocument();
@@ -171,7 +171,7 @@ describe("GoogleContactsPage", () => {
         // The "needs connect" card must not also be present — the
         // states are mutually exclusive.
         expect(
-            screen.queryByTestId("google-contacts-needs-connect"),
+            screen.queryByTestId("oauth-needs-connect"),
         ).toBeNull();
     });
 
@@ -249,7 +249,7 @@ describe("GoogleContactsPage", () => {
         // connected state.
         await waitFor(() => {
             expect(
-                screen.getByTestId("google-contacts-needs-connect"),
+                screen.getByTestId("oauth-needs-connect"),
             ).toBeInTheDocument();
         });
     });
