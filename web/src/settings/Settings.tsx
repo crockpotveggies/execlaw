@@ -28,7 +28,6 @@ import { ToolsPage } from "./ToolsPage";
 import { McpServersPage } from "./McpServersPage";
 import { RunnersPage } from "./RunnersPage";
 import { ResearchPage } from "./ResearchPage";
-import { RoutinesPage } from "./RoutinesPage";
 import { PersonalityPage } from "./PersonalityPage";
 import { AlertsPage } from "./AlertsPage";
 import { SkillsPage } from "./SkillsPage";
@@ -58,10 +57,10 @@ const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
         icon: "bi-person-badge",
         label: "My identities",
     },
-    // Routines is a top-level destination from the chat sidebar but
-    // also lives here so it's discoverable from Settings. Placeholder
-    // page until the feature lands.
-    { to: "/settings/routines", icon: "bi-clock-history", label: "Routines" },
+    // Routines used to live here too (Phase 10) but it's a feature,
+    // not a setting — it now sits at the top-level `/routines` route
+    // with its own sidebar entry. A back-compat redirect below keeps
+    // old `/settings/routines` bookmarks working.
     {
         to: "/settings/research",
         icon: "bi-binoculars",
@@ -180,7 +179,11 @@ export function Settings() {
                         <Route path="user" element={<UserPage />} />
                         <Route path="personality" element={<PersonalityPage />} />
                         <Route path="my-identities" element={<MyIdentitiesPage />} />
-                        <Route path="routines" element={<RoutinesPage />} />
+                        {/* Legacy: routines is now a top-level page. */}
+                        <Route
+                            path="routines"
+                            element={<Navigate to="/routines" replace />}
+                        />
                         <Route path="research" element={<ResearchPage />} />
                         <Route path="plugins" element={<PluginsPage />} />
                         <Route

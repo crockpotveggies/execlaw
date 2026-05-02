@@ -109,7 +109,7 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                 </button>
                 <div className="execlaw-sidebar__section">Browse</div>
                 <SidebarNavLink
-                    to="/settings/routines"
+                    to="/routines"
                     icon="bi-clock-history"
                     label="Routines"
                     testId="sidebar-routines"
