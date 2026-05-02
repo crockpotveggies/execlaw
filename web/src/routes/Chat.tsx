@@ -462,6 +462,12 @@ export function Chat() {
             case "chat_token_delta":
                 if (cid && typeof ev.text === "string") {
                     appendStreamingToken(cid, ev.text);
+                    // Streaming bubble takes over as the
+                    // "agent is talking" affordance — clear the
+                    // sticky tool-activity label so the
+                    // indicator doesn't sit beside the bubble
+                    // with stale text.
+                    clearToolActivity(cid);
                 }
                 break;
             case "chat_message_outbound":
@@ -540,29 +546,31 @@ export function Chat() {
                 break;
             case "agent_tool_activity":
                 // Loader pulse — generated server-side when the
-                // runner emits a tool-call request and again when
-                // the result is back. Drives the "Searching the
-                // web for X…" pill above the composer so the
-                // operator knows what's happening during multi-
-                // round flows.
+                // runner emits a tool-call request. Drives the
+                // "Searching the web for X…" label inside the
+                // message stream's activity row so the operator
+                // knows what's happening during multi-round flows.
+                //
+                // 2026-05-02 — only `started` mutates the store.
+                // Pre-fix `finished`/`failed` cleared the label
+                // immediately, which felt like the line flashed
+                // on/off between rounds — the operator saw a
+                // bare spinner during the gap. The store now
+                // holds the most-recent label until either the
+                // next tool's `started` pulse replaces it or a
+                // token-delta / message commit clears it via the
+                // surrounding cases.
                 if (
                     cid &&
                     typeof ev.tool_name === "string" &&
                     typeof ev.label === "string" &&
-                    typeof ev.status === "string"
+                    typeof ev.status === "string" &&
+                    ev.status === "started"
                 ) {
-                    if (ev.status === "started") {
-                        setToolActivity(cid, {
-                            tool_name: ev.tool_name,
-                            label: ev.label,
-                        });
-                    } else {
-                        // "finished" or "failed" — drop the entry
-                        // so the loader clears unless the next
-                        // tool's started-pulse beats the agent's
-                        // final reply.
-                        clearToolActivity(cid);
-                    }
+                    setToolActivity(cid, {
+                        tool_name: ev.tool_name,
+                        label: ev.label,
+                    });
                 }
                 break;
             // ---- C4 — generic Card events (research, future
