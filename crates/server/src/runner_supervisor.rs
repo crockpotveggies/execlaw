@@ -140,6 +140,14 @@ pub struct RunnerHandle {
     /// `RunnerToServer` frames into the matching `TurnEventTx`.
     pub turn_streams: Arc<DashMap<String, TurnEventTx>>,
     pub state: Arc<RwLock<RunnerState>>,
+    /// Fired the first time `attach_tx` runs after the WS handler
+    /// claims the outbound channel. `forward_turn` awaits this with
+    /// a short timeout so the registration → upgrade → attach_tx
+    /// race window doesn't surface as a 500 to the operator. The
+    /// notify keeps a permit for late waiters (`notify_one`),
+    /// matching the same pattern `accept_registration` uses for
+    /// `pending.registered`.
+    pub tx_attached: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Clone)]
@@ -212,7 +220,27 @@ impl RunnerHandle {
                 container_id: None,
                 turn_deadlines: std::collections::HashMap::new(),
             })),
+            tx_attached: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Wait briefly for the WS handler to attach the outbound
+    /// channel. Returns true once attached, false on timeout.
+    /// Polls the mutex first so a tx that's ALREADY attached
+    /// returns instantly (no notify wait); the notify path covers
+    /// the registration → upgrade → attach_tx race window where
+    /// `runners.insert` has run but `attach_tx` hasn't yet.
+    pub async fn wait_until_tx_attached(&self, timeout: Duration) -> bool {
+        if self.tx.lock().await.is_some() {
+            return true;
+        }
+        let notified = self.tx_attached.notified();
+        // After arming the notify, re-check — `attach_tx` may have
+        // landed in the gap between the lock release and arming.
+        if self.tx.lock().await.is_some() {
+            return true;
+        }
+        tokio::time::timeout(timeout, notified).await.is_ok()
     }
 }
 
@@ -709,6 +737,7 @@ impl RunnerSupervisor {
                 container_id: None,
                 turn_deadlines: std::collections::HashMap::new(),
             })),
+            tx_attached: Arc::new(tokio::sync::Notify::new()),
         };
         self.inner
             .runners
@@ -766,6 +795,26 @@ impl RunnerSupervisor {
             .map(|kv| kv.value().clone())
             .ok_or(ForwardError::NoRunner)?;
 
+        // Cover the registration → upgrade → attach_tx race window:
+        // the supervisor's `accept_registration` inserts the handle
+        // into the runners map BEFORE the WS handler runs `attach_tx`
+        // (those are split across the HTTP-handler return + the
+        // axum on_upgrade future). Without this wait, a chat that
+        // lands in that window saw `tx = None` → SendError → 500.
+        // We retry briefly; if the tx never attaches, treat the
+        // handle as stale and remove it so the next turn respawns.
+        if !handle
+            .wait_until_tx_attached(Duration::from_secs(2))
+            .await
+        {
+            warn!(
+                group_id,
+                "forward_turn: tx never attached within 2s; pruning stale handle"
+            );
+            self.prune_dead_handle(group_id, &handle).await;
+            return Err(ForwardError::RunnerGone);
+        }
+
         // Build the per-turn event channel + register it with the
         // runner's read-loop dispatcher.
         let (tx, rx) = mpsc::unbounded_channel::<TurnEvent>();
@@ -787,21 +836,52 @@ impl RunnerSupervisor {
         // ServerToRunner value passing through tokio channels).
         let frame = ServerToRunner::Turn(Box::new(request.clone()));
         if let Err(send_err) = send_to_runner(&handle, frame).await {
-            // The runner just went away between our get() and the
+            // The runner just went away between our wait + the
             // send. Roll back the bookkeeping we already inserted
             // so the turn_id doesn't leak forever — without this,
             // turn_streams holds a never-drained sender + the
             // in_flight_turns set keeps reap_idle from ever
             // reclaiming the dead runner.
             handle.turn_streams.remove(&request.turn_id);
-            let mut s = handle.state.write().await;
-            s.in_flight_turns.remove(&request.turn_id);
-            s.turn_deadlines.remove(&request.turn_id);
-            let _ = send_err;
+            {
+                let mut s = handle.state.write().await;
+                s.in_flight_turns.remove(&request.turn_id);
+                s.turn_deadlines.remove(&request.turn_id);
+            }
+            // Mark the handle dead + drop it from the registry so
+            // the NEXT chat's `ensure_for_group` respawns instead
+            // of finding the same dead handle. Pre-fix the dead
+            // entry stuck around forever and every chat 500'd.
+            warn!(
+                group_id,
+                error = %send_err,
+                "forward_turn: send failed; pruning stale handle"
+            );
+            self.prune_dead_handle(group_id, &handle).await;
             return Err(ForwardError::RunnerGone);
         }
 
         Ok(rx)
+    }
+
+    /// Mark a runner handle as Dead and remove it from the registry
+    /// so the next `ensure_for_group` triggers a fresh spawn. Used
+    /// by `forward_turn` when the WS handshake never completed or
+    /// the outbound channel is closed mid-turn — symptoms that mean
+    /// the existing entry can never serve another turn.
+    async fn prune_dead_handle(&self, group_id: &str, handle: &RunnerHandle) {
+        {
+            let mut s = handle.state.write().await;
+            s.status = RunnerStatus::Dead;
+        }
+        // Only remove if the registry entry is the SAME handle —
+        // a concurrent `accept_registration` may have already
+        // replaced it with a fresh one we shouldn't clobber.
+        self.inner
+            .runners
+            .remove_if(group_id, |_, existing| {
+                Arc::ptr_eq(&existing.tx, &handle.tx)
+            });
     }
 
     /// Operator-driven turn cancellation (the existing stop button
@@ -1200,6 +1280,11 @@ impl RunnerSupervisor {
     pub async fn attach_tx(&self, group_id: &str, tx: ServerToRunnerTx) {
         if let Some(handle) = self.get(group_id) {
             *handle.tx.lock().await = Some(tx);
+            // Wake any forward_turn caller that was parked on the
+            // registration-window race. `notify_one` keeps the
+            // permit for late waiters too — a `notified()` armed
+            // AFTER this call still returns immediately.
+            handle.tx_attached.notify_one();
         }
     }
 }
