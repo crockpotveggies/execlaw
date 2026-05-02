@@ -1,17 +1,47 @@
-// google-calendar — Google Calendar API tools (read-only).
+// google-calendar — Google Calendar API tools.
 //
-// Two host-dispatched entry points:
+// Seven host-dispatched entry points:
 //
 //   tool_call("calendar.list_calendars", #{}, oauth)
 //     -> #{ "calendars": [...] }
 //
 //   tool_call("calendar.list_events", #{
 //       "calendar_id"?: "primary" | "<calendar_id>",
-//       "time_min"?: "2026-05-01T00:00:00Z",
-//       "time_max"?: "2026-06-01T00:00:00Z",
+//       "time_min"?:  "2026-05-01T00:00:00Z",
+//       "time_max"?:  "2026-06-01T00:00:00Z",
 //       "max_results"?: 25,
+//       "query"?:    "free-text search",
 //     }, oauth)
 //     -> #{ "events": [...], "calendar_id": "...", "next_page_token"?: "..." }
+//
+//   tool_call("calendar.check_availability", #{
+//       "time_min": "...", "time_max": "...",
+//       "calendar_ids"?: ["primary", "..."],
+//     }, oauth)
+//     -> Google freeBusy response (calendars keyed by id with `busy` arrays).
+//
+//   tool_call("calendar.get_event", #{
+//       "calendar_id"?: "primary", "event_id": "...",
+//     }, oauth)
+//     -> normalised event payload (same shape as list_events rows).
+//
+//   tool_call("calendar.create_event", #{
+//       "summary": "...", "start": "...", "end": "...",
+//       "calendar_id"?: "primary", "description"?, "location"?, "attendees"?: ["e@x"],
+//     }, oauth)
+//     -> normalised event payload.
+//
+//   tool_call("calendar.update_event", #{
+//       "event_id": "...",  // required
+//       "calendar_id"?: "primary",
+//       "summary"?, "start"?, "end"?, "description"?, "location"?, "attendees"?,
+//     }, oauth)
+//     -> normalised event payload (post-patch).
+//
+//   tool_call("calendar.delete_event", #{
+//       "calendar_id"?: "primary", "event_id": "...",
+//     }, oauth)
+//     -> #{ "deleted": true }
 //
 // `oauth` is a map of {account_name: access_token} the host
 // already injected from state_oauth_tokens. We never see the
@@ -21,12 +51,16 @@
 // Caching:
 //   * list_calendars is cached 5 min — calendar metadata changes
 //     rarely, the operator can hit "Refresh" if needed.
-//   * list_events is NOT cached (default) — events are
-//     time-windowed and Google's rate limits are generous; we'd
-//     rather pay a fresh call than serve stale results during a
-//     conversation about the day's schedule. If the cost shows
-//     up in production we can add a 60 s cache keyed on the
-//     full arg map.
+//   * list_events / check_availability / get_event are NOT cached
+//     — events shift quickly during a scheduling conversation and
+//     Google's rate limits are generous; freshness > 60 ms savings.
+//   * create_event / update_event / delete_event are mutations and
+//     are obviously never cached.
+//
+// Mutations send notifications when attendees are present.
+// Google's `sendNotifications=true` query param is appended to the
+// create/update/delete URLs only when there's at least one
+// attendee, mirroring selfhosted-claw's calendar runtime.
 //
 // Note on Rhai scope: top-level `const` declarations aren't
 // visible inside `fn` bodies, so the URL + cache TTL are inlined
@@ -46,6 +80,21 @@ fn tool_call(name, args, oauth) {
     }
     if name == "calendar.list_events" {
         return list_events_impl(token, args);
+    }
+    if name == "calendar.check_availability" {
+        return check_availability_impl(token, args);
+    }
+    if name == "calendar.get_event" {
+        return get_event_impl(token, args);
+    }
+    if name == "calendar.create_event" {
+        return create_event_impl(token, args);
+    }
+    if name == "calendar.update_event" {
+        return update_event_impl(token, args);
+    }
+    if name == "calendar.delete_event" {
+        return delete_event_impl(token, args);
     }
     throw "unknown tool '" + name + "'";
 }
@@ -86,15 +135,11 @@ fn summarize_calendar(item) {
 }
 
 // ---------------------------------------------------------------------------
-// list_events — windowed by (time_min, time_max).
+// list_events — windowed by (time_min, time_max), optional `query`.
 // Defaults to the next 7 days from "now" if no window given.
 
 fn list_events_impl(token, args) {
-    let calendar_id = if args["calendar_id"] != () && args["calendar_id"] != "" {
-        args["calendar_id"]
-    } else {
-        "primary"
-    };
+    let calendar_id = pick_calendar_id(args);
     let now = now();
     let time_min = if args["time_min"] != () && args["time_min"] != "" {
         args["time_min"]
@@ -115,24 +160,23 @@ fn list_events_impl(token, args) {
         25
     };
 
-    // calendar_id has to be URL-path-encoded (e.g. user@gmail.com
-    // contains '@'). The host's http_get takes the URL verbatim,
-    // so we hand it a pre-encoded path. Common case `primary`
-    // doesn't need encoding.
     let url = "https://www.googleapis.com/calendar/v3/calendars/"
         + url_encode(calendar_id) + "/events";
 
-    let resp = http_get(
-        url,
-        #{
-            "timeMin": time_min,
-            "timeMax": time_max,
-            "maxResults": "" + max_results,
-            "singleEvents": "true",
-            "orderBy": "startTime",
-        },
-        token,
-    );
+    let query = #{
+        "timeMin": time_min,
+        "timeMax": time_max,
+        "maxResults": "" + max_results,
+        "singleEvents": "true",
+        "orderBy": "startTime",
+    };
+    // Optional free-text search — mirrors the `q` param exposed
+    // by Google + selfhosted-claw's calendar_list_events.
+    if args["query"] != () && args["query"] != "" {
+        query["q"] = args["query"];
+    }
+
+    let resp = http_get(url, query, token);
     if resp == () || resp["items"] == () {
         return #{
             "events": [],
@@ -155,6 +199,168 @@ fn list_events_impl(token, args) {
         result["next_page_token"] = resp["nextPageToken"];
     }
     result
+}
+
+// ---------------------------------------------------------------------------
+// check_availability — POST /freeBusy with one or more calendar ids.
+
+fn check_availability_impl(token, args) {
+    let time_min = if args["time_min"] != () { args["time_min"] } else { "" };
+    let time_max = if args["time_max"] != () { args["time_max"] } else { "" };
+    if time_min == "" || time_max == "" {
+        throw "calendar.check_availability requires both `time_min` and `time_max`";
+    }
+    let ids_in = if args["calendar_ids"] != () && type_of(args["calendar_ids"]) == "array" {
+        args["calendar_ids"]
+    } else {
+        ["primary"]
+    };
+    let items = [];
+    for id in ids_in {
+        items.push(#{ "id": "" + id });
+    }
+    let body = #{
+        "timeMin": time_min,
+        "timeMax": time_max,
+        "items": items,
+    };
+    let resp = http_post(
+        "https://www.googleapis.com/calendar/v3/freeBusy",
+        body,
+        token,
+    );
+    // Pass the raw freeBusy response through — the agent reasons
+    // over the per-calendar `busy` arrays directly.
+    if resp == () { #{} } else { resp }
+}
+
+// ---------------------------------------------------------------------------
+// get_event — GET single event, normalised through summarize_event.
+
+fn get_event_impl(token, args) {
+    let calendar_id = pick_calendar_id(args);
+    let event_id = if args["event_id"] != () { args["event_id"] } else { "" };
+    if event_id == "" {
+        throw "calendar.get_event requires `event_id`";
+    }
+    let url = "https://www.googleapis.com/calendar/v3/calendars/"
+        + url_encode(calendar_id) + "/events/" + url_encode(event_id);
+    let resp = http_get(url, #{}, token);
+    if resp == () {
+        throw "calendar.get_event: empty response from Google";
+    }
+    let normalised = summarize_event(resp);
+    normalised["calendar_id"] = calendar_id;
+    normalised
+}
+
+// ---------------------------------------------------------------------------
+// create_event — POST a new event. Adds `sendNotifications=true`
+// when attendees are present so invitations actually go out.
+
+fn create_event_impl(token, args) {
+    let calendar_id = pick_calendar_id(args);
+    let summary = if args["summary"] != () { args["summary"] } else { "" };
+    let start = if args["start"] != () { args["start"] } else { "" };
+    let end = if args["end"] != () { args["end"] } else { "" };
+    if summary == "" || start == "" || end == "" {
+        throw "calendar.create_event requires `summary`, `start`, `end`";
+    }
+    let body = build_event_body(args, true);
+    let attendees_present = body["attendees"] != ();
+
+    let url = "https://www.googleapis.com/calendar/v3/calendars/"
+        + url_encode(calendar_id) + "/events";
+    if attendees_present {
+        url += "?sendNotifications=true";
+    }
+    let resp = http_post(url, body, token);
+    if resp == () {
+        throw "calendar.create_event: empty response from Google";
+    }
+    let normalised = summarize_event(resp);
+    normalised["calendar_id"] = calendar_id;
+    normalised
+}
+
+// ---------------------------------------------------------------------------
+// update_event — PATCH partial body. Same notification rule.
+
+fn update_event_impl(token, args) {
+    let calendar_id = pick_calendar_id(args);
+    let event_id = if args["event_id"] != () { args["event_id"] } else { "" };
+    if event_id == "" {
+        throw "calendar.update_event requires `event_id`";
+    }
+    let body = build_event_body(args, false);
+    let attendees_present = body["attendees"] != ();
+
+    let url = "https://www.googleapis.com/calendar/v3/calendars/"
+        + url_encode(calendar_id) + "/events/" + url_encode(event_id);
+    if attendees_present {
+        url += "?sendNotifications=true";
+    }
+    let resp = http_patch(url, body, token);
+    if resp == () {
+        throw "calendar.update_event: empty response from Google";
+    }
+    let normalised = summarize_event(resp);
+    normalised["calendar_id"] = calendar_id;
+    normalised
+}
+
+// ---------------------------------------------------------------------------
+// delete_event — DELETE. 204 No Content is the success path.
+
+fn delete_event_impl(token, args) {
+    let calendar_id = pick_calendar_id(args);
+    let event_id = if args["event_id"] != () { args["event_id"] } else { "" };
+    if event_id == "" {
+        throw "calendar.delete_event requires `event_id`";
+    }
+    let url = "https://www.googleapis.com/calendar/v3/calendars/"
+        + url_encode(calendar_id) + "/events/" + url_encode(event_id);
+    // http_delete throws on non-2xx; an Ok return means Google
+    // accepted the cancellation regardless of response body.
+    http_delete(url, #{}, token);
+    #{ "deleted": true, "calendar_id": calendar_id, "event_id": event_id }
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers.
+
+fn pick_calendar_id(args) {
+    if args["calendar_id"] != () && args["calendar_id"] != "" {
+        args["calendar_id"]
+    } else {
+        "primary"
+    }
+}
+
+// Build the JSON body for create/update. When `require_all_times`
+// is true (create), `start` + `end` are unconditionally written;
+// when false (update), only the fields the caller actually
+// supplied are emitted, since PATCH treats omitted fields as
+// "leave unchanged".
+fn build_event_body(args, require_all_times) {
+    let body = #{};
+    if args["summary"] != () { body["summary"] = args["summary"]; }
+    if args["description"] != () { body["description"] = args["description"]; }
+    if args["location"] != () { body["location"] = args["location"]; }
+    if require_all_times || args["start"] != () {
+        body["start"] = #{ "dateTime": args["start"] };
+    }
+    if require_all_times || args["end"] != () {
+        body["end"] = #{ "dateTime": args["end"] };
+    }
+    if args["attendees"] != () && type_of(args["attendees"]) == "array" {
+        let arr = [];
+        for email in args["attendees"] {
+            arr.push(#{ "email": "" + email });
+        }
+        body["attendees"] = arr;
+    }
+    body
 }
 
 // Normalise an event into the shape the agent / SPA consumes.

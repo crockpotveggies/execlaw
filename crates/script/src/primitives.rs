@@ -6,7 +6,8 @@
 //! design decision; subtracting is safe.
 //!
 //! Categories:
-//!   * **HTTP** — `http_get`, `http_post`, `http_get_cached`
+//!   * **HTTP** — `http_get`, `http_post`, `http_patch`, `http_delete`,
+//!     `http_get_cached`
 //!   * **String** — `digits_only`, `lower`, `trim`, `hash`
 //!   * **JSON** — `json_path`
 //!   * **Time** — `now`
@@ -67,6 +68,43 @@ pub(crate) fn register(
             move |url: ImmutableString, body: Dynamic, bearer: ImmutableString|
                   -> Result<Dynamic, Box<EvalAltResult>> {
                 http_post_impl(&agent, &pid, &url, body, &bearer, allow_loopback)
+            },
+        );
+    }
+
+    // http_patch(url, body_map_or_value, bearer) -> map | array | null
+    //
+    // Same shape as http_post but issues a PATCH — used by APIs
+    // that take partial-update bodies (e.g. Google Calendar's
+    // PATCH /calendars/{id}/events/{eventId}). ureq doesn't expose
+    // a `.patch()` shortcut, so we go through `.request("PATCH", url)`.
+    {
+        let agent = http_agent.clone();
+        let pid = plugin_id.to_owned();
+        engine.register_fn(
+            "http_patch",
+            move |url: ImmutableString, body: Dynamic, bearer: ImmutableString|
+                  -> Result<Dynamic, Box<EvalAltResult>> {
+                http_patch_impl(&agent, &pid, &url, body, &bearer, allow_loopback)
+            },
+        );
+    }
+
+    // http_delete(url, query_map, bearer) -> map | unit
+    //
+    // Issues a DELETE with optional query-string params (Google
+    // Calendar's DELETE accepts `sendNotifications` etc). Most
+    // DELETE endpoints return 204 No Content; `decode_response`
+    // already returns Dynamic::UNIT on an empty body so the script
+    // can branch with `if r == ()`.
+    {
+        let agent = http_agent.clone();
+        let pid = plugin_id.to_owned();
+        engine.register_fn(
+            "http_delete",
+            move |url: ImmutableString, query: Map, bearer: ImmutableString|
+                  -> Result<Dynamic, Box<EvalAltResult>> {
+                http_delete_impl(&agent, &pid, &url, &query, &bearer, allow_loopback)
             },
         );
     }
@@ -228,6 +266,49 @@ fn http_post_impl(
     let resp = req
         .send_json(body_json)
         .map_err(|e| ureq_to_eval_err(plugin_id, "http_post", url, e))?;
+    decode_response(plugin_id, url, resp)
+}
+
+fn http_patch_impl(
+    agent: &ureq::Agent,
+    plugin_id: &str,
+    url: &str,
+    body: Dynamic,
+    bearer: &str,
+    allow_loopback: bool,
+) -> Result<Dynamic, Box<EvalAltResult>> {
+    validate_url(plugin_id, "http_patch", url, allow_loopback)?;
+    let body_json = rhai_to_json(body)
+        .map_err(|e| EvalAltResult::ErrorRuntime(e.into(), rhai::Position::NONE))?;
+    let mut req = agent.request("PATCH", url);
+    if !bearer.is_empty() {
+        req = req.set("Authorization", &format!("Bearer {bearer}"));
+    }
+    let resp = req
+        .send_json(body_json)
+        .map_err(|e| ureq_to_eval_err(plugin_id, "http_patch", url, e))?;
+    decode_response(plugin_id, url, resp)
+}
+
+fn http_delete_impl(
+    agent: &ureq::Agent,
+    plugin_id: &str,
+    url: &str,
+    query: &Map,
+    bearer: &str,
+    allow_loopback: bool,
+) -> Result<Dynamic, Box<EvalAltResult>> {
+    validate_url(plugin_id, "http_delete", url, allow_loopback)?;
+    let mut req = agent.delete(url);
+    for (k, v) in map_to_query_iter(query) {
+        req = req.query(&k, &v);
+    }
+    if !bearer.is_empty() {
+        req = req.set("Authorization", &format!("Bearer {bearer}"));
+    }
+    let resp = req
+        .call()
+        .map_err(|e| ureq_to_eval_err(plugin_id, "http_delete", url, e))?;
     decode_response(plugin_id, url, resp)
 }
 
