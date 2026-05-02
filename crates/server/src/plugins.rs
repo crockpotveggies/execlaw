@@ -33,6 +33,14 @@ pub struct PluginSummary {
     pub enabled: bool,
     pub installed_at: i64,
     pub updated_at: i64,
+    /// True when the plugin's manifest declares any of the
+    /// configurable hooks the SPA renders a settings page for —
+    /// today that's just `[[oauth_accounts]]`. The SPA shows a
+    /// gear icon on rows where this is true, navigating to
+    /// `/settings/plugins/{plugin_id}`. Schema-driven
+    /// `[[settings_fields]]` lands later and flips this true for
+    /// plugins with operator-editable knobs but no OAuth.
+    pub has_settings_ui: bool,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -165,12 +173,25 @@ pub async fn list_handler(State(state): State<AppState>) -> impl IntoResponse {
         Ok(rows) => {
             let plugins: Vec<PluginSummary> = rows
                 .into_iter()
-                .map(|r| PluginSummary {
-                    plugin_id: r.plugin_id,
-                    version: r.version,
-                    enabled: r.enabled,
-                    installed_at: r.installed_at,
-                    updated_at: r.updated_at,
+                .map(|r| {
+                    // Re-parse the manifest_toml just to detect
+                    // the hooks the settings UI surfaces. Cheap
+                    // (small TOML) and the list endpoint is
+                    // operator-tier polling cadence, not a hot
+                    // path. If parsing fails (corrupt persisted
+                    // row), default to no settings UI rather than
+                    // failing the whole list.
+                    let has_settings_ui = execlaw_plugin_sdk::PluginManifest::parse(&r.manifest_toml)
+                        .map(|m| !m.oauth_accounts.is_empty())
+                        .unwrap_or(false);
+                    PluginSummary {
+                        plugin_id: r.plugin_id,
+                        version: r.version,
+                        enabled: r.enabled,
+                        installed_at: r.installed_at,
+                        updated_at: r.updated_at,
+                        has_settings_ui,
+                    }
                 })
                 .collect();
             (

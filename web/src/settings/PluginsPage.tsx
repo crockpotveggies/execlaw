@@ -3,6 +3,7 @@
 // switching to multipart lands when the upload-progress UI is needed.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
 import Spinner from "react-bootstrap/Spinner";
@@ -104,6 +105,18 @@ export function PluginsPage() {
                             >
                                 {p.enabled ? "enabled" : "disabled"}
                             </span>
+                            {p.has_settings_ui && p.enabled && (
+                                <Link
+                                    to={`/settings/plugins/${encodeURIComponent(p.plugin_id)}`}
+                                    className="btn btn-sm btn-link p-1 ms-1"
+                                    title="Configure"
+                                    aria-label={`Configure ${p.plugin_id}`}
+                                    data-testid="plugin-configure"
+                                    data-plugin-id={p.plugin_id}
+                                >
+                                    <i className="bi bi-gear" aria-hidden />
+                                </Link>
+                            )}
                         </div>
                         <div className="d-flex gap-2">
                             <Button

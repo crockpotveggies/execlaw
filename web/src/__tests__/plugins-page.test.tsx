@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { PluginsPage } from "../settings/PluginsPage";
 import { AuthProvider } from "../auth/AuthContext";
 
@@ -18,9 +19,11 @@ afterEach(() => {
 
 function mountPage() {
     return render(
-        <AuthProvider>
-            <PluginsPage />
-        </AuthProvider>,
+        <MemoryRouter>
+            <AuthProvider>
+                <PluginsPage />
+            </AuthProvider>
+        </MemoryRouter>,
     );
 }
 
@@ -161,5 +164,71 @@ describe("PluginsPage", () => {
         // The shape + content-type wiring of installPlugin is covered
         // by endpoints.test.ts; this UI test just guards the rendered
         // form surface.
+    });
+
+    it("renders a gear icon ONLY for enabled plugins with has_settings_ui", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") {
+                return new Response(
+                    JSON.stringify({
+                        user_id: "c1",
+                        username: "u",
+                        display_name: "U",
+                        email: null,
+                        role: "controller",
+                        last_login_at: null,
+                    }),
+                    { status: 200 },
+                );
+            }
+            if (url === "/api/admin/plugins") {
+                return new Response(
+                    JSON.stringify({
+                        plugins: [
+                            {
+                                plugin_id: "google-contacts",
+                                version: "0.1.0",
+                                enabled: true,
+                                installed_at: 0,
+                                updated_at: 0,
+                                has_settings_ui: true,
+                            },
+                            {
+                                plugin_id: "plain-tool",
+                                version: "0.1.0",
+                                enabled: true,
+                                installed_at: 0,
+                                updated_at: 0,
+                                has_settings_ui: false,
+                            },
+                            {
+                                plugin_id: "google-contacts-disabled",
+                                version: "0.1.0",
+                                enabled: false,
+                                installed_at: 0,
+                                updated_at: 0,
+                                has_settings_ui: true,
+                            },
+                        ],
+                    }),
+                    { status: 200 },
+                );
+            }
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        await waitFor(() => {
+            expect(screen.getByText("google-contacts")).toBeInTheDocument();
+        });
+        // Gear shown for the enabled + configurable row.
+        const gear = screen.getByTestId("plugin-configure");
+        expect(gear).toBeInTheDocument();
+        expect(gear.getAttribute("data-plugin-id")).toBe("google-contacts");
+        expect(gear.getAttribute("href")).toBe(
+            "/settings/plugins/google-contacts",
+        );
+        // Exactly one gear in the document — the disabled-but-configurable
+        // row and the enabled-but-not-configurable row both DON'T get one.
+        expect(screen.getAllByTestId("plugin-configure")).toHaveLength(1);
     });
 });

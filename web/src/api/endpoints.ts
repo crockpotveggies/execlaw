@@ -362,6 +362,10 @@ export interface PluginSummary {
     enabled: boolean;
     installed_at: number;
     updated_at: number;
+    /// True when the plugin's manifest declares hooks the SPA
+    /// renders a settings page for (today: any [[oauth_accounts]]).
+    /// Drives the gear icon on the Plugins page row.
+    has_settings_ui: boolean;
 }
 
 export interface PluginListResponse {
