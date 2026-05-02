@@ -120,8 +120,8 @@ export function MyIdentitiesCard() {
         "handle";
 
     return (
-        <div data-testid="my-identities-card">
-            <h3 className="h6 mb-1">My identities</h3>
+        <div className="execlaw-card mb-3" data-testid="my-identities-card">
+            <div className="execlaw-card__title mb-2">My identities</div>
             <p className="execlaw-muted small mb-3">
                 Transport-scoped handles that should resolve to you (the
                 controller). When a message lands on any of these handles
@@ -139,55 +139,49 @@ export function MyIdentitiesCard() {
             <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
             <div
-                className="execlaw-card mb-3"
-                data-testid="my-identities-add-card"
+                className="d-flex gap-2 align-items-end mb-3"
+                data-testid="my-identities-add-row"
             >
-                <div className="execlaw-card__title mb-2">
-                    Add an identifier
-                </div>
-                <div className="d-flex gap-2 align-items-end">
-                    <Form.Group className="flex-grow-0" controlId="ident-transport">
-                        <Form.Label className="small mb-1">Transport</Form.Label>
-                        <Form.Select
-                            value={transport}
-                            onChange={(e) => setTransport(e.target.value)}
-                            data-testid="my-identities-transport"
-                            style={{ minWidth: "10rem" }}
-                        >
-                            {TRANSPORT_HINTS.map((t) => (
-                                <option key={t.value} value={t.value}>
-                                    {t.label}
-                                </option>
-                            ))}
-                        </Form.Select>
-                    </Form.Group>
-                    <Form.Group className="flex-grow-1" controlId="ident-handle">
-                        <Form.Label className="small mb-1">Handle</Form.Label>
-                        <Form.Control
-                            type="text"
-                            value={handle}
-                            onChange={(e) => setHandle(e.target.value)}
-                            placeholder={placeholder}
-                            data-testid="my-identities-handle"
-                        />
-                    </Form.Group>
-                    <Button
-                        variant="primary"
-                        size="sm"
-                        onClick={() => void onAdd()}
-                        disabled={busy || handle.trim() === ""}
-                        data-testid="my-identities-add"
+                <Form.Group className="flex-grow-0" controlId="ident-transport">
+                    <Form.Label className="small mb-1">Transport</Form.Label>
+                    <Form.Select
+                        value={transport}
+                        onChange={(e) => setTransport(e.target.value)}
+                        data-testid="my-identities-transport"
+                        style={{ minWidth: "10rem" }}
                     >
-                        Add
-                    </Button>
-                </div>
+                        {TRANSPORT_HINTS.map((t) => (
+                            <option key={t.value} value={t.value}>
+                                {t.label}
+                            </option>
+                        ))}
+                    </Form.Select>
+                </Form.Group>
+                <Form.Group className="flex-grow-1" controlId="ident-handle">
+                    <Form.Label className="small mb-1">Handle</Form.Label>
+                    <Form.Control
+                        type="text"
+                        value={handle}
+                        onChange={(e) => setHandle(e.target.value)}
+                        placeholder={placeholder}
+                        data-testid="my-identities-handle"
+                    />
+                </Form.Group>
+                <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={() => void onAdd()}
+                    disabled={busy || handle.trim() === ""}
+                    data-testid="my-identities-add"
+                >
+                    Add
+                </Button>
             </div>
 
-            <div className="execlaw-card">
-                <div className="execlaw-card__title mb-2">
-                    Current identifiers
-                </div>
-                {data === null ? (
+            <div className="execlaw-muted small mb-2">
+                Current identifiers
+            </div>
+            {data === null ? (
                     <div className="execlaw-muted small">Loading…</div>
                 ) : (data.identifiers ?? []).length === 0 ? (
                     <div
@@ -224,7 +218,6 @@ export function MyIdentitiesCard() {
                         ))}
                     </ul>
                 )}
-            </div>
         </div>
     );
 }

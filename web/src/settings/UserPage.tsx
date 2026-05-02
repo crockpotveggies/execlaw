@@ -91,9 +91,7 @@ export function UserPage() {
                 rest of the operator-account surface. Sits above
                 Sessions because identifiers are about *who you are*,
                 not *where you're signed in*. */}
-            <div className="mt-4">
-                <MyIdentitiesCard />
-            </div>
+            <MyIdentitiesCard />
             <SessionsCard
                 signOutEverywhere={auth.signOutEverywhere}
                 navigate={navigate}
