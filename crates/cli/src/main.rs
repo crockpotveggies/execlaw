@@ -393,6 +393,160 @@ pub(crate) fn open_db(db_path: &Path, no_encrypt: bool) -> anyhow::Result<execla
     Ok(execlaw_core::Database::open(&cfg)?)
 }
 
+/// Build the runner image when it's missing OR older than the
+/// running control-plane binary. Operator workflow: bump source,
+/// `cargo build`, restart the control plane — the next supervisor
+/// boot rebuilds the runner image automatically without a manual
+/// `docker build` step.
+///
+/// Locates the workspace by walking up from the current
+/// executable looking for `Dockerfile.runner`. Production builds
+/// that don't ship the source tree fall through silently — the
+/// existing "image not present → warn + disable" path covers the
+/// no-build-context case.
+async fn ensure_runner_image_fresh(image: &str) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let exe = std::env::current_exe().context("locate current_exe")?;
+    let exe_mtime = std::fs::metadata(&exe)
+        .and_then(|m| m.modified())
+        .context("stat current_exe")?;
+
+    let workspace = match find_workspace_with_dockerfile(&exe) {
+        Some(p) => p,
+        None => {
+            tracing::debug!(
+                "runner image autobuild skipped: no Dockerfile.runner found \
+                 walking up from {}",
+                exe.display(),
+            );
+            return Ok(());
+        }
+    };
+
+    // Inspect the existing image. `docker image inspect <image>
+    // --format {{.Created}}` returns ISO-8601 on hit, non-zero
+    // exit on miss. We don't go through bollard here because the
+    // path also needs `docker build` and that's only via the CLI.
+    let inspect = std::process::Command::new("docker")
+        .args([
+            "image",
+            "inspect",
+            "--format",
+            "{{.Created}}",
+            image,
+        ])
+        .output();
+    let needs_build = match inspect {
+        Ok(out) if out.status.success() => {
+            let created_str = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            match chrono::DateTime::parse_from_rfc3339(&created_str) {
+                Ok(image_dt) => {
+                    let exe_dt: chrono::DateTime<chrono::Utc> = exe_mtime.into();
+                    let stale = image_dt.with_timezone(&chrono::Utc) < exe_dt;
+                    if stale {
+                        tracing::info!(
+                            image,
+                            image_created = %image_dt,
+                            exe_modified = %exe_dt,
+                            "runner image is older than the control-plane binary; \
+                             rebuilding",
+                        );
+                    } else {
+                        tracing::debug!(
+                            image,
+                            image_created = %image_dt,
+                            "runner image is up-to-date with the control-plane binary",
+                        );
+                    }
+                    stale
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        image,
+                        raw = %created_str,
+                        error = %e,
+                        "couldn't parse `docker image inspect` Created field; rebuilding to be safe",
+                    );
+                    true
+                }
+            }
+        }
+        Ok(_) => {
+            tracing::info!(
+                image,
+                "runner image not present locally; building from {}",
+                workspace.display(),
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                image,
+                error = %e,
+                "could not run `docker image inspect`; assuming Docker is not \
+                 available and skipping autobuild",
+            );
+            return Ok(());
+        }
+    };
+
+    if !needs_build {
+        return Ok(());
+    }
+
+    tracing::info!(
+        image,
+        workspace = %workspace.display(),
+        "running `docker build -f Dockerfile.runner -t {image} .` (this may take a few minutes on first run)",
+    );
+    let status = std::process::Command::new("docker")
+        .arg("build")
+        .arg("-f")
+        .arg("Dockerfile.runner")
+        .arg("-t")
+        .arg(image)
+        .arg(".")
+        .current_dir(&workspace)
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            tracing::info!(image, "runner image build succeeded");
+        }
+        Ok(s) => {
+            tracing::warn!(
+                image,
+                exit = ?s.code(),
+                "runner image build returned non-zero exit; supervisor may use \
+                 the previous image. Run the docker build manually to see the \
+                 full output.",
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                image,
+                error = %e,
+                "could not invoke `docker build`; supervisor will fall back \
+                 to the previous image (if any)",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Walk up from the executable looking for `Dockerfile.runner`.
+/// Returns the workspace root (containing the Dockerfile) on hit.
+/// `None` for production builds that ship without source.
+fn find_workspace_with_dockerfile(exe: &Path) -> Option<PathBuf> {
+    let mut cur: Option<&Path> = exe.parent();
+    while let Some(dir) = cur {
+        if dir.join("Dockerfile.runner").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
 fn cmd_install(
     no_encrypt: bool,
     system: bool,
@@ -1246,10 +1400,17 @@ async fn cmd_serve(
         use execlaw_server::runner_spawn::RunnerLauncher as _;
         match execlaw_server::runner_spawn::BollardRunnerLauncher::new() {
             Ok(launcher) => {
-                // Image-presence check. If the runner image
-                // doesn't exist, prewarm + every chat-path spawn
-                // will fail. Better to skip the supervisor
-                // entirely than to ship a hot-path failure mode.
+                // 2026-05-02 — autobuild the runner image when the
+                // current control-plane binary is newer than the
+                // image (or the image is missing). Operators
+                // restart the control plane to pick up new code;
+                // the runner is part of that surface and shouldn't
+                // need a separate `docker build` step they have to
+                // remember. Best-effort — production deployments
+                // without source on disk fall through to the old
+                // "warn + disable" branch when no Dockerfile is
+                // findable.
+                let _ = ensure_runner_image_fresh(&runner_image).await;
                 if launcher.image_present(&runner_image).await {
                     tracing::info!(
                         image = %runner_image,
