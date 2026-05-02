@@ -1038,8 +1038,18 @@ body {
 }
 
 .execlaw-mini-mascot__rotor {
-    transform-box: fill-box;
-    transform-origin: center;
+    // 2026-05-02 — `view-box` is the spec default for SVG
+    // elements but several browsers (Safari, older Chromium)
+    // silently fall back to `fill-box`, which puts the
+    // transform-origin in the rotor's own bounding-box frame.
+    // The mascot's hair extends much higher than the beard
+    // extends low, so the bbox centre is below the eye and the
+    // face wobbles in a tilted ellipse. Pinning to `view-box` +
+    // `50% 50%` rotates around the SVG canvas centre (627, 627
+    // for the 1254-unit viewBox), which is where the operator
+    // expects the pivot.
+    transform-box: view-box;
+    transform-origin: 50% 50%;
     animation: execlaw-mini-mascot-spin 1.6s linear infinite;
 }
 

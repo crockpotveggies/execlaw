@@ -11,7 +11,6 @@
 
 import { useEffect, useRef } from "react";
 import {
-    CANVAS_CENTER,
     EYE_PATH,
     BEARD_PATH,
     FALLBACK_EYE_CX,
@@ -131,12 +130,17 @@ export function MiniMascotSpinner({ size = 22, className }: Props) {
             }
         >
             {/* Rotating outer group — hair + beard + eye outline.
-                CSS class drives the spin so we don't pay a JS
-                animation tick per frame on every WS event flush. */}
-            <g
-                className="execlaw-mini-mascot__rotor"
-                style={{ transformOrigin: `${CANVAS_CENTER}px ${CANVAS_CENTER}px` }}
-            >
+                Pivot is the viewBox centre, not the group's
+                bounding-box centre: the mascot's hair extends
+                higher than the beard extends low, so the bbox
+                centre is below-of-eye and rotating around that
+                makes the face wobble. We pivot in viewBox-space
+                coordinates instead — see the `transform-box:
+                view-box` rule on `.execlaw-mini-mascot__rotor`
+                in theme.scss. CSS class drives the spin so we
+                don't pay a JS animation tick per frame on every
+                WS event flush. */}
+            <g className="execlaw-mini-mascot__rotor">
                 <path d={HAIR_PATH} fill="currentColor" />
                 <path d={BEARD_PATH} fill="currentColor" />
                 {/* Eye + iris share a parent <g ref> so the
