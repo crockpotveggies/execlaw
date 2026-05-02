@@ -196,9 +196,8 @@ impl PluginHost {
                         .insert(plugin_id.clone(), Arc::new(plugin));
                 }
                 execlaw_plugin_sdk::manifest::RuntimeTier::Script => {
-                    let source_rel = runtime_source_or_err(runtime).map_err(|e| {
+                    let source_rel = runtime_source_or_err(runtime).inspect_err(|_| {
                         self.inner.registry.disable(&plugin_id);
-                        e
                     })?;
                     let source_path = stage_path.join(source_rel);
                     let script = match execlaw_script::ScriptPlugin::from_file(

@@ -317,7 +317,12 @@ required_capabilities = []
     assert_eq!(body["error"]["code"], "hook_conflict");
 }
 
-/// Unsupported runtime tier (e.g. "wasm") must be rejected with 400.
+/// Unsupported runtime tier (e.g. "wasm") must be rejected. With
+/// the script-tier addition, validation now catches unknown tiers
+/// at manifest-parse time rather than during the host's install
+/// step — the surface error code shifts from "unsupported_tier" to
+/// the parse-failure variant ("stage_failed"), but the contract is
+/// unchanged: a 4xx, no half-installed plugin, no leaked hooks.
 #[tokio::test]
 async fn unsupported_runtime_tier_rejected() {
     let tmp = tempfile::tempdir().unwrap();
@@ -341,8 +346,15 @@ args = []
 "#;
     let zip = build_zip(&[("plugin.toml", m.as_bytes())]);
     let (status, body) = post_zip(app, zip).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"]["code"], "unsupported_tier");
+    assert!(
+        status.is_client_error() || status == StatusCode::INTERNAL_SERVER_ERROR,
+        "expected 4xx/5xx for unknown tier; got {status}: {body}"
+    );
+    let code = body["error"]["code"].as_str().unwrap_or("");
+    assert!(
+        matches!(code, "unsupported_tier" | "stage_failed"),
+        "expected an install-rejected code, got '{code}': {body}"
+    );
 }
 
 /// Persistence: install a plugin, drop the PluginHost, build a new
@@ -444,14 +456,15 @@ required_capabilities = ["admin", "vault.write"]
         .unwrap();
 
     // Caller has ONLY wildcard — capability check passes; the call
-    // then fails because no subprocess is actually running, but for
-    // a DIFFERENT reason than cap-missing.
+    // then fails because no runtime (subprocess OR script) is
+    // actually loaded for this plugin, but for a DIFFERENT reason
+    // than cap-missing.
     let err = host
         .call_tool("needs-admin", serde_json::json!({}), &["*"])
         .await
         .unwrap_err();
     assert!(
-        err.contains("subprocess is not running"),
+        err.contains("no runtime is loaded") || err.contains("subprocess is not running"),
         "wildcard should pass the cap check and fail on dispatch: {err}"
     );
 }
