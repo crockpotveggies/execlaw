@@ -208,6 +208,19 @@ pub enum InferenceError {
     Timeout,
 }
 
+/// Construct the reqwest client every `InferenceClient::new` uses.
+/// Centralised so the timeout / pool / keepalive knobs that bit
+/// operators in production stay in one obvious place.
+fn base_inference_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .pool_idle_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(120))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .build()
+        .expect("reqwest client build")
+}
+
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
@@ -229,10 +242,30 @@ impl InferenceClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self::with_client(
             base_url,
-            reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .build()
-                .expect("reqwest client build"),
+            // 2026-05-02 — reqwest's plain `.timeout()` covers
+            // request-build + send + complete-response-read. For
+            // streaming chat that's far too coarse: a long
+            // multi-round agent conversation can exceed 120s on the
+            // wire. Worse, the OLD client config bit operators
+            // staring at a ~49s stall before a 500: reqwest's
+            // connection pool would hand back a half-open keep-alive
+            // socket vLLM had already closed during a backend
+            // restart, and the client waited for the OS-level TCP
+            // retransmit window before bailing. Now:
+            //
+            //   * `connect_timeout(10s)` → a half-open / unreachable
+            //     vLLM fails in ~10s, not ~50s.
+            //   * `pool_idle_timeout(15s)` → stale sockets are
+            //     dropped from the pool 15s after their last use,
+            //     well under the typical interval between turns,
+            //     so the next turn opens a fresh connection.
+            //   * `read_timeout(120s)` → guards against vLLM going
+            //     silent mid-stream without holding the socket
+            //     forever.
+            //   * `tcp_keepalive(30s)` → kernel-side keepalive on
+            //     long-lived agent turns surfaces a dead remote as
+            //     a transport error rather than a hang.
+            base_inference_http_client(),
         )
     }
 
