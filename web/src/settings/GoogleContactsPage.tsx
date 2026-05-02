@@ -1,22 +1,14 @@
-// Settings → Google Contacts (Phase 9, plugin-google-contacts).
+// Settings → Google Contacts plugin config (Phase 9, plugin-google-contacts).
 //
-// Three states:
+// Renders the OAuth client form + Connect/Disconnect dance for the
+// `google-contacts` plugin. Mounted by `PluginConfigRouter` inside
+// the `PluginConfigShell`, which owns the page header (back button +
+// title + version badge) and the danger-zone footer (Uninstall) —
+// this component cannot remove either.
 //
-//   1. Plugin not installed              — page shows install hint
-//      pointing to Settings → Plugins.
-//   2. Installed, no client config       — form to paste Google
-//      OAuth client_id + client_secret + redirect URI (defaults to
-//      this server's /api/oauth/google/callback).
-//   3. Configured                        — shows redacted client_id,
-//      "Connect Account" button (or "Connected as alice@example.com"
-//      + Disconnect) and a Refresh button to recheck.
-//
-// First plugin to ride the new generic OAuth machinery; subsequent
-// Google plugins (calendar, gmail) get a near-identical page that
-// just changes the plugin_id constant + scope list. When the
-// generic ui_panels rendering mechanism lands (Phase 10+), the
-// hardcoded route here goes away in favour of a manifest-driven
-// mount point.
+// Implements the `PluginConfigComponent` contract from
+// `PluginConfigBase.tsx` so a future plugin with the same shape
+// can be a sibling component without touching the shell.
 
 import { useCallback, useEffect, useState } from "react";
 import Button from "react-bootstrap/Button";
@@ -32,8 +24,8 @@ import {
 import { ApiError } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
+import type { PluginConfigProps } from "./PluginConfigBase";
 
-const PLUGIN_ID = "google-contacts";
 const ACCOUNT_NAME = "controller";
 const PROVIDER = "google";
 const DEFAULT_SCOPES: ReadonlyArray<string> = [
@@ -70,7 +62,8 @@ function fromRow(c: OauthClientView): FormState {
     };
 }
 
-export function GoogleContactsPage() {
+export function GoogleContactsPage(props: PluginConfigProps) {
+    const { pluginId, onConfigChanged } = props;
     const { getAccessToken } = useAuth();
     const [client, setClient] = useState<OauthClientView | null | "loading">(
         "loading",
@@ -81,11 +74,15 @@ export function GoogleContactsPage() {
         null,
     );
 
+    const notifyShell = useCallback(() => {
+        if (onConfigChanged) onConfigChanged();
+    }, [onConfigChanged]);
+
     const refresh = useCallback(async () => {
         setError(null);
         try {
             const c = await getOauthClient(
-                PLUGIN_ID,
+                pluginId,
                 ACCOUNT_NAME,
                 getAccessToken,
             );
@@ -104,7 +101,7 @@ export function GoogleContactsPage() {
                 setClient(null);
             }
         }
-    }, [getAccessToken]);
+    }, [getAccessToken, pluginId]);
 
     useEffect(() => {
         void refresh();
@@ -115,7 +112,7 @@ export function GoogleContactsPage() {
         setBusy("save");
         try {
             const updated = await upsertOauthClient(
-                PLUGIN_ID,
+                pluginId,
                 ACCOUNT_NAME,
                 {
                     provider: PROVIDER,
@@ -128,18 +125,19 @@ export function GoogleContactsPage() {
             );
             setClient(updated);
             setForm(fromRow(updated));
+            notifyShell();
         } catch (e) {
             setError(e instanceof Error ? e.message : "save failed");
         } finally {
             setBusy(null);
         }
-    }, [form, getAccessToken]);
+    }, [form, getAccessToken, notifyShell, pluginId]);
 
     const onConnect = useCallback(async () => {
         setError(null);
         setBusy("connect");
         try {
-            const r = await connectOauth(PLUGIN_ID, ACCOUNT_NAME, getAccessToken);
+            const r = await connectOauth(pluginId, ACCOUNT_NAME, getAccessToken);
             // Open in a new tab — Google's consent screen lives at
             // accounts.google.com and they reject embedding via X-Frame.
             window.open(r.authorize_url, "_blank", "noopener,noreferrer");
@@ -151,57 +149,57 @@ export function GoogleContactsPage() {
         } finally {
             setBusy(null);
         }
-    }, [getAccessToken]);
+    }, [getAccessToken, pluginId]);
 
     const onDisconnect = useCallback(async () => {
         setError(null);
         setBusy("disconnect");
         try {
-            await disconnectOauth(PLUGIN_ID, ACCOUNT_NAME, getAccessToken);
+            await disconnectOauth(pluginId, ACCOUNT_NAME, getAccessToken);
             await refresh();
+            notifyShell();
         } catch (e) {
             setError(e instanceof Error ? e.message : "disconnect failed");
         } finally {
             setBusy(null);
         }
-    }, [getAccessToken, refresh]);
+    }, [getAccessToken, notifyShell, pluginId, refresh]);
 
     const onDeleteClient = useCallback(async () => {
         setError(null);
         setBusy("delete");
         try {
-            await deleteOauthClient(PLUGIN_ID, ACCOUNT_NAME, getAccessToken);
+            await deleteOauthClient(pluginId, ACCOUNT_NAME, getAccessToken);
             setClient(null);
             setForm({ ...EMPTY_FORM, redirect_uri: defaultRedirectUri() });
+            notifyShell();
         } catch (e) {
             setError(e instanceof Error ? e.message : "delete failed");
         } finally {
             setBusy(null);
         }
-    }, [getAccessToken]);
+    }, [getAccessToken, notifyShell, pluginId]);
 
     if (client === "loading") {
         return (
-            <section className="execlaw-settings__section">
-                <div className="execlaw-muted small">Loading…</div>
-            </section>
+            <div className="execlaw-muted small">Loading…</div>
         );
     }
 
     return (
-        <section className="execlaw-settings__section" data-testid="google-contacts-page">
-            <header className="execlaw-settings__head">
-                <h3 className="h6 mb-0">
+        <div data-testid="google-contacts-page">
+            <div className="execlaw-card mb-3">
+                <div className="execlaw-card__title">
                     <i className="bi bi-person-vcard me-2" aria-hidden />
                     Google Contacts
-                </h3>
-                <div className="execlaw-muted small mt-1">
-                    Connects the <code>google-contacts</code> plugin to your
+                </div>
+                <div className="execlaw-muted small">
+                    Connects the <code>{pluginId}</code> plugin to your
                     Google account. Saved contacts auto-trust as Contact-class
                     principals; the <code>contacts.list</code> tool becomes
                     available on chat turns.
                 </div>
-            </header>
+            </div>
 
             {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
 
@@ -433,6 +431,6 @@ export function GoogleContactsPage() {
                     </li>
                 </ol>
             </details>
-        </section>
+        </div>
     );
 }

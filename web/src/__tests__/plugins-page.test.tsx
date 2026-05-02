@@ -220,15 +220,127 @@ describe("PluginsPage", () => {
         await waitFor(() => {
             expect(screen.getByText("google-contacts")).toBeInTheDocument();
         });
-        // Gear shown for the enabled + configurable row.
-        const gear = screen.getByTestId("plugin-configure");
-        expect(gear).toBeInTheDocument();
-        expect(gear.getAttribute("data-plugin-id")).toBe("google-contacts");
-        expect(gear.getAttribute("href")).toBe(
+        // Gear shown for every configurable row regardless of
+        // enabled-state — operators may want to manage credentials
+        // on a disabled plugin or uninstall it via the config page.
+        const gears = screen.getAllByTestId("plugin-configure");
+        expect(gears).toHaveLength(2); // google-contacts + google-contacts-disabled
+        const ids = gears.map((g) => g.getAttribute("data-plugin-id")).sort();
+        expect(ids).toEqual(["google-contacts", "google-contacts-disabled"]);
+        // Each href points at the per-plugin nested route.
+        expect(
+            gears.find((g) => g.getAttribute("data-plugin-id") === "google-contacts")?.getAttribute("href"),
+        ).toBe("/settings/plugins/google-contacts");
+        // The plain-tool row (has_settings_ui=false) has no gear.
+        // Toggle icon present on every row regardless.
+        const toggles = screen.getAllByTestId("plugin-toggle");
+        expect(toggles).toHaveLength(3);
+        // Enabled rows show toggle-on, disabled shows toggle-off —
+        // distinguished via data-enabled (avoids brittle icon-class
+        // assertions).
+        const states = toggles.map((t) => t.getAttribute("data-enabled")).sort();
+        expect(states).toEqual(["false", "true", "true"]);
+    });
+
+    it("plugin title links to the config page when has_settings_ui (no underline)", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") {
+                return new Response(
+                    JSON.stringify({
+                        user_id: "c1",
+                        username: "u",
+                        display_name: "U",
+                        email: null,
+                        role: "controller",
+                        last_login_at: null,
+                    }),
+                    { status: 200 },
+                );
+            }
+            if (url === "/api/admin/plugins") {
+                return new Response(
+                    JSON.stringify({
+                        plugins: [
+                            {
+                                plugin_id: "google-contacts",
+                                version: "0.1.0",
+                                enabled: true,
+                                installed_at: 0,
+                                updated_at: 0,
+                                has_settings_ui: true,
+                            },
+                            {
+                                plugin_id: "plain-tool",
+                                version: "0.1.0",
+                                enabled: true,
+                                installed_at: 0,
+                                updated_at: 0,
+                                has_settings_ui: false,
+                            },
+                        ],
+                    }),
+                    { status: 200 },
+                );
+            }
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        await waitFor(() => {
+            expect(screen.getByText("google-contacts")).toBeInTheDocument();
+        });
+        // Configurable row's title is a Link to the config page.
+        const titleLink = screen.getByTestId("plugin-title-link");
+        expect(titleLink.getAttribute("data-plugin-id")).toBe("google-contacts");
+        expect(titleLink.getAttribute("href")).toBe(
             "/settings/plugins/google-contacts",
         );
-        // Exactly one gear in the document — the disabled-but-configurable
-        // row and the enabled-but-not-configurable row both DON'T get one.
-        expect(screen.getAllByTestId("plugin-configure")).toHaveLength(1);
+        // Underline removed via text-decoration-none.
+        expect(titleLink.className).toContain("text-decoration-none");
+        expect(titleLink.className).toContain("text-body");
+        // Plain-tool row has no link — title rendered as a plain span.
+        expect(screen.getAllByTestId("plugin-title-link")).toHaveLength(1);
+    });
+
+    it("does not render an Uninstall button on the row (moved to config page danger zone)", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") {
+                return new Response(
+                    JSON.stringify({
+                        user_id: "c1",
+                        username: "u",
+                        display_name: "U",
+                        email: null,
+                        role: "controller",
+                        last_login_at: null,
+                    }),
+                    { status: 200 },
+                );
+            }
+            if (url === "/api/admin/plugins") {
+                return new Response(
+                    JSON.stringify({
+                        plugins: [
+                            {
+                                plugin_id: "alpha",
+                                version: "1.0.0",
+                                enabled: true,
+                                installed_at: 0,
+                                updated_at: 0,
+                                has_settings_ui: false,
+                            },
+                        ],
+                    }),
+                    { status: 200 },
+                );
+            }
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        await waitFor(() => {
+            expect(screen.getByText("alpha")).toBeInTheDocument();
+        });
+        expect(screen.queryByTestId("plugin-uninstall")).toBeNull();
+        // No "Uninstall" text either.
+        expect(screen.queryByText(/Uninstall/i)).toBeNull();
     });
 });

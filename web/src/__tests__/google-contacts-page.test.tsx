@@ -30,7 +30,10 @@ const meResponse = () =>
 function mountPage() {
     return render(
         <AuthProvider>
-            <GoogleContactsPage />
+            <GoogleContactsPage
+                pluginId="google-contacts"
+                pluginVersion="0.1.0"
+            />
         </AuthProvider>,
     );
 }

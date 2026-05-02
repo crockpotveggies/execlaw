@@ -12,7 +12,6 @@ import {
     enablePlugin,
     installPlugin,
     listPlugins,
-    uninstallPlugin,
     type PluginSummary,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
@@ -55,22 +54,8 @@ export function PluginsPage() {
         [fetchList, getToken],
     );
 
-    const onUninstall = useCallback(
-        async (p: PluginSummary) => {
-            if (!confirm(`Uninstall plugin "${p.plugin_id}"? This is permanent.`))
-                return;
-            setBusyId(p.plugin_id);
-            try {
-                await uninstallPlugin(p.plugin_id, getToken);
-                await fetchList();
-            } catch (e) {
-                setError(e instanceof Error ? e.message : String(e));
-            } finally {
-                setBusyId(null);
-            }
-        },
-        [fetchList, getToken],
-    );
+    // Uninstall lives on the per-plugin config page's danger zone
+    // now (PluginConfigShell). The row only has gear + toggle.
 
     return (
         <div data-testid="settings-plugins">
@@ -91,9 +76,20 @@ export function PluginsPage() {
                     <div className="execlaw-card" key={p.plugin_id}>
                         <div className="d-flex align-items-center gap-2 mb-2">
                             <i className="bi bi-plug" aria-hidden />
-                            <span className="execlaw-card__title flex-grow-1">
-                                {p.plugin_id}
-                            </span>
+                            {p.has_settings_ui ? (
+                                <Link
+                                    to={`/settings/plugins/${encodeURIComponent(p.plugin_id)}`}
+                                    className="execlaw-card__title flex-grow-1 text-decoration-none text-body"
+                                    data-testid="plugin-title-link"
+                                    data-plugin-id={p.plugin_id}
+                                >
+                                    {p.plugin_id}
+                                </Link>
+                            ) : (
+                                <span className="execlaw-card__title flex-grow-1">
+                                    {p.plugin_id}
+                                </span>
+                            )}
                             <span className="execlaw-muted small">
                                 v{p.version}
                             </span>
@@ -105,37 +101,42 @@ export function PluginsPage() {
                             >
                                 {p.enabled ? "enabled" : "disabled"}
                             </span>
-                            {p.has_settings_ui && p.enabled && (
+                            {p.has_settings_ui && (
                                 <Link
                                     to={`/settings/plugins/${encodeURIComponent(p.plugin_id)}`}
-                                    className="btn btn-sm btn-link p-1 ms-1"
+                                    className="btn btn-sm btn-link p-1 ms-1 text-body"
                                     title="Configure"
                                     aria-label={`Configure ${p.plugin_id}`}
                                     data-testid="plugin-configure"
                                     data-plugin-id={p.plugin_id}
                                 >
-                                    <i className="bi bi-gear" aria-hidden />
+                                    <i className="bi bi-gear fs-5" aria-hidden />
                                 </Link>
                             )}
-                        </div>
-                        <div className="d-flex gap-2">
                             <Button
+                                variant="link"
                                 size="sm"
-                                variant={p.enabled ? "outline-secondary" : "outline-primary"}
+                                className="p-1 text-body"
                                 disabled={busyId === p.plugin_id}
                                 onClick={() => void onToggle(p)}
                                 data-testid="plugin-toggle"
+                                title={p.enabled ? "Disable plugin" : "Enable plugin"}
+                                aria-label={
+                                    p.enabled
+                                        ? `Disable ${p.plugin_id}`
+                                        : `Enable ${p.plugin_id}`
+                                }
+                                data-enabled={p.enabled}
                             >
-                                {p.enabled ? "Disable" : "Enable"}
-                            </Button>
-                            <Button
-                                size="sm"
-                                variant="outline-danger"
-                                disabled={busyId === p.plugin_id}
-                                onClick={() => void onUninstall(p)}
-                                data-testid="plugin-uninstall"
-                            >
-                                Uninstall
+                                <i
+                                    className={
+                                        "bi fs-5 " +
+                                        (p.enabled
+                                            ? "bi-toggle-on text-success"
+                                            : "bi-toggle-off")
+                                    }
+                                    aria-hidden
+                                />
                             </Button>
                         </div>
                     </div>
