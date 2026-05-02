@@ -219,6 +219,17 @@ pub async fn install_handler(
         }
     };
 
+    // Reflect the new tool surface into `config_tool_access`. Without
+    // this, Settings → Tools (and the per-turn dispatch gate's policy
+    // check) keeps serving the OLD tool list until the next server
+    // restart hits the boot-time sync. For an upgrade, the OLD plugin
+    // tools were removed from the registry by `host.upgrade()` — so we
+    // mark them removed in the DB first, then re-sync the new set.
+    // The order matters: mark-removed flips removed_at on every prior
+    // row, then sync upserts the current set with removed_at=NULL,
+    // leaving stale tools (e.g. one that 0.2 dropped) correctly tagged.
+    sync_after_lifecycle_change(&state, &row.plugin_id);
+
     (
         StatusCode::OK,
         Json(serde_json::json!(InstallResponse {
@@ -227,6 +238,36 @@ pub async fn install_handler(
         })),
     )
         .into_response()
+}
+
+/// Re-sync `config_tool_access` after a plugin lifecycle handler
+/// mutated the in-memory registry. Best-effort: a sync failure is
+/// logged but doesn't fail the operator's request — the worst case
+/// is Settings → Tools renders stale until the next call (or next
+/// server boot, which always runs the same sync).
+fn sync_after_lifecycle_change(state: &AppState, plugin_id: &str) {
+    let now = chrono::Utc::now().timestamp();
+    if let Err(e) = crate::tool_sync::mark_plugin_tools_removed(
+        &state.db,
+        plugin_id,
+        &state.plugin_host,
+        now,
+    ) {
+        tracing::warn!(
+            plugin_id = %plugin_id,
+            error = %e,
+            "mark_plugin_tools_removed failed during lifecycle sync",
+        );
+    }
+    if let Err(e) =
+        crate::tool_sync::sync_tool_access(&state.db, &state.plugin_host, now)
+    {
+        tracing::warn!(
+            plugin_id = %plugin_id,
+            error = %e,
+            "sync_tool_access failed during lifecycle sync",
+        );
+    }
 }
 
 /// `GET /api/admin/plugins`
@@ -300,7 +341,12 @@ pub async fn enable_handler(
     Path(plugin_id): Path<String>,
 ) -> impl IntoResponse {
     match state.plugin_host.enable(&plugin_id).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(()) => {
+            // Re-enable re-registers hooks; the previous disable left
+            // `removed_at` set on every owned row. Sync clears it.
+            sync_after_lifecycle_change(&state, &plugin_id);
+            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+        }
         Err(e) => plugin_error_response(e),
     }
 }
@@ -323,7 +369,24 @@ pub async fn disable_handler(
     Path(plugin_id): Path<String>,
 ) -> impl IntoResponse {
     match state.plugin_host.disable(&plugin_id).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(()) => {
+            // Disable removes hooks; mark every owned tool removed
+            // so the dispatch gate stops accepting them.
+            let now = chrono::Utc::now().timestamp();
+            if let Err(e) = crate::tool_sync::mark_plugin_tools_removed(
+                &state.db,
+                &plugin_id,
+                &state.plugin_host,
+                now,
+            ) {
+                tracing::warn!(
+                    plugin_id = %plugin_id,
+                    error = %e,
+                    "mark_plugin_tools_removed failed on disable",
+                );
+            }
+            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+        }
         Err(e) => plugin_error_response(e),
     }
 }
@@ -346,7 +409,25 @@ pub async fn uninstall_handler(
     Path(plugin_id): Path<String>,
 ) -> impl IntoResponse {
     match state.plugin_host.uninstall(&plugin_id).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(()) => {
+            // Same shape as disable: every owned tool gets
+            // `removed_at` so the SPA's tools panel + the dispatch
+            // gate both immediately reflect the removal.
+            let now = chrono::Utc::now().timestamp();
+            if let Err(e) = crate::tool_sync::mark_plugin_tools_removed(
+                &state.db,
+                &plugin_id,
+                &state.plugin_host,
+                now,
+            ) {
+                tracing::warn!(
+                    plugin_id = %plugin_id,
+                    error = %e,
+                    "mark_plugin_tools_removed failed on uninstall",
+                );
+            }
+            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+        }
         Err(e) => plugin_error_response(e),
     }
 }

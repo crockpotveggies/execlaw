@@ -385,6 +385,134 @@ async fn install_with_if_existing_upgrade_replaces_old_version() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upgrade_refreshes_config_tool_access_so_settings_tools_isnt_stale() {
+    // Regression: lifecycle handlers used to skip the
+    // `sync_tool_access` + `mark_plugin_tools_removed` calls, so an
+    // operator who upgraded a plugin to a manifest with new tools
+    // saw the OLD tool list in Settings → Tools until the next
+    // server restart.
+    use execlaw_core::tool_access::ToolAccessStore;
+
+    const MANIFEST_V1_TWO_TOOLS: &str = r#"
+[plugin]
+id = "tools-upgrade-test"
+name = "Tools Upgrade Test"
+version = "0.1.0"
+description = "v1"
+author = "execlaw-test"
+license = "AGPL-3.0-or-later"
+
+[[tools]]
+name = "tut.alpha"
+description = "v1 tool"
+latency = "low"
+
+[[tools]]
+name = "tut.beta"
+description = "v1 tool kept across upgrade"
+latency = "low"
+
+[runtime]
+tier = "script"
+source = "main.rhai"
+"#;
+
+    const MANIFEST_V2_THREE_TOOLS: &str = r#"
+[plugin]
+id = "tools-upgrade-test"
+name = "Tools Upgrade Test"
+version = "0.2.0"
+description = "v2"
+author = "execlaw-test"
+license = "AGPL-3.0-or-later"
+
+[[tools]]
+name = "tut.beta"
+description = "kept"
+latency = "low"
+
+[[tools]]
+name = "tut.gamma"
+description = "new in v2"
+latency = "low"
+
+[[tools]]
+name = "tut.delta"
+description = "also new in v2"
+latency = "low"
+
+[runtime]
+tier = "script"
+source = "main.rhai"
+"#;
+
+    let stage_dir = tempfile::tempdir().unwrap();
+    let (app, state) = build_app(stage_dir.path().to_path_buf());
+
+    // Install v0.1 — registers tut.alpha + tut.beta.
+    let v1_zip = build_zip(&[
+        ("plugin.toml", MANIFEST_V1_TWO_TOOLS.as_bytes()),
+        ("main.rhai", TINY_SCRIPT.as_bytes()),
+    ]);
+    let (status, body) = post_zip_with_query(app.clone(), v1_zip, "").await;
+    assert_eq!(status, StatusCode::OK, "v1 install body: {body}");
+
+    let store = ToolAccessStore::new(&state.db);
+    let alpha_v1 = store
+        .get("tut.alpha")
+        .unwrap()
+        .expect("tut.alpha must be in config_tool_access after v1 install");
+    assert!(
+        alpha_v1.removed_at.is_none(),
+        "fresh install must clear removed_at",
+    );
+    assert!(
+        store.get("tut.beta").unwrap().is_some(),
+        "tut.beta must appear after v1 install",
+    );
+    assert!(
+        store.get("tut.gamma").unwrap().is_none(),
+        "v2-only tool must not exist yet",
+    );
+
+    // Upgrade to v0.2. tut.alpha is dropped; tut.beta survives;
+    // tut.gamma + tut.delta are new.
+    let v2_zip = build_zip(&[
+        ("plugin.toml", MANIFEST_V2_THREE_TOOLS.as_bytes()),
+        ("main.rhai", TINY_SCRIPT.as_bytes()),
+    ]);
+    let (status, body) =
+        post_zip_with_query(app, v2_zip, "if_existing=upgrade").await;
+    assert_eq!(status, StatusCode::OK, "upgrade body: {body}");
+
+    // tut.alpha must be marked removed — it's gone from the new
+    // manifest, the dispatch gate should refuse it.
+    let alpha_after = store.get("tut.alpha").unwrap().expect("row stays");
+    assert!(
+        alpha_after.removed_at.is_some(),
+        "dropped tool must be marked removed_at after upgrade, got: {alpha_after:?}",
+    );
+    // tut.beta survives the upgrade with removed_at cleared.
+    let beta_after = store.get("tut.beta").unwrap().expect("row exists");
+    assert!(
+        beta_after.removed_at.is_none(),
+        "kept tool must have removed_at cleared after upgrade",
+    );
+    // tut.gamma + tut.delta now appear and are NOT marked removed.
+    let gamma_after = store
+        .get("tut.gamma")
+        .unwrap()
+        .expect("new v2 tool must be inserted on upgrade");
+    assert!(gamma_after.removed_at.is_none());
+    assert_eq!(gamma_after.source_id.as_deref(), Some("tools-upgrade-test"));
+    let delta_after = store
+        .get("tut.delta")
+        .unwrap()
+        .expect("new v2 tool must be inserted on upgrade");
+    assert!(delta_after.removed_at.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn if_existing_upgrade_falls_through_to_install_when_no_existing_row() {
     // Operator's SPA flow: hit install with ?if_existing=upgrade
     // unconditionally on the second attempt after a 409. If the
