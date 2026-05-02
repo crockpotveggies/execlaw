@@ -75,7 +75,6 @@ export function PluginsPage() {
                 plugins.map((p) => (
                     <div className="execlaw-card" key={p.plugin_id}>
                         <div className="d-flex align-items-center gap-2 mb-2">
-                            <i className="bi bi-plug" aria-hidden />
                             {p.has_settings_ui ? (
                                 <Link
                                     to={`/settings/plugins/${encodeURIComponent(p.plugin_id)}`}
