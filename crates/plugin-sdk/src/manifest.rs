@@ -241,23 +241,82 @@ pub struct SkillDecl {
     pub entry: String,
 }
 
-/// How the plugin's code actually runs (§4.4).
+/// How the plugin's code actually runs.
+///
+/// Two tiers are supported:
+///
+/// * **`subprocess`** — the original isolation tier. Plugin is a
+///   binary the host spawns; communication is JSON-RPC over stdio.
+///   Use for plugins that need native code (audio pipelines, ffmpeg,
+///   signal-cli, ONNX vision models, etc.). Requires `executable`.
+///
+/// * **`script`** — embedded Rhai interpreter. Plugin is a `.rhai`
+///   file the host loads + runs in-process under a sandbox.
+///   Use for HTTP-API wrappers, identity providers, simple
+///   transforms — anything that doesn't need native deps.
+///   Requires `source`. **No compilation cost; install ZIP is
+///   the script + the manifest.**
+///
+/// The validator enforces the right field is set per tier so a
+/// script plugin can't accidentally smuggle in a binary executable
+/// path and vice versa.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeDecl {
-    /// Which isolation tier — `"subprocess"` is the only one supported
-    /// in Phase 2. `"wasm"` and `"container"` land later.
+    /// `"subprocess"` or `"script"`. WASM lands later.
     pub tier: String,
     /// Path to the executable, relative to the plugin's staged root.
     /// Examples: `"node"` (resolved via PATH), `"./dist/plugin"`.
-    pub executable: String,
+    /// Required for `tier = "subprocess"`; ignored for `"script"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    /// Path to the Rhai source file, relative to the plugin's
+    /// staged root. Example: `"main.rhai"`. Required for
+    /// `tier = "script"`; ignored for `"subprocess"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// Arguments passed to the executable, in order.
+    /// (Subprocess tier only; ignored for script.)
     #[serde(default)]
     pub args: Vec<String>,
     /// Environment variables to set for the child. Secret references
     /// (`secret://<plugin_id>/<name>`) are resolved by the host
     /// against the vault before spawn.
+    /// (Subprocess tier only; ignored for script.)
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+}
+
+/// Symbolic tier choice. Parsed from the manifest's
+/// `runtime.tier` string field; surfaced to the host so it can
+/// dispatch to the right loader without re-stringly-comparing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeTier {
+    Subprocess,
+    Script,
+}
+
+impl RuntimeTier {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "subprocess" => Some(Self::Subprocess),
+            "script" => Some(Self::Script),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Subprocess => "subprocess",
+            Self::Script => "script",
+        }
+    }
+}
+
+impl RuntimeDecl {
+    /// Parsed tier or `None` if `tier` is not a known string.
+    pub fn parsed_tier(&self) -> Option<RuntimeTier> {
+        RuntimeTier::parse(&self.tier)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -274,6 +333,12 @@ pub enum ManifestError {
     DuplicateOauth(String),
     #[error("duplicate ui panel mount: '{0}'")]
     DuplicatePanel(String),
+    #[error("unknown runtime.tier '{0}' (must be 'subprocess' or 'script')")]
+    UnknownRuntimeTier(String),
+    #[error("runtime.tier = 'subprocess' requires 'executable'")]
+    SubprocessMissingExecutable,
+    #[error("runtime.tier = 'script' requires 'source' (path to .rhai file)")]
+    ScriptMissingSource,
 }
 
 impl PluginManifest {
@@ -315,6 +380,37 @@ impl PluginManifest {
         for p in &self.ui_panels {
             if !seen.insert(&p.mount) {
                 return Err(ManifestError::DuplicatePanel(p.mount.clone()));
+            }
+        }
+
+        // Runtime tier validation. Only enforce when [runtime] is
+        // present; some plugins (transports declared by external
+        // controllers, future tiers) may legitimately omit it.
+        if let Some(rt) = &self.runtime {
+            let tier = rt
+                .parsed_tier()
+                .ok_or_else(|| ManifestError::UnknownRuntimeTier(rt.tier.clone()))?;
+            match tier {
+                RuntimeTier::Subprocess => {
+                    let has_exe = rt
+                        .executable
+                        .as_ref()
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false);
+                    if !has_exe {
+                        return Err(ManifestError::SubprocessMissingExecutable);
+                    }
+                }
+                RuntimeTier::Script => {
+                    let has_src = rt
+                        .source
+                        .as_ref()
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false);
+                    if !has_src {
+                        return Err(ManifestError::ScriptMissingSource);
+                    }
+                }
             }
         }
 
@@ -433,5 +529,96 @@ mod tests {
         let m = PluginManifest::parse(tiny).unwrap();
         assert!(m.tools.is_empty());
         assert!(m.oauth_accounts.is_empty());
+    }
+
+    #[test]
+    fn subprocess_tier_requires_executable() {
+        let bad = r#"
+            [plugin]
+            id = "p"
+            name = "P"
+            version = "0.1.0"
+
+            [runtime]
+            tier = "subprocess"
+        "#;
+        let err = PluginManifest::parse(bad).unwrap_err();
+        assert!(matches!(err, ManifestError::SubprocessMissingExecutable));
+    }
+
+    #[test]
+    fn script_tier_requires_source() {
+        let bad = r#"
+            [plugin]
+            id = "p"
+            name = "P"
+            version = "0.1.0"
+
+            [runtime]
+            tier = "script"
+        "#;
+        let err = PluginManifest::parse(bad).unwrap_err();
+        assert!(matches!(err, ManifestError::ScriptMissingSource));
+    }
+
+    #[test]
+    fn script_tier_with_source_parses_cleanly() {
+        let ok = r#"
+            [plugin]
+            id = "google-contacts"
+            name = "Google Contacts"
+            version = "0.1.0"
+
+            [identity_provider]
+            resolves = ["email", "phone"]
+            trust_hint_default = "Contact"
+            confidence_ceiling = 0.95
+
+            [runtime]
+            tier = "script"
+            source = "main.rhai"
+        "#;
+        let m = PluginManifest::parse(ok).unwrap();
+        let rt = m.runtime.unwrap();
+        assert_eq!(rt.parsed_tier(), Some(RuntimeTier::Script));
+        assert_eq!(rt.source.as_deref(), Some("main.rhai"));
+        assert!(rt.executable.is_none());
+    }
+
+    #[test]
+    fn unknown_tier_rejected() {
+        let bad = r#"
+            [plugin]
+            id = "p"
+            name = "P"
+            version = "0.1.0"
+
+            [runtime]
+            tier = "wasm"
+            source = "main.wasm"
+        "#;
+        let err = PluginManifest::parse(bad).unwrap_err();
+        assert!(matches!(err, ManifestError::UnknownRuntimeTier(_)));
+    }
+
+    #[test]
+    fn subprocess_tier_with_executable_still_parses() {
+        // Backwards-compat: existing hello + identity-local-address-book
+        // manifests must still parse cleanly.
+        let ok = r#"
+            [plugin]
+            id = "hello"
+            name = "Hello"
+            version = "0.1.0"
+
+            [runtime]
+            tier = "subprocess"
+            executable = "./hello"
+        "#;
+        let m = PluginManifest::parse(ok).unwrap();
+        let rt = m.runtime.unwrap();
+        assert_eq!(rt.parsed_tier(), Some(RuntimeTier::Subprocess));
+        assert_eq!(rt.executable.as_deref(), Some("./hello"));
+        assert!(rt.source.is_none());
     }
 }

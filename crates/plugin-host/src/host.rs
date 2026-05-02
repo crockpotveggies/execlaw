@@ -164,7 +164,7 @@ impl PluginHost {
             }
             let spec = SubprocessSpec {
                 plugin_id: plugin_id.clone(),
-                executable: resolve_executable(stage_path, &runtime.executable),
+                executable: resolve_executable(stage_path, runtime_executable_or_err(runtime)?),
                 args: runtime.args.clone(),
                 cwd: Some(stage_path.to_path_buf()),
             };
@@ -283,7 +283,7 @@ impl PluginHost {
             let stage = PathBuf::from(&row.stage_path);
             let spec = SubprocessSpec {
                 plugin_id: plugin_id.to_owned(),
-                executable: resolve_executable(&stage, &runtime.executable),
+                executable: resolve_executable(&stage, runtime_executable_or_err(runtime)?),
                 args: runtime.args.clone(),
                 cwd: Some(stage),
             };
@@ -326,10 +326,21 @@ impl PluginHost {
             || manifest.identity_provider.is_some();
             if needs_subprocess {
                 if let Some(runtime) = &manifest.runtime {
+                    let exe = match runtime_executable_or_err(runtime) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            // Skip silently — best-effort hydrate.
+                            // Probably a script-tier plugin that
+                            // got rolled into needs_subprocess
+                            // before script-tier dispatch landed;
+                            // the script-tier branch handles it.
+                            continue;
+                        }
+                    };
                     let stage = PathBuf::from(&row.stage_path);
                     let spec = SubprocessSpec {
                         plugin_id: row.plugin_id.clone(),
-                        executable: resolve_executable(&stage, &runtime.executable),
+                        executable: resolve_executable(&stage, exe),
                         args: runtime.args.clone(),
                         cwd: Some(stage),
                     };
@@ -613,6 +624,21 @@ impl PluginHost {
 /// Windows's `Command::new` does not look in CWD for relative paths;
 /// this function normalizes that so plugin authors don't have to
 /// worry about platform differences.
+/// Pull the executable string out of a RuntimeDecl when the caller
+/// expects a subprocess plugin. Manifest validation already
+/// guarantees `executable` is present for `tier = "subprocess"`,
+/// so this returns `MissingRuntime` only on a corrupt persisted
+/// row that bypassed validation.
+fn runtime_executable_or_err(
+    runtime: &execlaw_plugin_sdk::manifest::RuntimeDecl,
+) -> Result<&str, PluginHostError> {
+    runtime
+        .executable
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or(PluginHostError::MissingRuntime)
+}
+
 fn resolve_executable(stage: &Path, declared: &str) -> String {
     let p = Path::new(declared);
     // Absolute path — use as-is.
