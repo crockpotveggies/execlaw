@@ -77,6 +77,7 @@ function makeResearchCard(extras: Partial<Card> = {}): Card {
         error: null,
         opened_at: 100,
         updated_at: 150,
+        event_seq: null,
         ...extras,
     };
 }

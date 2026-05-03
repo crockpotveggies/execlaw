@@ -79,14 +79,37 @@ export interface Card {
     error: string | null;
     opened_at: number; // unix-seconds
     updated_at: number;
+    /// 2026-05-03 — `state_events.seq` of the `CardOpened` event,
+    /// used by `MessageStream` to place the card inline in the
+    /// chat-thread timeline (instead of synthesizing a sortKey from
+    /// `opened_at` that always pinned cards to the bottom).
+    /// Optional because legacy bus events / fallback projections
+    /// may not carry it; the renderer falls back to the synthetic
+    /// sortKey when this is null.
+    event_seq: number | null;
 }
 
 /// Discriminated union surfaced through the WS event stream after
 /// the server decodes the MessagePack payload to JSON.
 export type CardEvent =
-    | { kind: "card.opened"; payload: CardOpenedPayload; committed_at: number }
-    | { kind: "card.progressed"; payload: CardProgressedPayload; committed_at: number }
-    | { kind: "card.closed"; payload: CardClosedPayload; committed_at: number };
+    | {
+          kind: "card.opened";
+          payload: CardOpenedPayload;
+          committed_at: number;
+          event_seq?: number | null;
+      }
+    | {
+          kind: "card.progressed";
+          payload: CardProgressedPayload;
+          committed_at: number;
+          event_seq?: number | null;
+      }
+    | {
+          kind: "card.closed";
+          payload: CardClosedPayload;
+          committed_at: number;
+          event_seq?: number | null;
+      };
 
 /// Whether to render the live progress UI vs. the static
 /// "completed" summary. Kind-specific renderers can use this to

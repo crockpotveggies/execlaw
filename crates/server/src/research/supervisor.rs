@@ -93,6 +93,20 @@ impl ResearchSupervisor {
     /// `cmd_serve`; the `Notify` handle is the same one the other
     /// sweepers consume so a SIGTERM drains everything together.
     pub async fn run(self, stop: Arc<Notify>) {
+        // 2026-05-03 — boot-time recovery. Any row left in an
+        // in-flight state (`planning`/`gathering`/`synthesizing`)
+        // by the previous process is from a service interruption
+        // (crash, SIGKILL, host reboot mid-job). Mark them all
+        // Failed("service interrupted") and emit `CardClosed` so
+        // the SPA's card flips out of "Running…" and the operator
+        // sees the failure instead of a stuck card. Operator can
+        // re-run the research from the UI; we don't auto-resume
+        // (preserves operator intent and avoids burning inference
+        // tokens on a restart they may not want).
+        if let Err(e) = self.recover_interrupted_jobs().await {
+            warn!("research supervisor: boot-time recovery failed: {e}");
+        }
+
         tracing::info!(
             interval_secs = TICK_INTERVAL.as_secs(),
             "research supervisor running"
@@ -109,6 +123,61 @@ impl ResearchSupervisor {
                 warn!("research supervisor tick failed: {e}");
             }
         }
+    }
+
+    /// One-shot at boot: mark every in-flight row Failed("service
+    /// interrupted") and emit `CardClosed` so the chat-pane card
+    /// flips out of its "Running…" state. Idempotent — a second
+    /// call after the first finds nothing to do.
+    pub async fn recover_interrupted_jobs(&self) -> Result<usize, String> {
+        let db = self.db.clone();
+        let recovered = tokio::task::spawn_blocking(move || {
+            let now = chrono::Utc::now().timestamp();
+            ResearchJobStore::new(&db)
+                .mark_failed_where_active("service interrupted", now)
+        })
+        .await
+        .map_err(|e| format!("join: {e}"))?
+        .map_err(|e| format!("mark_failed_where_active: {e}"))?;
+
+        if recovered.is_empty() {
+            return Ok(0);
+        }
+        tracing::warn!(
+            count = recovered.len(),
+            "research supervisor: marking interrupted jobs as failed (boot-time recovery)"
+        );
+        // Close the chat-pane card for each interrupted job so the
+        // SPA flips out of "Running…". Best-effort: a card-close
+        // failure logs but doesn't fail the recovery.
+        for r in &recovered {
+            let card_id = match &r.card_id {
+                Some(c) => c.clone(),
+                None => continue, // job died before card_id was minted
+            };
+            let payload = execlaw_core::cards::CardClosedPayload {
+                card_id,
+                state: execlaw_core::cards::CardState::Failed,
+                summary: "Research interrupted by service restart. Re-run to retry.".into(),
+                details: None,
+                attachment_id: None,
+                error: Some("service interrupted".into()),
+            };
+            if let Err(e) = crate::cards::close_card_and_broadcast(
+                &self.db,
+                &self.events,
+                &r.conversation_id,
+                "system",
+                &payload,
+            ) {
+                warn!(
+                    job_id = %r.job_id.as_str(),
+                    error = %e,
+                    "research recovery: close_card_and_broadcast failed (continuing)"
+                );
+            }
+        }
+        Ok(recovered.len())
     }
 
     /// Single tick. Public so tests can drive it directly.
@@ -219,6 +288,109 @@ mod tests {
             })
             .unwrap();
         cid
+    }
+
+    /// 2026-05-03 — boot-time recovery converts in-flight rows to
+    /// Failed, leaves Pending/Planned/Terminal rows untouched, and
+    /// emits CardClosed for each recovered job that had a card_id.
+    #[tokio::test]
+    async fn recover_interrupted_jobs_marks_in_flight_failed_and_closes_cards() {
+        use rusqlite::params;
+        let db = fresh_db();
+        let cid = seed_conv(&db, "c1");
+        // Seed three jobs: one each in planning / gathering /
+        // synthesizing, all with card_ids.
+        let store = ResearchJobStore::new(&db);
+        let in_flight: Vec<(ResearchJobId, &str, &str)> = vec![
+            (ResearchJobId::new(), "planning", "card-pln"),
+            (ResearchJobId::new(), "gathering", "card-gtr"),
+            (ResearchJobId::new(), "synthesizing", "card-syn"),
+        ];
+        // Plus one Pending and one Planned that must NOT transition.
+        let pending = ResearchJobId::new();
+        let planned = ResearchJobId::new();
+        for (id, _, _) in &in_flight {
+            store
+                .insert_pending(id, &cid, "q", "Controller", None, 100)
+                .unwrap();
+        }
+        for id in [&pending, &planned] {
+            store
+                .insert_pending(id, &cid, "q", "Controller", None, 100)
+                .unwrap();
+        }
+        // Force the in-flight states + card_ids; force planned for
+        // the planned row.
+        for (id, status, card) in &in_flight {
+            db.with_conn(|c| {
+                c.execute(
+                    "UPDATE state_research_jobs SET status = ?1, card_id = ?2 WHERE id = ?3",
+                    params![status, card, id.as_str()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_research_jobs SET status = 'planned' WHERE id = ?1",
+                params![planned.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Subscribe to the bus so we can verify CardClosed events fire.
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = ResearchWorkspace::new(tmp.path());
+        let sup = ResearchSupervisor::new(
+            db.clone(),
+            Arc::new(InferenceResolver::new(None)),
+            workspace,
+            "test-model".into(),
+            bus,
+        );
+        let n = sup.recover_interrupted_jobs().await.unwrap();
+        assert_eq!(n, 3);
+
+        // In-flight rows are now Failed with the recovery message.
+        for (id, _, _) in &in_flight {
+            let row = store.get(id).unwrap().unwrap();
+            assert_eq!(row.status, ResearchJobStatus::Failed);
+            assert_eq!(row.error.as_deref(), Some("service interrupted"));
+        }
+        // Pending + Planned are untouched.
+        assert_eq!(
+            store.get(&pending).unwrap().unwrap().status,
+            ResearchJobStatus::Pending
+        );
+        assert_eq!(
+            store.get(&planned).unwrap().unwrap().status,
+            ResearchJobStatus::Planned
+        );
+
+        // Three CardClosed events should have published. Drain the
+        // bus with a small timeout to avoid hanging if none fire.
+        let mut closed_card_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for _ in 0..10 {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(crate::events::UiEvent::CardClosed { card_id, state, .. })) => {
+                    assert_eq!(state, "Failed");
+                    closed_card_ids.insert(card_id);
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        assert!(closed_card_ids.contains("card-pln"));
+        assert!(closed_card_ids.contains("card-gtr"));
+        assert!(closed_card_ids.contains("card-syn"));
+
+        // Idempotent: a second call finds nothing.
+        assert_eq!(sup.recover_interrupted_jobs().await.unwrap(), 0);
     }
 
     /// With no inference backend wired, `tick_once` still claims the

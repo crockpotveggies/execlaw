@@ -40,6 +40,12 @@ export function fromOpened(
         error: null,
         opened_at: ev.committed_at,
         updated_at: ev.committed_at,
+        // 2026-05-03 — `state_events.seq` of the CardOpened event.
+        // When present (server >= the same date), MessageStream uses
+        // it as the sortKey so cards land at their true position in
+        // the chat-thread timeline. `null` for legacy WS payloads
+        // and the renderer falls back to the synthetic sortKey.
+        event_seq: ev.event_seq ?? null,
     };
 }
 

@@ -237,6 +237,7 @@ function makeCard(overrides: Partial<Card> = {}): Card {
         error: null,
         opened_at: 0,
         updated_at: 0,
+        event_seq: null,
         ...overrides,
     };
 }

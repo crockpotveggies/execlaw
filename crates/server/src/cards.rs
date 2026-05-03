@@ -44,7 +44,7 @@ pub fn open_card(
     cid: &ConversationId,
     actor: &str,
     payload: &CardOpenedPayload,
-) -> Result<(), CardEmitError> {
+) -> Result<i64, CardEmitError> {
     commit_card_event(db, cid, actor, EventKind::CardOpened, payload)
 }
 
@@ -53,7 +53,7 @@ pub fn progress_card(
     cid: &ConversationId,
     actor: &str,
     payload: &CardProgressedPayload,
-) -> Result<(), CardEmitError> {
+) -> Result<i64, CardEmitError> {
     commit_card_event(db, cid, actor, EventKind::CardProgressed, payload)
 }
 
@@ -62,7 +62,7 @@ pub fn close_card(
     cid: &ConversationId,
     actor: &str,
     payload: &CardClosedPayload,
-) -> Result<(), CardEmitError> {
+) -> Result<i64, CardEmitError> {
     commit_card_event(db, cid, actor, EventKind::CardClosed, payload)
 }
 
@@ -80,7 +80,7 @@ pub fn open_card_and_broadcast(
     actor: &str,
     payload: &CardOpenedPayload,
 ) -> Result<(), CardEmitError> {
-    open_card(db, cid, actor, payload)?;
+    let event_seq = open_card(db, cid, actor, payload)?;
     let now = chrono::Utc::now().timestamp();
     let actions_json =
         serde_json::to_value(&payload.actions).unwrap_or_else(|_| serde_json::json!([]));
@@ -94,6 +94,7 @@ pub fn open_card_and_broadcast(
         details: payload.details.clone(),
         actions: actions_json,
         committed_at: now,
+        event_seq,
     });
     Ok(())
 }
@@ -105,7 +106,7 @@ pub fn progress_card_and_broadcast(
     actor: &str,
     payload: &CardProgressedPayload,
 ) -> Result<(), CardEmitError> {
-    progress_card(db, cid, actor, payload)?;
+    let event_seq = progress_card(db, cid, actor, payload)?;
     let now = chrono::Utc::now().timestamp();
     let actions_json = payload
         .actions
@@ -121,6 +122,7 @@ pub fn progress_card_and_broadcast(
         actions: actions_json,
         summary: payload.summary.clone(),
         committed_at: now,
+        event_seq,
     });
     Ok(())
 }
@@ -132,7 +134,7 @@ pub fn close_card_and_broadcast(
     actor: &str,
     payload: &CardClosedPayload,
 ) -> Result<(), CardEmitError> {
-    close_card(db, cid, actor, payload)?;
+    let event_seq = close_card(db, cid, actor, payload)?;
     let now = chrono::Utc::now().timestamp();
     bus.publish(UiEvent::CardClosed {
         conversation_id: cid.as_str().to_owned(),
@@ -143,6 +145,7 @@ pub fn close_card_and_broadcast(
         attachment_id: payload.attachment_id.clone(),
         error: payload.error.clone(),
         committed_at: now,
+        event_seq,
     });
     Ok(())
 }
@@ -153,7 +156,7 @@ fn commit_card_event<T: serde::Serialize>(
     actor: &str,
     kind: EventKind,
     payload: &T,
-) -> Result<(), CardEmitError> {
+) -> Result<i64, CardEmitError> {
     let log = EventLog::new(db);
     let base_seq = log.last_seq(cid)?;
     let pending = PendingEvent {
@@ -161,8 +164,16 @@ fn commit_card_event<T: serde::Serialize>(
         payload: rmp_serde::to_vec(payload).map_err(|e| CardEmitError::Encode(e.to_string()))?,
         actor: Some(actor.to_owned()),
     };
-    log.commit_turn(cid, base_seq, vec![pending])?;
-    Ok(())
+    let written = log.commit_turn(cid, base_seq, vec![pending])?;
+    // commit_turn returns the materialized events with their assigned
+    // seqs. We always commit exactly one card event per call, so
+    // grab the last seq (defensive against future tool-pairing
+    // synthesis prepending cancellation results before our event).
+    let seq = written
+        .last()
+        .map(|e| e.seq.0)
+        .unwrap_or(base_seq.0 + 1);
+    Ok(seq)
 }
 
 /// Build the live projection of a single card by replaying every

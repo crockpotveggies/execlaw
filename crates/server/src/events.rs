@@ -191,6 +191,12 @@ pub enum UiEvent {
         details: serde_json::Value,
         actions: serde_json::Value,
         committed_at: i64,
+        /// 2026-05-03 — assigned `state_events.seq` so the SPA can
+        /// place the card inline in the chat-thread timeline at
+        /// the same position it occupies in the durable event log
+        /// (instead of falling back to a synthetic timestamp-based
+        /// sortKey that always pinned cards to the bottom).
+        event_seq: i64,
     },
 
     /// A Card progressed — partial update (every field optional;
@@ -208,6 +214,7 @@ pub enum UiEvent {
         actions: Option<serde_json::Value>,
         summary: Option<String>,
         committed_at: i64,
+        event_seq: i64,
     },
 
     /// A Card reached its terminal state. SPA flips inline-render
@@ -222,6 +229,7 @@ pub enum UiEvent {
         attachment_id: Option<String>,
         error: Option<String>,
         committed_at: i64,
+        event_seq: i64,
     },
 }
 

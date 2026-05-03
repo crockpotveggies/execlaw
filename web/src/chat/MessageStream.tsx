@@ -54,26 +54,26 @@ export function MessageStream({ conversationId }: Props) {
                 acc.push({ kind: "message", message: m, sortKey: m.seq });
             }
         }
-        // Cards sort by their `opened_at` (Unix-seconds). The
-        // event-log seq is monotonic-per-conversation so a fresh
-        // card always sorts after every message that committed
-        // before it. To keep cards from sliding around when a
-        // CardProgressed bumps `updated_at`, sort by the original
-        // opened_at — that anchors the card's chat-pane position
-        // for its lifetime.
+        // 2026-05-03 — cards now arrive with their real
+        // `state_events.seq` from the WS payload (`event_seq`).
+        // Use it as the sortKey so cards land inline at their
+        // true position in the chat-thread timeline, alongside
+        // messages, instead of being pinned to the tail.
+        //
+        // Fallback for legacy WS payloads / fixtures with no seq:
+        // synthesise a key from `opened_at` × 1e6 so the card
+        // still lands chronologically (and at the bottom for
+        // `event_seq`-less cards opened in the past, matching
+        // the prior behavior).
         for (const c of cards) {
-            // Translate the card's wall-clock open time into a
-            // synthetic seq that interleaves with the message list.
-            // We don't know the exact event-log seq from the SPA
-            // side; opened_at-as-millis × 1000 produces a number
-            // that's strictly greater than any plausible message
-            // seq the conversation has, so cards land at the
-            // tail by default. Future work threads the real seq
-            // through the WS payload for tighter ordering.
+            const sortKey =
+                c.event_seq !== null && c.event_seq !== undefined
+                    ? c.event_seq
+                    : c.opened_at * 1_000_000;
             acc.push({
                 kind: "card",
                 card: c,
-                sortKey: c.opened_at * 1_000_000,
+                sortKey,
             });
         }
         acc.sort((a, b) => a.sortKey - b.sortKey);

@@ -211,6 +211,17 @@ pub struct ResearchNote {
     pub error: Option<String>,
 }
 
+/// Returned by [`ResearchJobStore::mark_failed_where_active`].
+/// Just enough information for the caller (the supervisor) to
+/// emit a `CardClosed{Failed}` event for each interrupted job —
+/// otherwise the SPA shows the card stuck "Running" forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredJobRef {
+    pub job_id: ResearchJobId,
+    pub conversation_id: ConversationId,
+    pub card_id: Option<String>,
+}
+
 /// Full row as stored in `state_research_jobs`. The runner +
 /// admin endpoints + tools read/write this shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -582,6 +593,63 @@ impl<'db> ResearchJobStore<'db> {
             Ok(n)
         })?;
         Ok(n > 0)
+    }
+
+    /// 2026-05-03 — service-restart recovery. Marks every
+    /// in-flight row (`planning` / `gathering` / `synthesizing`)
+    /// as `failed` with a fixed reason. Returns the rows that
+    /// transitioned, so the supervisor can also close their
+    /// chat-thread cards (otherwise the SPA shows them stuck
+    /// "Running" forever).
+    ///
+    /// Excluded from the sweep:
+    ///   * `pending` — never claimed; the next supervisor tick
+    ///     picks it up cleanly
+    ///   * `planned` — operator-approved gate awaiting an
+    ///     explicit `Advance` click; preserve operator intent
+    ///   * Terminal states (`complete`/`failed`/`cancelled`)
+    ///
+    /// Idempotent: a second call after the first finds no
+    /// in-flight rows and returns an empty Vec.
+    pub fn mark_failed_where_active(
+        &self,
+        reason: &str,
+        now: i64,
+    ) -> Result<Vec<RecoveredJobRef>, ResearchError> {
+        let reason_owned = reason.to_owned();
+        // Read-then-write rather than a single UPDATE-RETURNING
+        // because rusqlite's bundled SQLite doesn't always have
+        // RETURNING enabled and we need the (id, conversation_id,
+        // card_id) triple for the supervisor's card-close pass.
+        let recovered = self.db.transaction(|tx| {
+            let mut stmt = tx.prepare(
+                "SELECT id, conversation_id, card_id
+                 FROM state_research_jobs
+                 WHERE status IN ('planning', 'gathering', 'synthesizing')",
+            )?;
+            let rows: Vec<RecoveredJobRef> = stmt
+                .query_map([], |r| {
+                    Ok(RecoveredJobRef {
+                        job_id: ResearchJobId::from(r.get::<_, String>(0)?),
+                        conversation_id: ConversationId::from(r.get::<_, String>(1)?),
+                        card_id: r.get::<_, Option<String>>(2)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            if !rows.is_empty() {
+                tx.execute(
+                    "UPDATE state_research_jobs
+                     SET status = 'failed',
+                         error = ?1,
+                         finished_at = ?2,
+                         updated_at = ?2
+                     WHERE status IN ('planning', 'gathering', 'synthesizing')",
+                    params![reason_owned, now],
+                )?;
+            }
+            Ok(rows)
+        })?;
+        Ok(recovered)
     }
 
     /// Set the workspace directory path on disk (the runner provisions
@@ -1128,6 +1196,158 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, ResearchError::Invalid(_)));
+    }
+
+    #[test]
+    fn mark_failed_where_active_only_touches_in_flight_states() {
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+
+        // Seed one row in EVERY state and verify only the
+        // in-flight ones flip to Failed.
+        let pending = ResearchJobId::new();
+        let planning = ResearchJobId::new();
+        let planned = ResearchJobId::new();
+        let gathering = ResearchJobId::new();
+        let synthesizing = ResearchJobId::new();
+        let complete = ResearchJobId::new();
+        let already_failed = ResearchJobId::new();
+        let cancelled = ResearchJobId::new();
+
+        for (id, status) in &[
+            (&pending, "pending"),
+            (&planning, "planning"),
+            (&planned, "planned"),
+            (&gathering, "gathering"),
+            (&synthesizing, "synthesizing"),
+            (&complete, "complete"),
+            (&already_failed, "failed"),
+            (&cancelled, "cancelled"),
+        ] {
+            store
+                .insert_pending(
+                    id,
+                    &ConversationId::from("c"),
+                    "q",
+                    "Controller",
+                    None,
+                    100,
+                )
+                .unwrap();
+            // Force the desired state via raw UPDATE since
+            // insert_pending always writes 'pending'.
+            db.with_conn(|c| {
+                c.execute(
+                    "UPDATE state_research_jobs SET status = ?1, card_id = ?2 WHERE id = ?3",
+                    params![status, format!("card-{}", id.as_str()), id.as_str()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        let recovered = store
+            .mark_failed_where_active("service interrupted", 999)
+            .unwrap();
+        // Three in-flight rows should have transitioned.
+        let recovered_ids: std::collections::HashSet<String> = recovered
+            .iter()
+            .map(|r| r.job_id.as_str().to_owned())
+            .collect();
+        assert_eq!(recovered.len(), 3);
+        assert!(recovered_ids.contains(planning.as_str()));
+        assert!(recovered_ids.contains(gathering.as_str()));
+        assert!(recovered_ids.contains(synthesizing.as_str()));
+
+        // Confirm the survivors are unchanged.
+        for (id, expected) in &[
+            (&pending, ResearchJobStatus::Pending),
+            (&planned, ResearchJobStatus::Planned),
+            (&complete, ResearchJobStatus::Complete),
+            (&already_failed, ResearchJobStatus::Failed),
+            (&cancelled, ResearchJobStatus::Cancelled),
+        ] {
+            let row = store.get(id).unwrap().unwrap();
+            assert_eq!(&row.status, expected, "{} should be {:?}", id.as_str(), expected);
+        }
+        // Confirm the converts have the recovery error stamped.
+        for id in [&planning, &gathering, &synthesizing] {
+            let row = store.get(id).unwrap().unwrap();
+            assert_eq!(row.status, ResearchJobStatus::Failed);
+            assert_eq!(row.error.as_deref(), Some("service interrupted"));
+            assert_eq!(row.finished_at, Some(999));
+        }
+    }
+
+    #[test]
+    fn mark_failed_where_active_is_idempotent() {
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(
+                &id,
+                &ConversationId::from("c"),
+                "q",
+                "Controller",
+                None,
+                100,
+            )
+            .unwrap();
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_research_jobs SET status = 'gathering' WHERE id = ?1",
+                params![id.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let first = store.mark_failed_where_active("svc int", 1).unwrap();
+        let second = store.mark_failed_where_active("svc int", 2).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 0);
+        // Original error/finished_at survive the second call.
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(row.error.as_deref(), Some("svc int"));
+        assert_eq!(row.finished_at, Some(1));
+    }
+
+    #[test]
+    fn mark_failed_where_active_returns_card_ids_for_card_close() {
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        let with_card = ResearchJobId::new();
+        let without_card = ResearchJobId::new();
+        for (id, card) in &[
+            (&with_card, Some("the-card")),
+            (&without_card, None::<&str>),
+        ] {
+            store
+                .insert_pending(
+                    id,
+                    &ConversationId::from("c"),
+                    "q",
+                    "Controller",
+                    None,
+                    100,
+                )
+                .unwrap();
+            db.with_conn(|c| {
+                c.execute(
+                    "UPDATE state_research_jobs SET status = 'gathering', card_id = ?1 WHERE id = ?2",
+                    params![card, id.as_str()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        let recovered = store.mark_failed_where_active("x", 1).unwrap();
+        let by_id: std::collections::HashMap<String, Option<String>> = recovered
+            .into_iter()
+            .map(|r| (r.job_id.as_str().to_owned(), r.card_id))
+            .collect();
+        assert_eq!(by_id[with_card.as_str()].as_deref(), Some("the-card"));
+        assert_eq!(by_id[without_card.as_str()], None);
     }
 
     #[test]

@@ -585,6 +585,10 @@ export function Chat() {
                             typeof ev.committed_at === "number"
                                 ? ev.committed_at
                                 : Math.floor(Date.now() / 1000),
+                        event_seq:
+                            typeof ev.event_seq === "number"
+                                ? ev.event_seq
+                                : null,
                         payload: {
                             card_id: ev.card_id,
                             kind:
@@ -625,6 +629,10 @@ export function Chat() {
                             typeof ev.committed_at === "number"
                                 ? ev.committed_at
                                 : Math.floor(Date.now() / 1000),
+                        event_seq:
+                            typeof ev.event_seq === "number"
+                                ? ev.event_seq
+                                : null,
                         payload: {
                             card_id: ev.card_id,
                             state:
@@ -666,6 +674,10 @@ export function Chat() {
                             typeof ev.committed_at === "number"
                                 ? ev.committed_at
                                 : Math.floor(Date.now() / 1000),
+                        event_seq:
+                            typeof ev.event_seq === "number"
+                                ? ev.event_seq
+                                : null,
                         payload: {
                             card_id: ev.card_id,
                             state:

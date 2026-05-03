@@ -1586,7 +1586,13 @@ body {
     background-color: $bg-elev;
     border-radius: $radius-md;
     padding: 0.85rem 1rem;
-    margin: 0.4rem 0;
+    // 2026-05-03 — match the chat-thread reading-column scaffold
+    // (`.execlaw-msg` uses the same `$thread-max-width` clamp +
+    // centered margin) so cards align with messages instead of
+    // bleeding to the scroll edge.
+    width: 100%;
+    max-width: $thread-max-width;
+    margin: 0.4rem auto;
 
     &__head {
         display: flex;
