@@ -917,6 +917,53 @@ impl ResearchApi for DbResearchApi {
         .map_err(ApiError::Storage)?;
         Ok(body)
     }
+
+    async fn clarify(
+        &self,
+        job_id: &str,
+        clarification: &str,
+    ) -> Result<ResearchJobView, ApiError> {
+        if !self.can_spawn {
+            return Err(ApiError::NotAuthorized(
+                "research_spawn capability not granted (clarify is a write)".into(),
+            ));
+        }
+        let trimmed = clarification.trim();
+        if trimmed.is_empty() {
+            return Err(ApiError::Validation("clarification is empty".into()));
+        }
+        if trimmed.chars().count() > 8_000 {
+            return Err(ApiError::Validation(
+                "clarification too long (max 8000 chars)".into(),
+            ));
+        }
+        // Trust-scope: the agent can only clarify a job in its own
+        // conversation (or anything if Controller). Reuse the status
+        // lookup so cross-thread probing returns NotFound.
+        let view = self.status(job_id).await?;
+        let Some(_) = view else {
+            return Err(ApiError::NotFound(format!("no job '{job_id}' visible")));
+        };
+        let db = self.db.clone();
+        let id = ResearchJobId::from(job_id);
+        let id_for_task = id.clone();
+        let now = self.clock_now_unix;
+        let answer = trimmed.to_owned();
+        let landed = tokio::task::spawn_blocking(move || {
+            ResearchJobStore::new(&db).resume_with_clarification(&id_for_task, &answer, now)
+        })
+        .await
+        .map_err(|e| ApiError::Storage(format!("join: {e}")))?
+        .map_err(|e| ApiError::Storage(e.to_string()))?;
+        if !landed {
+            return Err(ApiError::NotFound(format!(
+                "job '{job_id}' is not in awaiting_input (already resumed, cancelled, or finished)"
+            )));
+        }
+        // Re-read the updated row.
+        let updated = self.status(job_id).await?;
+        updated.ok_or_else(|| ApiError::Storage("job vanished after clarify".into()))
+    }
 }
 
 #[cfg(test)]

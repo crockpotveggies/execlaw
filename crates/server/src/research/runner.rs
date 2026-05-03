@@ -284,22 +284,23 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
     let plan = match call_planner(&client, &model, &row.query).await {
         Ok(PlanOutcome::Plan(p)) => p,
         Ok(PlanOutcome::NeedsClarification { question }) => {
-            // 2026-05-03 — query was too vague to plan. Mark the
-            // job Failed with the clarification question on the
-            // card so the operator sees "needs clarification:
-            // <question>" inline in chat. They can re-issue the
-            // research with the refined query in their next message.
-            mark_failed(
+            // 2026-05-03 (rev 2) — query was too vague to plan. The
+            // job pauses in `AwaitingInput` (non-terminal) rather
+            // than failing — the agent will see this status, surface
+            // the question to the operator in chat, and resume the
+            // job via `research_clarify(job_id, answer)`. The card
+            // emits a `CardProgressed{phase: AwaitingInput}` (NOT a
+            // CardClosed) so the SPA can render the paused state.
+            await_input_for_clarification(
                 &db,
                 &events,
-                &workspace,
                 &job_id,
                 &conv_id,
                 &card_id,
-                &format!("Needs clarification: {question}"),
+                &row.query,
+                &question,
             )
             .await;
-            // Re-read so the supervisor sees the (Failed) terminal state.
             let final_row = {
                 let db = db.clone();
                 let id = job_id.clone();
@@ -991,6 +992,94 @@ async fn mark_failed(
             job_id = job_id.as_str(),
             error = %e,
             "emitting CardClosed for failed job hit an error",
+        );
+    }
+}
+
+/// Pause the job in `AwaitingInput` and broadcast a
+/// `CardProgressed{phase: AwaitingInput}` so the SPA can render the
+/// "agent will ask the operator about this" state. The agent (per
+/// project-locked-decisions 2026-04-23: agent is the primary
+/// interface) sees the same state via `research_status` and surfaces
+/// the question in chat.
+///
+/// Mirrors `mark_failed`'s race-safety: a cancel that beats us to
+/// the row leaves it terminal; the `set_awaiting_input` UPDATE
+/// guards on `status NOT IN (terminal)`, returns false when the
+/// guard fires, and we then skip the CardProgressed broadcast.
+async fn await_input_for_clarification(
+    db: &Database,
+    events: &EventBus,
+    job_id: &ResearchJobId,
+    conv_id: &execlaw_core::ids::ConversationId,
+    card_id: &str,
+    original_query: &str,
+    question: &str,
+) {
+    let now = chrono::Utc::now().timestamp();
+    let id = job_id.clone();
+    let db_for_task = db.clone();
+    let q_owned = question.to_owned();
+    let res = tokio::task::spawn_blocking(move || {
+        ResearchJobStore::new(&db_for_task).set_awaiting_input(&id, &q_owned, now)
+    })
+    .await;
+    let landed = match &res {
+        Ok(Ok(b)) => *b,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                job_id = job_id.as_str(),
+                error = %e,
+                "set_awaiting_input hit a DB error; row may be stuck in Planning",
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(
+                job_id = job_id.as_str(),
+                error = %e,
+                "set_awaiting_input join error",
+            );
+            false
+        }
+    };
+    if !landed {
+        // Row was already terminal (cancel race). Don't broadcast a
+        // CardProgressed that contradicts the prior CardClosed.
+        tracing::info!(
+            job_id = job_id.as_str(),
+            "await_input: row already terminal (likely cancelled); skipping CardProgressed{{AwaitingInput}} broadcast",
+        );
+        return;
+    }
+    let progressed = progress_card_and_broadcast(
+        db,
+        events,
+        conv_id,
+        "system",
+        &CardProgressedPayload {
+            card_id: card_id.to_owned(),
+            state: Some(CardState::Running),
+            // Plan phase is ~1/3 of the work; sit at that progress
+            // value so the bar doesn't visually jump backwards if
+            // the operator clarifies and we re-enter Planning.
+            progress: Some(0.33),
+            phase: Some("AwaitingInput".into()),
+            details: Some(serde_json::json!({
+                "job_id": job_id.as_str(),
+                "phase": "AwaitingInput",
+                "query": original_query,
+                "clarification_question": question,
+            })),
+            actions: None,
+            summary: Some("Awaiting clarification — the agent will relay the planner's question.".into()),
+        },
+    );
+    if let Err(e) = progressed {
+        tracing::warn!(
+            job_id = job_id.as_str(),
+            error = %e,
+            "emitting CardProgressed{{AwaitingInput}} hit an error",
         );
     }
 }

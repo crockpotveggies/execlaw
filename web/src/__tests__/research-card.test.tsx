@@ -222,6 +222,50 @@ describe("ResearchCard renderer", () => {
         render(<ResearchCard card={card} />);
         expect(screen.queryByTestId("card-progress")).toBeNull();
     });
+
+    it("renders the awaiting-input panel with the planner's clarification question", () => {
+        // 2026-05-03 (rev 2): the runner pauses the job in
+        // AwaitingInput when the planner judges the query too vague.
+        // The card surfaces the question so the operator sees that
+        // research is paused; the agent (chat's primary interface)
+        // is what actually asks the user the question.
+        const card = makeResearchCard({
+            phase: "AwaitingInput",
+            state: "Running",
+            progress: 0.33,
+            details: {
+                job_id: "job-1",
+                phase: "AwaitingInput",
+                clarification_question:
+                    "Which USDA hardiness zone are you planting in?",
+                query: "Recommend evergreen ground covers.",
+            },
+        });
+        render(<ResearchCard card={card} />);
+        const panel = screen.getByTestId("card-research-clarification");
+        expect(panel).toBeTruthy();
+        const q = screen.getByTestId("card-research-clarification-question");
+        expect(q.textContent).toContain("USDA hardiness zone");
+        // The "agent will ask you" hint must be present so the
+        // operator knows where to provide the answer.
+        expect(panel.textContent).toMatch(/agent will ask you/i);
+    });
+
+    it("does not render the awaiting-input panel for other phases", () => {
+        // Defensive: only show clarification when the card actually
+        // is in the AwaitingInput phase. A stale clarification field
+        // bleeding into a Gathering card would mislead the operator.
+        const card = makeResearchCard({
+            phase: "Gathering",
+            details: {
+                job_id: "job-1",
+                phase: "Gathering",
+                clarification_question: "stale leftover",
+            },
+        });
+        render(<ResearchCard card={card} />);
+        expect(screen.queryByTestId("card-research-clarification")).toBeNull();
+    });
 });
 
 // ---- cardStore -------------------------------------------------------

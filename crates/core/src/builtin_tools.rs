@@ -1595,6 +1595,18 @@ fn default_allowed_for_research_read() -> Vec<String> {
 }
 
 fn job_view_to_json(v: &crate::tool::ResearchJobView) -> JsonValue {
+    // When `status == "awaiting_input"`, the planner stored its
+    // clarification question in the `error` column (intentional reuse
+    // — see `ResearchJobStore::set_awaiting_input`'s docs). Surface
+    // it under a dedicated key so the agent's tool-result reader
+    // doesn't have to know about that storage detail. The `error`
+    // field remains populated for backward-compat readers (the SPA
+    // card derives the question from this same value).
+    let clarification_question = if v.status == "awaiting_input" {
+        v.error.clone()
+    } else {
+        None
+    };
     json!({
         "id": v.id,
         "conversation_id": v.conversation_id,
@@ -1604,6 +1616,7 @@ fn job_view_to_json(v: &crate::tool::ResearchJobView) -> JsonValue {
         "workspace_path": v.workspace_path,
         "attachment_id": v.attachment_id,
         "error": v.error,
+        "clarification_question": clarification_question,
         "created_at": v.created_at,
         "updated_at": v.updated_at,
         "started_at": v.started_at,
@@ -1641,7 +1654,15 @@ impl ResearchStartTool {
                     "Enqueue a deep-research job for a question. The job runs asynchronously \
                      (minutes to hours) — this tool returns immediately with a job_id the \
                      operator can watch, and `research_status(job_id)` lets the agent poll \
-                     for progress. For sub-minute focused work use `delegate_task` instead."
+                     for progress. For sub-minute focused work use `delegate_task` instead.\n\n\
+                     CLARIFICATION FLOW: if the planner judges the query too vague to plan, the \
+                     job pauses in status `awaiting_input` with a `clarification_question` field \
+                     populated. Poll `research_status(job_id)` shortly after starting; if you \
+                     see `status == \"awaiting_input\"`, relay the `clarification_question` to \
+                     the user in chat verbatim (or with a brief framing) and call \
+                     `research_clarify(job_id, answer)` once they reply. The job will resume \
+                     automatically with the augmented query — no need to call research_start \
+                     again."
                         .into(),
                 schema: json!({
                     "type": "object",
@@ -1765,6 +1786,98 @@ impl ToolImpl for ResearchStatusTool {
         match api.status(&args.job_id).await {
             Ok(Some(view)) => ToolOutcome::Ok(json!({"job": job_view_to_json(&view)})),
             Ok(None) => ToolOutcome::err("not_found", format!("no job '{}' visible", args.job_id)),
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// research_clarify — resume an awaiting_input job with the user's
+// answer. Per project-locked-decisions 2026-04-23, the agent is the
+// primary interface for the clarification path; this tool is the
+// glue between "user answered the planner's question in chat" and
+// "runner gets the augmented query and re-plans."
+// ---------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ResearchClarifyArgs {
+    job_id: String,
+    /// The operator's answer to the planner's clarification question,
+    /// captured by the agent in chat. Will be appended to the
+    /// original query so the next planner pass sees both pieces of
+    /// context.
+    clarification: String,
+}
+
+pub struct ResearchClarifyTool {
+    descriptor: ToolDescriptor,
+}
+
+impl Default for ResearchClarifyTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ResearchClarifyTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "research_clarify".into(),
+                description:
+                    "Resume a deep-research job that is paused in `awaiting_input` by feeding \
+                     back the operator's answer to the planner's clarification question. The \
+                     answer is appended to the original query and the job re-enters the planner \
+                     queue automatically. Call this only after a job's `research_status` shows \
+                     status=`awaiting_input` and the user has answered the question in chat. \
+                     Returns the updated job view (status will be `pending` again)."
+                        .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "job_id": {
+                            "type": "string",
+                            "description": "The id returned by `research_start`."
+                        },
+                        "clarification": {
+                            "type": "string",
+                            "description": "The operator's answer, captured in chat. Will be \
+                                           appended to the original query for the planner to \
+                                           re-plan with."
+                        }
+                    },
+                    "required": ["job_id", "clarification"],
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Low,
+                capabilities: vec![Capability::ResearchSpawn],
+                default_allowed_classes: default_allowed_for_research_spawn(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for ResearchClarifyTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, args: Value) -> ToolOutcome {
+        let args: ResearchClarifyArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolOutcome::err("invalid_argument", e.to_string()),
+        };
+        let api = match ctx.research.as_ref() {
+            Some(a) => a,
+            None => {
+                return ToolOutcome::denied(
+                    "research_spawn capability not granted to this tool (clarify is a write)",
+                );
+            }
+        };
+        match api.clarify(&args.job_id, &args.clarification).await {
+            Ok(view) => ToolOutcome::Ok(json!({"job": job_view_to_json(&view)})),
             Err(e) => e.into_outcome(),
         }
     }
@@ -1934,6 +2047,7 @@ pub fn core_builtin_tools() -> Vec<Arc<dyn ToolImpl>> {
         Arc::new(DelegateTaskTool::new()),
         Arc::new(ResearchStartTool::new()),
         Arc::new(ResearchStatusTool::new()),
+        Arc::new(ResearchClarifyTool::new()),
         Arc::new(ResearchListTool::new()),
         Arc::new(ResearchGetReportTool::new()),
     ]
@@ -2068,9 +2182,10 @@ mod tests {
         assert!(names.contains(&"delegate_task"));
         assert!(names.contains(&"research_start"));
         assert!(names.contains(&"research_status"));
+        assert!(names.contains(&"research_clarify"));
         assert!(names.contains(&"research_list"));
         assert!(names.contains(&"research_get_report"));
-        assert_eq!(names.len(), 22);
+        assert_eq!(names.len(), 23);
     }
 
     #[test]
@@ -3393,6 +3508,129 @@ mod tests {
         match out {
             ToolOutcome::Ok(v) => assert_eq!(v["job"]["status"], "pending"),
             other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn research_status_surfaces_clarification_question_when_awaiting_input() {
+        // Reach into the store directly to put the row into
+        // awaiting_input — the runner is what does this in production
+        // but for the tool-surface test we just need the row in the
+        // right state.
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "c1");
+        let spawn_ctx = build_ctx_with_research_spawn(&db, cid.clone(), "Controller");
+        let started = ResearchStartTool::new()
+            .invoke(spawn_ctx, json!({"query": "vague"}))
+            .await;
+        let job_id = match started {
+            ToolOutcome::Ok(v) => v["job"]["id"].as_str().unwrap().to_owned(),
+            other => panic!("seed: {other:?}"),
+        };
+        crate::research::ResearchJobStore::new(&db)
+            .set_awaiting_input(
+                &crate::ids::ResearchJobId::from(job_id.clone()),
+                "Which region?",
+                500,
+            )
+            .unwrap();
+        let read_ctx = build_ctx_with_research_read(&db, cid, "Controller");
+        let out = ResearchStatusTool::new()
+            .invoke(read_ctx, json!({"job_id": job_id}))
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                assert_eq!(v["job"]["status"], "awaiting_input");
+                assert_eq!(v["job"]["clarification_question"], "Which region?");
+                // `error` keeps the same value for backward compat.
+                assert_eq!(v["job"]["error"], "Which region?");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn research_clarify_resumes_awaiting_input_job_with_augmented_query() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "c1");
+        let started = ResearchStartTool::new()
+            .invoke(
+                build_ctx_with_research_spawn(&db, cid.clone(), "Controller"),
+                json!({"query": "Recommend ground covers."}),
+            )
+            .await;
+        let job_id = match started {
+            ToolOutcome::Ok(v) => v["job"]["id"].as_str().unwrap().to_owned(),
+            other => panic!("seed: {other:?}"),
+        };
+        crate::research::ResearchJobStore::new(&db)
+            .set_awaiting_input(
+                &crate::ids::ResearchJobId::from(job_id.clone()),
+                "Which USDA zone?",
+                500,
+            )
+            .unwrap();
+
+        let out = ResearchClarifyTool::new()
+            .invoke(
+                build_ctx_with_research_spawn(&db, cid.clone(), "Controller"),
+                json!({"job_id": job_id, "clarification": "Zone 6, Pacific NW."}),
+            )
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                assert_eq!(v["job"]["status"], "pending", "should re-enter pending queue");
+                let q = v["job"]["query"].as_str().unwrap();
+                assert!(q.contains("ground covers"), "original query preserved");
+                assert!(q.contains("Zone 6"), "clarification appended");
+                // The old question must be cleared.
+                assert!(v["job"]["clarification_question"].is_null());
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn research_clarify_denied_when_capability_missing() {
+        // Adversarial: a read-only ctx must not be able to clarify.
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "c1");
+        let read_ctx = build_ctx_with_research_read(&db, cid, "Controller");
+        let out = ResearchClarifyTool::new()
+            .invoke(read_ctx, json!({"job_id": "x", "clarification": "y"}))
+            .await;
+        match out {
+            ToolOutcome::Denied { .. } => {}
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn research_clarify_returns_not_found_for_pending_or_terminal_job() {
+        // Calling clarify on a row that is not in awaiting_input must
+        // be a clean error — never silently overwrite.
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "c1");
+        let started = ResearchStartTool::new()
+            .invoke(
+                build_ctx_with_research_spawn(&db, cid.clone(), "Controller"),
+                json!({"query": "q"}),
+            )
+            .await;
+        let job_id = match started {
+            ToolOutcome::Ok(v) => v["job"]["id"].as_str().unwrap().to_owned(),
+            other => panic!("seed: {other:?}"),
+        };
+        // Row is still Pending — clarify must reject.
+        let out = ResearchClarifyTool::new()
+            .invoke(
+                build_ctx_with_research_spawn(&db, cid, "Controller"),
+                json!({"job_id": job_id, "clarification": "answer"}),
+            )
+            .await;
+        match out {
+            ToolOutcome::Err { code, .. } => assert_eq!(code, "not_found"),
+            other => panic!("expected Err(not_found), got {other:?}"),
         }
     }
 

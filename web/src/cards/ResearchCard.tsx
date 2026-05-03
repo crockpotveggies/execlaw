@@ -51,6 +51,13 @@ interface ResearchDetails {
     query?: string;
     plan?: ResearchPlanView;
     notes?: ResearchNoteView[];
+    /// Set on `CardProgressed { phase: "AwaitingInput" }` when the
+    /// planner judged the query too vague and posed a clarification
+    /// question. The agent (chat's primary interface per
+    /// project-locked-decisions 2026-04-23) relays this to the user
+    /// in conversation; the card surfaces it as visual confirmation
+    /// that research is paused waiting on the agent + user exchange.
+    clarification_question?: string;
     /// Final synthesized report — populated on the CardClosed event
     /// when status flips to `Completed`. The renderer surfaces it
     /// inline below the plan tree so the operator never has to
@@ -167,6 +174,32 @@ export function ResearchCard({ card, onAction }: CardRendererProps) {
                         );
                     })}
                 </ol>
+            )}
+
+            {details?.clarification_question && card.phase === "AwaitingInput" && (
+                <div
+                    className="execlaw-card-research__clarification"
+                    data-testid="card-research-clarification"
+                    role="status"
+                >
+                    <div className="execlaw-card-research__clarification-label">
+                        <i
+                            className="bi bi-chat-left-quote me-2"
+                            aria-hidden
+                        />
+                        Awaiting clarification
+                    </div>
+                    <div
+                        className="execlaw-card-research__clarification-question"
+                        data-testid="card-research-clarification-question"
+                    >
+                        {details.clarification_question}
+                    </div>
+                    <div className="execlaw-card-research__clarification-hint execlaw-muted small">
+                        The agent will ask you about this in chat — answer there
+                        and the research will resume automatically.
+                    </div>
+                </div>
             )}
 
             <div className="execlaw-card-task__summary">{card.summary}</div>

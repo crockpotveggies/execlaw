@@ -752,6 +752,29 @@ pub trait ResearchApi: Send + Sync {
     /// visible to the caller. Trust scoping mirrors `status` —
     /// below-Controller callers see only their own conversation.
     async fn get_report(&self, job_id: &str) -> Result<Option<String>, ApiError>;
+
+    /// Resume an `awaiting_input` job by feeding back the operator's
+    /// clarification. The runner appended a clarification question
+    /// to the job's `error` field when the planner judged the
+    /// original query too vague; the agent surfaces that question
+    /// to the user in chat (it is the primary interface) and calls
+    /// this method with their answer. The implementation augments
+    /// the job's stored query with the clarification and resets
+    /// status to `pending` so the supervisor re-claims it on the
+    /// next tick.
+    ///
+    /// Returns the updated `ResearchJobView`. Errors:
+    ///   * `ApiError::NotAuthorized` if the impl was constructed
+    ///     without spawn authority (clarify is a write).
+    ///   * `ApiError::NotFound` if the job id is not visible to the
+    ///     caller OR is not currently in `awaiting_input` (the
+    ///     `awaiting_input` guard prevents double-resume races and
+    ///     resuming a Cancelled row).
+    async fn clarify(
+        &self,
+        job_id: &str,
+        clarification: &str,
+    ) -> Result<ResearchJobView, ApiError>;
 }
 
 /// Outbound HTTP capability. Implementations are responsible for SSRF

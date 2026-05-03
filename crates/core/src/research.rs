@@ -19,7 +19,7 @@
 
 use crate::db::{Database, DbError};
 use crate::ids::{ConversationId, ResearchJobId};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -46,6 +46,17 @@ pub enum ResearchJobStatus {
     Gathering,
     /// Single synthesize LLM call composing the report (C5).
     Synthesizing,
+    /// Paused — the planner judged the query too vague to plan and
+    /// returned a clarification question. The runner does NOT
+    /// progress this row on its own; the agent surfaces the question
+    /// to the user in chat (it is the operator's primary interface
+    /// per project-locked-decisions 2026-04-23) and calls
+    /// `research_clarify(job_id, answer)` to provide the answer,
+    /// which augments the query and re-enqueues the job. Non-terminal
+    /// — the supervisor's pending-claim selector ignores this row
+    /// (only `Pending` is claimed) and the retention sweeper leaves
+    /// it alone (only terminal rows are swept).
+    AwaitingInput,
     /// Terminal: report written + attachment_id set.
     Complete,
     /// Terminal: runner reported a failure; `error` populated.
@@ -62,6 +73,7 @@ impl ResearchJobStatus {
             Self::Planned => "planned",
             Self::Gathering => "gathering",
             Self::Synthesizing => "synthesizing",
+            Self::AwaitingInput => "awaiting_input",
             Self::Complete => "complete",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -75,6 +87,7 @@ impl ResearchJobStatus {
             "planned" => Some(Self::Planned),
             "gathering" => Some(Self::Gathering),
             "synthesizing" => Some(Self::Synthesizing),
+            "awaiting_input" => Some(Self::AwaitingInput),
             "complete" => Some(Self::Complete),
             "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),
@@ -684,6 +697,98 @@ impl<'db> ResearchJobStore<'db> {
         Ok(())
     }
 
+    /// Pause the row in `AwaitingInput` with a clarification
+    /// question the planner posed. Refuses to overwrite a terminal
+    /// row (mirrors the `finish` guard) — a cancel that races a
+    /// clarification-needed planner result must win. Stamps
+    /// `updated_at` only; `finished_at` stays NULL because the row
+    /// is non-terminal — the agent will eventually call
+    /// `resume_with_clarification` (or the operator cancels).
+    ///
+    /// The question is stored in the `error` column. The column is
+    /// already typed as "operator-visible status note" and the
+    /// status discriminator (`awaiting_input` vs `failed`) tells
+    /// readers which semantics apply. Avoiding a new column avoids
+    /// a migration; the trade-off is documented at the call sites.
+    pub fn set_awaiting_input(
+        &self,
+        id: &ResearchJobId,
+        question: &str,
+        now: i64,
+    ) -> Result<bool, ResearchError> {
+        let id_owned = id.as_str().to_owned();
+        let q_owned = question.to_owned();
+        let n = self.db.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE state_research_jobs \
+                 SET status = 'awaiting_input', error = ?1, updated_at = ?2 \
+                 WHERE id = ?3 \
+                   AND status NOT IN ('complete', 'failed', 'cancelled')",
+                params![q_owned, now, id_owned],
+            )?;
+            Ok(n)
+        })?;
+        Ok(n > 0)
+    }
+
+    /// Resume an `AwaitingInput` row by appending the operator's
+    /// clarification to the original query and resetting the row to
+    /// `Pending`. The supervisor's pending-claim selector will pick
+    /// it up on the next tick and the planner will run again with
+    /// the augmented context.
+    ///
+    /// Behavior:
+    ///   * `error` is cleared (the question is no longer outstanding)
+    ///   * `plan_json` is cleared (the previous plan, if any, was
+    ///     based on the under-specified original query and is stale)
+    ///   * `query` becomes `"<original>\n\nClarification: <answer>"`
+    ///     so the planner sees both the original intent and the
+    ///     new specifics
+    ///   * `started_at` is reset to NULL because the job is
+    ///     re-entering the pending queue; the eventual planner
+    ///     re-claim will set a fresh started_at
+    ///
+    /// Refuses (returns `Ok(false)`) when the row is not currently
+    /// in `AwaitingInput` — protects against double-resume races
+    /// and against resuming a Cancelled row the operator killed.
+    pub fn resume_with_clarification(
+        &self,
+        id: &ResearchJobId,
+        clarification: &str,
+        now: i64,
+    ) -> Result<bool, ResearchError> {
+        let id_owned = id.as_str().to_owned();
+        let clarification_owned = clarification.to_owned();
+        let n = self.db.with_conn(|c| {
+            // Two-step inside the conn lock: read the original query
+            // (so we can append) then UPDATE atomically.
+            let original: String = c.query_row(
+                "SELECT query FROM state_research_jobs WHERE id = ?1 AND status = 'awaiting_input'",
+                params![id_owned],
+                |r| r.get(0),
+            ).optional()?
+                .unwrap_or_default();
+            if original.is_empty() {
+                return Ok(0); // not awaiting, or row missing
+            }
+            let merged = format!("{original}\n\nClarification from operator: {clarification_owned}");
+            let n = c.execute(
+                "UPDATE state_research_jobs \
+                 SET status = 'pending', \
+                     query = ?1, \
+                     error = NULL, \
+                     plan_json = NULL, \
+                     started_at = NULL, \
+                     updated_at = ?2 \
+                 WHERE id = ?3 \
+                   AND status = 'awaiting_input'",
+                params![merged, now, id_owned],
+            )?;
+            Ok(n)
+        })?;
+        Ok(n > 0)
+    }
+
     /// List every job whose `conversation_id` matches, newest first.
     /// Used by the chat-pane "running jobs" badge + `research_list`
     /// when the caller scopes to their own thread.
@@ -751,7 +856,8 @@ impl<'db> ResearchJobStore<'db> {
                      updated_at = ?2 \
                  WHERE id = ?3 \
                    AND status IN ('pending', 'planning', 'planned', \
-                                  'gathering', 'synthesizing')",
+                                  'gathering', 'synthesizing', \
+                                  'awaiting_input')",
                 params![reason_owned, now, id_owned],
             )?;
             Ok(n)
@@ -1107,6 +1213,7 @@ mod tests {
             ResearchJobStatus::Planned,
             ResearchJobStatus::Gathering,
             ResearchJobStatus::Synthesizing,
+            ResearchJobStatus::AwaitingInput,
             ResearchJobStatus::Complete,
             ResearchJobStatus::Failed,
             ResearchJobStatus::Cancelled,
@@ -2214,5 +2321,121 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, ResearchError::Invalid(_)));
+    }
+
+    // ---------------- AwaitingInput / clarification round-trip ----------------
+
+    fn seed_pending_job(db: &Database, q: &str) -> ResearchJobId {
+        let store = ResearchJobStore::new(db);
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(
+                &id,
+                &ConversationId::from("c-clar"),
+                q,
+                "Owner",
+                None,
+                100,
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn awaiting_input_is_not_terminal_so_retention_will_not_sweep_it() {
+        // The retention sweeper inspects `is_terminal` to decide
+        // which rows are eligible for purge. AwaitingInput is a
+        // PAUSE state — the agent will eventually resume the job
+        // via clarify — so it must NOT report as terminal.
+        assert!(!ResearchJobStatus::AwaitingInput.is_terminal());
+        // And the existing terminal trio still does.
+        assert!(ResearchJobStatus::Complete.is_terminal());
+        assert!(ResearchJobStatus::Failed.is_terminal());
+        assert!(ResearchJobStatus::Cancelled.is_terminal());
+    }
+
+    #[test]
+    fn set_awaiting_input_records_question_and_status() {
+        let db = fresh_db();
+        let id = seed_pending_job(&db, "vague query");
+        let store = ResearchJobStore::new(&db);
+        let landed = store
+            .set_awaiting_input(&id, "Which region?", 200)
+            .unwrap();
+        assert!(landed, "first set must land");
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(row.status, ResearchJobStatus::AwaitingInput);
+        assert_eq!(row.error.as_deref(), Some("Which region?"));
+        // Non-terminal: finished_at stays NULL.
+        assert!(row.finished_at.is_none(), "awaiting_input must not stamp finished_at");
+        assert_eq!(row.updated_at, 200);
+    }
+
+    #[test]
+    fn set_awaiting_input_refuses_to_overwrite_terminal_row() {
+        // Cancel-race: a cancel already moved the row to Cancelled
+        // before set_awaiting_input fires. The guard must reject the
+        // update so the operator's cancel intent is preserved.
+        let db = fresh_db();
+        let id = seed_pending_job(&db, "q");
+        let store = ResearchJobStore::new(&db);
+        store.cancel_active(&id, Some("operator killed"), 150).unwrap();
+        let landed = store
+            .set_awaiting_input(&id, "Should never apply", 200)
+            .unwrap();
+        assert!(!landed, "guard must reject overwrite of Cancelled row");
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(row.status, ResearchJobStatus::Cancelled);
+        // The clarification question must NOT have leaked into the row.
+        assert_ne!(row.error.as_deref(), Some("Should never apply"));
+    }
+
+    #[test]
+    fn resume_with_clarification_appends_answer_and_resets_to_pending() {
+        let db = fresh_db();
+        let id = seed_pending_job(&db, "Recommend evergreen ground covers.");
+        let store = ResearchJobStore::new(&db);
+        store
+            .set_awaiting_input(&id, "Which USDA zone?", 200)
+            .unwrap();
+
+        let landed = store
+            .resume_with_clarification(&id, "Zone 6, Pacific Northwest.", 300)
+            .unwrap();
+        assert!(landed, "resume must land on awaiting_input row");
+
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(row.status, ResearchJobStatus::Pending);
+        assert!(row.query.contains("evergreen ground covers"), "original query preserved");
+        assert!(row.query.contains("Zone 6"), "clarification appended");
+        assert!(row.error.is_none(), "outstanding question cleared");
+        assert!(row.plan_json.is_none(), "stale plan cleared");
+        assert!(row.started_at.is_none(), "started_at reset for re-claim");
+        assert_eq!(row.updated_at, 300);
+    }
+
+    #[test]
+    fn resume_with_clarification_refuses_when_not_in_awaiting_input() {
+        // Double-resume race: the agent calls clarify twice. The
+        // second call must be a no-op so the planner doesn't re-plan
+        // a pending job that's already running.
+        let db = fresh_db();
+        let id = seed_pending_job(&db, "q");
+        let store = ResearchJobStore::new(&db);
+        // No set_awaiting_input → row is still Pending.
+        let landed = store
+            .resume_with_clarification(&id, "answer", 300)
+            .unwrap();
+        assert!(!landed);
+
+        // Cancelled rows must not be resurrectable either.
+        store.set_awaiting_input(&id, "q?", 200).unwrap();
+        store.cancel_active(&id, Some("op killed"), 250).unwrap();
+        let landed = store
+            .resume_with_clarification(&id, "answer", 300)
+            .unwrap();
+        assert!(!landed, "cannot resume a cancelled row");
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(row.status, ResearchJobStatus::Cancelled);
     }
 }
