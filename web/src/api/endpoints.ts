@@ -1177,6 +1177,230 @@ export async function updateToolPolicy(
     );
 }
 
+// ---- /api/admin/skills (Phase B.3 — top-level Skills page) --------
+
+export type SkillState = "trial" | "stable" | "archived";
+export type SkillRegistrationKind = "authored" | "shipped" | "registered";
+
+export interface SkillListEntry {
+    name: string;
+    description: string;
+    state: SkillState;
+    version: number;
+    registration_kind: SkillRegistrationKind;
+    source: string;
+    owning_plugin_id: string | null;
+    updated_at: number;
+}
+
+export interface SkillListResponse {
+    skills: SkillListEntry[];
+}
+
+export interface SkillDetail {
+    name: string;
+    description: string;
+    state: SkillState;
+    registration_kind: SkillRegistrationKind;
+    source: string;
+    owning_plugin_id: string | null;
+    current_version: number;
+    body_md: string;
+    frontmatter_json: string;
+    authored_by: string;
+    authored_at: number;
+    created_at: number;
+    updated_at: number;
+    archived_at: number | null;
+    resource_paths: string[];
+}
+
+export async function listSkills(
+    tokenAccessor: () => string | null,
+    options?: { includeArchived?: boolean },
+): Promise<SkillListResponse> {
+    const qs = options?.includeArchived ? "?include_archived=true" : "";
+    return apiFetch<SkillListResponse>(
+        `/api/admin/skills${qs}`,
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function getSkill(
+    name: string,
+    tokenAccessor: () => string | null,
+): Promise<SkillDetail> {
+    return apiFetch<SkillDetail>(
+        `/api/admin/skills/${encodeURIComponent(name)}`,
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function promoteSkill(
+    name: string,
+    notes: string | null,
+    tokenAccessor: () => string | null,
+): Promise<SkillDetail> {
+    return apiFetch<SkillDetail>(
+        `/api/admin/skills/${encodeURIComponent(name)}/promote`,
+        { method: "POST", body: { notes } },
+        tokenAccessor,
+    );
+}
+
+export async function archiveSkill(
+    name: string,
+    tokenAccessor: () => string | null,
+): Promise<SkillDetail> {
+    return apiFetch<SkillDetail>(
+        `/api/admin/skills/${encodeURIComponent(name)}/archive`,
+        { method: "POST" },
+        tokenAccessor,
+    );
+}
+
+// ---- /api/admin/skills/config (Phase C — auto-capture worker) ----
+
+export interface SkillsConfigView {
+    auto_capture_enabled: boolean;
+    auto_capture_min_tool_calls: number;
+    auto_capture_dry_run: boolean;
+    reuse_update_enabled: boolean;
+    updated_at: number;
+}
+
+export interface UpdateSkillsConfigRequest {
+    auto_capture_enabled?: boolean;
+    auto_capture_min_tool_calls?: number;
+    auto_capture_dry_run?: boolean;
+    reuse_update_enabled?: boolean;
+}
+
+export async function getSkillsConfig(
+    tokenAccessor: () => string | null,
+): Promise<SkillsConfigView> {
+    return apiFetch<SkillsConfigView>(
+        "/api/admin/skills/config",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function putSkillsConfig(
+    body: UpdateSkillsConfigRequest,
+    tokenAccessor: () => string | null,
+): Promise<SkillsConfigView> {
+    return apiFetch<SkillsConfigView>(
+        "/api/admin/skills/config",
+        { method: "PUT", body },
+        tokenAccessor,
+    );
+}
+
+// ---- Phase D.1: edit body, version history, proposals ----
+
+export interface UpdateSkillBodyRequest {
+    description: string;
+    body_md: string;
+    frontmatter_json?: string;
+    promotion_notes?: string | null;
+}
+
+export async function updateSkillBody(
+    name: string,
+    body: UpdateSkillBodyRequest,
+    tokenAccessor: () => string | null,
+): Promise<SkillDetail> {
+    return apiFetch<SkillDetail>(
+        `/api/admin/skills/${encodeURIComponent(name)}`,
+        { method: "PUT", body },
+        tokenAccessor,
+    );
+}
+
+export interface SkillVersionView {
+    version: number;
+    description: string;
+    body_md: string;
+    frontmatter_json: string;
+    authored_by: string;
+    authored_at: number;
+    promotion_notes: string | null;
+    parent_version: number | null;
+}
+
+export async function listSkillVersions(
+    name: string,
+    tokenAccessor: () => string | null,
+): Promise<{ versions: SkillVersionView[] }> {
+    return apiFetch<{ versions: SkillVersionView[] }>(
+        `/api/admin/skills/${encodeURIComponent(name)}/versions`,
+        {},
+        tokenAccessor,
+    );
+}
+
+export type ProposalStateFilter = "pending" | "approved" | "rejected" | "superseded" | "all";
+export type ProposalKind = "new_skill" | "version_fork";
+export type ProposalState = "pending" | "approved" | "rejected" | "superseded";
+
+export interface SkillProposalView {
+    id: number;
+    kind: ProposalKind;
+    target_skill_id: number | null;
+    proposed_name: string;
+    description: string;
+    body_md: string;
+    frontmatter_json: string;
+    source_run_id: string;
+    trajectory_summary: string | null;
+    tool_calls_observed: number;
+    state: ProposalState;
+    promoted_skill_id: number | null;
+    promoted_version_id: number | null;
+    created_at: number;
+    reviewed_at: number | null;
+    reviewer: string | null;
+    decision_notes: string | null;
+}
+
+export async function listSkillProposals(
+    state: ProposalStateFilter,
+    tokenAccessor: () => string | null,
+): Promise<{ proposals: SkillProposalView[] }> {
+    return apiFetch<{ proposals: SkillProposalView[] }>(
+        `/api/admin/skills/proposals?state=${state}`,
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function approveSkillProposal(
+    id: number,
+    notes: string | null,
+    tokenAccessor: () => string | null,
+): Promise<SkillProposalView> {
+    return apiFetch<SkillProposalView>(
+        `/api/admin/skills/proposals/${id}/approve`,
+        { method: "POST", body: { notes } },
+        tokenAccessor,
+    );
+}
+
+export async function rejectSkillProposal(
+    id: number,
+    notes: string | null,
+    tokenAccessor: () => string | null,
+): Promise<SkillProposalView> {
+    return apiFetch<SkillProposalView>(
+        `/api/admin/skills/proposals/${id}/reject`,
+        { method: "POST", body: { notes } },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/mcp/servers (Phase 8c MCP integration) ------------
 
 export type McpTransport = "stdio" | "streamable_http";

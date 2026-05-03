@@ -89,6 +89,23 @@ struct PluginHostInner {
     /// Root directory for staged plugin ZIPs. Per-install directories
     /// land under `<root>/<plugin_id>-<version>/`.
     stage_root: PathBuf,
+    /// Phase B (2026-05-03) — when set, plugin install imports
+    /// declared `[[skills]]` rows into the SkillStore (with
+    /// `<plugin_id>/` namespace prepending) and plugin uninstall
+    /// archives them. Empty disables both paths so existing tests
+    /// and any caller that doesn't want skill side-effects continue
+    /// to work unchanged. Set once at boot via [`Self::attach_skill_store`];
+    /// `OnceLock` enforces single-init without needing to rebuild
+    /// the `Inner` (which would clobber subprocesses / script
+    /// plugins populated by an earlier hydrate call).
+    skill_store: std::sync::OnceLock<Arc<execlaw_skills::SkillStore>>,
+    /// Phase D.2 — sender clones are handed to each newly-spawned
+    /// `SubprocessPlugin` so its reader can forward notifications
+    /// (one-way `plugin → host` JSON-RPC messages with no `id`)
+    /// into a single dispatcher task. Set by `attach_skill_store`.
+    notification_tx: std::sync::OnceLock<
+        tokio::sync::mpsc::UnboundedSender<crate::subprocess::PluginNotification>,
+    >,
 }
 
 impl PluginHost {
@@ -120,8 +137,47 @@ impl PluginHost {
                 script_plugins: RwLock::new(BTreeMap::new()),
                 script_engine,
                 stage_root,
+                skill_store: std::sync::OnceLock::new(),
+                notification_tx: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// Attach a shared skill store. Idempotent on the same store
+    /// (calls after the first are no-ops); subsequent calls with a
+    /// DIFFERENT store are also no-ops because `OnceLock` only
+    /// captures the first value. This lets boot order be flexible —
+    /// `new()` → `hydrate()` → `attach_skill_store()` is fine and
+    /// preserves anything hydrate populated.
+    ///
+    /// Side effect (Phase D.2, 2026-05-03): also spawns the
+    /// notification dispatcher task that drains the
+    /// plugin → host channel and routes `skill.register` /
+    /// `skill.unregister` notifications to `SkillStore`. Subsequent
+    /// `install()` calls hand each fresh `SubprocessPlugin` a sender
+    /// clone so the dispatcher sees notifications from every plugin.
+    pub fn attach_skill_store(&self, skill_store: Arc<execlaw_skills::SkillStore>) {
+        if self.inner.skill_store.set(skill_store.clone()).is_err() {
+            return; // already attached; dispatcher already running
+        }
+        // Spawn the notification dispatcher.
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::subprocess::PluginNotification>();
+        // Stash the sender on the host so install() can clone it
+        // when spawning each subprocess.
+        let _ = self.inner.notification_tx.set(tx);
+        let store = skill_store;
+        tokio::spawn(async move {
+            while let Some(n) = rx.recv().await {
+                handle_plugin_notification(&store, n).await;
+            }
+        });
+    }
+
+    /// Borrow the attached skill store, if any. Used by tests to
+    /// verify the install/uninstall side-effects landed.
+    pub fn skill_store(&self) -> Option<&Arc<execlaw_skills::SkillStore>> {
+        self.inner.skill_store.get()
     }
 
     pub fn registry(&self) -> &HookRegistry {
@@ -204,7 +260,7 @@ impl PluginHost {
                         args: runtime.args.clone(),
                         cwd: Some(stage_path.to_path_buf()),
                     };
-                    let plugin = match SubprocessPlugin::spawn(spec).await {
+                    let plugin = match SubprocessPlugin::spawn(spec, self.inner.notification_tx.get().cloned()).await {
                         Ok(p) => p,
                         Err(e) => {
                             self.inner.registry.disable(&plugin_id);
@@ -256,6 +312,44 @@ impl PluginHost {
             updated_at: now,
         };
         self.insert_row(&row)?;
+
+        // Step 4 — Phase B: import any plugin-shipped skills. Best-
+        // effort: failures here do NOT roll back the install. The
+        // plugin's tools/transport are already wired and useful
+        // even if a skill conflicted (e.g. with an admin-authored
+        // skill of the same name). Operator sees a warning per
+        // failure and can fix + reinstall — re-import on an
+        // already-installed plugin appends new versions, so it's
+        // safe to retry.
+        if let Some(store) = self.inner.skill_store.get() {
+            if !manifest.skills.is_empty() {
+                let now_ms = now * 1000;
+                let report = execlaw_skills::import_plugin_skills(
+                    store,
+                    &plugin_id,
+                    &manifest.skills,
+                    stage_path,
+                    now_ms,
+                );
+                if !report.imported.is_empty() {
+                    info!(
+                        plugin_id,
+                        imported = report.imported.len(),
+                        "plugin skills imported"
+                    );
+                }
+                for failure in &report.failed {
+                    warn!(
+                        plugin_id,
+                        skill = %failure.plugin_local_name,
+                        stored_name = ?failure.stored_name,
+                        error = %failure.error,
+                        "plugin skill import failed (install proceeded)"
+                    );
+                }
+            }
+        }
+
         info!(plugin_id, version, "plugin installed");
         Ok(row)
     }
@@ -341,9 +435,9 @@ impl PluginHost {
         self.install(stage_path).await
     }
 
-    /// Uninstall: disable hooks, kill subprocess, remove DB row +
-    /// staged directory. Idempotent — missing plugin returns
-    /// `NotInstalled`.
+    /// Uninstall: disable hooks, kill subprocess, archive plugin-
+    /// shipped skills (Phase B), remove DB row + staged directory.
+    /// Idempotent — missing plugin returns `NotInstalled`.
     pub async fn uninstall(&self, plugin_id: &str) -> Result<(), PluginHostError> {
         let row = self
             .get_row(plugin_id)?
@@ -366,6 +460,30 @@ impl PluginHost {
             .write()
             .await
             .remove(plugin_id);
+
+        // Phase B (2026-05-03) — archive skills owned by this
+        // plugin BEFORE deleting the install row so the
+        // `state_skill_invocations.skill_id` foreign-key path stays
+        // valid for forensic queries on archived skills. Best-effort:
+        // a failure here is logged but doesn't block the uninstall.
+        if let Some(store) = self.inner.skill_store.get() {
+            let now_ms = chrono::Utc::now().timestamp() * 1000;
+            match store.archive_for_plugin(plugin_id, now_ms) {
+                Ok(archived) if !archived.is_empty() => {
+                    info!(
+                        plugin_id,
+                        count = archived.len(),
+                        "archived plugin-shipped skills"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => warn!(
+                    plugin_id,
+                    error = %e,
+                    "failed to archive plugin skills (uninstall continued)"
+                ),
+            }
+        }
 
         self.delete_row(plugin_id)?;
 
@@ -452,9 +570,12 @@ impl PluginHost {
                         args: runtime.args.clone(),
                         cwd: Some(stage),
                     };
-                    let plugin = SubprocessPlugin::spawn(spec)
-                        .await
-                        .map_err(PluginHostError::Spawn)?;
+                    let plugin = SubprocessPlugin::spawn(
+                        spec,
+                        self.inner.notification_tx.get().cloned(),
+                    )
+                    .await
+                    .map_err(PluginHostError::Spawn)?;
                     self.inner
                         .subprocesses
                         .write()
@@ -524,7 +645,7 @@ impl PluginHost {
                                 args: runtime.args.clone(),
                                 cwd: Some(stage),
                             };
-                            match SubprocessPlugin::spawn(spec).await {
+                            match SubprocessPlugin::spawn(spec, self.inner.notification_tx.get().cloned()).await {
                                 Ok(p) => {
                                     self.inner
                                         .subprocesses
@@ -937,6 +1058,143 @@ pub trait BuiltinTools: Send + Sync {
     ) -> Option<Result<serde_json::Value, String>>;
 }
 
+/// Phase D.2 — handle one plugin → host notification. Today we only
+/// understand `skill.register` and `skill.unregister`; future
+/// methods land here as additional match arms.
+async fn handle_plugin_notification(
+    skill_store: &Arc<execlaw_skills::SkillStore>,
+    n: crate::subprocess::PluginNotification,
+) {
+    let plugin_id = n.plugin_id.clone();
+    match n.method.as_str() {
+        "skill.register" => {
+            #[derive(serde::Deserialize)]
+            struct RegisterParams {
+                name: String,
+                description: String,
+                body_md: String,
+                #[serde(default)]
+                tags: Vec<String>,
+            }
+            let parsed: Result<RegisterParams, _> =
+                serde_json::from_value(n.params.clone());
+            let p = match parsed {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        plugin_id,
+                        error = %e,
+                        "skill.register: invalid params"
+                    );
+                    return;
+                }
+            };
+            // Build a `SkillDecl` and route through the existing
+            // import_plugin_skills path so the namespace prefix +
+            // sanitization rules are identical to ZIP-shipped skills.
+            // The `entry` field is a synthetic in-memory body; we
+            // bypass the file read by writing the body directly.
+            let stored_name = execlaw_skills::namespaced_name(&plugin_id, &p.name);
+            let frontmatter = serde_json::json!({
+                "name": stored_name,
+                "description": p.description,
+                "tags": p.tags,
+                "registered_at_runtime": true,
+            })
+            .to_string();
+            let now_ms = chrono::Utc::now().timestamp() * 1000;
+            let new = execlaw_skills::NewSkill {
+                name: stored_name.clone(),
+                source: format!("plugin:{plugin_id}"),
+                registration_kind: execlaw_skills::RegistrationKind::Registered,
+                owning_plugin_id: Some(plugin_id.clone()),
+                initial_version: execlaw_skills::NewSkillVersion {
+                    description: p.description,
+                    body_md: p.body_md,
+                    frontmatter_json: frontmatter,
+                    authored_by: format!("plugin:{plugin_id}"),
+                    promotion_notes: None,
+                },
+                resources: vec![],
+            };
+            match skill_store.import_shipped(new, now_ms) {
+                Ok(_) => info!(
+                    plugin_id,
+                    skill = %stored_name,
+                    "plugin registered skill at runtime"
+                ),
+                Err(e) => warn!(
+                    plugin_id,
+                    skill = %stored_name,
+                    error = %e,
+                    "skill.register failed"
+                ),
+            }
+        }
+        "skill.unregister" => {
+            #[derive(serde::Deserialize)]
+            struct UnregisterParams {
+                name: String,
+            }
+            let parsed: Result<UnregisterParams, _> =
+                serde_json::from_value(n.params.clone());
+            let p = match parsed {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(plugin_id, error = %e, "skill.unregister: invalid params");
+                    return;
+                }
+            };
+            let stored_name = execlaw_skills::namespaced_name(&plugin_id, &p.name);
+            // Verify the skill is owned by THIS plugin before
+            // archiving — defense against a misbehaving plugin
+            // trying to unregister someone else's skill.
+            let owner_check = skill_store.get(&stored_name);
+            match owner_check {
+                Ok(Some(s)) if s.owning_plugin_id.as_deref() == Some(&plugin_id) => {
+                    let now_ms = chrono::Utc::now().timestamp() * 1000;
+                    if let Err(e) = skill_store.archive(&stored_name, now_ms) {
+                        warn!(
+                            plugin_id,
+                            skill = %stored_name,
+                            error = %e,
+                            "skill.unregister: archive failed"
+                        );
+                    } else {
+                        info!(
+                            plugin_id,
+                            skill = %stored_name,
+                            "plugin unregistered skill at runtime"
+                        );
+                    }
+                }
+                Ok(Some(s)) => warn!(
+                    plugin_id,
+                    skill = %stored_name,
+                    actual_owner = ?s.owning_plugin_id,
+                    "skill.unregister: refusing — not owned by this plugin"
+                ),
+                Ok(None) => debug!(
+                    plugin_id,
+                    skill = %stored_name,
+                    "skill.unregister: target does not exist; ignoring"
+                ),
+                Err(e) => warn!(
+                    plugin_id,
+                    skill = %stored_name,
+                    error = %e,
+                    "skill.unregister: lookup failed"
+                ),
+            }
+        }
+        other => debug!(
+            plugin_id,
+            method = %other,
+            "plugin notification with unknown method; ignored"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1194,6 +1452,332 @@ source = "main.rhai"
         )
         .unwrap();
         (dir, stage)
+    }
+
+    /// Phase B (2026-05-03) — stages a script-tier plugin that
+    /// declares two `[[skills]]` rows + ships their body files.
+    /// Returns the temp dir keep-alive guard, the stage path the
+    /// caller hands to `host.install`, and the plugin id.
+    fn stage_plugin_with_skills(plugin_id: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join(format!("{plugin_id}-0.1.0"));
+        std::fs::create_dir_all(stage.join("skills")).unwrap();
+        let manifest = format!(
+            r#"
+[plugin]
+id = "{plugin_id}"
+name = "Skills Test"
+version = "0.1.0"
+description = "test"
+author = "a"
+license = "x"
+
+[[skills]]
+name = "Query Builder"
+description = "Use to construct SQL queries against Postgres."
+entry = "skills/query-builder.md"
+tags = ["db", "sql"]
+
+[[skills]]
+name = "migrate"
+description = "Use to plan and run database migrations."
+entry = "skills/migrate.md"
+
+[runtime]
+tier = "script"
+source = "main.rhai"
+"#
+        );
+        std::fs::write(stage.join("plugin.toml"), manifest).unwrap();
+        std::fs::write(
+            stage.join("main.rhai"),
+            "fn tool_call(name, args, oauth) { #{} }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            stage.join("skills/query-builder.md"),
+            "# Query Builder\n\nUse SELECT carefully.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            stage.join("skills/migrate.md"),
+            "# Migrations\n\nAlways back up first.\n",
+        )
+        .unwrap();
+        (dir, stage)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_imports_plugin_skills_with_namespaced_names() {
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
+        let store = std::sync::Arc::new(execlaw_skills::SkillStore::new(db.clone()));
+        host.attach_skill_store(store.clone());
+
+        let (_keep, stage) = stage_plugin_with_skills("postgres-toolkit");
+        host.install(&stage).await.unwrap();
+
+        let names = store.list_for_plugin("postgres-toolkit").unwrap();
+        assert_eq!(
+            names,
+            vec![
+                "postgres-toolkit/migrate".to_string(),
+                "postgres-toolkit/query-builder".to_string(),
+            ],
+            "both shipped skills must land with namespaced names"
+        );
+
+        // The skill's content + frontmatter is intact.
+        let view = store
+            .view("postgres-toolkit/query-builder")
+            .unwrap()
+            .unwrap();
+        assert!(view.body_md.contains("SELECT carefully"));
+        assert_eq!(view.description, "Use to construct SQL queries against Postgres.");
+        let fm: serde_json::Value =
+            serde_json::from_str(&view.frontmatter_json).unwrap();
+        assert_eq!(fm["tags"][0], "db");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_with_no_attached_store_is_a_no_op_for_skills() {
+        // Without a skill store attached, install() must succeed and
+        // simply ignore the [[skills]] blocks. Existing tests +
+        // callers that don't care about skills are unaffected.
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
+        // No attach_skill_store call.
+
+        let (_keep, stage) = stage_plugin_with_skills("p-noskills");
+        host.install(&stage).await.unwrap();
+        // No state_skills rows landed because no store was attached.
+        let count: i64 = db
+            .with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM state_skills", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uninstall_archives_plugin_shipped_skills() {
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
+        let store = std::sync::Arc::new(execlaw_skills::SkillStore::new(db.clone()));
+        host.attach_skill_store(store.clone());
+
+        let (_keep, stage) = stage_plugin_with_skills("ephemeral");
+        host.install(&stage).await.unwrap();
+        assert_eq!(store.list_for_plugin("ephemeral").unwrap().len(), 2);
+
+        host.uninstall("ephemeral").await.unwrap();
+        // Active list is empty…
+        assert!(store.list_for_plugin("ephemeral").unwrap().is_empty());
+        // …but the rows still exist in archived state for forensic
+        // queries (state_skill_invocations FKs stay valid).
+        let archived: i64 = db
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM state_skills
+                     WHERE owning_plugin_id = ?1 AND state = 'archived'",
+                    params!["ephemeral"],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(archived, 2);
+    }
+
+    /// Phase D.2 — `handle_plugin_notification` is the host's
+    /// single dispatch point for plugin → host notifications.
+    /// Unit-tested directly because driving a subprocess through
+    /// the full RPC pipeline is platform-flaky on Windows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handle_plugin_notification_register_lands_a_namespaced_skill() {
+        let db = fresh_db();
+        let store = std::sync::Arc::new(execlaw_skills::SkillStore::new(db.clone()));
+        super::handle_plugin_notification(
+            &store,
+            crate::subprocess::PluginNotification {
+                plugin_id: "postgres-toolkit".into(),
+                method: "skill.register".into(),
+                params: serde_json::json!({
+                    "name": "Query Builder",
+                    "description": "Use to build SELECT queries.",
+                    "body_md": "1. SELECT carefully.\n2. LIMIT.",
+                    "tags": ["db", "sql"]
+                }),
+            },
+        )
+        .await;
+        let names = store.list_for_plugin("postgres-toolkit").unwrap();
+        assert_eq!(names, vec!["postgres-toolkit/query-builder"]);
+        let g = store.get("postgres-toolkit/query-builder").unwrap().unwrap();
+        assert_eq!(
+            g.registration_kind,
+            execlaw_skills::RegistrationKind::Registered
+        );
+        assert!(g.current_version.body_md.contains("SELECT carefully"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handle_plugin_notification_unregister_archives_only_own_skill() {
+        let db = fresh_db();
+        let store = std::sync::Arc::new(execlaw_skills::SkillStore::new(db.clone()));
+        // Plugin "alpha" registers a skill.
+        super::handle_plugin_notification(
+            &store,
+            crate::subprocess::PluginNotification {
+                plugin_id: "alpha".into(),
+                method: "skill.register".into(),
+                params: serde_json::json!({
+                    "name": "x",
+                    "description": "alpha's",
+                    "body_md": "body",
+                }),
+            },
+        )
+        .await;
+        assert_eq!(store.list_for_plugin("alpha").unwrap(), vec!["alpha/x"]);
+
+        // Plugin "beta" tries to unregister alpha's skill — must be refused.
+        super::handle_plugin_notification(
+            &store,
+            crate::subprocess::PluginNotification {
+                plugin_id: "beta".into(),
+                method: "skill.unregister".into(),
+                params: serde_json::json!({"name": "x"}),
+            },
+        )
+        .await;
+        // Note: namespaced names differ — alpha/x vs beta/x.
+        // beta's unregister target (beta/x) doesn't exist, so it's a no-op.
+        // alpha/x is unchanged.
+        assert_eq!(store.list_for_plugin("alpha").unwrap(), vec!["alpha/x"]);
+
+        // Now alpha legitimately unregisters its own.
+        super::handle_plugin_notification(
+            &store,
+            crate::subprocess::PluginNotification {
+                plugin_id: "alpha".into(),
+                method: "skill.unregister".into(),
+                params: serde_json::json!({"name": "x"}),
+            },
+        )
+        .await;
+        assert!(store.list_for_plugin("alpha").unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handle_plugin_notification_invalid_params_is_logged_not_panicked() {
+        let db = fresh_db();
+        let store = std::sync::Arc::new(execlaw_skills::SkillStore::new(db.clone()));
+        // Garbage params.
+        super::handle_plugin_notification(
+            &store,
+            crate::subprocess::PluginNotification {
+                plugin_id: "p".into(),
+                method: "skill.register".into(),
+                params: serde_json::json!({"wrong": "shape"}),
+            },
+        )
+        .await;
+        // Unknown method.
+        super::handle_plugin_notification(
+            &store,
+            crate::subprocess::PluginNotification {
+                plugin_id: "p".into(),
+                method: "skill.unknown".into(),
+                params: serde_json::Value::Null,
+            },
+        )
+        .await;
+        // No state changes — assertion via row count.
+        let count: i64 = db
+            .with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM state_skills", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handle_plugin_notification_register_credential_is_rejected_by_scanner() {
+        let db = fresh_db();
+        let store = std::sync::Arc::new(execlaw_skills::SkillStore::new(db.clone()));
+        super::handle_plugin_notification(
+            &store,
+            crate::subprocess::PluginNotification {
+                plugin_id: "p".into(),
+                method: "skill.register".into(),
+                params: serde_json::json!({
+                    "name": "leaky",
+                    "description": "leaks",
+                    "body_md": "use sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz to call",
+                }),
+            },
+        )
+        .await;
+        // Scanner blocks; no row landed.
+        assert!(store.list_for_plugin("p").unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_continues_when_one_skill_conflicts_with_admin_authored() {
+        // Admin pre-authors a skill whose namespaced name will
+        // collide with one of the plugin's skills. The install
+        // must still succeed; the conflicting skill is logged as
+        // failed but the other one lands. This is the partial-
+        // success contract from the import design.
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
+        let store = std::sync::Arc::new(execlaw_skills::SkillStore::new(db.clone()));
+        host.attach_skill_store(store.clone());
+
+        // Admin owns `pg/query-builder` first, before the plugin
+        // ships its own.
+        store
+            .create(
+                execlaw_skills::NewSkill {
+                    name: "pg/query-builder".into(),
+                    source: "admin:Controller".into(),
+                    registration_kind: execlaw_skills::RegistrationKind::Authored,
+                    owning_plugin_id: None,
+                    initial_version: execlaw_skills::NewSkillVersion {
+                        description: "admin's version".into(),
+                        body_md: "by admin".into(),
+                        frontmatter_json: "{}".into(),
+                        authored_by: "admin:Controller".into(),
+                        promotion_notes: None,
+                    },
+                    resources: vec![],
+                },
+                execlaw_skills::Strictness::Strict,
+                100,
+            )
+            .unwrap();
+
+        let (_keep, stage) = stage_plugin_with_skills("pg");
+        // Install proceeds: `pg/migrate` lands, `pg/query-builder`
+        // is rejected as a conflict (admin's version already owns
+        // that name).
+        host.install(&stage).await.unwrap();
+
+        let names = store.list_for_plugin("pg").unwrap();
+        assert_eq!(names, vec!["pg/migrate".to_string()]);
+
+        // Admin's skill is unchanged: still admin-authored, still
+        // their original body.
+        let admins = store.get("pg/query-builder").unwrap().unwrap();
+        assert_eq!(
+            admins.registration_kind,
+            execlaw_skills::RegistrationKind::Authored
+        );
+        assert_eq!(admins.current_version.body_md, "by admin");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

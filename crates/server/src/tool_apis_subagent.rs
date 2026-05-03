@@ -170,17 +170,23 @@ impl SubagentApi for InferenceSubagentApi {
             chat_template_kwargs: None,
         };
 
-        let outcome = self.client.chat_completions(&chat_req).await;
+        let adapter = execlaw_model_adapter::adapter_for(
+            execlaw_model_adapter::ModelFamily::detect(&self.model),
+        );
+        // Subagent reply is consumed verbatim by the parent turn;
+        // markdown hint = no fence stripping (parent may want code
+        // blocks if the subagent emitted them).
+        let outcome = adapter
+            .chat(
+                &self.client,
+                chat_req,
+                execlaw_model_adapter::OutputHint::Markdown,
+            )
+            .await;
         let (text, tokens_used, succeeded) = match outcome {
-            Ok(resp) => {
-                let text = resp
-                    .choices
-                    .into_iter()
-                    .next()
-                    .and_then(|c| c.message.content)
-                    .unwrap_or_default();
-                let tokens = resp.usage.as_ref().map(|u| u.completion_tokens);
-                (text, tokens, true)
+            Ok(adapted) => {
+                let tokens = adapted.usage.as_ref().map(|u| u.completion_tokens);
+                (adapted.content, tokens, true)
             }
             Err(e) => {
                 let _ = self.emit_event(

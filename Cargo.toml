@@ -23,6 +23,8 @@ members = [
     "plugins/hello",
     "plugins/identity-local-address-book",
     "crates/eval-harness",
+    "crates/skills",
+    "crates/model-adapter",
 ]
 
 [workspace.package]

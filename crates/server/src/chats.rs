@@ -467,6 +467,54 @@ pub async fn send_message(
         let _ = store.set_last_activity_at(&cid, chrono::Utc::now().timestamp());
     }
 
+    // Phase C (2026-05-03) — auto-capture handoff. Non-blocking
+    // mpsc send; the worker pulls from the queue, gates on
+    // `config_skills.auto_capture_enabled` (default OFF), and runs
+    // the sanitize → summarize → SkillStore::create pipeline in the
+    // background. Returns false silently when the worker isn't
+    // installed (tests) or its receiver was dropped — auto-capture
+    // failure must never affect chat-handler success.
+    state.skill_capture.enqueue(execlaw_skills::CaptureRequest {
+        conversation_id: cid.clone(),
+        until_seq: execlaw_core::ids::EventSeq(assistant_seq),
+        run_id: format!("turn-{}-{}", cid.as_str(), assistant_seq),
+    });
+
+    // Phase D.3 (2026-05-03) — close any open `skill_invocations`
+    // for this conversation (the model may have called
+    // `skills.view` during the turn) and enqueue a reuse-update
+    // request per closed row. Best-effort: a DB hiccup logs but
+    // does not affect the chat handler's success path. Gated
+    // server-side by `config_skills.reuse_update_enabled`.
+    {
+        let skill_store = execlaw_skills::SkillStore::new(state.db.clone());
+        let now_ms = chrono::Utc::now().timestamp() * 1000;
+        // Tool calls in this turn are countable from the event log
+        // by the worker itself; we just pass 0 here as a placeholder
+        // since the close API requires a number.
+        match skill_store.close_open_invocations(cid.as_str(), "success", 0, now_ms) {
+            Ok(closures) => {
+                for (inv_id, sk_id) in closures {
+                    state.reuse_update.enqueue(execlaw_skills::ReuseUpdateRequest {
+                        conversation_id: cid.clone(),
+                        invocation_id: inv_id,
+                        skill_id: sk_id,
+                        until_seq: execlaw_core::ids::EventSeq(assistant_seq),
+                        run_id: format!("turn-{}-{}", cid.as_str(), assistant_seq),
+                        outcome: "success".into(),
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    conversation_id = %cid.as_str(),
+                    error = %e,
+                    "Phase D.3: close_open_invocations failed (best-effort; chat continues)"
+                );
+            }
+        }
+    }
+
     (
         StatusCode::OK,
         Json(serde_json::json!(SendMessageResponse {
@@ -660,7 +708,13 @@ async fn run_real_turn(
         .flatten()
         .map(|r| r.reasoning_enabled)
         .unwrap_or(false);
-    let req = ChatRequest {
+    // Pre-set chat_template_kwargs based on the operator's
+    // reasoning_enabled flag; the adapter's prepare_request will
+    // honor whatever the caller chose for Conversation hint (Qwen3
+    // adapter only fills in a default when the caller leaves it
+    // None). This preserves the existing reasoning-enabled toggle
+    // while still routing through the per-family adapter.
+    let base_req = ChatRequest {
         model: ModelId(state.config.model_id.clone()),
         messages,
         tools: None,
@@ -677,6 +731,11 @@ async fn run_real_turn(
             "enable_thinking": reasoning_enabled,
         })),
     };
+    let adapter = execlaw_model_adapter::adapter_for(
+        execlaw_model_adapter::ModelFamily::detect(&state.config.model_id),
+    );
+    let req = adapter
+        .prepare_request(base_req, execlaw_model_adapter::OutputHint::Conversation);
     let mut stream = inference
         .chat_completions_stream(&req)
         .await
@@ -2625,7 +2684,7 @@ async fn run_incognito_send(
         sender: req.sender_principal_id.clone(),
     });
 
-    let chat_req = ChatRequest {
+    let base_req = ChatRequest {
         model: ModelId(state.config.model_id.clone()),
         messages,
         tools: None,
@@ -2638,6 +2697,11 @@ async fn run_incognito_send(
             "enable_thinking": reasoning_enabled,
         })),
     };
+    let adapter = execlaw_model_adapter::adapter_for(
+        execlaw_model_adapter::ModelFamily::detect(&state.config.model_id),
+    );
+    let chat_req = adapter
+        .prepare_request(base_req, execlaw_model_adapter::OutputHint::Conversation);
     let mut stream = match inference.chat_completions_stream(&chat_req).await {
         Ok(s) => s,
         Err(e) => return err_500(&format!("incognito stream open: {e}")),
@@ -2862,13 +2926,19 @@ pub async fn generate_title(
         stream: false,
         temperature: Some(0.2),
         max_tokens: Some(20),
-        // Title gen never wants chain-of-thought.
-        chat_template_kwargs: Some(serde_json::json!({
-            "enable_thinking": false,
-        })),
+        // Adapter applies per-family kwargs (Qwen3 forces
+        // enable_thinking:false here regardless because Plain hint
+        // never wants reasoning).
+        chat_template_kwargs: None,
     };
-    let resp = match inference.chat_completions(&req).await {
-        Ok(r) => r,
+    let adapter = execlaw_model_adapter::adapter_for(
+        execlaw_model_adapter::ModelFamily::detect(&state.config.model_id),
+    );
+    let adapted = match adapter
+        .chat(&inference, req, execlaw_model_adapter::OutputHint::Plain)
+        .await
+    {
+        Ok(a) => a,
         Err(e) => {
             tracing::warn!(error = %e, "title generation failed; leaving display_name unset");
             return (
@@ -2882,12 +2952,7 @@ pub async fn generate_title(
                 .into_response();
         }
     };
-    let raw = resp
-        .choices
-        .first()
-        .and_then(|c| c.message.content.clone())
-        .unwrap_or_default();
-    let title = sanitize_generated_title(&raw);
+    let title = sanitize_generated_title(&adapted.content);
     if title.is_empty() {
         return (
             StatusCode::OK,

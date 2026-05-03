@@ -1013,6 +1013,7 @@ dependencies = [
  "execlaw-plugin-sdk",
  "execlaw-policy",
  "execlaw-server",
+ "execlaw-skills",
  "execlaw-vault",
  "keyring",
  "serde",
@@ -1135,6 +1136,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "execlaw-model-adapter"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "criterion",
+ "execlaw-inference-api",
+ "once_cell",
+ "pretty_assertions",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "execlaw-outbox"
 version = "0.1.0"
 dependencies = [
@@ -1162,6 +1179,7 @@ dependencies = [
  "execlaw-core",
  "execlaw-plugin-sdk",
  "execlaw-script",
+ "execlaw-skills",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1291,12 +1309,14 @@ dependencies = [
  "execlaw-core",
  "execlaw-inference-api",
  "execlaw-mcp-client",
+ "execlaw-model-adapter",
  "execlaw-plugin-host",
  "execlaw-plugin-sdk",
  "execlaw-policy",
  "execlaw-runner-local",
  "execlaw-runner-protocol",
  "execlaw-script",
+ "execlaw-skills",
  "execlaw-vault",
  "execlaw-voice-pipeline",
  "fs4",
@@ -1340,6 +1360,29 @@ dependencies = [
  "async-trait",
  "execlaw-core",
  "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "execlaw-skills"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "criterion",
+ "execlaw-core",
+ "execlaw-plugin-sdk",
+ "hex",
+ "once_cell",
+ "pretty_assertions",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

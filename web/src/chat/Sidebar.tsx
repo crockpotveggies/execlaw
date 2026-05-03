@@ -121,10 +121,10 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                     testId="sidebar-research"
                 />
                 <SidebarNavLink
-                    to="/settings/contacts"
-                    icon="bi-person-lines-fill"
-                    label="Contacts"
-                    testId="sidebar-contacts"
+                    to="/skills"
+                    icon="bi-stars"
+                    label="Skills"
+                    testId="sidebar-skills"
                 />
                 {pendingApprovalCount > 0 && (
                     <SidebarNavLink
@@ -165,6 +165,12 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                 </button>
                 {moreExpanded && (
                     <div className="ps-3" data-testid="sidebar-more-panels">
+                        <SidebarNavLink
+                            to="/settings/contacts"
+                            icon="bi-person-lines-fill"
+                            label="Contacts"
+                            testId="sidebar-contacts"
+                        />
                         {panels.length === 0 ? (
                             <div className="execlaw-muted small px-2 py-1">
                                 No plugin panels installed.

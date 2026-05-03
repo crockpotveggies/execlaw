@@ -1268,6 +1268,37 @@ async fn cmd_serve(
         }
     }
 
+    // 2026-05-03 — Phase A: register the skill subsystem's tool
+    // surface (skills.list/view/resource/search + admin-gated
+    // create/update/promote/archive). Uses the same
+    // `register_builtins` helper as the core tools so each skill
+    // tool also gets a `config_tool_access` seed row from its
+    // descriptor's `default_allowed_classes`. The store is shared
+    // across all eight tools via Arc; it holds only a Database
+    // handle so the clone is cheap.
+    let skill_store = std::sync::Arc::new(execlaw_skills::SkillStore::new(db.clone()));
+    {
+        let now = chrono::Utc::now().timestamp();
+        let tools = execlaw_skills::skill_tools(skill_store.clone());
+        match execlaw_plugin_host::register_builtins(
+            plugin_host.registry(),
+            &db,
+            now,
+            tools,
+        ) {
+            Ok(landed) => tracing::info!(count = landed.len(), "skill tools registered"),
+            Err(e) => return Err(anyhow::anyhow!("register skill tools failed: {e}")),
+        }
+    }
+
+    // 2026-05-03 — Phase B: attach the same shared SkillStore to
+    // the plugin host so `install` imports plugin-shipped skills
+    // (with `<plugin_id>/` namespace prepending) and `uninstall`
+    // archives them. `attach_skill_store` is `OnceLock`-backed and
+    // composes after `hydrate()` without disturbing already-loaded
+    // subprocesses or script plugins.
+    plugin_host.attach_skill_store(skill_store.clone());
+
     // Phase 8a: reflect every built-in + persisted plugin tool into
     // `config_tool_access` so the per-tool trust-class allowlist gate
     // has a row for everything. Idempotent — operator policy from
@@ -1490,6 +1521,28 @@ async fn cmd_serve(
         events.clone(),
     );
 
+    // Phase C (2026-05-03) — auto-capture worker. The summarizer
+    // talks to `BackendPurpose::Small` so the standard turn isn't
+    // contended; the worker gates internally on
+    // `config_skills.auto_capture_enabled` (default OFF) so an
+    // operator who hasn't opted in never burns inference cycles.
+    let (skill_capture_sink, _skill_capture_handle) =
+        execlaw_server::skill_capture_runtime::spawn_capture_worker(
+            db.clone(),
+            skill_store.clone(),
+            inference.clone(),
+            execlaw_inference_api::ModelId(config.model_id.clone()),
+        );
+    // Phase D.3 — reuse-update worker. Same shape; gates on
+    // `config_skills.reuse_update_enabled` (default OFF).
+    let (reuse_update_sink, _reuse_update_handle) =
+        execlaw_server::skill_capture_runtime::spawn_reuse_update_worker(
+            db.clone(),
+            skill_store.clone(),
+            inference.clone(),
+            execlaw_inference_api::ModelId(config.model_id.clone()),
+        );
+
     let state = execlaw_server::AppState {
         db: db.clone(),
         config: config.clone(),
@@ -1507,6 +1560,8 @@ async fn cmd_serve(
         turn_cancel: execlaw_server::turn_cancel::TurnCancellationRegistry::new(),
         runner_supervisor: runner_supervisor.clone(),
         research_supervisor: Some(research_supervisor.clone()),
+        skill_capture: skill_capture_sink,
+        reuse_update: reuse_update_sink,
     };
 
     // Phase-7 background workers — run for the lifetime of the

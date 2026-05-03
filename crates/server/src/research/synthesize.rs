@@ -103,7 +103,7 @@ pub async fn run_synthesize(ctx: SynthesizeCtx) -> Result<SynthesizeOutcome, Syn
     let prompt_user = build_synthesize_prompt(&query, &plan, &usable);
 
     let chat_req = ChatRequest {
-        model: ModelId(model),
+        model: ModelId(model.clone()),
         messages: vec![
             ChatMessage::system(SYNTHESIZE_SYSTEM_PROMPT),
             ChatMessage::user(prompt_user),
@@ -114,16 +114,14 @@ pub async fn run_synthesize(ctx: SynthesizeCtx) -> Result<SynthesizeOutcome, Syn
         tools: None,
         chat_template_kwargs: None,
     };
-    let resp = inference
-        .chat_completions(&chat_req)
+    let adapter = execlaw_model_adapter::adapter_for(
+        execlaw_model_adapter::ModelFamily::detect(&model),
+    );
+    let adapted = adapter
+        .chat(&inference, chat_req, execlaw_model_adapter::OutputHint::Markdown)
         .await
         .map_err(|e| SynthesizeError::Inference(e.to_string()))?;
-    let report_markdown = resp
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.message.content)
-        .unwrap_or_default();
+    let report_markdown = adapted.content;
     if report_markdown.trim().is_empty() {
         return Err(SynthesizeError::Inference(
             "synthesize LLM returned empty markdown".into(),

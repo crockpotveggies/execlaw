@@ -21,6 +21,7 @@ execlaw-vault = { path = "../vault" }
 execlaw-inference-api = { path = "../inference-api" }
 execlaw-plugin-host = { path = "../plugin-host" }
 execlaw-policy = { path = "../policy" }
+execlaw-skills = { path = "../skills" }
 
 clap.workspace = true
 chrono.workspace = true

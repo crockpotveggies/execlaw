@@ -46,6 +46,7 @@ pub mod research;
 pub mod retention;
 pub mod routine_run_retention;
 pub mod routines;
+pub mod skills_config;
 pub mod tool;
 pub mod tool_access;
 pub mod tool_apis;

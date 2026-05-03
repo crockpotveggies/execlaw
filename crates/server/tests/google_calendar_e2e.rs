@@ -194,6 +194,8 @@ fn build_app(stage_root: PathBuf) -> (axum::Router, AppState) {
         turn_cancel: execlaw_server::turn_cancel::TurnCancellationRegistry::new(),
         runner_supervisor: None,
         research_supervisor: None,
+        skill_capture: execlaw_skills::AutoCaptureSink::noop(),
+        reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
     };
     (execlaw_server::routes::build_router(state.clone()), state)
 }

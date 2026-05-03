@@ -662,28 +662,41 @@ async fn call_planner(
         temperature: Some(0.2),
         stream: false,
         tools: None,
+        // Adapter applies per-family kwargs (e.g. enable_thinking
+        // for Qwen3); leave None here so the adapter's choice wins.
         chat_template_kwargs: None,
     };
-    let resp = client
-        .chat_completions(&req)
+    let adapter = execlaw_model_adapter::adapter_for(
+        execlaw_model_adapter::ModelFamily::detect(model),
+    );
+    let adapted = adapter
+        .chat(client, req, execlaw_model_adapter::OutputHint::StructuredJson)
         .await
         .map_err(|e| ResearchRunnerError::Inference(e.to_string()))?;
-    let text = resp
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.message.content)
-        .unwrap_or_default();
-    parse_plan(&text)
+    parse_plan(&adapted.content)
 }
 
 /// Best-effort parser. The planner is told to reply with strict JSON,
-/// but real LLMs sometimes wrap the JSON in a ```json fence or add a
-/// preamble. Strip those before deserialising.
+/// but real LLMs sometimes wrap the JSON in a ```json fence, prepend
+/// a "Thinking Process:" preamble, or include `{` characters inside
+/// thinking text BEFORE the real object. We try a sequence of
+/// extraction strategies and take the first that parses.
 fn parse_plan(raw: &str) -> Result<ResearchPlan, ResearchRunnerError> {
-    let candidate = strip_fences_and_prose(raw);
-    let parsed: PlannerJson = serde_json::from_str(&candidate)
-        .map_err(|e| ResearchRunnerError::PlannerJson(format!("{e} — text was: {candidate}")))?;
+    let candidate = match extract_planner_json(raw) {
+        Some(c) => c,
+        None => {
+            return Err(ResearchRunnerError::PlannerJson(format!(
+                "no parseable JSON object found — text was: {}",
+                truncate_for_error(raw, 400)
+            )));
+        }
+    };
+    let parsed: PlannerJson = serde_json::from_str(&candidate).map_err(|e| {
+        ResearchRunnerError::PlannerJson(format!(
+            "{e} — text was: {}",
+            truncate_for_error(&candidate, 400)
+        ))
+    })?;
     let steps: Vec<PlanStep> = parsed
         .steps
         .into_iter()
@@ -704,14 +717,56 @@ fn parse_plan(raw: &str) -> Result<ResearchPlan, ResearchRunnerError> {
     })
 }
 
-fn strip_fences_and_prose(raw: &str) -> String {
+/// Find a parseable JSON object inside the planner's reply.
+///
+/// Strategy, in order:
+///   1. Trim whitespace; if the result starts with `{`, return it.
+///   2. Strip a ```json (or bare ```) fence + trailing fence.
+///   3. Strip well-known thinking preambles (`<think>...</think>` and
+///      Qwen3.5's literal "Thinking Process:" block).
+///   4. Walk every `{` position in the (possibly-stripped) text and
+///      return the substring from each one to its matching `}` —
+///      first one that parses as the planner's expected shape wins.
+///
+/// Returns `None` only when no balanced `{...}` substring parses.
+pub(crate) fn extract_planner_json(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    // Fast path: starts with `{`.
-    if trimmed.starts_with('{') {
-        return trimmed.to_owned();
+    if trimmed.is_empty() {
+        return None;
     }
-    // Strip a leading ```json or ``` fence + trailing fence.
-    let mut working = trimmed.to_owned();
+    if trimmed.starts_with('{') && serde_json::from_str::<PlannerJson>(trimmed).is_ok() {
+        return Some(trimmed.to_owned());
+    }
+    // Strip ```json fence pair.
+    let unfenced = strip_code_fences(trimmed);
+    let unfenced_trim = unfenced.trim();
+    if unfenced_trim.starts_with('{') && serde_json::from_str::<PlannerJson>(unfenced_trim).is_ok()
+    {
+        return Some(unfenced_trim.to_owned());
+    }
+    // Strip thinking blocks.
+    let depreamble = strip_thinking_preamble(unfenced_trim);
+    let depreamble_trim = depreamble.trim();
+    if depreamble_trim.starts_with('{')
+        && serde_json::from_str::<PlannerJson>(depreamble_trim).is_ok()
+    {
+        return Some(depreamble_trim.to_owned());
+    }
+    // Brace-walk: try every `{` position. First one with a balanced
+    // matching `}` whose substring parses as PlannerJson wins.
+    for (pos, _) in depreamble_trim.match_indices('{') {
+        if let Some(end) = matching_brace_end(depreamble_trim, pos) {
+            let slice = &depreamble_trim[pos..=end];
+            if serde_json::from_str::<PlannerJson>(slice).is_ok() {
+                return Some(slice.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn strip_code_fences(s: &str) -> String {
+    let mut working = s.to_owned();
     if let Some(rest) = working.strip_prefix("```json") {
         working = rest.trim_start().to_owned();
     } else if let Some(rest) = working.strip_prefix("```") {
@@ -720,14 +775,77 @@ fn strip_fences_and_prose(raw: &str) -> String {
     if let Some(end) = working.rfind("```") {
         working.truncate(end);
     }
-    let trimmed = working.trim();
-    // Last-ditch: find the first `{` and the last `}` and slice.
-    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
-        if end >= start {
-            return trimmed[start..=end].to_owned();
+    working
+}
+
+/// Strip Qwen3.5's "Thinking Process:" prefix and any `<think>...</think>`
+/// block. Both shapes have shown up in the wild even with
+/// `enable_thinking: false` set on certain backend versions.
+fn strip_thinking_preamble(s: &str) -> String {
+    let mut working = s.to_owned();
+    // <think>...</think> wrapper (xml-style). Drop everything up
+    // to and including </think>.
+    if let Some(close) = working.find("</think>") {
+        working = working[close + "</think>".len()..].to_string();
+    }
+    // Literal "Thinking Process:" block — Qwen3.5 sometimes emits
+    // this in plain prose. The block typically ends at the start of
+    // the actual structured output. Heuristic: if the text starts
+    // with "Thinking Process:" and a JSON object follows, slice from
+    // the first `{`. The brace-walk fallback in `extract_planner_json`
+    // handles the case where a `{` appears inside the thinking text
+    // itself (e.g. an example shown in a numbered list).
+    let lower = working.to_ascii_lowercase();
+    if lower.starts_with("thinking process:") || lower.contains("\nthinking process:") {
+        if let Some(first_brace) = working.find('{') {
+            working = working[first_brace..].to_string();
         }
     }
-    trimmed.to_owned()
+    working
+}
+
+/// Find the index of the `}` that matches the `{` at `start`.
+/// Tracks string literals + backslash escapes so a `}` inside a
+/// quoted string doesn't count.
+fn matching_brace_end(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    debug_assert_eq!(bytes[start], b'{');
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn truncate_for_error(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push_str("…[truncated]");
+    out
 }
 
 async fn mark_failed(
@@ -871,6 +989,71 @@ mod tests {
             parse_plan(r#"{"thesis":"t","steps":[{"query":"   "},{"query":"real"}]}"#).unwrap();
         assert_eq!(plan.steps.len(), 1);
         assert_eq!(plan.steps[0].query, "real");
+    }
+
+    /// Regression: Qwen3.5 sometimes ignores `enable_thinking: false`
+    /// and emits its native "Thinking Process:" preamble in front of
+    /// the JSON. The parser used to truncate at the first `}` it saw
+    /// — which sometimes appeared in the thinking text itself —
+    /// producing a parse error.
+    #[test]
+    fn parse_plan_skips_thinking_process_preamble_with_braces_in_prose() {
+        let raw = r#"Thinking Process:
+1. **Analyze the Request:**
+   * Output Format: EXACTLY a JSON object with keys "thesis" and "steps". Each step must have "query" and "rationale".
+   * Example placeholder: { 'thesis': '...', 'steps': [...] }  ← single quotes so this isn't valid JSON
+2. **Build the plan.**
+
+{"thesis": "ground covers vary by zone", "steps": [{"query": "evergreen ground cover zone 4", "rationale": "cold-hardy options"}, {"query": "evergreen ground cover zone 10", "rationale": "heat-tolerant options"}]}"#;
+        let plan = parse_plan(raw).unwrap();
+        assert_eq!(plan.steps.len(), 2);
+        assert!(plan.thesis.contains("zone"));
+    }
+
+    #[test]
+    fn parse_plan_handles_xml_think_block_wrapper() {
+        let raw = r#"<think>The user wants a research plan. I'll structure it as JSON with thesis and steps.</think>
+{"thesis": "t", "steps": [{"query": "q"}]}"#;
+        let plan = parse_plan(raw).unwrap();
+        assert_eq!(plan.steps.len(), 1);
+    }
+
+    #[test]
+    fn parse_plan_picks_first_valid_json_when_brace_walking() {
+        // Multiple `{` candidates; only one parses.
+        let raw = r#"prelude { not really json } more text {"thesis":"t","steps":[{"query":"q"}]} trailing"#;
+        let plan = parse_plan(raw).unwrap();
+        assert_eq!(plan.thesis, "t");
+    }
+
+    #[test]
+    fn parse_plan_error_message_truncates_long_inputs() {
+        // No JSON at all — error should contain a truncated preview,
+        // not echo back kilobytes of model output.
+        let raw = format!("Thinking Process:\n{}", "a".repeat(5000));
+        let err = parse_plan(&raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.len() < 1000, "error message must be bounded; got {} chars", msg.len());
+        assert!(msg.contains("no parseable JSON") || msg.contains("text was:"));
+    }
+
+    #[test]
+    fn matching_brace_end_handles_strings_with_escaped_quotes() {
+        // The `}` inside the string literal must NOT close the
+        // outer object early.
+        let s = r#"{"thesis":"has \"quoted\" } content","steps":[{"query":"q"}]}"#;
+        let end = matching_brace_end(s, 0).unwrap();
+        // The matching brace is the LAST char (after the inner step
+        // object closes too). We just need the substring to parse.
+        let slice = &s[0..=end];
+        assert!(serde_json::from_str::<PlannerJson>(slice).is_ok());
+    }
+
+    #[test]
+    fn matching_brace_end_handles_nested_braces() {
+        let s = r#"{"a":{"b":{"c":1}},"d":2}"#;
+        let end = matching_brace_end(s, 0).unwrap();
+        assert_eq!(end, s.len() - 1);
     }
 
     #[test]

@@ -151,6 +151,18 @@ pub struct AppState {
     /// `None` only in test fixtures that don't construct the
     /// supervisor (production cmd_serve always wires this up).
     pub research_supervisor: Option<crate::research::ResearchSupervisor>,
+    /// Phase C — sink the chat handler enqueues into at successful
+    /// turn completion. Never blocks; auto-capture is best-effort
+    /// and gated by `config_skills.auto_capture_enabled`. Defaults
+    /// to a no-op sink in tests; production constructs the real
+    /// sink + spawns the worker via
+    /// `crate::skill_capture_runtime::spawn_capture_worker`.
+    pub skill_capture: execlaw_skills::AutoCaptureSink,
+    /// Phase D.3 — sink for the reuse-update worker. Receives one
+    /// request per closed `skill_invocations` row at chat-turn end.
+    /// Same noop default + production-spawn pattern as
+    /// `skill_capture`.
+    pub reuse_update: execlaw_skills::ReuseUpdateSink,
 }
 
 impl std::fmt::Debug for AppState {

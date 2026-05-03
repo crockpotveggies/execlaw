@@ -75,6 +75,21 @@ pub enum EventKind {
     /// parent is mid-turn waiting for the child.
     SubagentStarted,
     SubagentCompleted,
+    /// 2026-05-02 — skill subsystem (Phase A). DB-backed,
+    /// versioned, admin-authored / plugin-registered procedural
+    /// knowledge. `SkillCreated` fires on the first version of a
+    /// new skill; `SkillVersionAdded` on subsequent edits;
+    /// `SkillPromoted` when a version transitions trial → stable;
+    /// `SkillArchived` when the skill is retired; `SkillInvoked`
+    /// when an agent loads the full body via `skills.view`;
+    /// `SkillWriteRejected` when the secret scanner blocks a
+    /// write. See `execlaw-skills` for emission sites.
+    SkillCreated,
+    SkillVersionAdded,
+    SkillPromoted,
+    SkillArchived,
+    SkillInvoked,
+    SkillWriteRejected,
     /// Escape hatch for future additions that predate this enum. The payload
     /// contains the original kind string.
     Other,
@@ -126,6 +141,12 @@ impl EventKind {
             EventKind::CardClosed => "card.closed",
             EventKind::SubagentStarted => "subagent.started",
             EventKind::SubagentCompleted => "subagent.completed",
+            EventKind::SkillCreated => "skill.created",
+            EventKind::SkillVersionAdded => "skill.version_added",
+            EventKind::SkillPromoted => "skill.promoted",
+            EventKind::SkillArchived => "skill.archived",
+            EventKind::SkillInvoked => "skill.invoked",
+            EventKind::SkillWriteRejected => "skill.write_rejected",
             EventKind::Other => "other",
         }
     }
@@ -174,6 +195,12 @@ impl EventKind {
             "card.closed" => EventKind::CardClosed,
             "subagent.started" => EventKind::SubagentStarted,
             "subagent.completed" => EventKind::SubagentCompleted,
+            "skill.created" => EventKind::SkillCreated,
+            "skill.version_added" => EventKind::SkillVersionAdded,
+            "skill.promoted" => EventKind::SkillPromoted,
+            "skill.archived" => EventKind::SkillArchived,
+            "skill.invoked" => EventKind::SkillInvoked,
+            "skill.write_rejected" => EventKind::SkillWriteRejected,
             _ => EventKind::Other,
         }
     }

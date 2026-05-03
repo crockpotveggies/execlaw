@@ -8,6 +8,7 @@ import { RequireSetupComplete } from "./routes/RequireSetupComplete";
 import { Research } from "./routes/Research";
 import { Routines } from "./routes/Routines";
 import { SetupWizard } from "./routes/SetupWizard";
+import { Skills } from "./routes/Skills";
 import { Settings } from "./settings/Settings";
 
 export function App() {
@@ -80,6 +81,14 @@ export function App() {
                         element={
                             <RequireSetupComplete>
                                 <Research />
+                            </RequireSetupComplete>
+                        }
+                    />
+                    <Route
+                        path="/skills"
+                        element={
+                            <RequireSetupComplete>
+                                <Skills />
                             </RequireSetupComplete>
                         }
                     />

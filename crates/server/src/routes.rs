@@ -716,6 +716,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::users::users_router())
         .merge(crate::webauthn::webauthn_router())
         .merge(crate::tools_admin::tools_admin_router())
+        .merge(crate::skills_admin::skills_admin_router())
         .merge(crate::mcp_admin::mcp_admin_router())
         .merge(crate::settings_general::settings_router())
         .merge(crate::factory_reset::factory_reset_router())
@@ -829,6 +830,13 @@ pub fn test_app_state() -> AppState {
         // tests that exercise the cancel-token registry construct
         // a mock supervisor and inject it manually.
         research_supervisor: None,
+        // Phase C — tests use a no-op sink so chat-handler hooks are
+        // safe to call but no auto-capture pipeline runs. Tests that
+        // exercise capture construct an AutoCaptureWorker manually
+        // and call `process_request` directly.
+        skill_capture: execlaw_skills::AutoCaptureSink::noop(),
+        // Phase D.3 — same noop pattern for the reuse-update sink.
+        reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
     }
 }
 

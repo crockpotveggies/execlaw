@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, warn};
 
 /// Config for launching a subprocess plugin.
@@ -59,6 +59,39 @@ pub struct RpcError {
     pub message: String,
 }
 
+/// Phase D.2 (2026-05-03) — unsolicited message a plugin can send
+/// the host. JSON-RPC convention: no `id` field, has `method` + `params`.
+/// Used for `skill.register` / `skill.unregister` (and any future
+/// plugin → host events, e.g. `notify`, `log`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcNotification {
+    pub method: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+/// Inbound discriminator: an unparsed line from a plugin's stdout
+/// is either a response to a host-issued request OR a one-way
+/// notification. We try Response first because every existing
+/// plugin sends only responses; the Notification branch fires for
+/// new D.2-aware plugins.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum InboundMessage {
+    Response(RpcResponse),
+    Notification(RpcNotification),
+}
+
+/// What the reader pushes to the host's notification channel when a
+/// notification arrives. The host's drain task knows which plugin
+/// each notification came from via `plugin_id`.
+#[derive(Debug, Clone)]
+pub struct PluginNotification {
+    pub plugin_id: String,
+    pub method: String,
+    pub params: serde_json::Value,
+}
+
 /// Live handle to a running subprocess plugin.
 #[derive(Debug)]
 pub struct SubprocessPlugin {
@@ -71,7 +104,14 @@ pub struct SubprocessPlugin {
 
 impl SubprocessPlugin {
     /// Spawn the plugin process and start its stdout reader task.
-    pub async fn spawn(spec: SubprocessSpec) -> Result<Self, String> {
+    /// `notifications` is an optional sink the reader forwards
+    /// unsolicited (no-id) messages to (Phase D.2). When `None`,
+    /// notifications are logged and dropped — backward-compatible
+    /// with pre-D.2 plugin tests.
+    pub async fn spawn(
+        spec: SubprocessSpec,
+        notifications: Option<mpsc::UnboundedSender<PluginNotification>>,
+    ) -> Result<Self, String> {
         let mut cmd = Command::new(&spec.executable);
         cmd.args(&spec.args)
             .stdin(Stdio::piped())
@@ -109,8 +149,8 @@ impl SubprocessPlugin {
                         if trimmed.is_empty() {
                             continue;
                         }
-                        match serde_json::from_str::<RpcResponse>(trimmed) {
-                            Ok(resp) => {
+                        match serde_json::from_str::<InboundMessage>(trimmed) {
+                            Ok(InboundMessage::Response(resp)) => {
                                 let id = resp.id;
                                 let mut p = pending_for_reader.lock().await;
                                 if let Some(tx) = p.remove(&id) {
@@ -121,6 +161,27 @@ impl SubprocessPlugin {
                                         id,
                                         "rpc response with no matching pending request"
                                     );
+                                }
+                            }
+                            Ok(InboundMessage::Notification(n)) => {
+                                // Phase D.2: forward to host. When no
+                                // sink is wired (older tests), log
+                                // and drop so behavior is unchanged.
+                                match &notifications {
+                                    Some(tx) => {
+                                        let _ = tx.send(PluginNotification {
+                                            plugin_id: plugin_id.clone(),
+                                            method: n.method,
+                                            params: n.params,
+                                        });
+                                    }
+                                    None => {
+                                        debug!(
+                                            plugin_id = %plugin_id,
+                                            method = %n.method,
+                                            "plugin sent a notification but no sink is wired"
+                                        );
+                                    }
                                 }
                             }
                             Err(e) => warn!(
@@ -277,7 +338,7 @@ mod tests {
             args: vec![],
             cwd: None,
         };
-        let err = SubprocessPlugin::spawn(spec).await.unwrap_err();
+        let err = SubprocessPlugin::spawn(spec, None).await.unwrap_err();
         assert!(err.to_lowercase().contains("spawn"));
     }
 
@@ -298,7 +359,7 @@ done
             args: vec!["-c".into(), script.into()],
             cwd: None,
         };
-        let plugin = SubprocessPlugin::spawn(spec).await.unwrap();
+        let plugin = SubprocessPlugin::spawn(spec, None).await.unwrap();
         let result = plugin
             .call("ping", serde_json::json!({"x": 1}))
             .await
@@ -337,7 +398,7 @@ done
             args: vec!["-c".into(), script.into()],
             cwd: None,
         };
-        let plugin = SubprocessPlugin::spawn(spec).await.unwrap();
+        let plugin = SubprocessPlugin::spawn(spec, None).await.unwrap();
         // Sanity: regular call works first.
         let _ = plugin.call("ping", serde_json::Value::Null).await.unwrap();
         // The bug: shutdown used to hang until the test runner
@@ -375,7 +436,7 @@ exit 1
             args: vec!["-c".into(), script.into()],
             cwd: None,
         };
-        let plugin = SubprocessPlugin::spawn(spec).await.unwrap();
+        let plugin = SubprocessPlugin::spawn(spec, None).await.unwrap();
         let started = std::time::Instant::now();
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(2),

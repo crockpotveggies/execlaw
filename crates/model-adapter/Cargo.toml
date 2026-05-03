@@ -1,0 +1,27 @@
+[package]
+name = "execlaw-model-adapter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Per-model-family request preparation + response normalization. Sits between call sites and the inference client so a model swap doesn't require code changes at every callsite."
+
+[dependencies]
+execlaw-inference-api = { path = "../inference-api" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+once_cell.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+criterion.workspace = true
+pretty_assertions.workspace = true
+
+[[bench]]
+name = "adapter_hot_paths"
+harness = false

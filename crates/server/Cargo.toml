@@ -20,6 +20,8 @@ bollard = { workspace = true }
 execlaw-plugin-host = { path = "../plugin-host" }
 execlaw-container-manager = { path = "../container-manager" }
 execlaw-mcp-client = { path = "../mcp-client" }
+execlaw-model-adapter = { path = "../model-adapter" }
+execlaw-skills = { path = "../skills" }
 execlaw-voice-pipeline = { path = "../voice-pipeline" }
 futures.workspace = true
 

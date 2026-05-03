@@ -30,7 +30,6 @@ import { RunnersPage } from "./RunnersPage";
 import { ResearchPage } from "./ResearchPage";
 import { PersonalityPage } from "./PersonalityPage";
 import { AlertsPage } from "./AlertsPage";
-import { SkillsPage } from "./SkillsPage";
 import { TrustPolicyPage } from "./TrustPolicyPage";
 
 const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
@@ -65,9 +64,6 @@ const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     },
     { to: "/settings/plugins", icon: "bi-plug", label: "Plugins" },
     { to: "/settings/tools", icon: "bi-wrench-adjustable", label: "Tools" },
-    // Skills is a derived "what can my agent do" view of the tools
-    // registry, grouped by source (Built-in / Plugin / MCP).
-    { to: "/settings/skills", icon: "bi-stars", label: "Skills" },
     { to: "/settings/mcp", icon: "bi-broadcast", label: "MCP" },
     // Hardware now lives at the bottom of the Backends page.
     { to: "/settings/backends", icon: "bi-cpu-fill", label: "Backends" },
@@ -205,7 +201,6 @@ export function Settings() {
                             }
                         />
                         <Route path="tools" element={<ToolsPage />} />
-                        <Route path="skills" element={<SkillsPage />} />
                         <Route path="mcp" element={<McpServersPage />} />
                         <Route path="backends" element={<BackendsPage />} />
                         <Route path="runners" element={<RunnersPage />} />

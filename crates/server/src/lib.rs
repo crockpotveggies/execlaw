@@ -57,6 +57,8 @@ pub mod tool_apis_search;
 pub mod tool_apis_subagent;
 pub mod tool_dispatch;
 pub mod tool_sync;
+pub mod skill_capture_runtime;
+pub mod skills_admin;
 pub mod tools_admin;
 pub mod tracing_layer;
 pub mod trust_policy;

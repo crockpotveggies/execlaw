@@ -235,10 +235,38 @@ pub enum HealthCheckProbe {
     },
 }
 
+/// One skill shipped by a plugin (Phase B, 2026-05-03).
+///
+/// At install time the host:
+///   1. Reads `entry` (relative to the staged plugin root) as a UTF-8
+///      markdown file — the skill's body.
+///   2. Sanitizes `name` (lowercase, alphanumeric + hyphen, slashes
+///      stripped) and prepends `<plugin_id>/` so the stored skill
+///      name is always `<plugin_id>/<sanitized_name>`. The plugin
+///      author cannot author a skill outside their own namespace.
+///   3. Builds a structured frontmatter from `description` + `tags`
+///      and inserts the row via `execlaw_skills::SkillStore` with
+///      `registration_kind = "shipped"` and `owning_plugin_id` set.
+///
+/// On plugin uninstall, every skill with this `owning_plugin_id` is
+/// archived. Admins can re-author a clean copy via `skills.create` if
+/// they want to keep the procedure after removing the plugin.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SkillDecl {
+    /// Local skill name (without the `<plugin_id>/` prefix). Lowercase
+    /// alphanumeric + hyphen. Slashes are sanitized to hyphens.
     pub name: String,
+    /// One- or two-sentence description shown to the LLM in
+    /// `skills.list`. Required so the agent can decide whether to
+    /// activate the skill without reading the body first.
+    pub description: String,
+    /// Path to the skill's body markdown file, relative to the plugin's
+    /// staged root. Example: `"skills/query-builder.md"`.
     pub entry: String,
+    /// Optional tags surfaced in the structured frontmatter. Useful for
+    /// admin-UI filtering; the LLM doesn't see them directly.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// How the plugin's code actually runs.
