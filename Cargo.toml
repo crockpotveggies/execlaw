@@ -130,6 +130,12 @@ tempfile = "3"
 dashmap = "6"
 bytes = "1"
 async-stream = "0.3"
+# Pure-Rust PDF generation for deep-research report.pdf delivery.
+# `printpdf` ships the 14 standard PDF fonts so we don't bundle TTFs;
+# `textwrap` does the line-wrapping the renderer's manual layout
+# needs. Both are ~200KB compiled, no external system deps.
+printpdf = { version = "0.7", default-features = false }
+textwrap = "0.16"
 
 # Embedded scripting engine for the script-tier plugin runtime.
 # Pure-Rust (no C deps), pinned to its built-in sandbox features

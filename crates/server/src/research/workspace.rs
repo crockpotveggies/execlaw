@@ -109,6 +109,39 @@ impl ResearchWorkspace {
         Ok(path)
     }
 
+    /// 2026-05-03 — render the synthesized markdown report into a
+    /// `report.pdf` alongside `report.md` so the operator's
+    /// CardClosed deliverable is the PDF (per MIGRATION_PLAN §5.6
+    /// "PDF" + "DELIVER" steps). Returns the absolute path on
+    /// success. Pure-Rust pipeline — `printpdf` ships the 14
+    /// standard PDF fonts (Helvetica family) so we don't bundle any
+    /// TTFs and the operator host needs no external deps.
+    ///
+    /// Markdown subset rendered today:
+    ///   * `# Heading` → 18pt bold
+    ///   * `## Heading` → 14pt bold
+    ///   * `### Heading` → 12pt bold
+    ///   * `- item` / `* item` → bullet, 11pt regular
+    ///   * Blank line → paragraph break
+    ///   * Everything else → 11pt regular paragraph (word-wrapped)
+    ///
+    /// Inline emphasis (`*italic*`, `**bold**`), code blocks, and
+    /// tables degrade to plain text — fine for v1 since the
+    /// synthesizer's prompt produces structured prose, not richly
+    /// formatted markdown.
+    pub fn write_report_pdf(
+        &self,
+        job_id: &ResearchJobId,
+        markdown: &str,
+        title: &str,
+    ) -> Result<PathBuf, WorkspaceError> {
+        let dir = self.provision(job_id)?;
+        let path = dir.join("report.pdf");
+        render_markdown_to_pdf(markdown, title, &path)
+            .map_err(|e| WorkspaceError::Encoding(format!("pdf render: {e}")))?;
+        Ok(path)
+    }
+
     /// Read the synthesized report back. Used by the
     /// `research_get_report` tool. Returns `Ok(None)` when the file
     /// hasn't been written yet (gather phase still running, or job
@@ -133,6 +166,136 @@ impl ResearchWorkspace {
         Ok(())
     }
 }
+
+// -----------------------------------------------------------------
+// Phase D PDF rendering — pure-Rust markdown subset → PDF
+// -----------------------------------------------------------------
+
+use printpdf::{BuiltinFont, IndirectFontRef, Mm, PdfDocument, PdfDocumentReference, PdfLayerReference, PdfPageIndex};
+
+const PAGE_W: f32 = 216.0; // mm — US Letter
+const PAGE_H: f32 = 279.0;
+const MARGIN_X: f32 = 20.0;
+const MARGIN_TOP: f32 = 20.0;
+const MARGIN_BOTTOM: f32 = 20.0;
+const LINE_H_BODY: f32 = 5.0;
+const LINE_H_HEADING: f32 = 8.0;
+const PARA_GAP: f32 = 3.0;
+const WRAP_WIDTH: usize = 95; // chars at 11pt Helvetica fits ~95 across (216-40)mm
+
+/// Render a small markdown subset to a single-or-multi-page PDF
+/// at `out_path`. See `Workspace::write_report_pdf` for the
+/// supported syntax.
+fn render_markdown_to_pdf(
+    markdown: &str,
+    title: &str,
+    out_path: &std::path::Path,
+) -> Result<(), String> {
+    let (doc, page1, layer1) = PdfDocument::new(title, Mm(PAGE_W), Mm(PAGE_H), "Layer 1");
+    let font_regular = doc
+        .add_builtin_font(BuiltinFont::Helvetica)
+        .map_err(|e| format!("regular font: {e}"))?;
+    let font_bold = doc
+        .add_builtin_font(BuiltinFont::HelveticaBold)
+        .map_err(|e| format!("bold font: {e}"))?;
+
+    let mut page = page1;
+    let mut layer_id = layer1;
+    let mut layer = doc.get_page(page).get_layer(layer_id);
+    let mut y = PAGE_H - MARGIN_TOP;
+
+    for raw in markdown.lines() {
+        let line = raw.trim_end_matches('\r');
+
+        // Blank line → paragraph gap.
+        if line.trim().is_empty() {
+            y -= PARA_GAP;
+            continue;
+        }
+
+        // Strip emphasis markers (rough): we don't do italics, but
+        // dropping the asterisks keeps the text readable instead
+        // of showing literal "**" everywhere.
+        let cleaned = strip_emphasis(line);
+
+        // Classify the line.
+        let (text, font, size, line_h) = if let Some(rest) = cleaned.strip_prefix("### ") {
+            (rest.to_string(), &font_bold, 12.0, LINE_H_HEADING)
+        } else if let Some(rest) = cleaned.strip_prefix("## ") {
+            (rest.to_string(), &font_bold, 14.0, LINE_H_HEADING)
+        } else if let Some(rest) = cleaned.strip_prefix("# ") {
+            (rest.to_string(), &font_bold, 18.0, LINE_H_HEADING + 2.0)
+        } else if let Some(rest) = cleaned
+            .strip_prefix("- ")
+            .or_else(|| cleaned.strip_prefix("* "))
+        {
+            (format!("• {rest}"), &font_regular, 11.0, LINE_H_BODY)
+        } else {
+            (cleaned, &font_regular, 11.0, LINE_H_BODY)
+        };
+
+        // Word-wrap and emit each visual line.
+        let wrap_w = if size >= 14.0 { WRAP_WIDTH * 7 / 10 } else { WRAP_WIDTH };
+        for visual in textwrap::wrap(&text, wrap_w) {
+            if y - line_h < MARGIN_BOTTOM {
+                let (np, nl) = doc.add_page(Mm(PAGE_W), Mm(PAGE_H), "Layer");
+                page = np;
+                layer_id = nl;
+                layer = doc.get_page(page).get_layer(layer_id);
+                y = PAGE_H - MARGIN_TOP;
+            }
+            layer.use_text(visual.as_ref(), size, Mm(MARGIN_X), Mm(y), font);
+            y -= line_h;
+        }
+    }
+
+    let f = std::fs::File::create(out_path).map_err(|e| format!("create: {e}"))?;
+    let mut writer = std::io::BufWriter::new(f);
+    doc.save(&mut writer).map_err(|e| format!("save: {e}"))?;
+    Ok(())
+}
+
+fn strip_emphasis(s: &str) -> String {
+    // Drop `**` and `__` (bold) and single `*` / `_` (italic)
+    // markers. Preserves everything else. Leaves backtick code
+    // spans intact since the model rarely uses them in synthesized
+    // prose and they read fine verbatim.
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && (bytes[i] == b'*' && bytes[i + 1] == b'*') {
+            i += 2;
+            continue;
+        }
+        if i + 1 < bytes.len() && (bytes[i] == b'_' && bytes[i + 1] == b'_') {
+            i += 2;
+            continue;
+        }
+        // Single * or _ used as emphasis: strip when adjacent to a
+        // word character on at least one side. That covers both the
+        // opening (`*emphasis`) and closing (`emphasis*`) markers
+        // while leaving bullet markers (`* item`, where the `*` has
+        // space on both sides) and lone-punctuation `*` alone.
+        if bytes[i] == b'*' || bytes[i] == b'_' {
+            let left_word = i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let right_word = i + 1 < bytes.len()
+                && (bytes[i + 1].is_ascii_alphanumeric() || bytes[i + 1] == b'_');
+            if left_word || right_word {
+                i += 1;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+// Type aliases used only to keep the public function signature
+// readable; nothing depends on them externally.
+#[allow(dead_code)]
+type _PdfRefs = (PdfDocumentReference, PdfPageIndex, PdfLayerReference, IndirectFontRef);
 
 #[cfg(test)]
 mod tests {
@@ -231,5 +394,48 @@ mod tests {
         let id = ResearchJobId::new();
         // No provision call — dir doesn't exist. Purge must not error.
         ws.purge(&id).unwrap();
+    }
+
+    // ---------------- Phase D PDF render ----------------
+
+    #[test]
+    fn write_report_pdf_writes_a_pdf_file_with_signature() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = ResearchWorkspace::new(tmp.path());
+        let id = ResearchJobId::new();
+        let md = "# Title\n\n## Subhead\n\nA short paragraph that should wrap reasonably and produce at least one line of body text.\n\n- Bullet one\n- Bullet two";
+        let path = ws.write_report_pdf(&id, md, "Test report").unwrap();
+        assert!(path.exists(), "report.pdf must land on disk");
+        let bytes = std::fs::read(&path).unwrap();
+        // PDF magic: %PDF-
+        assert!(bytes.len() > 200, "rendered pdf should be non-trivial");
+        assert_eq!(&bytes[0..5], b"%PDF-", "must have PDF magic header");
+    }
+
+    #[test]
+    fn write_report_pdf_handles_long_input_with_page_break() {
+        // Generate enough text to spill onto a second page; assert
+        // the PDF is bigger than the single-page baseline.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = ResearchWorkspace::new(tmp.path());
+        let id = ResearchJobId::new();
+        let mut long = String::from("# Long report\n\n");
+        for i in 0..200 {
+            long.push_str(&format!(
+                "Paragraph {i}. Lorem ipsum dolor sit amet, consectetur adipiscing elit. \
+                 Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.\n\n"
+            ));
+        }
+        let path = ws.write_report_pdf(&id, &long, "Long report").unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() > 5000, "multi-page pdf should be substantially bigger");
+    }
+
+    #[test]
+    fn strip_emphasis_removes_markdown_bold_and_italic_markers() {
+        assert_eq!(strip_emphasis("**bold** word"), "bold word");
+        assert_eq!(strip_emphasis("__bold__ word"), "bold word");
+        assert_eq!(strip_emphasis("an *emphasis* test"), "an emphasis test");
+        assert_eq!(strip_emphasis("plain text"), "plain text");
     }
 }

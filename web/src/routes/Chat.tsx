@@ -37,7 +37,6 @@ import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
 import { ApprovalCard } from "../chat/ApprovalCard";
 import { Composer } from "../chat/Composer";
-import { RunningJobsBadge } from "../chat/RunningJobsBadge";
 import { MessageStream } from "../chat/MessageStream";
 import { Sidebar } from "../chat/Sidebar";
 import { useVoiceReadiness } from "../chat/useVoiceReadiness";
@@ -1102,7 +1101,6 @@ function ActiveThreadPane({
             <MessageStream conversationId={conversationId} />
 
             <div className="execlaw-composer" data-flip-id="composer-shell">
-                <RunningJobsBadge conversationId={conversationId} />
                 <ApprovalCard
                     approval={approval}
                     busy={approvalBusy}

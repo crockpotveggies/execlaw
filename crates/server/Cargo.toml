@@ -23,6 +23,8 @@ execlaw-mcp-client = { path = "../mcp-client" }
 execlaw-model-adapter = { path = "../model-adapter" }
 execlaw-skills = { path = "../skills" }
 execlaw-voice-pipeline = { path = "../voice-pipeline" }
+printpdf.workspace = true
+textwrap.workspace = true
 futures.workspace = true
 
 axum = { workspace = true, features = ["ws"] }

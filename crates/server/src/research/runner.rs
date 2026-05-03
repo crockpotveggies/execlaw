@@ -92,15 +92,27 @@ pub struct JobRunCtx {
 /// System prompt for the planner LLM call. Asks for a strict JSON
 /// shape so we can parse without prose-stripping.
 const PLANNER_SYSTEM_PROMPT: &str = "You are the planner for a deep-research job. Given a research question, \
-break it into focused sub-queries the gather phase will run in parallel. \
-Reply with EXACTLY a JSON object of the shape: \
-{\"thesis\":\"<one-paragraph framing>\",\"steps\":[{\"query\":\"<sub-query>\",\"rationale\":\"<one line>\"}, ...]} \
-No prose before or after the JSON. No markdown fences. Aim for 3-8 sub-queries.";
+break it into focused sub-queries the gather phase will run in parallel.
 
+If the question is CLEAR enough to plan, reply with EXACTLY a JSON object of this shape:
+{\"thesis\":\"<one-paragraph framing>\",\"steps\":[{\"query\":\"<sub-query>\",\"rationale\":\"<one line>\"}, ...]}
+
+If the question is too VAGUE to plan well — missing scope, ambiguous terms, multiple plausible interpretations that would lead to very different results — reply with EXACTLY this shape instead:
+{\"clarification\":\"<one or two sentences asking the operator the SINGLE specific question that would let you plan; do not list multiple questions>\"}
+
+Aim for 3-8 sub-queries when planning. Default to planning if the query is workable; only ask for clarification when the spread between plausible interpretations is wide. No prose before or after the JSON. No markdown fences.";
+
+/// Raw JSON the planner emits. The two valid shapes are:
+///   * a plan: `thesis` + `steps` populated, `clarification` absent
+///   * a clarification request: `clarification` populated, others absent
 #[derive(Debug, Deserialize)]
 struct PlannerJson {
-    thesis: String,
-    steps: Vec<PlannerStep>,
+    #[serde(default)]
+    thesis: Option<String>,
+    #[serde(default)]
+    steps: Option<Vec<PlannerStep>>,
+    #[serde(default)]
+    clarification: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +120,16 @@ struct PlannerStep {
     query: String,
     #[serde(default)]
     rationale: Option<String>,
+}
+
+/// What `parse_plan` returns. The runner branches on this:
+/// `Plan` chains into the gather phase; `NeedsClarification`
+/// short-circuits the job to Failed with the operator-visible
+/// question on the card summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanOutcome {
+    Plan(ResearchPlan),
+    NeedsClarification { question: String },
 }
 
 /// Run one research job through its phases. Idempotent w.r.t.
@@ -260,7 +282,37 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
     }
 
     let plan = match call_planner(&client, &model, &row.query).await {
-        Ok(p) => p,
+        Ok(PlanOutcome::Plan(p)) => p,
+        Ok(PlanOutcome::NeedsClarification { question }) => {
+            // 2026-05-03 — query was too vague to plan. Mark the
+            // job Failed with the clarification question on the
+            // card so the operator sees "needs clarification:
+            // <question>" inline in chat. They can re-issue the
+            // research with the refined query in their next message.
+            mark_failed(
+                &db,
+                &events,
+                &workspace,
+                &job_id,
+                &conv_id,
+                &card_id,
+                &format!("Needs clarification: {question}"),
+            )
+            .await;
+            // Re-read so the supervisor sees the (Failed) terminal state.
+            let final_row = {
+                let db = db.clone();
+                let id = job_id.clone();
+                tokio::task::spawn_blocking(move || ResearchJobStore::new(&db).get(&id))
+                    .await
+                    .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??
+            };
+            return final_row.ok_or_else(|| {
+                ResearchRunnerError::Store(ResearchError::NotFound(
+                    job_id.as_str().to_owned(),
+                ))
+            });
+        }
         Err(e) => {
             mark_failed(
                 &db,
@@ -329,45 +381,40 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
         },
     )?;
 
-    // Phase-gate decision. The default is `plan_only` — runner stops
-    // here, the operator confirms before the (much more expensive)
-    // gather phase fires. With `none`, gather chains automatically.
-    // `every_phase` (C6) will pause for an approval between every
-    // pair of phases; for now C4 treats it identically to `plan_only`
-    // so the row sits at Planned until the C6 approval flow lands.
+    // 2026-05-03 — auto-advance: the runner now chains
+    // plan → gather → synthesize → complete in one invocation
+    // regardless of `config_research.phase_gates`. The
+    // operator-facing manual-approval flow is gone; if the
+    // research is too vague to plan, the planner returns a
+    // clarification question (see `PlanOutcome::NeedsClarification`
+    // above) which short-circuits the job to Failed with the
+    // question on the card. `phase_gates` is kept on the config
+    // row for backward compatibility but the runner ignores it.
     let cfg = {
         let db = db.clone();
         tokio::task::spawn_blocking(move || ResearchConfigStore::new(&db).get())
             .await
             .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??
     };
-    if matches!(cfg.phase_gates, PhaseGates::None) {
-        // None: chain plan → gather → synthesize → complete in one
-        // run_job invocation.
-        let phase_deps = PhaseDeps {
-            db: db.clone(),
-            events: events.clone(),
-            workspace: workspace.clone(),
-            conversation_id: conv_id.clone(),
-            card_id: card_id.clone(),
-            inference: client.clone(),
-            model: model.clone(),
-            cancel: cancel.clone(),
-        };
-        let notes = run_gather_phase(
-            &phase_deps,
-            &job_id,
-            &plan,
-            &cfg,
-            /* halt_after_gather = */ false,
-        )
-        .await?;
-        run_synthesize_phase(&phase_deps, &job_id, &row.query, &plan, &notes).await?;
-    }
-    // PlanOnly + EveryPhase both halt at Planned. The C6c
-    // `/api/admin/research/jobs/:id/advance` endpoint is what kicks
-    // the next phase for either; the runner stays a one-shot for
-    // the plan phase only when phase_gates != None.
+    let phase_deps = PhaseDeps {
+        db: db.clone(),
+        events: events.clone(),
+        workspace: workspace.clone(),
+        conversation_id: conv_id.clone(),
+        card_id: card_id.clone(),
+        inference: client.clone(),
+        model: model.clone(),
+        cancel: cancel.clone(),
+    };
+    let notes = run_gather_phase(
+        &phase_deps,
+        &job_id,
+        &plan,
+        &cfg,
+        /* halt_after_gather = */ false,
+    )
+    .await?;
+    run_synthesize_phase(&phase_deps, &job_id, &row.query, &plan, &notes).await?;
 
     // Re-read so the caller sees the final row state.
     let final_row = {
@@ -651,7 +698,7 @@ async fn call_planner(
     client: &InferenceClient,
     model: &str,
     query: &str,
-) -> Result<ResearchPlan, ResearchRunnerError> {
+) -> Result<PlanOutcome, ResearchRunnerError> {
     let req = ChatRequest {
         model: ModelId(model.to_owned()),
         messages: vec![
@@ -681,7 +728,15 @@ async fn call_planner(
 /// a "Thinking Process:" preamble, or include `{` characters inside
 /// thinking text BEFORE the real object. We try a sequence of
 /// extraction strategies and take the first that parses.
-fn parse_plan(raw: &str) -> Result<ResearchPlan, ResearchRunnerError> {
+///
+/// Two valid output shapes (see `PLANNER_SYSTEM_PROMPT`):
+///   * Plan: `thesis` + non-empty `steps` → `PlanOutcome::Plan`
+///   * Clarification: `clarification` populated → `PlanOutcome::NeedsClarification`
+///
+/// Clarification wins if both are present (defensive — the prompt
+/// asks for one or the other, but we'd rather honor an
+/// operator-visible question than silently run a half-baked plan).
+fn parse_plan(raw: &str) -> Result<PlanOutcome, ResearchRunnerError> {
     let candidate = match extract_planner_json(raw) {
         Some(c) => c,
         None => {
@@ -697,8 +752,21 @@ fn parse_plan(raw: &str) -> Result<ResearchPlan, ResearchRunnerError> {
             truncate_for_error(&candidate, 400)
         ))
     })?;
-    let steps: Vec<PlanStep> = parsed
-        .steps
+
+    // Clarification path takes precedence.
+    if let Some(q) = parsed
+        .clarification
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(PlanOutcome::NeedsClarification {
+            question: q.to_string(),
+        });
+    }
+
+    let raw_steps = parsed.steps.unwrap_or_default();
+    let steps: Vec<PlanStep> = raw_steps
         .into_iter()
         .filter(|s| !s.query.trim().is_empty())
         .map(|s| PlanStep {
@@ -711,10 +779,11 @@ fn parse_plan(raw: &str) -> Result<ResearchPlan, ResearchRunnerError> {
             "planner produced zero usable sub-queries".into(),
         ));
     }
-    Ok(ResearchPlan {
-        thesis: parsed.thesis.trim().to_owned(),
-        steps,
-    })
+    let thesis = parsed
+        .thesis
+        .map(|t| t.trim().to_owned())
+        .unwrap_or_default();
+    Ok(PlanOutcome::Plan(ResearchPlan { thesis, steps }))
 }
 
 /// Find a parseable JSON object inside the planner's reply.
@@ -947,10 +1016,18 @@ fn truncate_to(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    fn unwrap_plan(o: PlanOutcome) -> ResearchPlan {
+        match o {
+            PlanOutcome::Plan(p) => p,
+            other => panic!("expected Plan, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_plan_accepts_strict_json() {
-        let plan =
-            parse_plan(r#"{"thesis":"t","steps":[{"query":"q1","rationale":"r1"}]}"#).unwrap();
+        let plan = unwrap_plan(
+            parse_plan(r#"{"thesis":"t","steps":[{"query":"q1","rationale":"r1"}]}"#).unwrap(),
+        );
         assert_eq!(plan.thesis, "t");
         assert_eq!(plan.steps.len(), 1);
         assert_eq!(plan.steps[0].query, "q1");
@@ -958,16 +1035,18 @@ mod tests {
 
     #[test]
     fn parse_plan_strips_markdown_fences() {
-        let plan =
-            parse_plan("```json\n{\"thesis\":\"t\",\"steps\":[{\"query\":\"q1\"}]}\n```").unwrap();
+        let plan = unwrap_plan(
+            parse_plan("```json\n{\"thesis\":\"t\",\"steps\":[{\"query\":\"q1\"}]}\n```").unwrap(),
+        );
         assert_eq!(plan.steps.len(), 1);
     }
 
     #[test]
     fn parse_plan_strips_leading_prose() {
-        let plan =
+        let plan = unwrap_plan(
             parse_plan("Sure! Here's the plan: {\"thesis\":\"t\",\"steps\":[{\"query\":\"q1\"}]}")
-                .unwrap();
+                .unwrap(),
+        );
         assert_eq!(plan.steps.len(), 1);
     }
 
@@ -984,9 +1063,49 @@ mod tests {
     }
 
     #[test]
+    fn parse_plan_returns_clarification_when_present() {
+        let raw = r#"{"clarification":"Do you mean US zones 4-10 or international zones?"}"#;
+        let outcome = parse_plan(raw).unwrap();
+        match outcome {
+            PlanOutcome::NeedsClarification { question } => {
+                assert!(question.contains("zones"));
+            }
+            other => panic!("expected NeedsClarification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_plan_clarification_wins_when_both_shapes_present() {
+        // Defensive: if the model emits both clarification AND a
+        // half-baked plan, honor the clarification (operator-visible
+        // question is safer than running with a guess).
+        let raw = r#"{"clarification":"Specify the region.","thesis":"x","steps":[{"query":"q"}]}"#;
+        match parse_plan(raw).unwrap() {
+            PlanOutcome::NeedsClarification { question } => {
+                assert!(question.contains("region"));
+            }
+            other => panic!("expected NeedsClarification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_plan_clarification_in_thinking_preamble_still_extracted() {
+        // The brace-walker should find the clarification object even
+        // behind a Qwen "Thinking Process:" preamble.
+        let raw = "Thinking Process:\n1. The query is broad.\n\n{\"clarification\":\"Region?\"}";
+        match parse_plan(raw).unwrap() {
+            PlanOutcome::NeedsClarification { question } => {
+                assert_eq!(question, "Region?");
+            }
+            other => panic!("expected NeedsClarification, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_plan_filters_empty_step_queries() {
-        let plan =
-            parse_plan(r#"{"thesis":"t","steps":[{"query":"   "},{"query":"real"}]}"#).unwrap();
+        let plan = unwrap_plan(
+            parse_plan(r#"{"thesis":"t","steps":[{"query":"   "},{"query":"real"}]}"#).unwrap(),
+        );
         assert_eq!(plan.steps.len(), 1);
         assert_eq!(plan.steps[0].query, "real");
     }
@@ -1005,7 +1124,7 @@ mod tests {
 2. **Build the plan.**
 
 {"thesis": "ground covers vary by zone", "steps": [{"query": "evergreen ground cover zone 4", "rationale": "cold-hardy options"}, {"query": "evergreen ground cover zone 10", "rationale": "heat-tolerant options"}]}"#;
-        let plan = parse_plan(raw).unwrap();
+        let plan = unwrap_plan(parse_plan(raw).unwrap());
         assert_eq!(plan.steps.len(), 2);
         assert!(plan.thesis.contains("zone"));
     }
@@ -1014,7 +1133,7 @@ mod tests {
     fn parse_plan_handles_xml_think_block_wrapper() {
         let raw = r#"<think>The user wants a research plan. I'll structure it as JSON with thesis and steps.</think>
 {"thesis": "t", "steps": [{"query": "q"}]}"#;
-        let plan = parse_plan(raw).unwrap();
+        let plan = unwrap_plan(parse_plan(raw).unwrap());
         assert_eq!(plan.steps.len(), 1);
     }
 
@@ -1022,7 +1141,7 @@ mod tests {
     fn parse_plan_picks_first_valid_json_when_brace_walking() {
         // Multiple `{` candidates; only one parses.
         let raw = r#"prelude { not really json } more text {"thesis":"t","steps":[{"query":"q"}]} trailing"#;
-        let plan = parse_plan(raw).unwrap();
+        let plan = unwrap_plan(parse_plan(raw).unwrap());
         assert_eq!(plan.thesis, "t");
     }
 

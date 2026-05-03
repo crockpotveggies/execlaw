@@ -134,6 +134,11 @@ pub async fn run_synthesize(ctx: SynthesizeCtx) -> Result<SynthesizeOutcome, Syn
 /// Test seam: compose the prompt + finalize without going through
 /// the LLM. Tests substitute a canned report markdown to verify the
 /// attachment + workspace wiring without needing a mock InferenceClient.
+///
+/// 2026-05-03 — also renders `report.pdf` alongside `report.md` and
+/// uses the PDF as the attachment so the operator's CardClosed
+/// deliverable (per MIGRATION_PLAN §5.6) is the PDF rather than
+/// raw markdown. The markdown stays on disk for grep / reuse.
 pub async fn finalize_report(
     db: &Database,
     workspace: &ResearchWorkspace,
@@ -141,31 +146,80 @@ pub async fn finalize_report(
     conversation_id: &ConversationId,
     report_markdown: String,
 ) -> Result<SynthesizeOutcome, SynthesizeError> {
-    // Workspace write — the durable artifact. Any later failure
-    // should not lose the report.
-    let path = {
+    // Workspace write (markdown) — the durable text artifact.
+    {
         let ws = workspace.clone();
         let id = job_id.clone();
         let body = report_markdown.clone();
         tokio::task::spawn_blocking(move || ws.write_report(&id, &body))
             .await
-            .map_err(|e| SynthesizeError::Inference(format!("join: {e}")))??
+            .map_err(|e| SynthesizeError::Inference(format!("join: {e}")))??;
+    }
+    // Workspace write (PDF) — the operator-facing deliverable.
+    // Best-effort: a PDF render failure logs a warning but the job
+    // still completes with the markdown attachment as a fallback.
+    let pdf_path: Option<std::path::PathBuf> = {
+        let ws = workspace.clone();
+        let id = job_id.clone();
+        let body = report_markdown.clone();
+        let title = format!("Research report — {}", id.as_str());
+        match tokio::task::spawn_blocking(move || ws.write_report_pdf(&id, &body, &title)).await {
+            Ok(Ok(p)) => Some(p),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    job_id = job_id.as_str(),
+                    error = %e,
+                    "report.pdf render failed; falling back to report.md attachment"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    job_id = job_id.as_str(),
+                    error = %e,
+                    "report.pdf render task panicked; falling back to report.md attachment"
+                );
+                None
+            }
+        }
     };
-    let path_str = path.to_string_lossy().into_owned();
 
-    // Attachment row — the cross-cutting handle transport plugins +
-    // the SPA both consume. sha256 lets the SPA / transports
-    // de-duplicate if the operator re-runs the same job.
+    // Pick the attachment: PDF when it rendered, markdown when it
+    // didn't. SPA + transports both render attachments by mime
+    // type, so the right path + mime gets the right behavior.
+    let (att_path, att_mime, att_bytes_for_sha) = if let Some(p) = &pdf_path {
+        // Hash the PDF bytes (not the markdown) so re-rendering the
+        // same report produces a stable id only when the PDF bytes
+        // are identical.
+        let bytes = std::fs::read(p).unwrap_or_default();
+        (p.to_string_lossy().into_owned(), "application/pdf", bytes)
+    } else {
+        // Fallback: markdown.
+        let md_path = {
+            let ws = workspace.clone();
+            let id = job_id.clone();
+            let body = report_markdown.clone();
+            tokio::task::spawn_blocking(move || ws.write_report(&id, &body))
+                .await
+                .map_err(|e| SynthesizeError::Inference(format!("join: {e}")))??
+        };
+        (
+            md_path.to_string_lossy().into_owned(),
+            "text/markdown",
+            report_markdown.as_bytes().to_vec(),
+        )
+    };
+
     let mut hasher = Sha256::new();
-    hasher.update(report_markdown.as_bytes());
+    hasher.update(&att_bytes_for_sha);
     let sha = format!("{:x}", hasher.finalize());
 
     let att_id = AttachmentId::new();
     let row = AttachmentRow {
         id: att_id.clone(),
         conversation_id: conversation_id.clone(),
-        mime_type: "text/markdown".into(),
-        path: path_str.clone(),
+        mime_type: att_mime.into(),
+        path: att_path.clone(),
         sha256: sha,
         received_at: chrono::Utc::now().timestamp(),
     };
@@ -178,7 +232,7 @@ pub async fn finalize_report(
     Ok(SynthesizeOutcome {
         report_markdown,
         attachment_id: att_id,
-        attachment_path: path_str,
+        attachment_path: att_path,
     })
 }
 
@@ -315,11 +369,21 @@ mod tests {
         )
         .await
         .unwrap();
-        // Workspace file lands at <tmp>/<job_id>/report.md.
+        // Workspace markdown lands at <tmp>/<job_id>/report.md
+        // (always written for grep/reuse).
         let on_disk = std::fs::read_to_string(tmp.join(job_id.as_str()).join("report.md")).unwrap();
         assert!(on_disk.starts_with("# Final report"));
+        // PDF lands alongside.
+        let pdf_path = tmp.join(job_id.as_str()).join("report.pdf");
+        assert!(pdf_path.exists(), "report.pdf must be rendered");
         assert!(!outcome.attachment_id.as_str().is_empty());
-        assert!(outcome.attachment_path.contains("report.md"));
+        // Phase D: the attachment is the PDF (operator deliverable),
+        // markdown is on disk for grep but not the attachment.
+        assert!(
+            outcome.attachment_path.contains("report.pdf"),
+            "attachment should be the PDF, got {}",
+            outcome.attachment_path
+        );
         // Attachment row inserted — round-trip query.
         let count: i64 = db
             .with_conn(|c| {
