@@ -150,6 +150,13 @@ pub enum Capability {
     /// status on a job an operator started without being able to
     /// start new ones.
     ResearchRead,
+    /// Deliver an attachment (file) to the conversation. Symmetric
+    /// to channel plugins' `send_attachment` — gives the agent a
+    /// way to formally attach a file (e.g. a research PDF) to its
+    /// reply on the web channel. The capability is gated separately
+    /// from `Notify` because it only makes sense with a registered
+    /// AttachmentRow and a meaningful conversation_id.
+    AttachmentSend,
 }
 
 impl Capability {
@@ -169,6 +176,7 @@ impl Capability {
             Self::SubagentSpawn => "subagent_spawn",
             Self::ResearchSpawn => "research_spawn",
             Self::ResearchRead => "research_read",
+            Self::AttachmentSend => "attachment_send",
         }
     }
 
@@ -188,6 +196,7 @@ impl Capability {
             "subagent_spawn" => Some(Self::SubagentSpawn),
             "research_spawn" => Some(Self::ResearchSpawn),
             "research_read" => Some(Self::ResearchRead),
+            "attachment_send" => Some(Self::AttachmentSend),
             _ => None,
         }
     }
@@ -302,6 +311,7 @@ pub struct ToolCtx {
     pub search: Option<Arc<dyn WebSearchApi>>,
     pub subagent: Option<Arc<dyn SubagentApi>>,
     pub research: Option<Arc<dyn ResearchApi>>,
+    pub attachments: Option<Arc<dyn AttachmentApi>>,
 }
 
 impl ToolCtx {
@@ -325,6 +335,7 @@ impl ToolCtx {
             search: None,
             subagent: None,
             research: None,
+            attachments: None,
         }
     }
 }
@@ -775,6 +786,52 @@ pub trait ResearchApi: Send + Sync {
         job_id: &str,
         clarification: &str,
     ) -> Result<ResearchJobView, ApiError>;
+}
+
+/// Caller-facing summary of an attachment after `send_attachment`
+/// has emitted it into the conversation. Returned to the agent so
+/// it can confirm delivery to the user (and reference the
+/// `download_url` in its prose if it wants to).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeliveredAttachmentView {
+    pub attachment_id: String,
+    pub conversation_id: String,
+    pub mime_type: String,
+    pub filename: String,
+    pub byte_size: Option<i64>,
+    /// Web-channel download URL (e.g. `/api/attachments/<id>`).
+    /// The SPA renders the inline chip from the emitted card; this
+    /// URL is for the agent's own reply prose if it wants a
+    /// link-style affordance.
+    pub download_url: String,
+    /// Optional one-line caption the agent attached to the file.
+    pub caption: Option<String>,
+}
+
+/// Send-an-attachment-to-the-conversation capability. Symmetric to
+/// channel plugins' `send_attachment` (which delivers a file over a
+/// TextOnly transport like SMS / email); this trait is the
+/// web-channel equivalent — emits an `Attachment` card into the
+/// conversation that the SPA renders inline as a download chip.
+///
+/// Trust scoping:
+///   * The implementation refuses to deliver an attachment whose
+///     stored `conversation_id` doesn't match the caller's
+///     conversation. Returns `ApiError::NotFound` (not
+///     NotAuthorized) so cross-thread id probing is opaque.
+///   * The capability is gated by `Capability::AttachmentSend`;
+///     the dispatch layer constructs `ctx.attachments = None` for
+///     callers that didn't declare it.
+#[async_trait]
+pub trait AttachmentApi: Send + Sync {
+    /// Deliver `attachment_id` to the caller's conversation as an
+    /// inline chip with optional `caption`. Returns the rendered
+    /// view the agent can reference in its prose.
+    async fn send(
+        &self,
+        attachment_id: &str,
+        caption: Option<&str>,
+    ) -> Result<DeliveredAttachmentView, ApiError>;
 }
 
 /// Outbound HTTP capability. Implementations are responsible for SSRF

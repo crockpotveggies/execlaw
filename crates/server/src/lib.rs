@@ -17,6 +17,8 @@
 
 pub mod alerts;
 pub mod approvals;
+pub mod attachment_api;
+pub mod attachments_admin;
 pub mod auth;
 pub mod auth_extract;
 pub mod backend_presets;

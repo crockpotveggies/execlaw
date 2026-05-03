@@ -33,6 +33,10 @@ import { applyCardEvent } from "../cards/cardStore";
 // `kind: "research"` cards. CardRenderer.tsx already auto-registers
 // the generic LongRunningTaskCard fallback at module-load.
 import "../cards/ResearchCard";
+// Side-effect import: registers the AttachmentCard renderer for
+// `kind: "attachment"` cards (the inline file-delivery chip the
+// agent emits via `send_attachment`).
+import "../cards/AttachmentCard";
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
 import { ApprovalCard } from "../chat/ApprovalCard";

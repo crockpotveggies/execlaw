@@ -1745,7 +1745,13 @@ impl ResearchStatusTool {
                 description:
                     "Poll a deep-research job's status. Returns the current row including \
                      the plan (if landed), the workspace path, the attachment id of the \
-                     final report (if complete), and any error."
+                     final report (if complete), and any error.\n\n\
+                     DELIVERY: when status flips to `complete`, the row's `attachment_id` \
+                     points at the rendered PDF. Call `send_attachment(attachment_id, caption)` \
+                     to deliver it to the user as an inline download chip in chat. The chip \
+                     replaces what used to be a giant inline markdown blob — operators get a \
+                     compact filename + Download button. Always send the attachment after \
+                     research completes; do not paste the report text into your reply."
                         .into(),
                 schema: json!({
                     "type": "object",
@@ -1786,6 +1792,123 @@ impl ToolImpl for ResearchStatusTool {
         match api.status(&args.job_id).await {
             Ok(Some(view)) => ToolOutcome::Ok(json!({"job": job_view_to_json(&view)})),
             Ok(None) => ToolOutcome::err("not_found", format!("no job '{}' visible", args.job_id)),
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// send_attachment — agent delivers a file inline to the conversation.
+// Symmetric to channel plugins' send_attachment for TextOnly transports;
+// this is the web-channel equivalent (emits an Attachment card the SPA
+// renders as an inline download chip).
+// ---------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct SendAttachmentArgs {
+    /// AttachmentId (the row id from `state_attachments`). For
+    /// research deliverables, this is the value returned in the
+    /// research-job's `attachment_id` field after the synthesise
+    /// phase landed the report.
+    attachment_id: String,
+    /// Optional one-liner shown alongside the file chip in chat
+    /// (e.g. "Final research report on evergreen ground covers").
+    /// When omitted the chip falls back to the file basename.
+    #[serde(default)]
+    caption: Option<String>,
+}
+
+fn default_allowed_for_attachment_send() -> Vec<String> {
+    // Same trust ladder as research_spawn — the agent can deliver
+    // attachments only when it has spawn-class trust. A future
+    // tightening could split this further, but for now: agents that
+    // can spawn research can also deliver the resulting PDF.
+    vec![
+        "Controller".into(),
+        "Owner".into(),
+        "KnownTrusted".into(),
+    ]
+}
+
+pub struct SendAttachmentTool {
+    descriptor: ToolDescriptor,
+}
+
+impl Default for SendAttachmentTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SendAttachmentTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "send_attachment".into(),
+                description:
+                    "Deliver a file to the user as an inline download chip in chat. Use this \
+                     to surface a deliverable (e.g. a deep-research PDF) so the user can save \
+                     it directly from the conversation. Pass the `attachment_id` returned by \
+                     the producing tool — for research, that's the `attachment_id` field on a \
+                     completed `research_status` result. Optional `caption` shows above the \
+                     file chip (defaults to the file basename). The chip carries a Download \
+                     button; the user can save the file with one click."
+                        .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "attachment_id": {
+                            "type": "string",
+                            "description": "Id of the attachment row to deliver (e.g. from research_status)."
+                        },
+                        "caption": {
+                            "type": "string",
+                            "description": "Optional one-line caption shown above the chip."
+                        }
+                    },
+                    "required": ["attachment_id"],
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Low,
+                capabilities: vec![Capability::AttachmentSend],
+                default_allowed_classes: default_allowed_for_attachment_send(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for SendAttachmentTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, args: Value) -> ToolOutcome {
+        let args: SendAttachmentArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolOutcome::err("invalid_argument", e.to_string()),
+        };
+        let api = match ctx.attachments.as_ref() {
+            Some(a) => a,
+            None => {
+                return ToolOutcome::denied(
+                    "attachment_send capability not granted to this tool",
+                );
+            }
+        };
+        match api
+            .send(&args.attachment_id, args.caption.as_deref())
+            .await
+        {
+            Ok(view) => ToolOutcome::Ok(json!({
+                "attachment_id": view.attachment_id,
+                "filename": view.filename,
+                "mime_type": view.mime_type,
+                "byte_size": view.byte_size,
+                "download_url": view.download_url,
+                "caption": view.caption,
+                "delivered": true,
+            })),
             Err(e) => e.into_outcome(),
         }
     }
@@ -2050,6 +2173,7 @@ pub fn core_builtin_tools() -> Vec<Arc<dyn ToolImpl>> {
         Arc::new(ResearchClarifyTool::new()),
         Arc::new(ResearchListTool::new()),
         Arc::new(ResearchGetReportTool::new()),
+        Arc::new(SendAttachmentTool::new()),
     ]
 }
 
@@ -2185,7 +2309,8 @@ mod tests {
         assert!(names.contains(&"research_clarify"));
         assert!(names.contains(&"research_list"));
         assert!(names.contains(&"research_get_report"));
-        assert_eq!(names.len(), 23);
+        assert!(names.contains(&"send_attachment"));
+        assert_eq!(names.len(), 24);
     }
 
     #[test]

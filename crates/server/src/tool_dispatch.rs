@@ -72,6 +72,12 @@ pub struct ChainedToolDispatch<B: BuiltinTools> {
     /// `ctx.subagent` and the tool falls into the standard
     /// "capability not granted" denial.
     pub inference: Option<(Arc<InferenceClient>, String)>,
+    /// Live event bus used by capabilities that emit broadcast
+    /// events into the conversation (currently:
+    /// `Capability::AttachmentSend`, which opens an Attachment
+    /// card the SPA renders inline). `None` keeps the capability
+    /// dormant — tools requesting it find `ctx.attachments == None`.
+    pub events: Option<crate::events::EventBus>,
 }
 
 impl<B: BuiltinTools> ChainedToolDispatch<B> {
@@ -89,6 +95,7 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             conversation_id: None,
             clock: Arc::new(SystemClock),
             inference: None,
+            events: None,
         }
     }
 
@@ -112,6 +119,7 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             conversation_id: None,
             clock: Arc::new(SystemClock),
             inference: None,
+            events: None,
         }
     }
 
@@ -150,6 +158,15 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
         model: impl Into<String>,
     ) -> Self {
         self.inference = Some((client, model.into()));
+        self
+    }
+
+    /// Attach the live event bus so attachment-send (and any
+    /// future broadcast-emitting capability) can fire WS events.
+    /// Production wiring sets this from `AppState::events`; tests
+    /// that need to assert on emitted events pass a dedicated bus.
+    pub fn with_events(mut self, events: crate::events::EventBus) -> Self {
+        self.events = Some(events);
         self
     }
 
@@ -257,6 +274,20 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
                 ctx.conversation_id.clone(),
                 now,
             )));
+        }
+        let needs_attachment_send = caps
+            .iter()
+            .any(|c| matches!(c, Capability::AttachmentSend));
+        if needs_attachment_send {
+            if let Some(events) = self.events.as_ref() {
+                ctx.attachments = Some(Arc::new(crate::attachment_api::ServerAttachmentApi::new(
+                    self.host.db().clone(),
+                    events.clone(),
+                    ctx.conversation_id.clone(),
+                )));
+            }
+            // No bus → capability stays dormant. The tool body's
+            // own `ctx.attachments.is_none()` denial fires.
         }
         Ok(ctx)
     }

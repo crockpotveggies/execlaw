@@ -57,6 +57,15 @@ pub enum CardKind {
     ShellSession,
     /// Future — file-pipeline tools (e.g. batch upload + transform).
     FilePipeline,
+    /// A file the agent is delivering to the conversation. Opens
+    /// (and immediately closes) with `details = { attachment_id,
+    /// filename, mime_type, byte_size?, caption? }`. The SPA
+    /// renders it as an inline download chip rather than a
+    /// progress card. Symmetric to channel plugins'
+    /// `send_attachment` — gives the web channel the same
+    /// "agent attaches a file to its reply" affordance that
+    /// TextOnly transports get via `send_file`.
+    Attachment,
 }
 
 impl CardKind {
@@ -66,6 +75,7 @@ impl CardKind {
             Self::Research => "research",
             Self::ShellSession => "shell_session",
             Self::FilePipeline => "file_pipeline",
+            Self::Attachment => "attachment",
         }
     }
 
@@ -75,6 +85,7 @@ impl CardKind {
             "research" => Self::Research,
             "shell_session" => Self::ShellSession,
             "file_pipeline" => Self::FilePipeline,
+            "attachment" => Self::Attachment,
             // Unknown kind from the wire — render as the generic
             // catch-all so the SPA still shows progress without the
             // operator seeing a broken-render placeholder.

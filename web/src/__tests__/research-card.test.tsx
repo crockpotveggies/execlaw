@@ -178,7 +178,13 @@ describe("ResearchCard renderer", () => {
         expect(screen.getByTestId("card-research")).toBeTruthy();
     });
 
-    it("renders the synthesized report inline when details.report_markdown is set", () => {
+    it("does NOT render the report markdown inline (delivery is via send_attachment)", () => {
+        // 2026-05-03 (rev 3): the inline `<pre>{report_markdown}</pre>`
+        // block was removed. Reports were 1000+ lines and bloated the
+        // chat pane. The PDF flows through `send_attachment` →
+        // AttachmentCard chip instead. Even when stale data carries
+        // a `report_markdown` field, the ResearchCard must NOT
+        // render it.
         const card = makeResearchCard({
             state: "Completed",
             progress: 1,
@@ -200,21 +206,11 @@ describe("ResearchCard renderer", () => {
                 ],
                 report_markdown: "# Final report\n\nKey findings.",
                 report_url: "/research/job-1",
-            },
+            } as Record<string, unknown>,
         });
         render(<ResearchCard card={card} />);
-        const body = screen.getByTestId("card-research-report-body");
-        expect(body.textContent).toContain("Final report");
-        // Open by default on Completed.
-        const wrapper = screen.getByTestId("card-research-report");
-        expect((wrapper as HTMLDetailsElement).open).toBe(true);
-    });
-
-    it("does not render a report block when details.report_markdown is absent", () => {
-        // Mid-gather — no report yet. The block should be missing
-        // entirely rather than rendering an empty <details>.
-        render(<ResearchCard card={makeResearchCard()} />);
         expect(screen.queryByTestId("card-research-report")).toBeNull();
+        expect(screen.queryByTestId("card-research-report-body")).toBeNull();
     });
 
     it("never includes a progress bar when state is Completed", () => {

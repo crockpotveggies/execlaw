@@ -58,11 +58,10 @@ interface ResearchDetails {
     /// in conversation; the card surfaces it as visual confirmation
     /// that research is paused waiting on the agent + user exchange.
     clarification_question?: string;
-    /// Final synthesized report — populated on the CardClosed event
-    /// when status flips to `Completed`. The renderer surfaces it
-    /// inline below the plan tree so the operator never has to
-    /// click an "Open" button to read the conclusion.
-    report_markdown?: string;
+    /// Reserved for the /research/<job_id> deep-link. The card itself
+    /// no longer renders the report inline; the agent delivers the
+    /// PDF via `send_attachment` (see AttachmentCard) and that chip
+    /// lands as a sibling card immediately after this one.
     report_url?: string;
 }
 
@@ -204,21 +203,17 @@ export function ResearchCard({ card, onAction }: CardRendererProps) {
 
             <div className="execlaw-card-task__summary">{card.summary}</div>
 
-            {details?.report_markdown && (
-                <details
-                    className="execlaw-card-research__report"
-                    data-testid="card-research-report"
-                    open={card.state === "Completed"}
-                >
-                    <summary>Report</summary>
-                    <pre
-                        className="execlaw-card-research__report-body"
-                        data-testid="card-research-report-body"
-                    >
-                        {details.report_markdown}
-                    </pre>
-                </details>
-            )}
+            {/*
+              * 2026-05-03 (rev 3): the inline `<pre>` markdown dump
+              * was removed. Reports were 1000+ lines and bloated the
+              * chat pane. The PDF deliverable now flows through the
+              * agent's `send_attachment` tool, which emits an
+              * `Attachment` card immediately after this one — the SPA
+              * renders it as a download chip with a save-as button.
+              * The markdown remains on disk under the workspace; the
+              * /research/<job_id> page exposes it for operators who
+              * want to read it inline rather than download.
+              */}
 
             {card.error && (
                 <div

@@ -57,6 +57,33 @@ impl<'db> AttachmentStore<'db> {
         })
     }
 
+    /// Look up an attachment by id. Returns `None` if the row is
+    /// missing — caller distinguishes "no such id" from "DB error"
+    /// via Result + Option.
+    pub fn get(&self, id: &AttachmentId) -> Result<Option<AttachmentRow>, DbError> {
+        let id_owned = id.as_str().to_owned();
+        self.db.with_conn(|c| {
+            let row = c
+                .query_row(
+                    "SELECT id, conversation_id, mime_type, path, sha256, received_at \
+                     FROM state_attachments WHERE id = ?1",
+                    params![id_owned],
+                    |r| {
+                        Ok(AttachmentRow {
+                            id: AttachmentId::from(r.get::<_, String>(0)?),
+                            conversation_id: ConversationId::from(r.get::<_, String>(1)?),
+                            mime_type: r.get(2)?,
+                            path: r.get(3)?,
+                            sha256: r.get(4)?,
+                            received_at: r.get(5)?,
+                        })
+                    },
+                )
+                .ok();
+            Ok(row)
+        })
+    }
+
     pub fn insert_artifact(&self, row: &ArtifactRow) -> Result<(), DbError> {
         self.db.with_conn(|c| {
             c.execute(

@@ -10,7 +10,8 @@ export type CardKind =
     | "long_running_task"
     | "research"
     | "shell_session"
-    | "file_pipeline";
+    | "file_pipeline"
+    | "attachment";
 
 export type CardState =
     | "Pending"

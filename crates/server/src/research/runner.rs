@@ -672,7 +672,16 @@ pub async fn run_synthesize_phase(
         );
         return Ok(());
     }
-    let report_for_details = outcome.report_markdown.clone();
+    // 2026-05-03 (rev 3): we used to inline the entire report
+    // markdown into `details.report_markdown`. The SPA dumped it
+    // into a `<pre>` block below the plan tree which bloated the
+    // chat pane on any non-trivial report. The PDF deliverable now
+    // flows through `send_attachment` (the agent calls it after
+    // observing the completed status), which emits a separate
+    // Attachment card the SPA renders as a download chip. The
+    // research card still carries `attachment_id` for back-compat
+    // and the /research/<job_id> page can pull the markdown from
+    // the workspace for operators who want to read inline.
     close_card_and_broadcast(
         db,
         events,
@@ -681,11 +690,10 @@ pub async fn run_synthesize_phase(
         &CardClosedPayload {
             card_id: card_id.to_owned(),
             state: CardState::Completed,
-            summary: "Research complete. Report ready.".into(),
+            summary: "Research complete. PDF report attached below.".into(),
             details: Some(serde_json::json!({
                 "job_id": job_id.as_str(),
                 "phase": "Complete",
-                "report_markdown": report_for_details,
                 "report_url": format!("/research/{}", job_id.as_str()),
             })),
             attachment_id: Some(outcome.attachment_id.as_str().to_owned()),

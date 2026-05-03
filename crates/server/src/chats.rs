@@ -1168,7 +1168,8 @@ pub(crate) async fn run_runner_turn(
         .with_inference(
             inference_client_for_subagents.clone(),
             state.config.model_id.clone(),
-        ),
+        )
+        .with_events(state.events.clone()),
     );
 
     // Step 3.5 — lazy-spawn the runner if it's not registered yet.
@@ -1442,7 +1443,8 @@ async fn run_tool_capable_turn(
         // 2026-04-29 — wire the inference client + model so
         // `delegate_task` and any future SubagentSpawn-capability
         // tools have a live child-LLM path for this turn.
-        .with_inference(inference.clone(), state.config.model_id.clone()),
+        .with_inference(inference.clone(), state.config.model_id.clone())
+        .with_events(state.events.clone()),
     );
     let exec = TurnExecutor::new((*inference).clone(), dispatch);
     // Phase 11.A — wire a phase observer that fans the runner's
