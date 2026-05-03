@@ -317,29 +317,48 @@ async fn gather_one(
     }
 
     // Skip the subagent call if no body fetched OR the token cap
-    // already burned out — partial-success note is fine.
+    // already burned out.
+    //
+    // 2026-05-03 (rev 4): both no-search-results AND
+    // every-fetch-failed are marked Failed (state). The previous
+    // code returned `Done` for the every-fetch-failed case, which
+    // silently let an empty-excerpt note pass synthesise's `Done`
+    // filter. Synthesise then composed a report from zero usable
+    // text — operator-visible result was a confident-sounding
+    // empty PDF or, when EVERY worker hit this path, the misleading
+    // "no notes — gather produced zero usable rows" error since
+    // synthesise still saw zero notes worth using. Failing-loud
+    // surfaces the real cause (search ran but every URL bounced)
+    // on the card, which is what the operator needs to debug it
+    // (UA blocking, rate limit, dead URLs, etc.).
     let already_burned = tokens_consumed.load(Ordering::Relaxed);
     if bodies.is_empty() {
         let no_sources = sources.is_empty();
+        // Surface the per-source error reasons so the operator
+        // sees WHY (HTTP 403, content-type rejected, network
+        // timeout, etc.) — currently the most useful triage signal.
+        let fetch_summary = if no_sources {
+            "no search results".to_owned()
+        } else {
+            let reasons: Vec<&str> = sources
+                .iter()
+                .filter_map(|s| s.error.as_deref())
+                .take(3)
+                .collect();
+            if reasons.is_empty() {
+                "every fetch failed".to_owned()
+            } else {
+                format!("every fetch failed: {}", reasons.join("; "))
+            }
+        };
         return Ok(ResearchNote {
             index,
             sub_query: step.query.clone(),
-            state: if no_sources {
-                SubQueryState::Failed
-            } else {
-                SubQueryState::Done
-            },
+            state: SubQueryState::Failed,
             excerpt: String::new(),
             sources,
             tokens_used: None,
-            error: Some(
-                if no_sources {
-                    "no search results"
-                } else {
-                    "every fetch failed"
-                }
-                .into(),
-            ),
+            error: Some(fetch_summary),
         });
     }
     if already_burned >= config.max_total_tokens {
@@ -914,6 +933,55 @@ mod tests {
         for note in &notes {
             assert_eq!(note.state, SubQueryState::Done);
             assert!(note.excerpt.contains("no subagent"));
+        }
+    }
+
+    /// 2026-05-03 (rev 4) regression: the every-fetch-failed branch
+    /// used to return state=Done with an empty excerpt. Synthesise's
+    /// `Done`-only filter then included the empty note, producing
+    /// either a confidently-empty report OR (when EVERY worker hit
+    /// the same path and synthesise ended up with zero usable rows)
+    /// the misleading "no notes — gather produced zero usable rows"
+    /// error. The state must be Failed and the error string must
+    /// surface the per-source reasons so the operator can debug.
+    #[tokio::test]
+    async fn run_gather_failed_state_when_every_fetch_errors() {
+        struct AlwaysFailFetch;
+        #[async_trait]
+        impl WebFetchApi for AlwaysFailFetch {
+            async fn get(&self, url: &str) -> Result<WebFetchResponse, ApiError> {
+                Err(ApiError::Storage(format!("HTTP 403 from {url}")))
+            }
+        }
+        let db = fresh_db();
+        let plan = fixture_plan(2);
+        let deps = GatherDeps {
+            search: Arc::new(StubSearch {
+                per_query_results: 2,
+            }),
+            fetch: Arc::new(AlwaysFailFetch),
+            subagent: Some(Arc::new(StubSubagent {
+                tokens_per_call: 50,
+            })),
+        };
+        let ctx = make_ctx(&db, plan, config_with(2, 60, 100_000), deps);
+        let notes = run_gather(ctx).await.unwrap();
+        for note in &notes {
+            assert_eq!(
+                note.state,
+                SubQueryState::Failed,
+                "every-fetch-failed must produce Failed (not silent Done) so synthesise rejects it loudly: {note:?}",
+            );
+            let err = note.error.as_deref().unwrap_or("");
+            assert!(
+                err.starts_with("every fetch failed"),
+                "error must surface the cause; got {err:?}",
+            );
+            // The diagnostic should include at least one per-source reason.
+            assert!(
+                err.contains("HTTP 403"),
+                "error must surface the per-source HTTP status; got {err:?}",
+            );
         }
     }
 

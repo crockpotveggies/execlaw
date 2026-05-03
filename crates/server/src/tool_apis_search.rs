@@ -258,6 +258,33 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    /// Regression: parse a real DDG response (captured 2026-05-03)
+    /// to catch HTML structure drift early. The old parser regex
+    /// expected the snippet to be inside an `<a class="result__snippet">`
+    /// tag, but a fresh capture against the production endpoint
+    /// shows DDG also serves results where the snippet markup
+    /// changed. If this assertion ever drops to 0, the regex needs
+    /// updating — bisect against this fixture, not the live network.
+    #[test]
+    fn parser_handles_live_2026_05_html_capture() {
+        let html = include_str!("ddg_live_fixture.html");
+        let results = parse_ddg_html(html, 10);
+        assert!(
+            results.len() >= 5,
+            "expected >= 5 results from live DDG capture, got {}: \
+             this is the symptom users see as 'synthesize failed: no notes'. \
+             First three for triage: {:?}",
+            results.len(),
+            results.iter().take(3).collect::<Vec<_>>(),
+        );
+        // Sanity: every parsed entry must have a usable URL
+        // (search returns "no search results" if every URL is empty).
+        for r in &results {
+            assert!(r.url.starts_with("http"), "non-http url: {}", r.url);
+            assert!(!r.title.is_empty(), "empty title");
+        }
+    }
+
     #[test]
     fn redirect_unwrap_recovers_real_url() {
         assert_eq!(
@@ -280,5 +307,34 @@ mod tests {
     #[test]
     fn provider_id_is_duckduckgo() {
         assert_eq!(DuckDuckGoSearchApi::new().provider_id(), "duckduckgo");
+    }
+}
+
+#[cfg(test)]
+mod ua_smoke_tests {
+    //! Smoke check for the production HttpWebFetchApi UA. Doesn't
+    //! hit the network; just asserts the constant is set to
+    //! something that wouldn't immediately trigger CDN bot-protect.
+    //!
+    //! The actual outbound UA fix lives in `tool_apis_http.rs`; this
+    //! mirror lives next to the search module so the regression
+    //! lands in the same area as the other "DR fetch-failure"
+    //! triage tests.
+    use crate::tool_apis_http::DEFAULT_USER_AGENT;
+
+    #[test]
+    fn default_ua_does_not_identify_as_reqwest() {
+        // The bug we fixed: `reqwest/X.Y` UA → CDN 403 → empty
+        // notes → "no notes" synthesise failure. Catch any future
+        // regression that drops the override.
+        assert!(
+            !DEFAULT_USER_AGENT.to_ascii_lowercase().contains("reqwest"),
+            "default UA must not advertise as the reqwest library; got {DEFAULT_USER_AGENT:?}",
+        );
+        assert!(
+            DEFAULT_USER_AGENT.to_ascii_lowercase().contains("mozilla"),
+            "default UA should look like a real browser to satisfy CDN \
+             bot-protection; got {DEFAULT_USER_AGENT:?}",
+        );
     }
 }

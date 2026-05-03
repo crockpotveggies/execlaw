@@ -37,8 +37,14 @@ pub enum SynthesizeError {
     CardEmit(#[from] CardEmitError),
     #[error("inference: {0}")]
     Inference(String),
-    #[error("no notes — gather produced zero usable rows")]
-    NoNotes,
+    /// Carries a digest of the per-step failure reasons so the
+    /// operator-visible Failed state on the card explains WHY no
+    /// notes were usable (e.g. "every fetch failed: HTTP 403", "no
+    /// search results", "subagent failed: timeout"). Without this
+    /// the operator just saw "synthesize failed: no notes — gather
+    /// produced zero usable rows" with no actionable signal.
+    #[error("no usable notes from gather phase ({0})")]
+    NoNotes(String),
     #[error("attachment store: {0}")]
     Attachment(String),
 }
@@ -97,7 +103,32 @@ pub async fn run_synthesize(ctx: SynthesizeCtx) -> Result<SynthesizeOutcome, Syn
         .filter(|n| matches!(n.state, SubQueryState::Done))
         .collect();
     if usable.is_empty() {
-        return Err(SynthesizeError::NoNotes);
+        // Aggregate per-step failure reasons so the operator-visible
+        // error tells them WHY. Bucket-count by reason text so we
+        // don't dump 20 copies of the same "HTTP 403" line.
+        let mut reasons: std::collections::BTreeMap<String, u32> =
+            std::collections::BTreeMap::new();
+        for note in &notes {
+            if let Some(e) = note.error.as_deref() {
+                *reasons.entry(e.to_owned()).or_default() += 1;
+            }
+        }
+        let digest = if reasons.is_empty() {
+            format!("{} step(s), no error text", notes.len())
+        } else {
+            reasons
+                .into_iter()
+                .map(|(reason, count)| {
+                    if count > 1 {
+                        format!("{count}× {reason}")
+                    } else {
+                        reason
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        return Err(SynthesizeError::NoNotes(digest));
     }
 
     let prompt_user = build_synthesize_prompt(&query, &plan, &usable);
@@ -429,7 +460,7 @@ mod tests {
             model: "m".into(),
         };
         let err = run_synthesize(ctx).await.unwrap_err();
-        assert!(matches!(err, SynthesizeError::NoNotes));
+        assert!(matches!(err, SynthesizeError::NoNotes(_)));
     }
 
     #[tokio::test]

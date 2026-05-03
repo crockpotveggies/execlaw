@@ -50,6 +50,22 @@ pub const DEFAULT_MAX_BYTES: usize = 1_048_576;
 /// Default per-request timeout.
 pub const DEFAULT_TIMEOUT_S: u64 = 30;
 
+/// Default User-Agent string for outbound HTTP. Identifies as a
+/// recent Firefox so CDN bot-protection layers (Cloudflare, Akamai,
+/// AWS WAF, Fastly, etc.) don't 403/406 the request the way they
+/// reflexively do for the default `reqwest/X.Y` UA. The version is
+/// intentionally stable-ish (mid-2026 ESR) so we don't have to
+/// chase Firefox release-train churn; the bot-detection rules care
+/// about "looks like a real browser" much more than precise version
+/// matching.
+///
+/// Operators uneasy about UA-spoofing can override via
+/// `HttpWebFetchApi::with_client(...)` and pass their own configured
+/// reqwest client. The default is "stop the silent gather-failure
+/// surface that motivated this fix"; the override is for purists.
+pub const DEFAULT_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
+
 /// Content types `web_fetch` is willing to read. Binary types fail
 /// fast so the LLM doesn't get a base64-encoded image dumped into
 /// context. Operators who need broader types can register a plugin
@@ -74,9 +90,31 @@ impl HttpWebFetchApi {
     /// Production constructor: SSRF guard on, 1 MiB cap, 30 s
     /// timeout, fresh reqwest client with no redirect surprises
     /// (10-redirect cap, default).
+    ///
+    /// Sets a realistic browser User-Agent. Without one, the default
+    /// reqwest UA (`reqwest/0.12.x`) is recognized as a bot by most
+    /// CDN / WAF stacks (Cloudflare, Akamai, Fastly bot-protect) and
+    /// returns 403/406 — which silently torpedoed the deep-research
+    /// gather phase (every URL fetch failed, every note ended up
+    /// empty). Operator can override via `with_client` if they need
+    /// a different identity (e.g. a corporate-policy UA).
+    ///
+    /// Also sets `Accept` and `Accept-Language` headers since some
+    /// sites also bot-detect on those being absent.
     pub fn new() -> Self {
+        use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE};
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static(
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            ),
+        );
+        headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_S))
+            .user_agent(DEFAULT_USER_AGENT)
+            .default_headers(headers)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
