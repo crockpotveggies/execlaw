@@ -35,8 +35,27 @@ mod turn_loop;
 use connect::{ConnectionDriver, RunnerConfig};
 use turn_loop::{CancelFlags, ToolResultRoutes};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+// mimalloc beats both glibc-malloc and musl-malloc on the runner's
+// concurrent JSON-parsing + buffer-churn workload. Load-bearing on
+// alpine specifically — musl's default malloc is ~2-3× slower than
+// glibc under multi-thread contention.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+fn main() -> Result<()> {
+    // Manual runtime construction (instead of `#[tokio::main]`) so we
+    // can pin a generous thread stack. musl's default is 128 KB —
+    // dangerously small for deep async chains and serde_json
+    // recursion. 2 MB matches glibc's effective working set.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(2 * 1024 * 1024)
+        .build()
+        .context("building tokio runtime")?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     init_tracing();
 
     let cfg = RunnerConfig::from_env()

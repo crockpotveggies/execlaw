@@ -14,16 +14,26 @@
 # A named volume `execlaw-runner-<group_id>` is bind-mounted at
 # /workspace; the runner can scratch there freely.
 #
+# Image strategy (2026-05-03): static musl build → alpine runtime.
+# The runner binary is fully static; alpine gives us ~5 MB of base
+# vs ~80 MB for debian-slim. Final image lands ~6× smaller. Operator
+# can still `docker exec` for debugging because alpine ships busybox.
+# musl's default thread stack (128 KB) and malloc are mitigated in
+# the binary itself — see crates/runner-binary/src/main.rs.
+
 # ---- builder ----
-# 1.86+ required because some transitive deps (icu_*) bumped MSRV.
-FROM rust:1.90-bookworm AS builder
+# rust:N.M-alpine builds against musl by default — output binary is
+# fully static, no glibc dependency. musl-dev provides libc headers
+# any cc-rs-based dep (mimalloc-sys) needs.
+FROM rust:1.90-alpine AS builder
 WORKDIR /build
+
+RUN apk add --no-cache musl-dev
 
 # Cache the dependency graph: copy manifests first, then sources.
 # Workspace `Cargo.toml` references many crates we don't need at
 # runtime (server, cli, etc.), so we copy the whole tree but only
-# build the runner-binary target. Adjust if/when the build matrix
-# gets expensive.
+# build the runner-binary target.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY plugins ./plugins
@@ -34,14 +44,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/execlaw-runner /tmp/execlaw-runner
 
 # ---- runtime ----
-# Minimal Debian — needs ca-certificates for outbound HTTPS to vLLM
-# (operators sometimes terminate TLS at the inference proxy). No
-# shell tools by design; the runner doesn't exec anything externally
-# in v1.
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Bare alpine + ca-certificates. ca-certificates lets rustls-native-certs
+# load the system trust store at startup, which matters when operators
+# install their own CA (e.g. terminating TLS at the inference proxy
+# with a self-signed cert).
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
 
 # Workspace mount point. Supervisor mounts the per-group named
 # volume here; the runner has full RW within /workspace and zero
@@ -51,11 +59,10 @@ WORKDIR /workspace
 
 COPY --from=builder /tmp/execlaw-runner /usr/local/bin/execlaw-runner
 
-# Drop privileges. The runner reads env vars set by the supervisor
-# at `docker run` time; UID/GID 1000 keeps any files written to
-# /workspace owned by a non-root user (matters when the operator
-# inspects the volume from the host).
-RUN useradd -u 1000 -m -d /home/runner -s /usr/sbin/nologin runner \
+# Drop privileges. UID/GID 1000 keeps any files written to /workspace
+# owned by a non-root user (matters when the operator inspects the
+# volume from the host).
+RUN adduser -D -u 1000 -h /home/runner -s /sbin/nologin runner \
     && chown -R runner:runner /workspace
 USER runner
 

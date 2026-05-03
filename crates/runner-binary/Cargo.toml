@@ -37,5 +37,11 @@ tracing-subscriber.workspace = true
 rand.workspace = true
 hex.workspace = true
 
+# Faster allocator. musl's malloc is ~2-3× slower than glibc under
+# multi-thread contention; mimalloc closes the gap entirely and beats
+# both on most concurrent workloads. `default-features = false` skips
+# `secure` mode (overhead we don't need for a sandboxed runner).
+mimalloc = { version = "0.1", default-features = false }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
