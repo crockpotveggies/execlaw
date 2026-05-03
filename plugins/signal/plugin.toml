@@ -1,0 +1,85 @@
+[plugin]
+id = "signal"
+name = "Signal"
+version = "0.1.0"
+description = "Signal Messenger transport — send/reply/group operations via a host-managed signal-cli bridge container."
+author = "execlaw"
+license = "AGPL-3.0-or-later"
+
+# Phase-1 stub: the manifest declares the tool surface so the agent
+# catalogue, humaniser, and trust-floor enforcement light up the moment
+# the plugin is enabled. The actual tool implementations return
+# `{ "error": "signal bridge not yet running" }` until the bridge
+# supervisor lands (see docs/bridge-supervisor-design.md).
+#
+# `[transport]` is intentionally omitted on this stub — declaring it
+# would register a `signal` transport in the hook registry and the
+# routing layer would start trying to deliver messages through a
+# non-existent bridge. We add it back when the supervisor ships.
+
+[[tools]]
+name = "signal.send_message"
+description = """Send a Signal message to a person or group. \
+This tool IS the user-visible message — do NOT also produce a text \
+reply summarising what you sent. After calling this tool, return an \
+empty text response to end your turn. \
+Args: { to: string (name, phone, or `signal:user:<uuid>` JID), \
+text: string }."""
+trust_floor = "Controller"
+latency = "low"
+
+[[tools]]
+name = "signal.reply"
+description = """Reply in the current Signal conversation. \
+This tool IS the user-visible reply — do NOT also produce a text \
+response summarising what you replied. After calling this tool, \
+return an empty text response to end your turn. \
+Only available when the current turn was triggered by an inbound \
+Signal message; the bridge derives the recipient from the \
+conversation's principal_group.  Args: { text: string }."""
+# NOTE: reply intentionally has NO trust_floor — by definition the
+# inbound principal is the one being replied to, so a KnownLimited
+# Signal contact can ask the agent to reply on their own thread.
+# (send_message is the dangerous one — that's the tool that lets you
+# message OTHER people, hence Controller-only.)
+latency = "low"
+
+[[tools]]
+name = "signal.list_groups"
+description = """List Signal groups the controller is a member of. \
+Returns: { groups: [{ id, name, member_count }] }."""
+trust_floor = "Controller"
+latency = "medium"
+
+[[tools]]
+name = "signal.create_group"
+description = """Create a new Signal group with the specified members. \
+The tool result includes an `ack_text` field — your final reply to \
+the user MUST be exactly that ack_text with no additions, no emoji, \
+and no rephrasing. Args: { title?: string, members: string[] (names \
+or phone numbers), message?: string (initial post) }."""
+trust_floor = "Controller"
+latency = "medium"
+
+[[tools]]
+name = "signal.add_group_members"
+description = """Add members to an existing Signal group, looking up \
+the group by exact name match. The tool result includes an `ack_text` \
+field — your final reply to the user MUST be exactly that ack_text \
+with no additions, no emoji, and no rephrasing. Args: \
+{ groupName: string, members: string[] (names or phone numbers) }."""
+trust_floor = "Controller"
+latency = "medium"
+
+[[tools]]
+name = "signal.leave_group"
+description = """Leave an existing Signal group, looking up the group \
+by exact name match. The tool result includes an `ack_text` field — \
+your final reply to the user MUST be exactly that ack_text with no \
+additions, no emoji, and no rephrasing. Args: { groupName: string }."""
+trust_floor = "Controller"
+latency = "medium"
+
+[runtime]
+tier = "script"
+source = "main.rhai"

@@ -42,6 +42,12 @@ pub struct RegisteredTool {
     /// schema file, or when load failed (logged warn, falls back to
     /// `{"type":"object"}` at dispatch time).
     pub schema_json: Option<serde_json::Value>,
+    /// Manifest's `[[tools]].trust_floor` (optional). Stored as the
+    /// raw string so `plugin-host` doesn't have to depend on
+    /// `execlaw-policy`; the dispatch layer parses + ranks it. Tools
+    /// with no floor accept any caller that passes the existing
+    /// capability gate.
+    pub trust_floor: Option<String>,
 }
 
 /// A built-in tool registered via [`HookRegistry::register_builtin`].
@@ -294,6 +300,7 @@ impl HookRegistry {
                     schema_path: t.schema.clone(),
                     description: t.description.clone(),
                     schema_json,
+                    trust_floor: t.trust_floor.clone(),
                 }),
             );
         }

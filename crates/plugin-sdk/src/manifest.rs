@@ -93,6 +93,23 @@ pub struct ToolDecl {
     pub latency: ToolLatency,
     #[serde(default)]
     pub required_capabilities: Vec<String>,
+    /// Minimum trust level required to invoke this tool. Mirrors
+    /// selfhosted-claw's `controllerOnly: true` knob but generalised
+    /// — operators can pin a tool at `Controller` (admin only),
+    /// `KnownTrusted`, etc. Tools omitting this field have no trust
+    /// floor (anyone whose conversation reaches the dispatcher may
+    /// invoke them, subject to the existing `required_capabilities`
+    /// gate).
+    ///
+    /// The string is parsed against `execlaw_policy::TrustLevel`;
+    /// unknown strings cause manifest validation to fail loudly so a
+    /// typo doesn't silently downgrade to "no floor". Concretely, a
+    /// `signal.send_message` tool that pinned to `"Controller"`
+    /// prevents a Signal contact (KnownLimited / KnownTrusted) from
+    /// using the controller's outbound transport to spam other
+    /// people — selfhosted-claw learned this the hard way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_floor: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -367,6 +384,32 @@ pub enum ManifestError {
     SubprocessMissingExecutable,
     #[error("runtime.tier = 'script' requires 'source' (path to .rhai file)")]
     ScriptMissingSource,
+    #[error(
+        "tool '{tool}' has trust_floor = '{value}' which is not a known TrustLevel \
+         (expected one of: Controller, Delegated, KnownTrusted, KnownLimited, \
+         UnknownPending, Blocked)"
+    )]
+    UnknownTrustFloor { tool: String, value: String },
+}
+
+/// Trust levels the manifest may pin a tool to. Kept as a small flat
+/// set here so the SDK doesn't depend on `execlaw-policy`; the host
+/// re-validates against `execlaw_policy::TrustLevel` at registration
+/// time. Order matches `policy::trust::TrustLevel`'s declaration.
+const KNOWN_TRUST_LEVELS: &[&str] = &[
+    "Controller",
+    "Delegated",
+    "KnownTrusted",
+    "KnownLimited",
+    "UnknownPending",
+    "Blocked",
+];
+
+/// True iff `s` is a valid trust level string accepted by the manifest.
+/// Public so other crates can share the canonical list without re-typing
+/// it.
+pub fn is_known_trust_level(s: &str) -> bool {
+    KNOWN_TRUST_LEVELS.iter().any(|k| *k == s)
 }
 
 impl PluginManifest {
@@ -391,11 +434,19 @@ impl PluginManifest {
             return Err(ManifestError::EmptyVersion);
         }
 
-        // Uniqueness checks.
+        // Uniqueness + trust_floor validation, in one pass.
         let mut seen: std::collections::HashSet<&str> = Default::default();
         for t in &self.tools {
             if !seen.insert(&t.name) {
                 return Err(ManifestError::DuplicateTool(t.name.clone()));
+            }
+            if let Some(tf) = &t.trust_floor {
+                if !is_known_trust_level(tf) {
+                    return Err(ManifestError::UnknownTrustFloor {
+                        tool: t.name.clone(),
+                        value: tf.clone(),
+                    });
+                }
             }
         }
         let mut seen: std::collections::HashSet<&str> = Default::default();
@@ -627,6 +678,121 @@ mod tests {
         "#;
         let err = PluginManifest::parse(bad).unwrap_err();
         assert!(matches!(err, ManifestError::UnknownRuntimeTier(_)));
+    }
+
+    #[test]
+    fn trust_floor_parses_when_known() {
+        let ok = r#"
+            [plugin]
+            id = "p"
+            name = "P"
+            version = "0.1.0"
+
+            [[tools]]
+            name = "send"
+            description = "Send a thing."
+            trust_floor = "Controller"
+        "#;
+        let m = PluginManifest::parse(ok).unwrap();
+        assert_eq!(m.tools[0].trust_floor.as_deref(), Some("Controller"));
+    }
+
+    #[test]
+    fn trust_floor_rejected_when_unknown() {
+        // A typo here used to silently downgrade to "no floor",
+        // which is exactly the kind of bug that would let a Signal
+        // contact invoke a Controller-only tool — fail loudly.
+        let bad = r#"
+            [plugin]
+            id = "p"
+            name = "P"
+            version = "0.1.0"
+
+            [[tools]]
+            name = "send"
+            trust_floor = "Admin"
+        "#;
+        let err = PluginManifest::parse(bad).unwrap_err();
+        match err {
+            ManifestError::UnknownTrustFloor { tool, value } => {
+                assert_eq!(tool, "send");
+                assert_eq!(value, "Admin");
+            }
+            other => panic!("expected UnknownTrustFloor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trust_floor_optional_omission_leaves_none() {
+        let ok = r#"
+            [plugin]
+            id = "p"
+            name = "P"
+            version = "0.1.0"
+
+            [[tools]]
+            name = "free"
+        "#;
+        let m = PluginManifest::parse(ok).unwrap();
+        assert!(m.tools[0].trust_floor.is_none());
+    }
+
+    #[test]
+    fn shipped_signal_manifest_parses_cleanly() {
+        // Pin the on-disk `plugins/signal/plugin.toml` against this
+        // crate's parser so a manifest typo (or an SDK validator
+        // change that breaks the existing description prose) is
+        // caught at `cargo test` time, not at install time. This
+        // mirrors the same "shipped manifest" smoke test we'd want
+        // for every bundled plugin once we factor it out.
+        const SIGNAL_MANIFEST: &str =
+            include_str!("../../../plugins/signal/plugin.toml");
+        let m = PluginManifest::parse(SIGNAL_MANIFEST)
+            .expect("plugins/signal/plugin.toml must parse cleanly");
+        assert_eq!(m.plugin.id, "signal");
+        // Six tools mirror the selfhosted-claw integration. If we
+        // add or remove one, this assertion forces a deliberate
+        // update — the audit doc should stay in sync.
+        assert_eq!(m.tools.len(), 6);
+        // signal.send_message and the group ops MUST carry a
+        // Controller floor — that's the security invariant from the
+        // audit. Letting a Signal contact use these tools would let
+        // them message arbitrary other people via the controller's
+        // outbound transport. signal.reply intentionally has no
+        // floor (the inbound principal is by definition the one
+        // being replied to).
+        let send = m
+            .tools
+            .iter()
+            .find(|t| t.name == "signal.send_message")
+            .expect("signal.send_message must be declared");
+        assert_eq!(send.trust_floor.as_deref(), Some("Controller"));
+        let reply = m
+            .tools
+            .iter()
+            .find(|t| t.name == "signal.reply")
+            .expect("signal.reply must be declared");
+        assert!(
+            reply.trust_floor.is_none(),
+            "signal.reply must NOT pin a trust floor"
+        );
+    }
+
+    #[test]
+    fn is_known_trust_level_covers_full_ladder() {
+        for s in [
+            "Controller",
+            "Delegated",
+            "KnownTrusted",
+            "KnownLimited",
+            "UnknownPending",
+            "Blocked",
+        ] {
+            assert!(is_known_trust_level(s), "{s} should be recognised");
+        }
+        assert!(!is_known_trust_level("admin"));
+        assert!(!is_known_trust_level("CONTROLLER"));
+        assert!(!is_known_trust_level(""));
     }
 
     #[test]

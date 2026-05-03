@@ -2106,6 +2106,31 @@ pub(crate) fn humanise_tool_call(tool_name: &str, args: &serde_json::Value) -> S
             };
             format!("{} a routine", pretty.chars().next().map(|c| c.to_uppercase().collect::<String>() + &pretty[c.len_utf8()..]).unwrap_or_else(|| pretty.into()))
         }
+        // === Signal plugin ===
+        // These need bespoke phrasings because the generic
+        // dotted-namespace fallback below would render
+        // `signal.send_message` → "send message via signal", which
+        // is awkward and doesn't surface the recipient. Once the
+        // Signal plugin lands these are the labels operators see in
+        // the loader pill.
+        "signal.send_message" => match (s("to"), s("text")) {
+            (Some(to), _) => format!("Sending Signal message to {to}"),
+            _ => "Sending a Signal message".into(),
+        },
+        "signal.reply" => "Replying on Signal".into(),
+        "signal.create_group" => match s("title") {
+            Some(t) => format!("Creating Signal group “{t}”"),
+            None => "Creating a Signal group".into(),
+        },
+        "signal.add_group_members" => match s("groupName") {
+            Some(g) => format!("Adding members to “{g}”"),
+            None => "Adding members to a Signal group".into(),
+        },
+        "signal.list_groups" => "Listing Signal groups".into(),
+        "signal.leave_group" => match s("groupName") {
+            Some(g) => format!("Leaving Signal group “{g}”"),
+            None => "Leaving a Signal group".into(),
+        },
         // Plugin-namespaced tools (`google.calendar.list_events`
         // etc) get a "<verb> via <namespace>" rendering. Operators
         // have plugin descriptions in the catalogue; the loader
@@ -3418,6 +3443,59 @@ mod tests {
                 &serde_json::json!({"calendar_id": "primary"}),
             ),
             "list events via calendar",
+        );
+    }
+
+    #[test]
+    fn humanise_tool_call_renders_signal_tools_with_recipient_context() {
+        // Signal tools predate the plugin so they get bespoke
+        // entries — the dotted-namespace fallback would render
+        // `signal.send_message` → "send message via signal", which
+        // hides the recipient. The recipient is exactly the bit the
+        // operator wants to see in the loader pill ("am I about to
+        // send this to the right person?").
+        assert_eq!(
+            super::humanise_tool_call(
+                "signal.send_message",
+                &serde_json::json!({"to": "Alice", "text": "hi"}),
+            ),
+            "Sending Signal message to Alice",
+        );
+        assert_eq!(
+            super::humanise_tool_call(
+                "signal.send_message",
+                &serde_json::json!({"text": "no recipient passed"}),
+            ),
+            "Sending a Signal message",
+        );
+        assert_eq!(
+            super::humanise_tool_call("signal.reply", &serde_json::json!({"text": "ok"})),
+            "Replying on Signal",
+        );
+        assert_eq!(
+            super::humanise_tool_call(
+                "signal.create_group",
+                &serde_json::json!({"title": "Friday game night"}),
+            ),
+            "Creating Signal group “Friday game night”",
+        );
+        assert_eq!(
+            super::humanise_tool_call(
+                "signal.add_group_members",
+                &serde_json::json!({"groupName": "Friday game night"}),
+            ),
+            "Adding members to “Friday game night”",
+        );
+        assert_eq!(
+            super::humanise_tool_call("signal.list_groups", &serde_json::json!({})),
+            "Listing Signal groups",
+        );
+        assert_eq!(
+            super::humanise_tool_call(
+                "signal.leave_group",
+                &serde_json::json!({"groupName": "Friday game night"}),
+            ),
+            "Leaving Signal group “Friday game night”",
         );
     }
 

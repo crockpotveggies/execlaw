@@ -775,11 +775,21 @@ impl PluginHost {
     /// of the tool's `required_capabilities`, or the call is rejected
     /// before the child sees any args. The wildcard `"*"` satisfies
     /// any requirement (used by Controller turns).
+    ///
+    /// **Trust-floor enforcement**: if the manifest declares
+    /// `[[tools]].trust_floor`, the `caller_trust` rank must be at or
+    /// above that floor. This is the analogue of selfhosted-claw's
+    /// `controllerOnly: true` knob, but generalised so a plugin can
+    /// pin a tool at e.g. `KnownTrusted`. `caller_trust = None` means
+    /// the caller skipped the gate (legacy paths) — preserve the old
+    /// behaviour and only enforce capabilities. New call sites should
+    /// always pass `Some(_)`.
     pub async fn call_tool(
         &self,
         tool_name: &str,
         args: serde_json::Value,
         caller_caps: &[&str],
+        caller_trust: Option<&str>,
     ) -> Result<serde_json::Value, String> {
         let Some(registered) = self.inner.registry.tool(tool_name) else {
             return Err(format!("tool '{tool_name}' not registered"));
@@ -794,6 +804,24 @@ impl PluginHost {
                         "tool '{tool_name}' requires capability '{required}' not in caller's set"
                     ));
                 }
+            }
+        }
+
+        // Trust-floor check. We compare ranks rather than exact-match
+        // so e.g. `Controller` (rank 5) satisfies a `KnownTrusted`
+        // (rank 3) floor. Manifest validation already rejected
+        // unknown floor strings, but we re-validate defensively here:
+        // a stale registry entry whose plugin shipped before this
+        // field existed would have `trust_floor = None` and skip the
+        // check entirely.
+        if let Some(floor) = registered.trust_floor.as_deref() {
+            let floor_rank = trust_rank(floor);
+            let caller_rank = caller_trust.map(trust_rank).unwrap_or(0);
+            if caller_rank < floor_rank {
+                let caller_label = caller_trust.unwrap_or("<none>");
+                return Err(format!(
+                    "tool '{tool_name}' requires trust >= {floor} but caller is {caller_label}"
+                ));
             }
         }
 
@@ -1011,6 +1039,28 @@ fn runtime_source_or_err(
 /// Pull the `_oauth` map out of the JSON params the host injected
 /// for subprocess plugins. Script plugins receive it as a typed
 /// `serde_json::Map`. Empty map when no OAuth accounts apply.
+/// Map a trust-level string to its rank — higher = more trusted.
+/// Mirrors `execlaw_policy::trust::TrustLevel::rank` exactly so the
+/// `caller_trust` rank passed through from the dispatch layer compares
+/// correctly. Kept as a private helper so `plugin-host` doesn't pull
+/// `execlaw-policy` into its dep graph just for one enum.
+///
+/// Unknown strings (including "<none>" and the empty string) map to
+/// 0 — i.e. strictly below `Blocked`. That makes the trust-floor
+/// comparison conservative: a typo or stale call site can't
+/// accidentally let a tool through.
+fn trust_rank(s: &str) -> u8 {
+    match s {
+        "Controller" => 5,
+        "Delegated" => 4,
+        "KnownTrusted" => 3,
+        "KnownLimited" => 2,
+        "UnknownPending" => 1,
+        "Blocked" => 0,
+        _ => 0,
+    }
+}
+
 fn oauth_map_from_params(
     params: &serde_json::Value,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -1911,5 +1961,198 @@ source = "main.rhai"
             .unwrap()
             .expect("row must exist post-upgrade");
         assert_eq!(row.version, "1.4.7");
+    }
+
+    // === trust_floor enforcement ===
+
+    #[test]
+    fn trust_rank_orders_match_policy_crate() {
+        // Spot-check the rank ordering — must match
+        // execlaw_policy::trust::TrustLevel::rank exactly so a
+        // Controller satisfies a KnownTrusted floor and a
+        // KnownLimited fails it.
+        assert!(trust_rank("Controller") > trust_rank("KnownTrusted"));
+        assert!(trust_rank("KnownTrusted") > trust_rank("KnownLimited"));
+        assert!(trust_rank("KnownLimited") > trust_rank("UnknownPending"));
+        assert!(trust_rank("UnknownPending") > trust_rank("Blocked"));
+        assert_eq!(trust_rank("Controller"), 5);
+        assert_eq!(trust_rank("Blocked"), 0);
+        // Unknown / typo => 0 (strictly below Blocked) so a stale
+        // call site can't accidentally bypass enforcement.
+        assert_eq!(trust_rank("admin"), 0);
+        assert_eq!(trust_rank(""), 0);
+    }
+
+    #[tokio::test]
+    async fn call_tool_rejects_caller_below_trust_floor() {
+        // Plugin declares a Controller-floor tool. A KnownLimited
+        // caller must be rejected BEFORE the dispatcher tries to
+        // load any plugin runtime. Verifying the error message also
+        // pins the operator-facing string we surface in tool-result
+        // payloads.
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let manifest = r#"
+[plugin]
+id = "signal"
+name = "Signal"
+version = "0.1.0"
+
+[[tools]]
+name = "signal.send_message"
+description = "Send a Signal message."
+trust_floor = "Controller"
+
+[runtime]
+tier = "subprocess"
+executable = "./bin"
+"#;
+        install_manifest(&db, &registry, "signal", manifest);
+        let host = PluginHost::new(db, registry, PathBuf::from("/tmp"));
+
+        let err = host
+            .call_tool(
+                "signal.send_message",
+                serde_json::json!({"to": "alice", "text": "hi"}),
+                &[],
+                Some("KnownLimited"),
+            )
+            .await
+            .expect_err("KnownLimited must not pass a Controller floor");
+        assert!(
+            err.contains("trust >= Controller"),
+            "error should name the floor — got {err:?}",
+        );
+        assert!(
+            err.contains("KnownLimited"),
+            "error should name the actual caller — got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_passes_trust_floor_when_caller_is_above() {
+        // A Controller caller satisfies a Controller floor — the
+        // call must proceed past the gate. It still fails because
+        // the manifest's `subprocess` runtime points at a
+        // nonexistent binary, but the failure mode is "no runtime
+        // loaded", not "trust violation". That's the assertion: we
+        // pass the gate.
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let manifest = r#"
+[plugin]
+id = "signal"
+name = "Signal"
+version = "0.1.0"
+
+[[tools]]
+name = "signal.send_message"
+description = "Send a Signal message."
+trust_floor = "Controller"
+
+[runtime]
+tier = "subprocess"
+executable = "./bin"
+"#;
+        install_manifest(&db, &registry, "signal", manifest);
+        let host = PluginHost::new(db, registry, PathBuf::from("/tmp"));
+
+        let err = host
+            .call_tool(
+                "signal.send_message",
+                serde_json::json!({}),
+                &["*"],
+                Some("Controller"),
+            )
+            .await
+            .expect_err("no runtime loaded => Err, but NOT a trust error");
+        assert!(
+            !err.contains("trust"),
+            "must not be a trust error — got {err:?}",
+        );
+        assert!(
+            err.contains("no runtime is loaded") || err.contains("not registered"),
+            "expected 'no runtime' shape — got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_with_no_floor_accepts_any_caller_trust() {
+        // Tools that omit `trust_floor` keep the legacy behaviour:
+        // capability gate only. A KnownLimited caller still passes
+        // when no floor is declared.
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let manifest = r#"
+[plugin]
+id = "weather"
+name = "Weather"
+version = "0.1.0"
+
+[[tools]]
+name = "weather.lookup"
+description = "Look up the weather."
+
+[runtime]
+tier = "subprocess"
+executable = "./bin"
+"#;
+        install_manifest(&db, &registry, "weather", manifest);
+        let host = PluginHost::new(db, registry, PathBuf::from("/tmp"));
+
+        let err = host
+            .call_tool(
+                "weather.lookup",
+                serde_json::json!({}),
+                &[],
+                Some("KnownLimited"),
+            )
+            .await
+            .expect_err("no runtime loaded => Err, but NOT a trust error");
+        assert!(
+            !err.contains("trust"),
+            "no trust_floor declared — must not block on trust",
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_with_no_caller_trust_still_blocks_floor() {
+        // Defensive: a legacy call site that passes `caller_trust =
+        // None` must NOT be allowed to invoke a floor-protected
+        // tool. The conservative read is "unknown caller", which
+        // ranks 0 → strictly below every declared floor.
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let manifest = r#"
+[plugin]
+id = "signal"
+name = "Signal"
+version = "0.1.0"
+
+[[tools]]
+name = "signal.send_message"
+description = "Send a Signal message."
+trust_floor = "KnownTrusted"
+
+[runtime]
+tier = "subprocess"
+executable = "./bin"
+"#;
+        install_manifest(&db, &registry, "signal", manifest);
+        let host = PluginHost::new(db, registry, PathBuf::from("/tmp"));
+
+        let err = host
+            .call_tool(
+                "signal.send_message",
+                serde_json::json!({}),
+                &["*"],
+                None,
+            )
+            .await
+            .expect_err("no caller_trust => below any floor");
+        assert!(
+            err.contains("trust >= KnownTrusted"),
+            "expected trust violation — got {err:?}",
+        );
     }
 }

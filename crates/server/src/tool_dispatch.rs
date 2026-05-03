@@ -397,8 +397,18 @@ impl<B: BuiltinTools + 'static> ToolDispatch for ChainedToolDispatch<B> {
             return r;
         }
         let caps: Vec<&str> = self.caller_caps.iter().map(|s| s.as_str()).collect();
+        // 2026-05-03 — pass `caller_trust` so the host can enforce
+        // `[[tools]].trust_floor` (selfhosted-claw's `controllerOnly`
+        // generalised). Without this, a Signal contact mapped to
+        // `KnownLimited` could invoke `signal.send_message` and use
+        // the controller's outbound transport to spam other people.
         self.host
-            .call_tool(tool_name, args_json.clone(), &caps)
+            .call_tool(
+                tool_name,
+                args_json.clone(),
+                &caps,
+                Some(self.caller_trust.as_str()),
+            )
             .await
     }
 }
