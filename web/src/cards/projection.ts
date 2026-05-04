@@ -109,11 +109,27 @@ export function applyEvent(card: Card, ev: CardEvent): Card {
     // latest activity, then frozen (further messages naturally
     // appear after this card without re-popping it).
     const p = ev.payload;
+    // 2026-05-04 — derive the post-close phase from
+    // details.phase when the runner stamped it (today: "Complete"
+    // for the deep-research path), else null. Without this, the
+    // last CardProgressed phase ("Synthesizing", "Gathering" etc.)
+    // stays rendered on the card even after the Completed badge
+    // shows — visible to the operator as a stuck "Synthesizing"
+    // label below a "Completed" badge.
+    const nextDetails = p.details !== undefined ? p.details : card.details;
+    const phaseFromDetails =
+        nextDetails &&
+        typeof nextDetails === "object" &&
+        "phase" in (nextDetails as Record<string, unknown>) &&
+        typeof (nextDetails as Record<string, unknown>).phase === "string"
+            ? ((nextDetails as Record<string, unknown>).phase as string)
+            : null;
     return {
         ...card,
         state: p.state,
         summary: p.summary,
-        details: p.details !== undefined ? p.details : card.details,
+        details: nextDetails,
+        phase: phaseFromDetails,
         attachment_id:
             p.attachment_id !== undefined ? p.attachment_id : card.attachment_id,
         error: p.error !== undefined ? p.error : card.error,

@@ -390,9 +390,27 @@ function StatusBadge({ state }: { state: SubQueryState }) {
 function DownloadButton({ card }: { card: Card }) {
     const auth = useContext(AuthContext);
     if (card.state !== "Completed") return null;
-    if (!card.attachment_id) return null;
+    // Belt-and-suspenders: read attachment_id from the card's
+    // top-level field OR from details (the runner stamps both as
+    // of 2026-05-04 so a wire-edge that drops the top-level field
+    // doesn't kill the download link). Either source must be a
+    // non-empty string.
+    const fromDetails =
+        card.details &&
+        typeof card.details === "object" &&
+        "attachment_id" in (card.details as Record<string, unknown>) &&
+        typeof (card.details as Record<string, unknown>).attachment_id ===
+            "string"
+            ? ((card.details as Record<string, unknown>)
+                  .attachment_id as string)
+            : null;
+    const attachmentId =
+        (card.attachment_id && card.attachment_id.length > 0
+            ? card.attachment_id
+            : null) ?? fromDetails;
+    if (!attachmentId) return null;
     const token = auth?.getAccessToken() ?? null;
-    const baseUrl = `/api/attachments/${card.attachment_id}`;
+    const baseUrl = `/api/attachments/${attachmentId}`;
     // Token in query-string so the `<a download>` link
     // authenticates — browsers don't carry the Authorization
     // header on link navigations. See auth_extract.rs's

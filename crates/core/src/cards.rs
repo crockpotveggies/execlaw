@@ -376,6 +376,20 @@ impl Card {
                 if p.error.is_some() {
                     self.error = p.error.clone();
                 }
+                // 2026-05-04 — derive post-close phase from
+                // details.phase (the runner stamps "Complete" on
+                // the deep-research path), else clear. Without
+                // this the projection's `phase` field froze at
+                // whatever the last CardProgressed had set
+                // ("Synthesizing", "Gathering"), so the SPA
+                // showed a stale phase label below the
+                // "Completed" badge after refresh.
+                let phase_from_details = self
+                    .details
+                    .get("phase")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                self.phase = phase_from_details;
                 self.updated_at = *ts;
             }
         }

@@ -417,7 +417,15 @@ mod tests {
         let card = project_card(&db, &cid, "card-1").unwrap().unwrap();
         assert_eq!(card.state, CardState::Completed);
         assert_eq!(card.progress, Some(0.5));
-        assert_eq!(card.phase.as_deref(), Some("Halfway"));
+        // 2026-05-04: phase no longer survives a Closed event.
+        // Apply for Closed re-derives phase from details.phase
+        // (None here because the test's Closed payload has
+        // details=None and the open-time details were `{}`). The
+        // old behaviour where the last Progressed phase
+        // ("Halfway") leaked past the close was the bug
+        // surfaced by users seeing "Synthesizing" rendered below
+        // a "Completed" badge.
+        assert_eq!(card.phase, None);
         assert_eq!(card.summary, "Done.");
     }
 
@@ -566,6 +574,145 @@ mod tests {
         let b = &cards[1];
         assert_eq!(b.state, CardState::Running);
         assert_eq!(b.kind, CardKind::Attachment);
+    }
+
+    /// 2026-05-04 regression: `apply` for CardClosed used to leave
+    /// the `phase` field at whatever the last CardProgressed had
+    /// set ("Synthesizing", "Gathering"), so the SPA showed a
+    /// stale phase line below the "Completed" badge after the
+    /// research card closed. The fix derives the post-close phase
+    /// from `details.phase` when stamped (the deep-research path
+    /// stamps "Complete"), else clears.
+    #[test]
+    fn closed_event_resets_phase_from_details() {
+        let db = fresh_db();
+        let cid = seed_conv(&db, "conv-phase");
+        open_card(
+            &db,
+            &cid,
+            "system",
+            &CardOpenedPayload {
+                card_id: "card-x".into(),
+                kind: CardKind::Research,
+                title: "T".into(),
+                summary: "starting".into(),
+                state: Some(CardState::Running),
+                details: serde_json::json!({"phase": "Planning"}),
+                actions: vec![],
+            },
+        )
+        .unwrap();
+        progress_card(
+            &db,
+            &cid,
+            "system",
+            &CardProgressedPayload {
+                card_id: "card-x".into(),
+                state: Some(CardState::Running),
+                progress: Some(0.9),
+                phase: Some("Synthesizing".into()),
+                details: None,
+                actions: None,
+                summary: Some("nearly done".into()),
+            },
+        )
+        .unwrap();
+        // Sanity: phase is "Synthesizing" pre-close.
+        let mid = project_card(&db, &cid, "card-x").unwrap().unwrap();
+        assert_eq!(mid.phase.as_deref(), Some("Synthesizing"));
+
+        close_card(
+            &db,
+            &cid,
+            "system",
+            &CardClosedPayload {
+                card_id: "card-x".into(),
+                state: CardState::Completed,
+                summary: "done".into(),
+                // Runner stamps phase=Complete in details on the
+                // research path. Apply must pick that up so the
+                // top-level phase field reflects the new state
+                // instead of staying on "Synthesizing".
+                details: Some(serde_json::json!({
+                    "phase": "Complete",
+                    "report_url": "/research/x",
+                })),
+                attachment_id: Some("att-x".into()),
+                error: None,
+            },
+        )
+        .unwrap();
+
+        let after = project_card(&db, &cid, "card-x").unwrap().unwrap();
+        assert_eq!(after.state, CardState::Completed);
+        assert_eq!(
+            after.phase.as_deref(),
+            Some("Complete"),
+            "phase must update from details.phase on Closed (was the stuck-on-Synthesizing bug)",
+        );
+        assert_eq!(after.attachment_id.as_deref(), Some("att-x"));
+    }
+
+    #[test]
+    fn closed_event_clears_phase_when_details_omits_it() {
+        let db = fresh_db();
+        let cid = seed_conv(&db, "conv-phase-clear");
+        open_card(
+            &db,
+            &cid,
+            "system",
+            &CardOpenedPayload {
+                card_id: "c".into(),
+                kind: CardKind::Research,
+                title: "T".into(),
+                summary: "start".into(),
+                state: Some(CardState::Running),
+                details: serde_json::json!({"phase": "Planning"}),
+                actions: vec![],
+            },
+        )
+        .unwrap();
+        progress_card(
+            &db,
+            &cid,
+            "system",
+            &CardProgressedPayload {
+                card_id: "c".into(),
+                state: None,
+                progress: None,
+                phase: Some("Gathering".into()),
+                details: None,
+                actions: None,
+                summary: None,
+            },
+        )
+        .unwrap();
+        close_card(
+            &db,
+            &cid,
+            "system",
+            &CardClosedPayload {
+                card_id: "c".into(),
+                state: CardState::Completed,
+                summary: "done".into(),
+                // No phase in details → apply clears the field.
+                details: None,
+                attachment_id: None,
+                error: None,
+            },
+        )
+        .unwrap();
+        let after = project_card(&db, &cid, "c").unwrap().unwrap();
+        // Closed apply doesn't touch self.details when payload's
+        // details is None (which preserves the open-time
+        // {"phase": "Planning"} payload). So phase reflects that.
+        // The intent here is: phase MUST NOT stay on the stale
+        // "Gathering" from the last Progressed.
+        assert_ne!(
+            after.phase.as_deref(),
+            Some("Gathering"),
+            "stale Progressed phase must not leak past close",
+        );
     }
 
     /// 2026-05-04 — `event_seq` on the projected Card is the

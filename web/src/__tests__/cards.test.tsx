@@ -163,7 +163,13 @@ describe("card projection", () => {
         const card = cards.get("a")!;
         expect(card.state).toBe("Completed");
         expect(card.progress).toBe(0.9);
-        expect(card.phase).toBe("Synth");
+        // 2026-05-04: phase no longer survives a Closed event.
+        // Closed apply re-derives phase from details.phase (None
+        // here because the closed() helper omits details), so the
+        // last Progressed phase ("Synth") doesn't leak past the
+        // close. This was the bug surfaced by users seeing
+        // "Synthesizing" rendered below a "Completed" badge.
+        expect(card.phase).toBe(null);
         expect(card.updated_at).toBe(400);
     });
 

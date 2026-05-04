@@ -207,6 +207,28 @@ describe("ResearchCard renderer", () => {
         expect(screen.queryByTestId("card-research-download")).toBeNull();
     });
 
+    /// 2026-05-04 belt-and-suspenders: the runner stamps
+    /// attachment_id BOTH at the top-level CardClosedPayload field
+    /// AND inside details. DownloadButton reads either route so
+    /// a wire-edge that drops the top-level field doesn't kill
+    /// the link. Asserts the details fallback works.
+    it("renders Download button when attachment_id is only in details", () => {
+        const card = makeResearchCard({
+            state: "Completed",
+            attachment_id: null, // top-level missing
+            details: {
+                attachment_id: "att-from-details",
+                report_url: "/research/x",
+                phase: "Complete",
+            },
+        });
+        render(<ResearchCard card={card} />);
+        const dl = screen.getByTestId("card-research-download-link");
+        expect(dl.getAttribute("href")).toContain(
+            "/api/attachments/att-from-details",
+        );
+    });
+
     it("does NOT render the Download button when attachment_id is missing", () => {
         const card = makeResearchCard({
             state: "Completed",

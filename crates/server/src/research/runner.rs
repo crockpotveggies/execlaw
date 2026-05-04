@@ -736,10 +736,19 @@ pub async fn run_synthesize_phase(
             card_id: card_id.to_owned(),
             state: CardState::Completed,
             summary: "Research complete. PDF report attached below.".into(),
+            // attachment_id duplicated into details so the SPA's
+            // Download button can find it via either route — the
+            // top-level CardClosedPayload field OR the details
+            // JSON. Two paths because we've seen the top-level
+            // field occasionally not surface in some live-WS edge
+            // cases; details.attachment_id always travels with
+            // the card's serialized JSON because the projection
+            // re-serializes details verbatim.
             details: Some(serde_json::json!({
                 "job_id": job_id.as_str(),
                 "phase": "Complete",
                 "report_url": format!("/research/{}", job_id.as_str()),
+                "attachment_id": outcome.attachment_id.as_str(),
             })),
             attachment_id: Some(outcome.attachment_id.as_str().to_owned()),
             error: None,
