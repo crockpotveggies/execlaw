@@ -12,6 +12,7 @@ import {
     __resetChatStore,
     appendStreamingToken,
     markUnread,
+    setActiveThread,
     setThreads,
     getChatState,
 } from "../chat/store";
@@ -23,12 +24,14 @@ afterEach(() => {
     localStorage.clear();
 });
 
-function rerender(ui: React.ReactElement) {
+function rerender(ui: React.ReactElement, initialPath = "/chat") {
     // Sidebar uses react-router's <Link> for the settings gear, so
-    // tests must mount within a MemoryRouter.
+    // tests must mount within a MemoryRouter. `initialPath` lets
+    // route-aware behaviours (e.g. the .is-active gate on thread
+    // rows) be exercised from the test.
     return render(
         <AuthProvider>
-            <MemoryRouter>{ui}</MemoryRouter>
+            <MemoryRouter initialEntries={[initialPath]}>{ui}</MemoryRouter>
         </AuthProvider>,
     );
 }
@@ -414,5 +417,63 @@ describe("Sidebar", () => {
         expect(rows[0].querySelector(".bi-pin-angle-fill")).toBeTruthy();
         // Regular row renders the read/unread dot, NOT the pin icon.
         expect(rows[1].querySelector('[aria-label="Pinned"]')).toBeNull();
+    });
+
+    /// 2026-05-04 regression: navigating away from a chat thread
+    /// to /research, /settings, etc. used to leave the
+    /// `.is-active` highlight on the previously-viewed thread,
+    /// reading as "you're viewing this thread right now" when
+    /// the operator was actually on a different page. Sidebar now
+    /// gates the highlight on the current pathname starting with
+    /// `/chat`. The thread itself stays VISIBLE in the sidebar
+    /// (so switch-back is one click) — just not highlighted.
+    it("does not apply .is-active to threads when route is not /chat", () => {
+        setThreads([
+            {
+                conversation_id: "conv-active-1",
+                kind: "ControllerDM",
+                phase: "idle",
+                trust_class: "Controller",
+                modality: "Text",
+                display_name: "Q4 plans",
+                is_pinned: false,
+                is_ephemeral: false,
+                ephemeral_expires_at: null,
+                last_seq: 7,
+            },
+        ]);
+        setActiveThread("conv-active-1");
+
+        // Mount on /research (any non-chat route works).
+        rerender(<Sidebar onNewThread={() => {}} />, "/research");
+        const rows = screen.getAllByTestId("sidebar-thread");
+        expect(rows.length).toBeGreaterThan(0);
+        // Active thread is still visible (single thread case),
+        // but no row should carry .is-active.
+        for (const row of rows) {
+            expect(row.classList.contains("is-active")).toBe(false);
+        }
+    });
+
+    it("applies .is-active when route IS /chat and the thread matches activeId", () => {
+        setThreads([
+            {
+                conversation_id: "conv-active-2",
+                kind: "ControllerDM",
+                phase: "idle",
+                trust_class: "Controller",
+                modality: "Text",
+                display_name: "Q4 plans",
+                is_pinned: false,
+                is_ephemeral: false,
+                ephemeral_expires_at: null,
+                last_seq: 7,
+            },
+        ]);
+        setActiveThread("conv-active-2");
+        // Mount on /chat (the default).
+        rerender(<Sidebar onNewThread={() => {}} />, "/chat");
+        const row = screen.getByTestId("sidebar-thread");
+        expect(row.classList.contains("is-active")).toBe(true);
     });
 });

@@ -8,7 +8,7 @@
 // section.
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Link, NavLink, useNavigate } from "react-router-dom";
+import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import {
     deleteThread,
@@ -39,8 +39,19 @@ interface SidebarProps {
 export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
     const auth = useAuth();
     const navigate = useNavigate();
+    const location = useLocation();
     const threads = useChatState((s) => s.threads);
-    const activeId = useChatState((s) => s.activeId);
+    const activeIdRaw = useChatState((s) => s.activeId);
+    // 2026-05-04 — gate the thread `.is-active` highlight on the
+    // operator actually being on a /chat route. The chat store keeps
+    // `activeId` set across navigation so coming back to /chat re-
+    // surfaces the last viewed thread, but the sidebar shouldn't
+    // render that thread as "current page" while the operator is on
+    // /research, /settings, /routines, etc. Without this gate the
+    // highlighted row read as "you're viewing this thread right
+    // now," which is wrong on every non-chat route.
+    const isOnChatRoute = location.pathname.startsWith("/chat");
+    const activeId = isOnChatRoute ? activeIdRaw : null;
     // 2026-04-28 — inline-rename state. When the user clicks
     // "Rename" in a thread's hover menu, we stash that thread's id
     // here; the row swaps its label for an `<input>` until the user
@@ -66,7 +77,12 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
         // Always show pinned (Control thread).
         if (t.is_pinned) return true;
         // Always show the active one so it doesn't vanish on toggle.
-        if (t.conversation_id === activeId) return true;
+        // Use the RAW active id (not the route-gated one) so the
+        // last-viewed thread stays visible while the operator is on
+        // Settings / Research / Routines — switching back to it is
+        // one click. Only the .is-active CSS class respects the
+        // current route.
+        if (t.conversation_id === activeIdRaw) return true;
         if (!hideExternal) return true;
         // hideExternal=true → show only ControllerDM-shaped threads.
         return t.kind === "ControllerDM";
@@ -314,7 +330,14 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                                         // briefly flashes "no
                                         // messages yet" before the
                                         // list refresh clears it.
-                                        if (activeId === t.conversation_id) {
+                                        // Use the RAW active id (not
+                                        // route-gated): if the
+                                        // operator's last-viewed
+                                        // thread was this one, we
+                                        // still need to drop it
+                                        // even when deleting from a
+                                        // non-chat route.
+                                        if (activeIdRaw === t.conversation_id) {
                                             setActiveThread(null);
                                             navigate("/chat");
                                         }
