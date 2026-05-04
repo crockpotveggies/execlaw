@@ -26,7 +26,6 @@ use crate::research::gather::{GatherCtx, GatherDeps, GatherError, run_gather};
 use crate::research::synthesize::{SynthesizeCtx, SynthesizeError, run_synthesize};
 use crate::research::workspace::{ResearchWorkspace, WorkspaceError};
 use crate::tool_apis_http::HttpWebFetchApi;
-use crate::tool_apis_search::DuckDuckGoSearchApi;
 use crate::tool_apis_subagent::InferenceSubagentApi;
 use execlaw_core::Database;
 use execlaw_core::cards::{
@@ -520,7 +519,17 @@ pub async fn run_gather_phase(
         model,
         cancel,
     } = deps;
-    let search: Arc<dyn WebSearchApi> = Arc::new(DuckDuckGoSearchApi::new());
+    // 2026-05-04 — resolve the active provider from
+    // config_search_providers instead of hard-coding DDG. The
+    // dispatcher fix from rev 9 only touched the agent's
+    // `web_search` tool path; deep-research gather still bypassed
+    // the resolver and constructed DDG directly here, so the
+    // operator's Brave / SearxNG / Tavily / Exa selection in
+    // Settings → Search was silently ignored on research jobs.
+    // Reported as "DDG anomaly bot-detection" failures despite
+    // Brave being the configured default.
+    let search: Arc<dyn WebSearchApi> =
+        crate::search_resolver::resolve_active_provider(db);
     let fetch: Arc<dyn WebFetchApi> = Arc::new(HttpWebFetchApi::new());
     let subagent: Arc<dyn SubagentApi> = Arc::new(InferenceSubagentApi::new(
         client.clone(),
