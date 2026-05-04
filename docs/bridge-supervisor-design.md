@@ -92,9 +92,31 @@ Each bridge container exposes a localhost-only HTTP+WS endpoint. Schema we settl
 - `POST /v1/send` — outbound, returns `{ message_id }`
 - `GET /v1/inbound/stream` — long-lived WS the supervisor consumes
 - `GET /v1/contacts/resolve?q=...` — resolver fallback
-- `GET /healthz` — for the supervisor's healthcheck loop
+- `GET /healthz` (default) — for the supervisor's healthcheck loop
 
-Plugin manifest `[transport]` table gains `rpc_port` + `rpc_host` so the supervisor knows where to dial.
+The bridge meta lives on the `[[services]]` entry rather than `[transport]` — see `BridgeMeta` in `crates/plugin-sdk/src/manifest.rs`. The path is `[services.bridge]` with fields `channel`, `rpc_port`, `rpc_health_path` (defaults to `/healthz`). One bridge per channel across all installed plugins; the manifest validator + the hook registry both enforce this.
+
+## Phase 2b shipped knobs
+
+The supervisor invented these constants that the original memo didn't pin — back-ported here so future work has a single source of truth:
+
+- `MAX_RESTART_ATTEMPTS = 5` — mirrors `backend_supervisor`
+- `DEFAULT_TICK_INTERVAL = 5s` — same
+- `BRIDGE_PORT_POOL_START / END = 8501..=8600` — 100-port window above `backend_supervisor`'s 8101+ range, bounded so we can't drift into the ephemeral range; exhaustion parks `CrashLooping` (operator-visible) rather than silently colliding
+- container name format: `execlaw-bridge-<plugin_id>-<channel>` — mirrors `execlaw-backend-<purpose>`
+
+## Phase 2b lessons-learned (applied audit fixes)
+
+- **Port reuse on respawn.** First draft minted a fresh port on every respawn (RPC-fail restart, drift respawn, post-crash loop). Each leak was small but the supervisor's "URLs stay stable" promise was a lie. Fixed by storing `host_port: Option<u16>` on `BridgeSlot` and only minting on the very first spawn.
+- **Idle-tick `restart_attempts` double-count.** First draft did `restart_count.max(slot.restart_attempts + 1)` on every tick observing `CrashLooping` — five idle ticks would burn the cap. Fix: adopt the controller's count verbatim; the controller is the source of truth for crash-loop counting.
+- **Status-change event spam.** First draft published `BridgeStatusChanged` on every reconcile pass even when status was unchanged. Centralised via `transition_status(channel, slot, new_status)` which dedups + publishes only on transitions.
+- **Port allocator overflow.** `saturating_add(1)` would silently map every excess channel onto port 65535. Now `allocate_port` returns `Option<u16>` and the supervisor parks `CrashLooping` on exhaustion.
+
+## Phase 2b known limitations (next-phase work)
+
+- **Lock contention.** `slots: Mutex<HashMap>` is held across every `spawn`/`stop`/`inspect`/`health_check` await inside `reconcile_once`. A slow Docker call blocks `snapshot_status` and `reset_attempts`. Same pattern as `backend_supervisor` — both will be refactored together when Phase 3 adds the RPC client. Fix shape: snapshot desired+slot data under lock, drop, do controller calls, re-acquire to commit.
+- **`Healthy → vanished` flap escape hatch.** When `inspect` returns `NotFound`/`Stopped` the supervisor drops the handle but does NOT bump `restart_attempts`. A bridge crashed-and-removed by the operator should respawn freely; a bridge that genuinely flaps every 30 seconds deserves an alert. Phase 3 alert routing surfaces the flap without depending on the cap.
+- **No `LifecycleStage` analogue yet.** `backend_supervisor` has `Stage::DownloadingModel` etc. so a 5-minute "Starting" doesn't read as "stuck." Bridges will hit the same UX problem when signal-cli takes minutes to register; lift the pattern in Phase 3.
 
 ## Phasing
 
@@ -102,7 +124,7 @@ Plugin manifest `[transport]` table gains `rpc_port` + `rpc_host` so the supervi
 |---|---|---|
 | 1 | trust_floor manifest knob + dispatcher enforcement; signal humaniser entries; signal plugin manifest stub | **shipped** |
 | 2a | `TransportApi` capability trait + `state_transport_bindings` table + `TransportBindingStore` + criterion bench | **shipped** |
-| 2b | Bridge supervisor skeleton (container lifecycle reusing `ServiceController`, healthcheck/restart loop, no RPC yet) | next |
+| 2b | Bridge supervisor skeleton (container lifecycle reusing `ServiceController`, healthcheck/restart loop, no RPC yet) | **shipped** |
 | 3 | signal-cli sidecar container declaration + bridge RPC client + outbound dispatch wired to `signal.send_message` / `signal.reply` | |
 | 4 | Inbound stream consumer + first-contact intake → conversation creation → existing trust pipeline | |
 | 5 | Group ops (`create_group`, `add_group_members`, `leave_group`, `list_groups`) | |

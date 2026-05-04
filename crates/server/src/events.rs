@@ -99,6 +99,17 @@ pub enum UiEvent {
         phase: String,
     },
 
+    /// Fired by the bridge supervisor when a bridge sidecar's
+    /// observed status changes (Stopped → Starting → Healthy →
+    /// CrashLooping → ...). The SPA's bridges page uses these to
+    /// keep its row badges live without polling. `status` is the
+    /// `Debug` rendering of `ServiceStatus` so a future
+    /// CrashLooping variant carries `restart_count` along for free.
+    BridgeStatusChanged {
+        channel: String,
+        status: String,
+    },
+
     AlertFired {
         alert_id: String,
         severity: String,
@@ -230,6 +241,25 @@ pub enum UiEvent {
         error: Option<String>,
         committed_at: i64,
         event_seq: i64,
+    },
+
+    /// A deep-research job paused waiting on operator clarification.
+    /// Sister event to the `CardProgressed{phase: AwaitingInput}` the
+    /// SPA renders — this one is consumed by the server-side
+    /// `clarification_listener`, which wakes the agent in the
+    /// affected conversation so it can relay the question back to
+    /// the user. Kept distinct from `CardProgressed` so the listener
+    /// can subscribe with a narrow filter rather than projecting
+    /// every card update.
+    ///
+    /// 2026-05-03 (rev 7): replaces the polling-on-research_start
+    /// fast path. The agent's tool turn now returns immediately;
+    /// the listener fires a follow-up agent turn when the planner
+    /// decides clarification is needed.
+    ResearchAwaitingInput {
+        conversation_id: String,
+        job_id: String,
+        question: String,
     },
 }
 

@@ -176,6 +176,49 @@ pub struct ServiceDecl {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub ports: Vec<String>,
+    /// When present, this service is a **bridge** — a sidecar
+    /// container that mediates inbound/outbound traffic for a
+    /// transport channel (Signal-cli, WhatsApp Bridge, Matrix
+    /// Bridge, ...). The bridge supervisor takes responsibility for
+    /// its lifecycle: spawn, healthcheck, restart, alert on stuck.
+    /// Non-bridge services (helper daemons, OCR sidecars, etc.) omit
+    /// this and the supervisor leaves them alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge: Option<BridgeMeta>,
+}
+
+/// Bridge-specific metadata on a `ServiceDecl`. Together with the
+/// service's `name` + `image` + `ports` this is everything the bridge
+/// supervisor needs to run + monitor a transport sidecar.
+///
+/// Why a sub-struct rather than fields directly on `ServiceDecl`?
+/// Forward-compat: bridges will accumulate transport-specific knobs
+/// (account-data secret name, multi-account groupings, ...) that
+/// non-bridge services have no business knowing about. Hiding them
+/// behind a discriminator keeps `ServiceDecl`'s top-level shape lean
+/// and makes "is this a bridge?" a single `is_some()` check.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BridgeMeta {
+    /// Transport channel id ("signal", "whatsapp", "matrix", ...).
+    /// MUST match the `channel` column the bridge will write into
+    /// `state_transport_bindings`. The supervisor uses this as the
+    /// bridge's primary key — exactly one bridge per channel may be
+    /// registered at a time.
+    pub channel: String,
+    /// Container port serving the bridge's local RPC. The supervisor
+    /// publishes this as `127.0.0.1:<host_port>` and probes
+    /// `<rpc_health_path>` against it.
+    pub rpc_port: u16,
+    /// HTTP path on the RPC port that the supervisor probes for
+    /// liveness. Defaults to `/healthz`. Bridges that expose a
+    /// different convention (signal-cli's `/v1/about`, ...)
+    /// override here.
+    #[serde(default = "default_rpc_health_path")]
+    pub rpc_health_path: String,
+}
+
+fn default_rpc_health_path() -> String {
+    "/healthz".to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -390,6 +433,10 @@ pub enum ManifestError {
          UnknownPending, Blocked)"
     )]
     UnknownTrustFloor { tool: String, value: String },
+    #[error("duplicate bridge channel '{0}' across services in the same plugin")]
+    DuplicateBridgeChannel(String),
+    #[error("bridge service '{name}' has empty channel string")]
+    BridgeEmptyChannel { name: String },
 }
 
 /// Trust levels the manifest may pin a tool to. Kept as a small flat
@@ -459,6 +506,27 @@ impl PluginManifest {
         for p in &self.ui_panels {
             if !seen.insert(&p.mount) {
                 return Err(ManifestError::DuplicatePanel(p.mount.clone()));
+            }
+        }
+
+        // Bridge service validation. Two services in one plugin
+        // can't claim the same channel — the supervisor uses
+        // (channel) as the primary key. Empty channel strings are
+        // also rejected so a typo'd manifest doesn't silently
+        // register a bridge under "".
+        let mut bridge_channels: std::collections::HashSet<&str> = Default::default();
+        for s in &self.services {
+            if let Some(b) = &s.bridge {
+                if b.channel.is_empty() {
+                    return Err(ManifestError::BridgeEmptyChannel {
+                        name: s.name.clone(),
+                    });
+                }
+                if !bridge_channels.insert(&b.channel) {
+                    return Err(ManifestError::DuplicateBridgeChannel(
+                        b.channel.clone(),
+                    ));
+                }
             }
         }
 
@@ -735,6 +803,133 @@ mod tests {
         "#;
         let m = PluginManifest::parse(ok).unwrap();
         assert!(m.tools[0].trust_floor.is_none());
+    }
+
+    #[test]
+    fn bridge_metadata_parses_with_explicit_health_path() {
+        let ok = r#"
+            [plugin]
+            id = "p"
+            name = "P"
+            version = "0.1.0"
+
+            [[services]]
+            name = "signal-cli"
+            image = "asamuzak/signal-cli-rest-api:latest"
+            ports = ["8080:8080"]
+
+            [services.bridge]
+            channel = "signal"
+            rpc_port = 8080
+            rpc_health_path = "/v1/about"
+        "#;
+        let m = PluginManifest::parse(ok).unwrap();
+        assert_eq!(m.services.len(), 1);
+        let b = m.services[0].bridge.as_ref().unwrap();
+        assert_eq!(b.channel, "signal");
+        assert_eq!(b.rpc_port, 8080);
+        assert_eq!(b.rpc_health_path, "/v1/about");
+    }
+
+    #[test]
+    fn bridge_metadata_defaults_health_path() {
+        // Bridges that omit rpc_health_path get the conventional
+        // /healthz default — matches what most service meshes assume.
+        let ok = r#"
+            [plugin]
+            id = "p"
+            name = "P"
+            version = "0.1.0"
+
+            [[services]]
+            name = "wa-bridge"
+            image = "execlaw/wa-bridge:0.1"
+
+            [services.bridge]
+            channel = "whatsapp"
+            rpc_port = 8081
+        "#;
+        let m = PluginManifest::parse(ok).unwrap();
+        assert_eq!(
+            m.services[0].bridge.as_ref().unwrap().rpc_health_path,
+            "/healthz",
+        );
+    }
+
+    #[test]
+    fn non_bridge_service_leaves_bridge_field_none() {
+        // A helper sidecar (OCR worker, ffmpeg pool, ...) declares
+        // a [[services]] entry but no [services.bridge] table. The
+        // bridge supervisor must NOT pick this up.
+        let ok = r#"
+            [plugin]
+            id = "p"
+            name = "P"
+            version = "0.1.0"
+
+            [[services]]
+            name = "ocr-worker"
+            image = "execlaw/ocr-worker:0.1"
+        "#;
+        let m = PluginManifest::parse(ok).unwrap();
+        assert!(m.services[0].bridge.is_none());
+    }
+
+    #[test]
+    fn duplicate_bridge_channels_in_one_plugin_are_rejected() {
+        // Hard error — the supervisor keys by channel, so two
+        // services claiming the same channel would fight over the
+        // bridge slot. Catch at parse time.
+        let bad = r#"
+            [plugin]
+            id = "p"
+            name = "P"
+            version = "0.1.0"
+
+            [[services]]
+            name = "signal-a"
+            image = "x"
+            [services.bridge]
+            channel = "signal"
+            rpc_port = 8080
+
+            [[services]]
+            name = "signal-b"
+            image = "y"
+            [services.bridge]
+            channel = "signal"
+            rpc_port = 8081
+        "#;
+        let err = PluginManifest::parse(bad).unwrap_err();
+        match err {
+            ManifestError::DuplicateBridgeChannel(c) => assert_eq!(c, "signal"),
+            other => panic!("expected DuplicateBridgeChannel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_bridge_channel_rejected() {
+        // A typo'd / empty channel would silently register the
+        // bridge under "" and then collide with any future plugin
+        // doing the same. Reject loudly.
+        let bad = r#"
+            [plugin]
+            id = "p"
+            name = "P"
+            version = "0.1.0"
+
+            [[services]]
+            name = "x"
+            image = "y"
+            [services.bridge]
+            channel = ""
+            rpc_port = 8080
+        "#;
+        let err = PluginManifest::parse(bad).unwrap_err();
+        match err {
+            ManifestError::BridgeEmptyChannel { name } => assert_eq!(name, "x"),
+            other => panic!("expected BridgeEmptyChannel, got {other:?}"),
+        }
     }
 
     #[test]
