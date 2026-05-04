@@ -1651,18 +1651,24 @@ impl ResearchStartTool {
             descriptor: ToolDescriptor {
                 name: "research_start".into(),
                 description:
-                    "Enqueue a deep-research job for a question. The job runs asynchronously \
-                     (minutes to hours) — this tool returns immediately with a job_id the \
-                     operator can watch, and `research_status(job_id)` lets the agent poll \
-                     for progress. For sub-minute focused work use `delegate_task` instead.\n\n\
-                     CLARIFICATION FLOW: if the planner judges the query too vague to plan, the \
-                     job pauses in status `awaiting_input` with a `clarification_question` field \
-                     populated. Poll `research_status(job_id)` shortly after starting; if you \
-                     see `status == \"awaiting_input\"`, relay the `clarification_question` to \
-                     the user in chat verbatim (or with a brief framing) and call \
-                     `research_clarify(job_id, answer)` once they reply. The job will resume \
-                     automatically with the augmented query — no need to call research_start \
-                     again."
+                    "Start a deep-research job for a question. The tool blocks through the \
+                     planner phase (typically 5–15 s) so the returned `job` already reflects \
+                     the planner's decision; gather + synthesise then continue asynchronously. \
+                     For sub-minute focused work use `delegate_task` instead.\n\n\
+                     INSPECT THE RETURNED `job.status` AND ACT BEFORE ENDING YOUR TURN:\n\
+                     - `awaiting_input` — the planner needs more info from the user. Read \
+                       `job.clarification_question` and relay it to the user in chat verbatim \
+                       (or lightly reframed). When the user answers in their next message, \
+                       call `research_clarify(job_id, answer)` to resume the job. Do NOT call \
+                       `research_start` again — the original job stays alive across the pause.\n\
+                     - `planned` / `gathering` / `synthesizing` — the plan is good and the \
+                       runner is working. Briefly tell the user research has started; the \
+                       SPA renders the plan card inline. The runner will emit progress + an \
+                       attachment chip when complete.\n\
+                     - `failed` — the planner errored. Surface `job.error` to the user.\n\
+                     - `pending` / `planning` — the planner timed out (uncommon). Tell the user \
+                       research is running and will land asynchronously; you can poll \
+                       `research_status(job_id)` later if needed."
                         .into(),
                 schema: json!({
                     "type": "object",
@@ -3516,9 +3522,15 @@ mod tests {
     use crate::tool_apis::DbResearchApi;
 
     fn build_ctx_with_research_spawn(db: &Database, cid: ConversationId, trust: &str) -> ToolCtx {
+        // Use `with_spawn_no_wait` here: there's no supervisor in the
+        // builtin_tools test harness, so the production wait would
+        // poll for the full DEFAULT_PLAN_WAIT (45 s) waiting for a
+        // status transition that never comes. The test fixtures
+        // assert on the just-inserted Pending row directly, which is
+        // exactly what `no_wait` returns.
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let mut ctx = ToolCtx::empty(cid.clone(), trust, clock.clone());
-        ctx.research = Some(Arc::new(DbResearchApi::with_spawn(
+        ctx.research = Some(Arc::new(DbResearchApi::with_spawn_no_wait(
             db.clone(),
             trust,
             cid,
@@ -3671,6 +3683,70 @@ mod tests {
                 assert_eq!(v["job"]["error"], "Which region?");
             }
             other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// 2026-05-03 (rev 6): research_start now blocks through the
+    /// planner phase before returning, so the agent's tool result
+    /// already reflects an awaiting_input transition and the agent
+    /// can relay the clarification question in the same turn — no
+    /// polling required. This test simulates a supervisor finishing
+    /// the planner mid-call by flipping the row to AwaitingInput
+    /// from a parallel task while `research_start` is mid-poll;
+    /// the tool result must surface the awaiting_input view (with
+    /// the clarification question) instead of the original Pending.
+    #[tokio::test]
+    async fn research_start_returns_awaiting_input_view_when_planner_needs_clarification() {
+        use crate::tool_apis::DbResearchApi;
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "c1");
+        // Use the production wait variant (not the test no-wait
+        // helper) so we exercise the poll loop end-to-end.
+        let mut ctx = ToolCtx::empty(cid.clone(), "Controller", Arc::new(SystemClock));
+        ctx.research = Some(Arc::new(DbResearchApi::with_spawn(
+            db.clone(),
+            "Controller",
+            cid,
+            chrono::Utc::now().timestamp(),
+        )));
+
+        // Spawn the simulated planner: 100 ms after start fires, look
+        // up the most recent pending job and flip it to AwaitingInput.
+        // The poll loop in `start` should see the transition and
+        // return the awaiting_input view.
+        let db_for_planner = db.clone();
+        let planner = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let store = crate::research::ResearchJobStore::new(&db_for_planner);
+            // Find the row this test inserted — it's the only one.
+            let rows = store.list_all().unwrap();
+            let id = rows
+                .first()
+                .expect("research_start must insert a row before the planner fires")
+                .id
+                .clone();
+            store
+                .set_awaiting_input(&id, "Which USDA zone?", 1_000)
+                .unwrap();
+        });
+
+        let out = ResearchStartTool::new()
+            .invoke(ctx, json!({"query": "Ground covers"}))
+            .await;
+        planner.await.unwrap();
+        match out {
+            ToolOutcome::Ok(v) => {
+                assert_eq!(
+                    v["job"]["status"], "awaiting_input",
+                    "tool result must reflect the planner's clarification decision \
+                     synchronously so the agent can relay the question in the same turn",
+                );
+                assert_eq!(
+                    v["job"]["clarification_question"], "Which USDA zone?",
+                    "clarification_question must travel with the tool result",
+                );
+            }
+            other => panic!("expected Ok with awaiting_input, got {other:?}"),
         }
     }
 

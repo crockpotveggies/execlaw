@@ -17,7 +17,7 @@ use crate::conversation::ConversationStore;
 use crate::db::Database;
 use crate::ids::{AlertId, ConversationId, ResearchJobId};
 use crate::memory::{MemoryEntry, MemoryStore};
-use crate::research::{ResearchJobRow, ResearchJobStore, ResearchJobSummary};
+use crate::research::{ResearchJobRow, ResearchJobStatus, ResearchJobStore, ResearchJobSummary};
 use crate::routines::{
     RoutineRow, RoutineStore, RoutineUpsert, next_fire_after, parse_cron, parse_timezone,
 };
@@ -753,6 +753,64 @@ fn row_to_view(row: &ResearchJobRow) -> ResearchJobView {
     summary_to_view(&row.to_summary())
 }
 
+/// Poll the row at a short interval until its status leaves the
+/// pre-plan phase set (`Pending` / `Planning`), or `timeout`
+/// elapses. Used by `DbResearchApi::start` so the agent's tool
+/// turn doesn't end before the planner decides whether to plan or
+/// to ask for clarification.
+///
+/// Polling rather than event-subscription because:
+///   * `ResearchApi` lives in `core` and the live event bus lives
+///     in `server` — wiring the bus through the trait surface
+///     would force every impl (incl. tests + future stubs) to
+///     understand it. The poll is local to the impl.
+///   * The plan phase typically lasts 5–15 s on the operator's
+///     local LLM. A 250 ms poll loop costs ~60 cheap reads in the
+///     worst case — a rounding error against the LLM call itself.
+///
+/// Returns `None` on timeout (caller falls back to the
+/// just-inserted row); `Some(row)` once the row's status moves on.
+async fn wait_for_plan_phase_settle(
+    db: &Database,
+    job_id: &ResearchJobId,
+    timeout: std::time::Duration,
+) -> Option<ResearchJobRow> {
+    let deadline = std::time::Instant::now() + timeout;
+    let poll_interval = std::time::Duration::from_millis(250);
+    loop {
+        let db_for_task = db.clone();
+        let id_for_task = job_id.clone();
+        let row = tokio::task::spawn_blocking(move || {
+            ResearchJobStore::new(&db_for_task).get(&id_for_task)
+        })
+        .await
+        .ok()
+        .and_then(|r| r.ok().flatten());
+
+        if let Some(r) = row.as_ref() {
+            // Status moved out of the pre-plan set → done waiting.
+            // Anything Planned-or-later is a meaningful signal the
+            // tool result should carry.
+            if !matches!(
+                r.status,
+                ResearchJobStatus::Pending | ResearchJobStatus::Planning
+            ) {
+                return row;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return row; // last-known row, even if still planning
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Default plan-phase wait used by production callers. The planner
+/// is one LLM call against the operator's local model — typically
+/// 5–15 s on Qwen3.5-27B-AWQ; the 45 s ceiling absorbs slow first-
+/// turn loads without stranding the agent's tool turn forever.
+pub const DEFAULT_PLAN_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// DB-backed `ResearchApi`. Holds the caller's trust class +
 /// conversation id + a flag for whether spawn is allowed (driven by
 /// the descriptor's capability set: `ResearchSpawn` → `can_spawn =
@@ -763,6 +821,11 @@ pub struct DbResearchApi {
     caller_conversation_id: ConversationId,
     can_spawn: bool,
     clock_now_unix: i64,
+    /// How long `start` polls the row waiting for the planner to
+    /// settle before returning. Production wires `DEFAULT_PLAN_WAIT`;
+    /// tests use `Duration::ZERO` so they don't hang waiting for a
+    /// supervisor that isn't running.
+    plan_wait: std::time::Duration,
 }
 
 impl DbResearchApi {
@@ -780,6 +843,28 @@ impl DbResearchApi {
             caller_conversation_id,
             can_spawn: true,
             clock_now_unix: now_unix,
+            plan_wait: DEFAULT_PLAN_WAIT,
+        }
+    }
+
+    /// Variant for tests that don't have a running supervisor — the
+    /// poll-loop in `start` would otherwise wait the full
+    /// `DEFAULT_PLAN_WAIT` for a status transition that will never
+    /// happen. Tests that DO want to exercise the wait path should
+    /// drive the supervisor directly.
+    pub fn with_spawn_no_wait(
+        db: Database,
+        caller_trust: impl Into<String>,
+        caller_conversation_id: ConversationId,
+        now_unix: i64,
+    ) -> Self {
+        Self {
+            db,
+            caller_trust: caller_trust.into(),
+            caller_conversation_id,
+            can_spawn: true,
+            clock_now_unix: now_unix,
+            plan_wait: std::time::Duration::ZERO,
         }
     }
 
@@ -796,6 +881,7 @@ impl DbResearchApi {
             caller_conversation_id,
             can_spawn: false,
             clock_now_unix: now_unix,
+            plan_wait: DEFAULT_PLAN_WAIT,
         }
     }
 
@@ -849,7 +935,29 @@ impl ResearchApi for DbResearchApi {
         .await
         .map_err(|e| ApiError::Storage(format!("join: {e}")))?
         .map_err(|e| ApiError::Storage(e.to_string()))?;
-        Ok(row_to_view(&row))
+
+        // 2026-05-03 (rev 6): wait synchronously for the planner
+        // phase to settle before returning. Without this, the agent
+        // call site sees a `pending` row, ends its turn, and the
+        // operator gets nothing back in chat — even when the
+        // planner produces a clarification question. By blocking
+        // through the planner we can return either a planned-or-
+        // running view (agent says "started research with this
+        // plan") OR an awaiting_input view (agent reads
+        // clarification_question and relays it).
+        //
+        // The supervisor still owns the job — we just poll the row
+        // it's working on. A bounded timeout keeps the tool turn
+        // from hanging indefinitely if the planner is wedged or the
+        // inference backend is down; on timeout the agent gets the
+        // pending row and falls back to the legacy "I started it,
+        // I'll let you know" path.
+        let waited = if self.plan_wait.is_zero() {
+            None
+        } else {
+            wait_for_plan_phase_settle(&self.db, &id, self.plan_wait).await
+        };
+        Ok(row_to_view(&waited.unwrap_or(row)))
     }
 
     async fn status(&self, job_id: &str) -> Result<Option<ResearchJobView>, ApiError> {
