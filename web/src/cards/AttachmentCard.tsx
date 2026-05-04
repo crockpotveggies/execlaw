@@ -11,6 +11,8 @@
 // email — those transport the file out-of-band; the web channel
 // surfaces it as this chip.
 
+import { useContext } from "react";
+import { AuthContext } from "../auth/AuthContext";
 import { registerCardRenderer, type CardRendererProps } from "./CardRenderer";
 
 interface AttachmentDetails {
@@ -58,15 +60,44 @@ function iconForMime(mime?: string): string {
 }
 
 export function AttachmentCard({ card }: CardRendererProps) {
+    // Read AuthContext directly (instead of via the standard
+    // `useAuth()` hook) so this renderer doesn't throw in test
+    // environments that mount cards without an AuthProvider.
+    // Production always has the provider — `null` only happens
+    // in unit tests that focus on the chip's visual behaviour.
+    const auth = useContext(AuthContext);
     const details = readDetails(card.details);
     // Prefer the URL the server emitted (`/api/attachments/<id>`).
     // Fallback constructs it from `attachment_id` so older cards
     // that pre-date the field still render a working button.
-    const url =
+    const baseUrl =
         details?.download_url ??
         (details?.attachment_id
             ? `/api/attachments/${details.attachment_id}`
             : null);
+    // 2026-05-04: append `?access_token=<jwt>` so the
+    // browser's link navigation authenticates. Browsers don't
+    // carry the Authorization header on `<a download href>`
+    // requests, so without this the streaming-attachment endpoint
+    // returns 401 even though the operator is signed in. The
+    // server's AuthedUser extractor reads `?access_token=…` as a
+    // fallback to the Bearer header for exactly this case.
+    //
+    // Token comes from accessTokenRef via getAccessToken — a
+    // straight ref read, no React re-render dependency. The href
+    // updates on the next render after a token refresh; if a
+    // user clicks during the brief window between expiry and
+    // refresh the request 401s and the chip surfaces the error
+    // (acceptable — same shape as any other expired-token
+    // request).
+    const token = auth?.getAccessToken() ?? null;
+    const url = baseUrl
+        ? token
+            ? `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}access_token=${encodeURIComponent(
+                  token,
+              )}`
+            : baseUrl
+        : null;
     const filename = details?.filename ?? card.title ?? "attachment";
     const sizeLabel = formatBytes(details?.byte_size);
     const caption = details?.caption ?? null;

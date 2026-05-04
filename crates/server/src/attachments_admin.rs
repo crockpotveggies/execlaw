@@ -400,6 +400,66 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// 2026-05-04 regression: the `<a download>` link in the
+    /// SPA's AttachmentCard can't carry an Authorization header
+    /// (browsers don't propagate it on link navigations). Fix is
+    /// to accept `?access_token=…` as a fallback. Asserts the
+    /// query-param path works end-to-end against the actual route.
+    #[tokio::test]
+    async fn get_attachment_accepts_access_token_query_param() {
+        let state = test_app_state();
+        let dir = TempDir::new().unwrap();
+        let cid = seed_conv(&state, "c-q");
+        let (att_id, _path) = seed_attachment(&state, &cid, &dir);
+        let app = build_router(state);
+        let tok = setup_controller_token(&app).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/attachments/{att_id}?access_token={tok}"))
+                    // Deliberately NO Authorization header — the
+                    // whole point is that the query param works
+                    // alone.
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        assert!(bytes.starts_with(b"%PDF-"));
+    }
+
+    #[tokio::test]
+    async fn get_attachment_rejects_invalid_access_token_query_param() {
+        // Asserts the query param doesn't bypass validation —
+        // an arbitrary string isn't enough; the JWT signature
+        // still has to verify.
+        let state = test_app_state();
+        let dir = TempDir::new().unwrap();
+        let cid = seed_conv(&state, "c-bad");
+        let (att_id, _path) = seed_attachment(&state, &cid, &dir);
+        let app = build_router(state);
+        // Invoke setup so the JwtSigner state matches production
+        // (test_app_state() generates a fresh signer; setup just
+        // mints an unrelated token we ignore).
+        let _ = setup_controller_token(&app).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/attachments/{att_id}?access_token=not-a-real-jwt"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[test]
     fn sanitize_filename_replaces_quote_backslash_and_control_chars() {
         assert_eq!(sanitize_filename("ok.pdf"), "ok.pdf");

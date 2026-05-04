@@ -9,6 +9,7 @@
 import { describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { AttachmentCard } from "../cards/AttachmentCard";
+import { AuthContext } from "../auth/AuthContext";
 import { getCardRenderer } from "../cards/CardRenderer";
 import type { Card } from "../cards/types";
 
@@ -69,6 +70,69 @@ describe("AttachmentCard renderer", () => {
         ) as HTMLAnchorElement;
         expect(link.getAttribute("href")).toBe("/api/attachments/att-9");
         expect(link.getAttribute("download")).toBe("report.pdf");
+    });
+
+    /// 2026-05-04 regression: clicking Download used to 401
+    /// because browsers don't carry the Authorization header on
+    /// `<a download>` link navigations. Fix: append the
+    /// operator's current JWT as `?access_token=…` so the
+    /// server's AuthedUser extractor can read it from the query
+    /// string (it falls back there when the header is absent).
+    it("appends ?access_token=<jwt> to the download href when an AuthProvider is mounted", () => {
+        const fakeAuth = {
+            // Only the methods this test path uses; cast to the
+            // full type so the consumer doesn't need every field.
+            getAccessToken: () => "header.payload.signature",
+        } as unknown as React.ContextType<typeof AuthContext>;
+        render(
+            <AuthContext.Provider value={fakeAuth}>
+                <AttachmentCard card={makeAttachmentCard()} />
+            </AuthContext.Provider>,
+        );
+        const link = screen.getByTestId(
+            "card-attachment-download",
+        ) as HTMLAnchorElement;
+        const href = link.getAttribute("href") ?? "";
+        expect(href).toContain("/api/attachments/att-9");
+        expect(href).toContain("access_token=header.payload.signature");
+    });
+
+    it("preserves existing query strings when appending the token (uses & separator)", () => {
+        const fakeAuth = {
+            getAccessToken: () => "abc.def.ghi",
+        } as unknown as React.ContextType<typeof AuthContext>;
+        const card = makeAttachmentCard({
+            details: {
+                attachment_id: "att-9",
+                filename: "report.pdf",
+                mime_type: "application/pdf",
+                // download_url already has a query string.
+                download_url: "/api/attachments/att-9?disposition=inline",
+            },
+        });
+        render(
+            <AuthContext.Provider value={fakeAuth}>
+                <AttachmentCard card={card} />
+            </AuthContext.Provider>,
+        );
+        const link = screen.getByTestId(
+            "card-attachment-download",
+        ) as HTMLAnchorElement;
+        const href = link.getAttribute("href") ?? "";
+        expect(href).toContain("disposition=inline");
+        expect(href).toContain("&access_token=abc.def.ghi");
+    });
+
+    it("renders the bare URL when no AuthProvider is mounted (test-environment safety)", () => {
+        // Production always has a provider; tests sometimes don't.
+        // The renderer must not throw and must produce a navigable
+        // URL even without a token (the click 401s, but the chip
+        // renders).
+        render(<AttachmentCard card={makeAttachmentCard()} />);
+        const link = screen.getByTestId(
+            "card-attachment-download",
+        ) as HTMLAnchorElement;
+        expect(link.getAttribute("href")).toBe("/api/attachments/att-9");
     });
 
     it("falls back to deriving the URL from attachment_id if download_url missing", () => {

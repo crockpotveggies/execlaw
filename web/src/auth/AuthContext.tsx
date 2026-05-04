@@ -62,7 +62,7 @@ const initialState: AuthState = {
     tokens: null,
 };
 
-const AuthContext = createContext<AuthContextValue | null>(null);
+export const AuthContext = createContext<AuthContextValue | null>(null);
 
 /** Fallback access-token TTL used only when the JWT can't be parsed
  *  (malformed token, missing `exp` claim). The actual schedule is
