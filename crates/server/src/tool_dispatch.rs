@@ -271,12 +271,16 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             ctx.web_fetch = Some(Arc::new(HttpWebFetchApi::new()));
         }
         if needs_search {
-            // Default provider is DuckDuckGo. The forthcoming
-            // Settings → Search page will let operators pick a
-            // different provider; the dispatcher will read that
-            // selection and swap impls here without the tool body
-            // needing to change.
-            ctx.search = Some(Arc::new(DuckDuckGoSearchApi::new()));
+            // 2026-05-04 (rev 9): the dispatcher used to hard-code
+            // DuckDuckGo here. With config_search_providers + the
+            // resolver landing, the active provider is resolved
+            // from DB at every dispatch — the operator can swap
+            // providers via Settings → Search without restart.
+            // Resolver always returns SOMETHING (falls back to
+            // DDG on error), so this can never produce None.
+            ctx.search = Some(crate::search_resolver::resolve_active_provider(
+                &self.host.db().clone(),
+            ));
         }
         if needs_subagent {
             if let Some((client, model)) = self.inference.as_ref() {

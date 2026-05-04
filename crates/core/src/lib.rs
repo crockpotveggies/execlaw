@@ -44,6 +44,7 @@ pub mod principal_groups;
 pub mod refresh_tokens;
 pub mod research;
 pub mod retention;
+pub mod search_providers;
 pub mod routine_run_retention;
 pub mod routines;
 pub mod skills_config;

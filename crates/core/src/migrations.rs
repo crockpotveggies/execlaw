@@ -187,6 +187,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "transport-bindings",
         sql: include_str!("../migrations/0032_transport_bindings.sql"),
     },
+    Migration {
+        id: 33,
+        name: "search-providers",
+        sql: include_str!("../migrations/0033_search_providers.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]

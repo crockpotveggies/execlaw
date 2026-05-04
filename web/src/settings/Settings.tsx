@@ -28,6 +28,7 @@ import { ToolsPage } from "./ToolsPage";
 import { McpServersPage } from "./McpServersPage";
 import { RunnersPage } from "./RunnersPage";
 import { ResearchPage } from "./ResearchPage";
+import { SearchPage } from "./SearchPage";
 import { PersonalityPage } from "./PersonalityPage";
 import { AlertsPage } from "./AlertsPage";
 import { TrustPolicyPage } from "./TrustPolicyPage";
@@ -62,6 +63,7 @@ const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
         icon: "bi-binoculars",
         label: "Research",
     },
+    { to: "/settings/search", icon: "bi-search", label: "Search" },
     { to: "/settings/plugins", icon: "bi-plug", label: "Plugins" },
     { to: "/settings/tools", icon: "bi-wrench-adjustable", label: "Tools" },
     { to: "/settings/mcp", icon: "bi-broadcast", label: "MCP" },
@@ -183,6 +185,7 @@ export function Settings() {
                             element={<Navigate to="/routines" replace />}
                         />
                         <Route path="research" element={<ResearchPage />} />
+                        <Route path="search" element={<SearchPage />} />
                         <Route path="plugins" element={<PluginsPage />} />
                         <Route
                             path="plugins/:plugin_id"

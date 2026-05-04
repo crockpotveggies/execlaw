@@ -722,6 +722,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::settings_general::settings_router())
         .merge(crate::factory_reset::factory_reset_router())
         .merge(crate::settings_research::settings_research_router())
+        .merge(crate::settings_search::settings_search_router())
         .merge(crate::research_admin::research_admin_router())
         .merge(crate::oauth_admin::oauth_admin_router())
         .merge(crate::setup_preflight::setup_preflight_router())

@@ -2525,3 +2525,104 @@ export async function disconnectOauth(
         tokenAccessor,
     );
 }
+
+
+// ============================================================
+// Settings → Search (search-provider registry)
+// ============================================================
+
+export interface SearchProviderView {
+    kind: string;
+    display_name: string;
+    enabled: boolean;
+    is_default: boolean;
+    /// Per-kind config object. Shape varies by `kind`:
+    ///   * `duckduckgo` → `{}`
+    ///   * `searxng`    → `{ base_url: string }`
+    ///   * `brave`      → `{ api_key: string }`
+    config: Record<string, unknown>;
+    created_at: number;
+    updated_at: number;
+}
+
+export interface ListSearchProvidersResponse {
+    providers: SearchProviderView[];
+}
+
+export interface UpsertSearchProviderRequest {
+    kind: string;
+    enabled: boolean;
+    is_default: boolean;
+    config: Record<string, unknown>;
+}
+
+export interface SearchTestRequest {
+    query: string;
+}
+
+export interface SearchTestHit {
+    title: string;
+    url: string;
+    snippet: string | null;
+}
+
+export interface SearchTestResponse {
+    provider_id: string;
+    results: SearchTestHit[];
+    elapsed_ms: number;
+}
+
+export async function listSearchProviders(
+    tokenAccessor: () => string | null,
+): Promise<ListSearchProvidersResponse> {
+    return apiFetch<ListSearchProvidersResponse>(
+        "/api/admin/search/providers",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function upsertSearchProvider(
+    req: UpsertSearchProviderRequest,
+    tokenAccessor: () => string | null,
+): Promise<SearchProviderView> {
+    return apiFetch<SearchProviderView>(
+        "/api/admin/search/providers",
+        { method: "POST", body: req },
+        tokenAccessor,
+    );
+}
+
+export async function deleteSearchProvider(
+    kind: string,
+    tokenAccessor: () => string | null,
+): Promise<void> {
+    await apiFetch<unknown>(
+        `/api/admin/search/providers/${encodeURIComponent(kind)}`,
+        { method: "DELETE" },
+        tokenAccessor,
+    );
+}
+
+export async function setDefaultSearchProvider(
+    kind: string,
+    tokenAccessor: () => string | null,
+): Promise<SearchProviderView> {
+    return apiFetch<SearchProviderView>(
+        "/api/admin/search/providers/default",
+        { method: "POST", body: { kind } },
+        tokenAccessor,
+    );
+}
+
+export async function testSearchProvider(
+    kind: string,
+    query: string,
+    tokenAccessor: () => string | null,
+): Promise<SearchTestResponse> {
+    return apiFetch<SearchTestResponse>(
+        `/api/admin/search/providers/${encodeURIComponent(kind)}/test`,
+        { method: "POST", body: { query } },
+        tokenAccessor,
+    );
+}
