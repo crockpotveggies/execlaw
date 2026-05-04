@@ -21,6 +21,7 @@
 //! [research handoff doc]: ../../../docs/handoffs/2026-04-29-research-subsystem.md
 
 pub mod gather;
+pub mod readability_extract;
 pub mod retention;
 pub mod runner;
 pub mod supervisor;

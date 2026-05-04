@@ -30,6 +30,7 @@
 
 use crate::cards::{CardEmitError, progress_card_and_broadcast};
 use crate::events::EventBus;
+use crate::research::readability_extract::{extract_readable_text, ExtractionOutcome};
 use crate::research::workspace::{ResearchWorkspace, WorkspaceError};
 use execlaw_core::Database;
 use execlaw_core::cards::{CardProgressedPayload, CardState};
@@ -292,7 +293,35 @@ async fn gather_one(
         }
         match deps.fetch.get(&hit.url).await {
             Ok(resp) => {
-                bodies.push(truncate_body(&resp.body, BODY_TRUNCATE_PER_URL));
+                // 2026-05-03 (rev 5): run the fetched body through
+                // dom_smoothie's Readability port to strip nav /
+                // sidebar / ads / footer chrome BEFORE we hand the
+                // text to the subagent. Previously we just truncated
+                // raw HTML to 4 KB, which meant the subagent often
+                // got 60% chrome and 40% content — the extraction
+                // quality was the actual bottleneck on report
+                // quality. Readability is CPU-bound (~10-50 ms per
+                // page), so it runs on a blocking thread to keep
+                // the async runtime responsive.
+                //
+                // Falls back to the raw-truncate path if Readability
+                // can't find an article (some pages are SPA shells,
+                // wikis-with-no-main-content, redirect pages).
+                let url_for_readability = resp.final_url.clone();
+                let body_for_readability = resp.body.clone();
+                let extracted = tokio::task::spawn_blocking(move || {
+                    extract_readable_text(
+                        &body_for_readability,
+                        Some(&url_for_readability),
+                        BODY_TRUNCATE_PER_URL,
+                    )
+                })
+                .await
+                .unwrap_or(ExtractionOutcome::Fallback {
+                    text: truncate_body(&resp.body, BODY_TRUNCATE_PER_URL),
+                    reason: "extraction task panicked".into(),
+                });
+                bodies.push(extracted.into_text());
                 sources.push(ResearchSource {
                     url: resp.final_url,
                     title: Some(hit.title.clone()),

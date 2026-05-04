@@ -274,6 +274,74 @@ fn bench_runner_frame_codec(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// 2026-05-03 — deep-research web-tooling hot paths.
+//
+// Two new benches lock in the perf budget on the gather phase's
+// per-page CPU work after the rev-5 swap from regex+truncate to
+// scraper+dom_smoothie. The pre-existing implementations were
+// chosen partly for their constant-time character; the new ones
+// are richer but still need to fit inside a per-URL slice of the
+// gather worker's wall budget.
+//
+// Budgets:
+//   * research/parse_ddg_html — < 5 ms per result page (gather
+//     calls it once per sub-query; with parallel_workers=3 a
+//     50ms regression here costs the whole job 150 ms+).
+//   * research/extract_readable_text — < 50 ms per typical
+//     article page (gather runs this from spawn_blocking, but
+//     a regression past ~100 ms starts compounding across
+//     parallel workers + the per-job page cap).
+// ---------------------------------------------------------------------------
+
+fn bench_research_parse_ddg_html(c: &mut Criterion) {
+    use execlaw_server::tool_apis_search::parse_ddg_html;
+    // Use the live-capture fixture so the bench reflects real DDG
+    // output, not a synthetic toy. ~29 KB, ~10 result blocks —
+    // representative of a typical gather sub-query response.
+    let html = include_str!("../src/ddg_live_fixture.html");
+    c.bench_function("research/parse_ddg_html_live_capture", |b| {
+        b.iter(|| {
+            let results = parse_ddg_html(black_box(html), black_box(10));
+            black_box(results);
+        })
+    });
+}
+
+fn bench_research_extract_readable_text(c: &mut Criterion) {
+    use execlaw_server::research::readability_extract::extract_readable_text;
+    // Synthetic article: nav + sidebar + article body + footer.
+    // Roughly the shape of a typical garden / news / blog page.
+    // We deliberately don't pull a multi-MB capture — the bench
+    // measures the steady-state per-article cost, not the input-
+    // cap defense (which has its own test).
+    let html = r##"<!DOCTYPE html><html><head><title>Bench Article</title></head><body>
+<nav><a>Home</a> | <a>About</a> | <a>Subscribe</a></nav>
+<aside><h3>Popular</h3><ul><li>Item 1</li><li>Item 2</li></ul></aside>
+<article>
+  <h1>Long-Form Article For Benchmark</h1>
+  <p>This is a paragraph of moderate length to give Readability some content to score.
+     It contains enough text to clear the degenerate-article threshold and exercise
+     the scoring + cleaning passes.</p>
+  <p>A second paragraph keeps the score above the noise floor and lets the cleaning
+     pass do meaningful work walking the DOM.</p>
+  <p>A third paragraph for good measure — three paragraphs is roughly the lower bound
+     where Readability stops bailing out as degenerate.</p>
+</article>
+<footer><p>Footer chrome to be stripped.</p></footer>
+</body></html>"##;
+    c.bench_function("research/extract_readable_text_typical_article", |b| {
+        b.iter(|| {
+            let outcome = extract_readable_text(
+                black_box(html),
+                black_box(Some("https://example.com/x")),
+                black_box(4_000),
+            );
+            black_box(outcome);
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_jwt_access,
@@ -283,5 +351,7 @@ criterion_group!(
     bench_runner_principal_group_hash,
     bench_runner_supervisor_lookup,
     bench_runner_frame_codec,
+    bench_research_parse_ddg_html,
+    bench_research_extract_readable_text,
 );
 criterion_main!(benches);

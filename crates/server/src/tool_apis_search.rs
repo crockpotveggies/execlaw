@@ -19,7 +19,7 @@
 
 use async_trait::async_trait;
 use execlaw_core::tool::{ApiError, SearchResult, WebSearchApi};
-use regex::Regex;
+use scraper::{Html, Selector};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -61,33 +61,58 @@ impl Default for DuckDuckGoSearchApi {
     }
 }
 
-/// Compile-once regex for the DDG result block. Captures:
-///   1. the result-link redirect href (so we can recover the real URL
-///      from the `uddg=` param)
-///   2. the link text (raw HTML; we strip tags afterward)
-///   3. the snippet HTML (also raw)
-fn ddg_result_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        // (?s) — let `.` match newlines so the regex spans multi-line
-        // result blocks. Non-greedy on every capture so we don't leak
-        // across siblings.
-        Regex::new(
-            r#"(?s)<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?<a[^>]+class="result__snippet"[^>]*>(.*?)</a>"#,
-        )
-        .expect("ddg_result_regex literal is valid")
-    })
+/// Compile-once CSS selectors for the DDG result list. We address
+/// the result block once and pull title/url/snippet from descendants
+/// rather than relying on a single regex that requires the snippet
+/// to come AFTER the link in source order — DDG occasionally
+/// reorders or interleaves trackers between the link and the
+/// snippet, which broke the previous regex parser silently.
+///
+/// 2026-05-03 (rev 5): swapped from `regex::Regex` to `scraper`'s
+/// CSS-selector parser over `html5ever`. Robust to whitespace,
+/// reorderings, attribute changes, and most class-name drift; a
+/// future DDG markup tweak that does invalidate the selectors fails
+/// loud (the `parser_handles_live_2026_05_html_capture` regression
+/// test catches it before users do).
+fn ddg_selectors() -> &'static DdgSelectors {
+    static S: OnceLock<DdgSelectors> = OnceLock::new();
+    S.get_or_init(DdgSelectors::compile)
 }
 
-/// Strip `<...>` tags from a fragment and HTML-decode the few
-/// entities DDG actually emits. Good enough for snippet-quality
-/// text; not a general-purpose HTML-to-text converter.
-fn strip_tags_and_decode(s: &str) -> String {
-    static TAG_RE: OnceLock<Regex> = OnceLock::new();
-    let tag_re = TAG_RE.get_or_init(|| Regex::new("<[^>]*>").unwrap());
-    let no_tags = tag_re.replace_all(s, "");
-    no_tags
-        .replace("&amp;", "&")
+struct DdgSelectors {
+    /// Each result block lives under `div.result`. We anchor on the
+    /// block so child queries are scoped — a `result__snippet` from
+    /// a different block can't bleed in.
+    result: Selector,
+    /// Link + title text live in `a.result__a` (href + inner text).
+    link: Selector,
+    /// Snippet text. DDG's HTML serves this as `a.result__snippet`
+    /// today but also occasionally as a `<div>` with the same class
+    /// in newer captures — selecting on the class alone keeps both
+    /// shapes working.
+    snippet: Selector,
+}
+
+impl DdgSelectors {
+    fn compile() -> Self {
+        Self {
+            // `Selector::parse` returns a Result; the literals here
+            // are guaranteed-valid CSS so the unwrap is safe. Test
+            // coverage in this module catches any future typo.
+            result: Selector::parse("div.result").expect("static .result selector"),
+            link: Selector::parse("a.result__a").expect("static a.result__a selector"),
+            snippet: Selector::parse(".result__snippet").expect("static .result__snippet selector"),
+        }
+    }
+}
+
+/// Decode the few entities DDG emits in plain text fragments. The
+/// CSS selector path returns inner text via `Element.text()` which
+/// already collapses tags but not entities — the parser feeds them
+/// through unchanged, so we decode the small fixed set DDG produces
+/// here to keep the result clean.
+fn decode_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
@@ -96,6 +121,27 @@ fn strip_tags_and_decode(s: &str) -> String {
         .replace("&nbsp;", " ")
         .trim()
         .to_owned()
+}
+
+/// Collapse internal whitespace runs in a text fragment to single
+/// spaces. `scraper`'s `text()` iterator already returns nodes
+/// trimmed of nothing — runs of newlines / tabs from indented HTML
+/// become noise in the snippet field if we don't squeeze them.
+fn squeeze_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_ws = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !last_was_ws {
+                out.push(' ');
+                last_was_ws = true;
+            }
+        } else {
+            out.push(ch);
+            last_was_ws = false;
+        }
+    }
+    out.trim().to_owned()
 }
 
 /// Pull the real URL out of a DDG redirect href. DDG wraps result
@@ -155,24 +201,47 @@ fn hex_nibble(b: u8) -> Option<u8> {
 /// Parse DDG HTML into search results. Bounded by `max_results`.
 /// Public-but-doc-hidden so tests in this module can drive it
 /// against canned HTML without hitting the network.
+///
+/// Implementation: scoped CSS-selector walk over `html5ever`'s DOM
+/// (via the `scraper` crate). For each `div.result` block we pull
+/// the first `a.result__a` (title + href) and the first
+/// `.result__snippet` (snippet text). Blocks missing a usable href
+/// or title are skipped silently.
 #[doc(hidden)]
 pub fn parse_ddg_html(html: &str, max_results: usize) -> Vec<SearchResult> {
+    let document = Html::parse_document(html);
+    let sel = ddg_selectors();
     let mut out = Vec::with_capacity(max_results);
-    for caps in ddg_result_regex().captures_iter(html) {
+    for result_block in document.select(&sel.result) {
         if out.len() >= max_results {
             break;
         }
-        let raw_href = &caps[1];
-        let title = strip_tags_and_decode(&caps[2]);
-        let snippet = strip_tags_and_decode(&caps[3]);
-        let url = unwrap_ddg_redirect(raw_href);
-        if url.is_empty() || title.is_empty() {
+        let Some(link) = result_block.select(&sel.link).next() else {
+            continue;
+        };
+        let raw_href = match link.value().attr("href") {
+            Some(h) => h,
+            None => continue,
+        };
+        let title = decode_entities(&squeeze_whitespace(
+            &link.text().collect::<String>(),
+        ));
+        if title.is_empty() {
             continue;
         }
+        let url = unwrap_ddg_redirect(raw_href);
+        if url.is_empty() {
+            continue;
+        }
+        let snippet = result_block
+            .select(&sel.snippet)
+            .next()
+            .map(|s| decode_entities(&squeeze_whitespace(&s.text().collect::<String>())))
+            .filter(|s| !s.is_empty());
         out.push(SearchResult {
             title,
             url,
-            snippet: if snippet.is_empty() { None } else { Some(snippet) },
+            snippet,
         });
     }
     out
@@ -258,6 +327,47 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    /// Drift simulation: exercise variants the regex parser would
+    /// have silently swallowed but that the scraper-based parser
+    /// must handle.
+    ///   1. Snippet served as `<div class="result__snippet">` (DDG
+    ///      has occasionally swapped `<a>`-shaped snippets for
+    ///      div-shaped ones in newer captures).
+    ///   2. Trackers / `<span>`s interleaved between the link and
+    ///      the snippet (would break the regex's `.*?` chain).
+    ///   3. Extra attributes in arbitrary order on the link element.
+    #[test]
+    fn parser_handles_markup_drift_variants() {
+        let html = r##"
+<html><body>
+<div class="result">
+  <span class="tracker"><img src="t.gif"/></span>
+  <a class="result__a" rel="nofollow" data-test="x" href="https://example.com/a">Title A</a>
+  <span class="meta">3 days ago</span>
+  <div class="result__snippet">Snippet for A served as a div</div>
+</div>
+<div class="result">
+  <a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fb&amp;rut=zz" class="result__a">Title B</a>
+  <a class="result__snippet" href="x">Snippet for B served as an anchor</a>
+</div>
+</body></html>
+"##;
+        let results = parse_ddg_html(html, 10);
+        assert_eq!(results.len(), 2, "drift variants must both parse");
+        assert_eq!(results[0].title, "Title A");
+        assert_eq!(results[0].url, "https://example.com/a");
+        assert_eq!(
+            results[0].snippet.as_deref(),
+            Some("Snippet for A served as a div"),
+        );
+        assert_eq!(results[1].title, "Title B");
+        assert_eq!(results[1].url, "https://example.com/b");
+        assert_eq!(
+            results[1].snippet.as_deref(),
+            Some("Snippet for B served as an anchor"),
+        );
+    }
+
     /// Regression: parse a real DDG response (captured 2026-05-03)
     /// to catch HTML structure drift early. The old parser regex
     /// expected the snippet to be inside an `<a class="result__snippet">`
@@ -296,12 +406,29 @@ mod tests {
     }
 
     #[test]
-    fn strip_tags_handles_common_html_entities() {
+    fn decode_entities_handles_common_html_entities() {
+        // The new scraper-based parser pulls inner text via
+        // `Element.text()` which already drops tag markup;
+        // `decode_entities` is the post-processing step that
+        // turns the few entities DDG emits back into their literal
+        // characters. The old `strip_tags_and_decode` helper went
+        // away with the regex parser.
         assert_eq!(
-            strip_tags_and_decode("Tom &amp; Jerry &lt;tag&gt;"),
+            decode_entities("Tom &amp; Jerry &lt;tag&gt;"),
             "Tom & Jerry <tag>"
         );
-        assert_eq!(strip_tags_and_decode("<b>bold</b> text"), "bold text");
+        // Bare entities round-trip too.
+        assert_eq!(decode_entities("Brian&#39;s page"), "Brian's page");
+        assert_eq!(decode_entities("a &nbsp; b"), "a   b");
+    }
+
+    #[test]
+    fn squeeze_whitespace_collapses_runs_of_indentation() {
+        assert_eq!(
+            squeeze_whitespace("  hello\n   world  \t\t"),
+            "hello world"
+        );
+        assert_eq!(squeeze_whitespace(""), "");
     }
 
     #[test]

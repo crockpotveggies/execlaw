@@ -63,6 +63,21 @@ reqwest = { workspace = true, default-features = false, features = ["json", "rus
 url.workspace = true
 regex.workspace = true
 
+# 2026-05-03 — deep-research gather quality fix.
+#   * `scraper` replaces the hand-rolled DDG result regex with a
+#     CSS-selector parser over `html5ever`. Robust to DDG markup
+#     drift (the regex broke silently the moment classes shifted);
+#     also gives us a clean foundation for adding other search
+#     providers + page-structure inspection.
+#   * `dom_smoothie` is a maintained Rust port of Mozilla's
+#     Readability — it strips nav / sidebar / ads / footer chrome
+#     from a fetched HTML page and returns the clean article body.
+#     Replaces the previous `truncate_body` (which fed the subagent
+#     4 KB of mostly-chrome HTML soup, killing extraction quality).
+#     The original `readability` crate is unmaintained as of 2026.
+scraper = "0.21"
+dom_smoothie = "0.10"
+
 utoipa.workspace = true
 utoipa-axum.workspace = true
 utoipa-swagger-ui.workspace = true
