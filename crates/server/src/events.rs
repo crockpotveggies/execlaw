@@ -102,11 +102,12 @@ pub enum UiEvent {
     /// Fired by the sidecar supervisor when a supervised sidecar's
     /// observed status changes (Stopped → Starting → Healthy →
     /// CrashLooping → ...). The SPA's sidecars page uses these to
-    /// keep its row badges live without polling. `status` is the
-    /// `Debug` rendering of `ServiceStatus` so a future
+    /// keep its row badges live without polling. `name` is the
+    /// sidecar's globally-unique service-name identifier; `status`
+    /// is the `Debug` rendering of `ServiceStatus` so a future
     /// CrashLooping variant carries `restart_count` along for free.
     SidecarStatusChanged {
-        channel: String,
+        name: String,
         status: String,
     },
 

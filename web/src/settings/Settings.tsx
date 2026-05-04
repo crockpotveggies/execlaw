@@ -27,6 +27,7 @@ import { UserPage } from "./UserPage";
 import { ToolsPage } from "./ToolsPage";
 import { McpServersPage } from "./McpServersPage";
 import { RunnersPage } from "./RunnersPage";
+import { SidecarsPage } from "./SidecarsPage";
 import { ResearchPage } from "./ResearchPage";
 import { SearchPage } from "./SearchPage";
 import { PersonalityPage } from "./PersonalityPage";
@@ -70,6 +71,11 @@ const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     // Hardware now lives at the bottom of the Backends page.
     { to: "/settings/backends", icon: "bi-cpu-fill", label: "Backends" },
     { to: "/settings/runners", icon: "bi-fire", label: "Runners" },
+    // Sidecars — companion containers the sidecar supervisor manages
+    // (signal-cli, WhatsApp bridges, future OCR / ffmpeg helpers).
+    // Sits next to Runners because both are container-supervisor surfaces;
+    // operators tend to reach for them in the same diagnosis sessions.
+    { to: "/settings/sidecars", icon: "bi-boxes", label: "Sidecars" },
     // Contacts is the curated address-book view, Principals is the
     // "everything else" view (controllers, delegated bots, blocked).
     { to: "/settings/contacts", icon: "bi-person-lines-fill", label: "Contacts" },
@@ -207,6 +213,7 @@ export function Settings() {
                         <Route path="mcp" element={<McpServersPage />} />
                         <Route path="backends" element={<BackendsPage />} />
                         <Route path="runners" element={<RunnersPage />} />
+                        <Route path="sidecars" element={<SidecarsPage />} />
                         <Route path="contacts" element={<ContactsPage />} />
                         <Route path="principals" element={<PrincipalsPage />} />
                         <Route path="trust-policy" element={<TrustPolicyPage />} />

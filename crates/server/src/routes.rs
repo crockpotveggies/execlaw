@@ -714,6 +714,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::routines::routines_router())
         .merge(crate::personality::personality_router())
         .merge(crate::runners_admin::runners_admin_router())
+        .merge(crate::sidecars_admin::sidecars_admin_router())
         .merge(crate::users::users_router())
         .merge(crate::webauthn::webauthn_router())
         .merge(crate::tools_admin::tools_admin_router())
@@ -806,6 +807,7 @@ pub fn test_app_state() -> AppState {
         // routes report 503 if exercised. Tests that DO want a
         // mock-backed supervisor construct AppState manually.
         backend_supervisor: None,
+        sidecar_supervisor: None,
         voice_sessions: crate::voice_session::VoiceSessionRegistry::new(events.clone()),
         // Test fixtures use mock STT/TTS factories — production
         // wires real Whisper + Kokoro clients via

@@ -121,29 +121,28 @@ pub struct RegisteredAlertSource {
 
 /// A supervised sidecar — registered when a plugin's `[[services]]`
 /// entry declares a `[services.sidecar]` table. The sidecar supervisor
-/// reads this to learn which channels need a managed container, and
-/// it learns the RPC port + healthcheck path the supervisor probes.
+/// reads this to learn which companion containers need managing.
+///
+/// The sidecar's identity is the parent service's `name`, which the
+/// hook registry enforces is globally unique across installed
+/// plugins. (Within-plugin uniqueness is caught at manifest-parse
+/// time; cross-plugin collisions surface here.) Forcing global
+/// uniqueness keeps docker container names distinct without
+/// composite-key surgery in the supervisor.
 ///
 /// Cheap to clone: every field is a small string or scalar.
 #[derive(Debug, Clone)]
 pub struct RegisteredSidecar {
     /// Owning plugin id — used by `disable` to drop sidecars when a
     /// plugin is uninstalled, AND to compose the supervisor's stable
-    /// container name (`execlaw-sidecar-<plugin>-<channel>`) so two
-    /// distinct plugins claiming the same channel can't collide on
-    /// the docker side (the manifest validator already rejects
-    /// duplicates within one plugin).
+    /// container name (`execlaw-sidecar-<plugin>-<name>`).
     pub plugin_id: String,
-    /// Manifest's `[[services]].name`. Echoed into the container
-    /// name and surfaced in operator-facing UI.
-    pub service_name: String,
+    /// Manifest's `[[services]].name`. The supervisor's primary key
+    /// — exactly one sidecar with this name may be registered at a
+    /// time across the whole control plane.
+    pub name: String,
     /// Container image reference, copied verbatim from the manifest.
     pub image: String,
-    /// Transport channel id ("signal", "whatsapp", ...). The
-    /// supervisor keys on this — exactly one sidecar per channel
-    /// may be enabled at a time. `enable` enforces this across
-    /// plugins (not just within one).
-    pub channel: String,
     /// Container port serving the sidecar's local RPC. The supervisor
     /// publishes this on a host port and probes the health path
     /// against it.
@@ -209,7 +208,7 @@ struct HookRegistryInner {
     /// whole control plane. The supervisor reads this; conflicts are
     /// rejected at `enable` time so the supervisor only ever sees
     /// well-formed state.
-    sidecars_by_channel: BTreeMap<String, RegisteredSidecar>,
+    sidecars_by_name: BTreeMap<String, RegisteredSidecar>,
     identity_providers: BTreeMap<String, RegisteredIdentityProvider>,
     event_subs: HashMap<String, Vec<RegisteredEventSubscription>>,
     alert_sources: Vec<RegisteredAlertSource>,
@@ -283,17 +282,20 @@ impl HookRegistry {
                 t.transport_id, existing.plugin_id
             ));
         }
-        // Sidecars — at most one per channel across the whole control
-        // plane. Within-plugin duplicates were caught at parse time;
+        // Sidecars — at most one per name across the whole control
+        // plane. Within-plugin name dups were caught at parse time;
         // this check catches *cross-plugin* collisions (two plugins
-        // both wanting to be the Signal sidecar).
+        // both wanting to register a sidecar named "signal-cli", or
+        // both wanting an "ocr-worker"). Globally-unique names keep
+        // docker container names distinct without composite-key
+        // surgery in the supervisor.
         for s in &manifest.services {
-            if let Some(b) = &s.sidecar
-                && let Some(existing) = w.sidecars_by_channel.get(&b.channel)
+            if s.sidecar.is_some()
+                && let Some(existing) = w.sidecars_by_name.get(&s.name)
             {
                 return Err(format!(
-                    "sidecar channel '{}' is already registered by plugin '{}'",
-                    b.channel, existing.plugin_id,
+                    "sidecar name '{}' is already registered by plugin '{}'",
+                    s.name, existing.plugin_id,
                 ));
             }
         }
@@ -379,13 +381,12 @@ impl HookRegistry {
         }
         for s in &manifest.services {
             if let Some(b) = &s.sidecar {
-                w.sidecars_by_channel.insert(
-                    b.channel.clone(),
+                w.sidecars_by_name.insert(
+                    s.name.clone(),
                     RegisteredSidecar {
                         plugin_id: plugin_id.clone(),
-                        service_name: s.name.clone(),
+                        name: s.name.clone(),
                         image: s.image.clone(),
-                        channel: b.channel.clone(),
                         rpc_port: b.rpc_port,
                         rpc_health_path: b.rpc_health_path.clone(),
                     },
@@ -440,7 +441,7 @@ impl HookRegistry {
         w.tools_by_name.retain(|_, v| v.plugin_id != plugin_id);
         w.ui_panels_by_mount.retain(|_, v| v.plugin_id != plugin_id);
         w.transports_by_id.retain(|_, v| v.plugin_id != plugin_id);
-        w.sidecars_by_channel.retain(|_, v| v.plugin_id != plugin_id);
+        w.sidecars_by_name.retain(|_, v| v.plugin_id != plugin_id);
         w.identity_providers.remove(plugin_id);
         for subs in w.event_subs.values_mut() {
             subs.retain(|s| s.plugin_id != plugin_id);
@@ -549,15 +550,15 @@ impl HookRegistry {
         self.inner.read().unwrap().transports_by_id.get(id).cloned()
     }
 
-    /// Look up the sidecar registered for `channel`, if any. Returns
+    /// Look up the sidecar registered with `name`, if any. Returns
     /// a clone — the supervisor calls this on every reconcile tick
     /// so it pays the clone cost in exchange for a lock-free read.
-    pub fn sidecar(&self, channel: &str) -> Option<RegisteredSidecar> {
+    pub fn sidecar(&self, name: &str) -> Option<RegisteredSidecar> {
         self.inner
             .read()
             .unwrap()
-            .sidecars_by_channel
-            .get(channel)
+            .sidecars_by_name
+            .get(name)
             .cloned()
     }
 
@@ -569,7 +570,7 @@ impl HookRegistry {
         self.inner
             .read()
             .unwrap()
-            .sidecars_by_channel
+            .sidecars_by_name
             .values()
             .cloned()
             .collect()
@@ -813,7 +814,7 @@ latency = "low"
         assert!(reg.tool("a").is_some());
     }
 
-    fn manifest_with_sidecar(plugin_id: &str, channel: &str, port: u16) -> PluginManifest {
+    fn manifest_with_sidecar(plugin_id: &str, sidecar_name: &str, port: u16) -> PluginManifest {
         PluginManifest::parse(&format!(
             r#"
 [plugin]
@@ -822,11 +823,10 @@ name = "P"
 version = "0.1.0"
 
 [[services]]
-name = "{plugin_id}-sidecar"
-image = "execlaw/{plugin_id}-sidecar:0.1"
+name = "{sidecar_name}"
+image = "execlaw/{sidecar_name}:0.1"
 
 [services.sidecar]
-channel = "{channel}"
 rpc_port = {port}
 "#
         ))
@@ -836,36 +836,36 @@ rpc_port = {port}
     #[test]
     fn enable_registers_sidecar_service() {
         let reg = HookRegistry::new();
-        reg.enable(&manifest_with_sidecar("p-signal", "signal", 8080))
+        reg.enable(&manifest_with_sidecar("p-signal", "signal-cli", 8080))
             .unwrap();
-        let b = reg.sidecar("signal").expect("sidecar registered");
+        let b = reg.sidecar("signal-cli").expect("sidecar registered");
         assert_eq!(b.plugin_id, "p-signal");
-        assert_eq!(b.service_name, "p-signal-sidecar");
-        assert_eq!(b.image, "execlaw/p-signal-sidecar:0.1");
+        assert_eq!(b.name, "signal-cli");
+        assert_eq!(b.image, "execlaw/signal-cli:0.1");
         assert_eq!(b.rpc_port, 8080);
         // Default health path applied via the manifest default.
         assert_eq!(b.rpc_health_path, "/healthz");
     }
 
     #[test]
-    fn cross_plugin_sidecar_channel_collision_rejected() {
-        // Two distinct plugins both wanting to be the Signal sidecar
-        // — the supervisor would have no way to pick a winner, so
+    fn cross_plugin_sidecar_name_collision_rejected() {
+        // Two distinct plugins both wanting a sidecar named
+        // "signal-cli" — the supervisor would have no way to pick
+        // a winner (and docker container names would collide), so
         // refuse the second enable. The first plugin keeps its
-        // sidecar; the second isn't registered at all (atomic enable).
+        // sidecar; the second isn't registered at all.
         let reg = HookRegistry::new();
-        reg.enable(&manifest_with_sidecar("p-signal-a", "signal", 8080))
+        reg.enable(&manifest_with_sidecar("p-signal-a", "signal-cli", 8080))
             .unwrap();
         let err = reg
-            .enable(&manifest_with_sidecar("p-signal-b", "signal", 8081))
+            .enable(&manifest_with_sidecar("p-signal-b", "signal-cli", 8081))
             .unwrap_err();
         assert!(
-            err.contains("sidecar channel 'signal' is already registered"),
-            "expected channel-collision message, got: {err}",
+            err.contains("sidecar name 'signal-cli' is already registered"),
+            "expected name-collision message, got: {err}",
         );
         assert!(!reg.is_enabled("p-signal-b"));
-        // Original sidecar still owned by the first plugin.
-        let b = reg.sidecar("signal").unwrap();
+        let b = reg.sidecar("signal-cli").unwrap();
         assert_eq!(b.plugin_id, "p-signal-a");
         assert_eq!(b.rpc_port, 8080);
     }
@@ -873,16 +873,16 @@ rpc_port = {port}
     #[test]
     fn disable_drops_sidecar_for_owning_plugin() {
         let reg = HookRegistry::new();
-        reg.enable(&manifest_with_sidecar("p-signal", "signal", 8080))
+        reg.enable(&manifest_with_sidecar("p-signal", "signal-cli", 8080))
             .unwrap();
-        reg.enable(&manifest_with_sidecar("p-wa", "whatsapp", 8081))
+        reg.enable(&manifest_with_sidecar("p-wa", "whatsapp-bridge", 8081))
             .unwrap();
         reg.disable("p-signal");
         // Signal sidecar gone…
-        assert!(reg.sidecar("signal").is_none());
+        assert!(reg.sidecar("signal-cli").is_none());
         // …but WhatsApp sidecar survives. Important — disable must
         // not be over-broad.
-        let wa = reg.sidecar("whatsapp").expect("wa sidecar survives");
+        let wa = reg.sidecar("whatsapp-bridge").expect("wa sidecar survives");
         assert_eq!(wa.plugin_id, "p-wa");
     }
 
@@ -890,22 +890,22 @@ rpc_port = {port}
     fn all_sidecars_returns_stable_order_across_calls() {
         // BTreeMap order — useful for deterministic supervisor logs.
         let reg = HookRegistry::new();
-        reg.enable(&manifest_with_sidecar("p-z", "z-channel", 9000))
+        reg.enable(&manifest_with_sidecar("p-z", "z-sidecar", 9000))
             .unwrap();
-        reg.enable(&manifest_with_sidecar("p-a", "a-channel", 9001))
+        reg.enable(&manifest_with_sidecar("p-a", "a-sidecar", 9001))
             .unwrap();
         let names: Vec<String> = reg
             .all_sidecars()
             .into_iter()
-            .map(|b| b.channel)
+            .map(|b| b.name)
             .collect();
-        assert_eq!(names, vec!["a-channel", "z-channel"]);
+        assert_eq!(names, vec!["a-sidecar", "z-sidecar"]);
     }
 
     #[test]
     fn non_sidecar_service_does_not_register_in_sidecars_map() {
-        // Helper sidecar with no [services.sidecar] table — must
-        // NOT show up in the sidecars map.
+        // A helper service with no [services.sidecar] table is
+        // unsupervised — must NOT show up in the sidecars map.
         let m = PluginManifest::parse(
             r#"
 [plugin]
@@ -923,6 +923,20 @@ image = "x"
         reg.enable(&m).unwrap();
         assert!(reg.sidecar("ocr-worker").is_none());
         assert_eq!(reg.all_sidecars().len(), 0);
+    }
+
+    #[test]
+    fn ffmpeg_or_ocr_sidecar_registers_just_like_a_transport_one() {
+        // The simplification's whole point: the registry doesn't
+        // care that signal is a transport. A plugin shipping an
+        // ffmpeg pool with [services.sidecar] gets the same
+        // treatment.
+        let reg = HookRegistry::new();
+        reg.enable(&manifest_with_sidecar("p-ffmpeg", "ffmpeg-pool", 7000))
+            .unwrap();
+        let b = reg.sidecar("ffmpeg-pool").unwrap();
+        assert_eq!(b.name, "ffmpeg-pool");
+        assert_eq!(b.rpc_port, 7000);
     }
 
     /// All-or-nothing atomicity: if ONE tool from a manifest conflicts

@@ -55,6 +55,7 @@ pub mod runner_rpc;
 pub mod runner_spawn;
 pub mod runner_supervisor;
 pub mod sidecar_supervisor;
+pub mod sidecars_admin;
 pub mod runners_admin;
 pub mod settings_general;
 pub mod settings_research;

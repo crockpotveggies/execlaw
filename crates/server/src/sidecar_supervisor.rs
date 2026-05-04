@@ -11,7 +11,7 @@
 //!     containers (the agent loop).
 //!   * **`sidecar_supervisor`** *(this)* — owns Signal-cli /
 //!     WhatsApp-sidecar / Matrix-sidecar / ... sidecars. One container
-//!     per registered `channel`; `HookRegistry::all_sidecars` is the
+//!     per registered sidecar (`HookRegistry::all_sidecars` is the
 //!     source of truth for desired state.
 //!
 //! What's in scope **for Phase 2b**:
@@ -49,7 +49,7 @@ pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(5);
 /// `backend_supervisor::MAX_RESTART_ATTEMPTS`.
 pub const MAX_RESTART_ATTEMPTS: u32 = 5;
 
-/// Per-channel runtime state. Cheap to clone individual fields; the
+/// Per-sidecar runtime state. Cheap to clone individual fields; the
 /// container handle is owned and replaced on respawn.
 #[derive(Debug)]
 struct SidecarSlot {
@@ -62,7 +62,7 @@ struct SidecarSlot {
     /// and the next reconcile.
     handle: Option<ServiceHandle>,
     /// Stable host port assigned the first time we spawned a
-    /// container for this channel. Reused on every subsequent
+    /// container for this sidecar. Reused on every subsequent
     /// respawn (RPC-fail restart, drift respawn, post-crash loop)
     /// so the sidecar's URL stays stable across the supervisor's
     /// lifetime — matches the operator-facing "the supervisor
@@ -93,25 +93,29 @@ impl SidecarSlot {
 
     /// True if a manifest edit invalidated the running container —
     /// the supervisor must stop + respawn rather than try to
-    /// hot-update a `bollard` container.
+    /// hot-update a `bollard` container. Name+plugin_id changes
+    /// shouldn't actually reach this code path (the registry's key
+    /// would change, so the supervisor would see the slot as
+    /// orphaned + a new one as fresh) — included defensively.
     fn drift_from(&self, latest: &RegisteredSidecar) -> bool {
         self.registered.image != latest.image
             || self.registered.rpc_port != latest.rpc_port
             || self.registered.rpc_health_path != latest.rpc_health_path
-            || self.registered.service_name != latest.service_name
+            || self.registered.name != latest.name
             || self.registered.plugin_id != latest.plugin_id
     }
 }
 
-/// Read-only status snapshot for the future Sidecars admin page. One
-/// entry per registered channel; channels with no live container
-/// report `Stopped`. Plain struct so JSON serialisation stays
-/// boring.
+/// Read-only status snapshot for the Sidecars admin page. One entry
+/// per registered sidecar; sidecars with no live container report
+/// `Stopped`. Plain struct so JSON serialisation stays boring.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SidecarRuntimeStatus {
-    pub channel: String,
+    /// The sidecar's name — the manifest's `[[services]].name` for
+    /// the entry that carries `[services.sidecar]`. Globally unique
+    /// across enabled plugins; the supervisor's primary key.
+    pub name: String,
     pub plugin_id: String,
-    pub service_name: String,
     pub status: ServiceStatus,
     pub restart_attempts: u32,
     /// Loopback URL the supervisor would dispatch RPC against.
@@ -136,7 +140,7 @@ pub struct SidecarSupervisor {
     /// Host port pool start. The supervisor mints sequential ports
     /// starting from this value to avoid collisions with
     /// `backend_supervisor`'s 8101+ pool. Sidecars of distinct
-    /// channels get distinct stable ports; the assignment lives in
+    /// sidecars get distinct stable ports; the assignment lives in
     /// the `SidecarSlot` so a respawn keeps the same URL.
     next_host_port: Arc<Mutex<u16>>,
 }
@@ -191,12 +195,12 @@ impl SidecarSupervisor {
         self.kick.notify_one();
     }
 
-    /// Reset the per-channel restart counter. Operators call this
+    /// Reset the per-sidecar restart counter. Operators call this
     /// after fixing the underlying issue (image edit, secrets
     /// re-mount) so a parked-CrashLooping slot gets a fresh runway.
-    pub async fn reset_attempts(&self, channel: &str) {
+    pub async fn reset_attempts(&self, name: &str) {
         let mut slots = self.slots.lock().await;
-        if let Some(slot) = slots.get_mut(channel) {
+        if let Some(slot) = slots.get_mut(name) {
             slot.restart_attempts = 0;
             if matches!(slot.status, ServiceStatus::CrashLooping { .. }) {
                 slot.status = ServiceStatus::Stopped;
@@ -205,18 +209,18 @@ impl SidecarSupervisor {
         }
     }
 
-    /// Snapshot every channel's current state. Returns one entry per
-    /// channel **registered in the hook registry** — channels the
-    /// supervisor has never seen yet still show up as `Stopped` so
-    /// the SPA's sidecars page can render the row before the first
-    /// reconcile lands.
+    /// Snapshot every sidecar's current state. Returns one entry
+    /// per sidecar **registered in the hook registry** — sidecars
+    /// the supervisor has never reconciled yet still show up as
+    /// `Stopped` so the SPA's sidecars page can render the row
+    /// before the first reconcile lands.
     pub async fn snapshot_status(&self) -> Vec<SidecarRuntimeStatus> {
         let sidecars = self.registry.all_sidecars();
         let slots = self.slots.lock().await;
         sidecars
             .into_iter()
             .map(|b| {
-                let slot = slots.get(&b.channel);
+                let slot = slots.get(&b.name);
                 let status = slot
                     .map(|s| s.status.clone())
                     .unwrap_or(ServiceStatus::Stopped);
@@ -225,9 +229,8 @@ impl SidecarSupervisor {
                     .and_then(|s| s.handle.as_ref())
                     .map(|h| format!("http://127.0.0.1:{}", h.host_port));
                 SidecarRuntimeStatus {
-                    channel: b.channel.clone(),
+                    name: b.name.clone(),
                     plugin_id: b.plugin_id.clone(),
-                    service_name: b.service_name.clone(),
                     status,
                     restart_attempts,
                     rpc_url,
@@ -263,23 +266,23 @@ impl SidecarSupervisor {
         let desired = self.registry.all_sidecars();
         let mut slots = self.slots.lock().await;
 
-        // Phase 1: stop + drop slots whose channel is no longer
+        // Phase 1: stop + drop slots whose sidecar is no longer
         // registered (plugin disabled / uninstalled).
-        let desired_channels: std::collections::HashSet<String> =
-            desired.iter().map(|b| b.channel.clone()).collect();
+        let desired_names: std::collections::HashSet<String> =
+            desired.iter().map(|b| b.name.clone()).collect();
         let to_drop: Vec<String> = slots
             .keys()
-            .filter(|c| !desired_channels.contains(*c))
+            .filter(|c| !desired_names.contains(*c))
             .cloned()
             .collect();
         for c in to_drop {
             if let Some(mut slot) = slots.remove(&c) {
                 let was_running = slot.handle.is_some();
                 if let Some(handle) = slot.handle.take() {
-                    debug!(channel = %c, "stopping orphaned sidecar container");
+                    debug!(sidecar = %c, "stopping orphaned sidecar container");
                     if let Err(e) = self.controller.stop(&handle).await {
                         warn!(
-                            channel = %c,
+                            sidecar = %c,
                             error = %e,
                             "failed to stop orphaned sidecar container",
                         );
@@ -293,14 +296,14 @@ impl SidecarSupervisor {
                     && let Some(bus) = &self.bus
                 {
                     bus.publish(UiEvent::SidecarStatusChanged {
-                        channel: c.clone(),
+                        name: c.clone(),
                         status: format!("{:?}", ServiceStatus::Stopped),
                     });
                 }
             }
         }
 
-        // Phase 2: ensure every desired channel has a slot, then
+        // Phase 2: ensure every desired sidecar has a slot, then
         // reconcile that slot's runtime state.
         for sidecar in desired {
             // Drift detection: a manifest edit (new image, port)
@@ -315,18 +318,18 @@ impl SidecarSupervisor {
             //      already dropped, attempts > 0) still deserves the
             //      counter reset.
             let needs_respawn_for_drift = slots
-                .get(&sidecar.channel)
+                .get(&sidecar.name)
                 .map(|s| s.drift_from(&sidecar))
                 .unwrap_or(false);
             if needs_respawn_for_drift {
-                if let Some(slot) = slots.get_mut(&sidecar.channel) {
+                if let Some(slot) = slots.get_mut(&sidecar.name) {
                     if let Some(handle) = slot.handle.take() {
                         debug!(
-                            channel = %sidecar.channel,
+                            sidecar = %sidecar.name,
                             "sidecar manifest changed; stopping prior container",
                         );
                         if let Err(e) = self.controller.stop(&handle).await {
-                            warn!(channel = %sidecar.channel, error = %e,
+                            warn!(sidecar = %sidecar.name, error = %e,
                                   "failed to stop sidecar during drift respawn");
                         }
                     }
@@ -337,7 +340,7 @@ impl SidecarSupervisor {
             }
 
             let slot = slots
-                .entry(sidecar.channel.clone())
+                .entry(sidecar.name.clone())
                 .or_insert_with(|| SidecarSlot::fresh(sidecar.clone()));
             slot.registered = sidecar.clone();
 
@@ -371,7 +374,7 @@ impl SidecarSupervisor {
                     }
                     None => {
                         warn!(
-                            channel = %sidecar.channel,
+                            sidecar = %sidecar.name,
                             "sidecar port pool exhausted; refusing to spawn",
                         );
                         // Park CrashLooping so the slot doesn't
@@ -381,13 +384,13 @@ impl SidecarSupervisor {
                         let new_status = ServiceStatus::CrashLooping {
                             restart_count: MAX_RESTART_ATTEMPTS,
                         };
-                        self.transition_status(&sidecar.channel, slot, new_status);
+                        self.transition_status(&sidecar.name, slot, new_status);
                         return;
                     }
                 },
             };
             let spec = ServiceSpec {
-                name: container_name(&sidecar.plugin_id, &sidecar.channel),
+                name: container_name(&sidecar.plugin_id, &sidecar.name),
                 image: sidecar.image.clone(),
                 args: Vec::new(),
                 env: Vec::new(),
@@ -400,14 +403,14 @@ impl SidecarSupervisor {
             match self.controller.spawn(&spec).await {
                 Ok(handle) => {
                     info!(
-                        channel = %sidecar.channel,
+                        sidecar = %sidecar.name,
                         container = %handle.name,
                         host_port = handle.host_port,
                         "sidecar container spawned",
                     );
                     slot.handle = Some(handle);
                     self.transition_status(
-                        &sidecar.channel,
+                        &sidecar.name,
                         slot,
                         ServiceStatus::Starting,
                     );
@@ -417,7 +420,7 @@ impl SidecarSupervisor {
                     slot.restart_attempts = slot.restart_attempts.saturating_add(1);
                     let new_status = if slot.restart_attempts >= MAX_RESTART_ATTEMPTS {
                         warn!(
-                            channel = %sidecar.channel,
+                            sidecar = %sidecar.name,
                             attempts = slot.restart_attempts,
                             error = %e,
                             "sidecar container hit restart cap; parking CrashLooping",
@@ -427,14 +430,14 @@ impl SidecarSupervisor {
                         }
                     } else {
                         warn!(
-                            channel = %sidecar.channel,
+                            sidecar = %sidecar.name,
                             attempts = slot.restart_attempts,
                             error = %e,
                             "sidecar container spawn failed; will retry",
                         );
                         ServiceStatus::Stopped
                     };
-                    self.transition_status(&sidecar.channel, slot, new_status);
+                    self.transition_status(&sidecar.name, slot, new_status);
                     return;
                 }
             }
@@ -451,7 +454,7 @@ impl SidecarSupervisor {
             Ok(s) => s,
             Err(e) => {
                 warn!(
-                    channel = %sidecar.channel,
+                    sidecar = %sidecar.name,
                     error = %e,
                     "sidecar inspect failed; will recheck next tick",
                 );
@@ -471,12 +474,12 @@ impl SidecarSupervisor {
                 // flap case is a known limitation; Phase 3 alert
                 // routing surfaces it without depending on the cap.)
                 debug!(
-                    channel = %sidecar.channel,
+                    sidecar = %sidecar.name,
                     "sidecar container vanished; will respawn",
                 );
                 slot.handle = None;
                 self.transition_status(
-                    &sidecar.channel,
+                    &sidecar.name,
                     slot,
                     ServiceStatus::Stopped,
                 );
@@ -490,13 +493,13 @@ impl SidecarSupervisor {
                 // crash-loop counting; we just mirror it.
                 slot.restart_attempts = restart_count;
                 self.transition_status(
-                    &sidecar.channel,
+                    &sidecar.name,
                     slot,
                     ServiceStatus::CrashLooping { restart_count },
                 );
             }
             ServiceStatus::Pulling | ServiceStatus::Starting => {
-                self.transition_status(&sidecar.channel, slot, inspect);
+                self.transition_status(&sidecar.name, slot, inspect);
             }
             ServiceStatus::Healthy => {
                 // Validate via the sidecar's own RPC healthcheck —
@@ -513,11 +516,11 @@ impl SidecarSupervisor {
                     .unwrap_or(false);
                 if healthy {
                     if !matches!(slot.status, ServiceStatus::Healthy) {
-                        info!(channel = %sidecar.channel, "sidecar healthy");
+                        info!(sidecar = %sidecar.name, "sidecar healthy");
                     }
                     slot.restart_attempts = 0;
                     self.transition_status(
-                        &sidecar.channel,
+                        &sidecar.name,
                         slot,
                         ServiceStatus::Healthy,
                     );
@@ -526,12 +529,12 @@ impl SidecarSupervisor {
                     // restart. Could be a slow-starting sidecar; the
                     // restart-attempt cap protects us either way.
                     warn!(
-                        channel = %sidecar.channel,
+                        sidecar = %sidecar.name,
                         url = %url,
                         "sidecar RPC health failed; restarting container",
                     );
                     if let Err(e) = self.controller.stop(&handle).await {
-                        warn!(channel = %sidecar.channel, error = %e,
+                        warn!(sidecar = %sidecar.name, error = %e,
                               "stop-for-restart failed");
                     }
                     slot.handle = None;
@@ -544,7 +547,7 @@ impl SidecarSupervisor {
                         } else {
                             ServiceStatus::Stopped
                         };
-                    self.transition_status(&sidecar.channel, slot, new_status);
+                    self.transition_status(&sidecar.name, slot, new_status);
                 }
             }
         }
@@ -555,7 +558,7 @@ impl SidecarSupervisor {
     /// exhausted, returns `None` and the supervisor refuses to spawn
     /// (parking the slot CrashLooping). In practice no operator runs
     /// 100 sidecars, but a saturating overflow that quietly mapped
-    /// every excess channel onto the same port would be a much worse
+    /// every excess sidecar onto the same port would be a much worse
     /// failure mode than the explicit refusal.
     async fn allocate_port(&self) -> Option<u16> {
         let mut next = self.next_host_port.lock().await;
@@ -577,7 +580,7 @@ impl SidecarSupervisor {
     /// site naturally dedups.
     fn transition_status(
         &self,
-        channel: &str,
+        name: &str,
         slot: &mut SidecarSlot,
         new_status: ServiceStatus,
     ) {
@@ -587,18 +590,18 @@ impl SidecarSupervisor {
         slot.status = new_status.clone();
         if let Some(bus) = &self.bus {
             bus.publish(UiEvent::SidecarStatusChanged {
-                channel: channel.to_owned(),
+                name: name.to_owned(),
                 status: format!("{new_status:?}"),
             });
         }
     }
 }
 
-/// Stable per-(plugin, channel) container name. Mirrors
+/// Stable per-(plugin, sidecar) container name. Mirrors
 /// `backend_supervisor`'s naming scheme so an operator who knows the
 /// `execlaw-…` convention finds sidecars where they expect.
-fn container_name(plugin_id: &str, channel: &str) -> String {
-    format!("execlaw-sidecar-{plugin_id}-{channel}")
+fn container_name(plugin_id: &str, name: &str) -> String {
+    format!("execlaw-sidecar-{plugin_id}-{name}")
 }
 
 #[cfg(test)]
@@ -607,7 +610,7 @@ mod tests {
     use execlaw_container_manager::MockServiceController;
     use execlaw_plugin_sdk::PluginManifest;
 
-    fn registry_with_sidecar(plugin_id: &str, channel: &str, port: u16) -> HookRegistry {
+    fn registry_with_sidecar(plugin_id: &str, sidecar_name: &str, port: u16) -> HookRegistry {
         let m = PluginManifest::parse(&format!(
             r#"
 [plugin]
@@ -616,11 +619,10 @@ name = "P"
 version = "0.1.0"
 
 [[services]]
-name = "{plugin_id}-sidecar"
-image = "execlaw/{plugin_id}-sidecar:0.1"
+name = "{sidecar_name}"
+image = "execlaw/{sidecar_name}:0.1"
 
 [services.sidecar]
-channel = "{channel}"
 rpc_port = {port}
 "#
         ))
@@ -640,13 +642,13 @@ rpc_port = {port}
 
         assert_eq!(mock.spawn_count().await, 1);
         let last = mock.last_spawn().await.unwrap();
-        assert_eq!(last.image, "execlaw/p-signal-sidecar:0.1");
+        assert_eq!(last.image, "execlaw/signal:0.1");
         assert_eq!(last.container_port, 8080);
         assert_eq!(last.host_port, SIDECAR_PORT_POOL_START);
 
         let snap = sup.snapshot_status().await;
         assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].channel, "signal");
+        assert_eq!(snap[0].name, "signal");
         assert_eq!(snap[0].status, ServiceStatus::Starting);
         assert_eq!(snap[0].restart_attempts, 0);
     }
@@ -785,11 +787,10 @@ name = "P"
 version = "0.1.0"
 
 [[services]]
-name = "p-signal-sidecar"
-image = "execlaw/p-signal-sidecar:0.2"
+name = "signal"
+image = "execlaw/signal:0.2"
 
 [services.sidecar]
-channel = "signal"
 rpc_port = 8080
 "#,
         )
@@ -802,7 +803,7 @@ rpc_port = 8080
         // 1 from the original spawn + 1 from the post-drift spawn.
         assert_eq!(mock.spawn_count().await, 2);
         let last = mock.last_spawn().await.unwrap();
-        assert_eq!(last.image, "execlaw/p-signal-sidecar:0.2");
+        assert_eq!(last.image, "execlaw/signal:0.2");
     }
 
     #[tokio::test]
@@ -912,11 +913,10 @@ name = "P"
 version = "0.1.0"
 
 [[services]]
-name = "p-signal-sidecar"
-image = "execlaw/p-signal-sidecar:0.2"
+name = "signal"
+image = "execlaw/signal:0.2"
 
 [services.sidecar]
-channel = "signal"
 rpc_port = 8080
 "#,
         )
@@ -999,13 +999,13 @@ rpc_port = 8080
     }
 
     #[tokio::test]
-    async fn distinct_channels_get_distinct_host_ports() {
-        // Port pool stability — two sidecars in distinct channels
-        // get sequential, non-colliding host ports.
+    async fn distinct_sidecars_get_distinct_host_ports() {
+        // Port pool stability — two distinct sidecars get sequential,
+        // non-colliding host ports.
         let reg = HookRegistry::new();
-        for (pid, ch, p) in [
-            ("p-signal", "signal", 8080u16),
-            ("p-wa", "whatsapp", 8081u16),
+        for (pid, sname, p) in [
+            ("p-signal", "signal-cli", 8080u16),
+            ("p-wa", "whatsapp-bridge", 8081u16),
         ] {
             let m = PluginManifest::parse(&format!(
                 r#"
@@ -1015,11 +1015,10 @@ name = "P"
 version = "0.1.0"
 
 [[services]]
-name = "{pid}-sidecar"
+name = "{sname}"
 image = "x"
 
 [services.sidecar]
-channel = "{ch}"
 rpc_port = {p}
 "#
             ))
@@ -1044,7 +1043,7 @@ rpc_port = {p}
             .collect();
         assert_eq!(ports.len(), 2);
         // Order isn't deterministic across snapshot (BTreeMap by
-        // channel), so just check the set.
+        // name), so just check the set.
         let mut sorted = ports.clone();
         sorted.sort();
         assert_eq!(sorted, vec![SIDECAR_PORT_POOL_START, SIDECAR_PORT_POOL_START + 1]);

@@ -124,6 +124,13 @@ pub struct AppState {
     /// builds without Docker). Routes that depend on it return
     /// 503 in that mode.
     pub backend_supervisor: Option<crate::backend_supervisor::BackendSupervisor>,
+    /// Phase 2b — sidecar (companion-container) supervisor.
+    /// Owns Signal-cli / WhatsApp / Matrix / ... sidecars declared
+    /// by installed plugins via `[services.sidecar]`. `None` when no
+    /// `ServiceController` is wired (tests, dev builds without
+    /// Docker); the `/api/admin/sidecars` route returns 503 in
+    /// that mode.
+    pub sidecar_supervisor: Option<crate::sidecar_supervisor::SidecarSupervisor>,
     /// Phase 13.B — voice-session registry. Owns the per-session
     /// jitter buffer + lifecycle state. Always present (cheap to
     /// construct); no HTTP route depends on it being None vs Some.

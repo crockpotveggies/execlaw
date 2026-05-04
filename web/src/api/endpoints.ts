@@ -617,6 +617,54 @@ export async function wipeRunnerGroup(
     );
 }
 
+// -----------------------------------------------------------------
+// Phase 2b — sidecar (companion-container) supervisor admin surface.
+//
+// One row per registered sidecar; status mirrors the supervisor's
+// view (`stopped` / `starting` / `healthy` / `crash_looping` /
+// `pulling` / `not_found`). Settings → Sidecars renders these.
+// -----------------------------------------------------------------
+
+export interface SidecarView {
+    /// Globally-unique sidecar name (the manifest's
+    /// `[[services]].name` for the entry that carried
+    /// `[services.sidecar]`).
+    name: string;
+    plugin_id: string;
+    /// "stopped" | "starting" | "healthy" | "crash_looping" |
+    /// "pulling" | "not_found"
+    status: string;
+    restart_attempts: number;
+    /// Loopback URL the supervisor would dispatch RPC against.
+    /// Null until the first successful spawn.
+    rpc_url: string | null;
+}
+
+export interface SidecarListResponse {
+    sidecars: SidecarView[];
+}
+
+export async function listSidecars(
+    tokenAccessor: () => string | null,
+): Promise<SidecarListResponse> {
+    return apiFetch<SidecarListResponse>(
+        "/api/admin/sidecars",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function resetSidecarAttempts(
+    name: string,
+    tokenAccessor: () => string | null,
+): Promise<unknown> {
+    return apiFetch(
+        `/api/admin/sidecars/${encodeURIComponent(name)}/reset`,
+        { method: "POST", body: {} },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/backends (Phase 8.5; replaces "deployments" CRUD) -
 
 export type BackendPurpose = "Standard" | "Small" | "VoiceSTT" | "VoiceTTS";

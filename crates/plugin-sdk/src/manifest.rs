@@ -179,46 +179,45 @@ pub struct ServiceDecl {
     /// When present, this service is a **supervised sidecar** — a
     /// companion container the sidecar supervisor takes
     /// responsibility for: spawn, healthcheck, restart, alert on
-    /// stuck. Today every supervised sidecar is also a transport
-    /// bridge (signal-cli, WhatsApp Bridge, Matrix Bridge, ...) —
-    /// hence `SidecarMeta::channel`. When the first non-transport
-    /// sidecar lands (an OCR worker, an ffmpeg pool) we'll add a
-    /// discriminator field; today the existence of `[services.sidecar]`
-    /// is the discriminator. Plain `[[services]]` entries (helper
-    /// daemons that take no supervision) omit this and the supervisor
-    /// leaves them alone.
+    /// stuck. The sidecar's identity is the parent service's `name`
+    /// (which the supervisor enforces is globally unique across
+    /// installed plugins, so docker container names don't collide).
+    ///
+    /// The sidecar system is intentionally generic: signal-cli,
+    /// WhatsApp Bridge, an ffmpeg pool, an OCR worker — all the
+    /// supervisor needs is "a container to keep running on this
+    /// port." Transport bridges happen to be the first set of
+    /// sidecars we ship, but `SidecarMeta` carries no transport-
+    /// specific knobs.
+    ///
+    /// Plain `[[services]]` entries that omit this table are
+    /// **unsupervised** helper daemons — the manifest registers
+    /// them but the supervisor leaves them alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar: Option<SidecarMeta>,
 }
 
-/// Sidecar-specific metadata on a `ServiceDecl`. Together with the
-/// service's `name` + `image` + `ports` this is everything the
-/// sidecar supervisor needs to run + monitor a companion container.
+/// Sidecar-specific metadata on a `ServiceDecl`. Combined with the
+/// parent service's `name` + `image` + `ports`, this is everything
+/// the sidecar supervisor needs to run + monitor a companion
+/// container.
 ///
-/// Why a sub-struct rather than fields directly on `ServiceDecl`?
-/// Forward-compat: supervised sidecars will accumulate transport-
-/// specific knobs (account-data secret name, multi-account
-/// groupings, ...) that plain helper services have no business
-/// knowing about. Hiding them behind a discriminator keeps
-/// `ServiceDecl`'s top-level shape lean and makes "is this
-/// supervised?" a single `is_some()` check.
+/// Deliberately tiny: the supervisor's job is generic
+/// container-lifecycle, not a transport-specific abstraction.
+/// Anything transport-specific lives in the plugin's tool layer or
+/// in a future separate `[transport]` declaration; the sidecar meta
+/// only carries fields the supervisor actually uses (RPC port to
+/// publish + health path to probe).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SidecarMeta {
-    /// Transport channel id ("signal", "whatsapp", "matrix", ...).
-    /// MUST match the `channel` column the sidecar will write into
-    /// `state_transport_bindings`. The supervisor uses this as the
-    /// sidecar's primary key — exactly one sidecar per channel may
-    /// be registered at a time. (When non-transport sidecars land,
-    /// channel becomes optional + a kind tag is added.)
-    pub channel: String,
     /// Container port serving the sidecar's local RPC. The
     /// supervisor publishes this as `127.0.0.1:<host_port>` and
     /// probes `<rpc_health_path>` against it.
     pub rpc_port: u16,
     /// HTTP path on the RPC port that the supervisor probes for
     /// liveness. Defaults to `/healthz`. Sidecars that expose a
-    /// different convention (signal-cli's `/v1/about`, ...)
-    /// override here.
+    /// different convention (signal-cli's `/v1/about`, an OCR
+    /// worker's `/ready`, ...) override here.
     #[serde(default = "default_rpc_health_path")]
     pub rpc_health_path: String,
 }
@@ -439,10 +438,10 @@ pub enum ManifestError {
          UnknownPending, Blocked)"
     )]
     UnknownTrustFloor { tool: String, value: String },
-    #[error("duplicate sidecar channel '{0}' across services in the same plugin")]
-    DuplicateSidecarChannel(String),
-    #[error("sidecar service '{name}' has empty channel string")]
-    SidecarEmptyChannel { name: String },
+    #[error("duplicate service name '{0}' in the same plugin")]
+    DuplicateServiceName(String),
+    #[error("service has empty name string")]
+    ServiceEmptyName,
 }
 
 /// Trust levels the manifest may pin a tool to. Kept as a small flat
@@ -515,24 +514,18 @@ impl PluginManifest {
             }
         }
 
-        // Supervised-sidecar service validation. Two services in
-        // one plugin can't claim the same channel — the supervisor
-        // uses (channel) as the primary key. Empty channel strings
-        // are also rejected so a typo'd manifest doesn't silently
-        // register a sidecar under "".
-        let mut sidecar_channels: std::collections::HashSet<&str> = Default::default();
+        // Service-name uniqueness within one plugin. The supervisor
+        // keys sidecars on `service.name`, so two `[[services]]`
+        // entries in the same plugin can't share a name. (Cross-
+        // plugin uniqueness is enforced at hook-registry enable
+        // time — that needs context this validator doesn't have.)
+        let mut service_names: std::collections::HashSet<&str> = Default::default();
         for s in &self.services {
-            if let Some(b) = &s.sidecar {
-                if b.channel.is_empty() {
-                    return Err(ManifestError::SidecarEmptyChannel {
-                        name: s.name.clone(),
-                    });
-                }
-                if !sidecar_channels.insert(&b.channel) {
-                    return Err(ManifestError::DuplicateSidecarChannel(
-                        b.channel.clone(),
-                    ));
-                }
+            if s.name.is_empty() {
+                return Err(ManifestError::ServiceEmptyName);
+            }
+            if !service_names.insert(&s.name) {
+                return Err(ManifestError::DuplicateServiceName(s.name.clone()));
             }
         }
 
@@ -813,6 +806,9 @@ mod tests {
 
     #[test]
     fn sidecar_metadata_parses_with_explicit_health_path() {
+        // The sidecar's identity comes from the parent service's
+        // `name`; SidecarMeta only carries supervisor-specific
+        // knobs (rpc_port + rpc_health_path).
         let ok = r#"
             [plugin]
             id = "p"
@@ -825,14 +821,13 @@ mod tests {
             ports = ["8080:8080"]
 
             [services.sidecar]
-            channel = "signal"
             rpc_port = 8080
             rpc_health_path = "/v1/about"
         "#;
         let m = PluginManifest::parse(ok).unwrap();
         assert_eq!(m.services.len(), 1);
+        assert_eq!(m.services[0].name, "signal-cli");
         let b = m.services[0].sidecar.as_ref().unwrap();
-        assert_eq!(b.channel, "signal");
         assert_eq!(b.rpc_port, 8080);
         assert_eq!(b.rpc_health_path, "/v1/about");
     }
@@ -848,11 +843,10 @@ mod tests {
             version = "0.1.0"
 
             [[services]]
-            name = "wa-sidecar"
-            image = "execlaw/wa-sidecar:0.1"
+            name = "ocr-worker"
+            image = "execlaw/ocr-worker:0.1"
 
             [services.sidecar]
-            channel = "whatsapp"
             rpc_port = 8081
         "#;
         let m = PluginManifest::parse(ok).unwrap();
@@ -864,9 +858,9 @@ mod tests {
 
     #[test]
     fn non_sidecar_service_leaves_sidecar_field_none() {
-        // A helper sidecar (OCR worker, ffmpeg pool, ...) declares
-        // a [[services]] entry but no [services.sidecar] table. The
-        // sidecar supervisor must NOT pick this up.
+        // An unsupervised helper service declares a [[services]]
+        // entry but no [services.sidecar] table. The sidecar
+        // supervisor must NOT pick this up.
         let ok = r#"
             [plugin]
             id = "p"
@@ -882,10 +876,11 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_sidecar_channels_in_one_plugin_are_rejected() {
-        // Hard error — the supervisor keys by channel, so two
-        // services claiming the same channel would fight over the
-        // sidecar slot. Catch at parse time.
+    fn duplicate_service_names_in_one_plugin_are_rejected() {
+        // The supervisor keys sidecars on `service.name`, so two
+        // [[services]] entries in one plugin can't share a name.
+        // (Cross-plugin dups are caught at hook-registry enable
+        // time; this validator handles the within-plugin case.)
         let bad = r#"
             [plugin]
             id = "p"
@@ -893,29 +888,27 @@ mod tests {
             version = "0.1.0"
 
             [[services]]
-            name = "signal-a"
+            name = "signal-cli"
             image = "x"
             [services.sidecar]
-            channel = "signal"
             rpc_port = 8080
 
             [[services]]
-            name = "signal-b"
+            name = "signal-cli"
             image = "y"
             [services.sidecar]
-            channel = "signal"
             rpc_port = 8081
         "#;
         let err = PluginManifest::parse(bad).unwrap_err();
         match err {
-            ManifestError::DuplicateSidecarChannel(c) => assert_eq!(c, "signal"),
-            other => panic!("expected DuplicateSidecarChannel, got {other:?}"),
+            ManifestError::DuplicateServiceName(n) => assert_eq!(n, "signal-cli"),
+            other => panic!("expected DuplicateServiceName, got {other:?}"),
         }
     }
 
     #[test]
-    fn empty_sidecar_channel_rejected() {
-        // A typo'd / empty channel would silently register the
+    fn empty_service_name_rejected() {
+        // A typo'd / empty service name would silently register the
         // sidecar under "" and then collide with any future plugin
         // doing the same. Reject loudly.
         let bad = r#"
@@ -925,17 +918,42 @@ mod tests {
             version = "0.1.0"
 
             [[services]]
-            name = "x"
+            name = ""
             image = "y"
             [services.sidecar]
-            channel = ""
             rpc_port = 8080
         "#;
         let err = PluginManifest::parse(bad).unwrap_err();
         match err {
-            ManifestError::SidecarEmptyChannel { name } => assert_eq!(name, "x"),
-            other => panic!("expected SidecarEmptyChannel, got {other:?}"),
+            ManifestError::ServiceEmptyName => {}
+            other => panic!("expected ServiceEmptyName, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn non_transport_sidecar_does_not_need_any_extra_fields() {
+        // The whole point of dropping SidecarMeta.channel: an
+        // ffmpeg pool / OCR worker / whisper helper is just a
+        // companion container with an RPC port. No transport-
+        // specific knob required.
+        let ok = r#"
+            [plugin]
+            id = "ocr"
+            name = "OCR"
+            version = "0.1.0"
+
+            [[services]]
+            name = "ocr-worker"
+            image = "execlaw/ocr-worker:0.1"
+
+            [services.sidecar]
+            rpc_port = 9090
+            rpc_health_path = "/ready"
+        "#;
+        let m = PluginManifest::parse(ok).unwrap();
+        let s = &m.services[0];
+        assert_eq!(s.name, "ocr-worker");
+        assert!(s.sidecar.is_some());
     }
 
     #[test]
