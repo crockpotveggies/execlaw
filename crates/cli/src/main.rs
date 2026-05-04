@@ -1633,6 +1633,16 @@ async fn cmd_serve(
         );
         let stop = sweep_stop.clone();
         tokio::spawn(async move { retention_sweeper.run(stop).await });
+
+        // 2026-05-03 (rev 7) — clarification listener. Subscribes
+        // to UiEvent::ResearchAwaitingInput and wakes the agent in
+        // the affected conversation so it can relay the planner's
+        // question to the user. Replaces the polling-on-
+        // research_start fast path; no shutdown signal needed —
+        // the task exits cleanly when the event-bus subscriber
+        // returns Closed at server teardown.
+        let _clarification_listener =
+            execlaw_server::research::clarification_listener::spawn(state.clone());
     }
 
     // Phase 10 closure — purge state_routine_runs rows past the

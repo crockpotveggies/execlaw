@@ -1970,6 +1970,124 @@ pub async fn dispatch_routine_turn(
     mapped
 }
 
+/// 2026-05-03 (rev 7) — entry point for clarification-fired turns.
+/// Wakes the agent in `cid` with a system-framed prompt that tells
+/// it to relay a deep-research clarification question to the user
+/// and call `research_clarify` once they answer.
+///
+/// Why a dedicated dispatcher instead of reusing `dispatch_routine_turn`:
+///   * The prompt shape is fixed (orchestrator boilerplate the model
+///     should treat as a directive, not a user message).
+///   * Trust class is forced Controller — clarification turns run on
+///     behalf of the system, never on behalf of an external sender.
+///   * Lets the listener log + meter clarification dispatches
+///     separately from routine fires.
+pub async fn dispatch_clarification_turn(
+    state: &AppState,
+    cid: &ConversationId,
+    job_id: &str,
+    question: &str,
+) -> Result<RoutineDispatchOutcome, String> {
+    use execlaw_core::conversation::ConversationStore;
+    let cid_str = cid.as_str().to_owned();
+
+    // Make sure the conversation row exists before any turn writes.
+    // It almost always does (the research job was started from this
+    // conversation in the first place), but be defensive — a row
+    // could have been purged if the operator deleted the thread
+    // mid-research.
+    let store = ConversationStore::new(&state.db);
+    ensure_conversation(&store, cid);
+
+    // Outer processing window — same as send_message + routine paths
+    // so the SPA's typing indicator surfaces while the agent composes
+    // the clarification message.
+    state.events.publish(UiEvent::ConversationPhaseChanged {
+        conversation_id: cid_str.clone(),
+        phase: Phase::Thinking.as_str().to_owned(),
+    });
+    let idle_guard = IdlePhaseGuard::new(state.events.clone(), cid_str.clone());
+
+    // System-framed prompt. The model sees this as the "user" turn
+    // (we reuse the routine path for plumbing) but the framing is
+    // unambiguous orchestrator-instruction. The model is expected to
+    // (a) ask the user the clarification question naturally, and
+    // (b) call research_clarify once the user answers (in their next
+    // turn, which is a real user message).
+    //
+    // We pass the question + job_id so the agent doesn't have to
+    // round-trip through research_status to discover them.
+    let prompt = format!(
+        "[SYSTEM ORCHESTRATOR NOTICE] A deep-research job (id: {job_id}) you started \
+         needs the user's clarification before it can proceed.\n\n\
+         The planner asked:\n  {question}\n\n\
+         Please relay this question to the user in chat in a natural way \
+         — quote it verbatim or briefly reframe, whichever feels more conversational. \
+         Do NOT call any research_* tool right now: wait for the user's reply in their \
+         next message, then call research_clarify(job_id=\"{job_id}\", \
+         clarification=\"<their answer>\") to resume the job.",
+        job_id = job_id,
+        question = question,
+    );
+
+    let sender = Some("system".to_owned());
+    // Clarification turns are system-driven, not on behalf of an
+    // external sender. Controller trust is correct — same as
+    // routines.
+    let caller_caps: Vec<String> = vec!["*".into()];
+    let caller_trust = TrustLevel::Controller;
+
+    let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
+    let inference_for_turn = state
+        .inference
+        .resolve(&state.db, BackendPurpose::Standard);
+    let result = match inference_for_turn {
+        Some(inference) if has_plugin_tools => {
+            run_tool_capable_turn(
+                state,
+                inference.clone(),
+                cid,
+                &prompt,
+                sender.clone(),
+                caller_caps,
+                caller_trust,
+            )
+            .await
+        }
+        Some(inference) => {
+            let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
+                state.turn_cancel.clone(),
+                cid.as_str().to_owned(),
+            );
+            let cancel_flag = cancel_guard.flag.clone();
+            let res = run_real_turn(
+                state,
+                inference.clone(),
+                cid,
+                &prompt,
+                sender.clone(),
+                caller_trust,
+                false,
+                cancel_flag,
+            )
+            .await;
+            drop(cancel_guard);
+            res
+        }
+        None => run_stub_turn(state, cid, &prompt, sender.clone()),
+    };
+
+    let mapped = result.map(|(_user_seq, text, _assistant_seq)| RoutineDispatchOutcome {
+        conversation_id: cid_str,
+        assistant_text: text,
+    });
+    match &mapped {
+        Ok(_) => idle_guard.disarm_after_publishing_idle(),
+        Err(_) => drop(idle_guard),
+    }
+    mapped
+}
+
 /// Build the per-turn context block — runtime facts the model
 /// needs to answer recency- and identity-sensitive questions
 /// without round-tripping a tool. Selfhosted-claw baked these

@@ -1090,6 +1090,16 @@ async fn await_input_for_clarification(
             "emitting CardProgressed{{AwaitingInput}} hit an error",
         );
     }
+    // Sister event for the server-side clarification listener,
+    // which fires a follow-up agent turn so the agent relays the
+    // question to the user in chat. Distinct from CardProgressed
+    // so the listener can subscribe with a narrow filter and so
+    // SPA card-store doesn't double-process.
+    events.publish(crate::events::UiEvent::ResearchAwaitingInput {
+        conversation_id: conv_id.as_str().to_owned(),
+        job_id: job_id.as_str().to_owned(),
+        question: question.to_owned(),
+    });
 }
 
 fn truncate_for_card_title(s: &str) -> String {

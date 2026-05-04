@@ -20,6 +20,7 @@
 //!
 //! [research handoff doc]: ../../../docs/handoffs/2026-04-29-research-subsystem.md
 
+pub mod clarification_listener;
 pub mod gather;
 pub mod readability_extract;
 pub mod retention;
