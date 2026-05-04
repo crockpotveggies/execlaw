@@ -266,9 +266,22 @@ fn render_markdown_to_pdf(
             y -= above_gap;
         }
 
+        // 2026-05-04 — normalise Unicode punctuation into the
+        // WinAnsi-safe ASCII subset BEFORE measuring + emitting.
+        // printpdf's built-in fonts (Helvetica family, etc.) are
+        // declared with WinAnsiEncoding; multi-byte UTF-8 sequences
+        // for em-dash, en-dash, smart quotes, ellipsis, etc. get
+        // bit-for-bit reinterpreted as Latin-1 in the PDF stream
+        // and surface as mojibake (the user's reported `â` is the
+        // first byte of an en-dash's UTF-8 encoding `0xE2 0x80
+        // 0x93` interpreted as Latin-1). Replacing here keeps
+        // the renderer building-font-only (no TTF embed) while
+        // making the output readable.
+        let text_pdf_safe = normalise_for_winansi(&text);
+
         // Word-wrap and emit each visual line.
         let wrap_w = if size >= 14.0 { WRAP_WIDTH * 7 / 10 } else { WRAP_WIDTH };
-        for visual in textwrap::wrap(&text, wrap_w) {
+        for visual in textwrap::wrap(&text_pdf_safe, wrap_w) {
             if y - line_h < MARGIN_BOTTOM {
                 let (np, nl) = doc.add_page(Mm(PAGE_W), Mm(PAGE_H), "Layer");
                 page = np;
@@ -384,6 +397,94 @@ fn first_h1(markdown: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Map common Unicode punctuation, math symbols, and "smart"
+/// typography to their ASCII equivalents so the PDF renderer's
+/// WinAnsi-encoded built-in fonts can carry them through cleanly.
+///
+/// Without this preprocessing, characters outside the WinAnsi
+/// (cp1252) covered set get bit-for-bit reinterpreted from UTF-8
+/// to Latin-1 — an en-dash (`–`, UTF-8 `0xE2 0x80 0x93`) shows up
+/// as `â` followed by control chars (the user's reported
+/// "minor character encoding issues, `-` is appearing as `â`").
+///
+/// The replacement table covers what synthesised research reports
+/// actually emit:
+///   * Em / en dashes → ASCII hyphens (em → `--`, en → `-`)
+///   * Smart quotes → straight quotes
+///   * Ellipsis → `...`
+///   * Common math symbols (≥ ≤ ± × ÷ → arrows)
+///   * Bullets → `*`
+///   * Non-breaking space → regular space
+///
+/// Anything else outside the printable-ASCII range (incl. accented
+/// Latin characters that ARE in WinAnsi like `é` or `ñ`) passes
+/// through unchanged — printpdf handles those correctly because
+/// they're single-byte in WinAnsi too. Only the multi-byte UTF-8
+/// sequences need fixing.
+///
+/// Doc-hidden because the surface is implementation detail; tests
+/// in this module exercise it directly.
+#[doc(hidden)]
+pub fn normalise_for_winansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            // Dashes
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' => out.push('-'), // hyphen / non-breaking hyphen / figure dash / en dash
+            '\u{2014}' | '\u{2015}' => out.push_str("--"), // em dash / horizontal bar
+
+            // Quotes
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => out.push('\''), // single quote variants
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => out.push('"'), // double quote variants
+            '\u{2032}' => out.push('\''), // prime
+            '\u{2033}' => out.push('"'),  // double prime
+
+            // Spaces + invisible
+            '\u{00A0}' | '\u{2007}' | '\u{2009}' | '\u{200A}' | '\u{202F}' => out.push(' '), // various spaces
+            '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' => {}                          // zero-width chars: drop
+            '\u{2028}' | '\u{2029}' => out.push('\n'),                                       // line separator / paragraph separator
+
+            // Punctuation
+            '\u{2026}' => out.push_str("..."), // ellipsis
+            '\u{2022}' | '\u{2023}' | '\u{25E6}' | '\u{2043}' => out.push('*'), // bullets
+            '\u{00B7}' => out.push('-'), // middle dot
+            '\u{00B0}' => out.push_str("deg"), // degree sign
+
+            // Arrows
+            '\u{2190}' => out.push_str("<-"),
+            '\u{2192}' => out.push_str("->"),
+            '\u{2194}' => out.push_str("<->"),
+            '\u{21D0}' => out.push_str("<="),
+            '\u{21D2}' => out.push_str("=>"),
+            '\u{21D4}' => out.push_str("<=>"),
+
+            // Math comparators
+            '\u{2264}' => out.push_str("<="),
+            '\u{2265}' => out.push_str(">="),
+            '\u{2260}' => out.push_str("!="),
+            '\u{2248}' => out.push('~'),
+            '\u{00B1}' => out.push_str("+/-"),
+            '\u{00D7}' => out.push('x'),
+            '\u{00F7}' => out.push('/'),
+
+            // Common typographic
+            '\u{00A9}' => out.push_str("(c)"),
+            '\u{00AE}' => out.push_str("(R)"),
+            '\u{2122}' => out.push_str("(TM)"),
+
+            // Currency (most are in WinAnsi — pass through)
+            // Default: passthrough. Latin-1 supplement chars
+            // (é, ñ, ü, etc.) are valid in WinAnsi as single
+            // bytes; printpdf handles them correctly. Multi-byte
+            // UTF-8 chars not in the table above might still
+            // mojibake — but the table covers what synthesised
+            // reports actually use.
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Per-level heading metadata. The renderer reads this to size +
@@ -723,6 +824,95 @@ mod tests {
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         assert!(name.contains(&today), "missing date {today}: {name}");
         assert!(name.ends_with(".pdf"));
+    }
+
+    /// 2026-05-04 regression: synthesised reports often contain
+    /// Unicode punctuation (em / en dashes, smart quotes,
+    /// ellipsis) that printpdf's built-in fonts can't carry
+    /// through cleanly — the WinAnsi-encoded font stream
+    /// reinterprets the UTF-8 bytes as Latin-1, so an en-dash
+    /// (`–`, UTF-8 `0xE2 0x80 0x93`) shows up as `â` followed
+    /// by control chars. Asserts the normaliser collapses each
+    /// problematic character into a WinAnsi-safe equivalent.
+    #[test]
+    fn normalise_for_winansi_fixes_en_dash_user_reported() {
+        // Direct repro of the user's reported bug: an en-dash
+        // ("Recommend evergreen ground covers – the survey")
+        // showed up as `â` in the PDF.
+        let input = "Recommend evergreen ground covers – the survey";
+        let out = normalise_for_winansi(input);
+        assert!(!out.contains('\u{2013}'), "en-dash must be replaced");
+        assert!(out.contains(" - "), "should be replaced with ASCII hyphen, got {out:?}");
+    }
+
+    #[test]
+    fn normalise_for_winansi_handles_em_dash_with_double_hyphen() {
+        let input = "first — second";
+        let out = normalise_for_winansi(input);
+        assert!(out.contains(" -- "), "em-dash should become double-hyphen, got {out:?}");
+    }
+
+    #[test]
+    fn normalise_for_winansi_collapses_smart_quotes_to_straight() {
+        let input = "He said \u{201C}hello\u{201D} and \u{2018}goodbye\u{2019}.";
+        let out = normalise_for_winansi(input);
+        assert_eq!(out, "He said \"hello\" and 'goodbye'.");
+    }
+
+    #[test]
+    fn normalise_for_winansi_replaces_ellipsis_with_three_dots() {
+        let input = "wait\u{2026}for\u{2026}it";
+        let out = normalise_for_winansi(input);
+        assert_eq!(out, "wait...for...it");
+    }
+
+    #[test]
+    fn normalise_for_winansi_replaces_arrows_and_comparators() {
+        // Common in research reports comparing values or showing flow.
+        assert_eq!(normalise_for_winansi("a \u{2192} b"), "a -> b");
+        assert_eq!(normalise_for_winansi("x \u{2265} 5"), "x >= 5");
+        assert_eq!(normalise_for_winansi("x \u{2264} 5"), "x <= 5");
+        assert_eq!(normalise_for_winansi("a \u{2260} b"), "a != b");
+        assert_eq!(normalise_for_winansi("\u{00B1}3"), "+/-3");
+        assert_eq!(normalise_for_winansi("3 \u{00D7} 4"), "3 x 4");
+    }
+
+    #[test]
+    fn normalise_for_winansi_strips_zero_width_chars() {
+        // Synthesizers occasionally emit zero-width joiners or BOMs
+        // that printpdf would also mojibake.
+        let input = "hello\u{200B}world\u{FEFF}!";
+        let out = normalise_for_winansi(input);
+        assert_eq!(out, "helloworld!");
+    }
+
+    #[test]
+    fn normalise_for_winansi_collapses_nbsp_to_space() {
+        // Non-breaking space looks identical visually but is two
+        // bytes in UTF-8 (`0xC2 0xA0`) — the leading `0xC2` shows
+        // up as `Â` in mojibake'd output.
+        let input = "first\u{00A0}second";
+        let out = normalise_for_winansi(input);
+        assert_eq!(out, "first second");
+    }
+
+    #[test]
+    fn normalise_for_winansi_passes_through_latin1_chars_unchanged() {
+        // é, ñ, ü, etc. ARE valid in WinAnsi as single bytes.
+        // printpdf handles them correctly — don't mangle them.
+        let input = "naïve résumé piñata";
+        assert_eq!(normalise_for_winansi(input), "naïve résumé piñata");
+    }
+
+    #[test]
+    fn normalise_for_winansi_passes_through_pure_ascii_unchanged() {
+        let input = "plain ASCII: 0123456789!?.,'\"";
+        assert_eq!(normalise_for_winansi(input), input);
+    }
+
+    #[test]
+    fn normalise_for_winansi_handles_empty_string() {
+        assert_eq!(normalise_for_winansi(""), "");
     }
 
     #[test]
