@@ -1443,6 +1443,81 @@ fn bench_research_plan_codec(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// TransportBindingStore — the bridge supervisor's inbound-routing
+// hot path. Every inbound Signal/WhatsApp/Matrix message becomes one
+// `lookup_principal_group(channel, foreign_id)` call before anything
+// else happens, so this needs to stay sub-50µs even with thousands of
+// bindings on the table. Indexed by (channel, foreign_id) PK so the
+// only thing growing the cost is the BTree depth.
+// ---------------------------------------------------------------------------
+
+fn bench_transport_binding_store(c: &mut Criterion) {
+    use execlaw_core::transport_bindings::TransportBindingStore;
+
+    let db = fresh_db();
+    let store = TransportBindingStore::new(&db);
+
+    // Seed 1k bindings across two channels so the indexed lookup
+    // touches a non-trivial BTree depth. Real-world deployments
+    // would likely have ~10s-100s; 1k is a 10-100x safety margin.
+    for i in 0..500 {
+        let fid = format!("signal:user:{i}");
+        store
+            .insert_binding("signal", &fid, &format!("pg-{i}"), false, i)
+            .unwrap();
+    }
+    for i in 0..500 {
+        let fid = format!("whatsapp:{i}");
+        store
+            .insert_binding("whatsapp", &fid, &format!("pg-w-{i}"), false, i)
+            .unwrap();
+    }
+
+    let hit = "signal:user:250";
+    let miss = "signal:user:never";
+
+    let mut group = c.benchmark_group("transport_binding_store");
+    // Inbound hit — the dominant case once the bridge has been
+    // running long enough to remember everyone.
+    group.bench_function("lookup_hit", |b| {
+        b.iter(|| {
+            store
+                .lookup_principal_group(black_box("signal"), black_box(hit))
+                .unwrap()
+        })
+    });
+    // Inbound miss — fires the first-contact flow. Should be
+    // identically fast (same indexed query, just no row).
+    group.bench_function("lookup_miss", |b| {
+        b.iter(|| {
+            store
+                .lookup_principal_group(black_box("signal"), black_box(miss))
+                .unwrap()
+        })
+    });
+    // Outbound dispatch path — list every binding for one group.
+    // Most groups have one binding; bench the realistic case.
+    group.bench_function("bindings_for_group", |b| {
+        b.iter(|| {
+            store
+                .bindings_for_group(black_box("pg-250"), black_box("signal"))
+                .unwrap()
+        })
+    });
+    // Touch — fired after every successful inbound ingest.
+    // Touches must NOT be slower than lookups or we double the
+    // per-message budget.
+    group.bench_function("touch", |b| {
+        b.iter(|| {
+            store
+                .touch_binding(black_box("signal"), black_box(hit), black_box(9_999))
+                .unwrap()
+        })
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_hmac,
@@ -1467,5 +1542,6 @@ criterion_group!(
     bench_research_plan_codec,
     bench_research_gather_paths,
     bench_research_purge_terminal,
+    bench_transport_binding_store,
 );
 criterion_main!(benches);

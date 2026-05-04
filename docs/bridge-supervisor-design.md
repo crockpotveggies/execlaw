@@ -40,58 +40,50 @@ Add to `crates/core/src/tool.rs` alongside the other `Option<Arc<dyn FooApi>>` c
 pub transport: Option<Arc<dyn TransportApi>>,
 ```
 
-```rust
-#[async_trait]
-pub trait TransportApi: Send + Sync {
-    /// Resolve a free-form recipient string (name, phone, JID) to a
-    /// canonical foreign-id. Backed by the Contacts plugin first,
-    /// then by the bridge's own contact list.
-    async fn resolve_recipient(
-        &self,
-        transport_id: &str,
-        free_form: &str,
-    ) -> Result<String, TransportError>;
+See `crates/core/src/tool.rs` for the live trait. Notes vs the sketch:
 
-    /// Send to a foreign-id, returning the bridge's message id for
-    /// idempotency / read-receipt correlation.
-    async fn send(
-        &self,
-        transport_id: &str,
-        recipient: &str,
-        text: &str,
-    ) -> Result<String, TransportError>;
-
-    /// The current turn's inbound JID, if the turn was triggered by
-    /// an inbound message on this transport. Mirror of
-    /// selfhosted-claw's `ctx.chatJid` — the `signal.reply` tool
-    /// reads it without taking a recipient arg.
-    fn current_chat_jid(&self, transport_id: &str) -> Option<String>;
-}
-```
-
-Capability declared per-plugin via a new `capabilities = ["transport:signal"]` field on `ToolDecl` so the `Option<Arc<dyn TransportApi>>` is only populated for tools that asked for it.
+- `transport_id` arg renamed to `channel` everywhere (matches the
+  storage column + `state_principal_groups.channel`).
+- `current_chat_jid` renamed to `current_chat_id` (JID is
+  Signal-specific; the surface is generic) and made `async` so
+  impls can swap to a DB-backed lookup without forcing
+  `block_in_place`.
+- All methods return `Result<_, ApiError>` — bridge-specific
+  failure modes collapse to existing variants (`NotFound`,
+  `Storage`, `NotAuthorized`).
+- Capability is a single flat `Capability::Transport`; the
+  per-call `channel` arg dispatches inside the impl. Earlier
+  sketch said `transport:signal` per-channel — flattening is
+  cleaner because channel is data, not capability.
 
 ## Storage
 
-New table:
+New table — see `crates/core/migrations/0032_transport_bindings.sql` for the live schema. Notes vs the original sketch:
 
-```sql
-CREATE TABLE state_transport_bindings (
-    principal_group_id TEXT NOT NULL,
-    transport_id       TEXT NOT NULL,
-    foreign_id         TEXT NOT NULL,
-    is_group           INTEGER NOT NULL DEFAULT 0,
-    created_at         INTEGER NOT NULL,
-    last_seen_at       INTEGER,
-    PRIMARY KEY (principal_group_id, transport_id)
-);
-CREATE INDEX idx_transport_bindings_foreign
-    ON state_transport_bindings(transport_id, foreign_id);
-```
+- The column is `channel`, not `transport_id` — matches the existing
+  `state_principal_groups.channel` column so joins read naturally.
+- PK is `(channel, foreign_id)` — inbound routing is the dominant
+  hot path. The reverse `principal_group_id → bindings` direction
+  is covered by `idx_transport_bindings_pg`.
+- A separate `idx_transport_bindings_channel_last_seen` keeps the
+  retention sweep off a full scan once the table grows.
+- No FK to `state_principal_groups` — see migration comment + the
+  `insert_succeeds_for_nonexistent_principal_group` test for why
+  (first-contact flow needs binding-first/group-second ordering).
 
-Inbound routing: `SELECT principal_group_id FROM state_transport_bindings WHERE transport_id = ? AND foreign_id = ?`. Miss → first-contact intake.
+Inbound routing: `lookup_principal_group(channel, foreign_id)` — single indexed query. Miss → first-contact intake.
 
-Outbound: lookup by `principal_group_id` to find the foreign-id, dispatch via the supervisor's RPC handle.
+Outbound: `bindings_for_group(group_id, channel)` returns every binding the supervisor needs to dispatch to.
+
+API split lessons-learned:
+
+- `insert_binding` errors-as-`Ok(false)` on PK conflict (does NOT
+  silently steal). `repoint_binding` is the explicit rebind path
+  and returns the displaced `principal_group_id` for audit logging.
+  Earlier draft had a single `upsert_binding` that conflated the
+  two — first-insert and "steal an existing binding" were
+  syntactically identical, which is exactly the kind of footgun a
+  buggy bridge would trip on.
 
 ## Bridge RPC
 
@@ -109,7 +101,8 @@ Plugin manifest `[transport]` table gains `rpc_port` + `rpc_host` so the supervi
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | trust_floor manifest knob + dispatcher enforcement; signal humaniser entries; signal plugin manifest stub | **shipped** |
-| 2 | `TransportApi` capability trait + `state_transport_bindings` table + supervisor skeleton (no real RPC yet, just container lifecycle) | next |
+| 2a | `TransportApi` capability trait + `state_transport_bindings` table + `TransportBindingStore` + criterion bench | **shipped** |
+| 2b | Bridge supervisor skeleton (container lifecycle reusing `ServiceController`, healthcheck/restart loop, no RPC yet) | next |
 | 3 | signal-cli sidecar container declaration + bridge RPC client + outbound dispatch wired to `signal.send_message` / `signal.reply` | |
 | 4 | Inbound stream consumer + first-contact intake → conversation creation → existing trust pipeline | |
 | 5 | Group ops (`create_group`, `add_group_members`, `leave_group`, `list_groups`) | |

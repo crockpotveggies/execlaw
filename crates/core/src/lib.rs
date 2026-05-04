@@ -50,6 +50,7 @@ pub mod skills_config;
 pub mod tool;
 pub mod tool_access;
 pub mod tool_apis;
+pub mod transport_bindings;
 pub mod transport_conversations;
 pub mod trust_policy;
 pub mod transport_cursor;

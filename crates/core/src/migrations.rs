@@ -182,6 +182,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "skill-proposals",
         sql: include_str!("../migrations/0031_skill_proposals.sql"),
     },
+    Migration {
+        id: 32,
+        name: "transport-bindings",
+        sql: include_str!("../migrations/0032_transport_bindings.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -317,7 +322,7 @@ mod tests {
             applied,
             vec![
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27, 28, 29, 30, 31,
+                24, 25, 26, 27, 28, 29, 30, 31, 32,
             ]
         );
 
@@ -367,6 +372,7 @@ mod tests {
             "state_skill_invocations",
             "config_skills",
             "state_skill_proposals",
+            "state_transport_bindings",
         ];
         db.with_conn(|c| {
             for t in &tables {
@@ -394,7 +400,7 @@ mod tests {
             first,
             vec![
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27, 28, 29, 30, 31,
+                24, 25, 26, 27, 28, 29, 30, 31, 32,
             ]
         );
         assert!(

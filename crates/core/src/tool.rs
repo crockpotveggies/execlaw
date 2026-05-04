@@ -157,6 +157,16 @@ pub enum Capability {
     /// from `Notify` because it only makes sense with a registered
     /// AttachmentRow and a meaningful conversation_id.
     AttachmentSend,
+    /// Outbound dispatch through a bridged transport (Signal,
+    /// WhatsApp, Matrix, ...). The runtime hands the tool a
+    /// `TransportApi` keyed by `channel`; resolving recipients,
+    /// sending messages, and reading the current inbound chat id
+    /// all flow through it. Distinct from `Notify` (which is the
+    /// controller's priority-channel sideband — typically a
+    /// single, hard-wired transport configured by the operator),
+    /// because `Transport` is the agent's general "send outbound
+    /// on a registered bridge" surface.
+    Transport,
 }
 
 impl Capability {
@@ -177,6 +187,7 @@ impl Capability {
             Self::ResearchSpawn => "research_spawn",
             Self::ResearchRead => "research_read",
             Self::AttachmentSend => "attachment_send",
+            Self::Transport => "transport",
         }
     }
 
@@ -197,6 +208,7 @@ impl Capability {
             "research_spawn" => Some(Self::ResearchSpawn),
             "research_read" => Some(Self::ResearchRead),
             "attachment_send" => Some(Self::AttachmentSend),
+            "transport" => Some(Self::Transport),
             _ => None,
         }
     }
@@ -312,6 +324,11 @@ pub struct ToolCtx {
     pub subagent: Option<Arc<dyn SubagentApi>>,
     pub research: Option<Arc<dyn ResearchApi>>,
     pub attachments: Option<Arc<dyn AttachmentApi>>,
+    /// Outbound bridge transport. Populated for tools that declared
+    /// `Capability::Transport`. Consumers pass `channel` ("signal",
+    /// "whatsapp", ...) on each call so one capability slot serves
+    /// every registered bridge — no per-channel cap proliferation.
+    pub transport: Option<Arc<dyn TransportApi>>,
 }
 
 impl ToolCtx {
@@ -336,6 +353,7 @@ impl ToolCtx {
             subagent: None,
             research: None,
             attachments: None,
+            transport: None,
         }
     }
 }
@@ -851,6 +869,63 @@ pub trait WebFetchApi: Send + Sync {
     async fn get(&self, url: &str) -> Result<WebFetchResponse, ApiError>;
 }
 
+/// Outbound transport / bridge API.
+///
+/// Mirrors selfhosted-claw's per-turn `ctx.sendMessage` /
+/// `ctx.resolveRecipient` / `ctx.chatJid` triple, but parameterised
+/// by `channel` so a single capability slot can serve every bridged
+/// transport. Bridge-supervised plugins (Signal, WhatsApp, ...) all
+/// land here; the supervisor dispatches by channel string to the
+/// right RPC handle.
+///
+/// Errors come back as `ApiError`. Bridge-specific failure modes
+/// (signal-cli unreachable, recipient blocked the controller, group
+/// membership lost, ...) all collapse to `ApiError` variants — the
+/// tool's job is to convert to a user-facing `ToolOutcome::Err` with
+/// a stable code.
+#[async_trait]
+pub trait TransportApi: Send + Sync {
+    /// Resolve a free-form recipient string (display name, phone
+    /// number, foreign id, ...) to a canonical foreign id the
+    /// bridge can dispatch to. Implementations consult the contacts
+    /// registry first, then fall back to the bridge's own contact
+    /// list (signal-cli has one, signal-cli's `--contact` lookup).
+    /// Returns `ApiError::NotFound` when nothing matches.
+    async fn resolve_recipient(
+        &self,
+        channel: &str,
+        free_form: &str,
+    ) -> Result<String, ApiError>;
+
+    /// Dispatch `text` to `recipient` (a canonical foreign id).
+    /// Returns the bridge's message id for read-receipt /
+    /// idempotency correlation; the supervisor logs it.
+    async fn send(
+        &self,
+        channel: &str,
+        recipient: &str,
+        text: &str,
+    ) -> Result<String, ApiError>;
+
+    /// The current turn's inbound foreign id, if the turn was
+    /// triggered by an inbound message on this transport. Mirror of
+    /// selfhosted-claw's `ctx.chatJid`. The `signal.reply` tool
+    /// reads this and dispatches without taking a recipient arg.
+    /// `Ok(None)` when the turn was triggered some other way (web
+    /// SPA, scheduled task, controller-initiated, ...).
+    ///
+    /// Async deliberately — even when an impl caches the value in a
+    /// pre-populated `HashMap` (the common case), keeping the
+    /// signature async lets us swap to a DB-backed lookup later
+    /// without forcing every consumer to migrate. The cost of the
+    /// extra `await` on a synchronous-cache hit is one Rust function
+    /// call.
+    async fn current_chat_id(
+        &self,
+        channel: &str,
+    ) -> Result<Option<String>, ApiError>;
+}
+
 /// Memory API. Reads cascade from the caller's trust class downward
 /// (you can read at-or-below your level). Writes always land at your
 /// own trust class — there's no escalation.
@@ -886,10 +961,26 @@ mod tests {
             Capability::SubagentSpawn,
             Capability::ResearchSpawn,
             Capability::ResearchRead,
+            Capability::AttachmentSend,
+            Capability::Transport,
         ] {
             assert_eq!(Capability::parse(c.as_str()), Some(c));
         }
         assert_eq!(Capability::parse("not_a_real_capability"), None);
+    }
+
+    #[test]
+    fn tool_ctx_empty_leaves_transport_slot_unpopulated() {
+        // Belt-and-suspenders: the `Transport` capability is opt-in
+        // per tool. A tool that didn't declare it must NOT find a
+        // transport handle in its ctx — that's the whole point of
+        // capability-scoped contexts.
+        let ctx = ToolCtx::empty(
+            ConversationId::from("c"),
+            "Controller",
+            Arc::new(SystemClock),
+        );
+        assert!(ctx.transport.is_none());
     }
 
     #[test]
