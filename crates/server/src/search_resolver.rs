@@ -15,7 +15,9 @@
 
 use crate::tool_apis_search::DuckDuckGoSearchApi;
 use crate::tool_apis_search_brave::BraveSearchApi;
+use crate::tool_apis_search_exa::ExaSearchApi;
 use crate::tool_apis_search_searxng::SearxNGSearchApi;
+use crate::tool_apis_search_tavily::TavilySearchApi;
 use execlaw_core::Database;
 use execlaw_core::search_providers::{
     SearchProviderKind, SearchProviderRow, SearchProviderStore,
@@ -71,6 +73,22 @@ pub fn construct_from_row(row: &SearchProviderRow) -> Arc<dyn WebSearchApi> {
                 .unwrap_or("")
                 .to_owned();
             Arc::new(BraveSearchApi::new(api_key))
+        }
+        SearchProviderKind::Exa => {
+            let api_key = cfg
+                .get("api_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            Arc::new(ExaSearchApi::new(api_key))
+        }
+        SearchProviderKind::Tavily => {
+            let api_key = cfg
+                .get("api_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            Arc::new(TavilySearchApi::new(api_key))
         }
     }
 }
@@ -128,6 +146,42 @@ mod tests {
             .unwrap();
         let provider = resolve_active_provider(&db);
         assert_eq!(provider.provider_id(), "brave");
+    }
+
+    #[test]
+    fn resolves_to_exa_when_promoted_with_api_key() {
+        let db = fresh_db();
+        let store = SearchProviderStore::new(&db);
+        store
+            .upsert(&SearchProviderRow {
+                kind: SearchProviderKind::Exa,
+                enabled: true,
+                is_default: true,
+                config_json: r#"{"api_key":"exa-test"}"#.into(),
+                created_at: 100,
+                updated_at: 100,
+            })
+            .unwrap();
+        let provider = resolve_active_provider(&db);
+        assert_eq!(provider.provider_id(), "exa");
+    }
+
+    #[test]
+    fn resolves_to_tavily_when_promoted_with_api_key() {
+        let db = fresh_db();
+        let store = SearchProviderStore::new(&db);
+        store
+            .upsert(&SearchProviderRow {
+                kind: SearchProviderKind::Tavily,
+                enabled: true,
+                is_default: true,
+                config_json: r#"{"api_key":"tvly-test"}"#.into(),
+                created_at: 100,
+                updated_at: 100,
+            })
+            .unwrap();
+        let provider = resolve_active_provider(&db);
+        assert_eq!(provider.provider_id(), "tavily");
     }
 
     #[test]

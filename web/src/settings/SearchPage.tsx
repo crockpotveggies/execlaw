@@ -79,6 +79,38 @@ const KNOWN_KINDS: ReadonlyArray<{
             },
         ],
     },
+    {
+        kind: "exa",
+        display: "Exa (neural search)",
+        description:
+            "Neural / semantic web search built for AI agents. Returns higher-signal results than keyword engines for natural-language queries. Includes extracted page text + highlights so the gather worker doesn't have to re-fetch every URL. Paid by query + content fee. Get a key at exa.ai.",
+        fields: [
+            {
+                key: "api_key",
+                label: "API key",
+                type: "password",
+                placeholder: "exa-...",
+                helpText:
+                    "Your Exa API key, sent as the x-api-key header. Stored server-side.",
+            },
+        ],
+    },
+    {
+        kind: "tavily",
+        display: "Tavily (RAG-optimised)",
+        description:
+            "Search API purpose-built for LLM/RAG pipelines. Free tier (1k credits/month) is enough for personal research workloads. Returns clean per-result snippets; we skip the optional answer summary since gather has its own synthesizer. Get a key at tavily.com.",
+        fields: [
+            {
+                key: "api_key",
+                label: "API key",
+                type: "password",
+                placeholder: "tvly-...",
+                helpText:
+                    "Your Tavily API key (typically starts with 'tvly-'), sent as a Bearer token. Stored server-side.",
+            },
+        ],
+    },
 ];
 
 interface EditingState {
@@ -249,6 +281,28 @@ export function SearchPage() {
         [providers],
     );
 
+    /// Order the cards: active default first (most-relevant for the
+    /// operator who's looking at this page because something with
+    /// the active provider isn't working), then any other configured
+    /// providers, then unconfigured ones in the canonical
+    /// KNOWN_KINDS order. Stable across renders so cards don't
+    /// shuffle while the user is reading.
+    const orderedKinds = useMemo(() => {
+        const defaultKind = (providers ?? []).find((p) => p.is_default)?.kind;
+        const score = (kind: string): number => {
+            if (kind === defaultKind) return 0;
+            if (configuredKinds.has(kind)) return 1;
+            return 2;
+        };
+        return [...KNOWN_KINDS].sort((a, b) => {
+            const sa = score(a.kind);
+            const sb = score(b.kind);
+            if (sa !== sb) return sa - sb;
+            // Same priority bucket → preserve canonical order.
+            return KNOWN_KINDS.indexOf(a) - KNOWN_KINDS.indexOf(b);
+        });
+    }, [providers, configuredKinds]);
+
     return (
         <div className="execlaw-settings__page" data-testid="settings-search">
             <header className="mb-3">
@@ -278,7 +332,7 @@ export function SearchPage() {
 
             {!loading && (
                 <div className="d-flex flex-column gap-3">
-                    {KNOWN_KINDS.map((meta) => {
+                    {orderedKinds.map((meta) => {
                         const row = providers?.find((p) => p.kind === meta.kind);
                         const configured = configuredKinds.has(meta.kind);
                         const isDefault = row?.is_default ?? false;

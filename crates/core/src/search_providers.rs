@@ -41,6 +41,18 @@ pub enum SearchProviderKind {
     /// fast + reliable + AI-research-friendly. Requires an API
     /// key from search.brave.com.
     Brave,
+    /// Exa (formerly Metaphor). Neural / semantic web search built
+    /// for AI agents. Returns higher-signal results than keyword
+    /// engines for natural-language research queries; supports
+    /// "neural", "keyword", and "auto" search modes. Requires an
+    /// API key from exa.ai. Paid by query + content cost.
+    Exa,
+    /// Tavily Search. Purpose-built for LLM/RAG pipelines —
+    /// returns clean snippets + an LLM-generated answer summary
+    /// (when requested). Requires an API key from tavily.com.
+    /// Free tier (currently 1k credits/month) is enough for
+    /// personal research workloads.
+    Tavily,
 }
 
 impl SearchProviderKind {
@@ -49,6 +61,8 @@ impl SearchProviderKind {
             Self::DuckDuckGo => "duckduckgo",
             Self::SearxNG => "searxng",
             Self::Brave => "brave",
+            Self::Exa => "exa",
+            Self::Tavily => "tavily",
         }
     }
 
@@ -57,6 +71,8 @@ impl SearchProviderKind {
             "duckduckgo" => Some(Self::DuckDuckGo),
             "searxng" => Some(Self::SearxNG),
             "brave" => Some(Self::Brave),
+            "exa" => Some(Self::Exa),
+            "tavily" => Some(Self::Tavily),
             _ => None,
         }
     }
@@ -70,6 +86,8 @@ impl SearchProviderKind {
             Self::DuckDuckGo => "DuckDuckGo",
             Self::SearxNG => "SearxNG (self-hosted)",
             Self::Brave => "Brave Search API",
+            Self::Exa => "Exa (neural search)",
+            Self::Tavily => "Tavily (RAG-optimised)",
         }
     }
 }
@@ -390,6 +408,8 @@ mod tests {
             SearchProviderKind::DuckDuckGo,
             SearchProviderKind::SearxNG,
             SearchProviderKind::Brave,
+            SearchProviderKind::Exa,
+            SearchProviderKind::Tavily,
         ] {
             assert_eq!(SearchProviderKind::parse(k.as_str()), Some(k));
             assert!(!k.display_name().is_empty());

@@ -21,6 +21,8 @@ pub mod attachment_api;
 pub mod attachments_admin;
 pub mod tool_apis_search_searxng;
 pub mod tool_apis_search_brave;
+pub mod tool_apis_search_exa;
+pub mod tool_apis_search_tavily;
 pub mod search_resolver;
 pub mod settings_search;
 pub mod auth;
