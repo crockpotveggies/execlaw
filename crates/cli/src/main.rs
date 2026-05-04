@@ -303,8 +303,23 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
+    // Default filter: `info` for everything else, plus a per-crate
+    // override that silences html5ever's noisy WARN spam. The
+    // `html5ever::serialize` module fires `warn!("node with weird
+    // namespace ...")` for every element with a non-html/mathml/svg
+    // namespace — which fires constantly when dom_smoothie
+    // serializes the cleaned DOM during deep-research gather (one
+    // line per element per page; thousands per job). It's a known
+    // upstream issue (servo/html5ever#122) that they've left as a
+    // FIXME for years; safe to ignore at our level.
+    //
+    // Operators can still see those messages by setting
+    // RUST_LOG="html5ever=warn,..." explicitly; the default just
+    // gets them out of the way.
+    let default_filter_directive =
+        "info,html5ever=error,markup5ever=error,html5ever::serialize=error";
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter_directive));
     let want_json = std::env::var("EXECLAW_LOG_FORMAT")
         .map(|v| v.eq_ignore_ascii_case("json"))
         .unwrap_or(false);
