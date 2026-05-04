@@ -201,6 +201,7 @@ pub fn project_cards_for_conversation(
     let mut by_id: std::collections::HashMap<String, Card> =
         std::collections::HashMap::new();
     for ev in events {
+        let ev_seq = ev.seq.0;
         let (card_id, card_event) = match ev.kind {
             EventKind::CardOpened => {
                 let p: CardOpenedPayload = decode_payload(&ev)?;
@@ -219,11 +220,29 @@ pub fn project_cards_for_conversation(
             }
             _ => continue,
         };
+        // 2026-05-04 (rev 10): event_seq is the card's "surface
+        // seq" — the seq it sorts by in the SPA's chat-pane
+        // timeline. Updated on:
+        //   * CardOpened (initial OR resume after clarification —
+        //     the runner emits a duplicate Open with a fresh seq,
+        //     so the card pops to the bottom)
+        //   * CardClosed (one-time pop on completion so the
+        //     deliverable surfaces inline with the latest
+        //     activity)
+        // NOT updated on CardProgressed (intermediate Gather/
+        // Synth ticks would otherwise pop the card on every
+        // sub-query, which is too noisy).
+        let bumps_surface_seq =
+            matches!(card_event, CardEvent::Opened(..) | CardEvent::Closed(..));
         if let Some(c) = by_id.get_mut(&card_id) {
             c.apply(&card_event);
+            if bumps_surface_seq {
+                c.event_seq = Some(ev_seq);
+            }
         } else if let CardEvent::Opened(..) = &card_event
-            && let Some(c) = Card::from_opened(cid.as_str(), &card_event)
+            && let Some(mut c) = Card::from_opened(cid.as_str(), &card_event)
         {
+            c.event_seq = Some(ev_seq);
             by_id.insert(card_id, c);
         }
         // Progressed/Closed before Opened: skip. Same tolerance
@@ -252,6 +271,7 @@ pub fn project_card(
     let events = log.replay_since(cid, EventSeq(0))?;
     let mut card: Option<Card> = None;
     for ev in events {
+        let ev_seq = ev.seq.0;
         let card_event = match ev.kind {
             EventKind::CardOpened => {
                 let p: CardOpenedPayload = decode_payload(&ev)?;
@@ -278,7 +298,8 @@ pub fn project_card(
         };
         match (&mut card, &card_event) {
             (None, CardEvent::Opened(..)) => {
-                card = Card::from_opened(cid.as_str(), &card_event);
+                card = Card::from_opened(cid.as_str(), &card_event)
+                    .map(|mut c| { c.event_seq = Some(ev_seq); c });
             }
             (Some(c), _) => {
                 c.apply(&card_event);
@@ -545,6 +566,84 @@ mod tests {
         let b = &cards[1];
         assert_eq!(b.state, CardState::Running);
         assert_eq!(b.kind, CardKind::Attachment);
+    }
+
+    /// 2026-05-04 — `event_seq` on the projected Card is the
+    /// "surface seq" the SPA's chat-pane uses for inline ordering.
+    /// Bumped on CardOpened (initial OR resume after clarification —
+    /// the runner emits a duplicate Open with a fresh seq) and on
+    /// CardClosed (one-time pop on completion). NOT bumped on
+    /// CardProgressed (intermediate gather/synth ticks would
+    /// otherwise pop the card on every sub-query, too noisy).
+    #[test]
+    fn project_event_seq_bumps_on_open_and_close_but_not_on_progressed() {
+        let db = fresh_db();
+        let cid = seed_conv(&db, "conv-pop");
+
+        // Open — initial seq.
+        open_card(
+            &db,
+            &cid,
+            "system",
+            &CardOpenedPayload {
+                card_id: "c1".into(),
+                kind: CardKind::Research,
+                title: "T".into(),
+                summary: "starting".into(),
+                state: Some(CardState::Running),
+                details: serde_json::json!({}),
+                actions: vec![],
+            },
+        )
+        .unwrap();
+        let after_open = project_cards_for_conversation(&db, &cid).unwrap();
+        let open_seq = after_open[0].event_seq.expect("event_seq populated on open");
+        assert!(open_seq > 0);
+
+        // Progressed — must NOT bump.
+        progress_card(
+            &db,
+            &cid,
+            "system",
+            &CardProgressedPayload {
+                card_id: "c1".into(),
+                state: Some(CardState::Running),
+                progress: Some(0.4),
+                phase: Some("Gathering".into()),
+                details: None,
+                actions: None,
+                summary: Some("mid".into()),
+            },
+        )
+        .unwrap();
+        let after_progress = project_cards_for_conversation(&db, &cid).unwrap();
+        assert_eq!(
+            after_progress[0].event_seq,
+            Some(open_seq),
+            "Progressed must not bump surface seq",
+        );
+
+        // Closed — must bump.
+        close_card(
+            &db,
+            &cid,
+            "system",
+            &CardClosedPayload {
+                card_id: "c1".into(),
+                state: CardState::Completed,
+                summary: "done".into(),
+                details: None,
+                attachment_id: Some("att-1".into()),
+                error: None,
+            },
+        )
+        .unwrap();
+        let after_close = project_cards_for_conversation(&db, &cid).unwrap();
+        let close_seq = after_close[0].event_seq.expect("event_seq still populated");
+        assert!(
+            close_seq > open_seq,
+            "Closed must bump surface seq above the open seq (open={open_seq}, close={close_seq})",
+        );
     }
 
     #[test]

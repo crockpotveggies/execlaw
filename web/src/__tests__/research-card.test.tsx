@@ -179,6 +179,43 @@ describe("ResearchCard renderer", () => {
         expect(screen.getByTestId("card-research")).toBeTruthy();
     });
 
+    /// 2026-05-04 (rev 4): the PDF deliverable now lives on the
+    /// ResearchCard itself as an inline Download button rather
+    /// than a separate Attachment chip. Renders only when the
+    /// card is in the terminal Completed state AND has an
+    /// attachment_id set. Same code path for live (CardClosed
+    /// payload's attachment_id field) and replayed (cardStore
+    /// hydration via listCards projection).
+    it("renders an inline Download button when state=Completed and attachment_id is set", () => {
+        const card = makeResearchCard({
+            state: "Completed",
+            attachment_id: "att-abc",
+        });
+        render(<ResearchCard card={card} />);
+        const dl = screen.getByTestId("card-research-download-link");
+        expect(dl).toBeTruthy();
+        expect(dl.getAttribute("href")).toContain("/api/attachments/att-abc");
+        expect(dl.getAttribute("download")).not.toBeNull();
+    });
+
+    it("does NOT render the Download button while the card is still Running", () => {
+        const card = makeResearchCard({
+            state: "Running",
+            attachment_id: "att-pre", // shouldn't happen in practice, but defend
+        });
+        render(<ResearchCard card={card} />);
+        expect(screen.queryByTestId("card-research-download")).toBeNull();
+    });
+
+    it("does NOT render the Download button when attachment_id is missing", () => {
+        const card = makeResearchCard({
+            state: "Completed",
+            attachment_id: null,
+        });
+        render(<ResearchCard card={card} />);
+        expect(screen.queryByTestId("card-research-download")).toBeNull();
+    });
+
     it("does NOT render the report markdown inline (delivery is via send_attachment)", () => {
         // 2026-05-03 (rev 3): the inline `<pre>{report_markdown}</pre>`
         // block was removed. Reports were 1000+ lines and bloated the

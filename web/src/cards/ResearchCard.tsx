@@ -18,8 +18,10 @@
 //
 // 2026-04-29.
 
-import { useState } from "react";
+import { useContext, useState } from "react";
+import { AuthContext } from "../auth/AuthContext";
 import { registerCardRenderer, type CardRendererProps } from "./CardRenderer";
+import type { Card } from "./types";
 
 type SubQueryState = "Pending" | "Running" | "Done" | "Failed";
 
@@ -204,16 +206,24 @@ export function ResearchCard({ card, onAction }: CardRendererProps) {
             <div className="execlaw-card-task__summary">{card.summary}</div>
 
             {/*
-              * 2026-05-03 (rev 3): the inline `<pre>` markdown dump
-              * was removed. Reports were 1000+ lines and bloated the
-              * chat pane. The PDF deliverable now flows through the
-              * agent's `send_attachment` tool, which emits an
-              * `Attachment` card immediately after this one — the SPA
-              * renders it as a download chip with a save-as button.
-              * The markdown remains on disk under the workspace; the
-              * /research/<job_id> page exposes it for operators who
-              * want to read it inline rather than download.
+              * 2026-05-04 (rev 4): the PDF deliverable now lives on
+              * THIS card as a Download button (rendered below) rather
+              * than via a separate Attachment chip. Two reasons:
+              *   1. The separate chip + parent research card created
+              *      visual duplication ("research complete" message
+              *      followed by "here's a file" chip) that read as
+              *      sloppy / two-step instead of one cohesive
+              *      result.
+              *   2. The chip's render diverged between live
+              *      (CardOpened/Closed via send_attachment) and
+              *      replayed (cardStore hydration on refresh)
+              *      paths, making refresh feel buggy.
+              * The download button just inlines into this card; both
+              * live and replayed render through the same code path
+              * because attachment_id is part of the card row itself.
               */}
+            <DownloadButton card={card} />
+
 
             {card.error && (
                 <div
@@ -362,6 +372,49 @@ function StatusBadge({ state }: { state: SubQueryState }) {
         >
             {label}
         </span>
+    );
+}
+
+/// Inline download button for the research deliverable. Renders
+/// only when:
+///   * The card has an `attachment_id` set (synthesise produced a
+///     PDF and the runner stamped it on CardClosed)
+///   * The card is in a terminal Completed state (the runner sets
+///     attachment_id BEFORE closing, so this gate ensures we don't
+///     show a stale link mid-run)
+///
+/// Replaces the previous "separate Attachment card chip" rendering.
+/// Same persistence guarantees as any other ResearchCard field —
+/// attachment_id flows through CardClosed payload and survives
+/// page refresh via the listCards projection.
+function DownloadButton({ card }: { card: Card }) {
+    const auth = useContext(AuthContext);
+    if (card.state !== "Completed") return null;
+    if (!card.attachment_id) return null;
+    const token = auth?.getAccessToken() ?? null;
+    const baseUrl = `/api/attachments/${card.attachment_id}`;
+    // Token in query-string so the `<a download>` link
+    // authenticates — browsers don't carry the Authorization
+    // header on link navigations. See auth_extract.rs's
+    // `?access_token=…` fallback.
+    const url = token
+        ? `${baseUrl}?access_token=${encodeURIComponent(token)}`
+        : baseUrl;
+    return (
+        <div
+            className="execlaw-card-research__download"
+            data-testid="card-research-download"
+        >
+            <a
+                className="btn btn-sm btn-primary"
+                href={url}
+                download
+                data-testid="card-research-download-link"
+            >
+                <i className="bi bi-download me-1" aria-hidden />
+                Download report (PDF)
+            </a>
+        </div>
     );
 }
 

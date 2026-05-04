@@ -63,9 +63,13 @@ export function applyEvent(card: Card, ev: CardEvent): Card {
     if (targetId !== card.card_id) return card;
 
     if (ev.kind === "card.opened") {
-        // CardOpened on an already-open card — replace
-        // title/summary/state/details/actions to match the runner's
-        // re-key (e.g. server restart with the same id).
+        // CardOpened on an already-open card — happens on
+        // clarification resume (the runner emits a fresh Open with
+        // the same card_id when claim_next_pending re-claims a
+        // Pending row). Replace title/summary/state/details/actions
+        // AND clear the stale `phase` (which would otherwise stay
+        // on "AwaitingInput" after the resume), AND bump event_seq
+        // so the card pops to its new position in the timeline.
         const p = ev.payload as CardOpenedPayload;
         return {
             ...card,
@@ -73,8 +77,16 @@ export function applyEvent(card: Card, ev: CardEvent): Card {
             state: p.state ?? card.state,
             title: p.title,
             summary: p.summary,
+            // Reset phase — the runner emits an explicit
+            // CardProgressed{phase: "Planning"} immediately after
+            // this on the resume path; clearing here avoids a
+            // single-frame flash of the stale label.
+            phase: null,
             details: p.details ?? card.details,
             actions: p.actions ?? card.actions,
+            // Surface-seq bump — this card was just (re-)opened,
+            // so it pops to the bottom of the inline timeline.
+            event_seq: ev.event_seq ?? card.event_seq,
         };
     }
 
@@ -92,7 +104,10 @@ export function applyEvent(card: Card, ev: CardEvent): Card {
         };
     }
 
-    // ev.kind === "card.closed"
+    // ev.kind === "card.closed" — terminal state. One-time pop on
+    // the close event so the deliverable surfaces inline with the
+    // latest activity, then frozen (further messages naturally
+    // appear after this card without re-popping it).
     const p = ev.payload;
     return {
         ...card,
@@ -103,6 +118,11 @@ export function applyEvent(card: Card, ev: CardEvent): Card {
             p.attachment_id !== undefined ? p.attachment_id : card.attachment_id,
         error: p.error !== undefined ? p.error : card.error,
         updated_at: ev.committed_at,
+        // Surface-seq bump on close so the completed card pops to
+        // the bottom of the timeline once. CardProgressed events
+        // (intermediate ticks) deliberately don't bump — only the
+        // milestone transitions do.
+        event_seq: ev.event_seq ?? card.event_seq,
     };
 }
 

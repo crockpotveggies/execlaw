@@ -287,6 +287,21 @@ pub struct Card {
     pub opened_at: i64,
     /// Unix-seconds of the most recent event committed.
     pub updated_at: i64,
+    /// Monotonic event-log seq of the `CardOpened` event. Drives
+    /// stable inline ordering in the SPA's chat-pane timeline:
+    /// `opened_at` is Unix-seconds, so two cards opened in the
+    /// same tick (the runner often emits CardOpened back-to-back
+    /// during a single phase) tied on the timestamp and HashMap
+    /// iteration in the projection produced non-deterministic
+    /// ordering on every page refresh. The seq is monotonic and
+    /// unique per row, so sorting on it gives a deterministic +
+    /// log-order match.
+    ///
+    /// `Option<i64>` so the SPA's bootstrap that doesn't have the
+    /// seq (incognito mock cards, fixture data) keeps round-
+    /// tripping; `None` falls back to opened_at-based ordering.
+    #[serde(default)]
+    pub event_seq: Option<i64>,
 }
 
 /// One step in a projection — exposed so callers (the SPA's WS
@@ -391,6 +406,9 @@ impl Card {
                 error: None,
                 opened_at: *ts,
                 updated_at: *ts,
+                // Caller (the projection helper) overwrites this
+                // after construction with the open-event seq.
+                event_seq: None,
             }),
             _ => None,
         }

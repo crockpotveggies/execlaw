@@ -433,9 +433,21 @@ impl<'db> ResearchJobStore<'db> {
                 )
                 .ok();
             if let Some(id) = id.as_ref() {
+                // 2026-05-04 — preserve existing card_id when set.
+                // Without `COALESCE(card_id, ?1)`, a row that's been
+                // through one planner pass + clarification resume
+                // gets a NEW card_id assigned on the next claim,
+                // and the original AwaitingInput card stays
+                // stranded in the SPA's chat-pane as an orphan.
+                // Reusing the existing id lets the runner emit
+                // CardProgressed onto the SAME card so it
+                // transitions smoothly from AwaitingInput →
+                // Planning → ... → Completed in one continuous
+                // visual stream.
                 tx.execute(
                     "UPDATE state_research_jobs \
-                     SET status = 'planning', card_id = ?1, \
+                     SET status = 'planning', \
+                         card_id = COALESCE(card_id, ?1), \
                          started_at = ?2, updated_at = ?2 \
                      WHERE id = ?3 AND status = 'pending'",
                     params![card_id_owned, now, id],
@@ -1479,6 +1491,58 @@ mod tests {
         assert_eq!(claimed.started_at, Some(200));
         // Second claim returns None.
         assert!(store.claim_next_pending("card-2", 300).unwrap().is_none());
+    }
+
+    /// 2026-05-04 regression: claim_next_pending used to overwrite
+    /// the row's card_id with the freshly-generated one on EVERY
+    /// claim — including the one that fires after
+    /// resume_with_clarification flips the row back to Pending.
+    /// Result: the user's clarification answer kicked off a new
+    /// planner pass on a NEW card, leaving the original
+    /// AwaitingInput card stranded in the SPA's chat-pane as an
+    /// orphan. Fix: COALESCE(card_id, ?1) so resumed claims keep
+    /// the original card (the runner emits a fresh CardOpened
+    /// onto the same id, transitioning it visually from
+    /// AwaitingInput → Planning rather than spawning a sibling
+    /// card).
+    #[test]
+    fn claim_next_pending_preserves_existing_card_id_on_resume() {
+        let db = fresh_db();
+        let store = ResearchJobStore::new(&db);
+        let id = ResearchJobId::new();
+        store
+            .insert_pending(
+                &id,
+                &ConversationId::from("c"),
+                "Recommend ground covers",
+                "Controller",
+                None,
+                100,
+            )
+            .unwrap();
+
+        // First claim — fresh card_id assigned.
+        let first = store.claim_next_pending("card-original", 200).unwrap().unwrap();
+        assert_eq!(first.card_id.as_deref(), Some("card-original"));
+
+        // Simulate the planner returning clarification + the user
+        // answering: AwaitingInput → resume → Pending.
+        store.set_awaiting_input(&id, "Which zone?", 250).unwrap();
+        store
+            .resume_with_clarification(&id, "Zone 6", 300)
+            .unwrap();
+
+        // Second claim — supervisor's next tick. Must NOT
+        // overwrite the original card_id even though we passed
+        // a fresh placeholder. This is the regression.
+        let resumed = store.claim_next_pending("card-fresh-uuid", 400).unwrap().unwrap();
+        assert_eq!(
+            resumed.card_id.as_deref(),
+            Some("card-original"),
+            "resumed claim must reuse the original card_id so the SPA's existing card transitions \
+             instead of being orphaned",
+        );
+        assert_eq!(resumed.status, ResearchJobStatus::Planning);
     }
 
     #[test]

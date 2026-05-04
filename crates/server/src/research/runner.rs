@@ -234,6 +234,43 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
         },
     )?;
 
+    // 2026-05-04 — emit an explicit "Planning" phase update right
+    // after the open. Two reasons:
+    //   1. On a CLAIMED-RESUME path (clarification → Pending →
+    //      claim_next_pending → here), the card was previously left
+    //      in `phase: "AwaitingInput"`. The duplicate CardOpened the
+    //      runner emitted above resets state but NOT phase (the
+    //      SPA's applyEvent for Opened intentionally leaves phase
+    //      alone — prior behaviour). This explicit Progressed
+    //      flushes the stale phase so the card transitions cleanly
+    //      from "Awaiting clarification" → "Planning" instead of
+    //      sitting on the stale label until the planner finishes.
+    //   2. On a fresh claim, this gives the first-frame card a
+    //      meaningful phase label ("Planning") instead of an empty
+    //      phase row that flickers in and out.
+    progress_card_and_broadcast(
+        &db,
+        &events,
+        &conv_id,
+        "system",
+        &CardProgressedPayload {
+            card_id: card_id.clone(),
+            state: Some(CardState::Running),
+            progress: Some(0.10),
+            phase: Some("Planning".into()),
+            details: Some(serde_json::json!({
+                "job_id": row.id.as_str(),
+                "phase": "Planning",
+                "query": row.query,
+            })),
+            actions: None,
+            summary: Some(format!(
+                "Planning: {}",
+                truncate_for_card_summary(&row.query)
+            )),
+        },
+    )?;
+
     // Planning phase — single LLM call.
     let (client, model) = match inference {
         Some(i) => i,
@@ -700,45 +737,25 @@ pub async fn run_synthesize_phase(
         },
     )?;
 
-    // 2026-05-04 (rev 8): auto-emit the Attachment card chip so the
-    // user sees a download link as soon as synthesise completes.
-    // Previous design assumed the agent would call `send_attachment`
-    // after observing the completed status, but the agent has no
-    // observation mechanism here (we explicitly told it to NOT poll
-    // research_status), so the chip never appeared and the user
-    // just saw the research card close with no actual deliverable.
-    // Direct emit from the runner is correct because PDF delivery
-    // is deterministic — there's no judgment call for the agent to
-    // make. The agent's `send_attachment` tool stays available for
-    // re-surfacing or future flows that DO want the agent in the
-    // loop (e.g. multi-attachment composition).
-    // Trait import is local-scope so the runner module's other
-    // imports stay narrow. AttachmentApi::send is the canonical
-    // way to emit the chip pair (it handles trust scoping, file-
-    // size lookup, etc. — duplicating that logic here would drift).
-    use execlaw_core::tool::AttachmentApi;
-    let attachment_api = crate::attachment_api::ServerAttachmentApi::new(
-        db.clone(),
-        events.clone(),
-        conv_id.clone(),
-    );
-    let caption = format!("Research report — {}", truncate_for_card_summary(query));
-    if let Err(e) = attachment_api
-        .send(outcome.attachment_id.as_str(), Some(&caption))
-        .await
-    {
-        // Non-fatal: the research card is already closed with the
-        // attachment_id, so the SPA can still surface the download
-        // via the operator hitting /research/<job_id>. Log so the
-        // operator can see why the chip didn't appear inline.
-        tracing::warn!(
-            job_id = job_id.as_str(),
-            attachment_id = outcome.attachment_id.as_str(),
-            error = %e,
-            "auto-emit Attachment card on synthesize completion failed; \
-             chip will not appear inline (operator can still download via /research/<id>)",
-        );
-    }
+    // 2026-05-04 (rev 9): the separate Attachment card emit is
+    // gone. The PDF deliverable now renders as an inline Download
+    // button on the ResearchCard itself (see web/src/cards/
+    // ResearchCard.tsx). Two reasons:
+    //   * The dual-card layout (research card + chip) read as
+    //     visually duplicative — "research complete" message
+    //     followed by a separate "here's a file" chip created
+    //     a two-step that felt sloppy.
+    //   * The chip's render diverged between live (CardOpened/
+    //     Closed) and replayed (cardStore hydration) paths,
+    //     making refresh feel buggy.
+    // The download button keys on attachment_id (already on the
+    // ResearchCard's CardClosedPayload above) so live + replayed
+    // render through the same code path.
+    //
+    // The agent's send_attachment tool stays available for
+    // future flows that DO want a separate chip (multi-
+    // attachment composition, ad-hoc file delivery from the
+    // agent, etc.). Just not this code path.
     Ok(())
 }
 
