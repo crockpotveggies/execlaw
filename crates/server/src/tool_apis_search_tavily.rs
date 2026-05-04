@@ -37,6 +37,13 @@ use std::time::Duration;
 const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
 const DEFAULT_TIMEOUT_S: u64 = 25;
 
+/// Tavily's free tier doesn't publish a per-second cap (the
+/// monthly credit count is the limit) but operator-friendly
+/// pacing keeps a 7-step gather under 2 s of search wall-time
+/// without sacrificing parallelism on URL fetch + subagent calls.
+/// 250 ms (~4 qps) is well within polite-client norms.
+const TAVILY_MIN_REQUEST_GAP: std::time::Duration = std::time::Duration::from_millis(250);
+
 #[derive(Debug, Deserialize)]
 struct TavilyResponse {
     #[serde(default)]
@@ -59,6 +66,7 @@ struct TavilyResult {
 pub struct TavilySearchApi {
     client: reqwest::Client,
     api_key: String,
+    rate_limit: crate::search_rate_limit::RateLimitGate,
 }
 
 impl TavilySearchApi {
@@ -71,6 +79,7 @@ impl TavilySearchApi {
         Self {
             client,
             api_key: api_key.into(),
+            rate_limit: crate::search_rate_limit::RateLimitGate::new(TAVILY_MIN_REQUEST_GAP),
         }
     }
 
@@ -78,6 +87,7 @@ impl TavilySearchApi {
         Self {
             client,
             api_key: api_key.into(),
+            rate_limit: crate::search_rate_limit::RateLimitGate::new(TAVILY_MIN_REQUEST_GAP),
         }
     }
 }
@@ -97,6 +107,7 @@ impl WebSearchApi for TavilySearchApi {
                 "Tavily api_key is empty; configure it in Settings → Search".into(),
             ));
         }
+        self.rate_limit.wait().await;
         // Tavily caps `max_results` at 20 server-side; clamp here
         // so the request is well-formed and the operator's intent
         // is preserved (returning 20 instead of erroring on >20).

@@ -19,6 +19,7 @@ pub mod alerts;
 pub mod approvals;
 pub mod attachment_api;
 pub mod attachments_admin;
+pub mod search_rate_limit;
 pub mod tool_apis_search_searxng;
 pub mod tool_apis_search_brave;
 pub mod tool_apis_search_exa;

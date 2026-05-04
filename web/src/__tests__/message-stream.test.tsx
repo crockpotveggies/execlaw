@@ -209,6 +209,87 @@ describe("MessageStream", () => {
         expect(btn).toHaveAttribute("aria-label", "Scroll to latest message");
     });
 
+    /// 2026-05-04 regression: cards rendered in MessageStream
+    /// (research card, attachment chip, etc.) used to anchor to
+    /// the outer scroll surface and run the full viewport width —
+    /// out of alignment with the surrounding chat bubbles. Each
+    /// card is now wrapped in `.execlaw-msg .execlaw-msg--card`
+    /// so it inherits the centered + clamped reading-column
+    /// treatment messages get via MessageBubble.
+    it("wraps each card in .execlaw-msg so it shares the chat-thread reading column", async () => {
+        // Side-effect import the AttachmentCard renderer (its
+        // module-level registerCardRenderer call is what wires
+        // it into the registry). MessageStream's own imports
+        // include the LongRunningTaskCard fallback but not the
+        // per-kind ones — they're side-effect-imported by Chat.tsx
+        // in production. Pulling AttachmentCard in here makes the
+        // test self-contained.
+        await import("../cards/AttachmentCard");
+        const { applyCardEvent } = await import("../cards/cardStore");
+        // Seed at least one message so MessageStream renders the
+        // list (it short-circuits to a loading state when
+        // `messages` is null). The card itself is what we're
+        // asserting on — the message just keeps the stream live.
+        setMessages("conv-card-margin", [baseMsg(1, "hi")]);
+        // Open + close a tiny attachment card on the test
+        // conversation so MessageStream renders it inline. Event
+        // shapes mirror what the WS bus delivers (see
+        // crates/server/src/events.rs).
+        applyCardEvent("conv-card-margin", {
+            kind: "card.opened",
+            payload: {
+                card_id: "card-1",
+                kind: "attachment",
+                title: "report.pdf",
+                summary: "report.pdf (application/pdf)",
+                state: "Running",
+                details: {
+                    attachment_id: "att-1",
+                    filename: "report.pdf",
+                    mime_type: "application/pdf",
+                    download_url: "/api/attachments/att-1",
+                },
+                actions: [],
+            },
+            committed_at: 1,
+            event_seq: 1,
+        });
+        applyCardEvent("conv-card-margin", {
+            kind: "card.closed",
+            payload: {
+                card_id: "card-1",
+                state: "Completed",
+                summary: "report.pdf (application/pdf)",
+                details: {
+                    attachment_id: "att-1",
+                    filename: "report.pdf",
+                    mime_type: "application/pdf",
+                    download_url: "/api/attachments/att-1",
+                },
+                attachment_id: "att-1",
+                error: undefined,
+            },
+            committed_at: 2,
+            event_seq: 2,
+        });
+
+        render(<MessageStream conversationId="conv-card-margin" />);
+        const chip = screen.getByTestId("card-attachment");
+        // Walk up to find the wrapper. Must be a direct (or near-
+        // direct) ancestor with .execlaw-msg — otherwise the
+        // shared margin/centering CSS doesn't apply.
+        let cursor: HTMLElement | null = chip;
+        let foundWrapper = false;
+        while (cursor) {
+            if (cursor.classList.contains("execlaw-msg")) {
+                foundWrapper = true;
+                break;
+            }
+            cursor = cursor.parentElement;
+        }
+        expect(foundWrapper).toBe(true);
+    });
+
     it("clicking the ↓ button calls scrollTo and the button hides on next scroll event", () => {
         setMessages("conv-click", [
             baseMsg(1, "first"),

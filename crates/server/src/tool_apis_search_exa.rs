@@ -39,6 +39,13 @@ use std::time::Duration;
 const EXA_ENDPOINT: &str = "https://api.exa.ai/search";
 const DEFAULT_TIMEOUT_S: u64 = 25;
 
+/// Exa doesn't publish a hard per-second cap but charges per query
+/// + per content character — bursting 3 parallel calls can both
+/// rate-limit AND multiply spend unnecessarily. 250 ms gap (~4 qps)
+/// keeps within polite-client territory while letting a 7-step
+/// gather complete in under 2 s of search wall-time.
+const EXA_MIN_REQUEST_GAP: std::time::Duration = std::time::Duration::from_millis(250);
+
 #[derive(Debug, Deserialize)]
 struct ExaResponse {
     #[serde(default)]
@@ -64,6 +71,7 @@ struct ExaResult {
 pub struct ExaSearchApi {
     client: reqwest::Client,
     api_key: String,
+    rate_limit: crate::search_rate_limit::RateLimitGate,
 }
 
 impl ExaSearchApi {
@@ -76,6 +84,7 @@ impl ExaSearchApi {
         Self {
             client,
             api_key: api_key.into(),
+            rate_limit: crate::search_rate_limit::RateLimitGate::new(EXA_MIN_REQUEST_GAP),
         }
     }
 
@@ -83,6 +92,7 @@ impl ExaSearchApi {
         Self {
             client,
             api_key: api_key.into(),
+            rate_limit: crate::search_rate_limit::RateLimitGate::new(EXA_MIN_REQUEST_GAP),
         }
     }
 }
@@ -102,6 +112,7 @@ impl WebSearchApi for ExaSearchApi {
                 "Exa api_key is empty; configure it in Settings → Search".into(),
             ));
         }
+        self.rate_limit.wait().await;
         let num_results = max_results.max(1).min(100) as i64;
         // `type: "auto"` lets Exa pick neural vs keyword per query.
         // `contents.text.maxCharacters` keeps the per-result body

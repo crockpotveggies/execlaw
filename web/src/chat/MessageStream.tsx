@@ -166,11 +166,24 @@ export function MessageStream({ conversationId }: Props) {
                         );
                     }
                     const Renderer = getCardRenderer(item.card.kind);
+                    // 2026-05-04 — wrap every card in `.execlaw-msg`
+                    // so it inherits the same centered + clamped
+                    // reading-column treatment that messages get via
+                    // MessageBubble. Without this wrapper, cards
+                    // (research card, attachment chip, etc.) anchored
+                    // to the outer scroll surface and ran the full
+                    // viewport width — out of alignment with the
+                    // surrounding chat bubbles. The renderer's own
+                    // outer `<div className="execlaw-card-…">` keeps
+                    // its kind-specific styling; the wrapper just
+                    // owns column placement.
                     return (
-                        <Renderer
+                        <div
                             key={`card-${item.card.card_id}`}
-                            card={item.card}
-                        />
+                            className="execlaw-msg execlaw-msg--card"
+                        >
+                            <Renderer card={item.card} />
+                        </div>
                     );
                 })}
                 {/* Live "what's the agent doing" pulse, mounted

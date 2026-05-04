@@ -23,6 +23,19 @@ use std::time::Duration;
 const BRAVE_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/search";
 const DEFAULT_TIMEOUT_S: u64 = 20;
 
+/// Brave free tier is 1 query/sec; the 1100 ms gap leaves a small
+/// safety margin so concurrent gather workers don't trip the
+/// limiter. Paid plans raise the per-second ceiling but at the
+/// cost of a potential burst-bounce on free tier — the conservative
+/// default is the right call until per-provider config exposes
+/// this knob to the operator.
+///
+/// Without this gate, `parallel_workers=3` (gather default) burst-
+/// fires three searches within ms → Brave HTTP 429 on two of them →
+/// "4/5 sections failed" on a 5-step plan. Same shape as the DDG
+/// burst issue fixed earlier; same shape of fix.
+const BRAVE_MIN_REQUEST_GAP: std::time::Duration = std::time::Duration::from_millis(1_100);
+
 #[derive(Debug, Deserialize)]
 struct BraveResponse {
     web: Option<BraveWeb>,
@@ -50,6 +63,7 @@ struct BraveResult {
 pub struct BraveSearchApi {
     client: reqwest::Client,
     api_key: String,
+    rate_limit: crate::search_rate_limit::RateLimitGate,
 }
 
 impl BraveSearchApi {
@@ -62,6 +76,7 @@ impl BraveSearchApi {
         Self {
             client,
             api_key: api_key.into(),
+            rate_limit: crate::search_rate_limit::RateLimitGate::new(BRAVE_MIN_REQUEST_GAP),
         }
     }
 
@@ -69,6 +84,7 @@ impl BraveSearchApi {
         Self {
             client,
             api_key: api_key.into(),
+            rate_limit: crate::search_rate_limit::RateLimitGate::new(BRAVE_MIN_REQUEST_GAP),
         }
     }
 }
@@ -88,6 +104,10 @@ impl WebSearchApi for BraveSearchApi {
                 "Brave api_key is empty; configure it in Settings → Search".into(),
             ));
         }
+        // Serialize concurrent searches behind the per-process gate
+        // so a burst of parallel gather workers doesn't trip Brave's
+        // free-tier 1qps limit.
+        self.rate_limit.wait().await;
         let count = max_results.max(1).min(20);
         let resp = self
             .client
