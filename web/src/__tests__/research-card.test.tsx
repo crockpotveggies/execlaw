@@ -19,6 +19,7 @@ import { getCardRenderer } from "../cards/CardRenderer";
 import {
     __resetCardStore,
     applyCardEvent,
+    setCardsForConversation,
     useCardsForConversation,
 } from "../cards/cardStore";
 import type { Card, CardEvent } from "../cards/types";
@@ -352,5 +353,131 @@ describe("cardStore + useCardsForConversation", () => {
             applyCardEvent("conv-1", openedEvent("early", "conv-1", 100));
         });
         expect(result.current.map((c) => c.card_id)).toEqual(["early", "late"]);
+    });
+
+    /// 2026-05-04 regression: cards used to be live-WS-only state;
+    /// a page refresh dropped every inline card even though the
+    /// underlying CardOpened/Closed events were durably persisted.
+    /// Chat.tsx now fetches /api/chats/{cid}/cards on thread load
+    /// and seeds the store via setCardsForConversation. Asserts:
+    ///   * setCardsForConversation overwrites the conversation's
+    ///     map in one shot
+    ///   * subsequent applyCardEvent merges per-card on top
+    ///     (live events arriving after hydration still work)
+    it("setCardsForConversation hydrates the store; live events merge on top", () => {
+        const { result } = renderHook(() =>
+            useCardsForConversation("conv-hydrate"),
+        );
+        expect(result.current).toHaveLength(0);
+
+        // Simulated `GET /api/chats/{cid}/cards` response — two
+        // already-completed attachment cards.
+        act(() => {
+            setCardsForConversation("conv-hydrate", [
+                {
+                    card_id: "att-1",
+                    conversation_id: "conv-hydrate",
+                    kind: "attachment",
+                    state: "Completed",
+                    title: "report-a.pdf",
+                    summary: "report-a.pdf",
+                    progress: null,
+                    phase: null,
+                    details: { attachment_id: "att-1" },
+                    actions: [],
+                    error: null,
+                    opened_at: 1,
+                    updated_at: 1,
+                    attachment_id: "att-1",
+                    event_seq: 5,
+                },
+                {
+                    card_id: "att-2",
+                    conversation_id: "conv-hydrate",
+                    kind: "attachment",
+                    state: "Completed",
+                    title: "report-b.pdf",
+                    summary: "report-b.pdf",
+                    progress: null,
+                    phase: null,
+                    details: { attachment_id: "att-2" },
+                    actions: [],
+                    error: null,
+                    opened_at: 2,
+                    updated_at: 2,
+                    attachment_id: "att-2",
+                    event_seq: 7,
+                },
+            ]);
+        });
+        expect(result.current.map((c) => c.card_id)).toEqual(["att-1", "att-2"]);
+
+        // Live event after hydration: a new card opens. Merges
+        // into the same conversation map (doesn't clobber the
+        // hydrated set).
+        act(() => {
+            applyCardEvent(
+                "conv-hydrate",
+                openedEvent("att-3", "conv-hydrate", 100),
+            );
+        });
+        expect(result.current.map((c) => c.card_id)).toEqual([
+            "att-1",
+            "att-2",
+            "att-3",
+        ]);
+    });
+
+    it("setCardsForConversation called twice replaces prior contents (no merge)", () => {
+        // The endpoint returns the canonical state — a second
+        // hydration call (e.g. operator switches threads + back)
+        // should overwrite, not append.
+        const { result } = renderHook(() =>
+            useCardsForConversation("conv-replace"),
+        );
+        act(() => {
+            setCardsForConversation("conv-replace", [
+                {
+                    card_id: "old",
+                    conversation_id: "conv-replace",
+                    kind: "research",
+                    state: "Completed",
+                    title: "Old",
+                    summary: "Old",
+                    progress: null,
+                    phase: null,
+                    details: {},
+                    actions: [],
+                    error: null,
+                    opened_at: 1,
+                    updated_at: 1,
+                    attachment_id: null,
+                    event_seq: 1,
+                },
+            ]);
+        });
+        expect(result.current.map((c) => c.card_id)).toEqual(["old"]);
+        act(() => {
+            setCardsForConversation("conv-replace", [
+                {
+                    card_id: "new",
+                    conversation_id: "conv-replace",
+                    kind: "research",
+                    state: "Completed",
+                    title: "New",
+                    summary: "New",
+                    progress: null,
+                    phase: null,
+                    details: {},
+                    actions: [],
+                    error: null,
+                    opened_at: 2,
+                    updated_at: 2,
+                    attachment_id: null,
+                    event_seq: 2,
+                },
+            ]);
+        });
+        expect(result.current.map((c) => c.card_id)).toEqual(["new"]);
     });
 });

@@ -2624,6 +2624,45 @@ pub async fn list_messages(
         .into_response()
 }
 
+/// `GET /api/chats/:id/cards` — projection of every card in this
+/// conversation's event log.
+///
+/// 2026-05-04: added so a page refresh re-hydrates inline cards
+/// (research card, attachment chip, etc.). Pre-fix: `cardStore`
+/// was live-only state populated by WS events; on refresh the
+/// store started empty and the chips vanished even though the
+/// underlying CardOpened/Closed events were durably persisted.
+/// The SPA now fetches this endpoint on thread load and seeds
+/// the store from the result.
+#[utoipa::path(
+    get,
+    path = "/api/chats/{conversation_id}/cards",
+    params(("conversation_id" = String, Path, description = "Target conversation id")),
+    responses(
+        (status = 200, description = "Ordered list of cards (oldest first)"),
+    ),
+    tag = "chats"
+)]
+pub async fn list_cards(
+    State(state): State<AppState>,
+    Path(conversation_id): Path<String>,
+    _user: crate::auth_extract::AuthedUser,
+) -> impl IntoResponse {
+    let cid = ConversationId::from(conversation_id.as_str());
+    let cards = match crate::cards::project_cards_for_conversation(&state.db, &cid) {
+        Ok(c) => c,
+        Err(e) => return err_500(&format!("project cards: {e}")),
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "conversation_id": cid.as_str(),
+            "cards": cards,
+        })),
+    )
+        .into_response()
+}
+
 /// `PATCH /api/chats/:id` — update thread metadata.
 ///
 /// Used by the SPA when the operator renames a thread, pins/unpins it,

@@ -190,6 +190,49 @@ export async function listMessages(
     return apiFetch<MessagesListResponse>(path, {}, tokenAccessor);
 }
 
+/// Card-history projection for a conversation. The chat-pane
+/// fetches this on thread load (alongside `listMessages`) and
+/// seeds `cardStore` so a page refresh re-hydrates inline cards
+/// (research card, attachment chip, etc.). Without this fetch,
+/// the card store starts empty on refresh and chips vanish even
+/// though the underlying CardOpened/Closed events are durably
+/// persisted server-side.
+///
+/// Card shape mirrors `core::cards::Card` — see web/src/cards/types.ts.
+export interface ListCardsResponse {
+    conversation_id: string;
+    /// Ordered oldest → newest (by opened_at on the server side).
+    /// Use as-is; card_id is the de-dupe key in the store.
+    cards: Array<{
+        card_id: string;
+        conversation_id: string;
+        kind: string;
+        state: string;
+        title: string;
+        summary: string;
+        progress: number | null;
+        phase: string | null;
+        details: unknown;
+        actions: ReadonlyArray<unknown>;
+        error: string | null;
+        opened_at: number;
+        updated_at: number;
+        attachment_id?: string | null;
+        event_seq?: number | null;
+    }>;
+}
+
+export async function listCards(
+    conversationId: string,
+    tokenAccessor: () => string | null,
+): Promise<ListCardsResponse> {
+    return apiFetch<ListCardsResponse>(
+        `/api/chats/${encodeURIComponent(conversationId)}/cards`,
+        {},
+        tokenAccessor,
+    );
+}
+
 export interface SendMessageRequest {
     text: string;
     sender_principal_id?: string;

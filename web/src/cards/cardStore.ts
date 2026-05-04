@@ -119,6 +119,36 @@ export function applyCardEvent(
     });
 }
 
+/// Replace the card set for one conversation in one shot.
+///
+/// 2026-05-04: used by the chat-pane on thread load to seed the
+/// store from the server's `GET /api/chats/{cid}/cards`
+/// projection. Without this, `cardStore` was live-only state
+/// populated by WS events; cards vanished on page refresh
+/// because the store started empty even though CardOpened/Closed
+/// events were durably persisted.
+///
+/// Replaces the conversation's entire card map (rather than
+/// merging) because the projection IS the canonical state — any
+/// in-memory drift is by definition stale and should be
+/// overwritten. Live WS events that arrive AFTER hydration land
+/// via `applyCardEvent` and merge per-card on top.
+export function setCardsForConversation(
+    conversationId: string,
+    cards: ReadonlyArray<Card>,
+): void {
+    const next: Record<string, Card> = {};
+    for (const c of cards) {
+        next[c.card_id] = c;
+    }
+    setState({
+        byConversation: {
+            ...state.byConversation,
+            [conversationId]: next,
+        },
+    });
+}
+
 /// Test seam: drop everything. Production callers don't need this.
 export function __resetCardStore(): void {
     state = { byConversation: {} };

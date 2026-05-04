@@ -16,6 +16,7 @@ import { useScreenTransition } from "../anim/useScreenTransition";
 import { ApiError } from "../api/client";
 import {
     getAlertCount,
+    listCards,
     listMessages,
     listPendingApprovals,
     listThreads,
@@ -28,7 +29,7 @@ import {
     type UiPanelSummary,
 } from "../api/endpoints";
 import { WsClient, type WsEvent } from "../api/ws";
-import { applyCardEvent } from "../cards/cardStore";
+import { applyCardEvent, setCardsForConversation } from "../cards/cardStore";
 // Side-effect import: registers the ResearchCard renderer for
 // `kind: "research"` cards. CardRenderer.tsx already auto-registers
 // the generic LongRunningTaskCard fallback at module-load.
@@ -233,8 +234,40 @@ export function Chat() {
         let cancelled = false;
         (async () => {
             try {
-                const resp = await listMessages(activeId, getToken);
-                if (!cancelled) setMessages(activeId, resp.messages);
+                // Fire messages + cards in parallel so the chat
+                // pane re-hydrates both halves of the timeline at
+                // once. Cards used to be live-WS-only state, which
+                // meant a page refresh dropped every inline card
+                // (research card, attachment chip, etc.) even
+                // though the underlying CardOpened/Closed events
+                // were durably persisted server-side. The
+                // `listCards` projection rebuilds the per-card
+                // state from the log; `setCardsForConversation`
+                // overwrites the conversation's card map in one
+                // shot so the SPA re-renders with the chips back
+                // in place.
+                const [messagesResp, cardsResp] = await Promise.all([
+                    listMessages(activeId, getToken),
+                    listCards(activeId, getToken).catch((e) => {
+                        // Cards endpoint failure is non-fatal —
+                        // messages still render, just without
+                        // historical cards. Log so we notice if
+                        // it starts happening regularly.
+                        // eslint-disable-next-line no-console
+                        console.warn("listCards failed:", e);
+                        return null;
+                    }),
+                ]);
+                if (cancelled) return;
+                setMessages(activeId, messagesResp.messages);
+                if (cardsResp) {
+                    setCardsForConversation(
+                        activeId,
+                        cardsResp.cards as unknown as Parameters<
+                            typeof setCardsForConversation
+                        >[1],
+                    );
+                }
             } catch (e) {
                 if (e instanceof ApiError && e.code === "unauthorized") {
                     await auth.signOut();

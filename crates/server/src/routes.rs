@@ -681,6 +681,10 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::chats::send_message).get(crate::chats::list_messages),
         )
         .route(
+            "/api/chats/{conversation_id}/cards",
+            get(crate::chats::list_cards),
+        )
+        .route(
             "/api/chats/{conversation_id}/stop",
             post(crate::chats::stop_turn),
         )
