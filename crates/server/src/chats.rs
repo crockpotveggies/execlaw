@@ -2103,6 +2103,31 @@ pub async fn dispatch_clarification_turn(
         None => run_stub_turn(state, cid, &prompt, sender.clone()),
     };
 
+    // 2026-05-04 — broadcast the agent's reply on the WS bus so the
+    // SPA flushes its streaming buffer and refetches the message
+    // list. Without this the chat-pane sees `chat_token_delta`
+    // events stream in but never receives the `chat_message_outbound`
+    // that signals "the turn committed; persist + refresh." The
+    // result was that the agent's clarification appeared only on
+    // page refresh — confusing in real time. Mirrors the broadcast
+    // pair `send_message` emits at lines 444 + 450; we publish the
+    // synthetic inbound too (with the orchestrator-actor sender)
+    // for symmetry, but `list_messages` filters that one out so the
+    // SPA's refetch doesn't surface the orchestrator notice.
+    if let Ok((user_seq, assistant_text, assistant_seq)) = &result {
+        state.events.publish(UiEvent::ChatMessageInbound {
+            conversation_id: cid.as_str().to_owned(),
+            seq: *user_seq,
+            text: prompt.clone(),
+            sender: Some(SYSTEM_ORCHESTRATOR_ACTOR.to_owned()),
+        });
+        state.events.publish(UiEvent::ChatMessageOutbound {
+            conversation_id: cid.as_str().to_owned(),
+            seq: *assistant_seq,
+            text: assistant_text.clone(),
+        });
+    }
+
     let mapped = result.map(|(_user_seq, text, _assistant_seq)| RoutineDispatchOutcome {
         conversation_id: cid_str,
         assistant_text: text,
