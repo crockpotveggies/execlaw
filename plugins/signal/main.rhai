@@ -5,12 +5,12 @@
 // signal.ts`) so the agent's tool catalogue, the operator's loader
 // pill, the per-tool trust-floor enforcement, and the install-time
 // validator all light up. The actual signal-cli RPC plumbing waits on
-// the bridge supervisor (see `docs/bridge-supervisor-design.md`).
+// the sidecar supervisor (see `docs/sidecar-supervisor-design.md`).
 //
-// Until the bridge ships, every tool returns a structured error of
-// the form `{ "error": "signal bridge not yet running" }`. The agent's
+// Until the sidecar ships, every tool returns a structured error of
+// the form `{ "error": "signal sidecar not yet running" }`. The agent's
 // existing tool-error UX surfaces this gracefully — operator sees
-// "Sending Signal message to Alice — failed: signal bridge not yet
+// "Sending Signal message to Alice — failed: signal sidecar not yet
 // running" rather than a 500.
 //
 // When the supervisor lands, this file gets its real bodies — each
@@ -33,8 +33,8 @@ fn tool_call(name, args, oauth) {
         || name == "signal.leave_group"
     {
         #{
-            "error": "signal bridge not yet running — Phase-1 stub. " +
-                     "Install the bridge supervisor + signal-cli sidecar " +
+            "error": "signal sidecar not yet running — Phase-1 stub. " +
+                     "Install the sidecar supervisor + signal-cli sidecar " +
                      "to enable real dispatch.",
             "tool": name,
         }

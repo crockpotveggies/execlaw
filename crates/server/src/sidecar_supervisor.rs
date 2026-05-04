@@ -1,37 +1,37 @@
-//! Bridge supervisor (Phase 2b — `docs/bridge-supervisor-design.md`).
+//! Sidecar supervisor (Phase 2b — `docs/sidecar-supervisor-design.md`).
 //!
-//! Owns the lifecycle of every transport-bridge sidecar container
+//! Owns the lifecycle of every transport-sidecar sidecar container
 //! declared by an installed plugin's `[[services]]` entries with a
-//! `[services.bridge]` table. Conceptually the third member of the
+//! `[services.sidecar]` table. Conceptually the third member of the
 //! supervisor family alongside `backend_supervisor` (inference
 //! containers) and `runner_supervisor` (per-group runner containers):
 //!
 //!   * **`backend_supervisor`** — owns vLLM / TTS / STT containers.
 //!   * **`runner_supervisor`** — owns per-principal-group runner
 //!     containers (the agent loop).
-//!   * **`bridge_supervisor`** *(this)* — owns Signal-cli /
-//!     WhatsApp-bridge / Matrix-bridge / ... sidecars. One container
-//!     per registered `channel`; `HookRegistry::all_bridges` is the
+//!   * **`sidecar_supervisor`** *(this)* — owns Signal-cli /
+//!     WhatsApp-sidecar / Matrix-sidecar / ... sidecars. One container
+//!     per registered `channel`; `HookRegistry::all_sidecars` is the
 //!     source of truth for desired state.
 //!
 //! What's in scope **for Phase 2b**:
 //!   * tick + reconcile pattern mirroring `backend_supervisor`
 //!   * spawn-on-register, healthcheck-loop, restart-on-crash with
 //!     exponential-attempt cap, stop-on-unregister
-//!   * status snapshot for the SPA's bridges page (a future hookup)
+//!   * status snapshot for the SPA's sidecars page (a future hookup)
 //!
 //! What's deliberately **not** in scope yet (Phase 3 work):
-//!   * the bridge RPC client (`/v1/send`, `/v1/inbound/stream`)
+//!   * the sidecar RPC client (`/v1/send`, `/v1/inbound/stream`)
 //!   * inbound message ingestion → `state_transport_bindings` lookup
 //!   * outbound dispatch wired into `signal.send_message`
-//!   * fingerprinted alert routing on bridge-down events
+//!   * fingerprinted alert routing on sidecar-down events
 //!
 //! Tests use `MockServiceController` so no Docker daemon is touched
 //! and every transition can be driven deterministically.
 
 use crate::events::{EventBus, UiEvent};
 use execlaw_container_manager::{ServiceController, ServiceHandle, ServiceSpec, ServiceStatus};
-use execlaw_plugin_host::hook_registry::{HookRegistry, RegisteredBridge};
+use execlaw_plugin_host::hook_registry::{HookRegistry, RegisteredSidecar};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,7 +39,7 @@ use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 
 /// Default sweep cadence — every 5 seconds the supervisor reconciles
-/// desired vs running state, just like `backend_supervisor`. Bridge
+/// desired vs running state, just like `backend_supervisor`. Sidecar
 /// outages aren't time-critical; once a configurable interval lands
 /// (Phase 3) operators can dial it.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(5);
@@ -52,19 +52,19 @@ pub const MAX_RESTART_ATTEMPTS: u32 = 5;
 /// Per-channel runtime state. Cheap to clone individual fields; the
 /// container handle is owned and replaced on respawn.
 #[derive(Debug)]
-struct BridgeSlot {
-    /// Echoes the bridge's `RegisteredBridge` snapshot from the last
+struct SidecarSlot {
+    /// Echoes the sidecar's `RegisteredSidecar` snapshot from the last
     /// reconcile so we can detect manifest-edits-without-disable
     /// (different image, port, ...) and respawn cleanly.
-    registered: RegisteredBridge,
-    /// Live container handle when the bridge is running. `None`
+    registered: RegisteredSidecar,
+    /// Live container handle when the sidecar is running. `None`
     /// before the first successful spawn AND between spawn-failure
     /// and the next reconcile.
     handle: Option<ServiceHandle>,
     /// Stable host port assigned the first time we spawned a
     /// container for this channel. Reused on every subsequent
     /// respawn (RPC-fail restart, drift respawn, post-crash loop)
-    /// so the bridge's URL stays stable across the supervisor's
+    /// so the sidecar's URL stays stable across the supervisor's
     /// lifetime — matches the operator-facing "the supervisor
     /// keeps URLs stable" promise. `None` before the first
     /// successful spawn.
@@ -80,8 +80,8 @@ struct BridgeSlot {
     restart_attempts: u32,
 }
 
-impl BridgeSlot {
-    fn fresh(b: RegisteredBridge) -> Self {
+impl SidecarSlot {
+    fn fresh(b: RegisteredSidecar) -> Self {
         Self {
             registered: b,
             handle: None,
@@ -94,7 +94,7 @@ impl BridgeSlot {
     /// True if a manifest edit invalidated the running container —
     /// the supervisor must stop + respawn rather than try to
     /// hot-update a `bollard` container.
-    fn drift_from(&self, latest: &RegisteredBridge) -> bool {
+    fn drift_from(&self, latest: &RegisteredSidecar) -> bool {
         self.registered.image != latest.image
             || self.registered.rpc_port != latest.rpc_port
             || self.registered.rpc_health_path != latest.rpc_health_path
@@ -103,12 +103,12 @@ impl BridgeSlot {
     }
 }
 
-/// Read-only status snapshot for the future Bridges admin page. One
+/// Read-only status snapshot for the future Sidecars admin page. One
 /// entry per registered channel; channels with no live container
 /// report `Stopped`. Plain struct so JSON serialisation stays
 /// boring.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct BridgeRuntimeStatus {
+pub struct SidecarRuntimeStatus {
     pub channel: String,
     pub plugin_id: String,
     pub service_name: String,
@@ -122,42 +122,42 @@ pub struct BridgeRuntimeStatus {
 
 /// The supervisor itself. Cheap to clone (everything's `Arc` inside).
 #[derive(Clone)]
-pub struct BridgeSupervisor {
+pub struct SidecarSupervisor {
     controller: Arc<dyn ServiceController>,
     registry: HookRegistry,
     /// Optional event bus for surface-status events. Tests usually
-    /// pass `None`. Production wires the SPA's bus so a bridge
+    /// pass `None`. Production wires the SPA's bus so a sidecar
     /// flipping to `CrashLooping` shows up in the loader-pill /
     /// alerts dock without a polling round-trip.
     bus: Option<Arc<EventBus>>,
     interval: Duration,
     kick: Arc<Notify>,
-    slots: Arc<Mutex<HashMap<String, BridgeSlot>>>,
+    slots: Arc<Mutex<HashMap<String, SidecarSlot>>>,
     /// Host port pool start. The supervisor mints sequential ports
     /// starting from this value to avoid collisions with
-    /// `backend_supervisor`'s 8101+ pool. Bridges of distinct
+    /// `backend_supervisor`'s 8101+ pool. Sidecars of distinct
     /// channels get distinct stable ports; the assignment lives in
-    /// the `BridgeSlot` so a respawn keeps the same URL.
+    /// the `SidecarSlot` so a respawn keeps the same URL.
     next_host_port: Arc<Mutex<u16>>,
 }
 
-/// First host port the supervisor mints for bridges. Picked above
+/// First host port the supervisor mints for sidecars. Picked above
 /// `backend_supervisor`'s 8101–8200 range and below the typical
 /// dev-tools range so collisions with operator workflows are
 /// vanishingly rare. Operators who need to override can edit at
-/// install time (Phase 3 will surface this in the bridge config UI).
-pub const BRIDGE_PORT_POOL_START: u16 = 8501;
+/// install time (Phase 3 will surface this in the sidecar config UI).
+pub const SIDECAR_PORT_POOL_START: u16 = 8501;
 
-/// Last host port in the bridge pool. The 100-port window is large
+/// Last host port in the sidecar pool. The 100-port window is large
 /// enough that no realistic operator will hit it (selfhosted-claw's
-/// busiest deployments ran ~3 bridges; even an order of magnitude up
+/// busiest deployments ran ~3 sidecars; even an order of magnitude up
 /// from there fits) and small enough that we can't drift into the
 /// ephemeral-port range. Hitting this ceiling causes
 /// `allocate_port` to return `None` rather than silently colliding,
 /// which is the right failure mode for an operator-visible problem.
-pub const BRIDGE_PORT_POOL_END: u16 = 8600;
+pub const SIDECAR_PORT_POOL_END: u16 = 8600;
 
-impl BridgeSupervisor {
+impl SidecarSupervisor {
     pub fn new(controller: Arc<dyn ServiceController>, registry: HookRegistry) -> Self {
         Self::with_config(controller, registry, DEFAULT_TICK_INTERVAL)
     }
@@ -174,7 +174,7 @@ impl BridgeSupervisor {
             interval,
             kick: Arc::new(Notify::new()),
             slots: Arc::new(Mutex::new(HashMap::new())),
-            next_host_port: Arc::new(Mutex::new(BRIDGE_PORT_POOL_START)),
+            next_host_port: Arc::new(Mutex::new(SIDECAR_PORT_POOL_START)),
         }
     }
 
@@ -184,8 +184,8 @@ impl BridgeSupervisor {
     }
 
     /// Force a reconcile pass — operators trigger this from a
-    /// "restart bridge" button, and the plugin-install handler
-    /// kicks it after enabling a plugin so the new bridge spins up
+    /// "restart sidecar" button, and the plugin-install handler
+    /// kicks it after enabling a plugin so the new sidecar spins up
     /// without waiting the full tick interval.
     pub fn kick(&self) {
         self.kick.notify_one();
@@ -208,12 +208,12 @@ impl BridgeSupervisor {
     /// Snapshot every channel's current state. Returns one entry per
     /// channel **registered in the hook registry** — channels the
     /// supervisor has never seen yet still show up as `Stopped` so
-    /// the SPA's bridges page can render the row before the first
+    /// the SPA's sidecars page can render the row before the first
     /// reconcile lands.
-    pub async fn snapshot_status(&self) -> Vec<BridgeRuntimeStatus> {
-        let bridges = self.registry.all_bridges();
+    pub async fn snapshot_status(&self) -> Vec<SidecarRuntimeStatus> {
+        let sidecars = self.registry.all_sidecars();
         let slots = self.slots.lock().await;
-        bridges
+        sidecars
             .into_iter()
             .map(|b| {
                 let slot = slots.get(&b.channel);
@@ -224,7 +224,7 @@ impl BridgeSupervisor {
                 let rpc_url = slot
                     .and_then(|s| s.handle.as_ref())
                     .map(|h| format!("http://127.0.0.1:{}", h.host_port));
-                BridgeRuntimeStatus {
+                SidecarRuntimeStatus {
                     channel: b.channel.clone(),
                     plugin_id: b.plugin_id.clone(),
                     service_name: b.service_name.clone(),
@@ -241,14 +241,14 @@ impl BridgeSupervisor {
     pub async fn run(&self, stop: Arc<Notify>) {
         info!(
             interval_secs = self.interval.as_secs(),
-            "bridge supervisor running"
+            "sidecar supervisor running"
         );
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(self.interval) => {}
                 _ = self.kick.notified() => {}
                 _ = stop.notified() => {
-                    info!("bridge supervisor stop received; exiting");
+                    info!("sidecar supervisor stop received; exiting");
                     return;
                 }
             }
@@ -260,7 +260,7 @@ impl BridgeSupervisor {
     /// deterministically without spinning up a tokio task or
     /// waiting on `interval`.
     pub async fn reconcile_once(&self) {
-        let desired = self.registry.all_bridges();
+        let desired = self.registry.all_sidecars();
         let mut slots = self.slots.lock().await;
 
         // Phase 1: stop + drop slots whose channel is no longer
@@ -276,12 +276,12 @@ impl BridgeSupervisor {
             if let Some(mut slot) = slots.remove(&c) {
                 let was_running = slot.handle.is_some();
                 if let Some(handle) = slot.handle.take() {
-                    debug!(channel = %c, "stopping orphaned bridge container");
+                    debug!(channel = %c, "stopping orphaned sidecar container");
                     if let Err(e) = self.controller.stop(&handle).await {
                         warn!(
                             channel = %c,
                             error = %e,
-                            "failed to stop orphaned bridge container",
+                            "failed to stop orphaned sidecar container",
                         );
                     }
                 }
@@ -292,7 +292,7 @@ impl BridgeSupervisor {
                 if was_running
                     && let Some(bus) = &self.bus
                 {
-                    bus.publish(UiEvent::BridgeStatusChanged {
+                    bus.publish(UiEvent::SidecarStatusChanged {
                         channel: c.clone(),
                         status: format!("{:?}", ServiceStatus::Stopped),
                     });
@@ -302,7 +302,7 @@ impl BridgeSupervisor {
 
         // Phase 2: ensure every desired channel has a slot, then
         // reconcile that slot's runtime state.
-        for bridge in desired {
+        for sidecar in desired {
             // Drift detection: a manifest edit (new image, port)
             // means we tear down the old container and respawn,
             // resetting the restart counter so the new image gets
@@ -315,40 +315,40 @@ impl BridgeSupervisor {
             //      already dropped, attempts > 0) still deserves the
             //      counter reset.
             let needs_respawn_for_drift = slots
-                .get(&bridge.channel)
-                .map(|s| s.drift_from(&bridge))
+                .get(&sidecar.channel)
+                .map(|s| s.drift_from(&sidecar))
                 .unwrap_or(false);
             if needs_respawn_for_drift {
-                if let Some(slot) = slots.get_mut(&bridge.channel) {
+                if let Some(slot) = slots.get_mut(&sidecar.channel) {
                     if let Some(handle) = slot.handle.take() {
                         debug!(
-                            channel = %bridge.channel,
-                            "bridge manifest changed; stopping prior container",
+                            channel = %sidecar.channel,
+                            "sidecar manifest changed; stopping prior container",
                         );
                         if let Err(e) = self.controller.stop(&handle).await {
-                            warn!(channel = %bridge.channel, error = %e,
-                                  "failed to stop bridge during drift respawn");
+                            warn!(channel = %sidecar.channel, error = %e,
+                                  "failed to stop sidecar during drift respawn");
                         }
                     }
                     slot.status = ServiceStatus::Stopped;
                     slot.restart_attempts = 0;
-                    slot.registered = bridge.clone();
+                    slot.registered = sidecar.clone();
                 }
             }
 
             let slot = slots
-                .entry(bridge.channel.clone())
-                .or_insert_with(|| BridgeSlot::fresh(bridge.clone()));
-            slot.registered = bridge.clone();
+                .entry(sidecar.channel.clone())
+                .or_insert_with(|| SidecarSlot::fresh(sidecar.clone()));
+            slot.registered = sidecar.clone();
 
-            self.reconcile_slot(&bridge, slot).await;
+            self.reconcile_slot(&sidecar, slot).await;
         }
     }
 
     /// Reconcile one slot. Pulled into its own method so the
-    /// reconcile loop reads as "for each desired bridge, drive its
+    /// reconcile loop reads as "for each desired sidecar, drive its
     /// state machine forward by one step."
-    async fn reconcile_slot(&self, bridge: &RegisteredBridge, slot: &mut BridgeSlot) {
+    async fn reconcile_slot(&self, sidecar: &RegisteredSidecar, slot: &mut SidecarSlot) {
         // Park early when we've blown the restart budget. Operator
         // intervention via `reset_attempts` is the only way out.
         if matches!(slot.status, ServiceStatus::CrashLooping { .. }) {
@@ -358,7 +358,7 @@ impl BridgeSupervisor {
         // Spawn the container if we don't have a handle. This is
         // the steady-state cold-start path AND the post-crash
         // respawn path. Reuse the slot's previously-allocated
-        // host_port so the bridge's URL stays stable across the
+        // host_port so the sidecar's URL stays stable across the
         // supervisor's lifetime; only mint a fresh one on the very
         // first spawn.
         if slot.handle.is_none() {
@@ -371,8 +371,8 @@ impl BridgeSupervisor {
                     }
                     None => {
                         warn!(
-                            channel = %bridge.channel,
-                            "bridge port pool exhausted; refusing to spawn",
+                            channel = %sidecar.channel,
+                            "sidecar port pool exhausted; refusing to spawn",
                         );
                         // Park CrashLooping so the slot doesn't
                         // burn restart attempts on a problem
@@ -381,33 +381,33 @@ impl BridgeSupervisor {
                         let new_status = ServiceStatus::CrashLooping {
                             restart_count: MAX_RESTART_ATTEMPTS,
                         };
-                        self.transition_status(&bridge.channel, slot, new_status);
+                        self.transition_status(&sidecar.channel, slot, new_status);
                         return;
                     }
                 },
             };
             let spec = ServiceSpec {
-                name: container_name(&bridge.plugin_id, &bridge.channel),
-                image: bridge.image.clone(),
+                name: container_name(&sidecar.plugin_id, &sidecar.channel),
+                image: sidecar.image.clone(),
                 args: Vec::new(),
                 env: Vec::new(),
                 gpu_id: None,
                 gpu_vendor: None,
                 mounts: Vec::new(),
                 host_port: port,
-                container_port: bridge.rpc_port,
+                container_port: sidecar.rpc_port,
             };
             match self.controller.spawn(&spec).await {
                 Ok(handle) => {
                     info!(
-                        channel = %bridge.channel,
+                        channel = %sidecar.channel,
                         container = %handle.name,
                         host_port = handle.host_port,
-                        "bridge container spawned",
+                        "sidecar container spawned",
                     );
                     slot.handle = Some(handle);
                     self.transition_status(
-                        &bridge.channel,
+                        &sidecar.channel,
                         slot,
                         ServiceStatus::Starting,
                     );
@@ -417,24 +417,24 @@ impl BridgeSupervisor {
                     slot.restart_attempts = slot.restart_attempts.saturating_add(1);
                     let new_status = if slot.restart_attempts >= MAX_RESTART_ATTEMPTS {
                         warn!(
-                            channel = %bridge.channel,
+                            channel = %sidecar.channel,
                             attempts = slot.restart_attempts,
                             error = %e,
-                            "bridge container hit restart cap; parking CrashLooping",
+                            "sidecar container hit restart cap; parking CrashLooping",
                         );
                         ServiceStatus::CrashLooping {
                             restart_count: slot.restart_attempts,
                         }
                     } else {
                         warn!(
-                            channel = %bridge.channel,
+                            channel = %sidecar.channel,
                             attempts = slot.restart_attempts,
                             error = %e,
-                            "bridge container spawn failed; will retry",
+                            "sidecar container spawn failed; will retry",
                         );
                         ServiceStatus::Stopped
                     };
-                    self.transition_status(&bridge.channel, slot, new_status);
+                    self.transition_status(&sidecar.channel, slot, new_status);
                     return;
                 }
             }
@@ -451,9 +451,9 @@ impl BridgeSupervisor {
             Ok(s) => s,
             Err(e) => {
                 warn!(
-                    channel = %bridge.channel,
+                    channel = %sidecar.channel,
                     error = %e,
-                    "bridge inspect failed; will recheck next tick",
+                    "sidecar inspect failed; will recheck next tick",
                 );
                 return;
             }
@@ -465,18 +465,18 @@ impl BridgeSupervisor {
                 // handle so the next reconcile respawns. Don't bump
                 // restart_attempts here; the spawn-failure branch
                 // is the canonical place that increments. (This is
-                // a deliberate escape hatch from the cap — a bridge
+                // a deliberate escape hatch from the cap — a sidecar
                 // crashed-and-removed by the operator should respawn
                 // freely, not get parked. The `Healthy → vanished`
                 // flap case is a known limitation; Phase 3 alert
                 // routing surfaces it without depending on the cap.)
                 debug!(
-                    channel = %bridge.channel,
-                    "bridge container vanished; will respawn",
+                    channel = %sidecar.channel,
+                    "sidecar container vanished; will respawn",
                 );
                 slot.handle = None;
                 self.transition_status(
-                    &bridge.channel,
+                    &sidecar.channel,
                     slot,
                     ServiceStatus::Stopped,
                 );
@@ -490,21 +490,21 @@ impl BridgeSupervisor {
                 // crash-loop counting; we just mirror it.
                 slot.restart_attempts = restart_count;
                 self.transition_status(
-                    &bridge.channel,
+                    &sidecar.channel,
                     slot,
                     ServiceStatus::CrashLooping { restart_count },
                 );
             }
             ServiceStatus::Pulling | ServiceStatus::Starting => {
-                self.transition_status(&bridge.channel, slot, inspect);
+                self.transition_status(&sidecar.channel, slot, inspect);
             }
             ServiceStatus::Healthy => {
-                // Validate via the bridge's own RPC healthcheck —
+                // Validate via the sidecar's own RPC healthcheck —
                 // `inspect` only tells us the container is up; the
-                // bridge process inside might still be initialising.
+                // sidecar process inside might still be initialising.
                 let url = format!(
                     "http://127.0.0.1:{}{}",
-                    handle.host_port, bridge.rpc_health_path
+                    handle.host_port, sidecar.rpc_health_path
                 );
                 let healthy = self
                     .controller
@@ -513,25 +513,25 @@ impl BridgeSupervisor {
                     .unwrap_or(false);
                 if healthy {
                     if !matches!(slot.status, ServiceStatus::Healthy) {
-                        info!(channel = %bridge.channel, "bridge healthy");
+                        info!(channel = %sidecar.channel, "sidecar healthy");
                     }
                     slot.restart_attempts = 0;
                     self.transition_status(
-                        &bridge.channel,
+                        &sidecar.channel,
                         slot,
                         ServiceStatus::Healthy,
                     );
                 } else {
                     // Container says it's up but RPC health failed —
-                    // restart. Could be a slow-starting bridge; the
+                    // restart. Could be a slow-starting sidecar; the
                     // restart-attempt cap protects us either way.
                     warn!(
-                        channel = %bridge.channel,
+                        channel = %sidecar.channel,
                         url = %url,
-                        "bridge RPC health failed; restarting container",
+                        "sidecar RPC health failed; restarting container",
                     );
                     if let Err(e) = self.controller.stop(&handle).await {
-                        warn!(channel = %bridge.channel, error = %e,
+                        warn!(channel = %sidecar.channel, error = %e,
                               "stop-for-restart failed");
                     }
                     slot.handle = None;
@@ -544,22 +544,22 @@ impl BridgeSupervisor {
                         } else {
                             ServiceStatus::Stopped
                         };
-                    self.transition_status(&bridge.channel, slot, new_status);
+                    self.transition_status(&sidecar.channel, slot, new_status);
                 }
             }
         }
     }
 
     /// Mint the next stable host port. Pool is contiguous from
-    /// `BRIDGE_PORT_POOL_START` up to `BRIDGE_PORT_POOL_END`; once
+    /// `SIDECAR_PORT_POOL_START` up to `SIDECAR_PORT_POOL_END`; once
     /// exhausted, returns `None` and the supervisor refuses to spawn
     /// (parking the slot CrashLooping). In practice no operator runs
-    /// 100 bridges, but a saturating overflow that quietly mapped
+    /// 100 sidecars, but a saturating overflow that quietly mapped
     /// every excess channel onto the same port would be a much worse
     /// failure mode than the explicit refusal.
     async fn allocate_port(&self) -> Option<u16> {
         let mut next = self.next_host_port.lock().await;
-        if *next > BRIDGE_PORT_POOL_END {
+        if *next > SIDECAR_PORT_POOL_END {
             return None;
         }
         let p = *next;
@@ -569,16 +569,16 @@ impl BridgeSupervisor {
         Some(p)
     }
 
-    /// Update `slot.status` and publish a `BridgeStatusChanged` event
+    /// Update `slot.status` and publish a `SidecarStatusChanged` event
     /// **only if the status actually changed**. Pre-fix the supervisor
     /// re-published on every reconcile pass even when the status was
-    /// the same, which spammed the event bus + the SPA's bridges
+    /// the same, which spammed the event bus + the SPA's sidecars
     /// page. Centralising the publish here means every transition
     /// site naturally dedups.
     fn transition_status(
         &self,
         channel: &str,
-        slot: &mut BridgeSlot,
+        slot: &mut SidecarSlot,
         new_status: ServiceStatus,
     ) {
         if slot.status == new_status {
@@ -586,7 +586,7 @@ impl BridgeSupervisor {
         }
         slot.status = new_status.clone();
         if let Some(bus) = &self.bus {
-            bus.publish(UiEvent::BridgeStatusChanged {
+            bus.publish(UiEvent::SidecarStatusChanged {
                 channel: channel.to_owned(),
                 status: format!("{new_status:?}"),
             });
@@ -596,9 +596,9 @@ impl BridgeSupervisor {
 
 /// Stable per-(plugin, channel) container name. Mirrors
 /// `backend_supervisor`'s naming scheme so an operator who knows the
-/// `execlaw-…` convention finds bridges where they expect.
+/// `execlaw-…` convention finds sidecars where they expect.
 fn container_name(plugin_id: &str, channel: &str) -> String {
-    format!("execlaw-bridge-{plugin_id}-{channel}")
+    format!("execlaw-sidecar-{plugin_id}-{channel}")
 }
 
 #[cfg(test)]
@@ -607,7 +607,7 @@ mod tests {
     use execlaw_container_manager::MockServiceController;
     use execlaw_plugin_sdk::PluginManifest;
 
-    fn registry_with_bridge(plugin_id: &str, channel: &str, port: u16) -> HookRegistry {
+    fn registry_with_sidecar(plugin_id: &str, channel: &str, port: u16) -> HookRegistry {
         let m = PluginManifest::parse(&format!(
             r#"
 [plugin]
@@ -616,10 +616,10 @@ name = "P"
 version = "0.1.0"
 
 [[services]]
-name = "{plugin_id}-bridge"
-image = "execlaw/{plugin_id}-bridge:0.1"
+name = "{plugin_id}-sidecar"
+image = "execlaw/{plugin_id}-sidecar:0.1"
 
-[services.bridge]
+[services.sidecar]
 channel = "{channel}"
 rpc_port = {port}
 "#
@@ -631,18 +631,18 @@ rpc_port = {port}
     }
 
     #[tokio::test]
-    async fn reconcile_spawns_registered_bridge_and_marks_starting() {
+    async fn reconcile_spawns_registered_sidecar_and_marks_starting() {
         let mock = Arc::new(MockServiceController::new());
-        let reg = registry_with_bridge("p-signal", "signal", 8080);
-        let sup = BridgeSupervisor::new(mock.clone(), reg);
+        let reg = registry_with_sidecar("p-signal", "signal", 8080);
+        let sup = SidecarSupervisor::new(mock.clone(), reg);
 
         sup.reconcile_once().await;
 
         assert_eq!(mock.spawn_count().await, 1);
         let last = mock.last_spawn().await.unwrap();
-        assert_eq!(last.image, "execlaw/p-signal-bridge:0.1");
+        assert_eq!(last.image, "execlaw/p-signal-sidecar:0.1");
         assert_eq!(last.container_port, 8080);
-        assert_eq!(last.host_port, BRIDGE_PORT_POOL_START);
+        assert_eq!(last.host_port, SIDECAR_PORT_POOL_START);
 
         let snap = sup.snapshot_status().await;
         assert_eq!(snap.len(), 1);
@@ -654,8 +654,8 @@ rpc_port = {port}
     #[tokio::test]
     async fn reconcile_promotes_to_healthy_when_inspect_and_rpc_both_pass() {
         let mock = Arc::new(MockServiceController::new());
-        let reg = registry_with_bridge("p-signal", "signal", 8080);
-        let sup = BridgeSupervisor::new(mock.clone(), reg);
+        let reg = registry_with_sidecar("p-signal", "signal", 8080);
+        let sup = SidecarSupervisor::new(mock.clone(), reg);
 
         // Tick 1: spawn → Starting.
         sup.reconcile_once().await;
@@ -674,13 +674,13 @@ rpc_port = {port}
 
     #[tokio::test]
     async fn rpc_health_failure_with_inspect_healthy_triggers_restart() {
-        // The "container says it's up but the bridge process inside
+        // The "container says it's up but the sidecar process inside
         // is wedged" case. Inspect says Healthy; RPC health says no.
         // Supervisor must stop + drop the handle so the next
         // reconcile respawns.
         let mock = Arc::new(MockServiceController::new());
-        let reg = registry_with_bridge("p-signal", "signal", 8080);
-        let sup = BridgeSupervisor::new(mock.clone(), reg);
+        let reg = registry_with_sidecar("p-signal", "signal", 8080);
+        let sup = SidecarSupervisor::new(mock.clone(), reg);
 
         sup.reconcile_once().await; // spawn
         mock.pin_status(ServiceStatus::Healthy).await;
@@ -703,8 +703,8 @@ rpc_port = {port}
         // CrashLooping; further reconciles must NOT keep spawning.
         let mock = Arc::new(MockServiceController::new());
         mock.pin_spawn_pull_error("nope").await;
-        let reg = registry_with_bridge("p-signal", "signal", 8080);
-        let sup = BridgeSupervisor::new(mock.clone(), reg);
+        let reg = registry_with_sidecar("p-signal", "signal", 8080);
+        let sup = SidecarSupervisor::new(mock.clone(), reg);
 
         for _ in 0..MAX_RESTART_ATTEMPTS {
             sup.reconcile_once().await;
@@ -727,8 +727,8 @@ rpc_port = {port}
     async fn reset_attempts_drops_crash_looping_park() {
         let mock = Arc::new(MockServiceController::new());
         mock.pin_spawn_pull_error("nope").await;
-        let reg = registry_with_bridge("p-signal", "signal", 8080);
-        let sup = BridgeSupervisor::new(mock.clone(), reg);
+        let reg = registry_with_sidecar("p-signal", "signal", 8080);
+        let sup = SidecarSupervisor::new(mock.clone(), reg);
 
         for _ in 0..MAX_RESTART_ATTEMPTS {
             sup.reconcile_once().await;
@@ -744,13 +744,13 @@ rpc_port = {port}
     }
 
     #[tokio::test]
-    async fn unregistering_bridge_stops_its_container() {
-        // Plugin disabled → bridge unregistered → supervisor must
+    async fn unregistering_sidecar_stops_its_container() {
+        // Plugin disabled → sidecar unregistered → supervisor must
         // stop the container on the next reconcile and drop the
         // slot.
         let mock = Arc::new(MockServiceController::new());
-        let reg = registry_with_bridge("p-signal", "signal", 8080);
-        let sup = BridgeSupervisor::new(mock.clone(), reg.clone());
+        let reg = registry_with_sidecar("p-signal", "signal", 8080);
+        let sup = SidecarSupervisor::new(mock.clone(), reg.clone());
         sup.reconcile_once().await;
         assert_eq!(mock.spawn_count().await, 1);
 
@@ -760,17 +760,17 @@ rpc_port = {port}
 
         assert_eq!(mock.stop_count().await, 1);
         let snap = sup.snapshot_status().await;
-        assert!(snap.is_empty(), "no registered bridges → empty snapshot");
+        assert!(snap.is_empty(), "no registered sidecars → empty snapshot");
     }
 
     #[tokio::test]
     async fn manifest_image_change_triggers_clean_respawn() {
         // Drift detection: same channel, different image → stop
-        // old, spawn new. Without this an `upgrade` of a bridge
+        // old, spawn new. Without this an `upgrade` of a sidecar
         // plugin would leave the prior container running.
         let mock = Arc::new(MockServiceController::new());
-        let reg = registry_with_bridge("p-signal", "signal", 8080);
-        let sup = BridgeSupervisor::new(mock.clone(), reg.clone());
+        let reg = registry_with_sidecar("p-signal", "signal", 8080);
+        let sup = SidecarSupervisor::new(mock.clone(), reg.clone());
         sup.reconcile_once().await;
         assert_eq!(mock.spawn_count().await, 1);
 
@@ -785,10 +785,10 @@ name = "P"
 version = "0.1.0"
 
 [[services]]
-name = "p-signal-bridge"
-image = "execlaw/p-signal-bridge:0.2"
+name = "p-signal-sidecar"
+image = "execlaw/p-signal-sidecar:0.2"
 
-[services.bridge]
+[services.sidecar]
 channel = "signal"
 rpc_port = 8080
 "#,
@@ -802,7 +802,7 @@ rpc_port = 8080
         // 1 from the original spawn + 1 from the post-drift spawn.
         assert_eq!(mock.spawn_count().await, 2);
         let last = mock.last_spawn().await.unwrap();
-        assert_eq!(last.image, "execlaw/p-signal-bridge:0.2");
+        assert_eq!(last.image, "execlaw/p-signal-sidecar:0.2");
     }
 
     #[tokio::test]
@@ -812,8 +812,8 @@ rpc_port = 8080
         // but NOT bump restart_attempts here (the spawn-failure
         // path is the canonical incrementer).
         let mock = Arc::new(MockServiceController::new());
-        let reg = registry_with_bridge("p-signal", "signal", 8080);
-        let sup = BridgeSupervisor::new(mock.clone(), reg);
+        let reg = registry_with_sidecar("p-signal", "signal", 8080);
+        let sup = SidecarSupervisor::new(mock.clone(), reg);
         sup.reconcile_once().await; // spawn
         mock.pin_status(ServiceStatus::NotFound).await;
         sup.reconcile_once().await; // observe
@@ -831,11 +831,11 @@ rpc_port = 8080
         // stable" promise). Pin port reuse: spawn → RPC-fail
         // respawn → next spawn lands on the SAME host port.
         let mock = Arc::new(MockServiceController::new());
-        let reg = registry_with_bridge("p-signal", "signal", 8080);
-        let sup = BridgeSupervisor::new(mock.clone(), reg);
+        let reg = registry_with_sidecar("p-signal", "signal", 8080);
+        let sup = SidecarSupervisor::new(mock.clone(), reg);
         sup.reconcile_once().await; // spawn (port = 8501)
         let first_port = mock.last_spawn().await.unwrap().host_port;
-        assert_eq!(first_port, BRIDGE_PORT_POOL_START);
+        assert_eq!(first_port, SIDECAR_PORT_POOL_START);
 
         mock.pin_status(ServiceStatus::Healthy).await;
         mock.pin_health(false).await;
@@ -857,10 +857,10 @@ rpc_port = 8080
     async fn rpc_health_failure_eventually_parks_at_cap() {
         // Audit gap: only the spawn-fail path was tested for the
         // restart cap. Pin the RPC-health-fail path too — it's the
-        // realistic "bridge is wedged" case.
+        // realistic "sidecar is wedged" case.
         let mock = Arc::new(MockServiceController::new());
-        let reg = registry_with_bridge("p-signal", "signal", 8080);
-        let sup = BridgeSupervisor::new(mock.clone(), reg);
+        let reg = registry_with_sidecar("p-signal", "signal", 8080);
+        let sup = SidecarSupervisor::new(mock.clone(), reg);
         sup.reconcile_once().await; // spawn
         mock.pin_status(ServiceStatus::Healthy).await;
         mock.pin_health(false).await;
@@ -892,8 +892,8 @@ rpc_port = 8080
         // count + image but not the restart_attempts reset that
         // `drift_from` triggers. Pin it.
         let mock = Arc::new(MockServiceController::new());
-        let reg = registry_with_bridge("p-signal", "signal", 8080);
-        let sup = BridgeSupervisor::new(mock.clone(), reg.clone());
+        let reg = registry_with_sidecar("p-signal", "signal", 8080);
+        let sup = SidecarSupervisor::new(mock.clone(), reg.clone());
         sup.reconcile_once().await; // spawn
         // Force the restart counter up via RPC-health failure.
         mock.pin_status(ServiceStatus::Healthy).await;
@@ -912,10 +912,10 @@ name = "P"
 version = "0.1.0"
 
 [[services]]
-name = "p-signal-bridge"
-image = "execlaw/p-signal-bridge:0.2"
+name = "p-signal-sidecar"
+image = "execlaw/p-signal-sidecar:0.2"
 
-[services.bridge]
+[services.sidecar]
 channel = "signal"
 rpc_port = 8080
 "#,
@@ -944,8 +944,8 @@ rpc_port = 8080
         // Pin the source-of-truth contract: idle ticks observing
         // CrashLooping must NOT bump restart_attempts.
         let mock = Arc::new(MockServiceController::new());
-        let reg = registry_with_bridge("p-signal", "signal", 8080);
-        let sup = BridgeSupervisor::new(mock.clone(), reg);
+        let reg = registry_with_sidecar("p-signal", "signal", 8080);
+        let sup = SidecarSupervisor::new(mock.clone(), reg);
         sup.reconcile_once().await; // spawn
 
         mock.pin_status(ServiceStatus::CrashLooping { restart_count: 2 })
@@ -968,19 +968,19 @@ rpc_port = 8080
 
     #[tokio::test]
     async fn port_pool_exhaustion_parks_crash_looping_without_spawning() {
-        // Drive the port allocator past BRIDGE_PORT_POOL_END by
+        // Drive the port allocator past SIDECAR_PORT_POOL_END by
         // pre-allocating manually, then attempt to register one
-        // more bridge. The supervisor must refuse the spawn (zero
+        // more sidecar. The supervisor must refuse the spawn (zero
         // controller calls) and park the slot CrashLooping so the
         // operator sees the problem instead of a silent collision.
         let mock = Arc::new(MockServiceController::new());
-        let reg = registry_with_bridge("p-signal", "signal", 8080);
-        let sup = BridgeSupervisor::new(mock.clone(), reg);
+        let reg = registry_with_sidecar("p-signal", "signal", 8080);
+        let sup = SidecarSupervisor::new(mock.clone(), reg);
         // Walk the pool down to one-past-the-end so the next
         // reconcile's allocate_port returns None.
         {
             let mut next = sup.next_host_port.lock().await;
-            *next = BRIDGE_PORT_POOL_END + 1;
+            *next = SIDECAR_PORT_POOL_END + 1;
         }
 
         sup.reconcile_once().await;
@@ -1000,7 +1000,7 @@ rpc_port = 8080
 
     #[tokio::test]
     async fn distinct_channels_get_distinct_host_ports() {
-        // Port pool stability — two bridges in distinct channels
+        // Port pool stability — two sidecars in distinct channels
         // get sequential, non-colliding host ports.
         let reg = HookRegistry::new();
         for (pid, ch, p) in [
@@ -1015,10 +1015,10 @@ name = "P"
 version = "0.1.0"
 
 [[services]]
-name = "{pid}-bridge"
+name = "{pid}-sidecar"
 image = "x"
 
-[services.bridge]
+[services.sidecar]
 channel = "{ch}"
 rpc_port = {p}
 "#
@@ -1027,10 +1027,10 @@ rpc_port = {p}
             reg.enable(&m).unwrap();
         }
         let mock = Arc::new(MockServiceController::new());
-        let sup = BridgeSupervisor::new(mock.clone(), reg);
+        let sup = SidecarSupervisor::new(mock.clone(), reg);
         sup.reconcile_once().await;
 
-        // Both bridges registered → two spawns, sequential host
+        // Both sidecars registered → two spawns, sequential host
         // ports starting at the pool start.
         assert_eq!(mock.spawn_count().await, 2);
         let snap = sup.snapshot_status().await;
@@ -1047,6 +1047,6 @@ rpc_port = {p}
         // channel), so just check the set.
         let mut sorted = ports.clone();
         sorted.sort();
-        assert_eq!(sorted, vec![BRIDGE_PORT_POOL_START, BRIDGE_PORT_POOL_START + 1]);
+        assert_eq!(sorted, vec![SIDECAR_PORT_POOL_START, SIDECAR_PORT_POOL_START + 1]);
     }
 }

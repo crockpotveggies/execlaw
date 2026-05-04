@@ -99,13 +99,13 @@ pub enum UiEvent {
         phase: String,
     },
 
-    /// Fired by the bridge supervisor when a bridge sidecar's
+    /// Fired by the sidecar supervisor when a supervised sidecar's
     /// observed status changes (Stopped → Starting → Healthy →
-    /// CrashLooping → ...). The SPA's bridges page uses these to
+    /// CrashLooping → ...). The SPA's sidecars page uses these to
     /// keep its row badges live without polling. `status` is the
     /// `Debug` rendering of `ServiceStatus` so a future
     /// CrashLooping variant carries `restart_count` along for free.
-    BridgeStatusChanged {
+    SidecarStatusChanged {
         channel: String,
         status: String,
     },

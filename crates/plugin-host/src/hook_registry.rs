@@ -119,17 +119,17 @@ pub struct RegisteredAlertSource {
     pub fingerprint_prefix: String,
 }
 
-/// A bridge sidecar — registered when a plugin's `[[services]]` entry
-/// declares a `[services.bridge]` table. The bridge supervisor reads
-/// this to learn which channels need a managed container, and it
-/// learns the RPC port + healthcheck path the supervisor probes.
+/// A supervised sidecar — registered when a plugin's `[[services]]`
+/// entry declares a `[services.sidecar]` table. The sidecar supervisor
+/// reads this to learn which channels need a managed container, and
+/// it learns the RPC port + healthcheck path the supervisor probes.
 ///
 /// Cheap to clone: every field is a small string or scalar.
 #[derive(Debug, Clone)]
-pub struct RegisteredBridge {
-    /// Owning plugin id — used by `disable` to drop bridges when a
+pub struct RegisteredSidecar {
+    /// Owning plugin id — used by `disable` to drop sidecars when a
     /// plugin is uninstalled, AND to compose the supervisor's stable
-    /// container name (`execlaw-bridge-<plugin>-<channel>`) so two
+    /// container name (`execlaw-sidecar-<plugin>-<channel>`) so two
     /// distinct plugins claiming the same channel can't collide on
     /// the docker side (the manifest validator already rejects
     /// duplicates within one plugin).
@@ -139,12 +139,12 @@ pub struct RegisteredBridge {
     pub service_name: String,
     /// Container image reference, copied verbatim from the manifest.
     pub image: String,
-    /// Bridge channel id ("signal", "whatsapp", ...). The supervisor
-    /// keys on this — exactly one bridge per channel may be enabled
-    /// at a time. `enable` enforces this across plugins (not just
-    /// within one).
+    /// Transport channel id ("signal", "whatsapp", ...). The
+    /// supervisor keys on this — exactly one sidecar per channel
+    /// may be enabled at a time. `enable` enforces this across
+    /// plugins (not just within one).
     pub channel: String,
-    /// Container port serving the bridge's local RPC. The supervisor
+    /// Container port serving the sidecar's local RPC. The supervisor
     /// publishes this on a host port and probes the health path
     /// against it.
     pub rpc_port: u16,
@@ -205,11 +205,11 @@ struct HookRegistryInner {
     builtins_by_name: BTreeMap<String, RegisteredBuiltin>,
     ui_panels_by_mount: BTreeMap<String, RegisteredUiPanel>,
     transports_by_id: BTreeMap<String, RegisteredTransport>,
-    /// Bridges keyed by channel — at most one per channel across the
+    /// Sidecars keyed by channel — at most one per channel across the
     /// whole control plane. The supervisor reads this; conflicts are
     /// rejected at `enable` time so the supervisor only ever sees
     /// well-formed state.
-    bridges_by_channel: BTreeMap<String, RegisteredBridge>,
+    sidecars_by_channel: BTreeMap<String, RegisteredSidecar>,
     identity_providers: BTreeMap<String, RegisteredIdentityProvider>,
     event_subs: HashMap<String, Vec<RegisteredEventSubscription>>,
     alert_sources: Vec<RegisteredAlertSource>,
@@ -283,16 +283,16 @@ impl HookRegistry {
                 t.transport_id, existing.plugin_id
             ));
         }
-        // Bridges — at most one per channel across the whole control
+        // Sidecars — at most one per channel across the whole control
         // plane. Within-plugin duplicates were caught at parse time;
         // this check catches *cross-plugin* collisions (two plugins
-        // both wanting to be the Signal bridge).
+        // both wanting to be the Signal sidecar).
         for s in &manifest.services {
-            if let Some(b) = &s.bridge
-                && let Some(existing) = w.bridges_by_channel.get(&b.channel)
+            if let Some(b) = &s.sidecar
+                && let Some(existing) = w.sidecars_by_channel.get(&b.channel)
             {
                 return Err(format!(
-                    "bridge channel '{}' is already registered by plugin '{}'",
+                    "sidecar channel '{}' is already registered by plugin '{}'",
                     b.channel, existing.plugin_id,
                 ));
             }
@@ -378,10 +378,10 @@ impl HookRegistry {
             );
         }
         for s in &manifest.services {
-            if let Some(b) = &s.bridge {
-                w.bridges_by_channel.insert(
+            if let Some(b) = &s.sidecar {
+                w.sidecars_by_channel.insert(
                     b.channel.clone(),
-                    RegisteredBridge {
+                    RegisteredSidecar {
                         plugin_id: plugin_id.clone(),
                         service_name: s.name.clone(),
                         image: s.image.clone(),
@@ -440,7 +440,7 @@ impl HookRegistry {
         w.tools_by_name.retain(|_, v| v.plugin_id != plugin_id);
         w.ui_panels_by_mount.retain(|_, v| v.plugin_id != plugin_id);
         w.transports_by_id.retain(|_, v| v.plugin_id != plugin_id);
-        w.bridges_by_channel.retain(|_, v| v.plugin_id != plugin_id);
+        w.sidecars_by_channel.retain(|_, v| v.plugin_id != plugin_id);
         w.identity_providers.remove(plugin_id);
         for subs in w.event_subs.values_mut() {
             subs.retain(|s| s.plugin_id != plugin_id);
@@ -549,27 +549,27 @@ impl HookRegistry {
         self.inner.read().unwrap().transports_by_id.get(id).cloned()
     }
 
-    /// Look up the bridge registered for `channel`, if any. Returns
+    /// Look up the sidecar registered for `channel`, if any. Returns
     /// a clone — the supervisor calls this on every reconcile tick
     /// so it pays the clone cost in exchange for a lock-free read.
-    pub fn bridge(&self, channel: &str) -> Option<RegisteredBridge> {
+    pub fn sidecar(&self, channel: &str) -> Option<RegisteredSidecar> {
         self.inner
             .read()
             .unwrap()
-            .bridges_by_channel
+            .sidecars_by_channel
             .get(channel)
             .cloned()
     }
 
-    /// Snapshot every registered bridge. The supervisor's
+    /// Snapshot every registered sidecar. The supervisor's
     /// reconcile-loop reads this each tick to compute "desired" vs
     /// "running" diff. Order is stable (BTreeMap) so the
     /// supervisor's tick log lines stay grep-able.
-    pub fn all_bridges(&self) -> Vec<RegisteredBridge> {
+    pub fn all_sidecars(&self) -> Vec<RegisteredSidecar> {
         self.inner
             .read()
             .unwrap()
-            .bridges_by_channel
+            .sidecars_by_channel
             .values()
             .cloned()
             .collect()
@@ -813,7 +813,7 @@ latency = "low"
         assert!(reg.tool("a").is_some());
     }
 
-    fn manifest_with_bridge(plugin_id: &str, channel: &str, port: u16) -> PluginManifest {
+    fn manifest_with_sidecar(plugin_id: &str, channel: &str, port: u16) -> PluginManifest {
         PluginManifest::parse(&format!(
             r#"
 [plugin]
@@ -822,10 +822,10 @@ name = "P"
 version = "0.1.0"
 
 [[services]]
-name = "{plugin_id}-bridge"
-image = "execlaw/{plugin_id}-bridge:0.1"
+name = "{plugin_id}-sidecar"
+image = "execlaw/{plugin_id}-sidecar:0.1"
 
-[services.bridge]
+[services.sidecar]
 channel = "{channel}"
 rpc_port = {port}
 "#
@@ -834,68 +834,68 @@ rpc_port = {port}
     }
 
     #[test]
-    fn enable_registers_bridge_service() {
+    fn enable_registers_sidecar_service() {
         let reg = HookRegistry::new();
-        reg.enable(&manifest_with_bridge("p-signal", "signal", 8080))
+        reg.enable(&manifest_with_sidecar("p-signal", "signal", 8080))
             .unwrap();
-        let b = reg.bridge("signal").expect("bridge registered");
+        let b = reg.sidecar("signal").expect("sidecar registered");
         assert_eq!(b.plugin_id, "p-signal");
-        assert_eq!(b.service_name, "p-signal-bridge");
-        assert_eq!(b.image, "execlaw/p-signal-bridge:0.1");
+        assert_eq!(b.service_name, "p-signal-sidecar");
+        assert_eq!(b.image, "execlaw/p-signal-sidecar:0.1");
         assert_eq!(b.rpc_port, 8080);
         // Default health path applied via the manifest default.
         assert_eq!(b.rpc_health_path, "/healthz");
     }
 
     #[test]
-    fn cross_plugin_bridge_channel_collision_rejected() {
-        // Two distinct plugins both wanting to be the Signal bridge —
-        // the supervisor would have no way to pick a winner, so
+    fn cross_plugin_sidecar_channel_collision_rejected() {
+        // Two distinct plugins both wanting to be the Signal sidecar
+        // — the supervisor would have no way to pick a winner, so
         // refuse the second enable. The first plugin keeps its
-        // bridge; the second isn't registered at all (atomic enable).
+        // sidecar; the second isn't registered at all (atomic enable).
         let reg = HookRegistry::new();
-        reg.enable(&manifest_with_bridge("p-signal-a", "signal", 8080))
+        reg.enable(&manifest_with_sidecar("p-signal-a", "signal", 8080))
             .unwrap();
         let err = reg
-            .enable(&manifest_with_bridge("p-signal-b", "signal", 8081))
+            .enable(&manifest_with_sidecar("p-signal-b", "signal", 8081))
             .unwrap_err();
         assert!(
-            err.contains("bridge channel 'signal' is already registered"),
+            err.contains("sidecar channel 'signal' is already registered"),
             "expected channel-collision message, got: {err}",
         );
         assert!(!reg.is_enabled("p-signal-b"));
-        // Original bridge still owned by the first plugin.
-        let b = reg.bridge("signal").unwrap();
+        // Original sidecar still owned by the first plugin.
+        let b = reg.sidecar("signal").unwrap();
         assert_eq!(b.plugin_id, "p-signal-a");
         assert_eq!(b.rpc_port, 8080);
     }
 
     #[test]
-    fn disable_drops_bridge_for_owning_plugin() {
+    fn disable_drops_sidecar_for_owning_plugin() {
         let reg = HookRegistry::new();
-        reg.enable(&manifest_with_bridge("p-signal", "signal", 8080))
+        reg.enable(&manifest_with_sidecar("p-signal", "signal", 8080))
             .unwrap();
-        reg.enable(&manifest_with_bridge("p-wa", "whatsapp", 8081))
+        reg.enable(&manifest_with_sidecar("p-wa", "whatsapp", 8081))
             .unwrap();
         reg.disable("p-signal");
-        // Signal bridge gone…
-        assert!(reg.bridge("signal").is_none());
-        // …but WhatsApp bridge survives. Important — disable must
+        // Signal sidecar gone…
+        assert!(reg.sidecar("signal").is_none());
+        // …but WhatsApp sidecar survives. Important — disable must
         // not be over-broad.
-        let wa = reg.bridge("whatsapp").expect("wa bridge survives");
+        let wa = reg.sidecar("whatsapp").expect("wa sidecar survives");
         assert_eq!(wa.plugin_id, "p-wa");
     }
 
     #[test]
-    fn all_bridges_returns_stable_order_across_calls() {
+    fn all_sidecars_returns_stable_order_across_calls() {
         // BTreeMap order — useful for deterministic supervisor logs.
         let reg = HookRegistry::new();
-        reg.enable(&manifest_with_bridge("p-z", "z-channel", 9000))
+        reg.enable(&manifest_with_sidecar("p-z", "z-channel", 9000))
             .unwrap();
-        reg.enable(&manifest_with_bridge("p-a", "a-channel", 9001))
+        reg.enable(&manifest_with_sidecar("p-a", "a-channel", 9001))
             .unwrap();
         let names: Vec<String> = reg
-            .all_bridges()
+            .all_sidecars()
             .into_iter()
             .map(|b| b.channel)
             .collect();
@@ -903,9 +903,9 @@ rpc_port = {port}
     }
 
     #[test]
-    fn non_bridge_service_does_not_register_in_bridges_map() {
-        // Helper sidecar with no [services.bridge] table — must
-        // NOT show up in the bridges map.
+    fn non_sidecar_service_does_not_register_in_sidecars_map() {
+        // Helper sidecar with no [services.sidecar] table — must
+        // NOT show up in the sidecars map.
         let m = PluginManifest::parse(
             r#"
 [plugin]
@@ -921,8 +921,8 @@ image = "x"
         .unwrap();
         let reg = HookRegistry::new();
         reg.enable(&m).unwrap();
-        assert!(reg.bridge("ocr-worker").is_none());
-        assert_eq!(reg.all_bridges().len(), 0);
+        assert!(reg.sidecar("ocr-worker").is_none());
+        assert_eq!(reg.all_sidecars().len(), 0);
     }
 
     /// All-or-nothing atomicity: if ONE tool from a manifest conflicts
