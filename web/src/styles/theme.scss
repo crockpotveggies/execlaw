@@ -1747,3 +1747,289 @@ body {
         margin-left: 0.4rem;
     }
 }
+
+// ---- Generic page shell (non-chat routes) ------------------------
+//
+// `.execlaw-page` is the load-bearing scaffold for every non-chat
+// destination that renders inside `.execlaw-main` (Research,
+// Routines, Skills, Settings, future pages). It enforces the
+// flex/min-height contract so children can scroll inside the
+// remaining viewport height — which the bare per-page wrappers
+// kept getting wrong, leaving content overflowing the viewport
+// with no scrollbar.
+//
+// Two flavours via a modifier:
+//   * default — flex column that fills remaining height with no
+//     overflow handling. Use when the page wants to manage its
+//     own scroll surfaces (two-pane list+detail layouts like
+//     Research and Skills).
+//   * `.execlaw-page--scroll` — single scrollable column with
+//     standard page padding. Use for stack-of-sections content
+//     pages like Routines.
+.execlaw-page {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    background-color: $bg-deep;
+}
+
+.execlaw-page--scroll {
+    overflow-y: auto;
+    padding: 1.25rem 1.75rem 3rem;
+
+    @media (max-width: 767.98px) {
+        padding: 1rem 1rem 2rem;
+    }
+}
+
+// ---- Research page (/research) -----------------------------------
+//
+// Two-pane operator drill-down: a left list of every research job,
+// plus a right detail pane with plan tree + report. Outer shell is
+// `.execlaw-page`; this layer adds the filter row + split panes.
+.execlaw-research {
+    // Inherits flex column + min-height: 0 + bg from `.execlaw-page`.
+}
+
+.execlaw-research__filters {
+    display: inline-flex;
+    gap: 0.25rem;
+    margin-left: auto;
+}
+
+.execlaw-research__filter {
+    background: transparent;
+    border: 0;
+    color: $text-muted;
+    padding: 0.25rem 0.7rem;
+    border-radius: $radius-pill;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: background-color 0.12s ease, color 0.12s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+
+    &:hover {
+        background-color: $bg-surface;
+        color: $text-primary;
+    }
+
+    &.is-active {
+        background-color: rgba($accent, 0.18);
+        color: color.adjust($accent, $lightness: 18%);
+    }
+}
+
+.execlaw-research__filter-count {
+    font-size: 0.7rem;
+    background-color: rgba($text-primary, 0.1);
+    color: $text-muted;
+    padding: 0.05rem 0.4rem;
+    border-radius: 999px;
+    line-height: 1.4;
+    .execlaw-research__filter.is-active & {
+        background-color: rgba($accent, 0.25);
+        color: color.adjust($accent, $lightness: 18%);
+    }
+}
+
+.execlaw-research__split {
+    width: 100%;
+}
+
+.execlaw-research__list {
+    width: 22rem;
+    flex: 0 0 22rem;
+    overflow-y: auto;
+    padding: 0.5rem 0.75rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+
+    @media (max-width: 991.98px) {
+        width: 18rem;
+        flex: 0 0 18rem;
+    }
+}
+
+.execlaw-research__list-row {
+    background-color: $bg-surface;
+    border: 0;
+    border-radius: $radius-md;
+    padding: 0.6rem 0.75rem;
+    text-align: left;
+    color: $text-primary;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    transition: background-color 0.12s ease, transform 0.06s ease;
+
+    &:hover {
+        background-color: $bg-elev;
+    }
+
+    &.is-active {
+        background-color: rgba($accent, 0.18);
+        outline: 1px solid rgba($accent, 0.35);
+    }
+}
+
+.execlaw-research__list-row-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+}
+
+.execlaw-research__list-time {
+    flex: 0 0 auto;
+}
+
+.execlaw-research__list-query {
+    font-size: 0.88rem;
+    line-height: 1.35;
+    // Two-line clamp keeps the row a predictable height while
+    // letting longer questions still convey enough context to
+    // pick the right job.
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    word-break: break-word;
+}
+
+.execlaw-research__detail {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-y: auto;
+    background-color: $bg-deep;
+}
+
+.execlaw-research__detail-empty {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 2rem;
+}
+
+.execlaw-research__detail-body {
+    padding: 1.25rem 1.75rem 3rem;
+    max-width: 56rem;
+    margin: 0 auto;
+}
+
+.execlaw-research__detail-head {
+    margin-bottom: 1.25rem;
+}
+
+.execlaw-research__detail-title {
+    font-family: $font-body;
+    font-weight: 500;
+    font-size: 1.25rem;
+    line-height: 1.35;
+    margin: 0;
+}
+
+.execlaw-research__section {
+    background-color: $bg-surface;
+    border-radius: $radius-md;
+    padding: 1rem 1.1rem;
+    margin-bottom: 1rem;
+}
+
+.execlaw-research__section-title {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: $text-muted;
+    margin: 0 0 0.6rem;
+}
+
+.execlaw-research__thesis {
+    font-size: 0.92rem;
+    margin-bottom: 0.75rem;
+}
+
+.execlaw-research__steps {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+}
+
+.execlaw-research__step {
+    background-color: $bg-elev;
+    border-radius: $radius-pill;
+    padding: 0.6rem 0.8rem;
+}
+
+.execlaw-research__step-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.execlaw-research__step-query {
+    font-size: 0.9rem;
+    font-weight: 500;
+}
+
+.execlaw-research__step-rationale {
+    margin-top: 0.25rem;
+}
+
+.execlaw-research__step-excerpt {
+    margin-top: 0.5rem;
+    font-size: 0.88rem;
+    line-height: 1.5;
+    color: $text-primary;
+}
+
+.execlaw-research__sources {
+    margin: 0.5rem 0 0;
+    padding-left: 1.1rem;
+    font-size: 0.8rem;
+    color: $text-muted;
+
+    a {
+        color: $accent;
+        text-decoration: none;
+        &:hover, &:focus-visible { text-decoration: underline; }
+    }
+}
+
+.execlaw-research__report {
+    background-color: $bg-elev;
+    border-radius: $radius-md;
+    padding: 1rem;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.82rem;
+    line-height: 1.55;
+    color: $text-primary;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: none;
+    margin: 0;
+}
+
+@media (max-width: 767.98px) {
+    .execlaw-research__split {
+        flex-direction: column;
+    }
+    .execlaw-research__list {
+        width: 100%;
+        flex: 0 0 auto;
+        max-height: 40vh;
+    }
+}
+

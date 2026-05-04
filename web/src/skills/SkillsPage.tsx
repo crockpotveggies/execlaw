@@ -63,7 +63,7 @@ export function SkillsPage() {
 
     return (
         <div
-            className="execlaw-skills d-flex flex-column h-100"
+            className="execlaw-page execlaw-skills"
             data-testid="skills-page"
         >
             <ErrorBanner

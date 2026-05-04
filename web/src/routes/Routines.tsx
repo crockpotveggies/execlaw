@@ -49,7 +49,10 @@ export function Routines() {
                         Routines
                     </h2>
                 </header>
-                <div className="execlaw-routines-shell" data-testid="routines-page">
+                <div
+                    className="execlaw-page execlaw-page--scroll"
+                    data-testid="routines-page"
+                >
                     <RoutinesPage />
                 </div>
             </main>
