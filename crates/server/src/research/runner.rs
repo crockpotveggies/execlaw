@@ -676,12 +676,11 @@ pub async fn run_synthesize_phase(
     // markdown into `details.report_markdown`. The SPA dumped it
     // into a `<pre>` block below the plan tree which bloated the
     // chat pane on any non-trivial report. The PDF deliverable now
-    // flows through `send_attachment` (the agent calls it after
-    // observing the completed status), which emits a separate
-    // Attachment card the SPA renders as a download chip. The
-    // research card still carries `attachment_id` for back-compat
-    // and the /research/<job_id> page can pull the markdown from
-    // the workspace for operators who want to read inline.
+    // flows through a separate Attachment card the SPA renders as
+    // a download chip (emitted below). The research card still
+    // carries `attachment_id` for back-compat and the
+    // /research/<job_id> page can pull the markdown from the
+    // workspace for operators who want to read inline.
     close_card_and_broadcast(
         db,
         events,
@@ -700,6 +699,46 @@ pub async fn run_synthesize_phase(
             error: None,
         },
     )?;
+
+    // 2026-05-04 (rev 8): auto-emit the Attachment card chip so the
+    // user sees a download link as soon as synthesise completes.
+    // Previous design assumed the agent would call `send_attachment`
+    // after observing the completed status, but the agent has no
+    // observation mechanism here (we explicitly told it to NOT poll
+    // research_status), so the chip never appeared and the user
+    // just saw the research card close with no actual deliverable.
+    // Direct emit from the runner is correct because PDF delivery
+    // is deterministic — there's no judgment call for the agent to
+    // make. The agent's `send_attachment` tool stays available for
+    // re-surfacing or future flows that DO want the agent in the
+    // loop (e.g. multi-attachment composition).
+    // Trait import is local-scope so the runner module's other
+    // imports stay narrow. AttachmentApi::send is the canonical
+    // way to emit the chip pair (it handles trust scoping, file-
+    // size lookup, etc. — duplicating that logic here would drift).
+    use execlaw_core::tool::AttachmentApi;
+    let attachment_api = crate::attachment_api::ServerAttachmentApi::new(
+        db.clone(),
+        events.clone(),
+        conv_id.clone(),
+    );
+    let caption = format!("Research report — {}", truncate_for_card_summary(query));
+    if let Err(e) = attachment_api
+        .send(outcome.attachment_id.as_str(), Some(&caption))
+        .await
+    {
+        // Non-fatal: the research card is already closed with the
+        // attachment_id, so the SPA can still surface the download
+        // via the operator hitting /research/<job_id>. Log so the
+        // operator can see why the chip didn't appear inline.
+        tracing::warn!(
+            job_id = job_id.as_str(),
+            attachment_id = outcome.attachment_id.as_str(),
+            error = %e,
+            "auto-emit Attachment card on synthesize completion failed; \
+             chip will not appear inline (operator can still download via /research/<id>)",
+        );
+    }
     Ok(())
 }
 
