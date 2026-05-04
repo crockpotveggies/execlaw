@@ -78,6 +78,12 @@ pub struct ChainedToolDispatch<B: BuiltinTools> {
     /// card the SPA renders inline). `None` keeps the capability
     /// dormant — tools requesting it find `ctx.attachments == None`.
     pub events: Option<crate::events::EventBus>,
+    /// Wake handle for the deep-research supervisor. Wired through
+    /// to `DbResearchApi` so `research_start` can poke the
+    /// supervisor immediately on insert instead of waiting up to 5 s
+    /// for the next scheduled tick. `None` short-circuits to the
+    /// tick-only path (fine for tests).
+    pub research_supervisor_wake: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl<B: BuiltinTools> ChainedToolDispatch<B> {
@@ -96,6 +102,7 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             clock: Arc::new(SystemClock),
             inference: None,
             events: None,
+            research_supervisor_wake: None,
         }
     }
 
@@ -120,6 +127,7 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             clock: Arc::new(SystemClock),
             inference: None,
             events: None,
+            research_supervisor_wake: None,
         }
     }
 
@@ -167,6 +175,34 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
     /// that need to assert on emitted events pass a dedicated bus.
     pub fn with_events(mut self, events: crate::events::EventBus) -> Self {
         self.events = Some(events);
+        self
+    }
+
+    /// Attach the deep-research supervisor's wake handle so
+    /// `research_start` poke-wakes the supervisor on insert. Without
+    /// this, the supervisor waits up to its 5 s tick interval before
+    /// claiming the new Pending row — which is the dominant source
+    /// of "the agent took a while to come back with the
+    /// clarification question" wall-clock latency.
+    pub fn with_research_supervisor_wake(
+        mut self,
+        wake: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.research_supervisor_wake = Some(wake);
+        self
+    }
+
+    /// Convenience: chain through `Option<Arc<Notify>>` directly.
+    /// Production callers read the handle from
+    /// `state.research_supervisor.as_ref().map(|s| s.wake.clone())`,
+    /// which is `Option<_>` because test fixtures construct an
+    /// `AppState` without a supervisor. This avoids an `if-let`
+    /// dance at every dispatch site.
+    pub fn with_research_supervisor_wake_opt(
+        mut self,
+        wake: Option<Arc<tokio::sync::Notify>>,
+    ) -> Self {
+        self.research_supervisor_wake = wake;
         self
     }
 
@@ -261,12 +297,16 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
         // read-only impl whose `start` errors. A descriptor that
         // declares neither leaves `ctx.research == None`.
         if needs_research_spawn {
-            ctx.research = Some(Arc::new(DbResearchApi::with_spawn(
+            let mut api = DbResearchApi::with_spawn(
                 self.host.db().clone(),
                 self.caller_trust.as_str(),
                 ctx.conversation_id.clone(),
                 now,
-            )));
+            );
+            if let Some(wake) = self.research_supervisor_wake.as_ref() {
+                api = api.with_supervisor_wake(wake.clone());
+            }
+            ctx.research = Some(Arc::new(api));
         } else if needs_research_read {
             ctx.research = Some(Arc::new(DbResearchApi::read_only(
                 self.host.db().clone(),

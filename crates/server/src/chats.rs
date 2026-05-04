@@ -1169,7 +1169,10 @@ pub(crate) async fn run_runner_turn(
             inference_client_for_subagents.clone(),
             state.config.model_id.clone(),
         )
-        .with_events(state.events.clone()),
+        .with_events(state.events.clone())
+        .with_research_supervisor_wake_opt(
+            state.research_supervisor.as_ref().map(|s| s.wake.clone()),
+        ),
     );
 
     // Step 3.5 — lazy-spawn the runner if it's not registered yet.
@@ -1444,7 +1447,10 @@ async fn run_tool_capable_turn(
         // `delegate_task` and any future SubagentSpawn-capability
         // tools have a live child-LLM path for this turn.
         .with_inference(inference.clone(), state.config.model_id.clone())
-        .with_events(state.events.clone()),
+        .with_events(state.events.clone())
+        .with_research_supervisor_wake_opt(
+            state.research_supervisor.as_ref().map(|s| s.wake.clone()),
+        ),
     );
     let exec = TurnExecutor::new((*inference).clone(), dispatch);
     // Phase 11.A — wire a phase observer that fans the runner's
@@ -1970,6 +1976,22 @@ pub async fn dispatch_routine_turn(
     mapped
 }
 
+/// Sender-id sentinel marking a UserMsg event the server-side
+/// orchestrator generated (currently: the deep-research
+/// clarification dispatch). The `list_messages` SPA-facing handler
+/// filters these out so the synthetic prompt never appears in chat
+/// history; the durable event log keeps them so model history
+/// hydration can reconstruct what the orchestrator told the agent
+/// to ask.
+///
+/// Picked as a hyphenated namespace ("system-orchestrator") so it
+/// can't collide with a real user_id (which the username validator
+/// rejects hyphen-leading and slash characters from). Future
+/// orchestrator-driven turns (alerts, scheduled-task results that
+/// need agent attention) should reuse this same sentinel rather
+/// than minting per-feature variants.
+pub(crate) const SYSTEM_ORCHESTRATOR_ACTOR: &str = "system-orchestrator";
+
 /// 2026-05-03 (rev 7) — entry point for clarification-fired turns.
 /// Wakes the agent in `cid` with a system-framed prompt that tells
 /// it to relay a deep-research clarification question to the user
@@ -2030,10 +2052,14 @@ pub async fn dispatch_clarification_turn(
         question = question,
     );
 
-    let sender = Some("system".to_owned());
-    // Clarification turns are system-driven, not on behalf of an
-    // external sender. Controller trust is correct — same as
-    // routines.
+    // Use a distinguishing sender label so the SPA's chat-pane
+    // history filter (`list_messages`) can hide this synthetic
+    // user_msg event. The model still SEES the prompt in its
+    // history hydration (the log-replay path doesn't filter); only
+    // the user-facing message list does. Without this filter the
+    // operator would see the [SYSTEM ORCHESTRATOR NOTICE] prompt
+    // rendered as if they had typed it.
+    let sender = Some(SYSTEM_ORCHESTRATOR_ACTOR.to_owned());
     let caller_caps: Vec<String> = vec!["*".into()];
     let caller_trust = TrustLevel::Controller;
 
@@ -2538,6 +2564,20 @@ pub async fn list_messages(
                     | EventKind::ToolUse
                     | EventKind::ToolResult
             )
+        })
+        // Hide synthetic UserMsg events the orchestrator generated
+        // for system-initiated turns (deep-research clarification
+        // dispatch today; future routine triggers, etc.). Without
+        // this filter the operator sees the
+        // "[SYSTEM ORCHESTRATOR NOTICE]..." prompt in chat as if
+        // they had typed it. The events stay in the durable log so
+        // model history hydration on subsequent turns can still see
+        // the orchestrator instruction (which is what tells the
+        // model what question it asked the user). This filter is
+        // strictly an SPA-rendering concern.
+        .filter(|e| {
+            !matches!(e.kind, EventKind::UserMsg)
+                || e.actor.as_deref() != Some(SYSTEM_ORCHESTRATOR_ACTOR)
         })
         .take(limit as usize)
         .map(|e| MessageView {
@@ -3488,6 +3528,64 @@ mod tests {
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0]["kind"].as_str().unwrap(), "user_msg");
         assert_eq!(msgs[1]["kind"].as_str().unwrap(), "model_turn");
+    }
+
+    /// Regression: the synthetic UserMsg the server-side
+    /// orchestrator emits to wake the agent for deep-research
+    /// clarification used to render in chat history as if the user
+    /// had typed `[SYSTEM ORCHESTRATOR NOTICE] ...`. The hide-fix
+    /// stamps the actor field with `SYSTEM_ORCHESTRATOR_ACTOR` and
+    /// `list_messages` filters those events out — the SPA never
+    /// sees them, but the durable event log keeps them so the
+    /// model can still reconstruct what it was told to ask the
+    /// user on subsequent turns.
+    #[tokio::test]
+    async fn list_messages_hides_user_msg_events_with_system_orchestrator_actor() {
+        use execlaw_core::events::{EventLog, EventRecord};
+        // Build the state once + reuse for both the send and the
+        // synthetic write so we operate on the same DB across both.
+        let state = crate::routes::test_app_state();
+        let _ = send(crate::routes::build_router(state.clone()), "hello").await;
+        let cid = ConversationId::from("conv1");
+        let log = EventLog::new(&state.db);
+        let next_seq = log.last_seq(&cid).unwrap().next();
+        let evt = EventRecord::new(
+            cid.clone(),
+            next_seq,
+            EventKind::UserMsg,
+            &UserMessagePayload {
+                text: "[SYSTEM ORCHESTRATOR NOTICE] please ask the user X".into(),
+                sender_principal_id: Some(SYSTEM_ORCHESTRATOR_ACTOR.into()),
+            },
+            Some(SYSTEM_ORCHESTRATOR_ACTOR.into()),
+        )
+        .unwrap();
+        log.append(&evt).unwrap();
+
+        let app = crate::routes::build_router(state);
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/chats/conv1/messages")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = json_body(resp.into_body()).await;
+        let msgs = body["messages"].as_array().unwrap();
+        for m in msgs {
+            let kind = m["kind"].as_str().unwrap();
+            let actor = m["actor"].as_str();
+            let text = m["text"].as_str().unwrap_or("");
+            assert!(
+                !(kind == "user_msg"
+                    && actor == Some(SYSTEM_ORCHESTRATOR_ACTOR)),
+                "synthetic orchestrator user_msg leaked into list_messages: {m:?}",
+            );
+            assert!(
+                !text.contains("SYSTEM ORCHESTRATOR NOTICE"),
+                "orchestrator boilerplate text leaked: {text}",
+            );
+        }
     }
 
     #[test]

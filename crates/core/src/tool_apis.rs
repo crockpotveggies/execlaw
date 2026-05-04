@@ -28,6 +28,7 @@ use crate::tool::{
 };
 use async_trait::async_trait;
 use rusqlite::params;
+use std::sync::Arc;
 use serde::Deserialize;
 
 // -----------------------------------------------------------------
@@ -763,6 +764,15 @@ pub struct DbResearchApi {
     caller_conversation_id: ConversationId,
     can_spawn: bool,
     clock_now_unix: i64,
+    /// Optional wake handle for the deep-research supervisor.
+    /// `start()` notifies this after inserting the Pending row so
+    /// the supervisor reconciles immediately instead of waiting up
+    /// to its 5 s tick interval. Production wires this from
+    /// `state.research_supervisor.wake` via the dispatcher; tests
+    /// without a running supervisor leave it `None` and fall back
+    /// to the regular tick (or in test contexts, simply never see
+    /// the supervisor act, which matches the test's expectations).
+    supervisor_wake: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl DbResearchApi {
@@ -780,7 +790,18 @@ impl DbResearchApi {
             caller_conversation_id,
             can_spawn: true,
             clock_now_unix: now_unix,
+            supervisor_wake: None,
         }
+    }
+
+    /// Builder: attach a supervisor wake handle. Production
+    /// dispatch wires this from
+    /// `state.research_supervisor.as_ref().map(|s| s.wake.clone())`
+    /// so calls to `start()` poke the supervisor immediately
+    /// rather than letting the 5 s tick eat the latency.
+    pub fn with_supervisor_wake(mut self, wake: Arc<tokio::sync::Notify>) -> Self {
+        self.supervisor_wake = Some(wake);
+        self
     }
 
     /// Read-only construction. `start` returns `NotAuthorized`.
@@ -796,6 +817,7 @@ impl DbResearchApi {
             caller_conversation_id,
             can_spawn: false,
             clock_now_unix: now_unix,
+            supervisor_wake: None,
         }
     }
 
@@ -865,6 +887,14 @@ impl ResearchApi for DbResearchApi {
         .await
         .map_err(|e| ApiError::Storage(format!("join: {e}")))?
         .map_err(|e| ApiError::Storage(e.to_string()))?;
+
+        // Poke the supervisor so it picks up the new Pending row at
+        // its next loop iteration instead of waiting up to ~5 s for
+        // the scheduled tick. notify_one is lock-free and idempotent.
+        if let Some(wake) = self.supervisor_wake.as_ref() {
+            wake.notify_one();
+        }
+
         Ok(row_to_view(&row))
     }
 

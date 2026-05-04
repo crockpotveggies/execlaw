@@ -59,6 +59,19 @@ pub struct ResearchSupervisor {
     /// endpoint flips the DB row but the runner keeps spending
     /// tokens until its phase finishes naturally.
     pub cancel_tokens: Arc<DashMap<String, CancellationToken>>,
+    /// Wake-up handle. `DbResearchApi::start` notifies this handle
+    /// after inserting a Pending row so the supervisor's tick loop
+    /// reconciles immediately instead of waiting up to TICK_INTERVAL
+    /// (5 s) for the next scheduled wake. Without this, the
+    /// agent-visible delay between calling research_start and the
+    /// planner emitting AwaitingInput included a 0–5 s "supervisor
+    /// hasn't ticked yet" tail that user-tested as "unusual delay
+    /// before clarification arrived."
+    ///
+    /// Tick is still on a 5 s schedule as a safety net for cases
+    /// where a row landed via a path that didn't kick (DB-direct
+    /// insert in tests, future routine-fired research, etc.).
+    pub wake: Arc<Notify>,
 }
 
 impl ResearchSupervisor {
@@ -76,7 +89,17 @@ impl ResearchSupervisor {
             model,
             events,
             cancel_tokens: Arc::new(DashMap::new()),
+            wake: Arc::new(Notify::new()),
         }
+    }
+
+    /// Wake the supervisor's tick loop immediately. Called after
+    /// `DbResearchApi::start` inserts a Pending row so the operator
+    /// doesn't see a 0–5 s "supervisor still snoozing" tail latency.
+    /// Cheap (`Notify::notify_one` is lock-free) and idempotent — a
+    /// second kick before the loop wakes is a no-op.
+    pub fn kick(&self) {
+        self.wake.notify_one();
     }
 
     /// Look up the live cancellation token for `job_id`. Returns
@@ -117,6 +140,12 @@ impl ResearchSupervisor {
                     tracing::info!("research supervisor stop signal received");
                     break;
                 }
+                // Race the scheduled tick against the wake handle so
+                // a `kick()` from research_start drains the pending
+                // queue immediately. The tick stays on as a safety
+                // net for paths that bypass kick (DB-direct inserts
+                // in tests, etc.).
+                _ = self.wake.notified() => {}
                 _ = tokio::time::sleep(TICK_INTERVAL) => {}
             }
             if let Err(e) = self.tick_once().await {
@@ -561,5 +590,44 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         panic!("runner should have driven the row to a terminal state");
+    }
+
+    /// Regression for the rev-7-pt2 wake fix: with TICK_INTERVAL=5s,
+    /// a research_start that landed a Pending row used to wait up
+    /// to 5 s before the supervisor noticed it. The new `kick()`
+    /// pokes the wake handle so the loop reconciles immediately.
+    /// This test asserts the loop wakes within ~100 ms of a kick
+    /// even though the next tick is 5 s away.
+    #[tokio::test]
+    async fn kick_wakes_supervisor_loop_immediately_without_waiting_for_tick() {
+        // Use a `notified()` helper directly rather than spinning up
+        // a real supervisor — the contract under test is "Notify
+        // wakes a tokio::select! arm that races sleep". Verifying
+        // that contract on a bare Notify covers the fix; the
+        // supervisor uses the same pattern.
+        let wake = Arc::new(Notify::new());
+        let wake_for_kick = wake.clone();
+
+        // Spawn a task that waits on `wake` racing a 5 s sleep,
+        // returning which arm fired.
+        let started = tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            tokio::select! {
+                _ = wake.notified() => ("wake", start.elapsed()),
+                _ = tokio::time::sleep(TICK_INTERVAL) => ("tick", start.elapsed()),
+            }
+        });
+
+        // Kick after a tiny sleep so the spawned task is definitely
+        // parked on `notified()` before the notify fires.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        wake_for_kick.notify_one();
+
+        let (which, elapsed) = started.await.unwrap();
+        assert_eq!(which, "wake", "wake arm must win the race");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "wake should fire within 500 ms; got {elapsed:?}",
+        );
     }
 }
