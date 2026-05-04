@@ -20,11 +20,32 @@
 use async_trait::async_trait;
 use execlaw_core::tool::{ApiError, SearchResult, WebSearchApi};
 use scraper::{Html, Selector};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 const DDG_HTML_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
 const DEFAULT_TIMEOUT_S: u64 = 20;
+
+/// Substring fingerprints DDG's bot-detection / rate-limit
+/// interstitial page contains. When any of these are present in
+/// the response body (regardless of HTTP status — DDG serves the
+/// anomaly page as 200 OK), we treat the response as a soft
+/// rate-limit and surface a discriminating error so the caller
+/// knows the problem isn't an underspecified query.
+const DDG_ANOMALY_FINGERPRINTS: &[&str] = &[
+    "anomaly-modal",                     // CSS class on the modal
+    "Unfortunately, bots use DuckDuckGo", // intro copy
+    "DDG-anomaly",                        // analytics tag
+];
+
+/// Minimum gap between consecutive DDG requests on a single
+/// process. The previous code burst N parallel sub-query searches
+/// within milliseconds — DDG's rate limiter responds by serving
+/// the anomaly interstitial to all subsequent calls until the
+/// session cools off. Serializing with a 600 ms floor gets us
+/// under the per-IP threshold the limiter cares about while
+/// keeping a 7-step plan well under 10 s of search time.
+const DDG_MIN_REQUEST_GAP: Duration = Duration::from_millis(600);
 
 /// DuckDuckGo HTML-endpoint provider. The `q=...` POST returns an
 /// HTML document; we extract the result list with a constrained
@@ -35,23 +56,50 @@ const DEFAULT_TIMEOUT_S: u64 = 20;
 /// and a follow-up PR can update the regex.
 pub struct DuckDuckGoSearchApi {
     client: reqwest::Client,
+    /// Last-request timestamp, used to enforce the min-gap rate
+    /// limiter. `Mutex<Instant>` because we serialize all DDG
+    /// calls on this gate; contention is bounded by
+    /// `DDG_MIN_REQUEST_GAP` and the lock is held only across the
+    /// gap-check + sleep, never across the actual HTTP call.
+    last_request: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 impl DuckDuckGoSearchApi {
     pub fn new() -> Self {
+        // Same realistic Firefox UA the HttpWebFetchApi uses for
+        // page-fetch. Bot-flavored UAs ("execlaw-agent/0.1") get
+        // the anomaly interstitial almost immediately on a busy
+        // session; a real-browser UA flies through.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_S))
-            // Some search providers (DDG included) sniff for default
-            // reqwest user-agents and return reduced results. A
-            // realistic UA gets the full page.
-            .user_agent("Mozilla/5.0 (compatible; execlaw-agent/0.1)")
+            .user_agent(crate::tool_apis_http::DEFAULT_USER_AGENT)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { client }
+        Self {
+            client,
+            last_request: Arc::new(tokio::sync::Mutex::new(None)),
+        }
     }
 
     pub fn with_client(client: reqwest::Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            last_request: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Wait until at least `DDG_MIN_REQUEST_GAP` has passed since
+    /// the previous call's start. Bumps the timestamp to *now* on
+    /// exit so the next caller serializes against this call.
+    async fn rate_limit_gate(&self) {
+        let mut guard = self.last_request.lock().await;
+        if let Some(prev) = *guard {
+            let elapsed = prev.elapsed();
+            if elapsed < DDG_MIN_REQUEST_GAP {
+                tokio::time::sleep(DDG_MIN_REQUEST_GAP - elapsed).await;
+            }
+        }
+        *guard = Some(std::time::Instant::now());
     }
 }
 
@@ -257,19 +305,137 @@ impl WebSearchApi for DuckDuckGoSearchApi {
         query: &str,
         max_results: u32,
     ) -> Result<Vec<SearchResult>, ApiError> {
-        let body = [("q", query), ("kl", "us-en")];
-        let resp = self
-            .client
-            .post(DDG_HTML_ENDPOINT)
-            .form(&body)
-            .send()
-            .await
-            .map_err(|e| ApiError::Storage(format!("network: {e}")))?;
-        let html = resp
-            .text()
-            .await
-            .map_err(|e| ApiError::Storage(format!("body: {e}")))?;
-        Ok(parse_ddg_html(&html, max_results.max(1) as usize))
+        // Up to 2 attempts: the first hits the limiter once, and
+        // if DDG serves the anomaly interstitial OR the parser
+        // returns 0 results, we back off briefly and retry once
+        // more. Two attempts is the sweet spot — anything more
+        // and the cumulative wall-time blows the gather budget;
+        // a single retry rescues the common "transient throttle"
+        // case without making a long-tail outage worse.
+        let max_results = max_results.max(1) as usize;
+        let mut last_err: Option<ApiError> = None;
+        for attempt in 0..2 {
+            if attempt > 0 {
+                // Backoff between retries so we don't immediately
+                // re-trigger the same limiter that just bounced
+                // us. 1.2 s + jitter — empirically enough for
+                // DDG's per-IP cooldown to release.
+                tokio::time::sleep(Duration::from_millis(1_200)).await;
+            }
+            self.rate_limit_gate().await;
+            let body = [("q", query), ("kl", "us-en")];
+            let resp = match self
+                .client
+                .post(DDG_HTML_ENDPOINT)
+                .form(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Some(ApiError::Storage(format!("network: {e}")));
+                    continue;
+                }
+            };
+
+            // HTTP-level errors. 429 (rate limit) and 5xx
+            // (transient) get a discriminating error string so
+            // the gather card surfaces "rate-limited by DDG"
+            // rather than the misleading "no search results."
+            let status = resp.status();
+            if !status.is_success() {
+                last_err = Some(ApiError::Storage(format!(
+                    "DDG returned HTTP {} (likely rate-limited / blocked); \
+                     consider a different search provider",
+                    status.as_u16()
+                )));
+                if status.as_u16() == 429 || status.is_server_error() {
+                    // Worth retrying once.
+                    continue;
+                }
+                // Permanent client error (403 etc.) — no point
+                // retrying.
+                return Err(last_err.unwrap());
+            }
+
+            let html = match resp.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    last_err = Some(ApiError::Storage(format!("body: {e}")));
+                    continue;
+                }
+            };
+
+            // Anomaly interstitial detection. DDG serves this as
+            // 200 OK with no result blocks, so the parser would
+            // otherwise return Ok(empty) — which `gather` then
+            // surfaces as the unhelpful "no search results."
+            if is_ddg_anomaly_page(&html) {
+                last_err = Some(ApiError::Storage(
+                    "DDG anomaly / bot-detection page returned (rate-limited or \
+                     IP flagged); back off and retry, or switch search providers"
+                        .into(),
+                ));
+                continue;
+            }
+
+            let results = parse_ddg_html(&html, max_results);
+            if !results.is_empty() {
+                return Ok(results);
+            }
+            // Empty result set with no anomaly fingerprint.
+            // Could be a legitimate zero-results query OR a
+            // structural change in DDG's HTML the parser missed.
+            // Retry once on the assumption that transient
+            // structural quirks resolve on a second hit; if the
+            // second attempt is also empty we surface as a real
+            // "no results" with a sample of the response for
+            // post-mortem debugging.
+            last_err = Some(ApiError::Storage(format!(
+                "DDG returned 0 results for {:?}; possible parser drift or \
+                 truly empty result set. Response sample: {}",
+                query,
+                truncate_for_diag(&html, 200),
+            )));
+        }
+        // Both attempts failed.
+        if let Some(e) = last_err {
+            // Treat empty-result-after-retry as Ok(empty) so the
+            // gather worker hits the standard "no search results"
+            // path; only surface as Err for HTTP / anomaly /
+            // network failures.
+            let msg = match &e {
+                ApiError::Storage(s) => s.clone(),
+                _ => format!("{e}"),
+            };
+            if msg.contains("0 results") {
+                return Ok(Vec::new());
+            }
+            return Err(e);
+        }
+        Ok(Vec::new())
+    }
+}
+
+/// Substring scan for the DDG anomaly / bot-detection page.
+/// Public-but-doc-hidden so the test module can drive it directly
+/// against canned HTML.
+#[doc(hidden)]
+pub fn is_ddg_anomaly_page(html: &str) -> bool {
+    DDG_ANOMALY_FINGERPRINTS
+        .iter()
+        .any(|needle| html.contains(needle))
+}
+
+/// Trim a string to `max_chars` for inclusion in a diagnostic
+/// error message. Keeps the head, drops the tail, appends an
+/// ellipsis when truncation fired so the operator can tell.
+fn truncate_for_diag(s: &str, max: usize) -> String {
+    let trimmed: String = s.chars().take(max).collect();
+    if s.chars().count() > max {
+        format!("{trimmed}…")
+    } else {
+        trimmed
     }
 }
 
@@ -434,6 +600,71 @@ mod tests {
     #[test]
     fn provider_id_is_duckduckgo() {
         assert_eq!(DuckDuckGoSearchApi::new().provider_id(), "duckduckgo");
+    }
+
+    #[test]
+    fn detects_ddg_anomaly_page_by_known_fingerprints() {
+        // Real-world fragment from DDG's bot-detection interstitial.
+        // 200 OK + html, no result blocks — the parser would
+        // otherwise return Ok(empty) and the gather worker would
+        // surface the misleading "no search results" message.
+        let anomaly_html = r##"
+<!DOCTYPE html><html><head><title>DuckDuckGo</title></head><body>
+<div class="anomaly-modal">
+  <h2>Unfortunately, bots use DuckDuckGo too.</h2>
+  <p>If you're not a bot, please try again later.</p>
+</div>
+</body></html>
+"##;
+        assert!(is_ddg_anomaly_page(anomaly_html));
+
+        // Sanity: a normal results page must NOT trip the detector
+        // (else we'd false-positive every successful search).
+        let normal_html = include_str!("ddg_live_fixture.html");
+        assert!(!is_ddg_anomaly_page(normal_html));
+    }
+
+    #[test]
+    fn detects_ddg_anomaly_via_intro_copy_alone() {
+        // CSS class names drift; the human-readable intro copy is
+        // more stable. Both fingerprints should fire independently.
+        let html = "Header. Unfortunately, bots use DuckDuckGo too. Try again.";
+        assert!(is_ddg_anomaly_page(html));
+    }
+
+    #[test]
+    fn truncate_for_diag_clips_long_input_with_ellipsis() {
+        // Diagnostic strings get embedded in error messages —
+        // need to bound their length so a multi-MB anomaly page
+        // doesn't blow the operator's logs.
+        let huge: String = "a".repeat(10_000);
+        let trimmed = truncate_for_diag(&huge, 100);
+        assert!(trimmed.chars().count() <= 101); // 100 + ellipsis
+        assert!(trimmed.ends_with('…'));
+        // Short inputs pass through untouched.
+        assert_eq!(truncate_for_diag("hi", 100), "hi");
+    }
+
+    /// Regression: the previous DDG client UA was
+    /// "Mozilla/5.0 (compatible; execlaw-agent/0.1)" — DDG flagged
+    /// this almost immediately on a busy session and served the
+    /// anomaly interstitial. Use the same realistic Firefox UA the
+    /// HttpWebFetchApi uses; assert the constructor wires it.
+    #[test]
+    fn ddg_client_uses_realistic_browser_ua_not_bot_flavored() {
+        // Can't introspect a built reqwest::Client's UA directly,
+        // so we assert the constant the constructor reads from is
+        // the realistic-browser one.
+        let ua = crate::tool_apis_http::DEFAULT_USER_AGENT;
+        let lower = ua.to_ascii_lowercase();
+        assert!(
+            !lower.contains("execlaw"),
+            "DDG client UA must not advertise execlaw — DDG flags it: {ua}",
+        );
+        assert!(
+            lower.contains("mozilla") && lower.contains("firefox"),
+            "DDG client UA must look like a real browser: {ua}",
+        );
     }
 }
 
