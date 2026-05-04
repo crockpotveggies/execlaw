@@ -136,7 +136,18 @@ impl ResearchWorkspace {
         title: &str,
     ) -> Result<PathBuf, WorkspaceError> {
         let dir = self.provision(job_id)?;
-        let path = dir.join("report.pdf");
+        // 2026-05-04 — friendly filename. Was: hard-coded
+        // "report.pdf" (the user's save-as dialog showed
+        // "report.pdf" for every research deliverable, regardless
+        // of topic). Now derived from the markdown's first H1
+        // (the synthesizer's article title) — slugified to a
+        // 3-5 word stub, suffixed with today's date in ISO
+        // YYYY-MM-DD format. Falls back to a sanitised version of
+        // the `title` parameter when the markdown has no usable H1.
+        let stem = derive_report_filename_stem(markdown, title);
+        let date = chrono::Utc::now().format("%Y-%m-%d");
+        let filename = format!("{stem}-{date}.pdf");
+        let path = dir.join(filename);
         render_markdown_to_pdf(markdown, title, &path)
             .map_err(|e| WorkspaceError::Encoding(format!("pdf render: {e}")))?;
         Ok(path)
@@ -203,6 +214,10 @@ fn render_markdown_to_pdf(
     let mut layer_id = layer1;
     let mut layer = doc.get_page(page).get_layer(layer_id);
     let mut y = PAGE_H - MARGIN_TOP;
+    // Track whether we just landed on a fresh page so the
+    // "above-heading" gap doesn't waste space at the top of a
+    // page (the heading is already sitting at the top margin).
+    let mut at_page_top = true;
 
     for raw in markdown.lines() {
         let line = raw.trim_end_matches('\r');
@@ -219,20 +234,37 @@ fn render_markdown_to_pdf(
         let cleaned = strip_emphasis(line);
 
         // Classify the line.
-        let (text, font, size, line_h) = if let Some(rest) = cleaned.strip_prefix("### ") {
-            (rest.to_string(), &font_bold, 12.0, LINE_H_HEADING)
-        } else if let Some(rest) = cleaned.strip_prefix("## ") {
-            (rest.to_string(), &font_bold, 14.0, LINE_H_HEADING)
-        } else if let Some(rest) = cleaned.strip_prefix("# ") {
-            (rest.to_string(), &font_bold, 18.0, LINE_H_HEADING + 2.0)
+        //
+        // 2026-05-04 — header handling now covers h1 through h6
+        // (was: only h1/h2/h3, with `#### Foo` being silently
+        // rendered as h3-with-text-"# Foo" because the `### `
+        // prefix matched first). Order matters: check the LONGEST
+        // marker first so `#### ` doesn't accidentally swallow as
+        // `### ` + text.
+        //
+        // Each header carries an `above_gap` — extra vertical
+        // breathing room before the line — that scales with the
+        // heading's importance. Higher-level headers (h1, h2)
+        // get more space above so the document's structure reads
+        // visually instead of running together. The gap is
+        // skipped when the heading lands at the top of a page
+        // (else it'd waste the top margin's worth of paper).
+        let header = classify_header(&cleaned);
+        let (text, font, size, line_h, above_gap) = if let Some(h) = header {
+            (h.text, &font_bold, h.size_pt, h.line_h, h.above_gap)
         } else if let Some(rest) = cleaned
             .strip_prefix("- ")
             .or_else(|| cleaned.strip_prefix("* "))
         {
-            (format!("• {rest}"), &font_regular, 11.0, LINE_H_BODY)
+            (format!("• {rest}"), &font_regular, 11.0, LINE_H_BODY, 0.0)
         } else {
-            (cleaned, &font_regular, 11.0, LINE_H_BODY)
+            (cleaned, &font_regular, 11.0, LINE_H_BODY, 0.0)
         };
+
+        // Apply the above-heading gap (skipped on a fresh page).
+        if above_gap > 0.0 && !at_page_top {
+            y -= above_gap;
+        }
 
         // Word-wrap and emit each visual line.
         let wrap_w = if size >= 14.0 { WRAP_WIDTH * 7 / 10 } else { WRAP_WIDTH };
@@ -243,9 +275,11 @@ fn render_markdown_to_pdf(
                 layer_id = nl;
                 layer = doc.get_page(page).get_layer(layer_id);
                 y = PAGE_H - MARGIN_TOP;
+                at_page_top = true;
             }
             layer.use_text(visual.as_ref(), size, Mm(MARGIN_X), Mm(y), font);
             y -= line_h;
+            at_page_top = false;
         }
     }
 
@@ -253,6 +287,151 @@ fn render_markdown_to_pdf(
     let mut writer = std::io::BufWriter::new(f);
     doc.save(&mut writer).map_err(|e| format!("save: {e}"))?;
     Ok(())
+}
+
+/// Build the filename stem (the part before `-<date>.pdf`) for a
+/// research report. Picks the first usable source in this order:
+///   1. The markdown's first H1 line (the synthesiser's article
+///      title — best signal for what the report is actually about)
+///   2. The provided `title` parameter (caller-set, currently
+///      "Research report — <job-id>")
+///   3. Hard fallback "research-report" so we never produce an
+///     empty filename
+///
+/// Slugified: lowercase ASCII, words joined by `-`, capped at
+/// 5 words and `MAX_STEM_CHARS` characters. Stop-words trimmed
+/// from the front so "the-best-evergreen-ground-covers" becomes
+/// "best-evergreen-ground-covers" — keeps the operator's
+/// download-list scannable.
+fn derive_report_filename_stem(markdown: &str, title: &str) -> String {
+    const MAX_WORDS: usize = 5;
+    const MAX_STEM_CHARS: usize = 60;
+    const STOP_WORDS: &[&str] = &[
+        "the", "a", "an", "of", "for", "to", "and", "or", "with", "in", "on", "at", "by",
+    ];
+
+    let raw = first_h1(markdown)
+        .or_else(|| {
+            // The runner's title is currently
+            // "Research report — <job-id>". Strip the boilerplate
+            // prefix; what's left is either the job-id (useless,
+            // produces "research-report" hard fallback below) or a
+            // future caller's actual title.
+            let t = title.trim();
+            if let Some(after) = t
+                .strip_prefix("Research report — ")
+                .or_else(|| t.strip_prefix("Research report - "))
+                .or_else(|| t.strip_prefix("Research report: "))
+            {
+                Some(after.to_owned())
+            } else {
+                Some(t.to_owned())
+            }
+        })
+        .unwrap_or_else(|| "research-report".to_owned());
+
+    // Tokenize: lowercase, alphanumerics-only, words separated by
+    // any non-alnum run.
+    let lowered = raw.to_lowercase();
+    let mut words: Vec<String> = lowered
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_owned())
+        .collect();
+
+    // Drop leading stop-words.
+    while let Some(first) = words.first() {
+        if STOP_WORDS.contains(&first.as_str()) {
+            words.remove(0);
+        } else {
+            break;
+        }
+    }
+
+    // Cap at MAX_WORDS, then re-cap at MAX_STEM_CHARS in case
+    // those 5 words are unusually long.
+    words.truncate(MAX_WORDS);
+    if words.is_empty() {
+        return "research-report".to_owned();
+    }
+    let mut stem = words.join("-");
+    if stem.chars().count() > MAX_STEM_CHARS {
+        stem = stem.chars().take(MAX_STEM_CHARS).collect();
+        // Trim a partial trailing word so we don't end mid-word.
+        if let Some(last_dash) = stem.rfind('-') {
+            if last_dash > 8 {
+                // keep stem readable
+                stem.truncate(last_dash);
+            }
+        }
+    }
+    stem
+}
+
+/// Pull the first `# Heading` line out of a markdown document.
+/// Returns None if the doc has no level-1 heading. We deliberately
+/// only consider H1 (not H2) because synthesised reports always
+/// open with the article title at H1; H2/H3 are sub-section
+/// headings and would produce off-topic filenames.
+fn first_h1(markdown: &str) -> Option<String> {
+    for line in markdown.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("# ") {
+            let trimmed = rest.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Per-level heading metadata. The renderer reads this to size +
+/// space each `#`-prefixed line.
+struct HeaderSpec {
+    text: String,
+    /// Point size for the heading line. Bigger for h1.
+    size_pt: f32,
+    /// Line height (mm) — controls intra-heading wrap spacing.
+    line_h: f32,
+    /// Extra mm of vertical space inserted ABOVE the heading.
+    /// Higher-level headings (h1, h2) get more so the document
+    /// structure reads visually. Skipped at page top.
+    above_gap: f32,
+}
+
+/// Classify a line as a markdown heading (h1-h6) and return its
+/// rendered spec. Returns `None` for non-headings (the caller
+/// falls through to bullet / body handling).
+///
+/// Order is important: longest prefix first. Without this,
+/// `#### Foo` matches `### ` first → renders as h3 with text
+/// "# Foo" which is the bug the user reported as "not all
+/// markdown headers are rendering."
+fn classify_header(line: &str) -> Option<HeaderSpec> {
+    // Each tuple: (prefix, size_pt, line_h, above_gap_mm)
+    // Sizes shrink on lower levels; gaps shrink correspondingly.
+    // h5 / h6 keep bold but are barely larger than body so they
+    // don't visually compete with h3 / h4.
+    const LEVELS: &[(&str, f32, f32, f32)] = &[
+        ("###### ", 10.0, LINE_H_BODY, 3.0),
+        ("##### ", 11.0, LINE_H_BODY, 4.0),
+        ("#### ", 12.0, LINE_H_BODY + 1.0, 5.0),
+        ("### ", 13.0, LINE_H_HEADING - 1.0, 7.0),
+        ("## ", 15.0, LINE_H_HEADING, 9.0),
+        ("# ", 18.0, LINE_H_HEADING + 2.0, 12.0),
+    ];
+    for &(prefix, size_pt, line_h, above_gap) in LEVELS {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            return Some(HeaderSpec {
+                text: rest.to_string(),
+                size_pt,
+                line_h,
+                above_gap,
+            });
+        }
+    }
+    None
 }
 
 fn strip_emphasis(s: &str) -> String {
@@ -429,6 +608,121 @@ mod tests {
         let path = ws.write_report_pdf(&id, &long, "Long report").unwrap();
         let bytes = std::fs::read(&path).unwrap();
         assert!(bytes.len() > 5000, "multi-page pdf should be substantially bigger");
+    }
+
+    /// 2026-05-04 — header rendering covers h1 through h6 (was:
+    /// only h1/h2/h3, with `#### Foo` silently rendering as
+    /// h3-with-text-"# Foo" because the `### ` prefix matched
+    /// first). Asserts each level returns the right metadata and
+    /// that none of them swallow lower-level prefixes.
+    #[test]
+    fn classify_header_handles_h1_through_h6_in_correct_priority() {
+        // h1 > h2 > h3 > h4 > h5 > h6 — sizes strictly decreasing.
+        let h1 = classify_header("# Top").unwrap();
+        let h2 = classify_header("## Two").unwrap();
+        let h3 = classify_header("### Three").unwrap();
+        let h4 = classify_header("#### Four").unwrap();
+        let h5 = classify_header("##### Five").unwrap();
+        let h6 = classify_header("###### Six").unwrap();
+
+        assert_eq!(h1.text, "Top");
+        assert_eq!(h2.text, "Two");
+        assert_eq!(h3.text, "Three");
+        assert_eq!(h4.text, "Four");
+        assert_eq!(h5.text, "Five");
+        assert_eq!(h6.text, "Six");
+
+        assert!(h1.size_pt > h2.size_pt, "h1 must be larger than h2");
+        assert!(h2.size_pt > h3.size_pt);
+        assert!(h3.size_pt > h4.size_pt);
+        assert!(h4.size_pt >= h5.size_pt); // h4 may equal h5 in pt but pure spacing differs
+        assert!(h5.size_pt >= h6.size_pt);
+
+        // Above-gap scales the same way — higher level → more
+        // breathing room.
+        assert!(h1.above_gap > h2.above_gap);
+        assert!(h2.above_gap > h3.above_gap);
+        assert!(h3.above_gap > h4.above_gap);
+        assert!(h4.above_gap > h5.above_gap);
+    }
+
+    #[test]
+    fn classify_header_h4_does_not_get_swallowed_by_h3_prefix() {
+        // The bug: `#### Foo` matched `### ` first and rendered
+        // as h3 with text "# Foo". Catches that regression
+        // explicitly.
+        let spec = classify_header("#### For Full Sun to Partial Shade").unwrap();
+        assert_eq!(spec.text, "For Full Sun to Partial Shade");
+        assert!(
+            !spec.text.starts_with('#'),
+            "h4 prefix must consume all 4 hashes; got {:?}",
+            spec.text,
+        );
+    }
+
+    #[test]
+    fn classify_header_returns_none_for_non_heading_lines() {
+        assert!(classify_header("plain paragraph").is_none());
+        assert!(classify_header("- bullet").is_none());
+        assert!(classify_header("").is_none());
+        // No-space `#foo` is not a heading.
+        assert!(classify_header("#foo").is_none());
+    }
+
+    /// 2026-05-04 — friendly PDF filename. Was: hard-coded
+    /// "report.pdf" for every research job. Now derived from the
+    /// markdown's first H1 (best signal for what the report's
+    /// about), slugified to a 3-5 word stub.
+    #[test]
+    fn derive_report_filename_stem_uses_first_h1_when_present() {
+        let md = "# Best Evergreen Ground Covers For 2026\n\nBody here.";
+        let stem = derive_report_filename_stem(md, "Research report — abc-123");
+        // "the / a / an" stop-words trim from the front; "best" is
+        // a content word so it stays.
+        assert_eq!(stem, "best-evergreen-ground-covers-for");
+    }
+
+    #[test]
+    fn derive_report_filename_stem_drops_leading_stopwords() {
+        let md = "# The Best Way To Pick A Ground Cover\n";
+        let stem = derive_report_filename_stem(md, "fallback");
+        // "the" stripped; "best", "way", "to", "pick", "a" → keep
+        // first 5 content words but cap at MAX_WORDS.
+        assert!(stem.starts_with("best-way-"), "got {stem}");
+        assert!(stem.split('-').count() <= 5);
+    }
+
+    #[test]
+    fn derive_report_filename_stem_falls_back_to_title_param_when_no_h1() {
+        let stem = derive_report_filename_stem(
+            "Body text only, no headings.",
+            "Research report — Recommend evergreen ground covers",
+        );
+        // Strips the "Research report — " boilerplate.
+        assert!(stem.starts_with("recommend-evergreen-"), "got {stem}");
+    }
+
+    #[test]
+    fn derive_report_filename_stem_hard_fallback_when_everything_empty() {
+        let stem = derive_report_filename_stem("", "");
+        assert_eq!(stem, "research-report");
+    }
+
+    #[test]
+    fn write_report_pdf_uses_friendly_filename_with_date() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = ResearchWorkspace::new(tmp.path());
+        let id = ResearchJobId::new();
+        let md = "# Best Evergreen Ground Covers\n\nBody.";
+        let path = ws
+            .write_report_pdf(&id, md, "Research report — anything")
+            .unwrap();
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("best-evergreen-"), "got {name}");
+        // YYYY-MM-DD date suffix before .pdf.
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        assert!(name.contains(&today), "missing date {today}: {name}");
+        assert!(name.ends_with(".pdf"));
     }
 
     #[test]

@@ -404,15 +404,37 @@ mod tests {
         // (always written for grep/reuse).
         let on_disk = std::fs::read_to_string(tmp.join(job_id.as_str()).join("report.md")).unwrap();
         assert!(on_disk.starts_with("# Final report"));
-        // PDF lands alongside.
-        let pdf_path = tmp.join(job_id.as_str()).join("report.pdf");
-        assert!(pdf_path.exists(), "report.pdf must be rendered");
+        // PDF lands alongside, named from the markdown's first H1
+        // ("Final report") + today's date + .pdf — see
+        // `derive_report_filename_stem` for the slug rules.
+        let workspace_dir = tmp.join(job_id.as_str());
+        let pdfs: Vec<_> = std::fs::read_dir(&workspace_dir)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("pdf"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(pdfs.len(), 1, "exactly one PDF in the workspace");
+        let pdf_name = pdfs[0].file_name().to_string_lossy().into_owned();
+        assert!(
+            pdf_name.starts_with("final-report-"),
+            "filename slug should derive from the H1; got {pdf_name}",
+        );
+        assert!(
+            pdf_name.ends_with(".pdf"),
+            "PDF extension required; got {pdf_name}",
+        );
         assert!(!outcome.attachment_id.as_str().is_empty());
         // Phase D: the attachment is the PDF (operator deliverable),
         // markdown is on disk for grep but not the attachment.
         assert!(
-            outcome.attachment_path.contains("report.pdf"),
-            "attachment should be the PDF, got {}",
+            outcome.attachment_path.ends_with(".pdf"),
+            "attachment should be a PDF, got {}",
             outcome.attachment_path
         );
         // Attachment row inserted — round-trip query.
