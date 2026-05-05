@@ -74,7 +74,30 @@ describe("MessageStream", () => {
         } as never);
         render(<MessageStream conversationId="conv-2" />);
         const origin = screen.getByTestId("channel-origin");
-        expect(origin).toHaveAttribute("data-origin", "signal");
+        // The new ChannelIcon component stamps `data-channel` so the
+        // SPA tests pin transport-specific rendering by attribute.
+        expect(origin).toHaveAttribute("data-channel", "signal");
+        // Signal-origin messages must render the BRAND Signal logo
+        // (svg), not a generic bi-* icon. The component picks an
+        // <svg> element with the official Signal blue when the
+        // channel is signal.
+        expect(origin.tagName.toLowerCase()).toBe("svg");
+    });
+
+    it("uses bootstrap-icons for non-Signal transports", () => {
+        // Email / voice / sms ride on `bi-*` since their generic
+        // glyphs communicate the channel without needing a brand
+        // SVG. The component renders a `<i class="bi …">` for these
+        // — same DOM shape as before the Signal logo upgrade.
+        appendMessage("conv-email", {
+            ...baseMsg(1, "hi"),
+            channel_origin: "email",
+        } as never);
+        render(<MessageStream conversationId="conv-email" />);
+        const origin = screen.getByTestId("channel-origin");
+        expect(origin).toHaveAttribute("data-channel", "email");
+        expect(origin.tagName.toLowerCase()).toBe("i");
+        expect(origin.className).toContain("bi-envelope");
     });
 
     /// 2026-04-28 — when the runner stamps `actor: "agent"` on a

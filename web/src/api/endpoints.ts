@@ -169,6 +169,14 @@ export interface MessageView {
     text: string | null;
     actor: string | null;
     committed_at: number;
+    /**
+     * Originating transport when this message flowed through a
+     * bridge (signal / email / voice / sms). Absent for the default
+     * web path. The chat view renders a per-message channel icon
+     * when set so the operator can tell at a glance "this came in
+     * via Signal" / "the agent replied via Signal".
+     */
+    channel_origin?: "signal" | "email" | "voice" | "sms" | null;
 }
 
 export interface MessagesListResponse {

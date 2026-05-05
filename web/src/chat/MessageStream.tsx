@@ -15,6 +15,7 @@ import type { MessageView } from "../api/endpoints";
 import { getCardRenderer } from "../cards/CardRenderer";
 import { useCardsForConversation } from "../cards/cardStore";
 import type { Card } from "../cards/types";
+import { ChannelIcon } from "../components/ChannelIcons";
 import { MarkdownContent } from "../components/MarkdownContent";
 import { ToolActivityPill } from "./ToolActivityPill";
 import { useChatState } from "./store";
@@ -315,8 +316,10 @@ function clamp(text: string, lineLimit: number, charLimit: number): string {
 }
 
 function readChannelOrigin(m: MessageView): ChannelOrigin {
-    // The server may attach a channel_origin to the event payload (§2.6).
-    // We fall back to "web" when absent so the UI still renders an icon.
+    // The server attaches a channel_origin field to user_msg +
+    // model_turn events that flowed through a transport bridge
+    // (signal / email / voice / sms). Web-originated turns leave it
+    // absent; the SPA defaults to "web" and shows no icon.
     const raw = (m as MessageView & { channel_origin?: unknown }).channel_origin;
     if (raw === "signal" || raw === "email" || raw === "voice" || raw === "sms") {
         return raw;
@@ -327,21 +330,13 @@ function readChannelOrigin(m: MessageView): ChannelOrigin {
 type ChannelOrigin = "web" | "signal" | "email" | "voice" | "sms";
 
 function ChannelOriginIcon({ origin }: { origin: ChannelOrigin }) {
-    const icon = (
-        {
-            web: "bi-globe",
-            signal: "bi-chat-dots",
-            email: "bi-envelope",
-            voice: "bi-mic",
-            sms: "bi-phone",
-        } as const
-    )[origin];
     return (
-        <i
-            className={`bi ${icon} execlaw-muted me-2`}
-            aria-label={`channel: ${origin}`}
+        <ChannelIcon
+            channel={origin}
+            size="1em"
+            decorative={false}
+            className="execlaw-channel-origin me-2"
             data-testid="channel-origin"
-            data-origin={origin}
         />
     );
 }

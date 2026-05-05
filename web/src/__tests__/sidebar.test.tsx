@@ -152,7 +152,7 @@ describe("Sidebar", () => {
 
     // ---- external-channel filter --------------------------------------
 
-    it("hide-external toggle filters out non-controller-DM threads", () => {
+    it("threads filters dropdown hides external channels when toggled", () => {
         setThreads([
             // ControllerDM — stays visible.
             {
@@ -182,12 +182,27 @@ describe("Sidebar", () => {
             },
         ]);
         rerender(<Sidebar onNewThread={() => {}} />);
-        // Toggle row only renders when at least one external thread exists.
+        // The Filters button always renders next to the Threads
+        // section header; the menu opens on click.
+        const filtersBtn = screen.getByTestId("sidebar-threads-filters");
+        expect(filtersBtn).toBeInTheDocument();
+        // Menu is closed by default.
         expect(
-            screen.getByTestId("sidebar-external-toggle-row"),
-        ).toBeInTheDocument();
+            screen.queryByTestId("sidebar-threads-filters-menu"),
+        ).toBeNull();
         // Both threads visible by default.
         expect(screen.getAllByTestId("sidebar-thread")).toHaveLength(2);
+
+        // Open the dropdown.
+        fireEvent.click(filtersBtn);
+        expect(
+            screen.getByTestId("sidebar-threads-filters-menu"),
+        ).toBeInTheDocument();
+        // External count badge shows up inside the menu when there's
+        // at least one external thread.
+        expect(screen.getByTestId("sidebar-external-count").textContent).toBe(
+            "1",
+        );
 
         const toggle = screen.getByTestId(
             "sidebar-hide-external",

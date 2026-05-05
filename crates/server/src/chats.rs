@@ -84,6 +84,15 @@ pub struct MessageView {
     pub text: Option<String>,
     pub actor: Option<String>,
     pub committed_at: i64,
+    /// Originating transport for this message (signal / email /
+    /// voice / sms). Set on user_msg + model_turn events that
+    /// flowed through a transport bridge; absent for the default
+    /// web path. The SPA reads this to render a per-message
+    /// channel icon in the chat view so the operator can tell at
+    /// a glance "this came in via Signal" / "the agent replied
+    /// via Signal".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_origin: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -337,6 +346,9 @@ pub async fn send_message(
                     cancel_flag: cancel_flag.clone(),
                     caller_caps: caller_caps.clone(),
                     caller_trust: sender_trust,
+                    // send_message hits this from the web-chat path;
+                    // no transport-bridge here.
+                    inbound_channel_origin: None,
                 })
                 .await
                 {
@@ -361,6 +373,7 @@ pub async fn send_message(
                 req.sender_principal_id.clone(),
                 caller_caps.clone(),
                 sender_trust,
+                None,
             )
             .await
             {
@@ -386,6 +399,7 @@ pub async fn send_message(
                     sender_trust,
                     spotlight_content,
                     cancel_flag.clone(),
+                    None,
                 )
                 .await
                 {
@@ -403,7 +417,7 @@ pub async fn send_message(
                 }
             }
             (None, _) => {
-                match run_stub_turn(&state, &cid, &req.text, req.sender_principal_id.clone()) {
+                match run_stub_turn(&state, &cid, &req.text, req.sender_principal_id.clone(), None) {
                     Ok(out) => out,
                     Err(e) => {
                         let chain = format!("{e:#}");
@@ -528,6 +542,7 @@ fn run_stub_turn(
     cid: &ConversationId,
     user_text: &str,
     sender_principal_id: Option<String>,
+    inbound_channel_origin: Option<&str>,
 ) -> Result<(i64, String, i64), String> {
     let log = event_log(state);
     let reply_text = format!(
@@ -540,6 +555,7 @@ fn run_stub_turn(
         &UserMessagePayload {
             text: user_text.to_owned(),
             sender_principal_id,
+            channel_origin: inbound_channel_origin.map(|s| s.to_owned()),
         },
         None,
     )
@@ -550,6 +566,7 @@ fn run_stub_turn(
             model: "stub".into(),
             text: reply_text.clone(),
             finish_reason: Some("stub".into()),
+            channel_origin: inbound_channel_origin.map(|s| s.to_owned()),
         },
         Some("agent-stub".into()),
     )
@@ -602,6 +619,7 @@ async fn run_real_turn(
     sender_trust: TrustLevel,
     spotlight_content: bool,
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    inbound_channel_origin: Option<&str>,
 ) -> Result<(i64, String, i64), String> {
     use execlaw_inference_api::{ChatMessage, ChatRequest};
     use execlaw_policy::spotlighting::Spotlight;
@@ -619,6 +637,7 @@ async fn run_real_turn(
         &UserMessagePayload {
             text: user_text.to_owned(),
             sender_principal_id: sender_principal_id.clone(),
+            channel_origin: inbound_channel_origin.map(|s| s.to_owned()),
         },
         sender_principal_id.clone(),
     )
@@ -822,6 +841,7 @@ async fn run_real_turn(
         finish_reason,
         prompt_tokens: None,
         completion_tokens: None,
+        channel_origin: inbound_channel_origin.map(|s| s.to_owned()),
     };
     let reply_pending =
         PendingEvent::encode(EventKind::ModelTurn, &reply_payload, Some("agent".into()))
@@ -914,6 +934,12 @@ pub(crate) struct RunnerTurnCtx<'a> {
     pub cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub caller_caps: Vec<String>,
     pub caller_trust: TrustLevel,
+    /// Originating transport when the turn was triggered by an
+    /// inbound transport message (signal / email / etc.). Stamped
+    /// into the user_msg + model_turn payloads so the SPA can
+    /// render a per-message channel icon. None for web-originated
+    /// turns.
+    pub inbound_channel_origin: Option<&'a str>,
 }
 
 pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, String, i64), String> {
@@ -927,6 +953,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         cancel_flag,
         caller_caps,
         caller_trust,
+        inbound_channel_origin,
     } = ctx;
     let supervisor = state
         .runner_supervisor
@@ -948,6 +975,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         &UserMessagePayload {
             text: user_text.to_owned(),
             sender_principal_id: sender_principal_id.clone(),
+            channel_origin: inbound_channel_origin.map(|s| s.to_owned()),
         },
         sender_principal_id.clone(),
     )
@@ -1309,6 +1337,26 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
                 // `encode` is generic; `serde_json::Value` is
                 // Serialize so it round-trips through rmp the
                 // same way a typed payload would.
+                //
+                // Channel-origin stamping for transport-bridged
+                // turns: when the runner emits a model_turn event,
+                // inject the originating transport's name into the
+                // payload so the SPA can render a per-message
+                // channel icon. The runner doesn't know about
+                // transports — that knowledge lives in the
+                // dispatcher — so we splice it on the way through.
+                // Only applies to model_turn payloads (matches the
+                // schema); other event kinds pass through unchanged.
+                let mut payload = payload;
+                if matches!(kind_enum, EventKind::ModelTurn) {
+                    if let Some(origin) = inbound_channel_origin {
+                        if let serde_json::Value::Object(ref mut map) = payload {
+                            map.entry("channel_origin".to_owned()).or_insert(
+                                serde_json::Value::String(origin.to_owned()),
+                            );
+                        }
+                    }
+                }
                 let pending_ev =
                     execlaw_core::events::PendingEvent::encode(kind_enum, &payload, actor)
                         .map_err(|e| format!("encode runner event: {e}"))?;
@@ -1385,6 +1433,7 @@ async fn run_tool_capable_turn(
     sender_principal_id: Option<String>,
     caller_caps: Vec<String>,
     caller_trust: TrustLevel,
+    inbound_channel_origin: Option<&str>,
 ) -> Result<(i64, String, i64), String> {
     use execlaw_inference_api::ToolDeclaration;
     use execlaw_runner_local::turn::{TurnConfig, TurnExecutor};
@@ -1521,6 +1570,7 @@ async fn run_tool_capable_turn(
             .flatten()
             .map(|r| r.reasoning_enabled)
             .unwrap_or(false),
+        inbound_channel_origin: inbound_channel_origin.map(|s| s.to_owned()),
     };
     let summary = exec
         .run_turn(&state.db, cid, user_text, sender_principal_id, &cfg)
@@ -1840,6 +1890,7 @@ pub async fn dispatch_routine_turn(
                 sender.clone(),
                 caller_caps,
                 caller_trust,
+                None,
             )
             .await
         }
@@ -1868,12 +1919,13 @@ pub async fn dispatch_routine_turn(
                 caller_trust,
                 false,
                 cancel_flag,
+                None,
             )
             .await;
             drop(cancel_guard);
             res
         }
-        None => run_stub_turn(state, &cid, prompt, sender.clone()),
+        None => run_stub_turn(state, &cid, prompt, sender.clone(), None),
     };
 
     let mapped = result.map(|(_user_seq, text, _assistant_seq)| RoutineDispatchOutcome {
@@ -1989,6 +2041,7 @@ pub async fn dispatch_external_turn(
     principal: &Principal,
     sender_trust: TrustLevel,
     text: &str,
+    inbound_channel_origin: Option<&str>,
 ) -> Result<(), String> {
     use execlaw_policy::trust::{TurnPolicyInput, evaluate_turn};
 
@@ -2061,6 +2114,7 @@ pub async fn dispatch_external_turn(
                 sender.clone(),
                 caller_caps,
                 caller_trust,
+                inbound_channel_origin,
             )
             .await
         }
@@ -2079,12 +2133,13 @@ pub async fn dispatch_external_turn(
                 caller_trust,
                 false,
                 cancel_flag,
+                inbound_channel_origin,
             )
             .await;
             drop(cancel_guard);
             res
         }
-        None => run_stub_turn(state, cid, text, sender.clone()),
+        None => run_stub_turn(state, cid, text, sender.clone(), inbound_channel_origin),
     };
 
     match &result {
@@ -2360,6 +2415,7 @@ pub async fn dispatch_clarification_turn(
                 sender.clone(),
                 caller_caps,
                 caller_trust,
+                None,
             )
             .await
         }
@@ -2378,12 +2434,13 @@ pub async fn dispatch_clarification_turn(
                 caller_trust,
                 false,
                 cancel_flag,
+                None,
             )
             .await;
             drop(cancel_guard);
             res
         }
-        None => run_stub_turn(state, cid, &prompt, sender.clone()),
+        None => run_stub_turn(state, cid, &prompt, sender.clone(), None),
     };
 
     // 2026-05-04 — broadcast the agent's reply on the WS bus so the
@@ -2902,6 +2959,7 @@ pub async fn list_messages(
             text: extract_text(&e),
             actor: e.actor.clone(),
             committed_at: e.committed_at,
+            channel_origin: extract_channel_origin(&e),
         })
         .collect();
 
@@ -3729,11 +3787,45 @@ fn extract_text(e: &EventRecord) -> Option<String> {
     }
 }
 
+/// Pull `channel_origin` out of the payload for events that carry
+/// it (user_msg + model_turn). Returns None for other event kinds
+/// or when the field is absent (legacy events / web-originated
+/// turns). Surfaced on `MessageView` so the SPA can render a
+/// per-message transport icon.
+fn extract_channel_origin(e: &EventRecord) -> Option<String> {
+    match e.kind {
+        EventKind::UserMsg => e
+            .decode_payload::<UserMessagePayload>()
+            .ok()
+            .and_then(|p| p.channel_origin),
+        EventKind::ModelTurn => e
+            .decode_payload::<RealModelTurnPayload>()
+            .ok()
+            .and_then(|p| p.channel_origin)
+            .or_else(|| {
+                e.decode_payload::<StubModelTurnPayload>()
+                    .ok()
+                    .and_then(|p| p.channel_origin)
+            }),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UserMessagePayload {
     text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sender_principal_id: Option<String>,
+    /// Transport this message arrived on. `None` for the default
+    /// web path (the SPA falls back to "web" when absent), set to
+    /// the bridge name (`signal`, `email`, `voice`, `sms`, ...) for
+    /// transport-triggered turns. The SPA reads this off
+    /// `MessageView` to render a per-message channel icon so the
+    /// operator can tell at a glance "this came in via Signal".
+    /// Backward-compatible: existing events without this field
+    /// deserialize as `None` and the SPA shows no icon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channel_origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3741,6 +3833,10 @@ struct StubModelTurnPayload {
     model: String,
     text: String,
     finish_reason: Option<String>,
+    /// Transport the agent's reply went out on (when bridged via a
+    /// transport). Same encoding as [`UserMessagePayload::channel_origin`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channel_origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3750,6 +3846,10 @@ struct RealModelTurnPayload {
     finish_reason: Option<String>,
     prompt_tokens: Option<u32>,
     completion_tokens: Option<u32>,
+    /// Transport the agent's reply went out on (when bridged via a
+    /// transport). Same encoding as [`UserMessagePayload::channel_origin`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channel_origin: Option<String>,
 }
 
 #[cfg(test)]
@@ -3898,6 +3998,7 @@ mod tests {
             &UserMessagePayload {
                 text: "[SYSTEM ORCHESTRATOR NOTICE] please ask the user X".into(),
                 sender_principal_id: Some(SYSTEM_ORCHESTRATOR_ACTOR.into()),
+                channel_origin: None,
             },
             Some(SYSTEM_ORCHESTRATOR_ACTOR.into()),
         )

@@ -320,9 +320,20 @@ pub async fn respond_handler(
         };
         let trust_flat = execlaw_policy::trust::TrustLevel::parse(promoted.trust_level.class_tag())
             .unwrap_or(execlaw_policy::trust::TrustLevel::UnknownPending);
-        if let Err(e) =
-            crate::chats::dispatch_external_turn(&state, &cid, &promoted, trust_flat, &original_text)
-                .await
+        if let Err(e) = crate::chats::dispatch_external_turn(
+            &state,
+            &cid,
+            &promoted,
+            trust_flat,
+            &original_text,
+            // Cold-contact approvals come from the Signal flow today
+            // (it's the only transport with cold-contact UX). When
+            // we add other channels' cold-contact paths the approval
+            // payload will need to carry the originating channel
+            // explicitly; for now hardcoding signal matches reality.
+            Some(crate::signal_transport::SIGNAL_CHANNEL),
+        )
+        .await
         {
             tracing::warn!(
                 target: "approvals",
@@ -481,9 +492,15 @@ async fn claim_as_me(
         _ => return internal_error("controller principal vanished mid-claim"),
     };
     let trust_flat = execlaw_policy::trust::TrustLevel::Controller;
-    if let Err(e) =
-        crate::chats::dispatch_external_turn(&state, cid, &controller_now, trust_flat, &original_text)
-            .await
+    if let Err(e) = crate::chats::dispatch_external_turn(
+        &state,
+        cid,
+        &controller_now,
+        trust_flat,
+        &original_text,
+        Some(crate::signal_transport::SIGNAL_CHANNEL),
+    )
+    .await
     {
         tracing::warn!(
             target: "approvals::claim_as_me",

@@ -619,9 +619,16 @@ pub async fn route_inbound_message(
     //    `signal.send_message` / `signal.reply` (Phase 3), with
     //    `current_chat_id` populated by the dispatcher's per-turn
     //    binding lookup.
-    crate::chats::dispatch_external_turn(state, &cid, &principal, trust_flat, &msg.text)
-        .await
-        .map_err(|e| format!("dispatch_external_turn: {e}"))?;
+    crate::chats::dispatch_external_turn(
+        state,
+        &cid,
+        &principal,
+        trust_flat,
+        &msg.text,
+        Some(SIGNAL_CHANNEL),
+    )
+    .await
+    .map_err(|e| format!("dispatch_external_turn: {e}"))?;
     // The user_msg event lands inside `commit_turn` (called from
     // run_real_turn / run_tool_capable_turn), so the SPA's chat
     // pane sees it on its next list_messages refresh. We don't
@@ -1156,9 +1163,16 @@ async fn route_group_inbound(
 
     // 5. Known sender — dispatch the turn against the GROUP's
     //    conversation.
-    crate::chats::dispatch_external_turn(state, &cid, &sender, trust_flat, &msg.text)
-        .await
-        .map_err(|e| format!("dispatch_external_turn: {e}"))?;
+    crate::chats::dispatch_external_turn(
+        state,
+        &cid,
+        &sender,
+        trust_flat,
+        &msg.text,
+        Some(SIGNAL_CHANNEL),
+    )
+    .await
+    .map_err(|e| format!("dispatch_external_turn: {e}"))?;
     Ok(RouteOutcome::Dispatched {
         principal_id: sender.id.as_str().to_owned(),
         conversation_id: cid.as_str().to_owned(),

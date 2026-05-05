@@ -82,6 +82,31 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
 
     const [hideExternal, setHideExternal] = useState(false);
     const [moreExpanded, setMoreExpanded] = useState(false);
+    const [filtersOpen, setFiltersOpen] = useState(false);
+    // Click-outside handler for the Threads → Filters dropdown.
+    // Closes the menu when the operator clicks anywhere else,
+    // matching browser-native dropdown behaviour.
+    const filtersRef = useRef<HTMLDivElement | null>(null);
+    useEffect(() => {
+        if (!filtersOpen) return;
+        const onClick = (e: MouseEvent) => {
+            if (
+                filtersRef.current &&
+                !filtersRef.current.contains(e.target as Node)
+            ) {
+                setFiltersOpen(false);
+            }
+        };
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key === "Escape") setFiltersOpen(false);
+        };
+        document.addEventListener("mousedown", onClick);
+        document.addEventListener("keydown", onKey);
+        return () => {
+            document.removeEventListener("mousedown", onClick);
+            document.removeEventListener("keydown", onKey);
+        };
+    }, [filtersOpen]);
 
     // 2026-05-04 — Sidebar owns the load of every piece of state it
     // renders: thread list, pending-approval count, firing-alert
@@ -263,26 +288,95 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                 )}
             </nav>
 
-            {externalCount > 0 && (
+            <div className="execlaw-sidebar__threads" data-testid="sidebar-threads">
                 <div
-                    className="d-flex align-items-center gap-2 px-3 py-1 execlaw-muted small"
-                    data-testid="sidebar-external-toggle-row"
+                    className="execlaw-sidebar__section d-flex align-items-center"
+                    style={{ position: "relative" }}
+                    ref={filtersRef}
                 >
                     <span className="flex-grow-1">Threads</span>
-                    <label className="d-flex align-items-center gap-1">
-                        <input
-                            type="checkbox"
-                            checked={hideExternal}
-                            onChange={(e) => setHideExternal(e.target.checked)}
-                            data-testid="sidebar-hide-external"
-                        />
-                        <span>Hide external ({externalCount})</span>
-                    </label>
+                    <button
+                        type="button"
+                        className="btn btn-link btn-sm p-0 execlaw-muted"
+                        onClick={() => setFiltersOpen((v) => !v)}
+                        aria-haspopup="menu"
+                        aria-expanded={filtersOpen}
+                        data-testid="sidebar-threads-filters"
+                        title="Filters"
+                        style={{
+                            lineHeight: 1,
+                            display: "inline-flex",
+                            alignItems: "center",
+                        }}
+                    >
+                        <i className="bi bi-funnel" aria-hidden />
+                        {hideExternal && (
+                            <span
+                                className="ms-1 execlaw-pill"
+                                data-testid="sidebar-threads-filters-active"
+                                style={{
+                                    background: "var(--bs-primary, #0d6efd)",
+                                    color: "white",
+                                    borderRadius: "10px",
+                                    padding: "0 0.4em",
+                                    fontSize: "0.7em",
+                                }}
+                                aria-label="Filters active"
+                            >
+                                ·
+                            </span>
+                        )}
+                    </button>
+                    {filtersOpen && (
+                        <div
+                            role="menu"
+                            className="execlaw-card"
+                            data-testid="sidebar-threads-filters-menu"
+                            style={{
+                                position: "absolute",
+                                top: "100%",
+                                right: 0,
+                                zIndex: 100,
+                                minWidth: "16rem",
+                                marginTop: "0.25rem",
+                                padding: "0.5rem 0.75rem",
+                                boxShadow: "0 4px 12px rgba(0,0,0,0.12)",
+                            }}
+                        >
+                            <label
+                                className="d-flex align-items-center gap-2 m-0"
+                                style={{ cursor: "pointer" }}
+                            >
+                                <input
+                                    type="checkbox"
+                                    checked={hideExternal}
+                                    onChange={(e) =>
+                                        setHideExternal(e.target.checked)
+                                    }
+                                    data-testid="sidebar-hide-external"
+                                />
+                                <span className="flex-grow-1 small">
+                                    Hide external channels
+                                </span>
+                                {externalCount > 0 && (
+                                    <span
+                                        className="execlaw-muted small"
+                                        data-testid="sidebar-external-count"
+                                    >
+                                        {externalCount}
+                                    </span>
+                                )}
+                            </label>
+                            <div
+                                className="execlaw-muted"
+                                style={{ fontSize: "0.7rem", marginTop: "0.25rem" }}
+                            >
+                                Hides threads bridged through Signal, email,
+                                etc. Pinned threads always stay visible.
+                            </div>
+                        </div>
+                    )}
                 </div>
-            )}
-
-            <div className="execlaw-sidebar__threads" data-testid="sidebar-threads">
-                <div className="execlaw-sidebar__section">Threads</div>
                 {visibleThreads.length === 0 ? (
                     <div className="execlaw-muted small px-2 pt-2">
                         No threads yet. Start a new chat to begin.

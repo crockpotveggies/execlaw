@@ -81,6 +81,12 @@ pub struct UserMessagePayload {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_principal_id: Option<String>,
+    /// Originating transport (signal / email / voice / sms) when
+    /// this user_msg arrived from a transport bridge. None for the
+    /// default web path. Surfaced to the SPA so it can render a
+    /// per-message channel icon in the chat view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +97,10 @@ pub struct ModelTurnPayload {
     pub text: String,
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
+    /// Same encoding as [`UserMessagePayload::channel_origin`] —
+    /// the transport the agent's reply went out on (when bridged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_origin: Option<String>,
 }
 
 /// Configuration for one turn.
@@ -122,6 +132,12 @@ pub struct TurnConfig {
     /// `<think>` reasoning blocks. Mirror of the operator-editable
     /// `config_backends.reasoning_enabled` flag (defaults to false).
     pub reasoning_enabled: bool,
+    /// Originating transport name when this turn was triggered by
+    /// an inbound message from a bridged transport (signal / email /
+    /// voice / sms). Threaded into the user_msg + model_turn
+    /// payloads the executor commits so the SPA can render
+    /// per-message channel icons. None for the default web path.
+    pub inbound_channel_origin: Option<String>,
 }
 
 impl std::fmt::Debug for TurnConfig {
@@ -204,6 +220,7 @@ impl TurnExecutor {
             &UserMessagePayload {
                 text: user_text.to_owned(),
                 sender_principal_id: sender_principal_id.clone(),
+                channel_origin: cfg.inbound_channel_origin.clone(),
             },
             sender_principal_id,
         )?;
@@ -288,6 +305,7 @@ impl TurnExecutor {
                         text: assistant_content,
                         prompt_tokens,
                         completion_tokens,
+                        channel_origin: cfg.inbound_channel_origin.clone(),
                     },
                     Some("agent".into()),
                 )?);
@@ -534,6 +552,7 @@ mod tests {
             event_log_hmac_key: None,
             phase_observer: None,
             reasoning_enabled: false,
+            inbound_channel_origin: None,
         };
 
         let summary = exec
@@ -626,6 +645,7 @@ mod tests {
             event_log_hmac_key: None,
             phase_observer: None,
             reasoning_enabled: false,
+            inbound_channel_origin: None,
         };
 
         let summary = exec
@@ -769,6 +789,7 @@ mod tests {
             event_log_hmac_key: None,
             phase_observer: None,
             reasoning_enabled: false,
+            inbound_channel_origin: None,
         };
         let _ = exec
             .run_turn(&db, &cid, "try it", None, &cfg)
@@ -843,6 +864,7 @@ mod tests {
             event_log_hmac_key: None,
             phase_observer: None,
             reasoning_enabled: false,
+            inbound_channel_origin: None,
         };
         let err = exec
             .run_turn(&db, &cid, "go", None, &cfg)
