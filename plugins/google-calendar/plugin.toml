@@ -1,7 +1,7 @@
 [plugin]
 id = "google-calendar"
 name = "Google Calendar"
-version = "0.2.1"
+version = "0.2.2"
 description = "Google Calendar API tools — list calendars/events, check availability, get/create/update/delete events. Mutations send notifications when attendees are present."
 author = "execlaw"
 license = "AGPL-3.0-or-later"
@@ -45,12 +45,25 @@ latency = "medium"
 
 [[tools]]
 name = "calendar.create_event"
-description = "Create a new calendar event. Args: { calendar_id?: string (default 'primary'), summary: string, start: RFC3339, end: RFC3339, description?: string, location?: string, attendees?: string[] (emails) }. Sends invitations when attendees are present."
+description = """Create a new calendar event. Args: { calendar_id?: string \
+(default 'primary'), summary: string, start: RFC3339, end: RFC3339, \
+description?: string, location?: string, attendees?: string[] (emails) }. \
+`start` and `end` MUST carry the operator's local UTC offset (e.g. \
+`2026-05-05T18:00:00-07:00` for 6pm Pacific) — NEVER use a `Z` suffix \
+unless the operator explicitly asked for UTC, since `Z` lands the event \
+in UTC and renders shifted by the offset in the operator's calendar app. \
+The per-turn context block lists the operator's timezone — use it. \
+Sends invitations when attendees are present."""
 latency = "medium"
 
 [[tools]]
 name = "calendar.update_event"
-description = "Patch an existing event. Args: { calendar_id?: string (default 'primary'), event_id: string, summary?, start?, end?, description?, location?, attendees? }. Sends update notifications when attendees are present."
+description = """Patch an existing event. Args: { calendar_id?: string \
+(default 'primary'), event_id: string, summary?, start?, end?, description?, \
+location?, attendees? }. Same RFC3339-with-local-offset rule as \
+`create_event` applies to `start` / `end` — use the operator's local \
+offset, never a `Z` suffix unless they explicitly want UTC. Sends update \
+notifications when attendees are present."""
 latency = "medium"
 
 [[tools]]

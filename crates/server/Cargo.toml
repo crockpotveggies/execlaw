@@ -46,6 +46,7 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 uuid.workspace = true
 async-trait.workspace = true
 dashmap.workspace = true

@@ -390,6 +390,13 @@ export function Chat() {
                           content: m.text ?? "",
                       }))
                 : undefined;
+            // Browser timezone — sourced once per send so the
+            // server stamps the right zone into the per-turn
+            // context. Detection is cheap and always available;
+            // fall back to undefined on the off chance Intl
+            // returns a falsy zone (older WebViews etc.).
+            const browserTz =
+                Intl.DateTimeFormat().resolvedOptions().timeZone || undefined;
             try {
                 const resp = await postMessage(
                     targetId,
@@ -398,8 +405,9 @@ export function Chat() {
                               text,
                               incognito: true,
                               prior_messages: priorMessages,
+                              timezone: browserTz,
                           }
-                        : { text },
+                        : { text, timezone: browserTz },
                     getToken,
                 );
                 if (incognito) {

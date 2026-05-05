@@ -55,6 +55,16 @@ pub struct SendMessageRequest {
     /// `"assistant"`. Ignored when `incognito = false`.
     #[serde(default)]
     pub prior_messages: Vec<IncognitoTurnMessage>,
+    /// IANA timezone name (e.g. `America/Los_Angeles`) the SPA
+    /// browser detected via `Intl.DateTimeFormat().resolvedOptions().timeZone`.
+    /// Stamped into the per-turn context prose so the agent
+    /// interprets bare clock times ("create an event at 6pm") in
+    /// the operator's local zone instead of UTC. Optional because
+    /// non-browser inbounds (Signal, future SMS / email) don't
+    /// supply one; those fall back to UTC and the agent should
+    /// ask if a clock time is ambiguous.
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
@@ -349,6 +359,7 @@ pub async fn send_message(
                     // send_message hits this from the web-chat path;
                     // no transport-bridge here.
                     inbound_channel_origin: None,
+                    caller_timezone: req.timezone.as_deref(),
                 })
                 .await
                 {
@@ -374,6 +385,7 @@ pub async fn send_message(
                 caller_caps.clone(),
                 sender_trust,
                 None,
+                req.timezone.as_deref(),
             )
             .await
             {
@@ -400,6 +412,7 @@ pub async fn send_message(
                     spotlight_content,
                     cancel_flag.clone(),
                     None,
+                    req.timezone.as_deref(),
                 )
                 .await
                 {
@@ -620,6 +633,7 @@ async fn run_real_turn(
     spotlight_content: bool,
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     inbound_channel_origin: Option<&str>,
+    caller_timezone: Option<&str>,
 ) -> Result<(i64, String, i64), String> {
     use execlaw_inference_api::{ChatMessage, ChatRequest};
     use execlaw_policy::spotlighting::Spotlight;
@@ -672,6 +686,7 @@ async fn run_real_turn(
         sender_principal_id.as_deref(),
         sender_trust.as_str(),
         inbound_channel_origin,
+        caller_timezone,
     );
     let composed_system = assemble_system_prompt(
         &state.db,
@@ -941,6 +956,16 @@ pub(crate) struct RunnerTurnCtx<'a> {
     /// render a per-message channel icon. None for web-originated
     /// turns.
     pub inbound_channel_origin: Option<&'a str>,
+    /// Operator's IANA timezone for this turn — sourced from the
+    /// SPA's `Intl.DateTimeFormat().resolvedOptions().timeZone` for
+    /// web turns, from a routine's stored zone for routine fires,
+    /// `None` for transport-bridged turns until a configurable
+    /// fallback lands. Threaded into `build_turn_context_prose` so
+    /// the agent renders bare clock times in the right zone — the
+    /// regression that prompted this field was a calendar event
+    /// "for 6pm" landing at 11am after the agent emitted UTC
+    /// without any local-time anchor.
+    pub caller_timezone: Option<&'a str>,
 }
 
 pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, String, i64), String> {
@@ -955,6 +980,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         caller_caps,
         caller_trust,
         inbound_channel_origin,
+        caller_timezone,
     } = ctx;
     let supervisor = state
         .runner_supervisor
@@ -1020,6 +1046,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         sender_principal_id.as_deref(),
         caller_trust.as_str(),
         inbound_channel_origin,
+        caller_timezone,
     );
     let composed_system = assemble_system_prompt(
         &state.db,
@@ -1437,6 +1464,7 @@ async fn run_tool_capable_turn(
     caller_caps: Vec<String>,
     caller_trust: TrustLevel,
     inbound_channel_origin: Option<&str>,
+    caller_timezone: Option<&str>,
 ) -> Result<(i64, String, i64), String> {
     use execlaw_inference_api::ToolDeclaration;
     use execlaw_runner_local::turn::{TurnConfig, TurnExecutor};
@@ -1555,6 +1583,7 @@ async fn run_tool_capable_turn(
         sender_principal_id.as_deref(),
         caller_trust.as_str(),
         inbound_channel_origin,
+        caller_timezone,
     );
     let cfg = TurnConfig {
         model: ModelId(state.config.model_id.clone()),
@@ -1897,6 +1926,22 @@ pub async fn dispatch_routine_turn(
     let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
     // Phase 12.E — same per-turn resolver as send_message uses.
     let inference_for_turn = state.inference.resolve(&state.db, BackendPurpose::Standard);
+    // Routine timezone: each routine row stores its own IANA zone
+    // (the scheduler uses it for cron evaluation). Read it once here
+    // so the agent's per-turn context renders bare clock times in
+    // the routine's configured zone — without this, a routine that
+    // says "schedule a 6pm reminder" would land at 11am the same way
+    // the web-chat path used to.
+    let routine_timezone: Option<String> = {
+        use execlaw_core::routines::RoutineStore;
+        let store = RoutineStore::new(&state.db);
+        match store.get(routine_id) {
+            Ok(Some(r)) => Some(r.timezone),
+            _ => None,
+        }
+    };
+    let routine_tz_ref = routine_timezone.as_deref();
+
     let result = match inference_for_turn {
         Some(inference) if has_plugin_tools => {
             run_tool_capable_turn(
@@ -1908,6 +1953,7 @@ pub async fn dispatch_routine_turn(
                 caller_caps,
                 caller_trust,
                 None,
+                routine_tz_ref,
             )
             .await
         }
@@ -1937,6 +1983,7 @@ pub async fn dispatch_routine_turn(
                 false,
                 cancel_flag,
                 None,
+                routine_tz_ref,
             )
             .await;
             drop(cancel_guard);
@@ -2186,6 +2233,14 @@ pub async fn dispatch_external_turn(
 
     let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
     let inference_for_turn = state.inference.resolve(&state.db, BackendPurpose::Standard);
+    // External-transport turns (Signal etc.) don't carry a per-call
+    // timezone yet — the bridge wire shape doesn't include
+    // `Intl.DateTimeFormat`. Fall back to UTC; the agent's prose
+    // explicitly tells the model to ASK if a clock time is
+    // ambiguous, so the user doesn't get a 7-hour-shifted calendar
+    // event from a Signal "6pm" message. Future: read a per-
+    // controller `config_general.controller_timezone` setting.
+    let caller_timezone: Option<&str> = None;
     let result = match inference_for_turn {
         Some(inference) if has_plugin_tools => {
             run_tool_capable_turn(
@@ -2197,6 +2252,7 @@ pub async fn dispatch_external_turn(
                 caller_caps,
                 caller_trust,
                 inbound_channel_origin,
+                caller_timezone,
             )
             .await
         }
@@ -2216,6 +2272,7 @@ pub async fn dispatch_external_turn(
                 false,
                 cancel_flag,
                 inbound_channel_origin,
+                caller_timezone,
             )
             .await;
             drop(cancel_guard);
@@ -2593,6 +2650,10 @@ pub async fn dispatch_clarification_turn(
 
     let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
     let inference_for_turn = state.inference.resolve(&state.db, BackendPurpose::Standard);
+    // Synthetic clarification turn — no operator-supplied timezone.
+    // The model just relays a question; date arithmetic isn't on
+    // this path's hot list.
+    let caller_timezone: Option<&str> = None;
     let result = match inference_for_turn {
         Some(inference) if has_plugin_tools => {
             run_tool_capable_turn(
@@ -2604,6 +2665,7 @@ pub async fn dispatch_clarification_turn(
                 caller_caps,
                 caller_trust,
                 None,
+                caller_timezone,
             )
             .await
         }
@@ -2623,6 +2685,7 @@ pub async fn dispatch_clarification_turn(
                 false,
                 cancel_flag,
                 None,
+                caller_timezone,
             )
             .await;
             drop(cancel_guard);
@@ -2707,6 +2770,7 @@ pub(crate) fn build_turn_context_prose(
     sender_principal_id: Option<&str>,
     sender_trust: &str,
     origin_channel: Option<&str>,
+    caller_timezone: Option<&str>,
 ) -> String {
     let mut out = String::from("## Turn context\n\n");
     // Date framing matters more than it looks. Earlier prompts
@@ -2726,11 +2790,44 @@ pub(crate) fn build_turn_context_prose(
     //      not a ceiling, and points at web_search / research as
     //      the right tools for "I don't know about events after my
     //      cutoff."
-    out.push_str(&format!(
-        "* Current date: {} (UTC: {})\n",
-        now_utc.format("%A, %B %-d, %Y"),
-        now_utc.format("%Y-%m-%dT%H:%M:%SZ"),
-    ));
+    //
+    // Timezone framing: when the SPA supplies the operator's IANA
+    // zone, render the local clock + offset alongside UTC and tell
+    // the agent which one to anchor on. Without this, "create a
+    // calendar event at 6pm" was being emitted as `2026-05-05T18:00:00Z`
+    // — i.e. 11am Pacific, the regression that prompted this fix.
+    let local_block = caller_timezone
+        .and_then(|tz| tz.parse::<chrono_tz::Tz>().ok())
+        .map(|tz| {
+            let local = now_utc.with_timezone(&tz);
+            format!(
+                "* Current date: {} ({} {})\n  (UTC: {})\n",
+                local.format("%A, %B %-d, %Y %-I:%M %p"),
+                tz.name(),
+                local.format("%Z"),
+                now_utc.format("%Y-%m-%dT%H:%M:%SZ"),
+            )
+        });
+    if let Some(b) = local_block {
+        out.push_str(&b);
+        out.push_str(
+            "* Bare clock times in the operator's message (\"6pm\", \"tomorrow at 9\") \
+             refer to the local zone above. When emitting RFC3339 timestamps to tools \
+             (calendar, routines, etc.), use the local offset (e.g. \
+             `2026-05-05T18:00:00-07:00`), NOT a `Z` suffix — a `Z` will land the event \
+             in UTC and surface in Google Calendar shifted by the offset.\n",
+        );
+    } else {
+        out.push_str(&format!(
+            "* Current date: {} (UTC: {})\n",
+            now_utc.format("%A, %B %-d, %Y"),
+            now_utc.format("%Y-%m-%dT%H:%M:%SZ"),
+        ));
+        out.push_str(
+            "* Operator timezone is unknown — if the user gives a bare clock time \
+             (\"6pm\"), ask which zone they mean before emitting an RFC3339 timestamp.\n",
+        );
+    }
     out.push_str(
         "* Date above is real, not hypothetical — for post-cutoff facts use \
          `web_search` or `research_start`.\n",
@@ -4617,8 +4714,14 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2026-05-02T10:23:45Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let prose =
-            super::build_turn_context_prose(now, "conv-abc", Some("controller"), "Controller", None);
+        let prose = super::build_turn_context_prose(
+            now,
+            "conv-abc",
+            Some("controller"),
+            "Controller",
+            None,
+            None,
+        );
         // ISO timestamp still present (precise form for any tool
         // call that needs it).
         assert!(prose.contains("2026-05-02T10:23:45Z"));
@@ -4645,6 +4748,7 @@ mod tests {
             None,
             "Controller",
             None,
+            None,
         );
         // Tight one-liner reframes the date as real (not
         // hypothetical) and points at the search escape valves.
@@ -4658,12 +4762,89 @@ mod tests {
     }
 
     #[test]
+    fn build_turn_context_prose_renders_local_time_when_tz_supplied() {
+        // Pin the regression that prompted timezone plumbing: the
+        // operator said "create an event at 6pm" and got a UTC
+        // timestamp back, which appeared as 11am Pacific. The prose
+        // now anchors the model in the local zone + tells it to
+        // emit RFC3339 offsets, not `Z`.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-05T22:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let prose = super::build_turn_context_prose(
+            now,
+            "conv-tz",
+            Some("controller"),
+            "Controller",
+            None,
+            Some("America/Los_Angeles"),
+        );
+        // Local clock-time form ("3:00 PM" in PDT for 22:00 UTC on
+        // 2026-05-05). %-I trims leading zero so the test pins the
+        // bare hour shape.
+        assert!(
+            prose.contains("3:00 PM"),
+            "must render local clock time; got: {prose}"
+        );
+        assert!(prose.contains("America/Los_Angeles"));
+        // PDT for May 5 (DST in effect).
+        assert!(prose.contains("PDT"));
+        // UTC anchor still present so tools that need a `Z`
+        // timestamp can find it.
+        assert!(prose.contains("2026-05-05T22:00:00Z"));
+        // Explicit guidance: emit the local OFFSET, not `Z`. This
+        // is the line that turns "6pm" into a calendar event at
+        // the right wall-clock time.
+        assert!(prose.to_lowercase().contains("local offset"));
+        assert!(prose.contains("NOT a `Z` suffix"));
+    }
+
+    #[test]
+    fn build_turn_context_prose_falls_back_to_ask_when_tz_unknown() {
+        // Signal-bridged + routine-fired turns might not carry a
+        // caller timezone. The prose tells the model to ASK before
+        // emitting an RFC3339 — much safer than silently picking
+        // UTC, which is the bug the per-turn caller_timezone field
+        // was added to fix.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-05T22:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let prose = super::build_turn_context_prose(
+            now,
+            "conv-tz",
+            Some("controller"),
+            "Controller",
+            None,
+            None,
+        );
+        assert!(prose.to_lowercase().contains("operator timezone is unknown"));
+        assert!(prose.to_lowercase().contains("ask which zone"));
+    }
+
+    #[test]
+    fn build_turn_context_prose_handles_unknown_tz_gracefully() {
+        // Defensive: a bogus IANA name (typo, manually-edited config,
+        // etc.) shouldn't crash. We fall back to the UTC-only path
+        // + the "ask which zone" guidance, same as the no-tz case.
+        let now = chrono::Utc::now();
+        let prose = super::build_turn_context_prose(
+            now,
+            "conv-tz",
+            None,
+            "Controller",
+            None,
+            Some("Not/A/Real/Zone"),
+        );
+        assert!(prose.to_lowercase().contains("operator timezone is unknown"));
+    }
+
+    #[test]
     fn build_turn_context_prose_omits_principal_line_when_unknown() {
         // Routine-fired turns may not have a principal id resolved
         // yet; the line just disappears rather than emitting "From
         // principal: `none`" which the model could misread.
         let now = chrono::Utc::now();
-        let prose = super::build_turn_context_prose(now, "conv-x", None, "Controller", None);
+        let prose = super::build_turn_context_prose(now, "conv-x", None, "Controller", None, None);
         assert!(!prose.contains("From principal"));
         assert!(prose.contains("conv-x"));
         assert!(prose.contains("Controller"));
@@ -4684,6 +4865,7 @@ mod tests {
             Some("controller"),
             "Controller",
             Some("signal"),
+            None,
         );
         assert!(prose.contains("Origin channel: `signal`"));
         // The "do NOT describe web-UI surfaces" nudge is the
@@ -4704,6 +4886,7 @@ mod tests {
             "conv-x",
             Some("controller"),
             "Controller",
+            None,
             None,
         );
         assert!(prose.contains("Origin channel: `web`"));

@@ -265,6 +265,14 @@ export interface SendMessageRequest {
     /// incognito send because the server can't replay the event
     /// log. Ignored when `incognito` is false/missing.
     prior_messages?: PriorMessage[];
+    /// IANA timezone (e.g. `America/Los_Angeles`) detected from the
+    /// browser via `Intl.DateTimeFormat().resolvedOptions().timeZone`.
+    /// The server stamps it into the per-turn context so the agent
+    /// interprets bare clock times in the operator's local zone
+    /// instead of UTC — without this, "create an event at 6pm" got
+    /// emitted as `T18:00:00Z` and surfaced 7 hours shifted in
+    /// Google Calendar.
+    timezone?: string;
 }
 
 export interface SendMessageResponse {
