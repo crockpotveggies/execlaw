@@ -962,6 +962,48 @@ impl TransportApi for SignalCliTransport {
     }
 }
 
+/// Channel-keyed factory for the host-side transport registry.
+/// The registry calls `build` on every transport-bridge dispatch
+/// (chat text reply auto-bridge, attachment fan-out, research-PDF
+/// dispatch). Captures the long-lived `Arc<dyn RpcEndpointResolver>`
+/// at registration so per-call construction is just an Arc clone +
+/// SignalCliTransport mint.
+pub struct SignalCliTransportFactory {
+    resolver: std::sync::Arc<dyn RpcEndpointResolver>,
+}
+
+impl SignalCliTransportFactory {
+    pub fn new(resolver: std::sync::Arc<dyn RpcEndpointResolver>) -> Self {
+        Self { resolver }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::transport_registry::HostTransportFactory for SignalCliTransportFactory {
+    fn channel(&self) -> &str {
+        SIGNAL_CHANNEL
+    }
+    fn build(
+        &self,
+        db: &execlaw_core::Database,
+        conversation_id: &execlaw_core::ids::ConversationId,
+        foreign_id: &str,
+    ) -> Option<std::sync::Arc<dyn execlaw_core::tool::TransportApi>> {
+        let transport = SignalCliTransport::new(
+            self.resolver.clone(),
+            db.clone(),
+            // `read_self_number_from_env` stays the override path
+            // for back-compat. `post_send` falls through to
+            // `/v1/accounts` when this is None — the common case
+            // post-pairing.
+            SignalCliTransport::read_self_number_from_env(),
+            Some(foreign_id.to_owned()),
+        )
+        .with_caller_conversation_id(conversation_id.clone());
+        Some(std::sync::Arc::new(transport))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

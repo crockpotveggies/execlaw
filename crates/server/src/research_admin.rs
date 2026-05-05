@@ -443,7 +443,7 @@ pub async fn advance_job_handler(
         inference,
         model,
         cancel: cancel.clone(),
-        sidecar_supervisor: state.sidecar_supervisor.clone(),
+        host_transports: Some(state.host_transports.clone()),
     };
     let db_for_notes = state.db.clone();
     let id_for_task = id.clone();

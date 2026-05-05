@@ -34,17 +34,14 @@ pub struct ServerAttachmentApi {
     db: Database,
     events: EventBus,
     caller_conversation_id: ConversationId,
-    /// When the caller's conversation is bound to a transport
-    /// (state_transport_bindings hit on the conversation's
-    /// principal_group), `send` ALSO ships the attachment through
-    /// that transport — not just the web-UI download chip. Without
-    /// this fan-out, an agent on a Signal-bridged conversation
-    /// asked to "resend that PDF" emits a card pair the operator
-    /// can only see in the web UI; the contact on Signal sees
-    /// nothing. `None` (no resolver wired) keeps the legacy
-    /// web-only behavior.
-    transport_resolver:
-        Option<std::sync::Arc<dyn crate::signal_transport::RpcEndpointResolver>>,
+    /// Host-transport registry. When the caller's conversation is
+    /// bound to a transport (state_transport_bindings hit on the
+    /// conversation's principal_group) AND the registry has a
+    /// factory for that channel, `send` ALSO ships the attachment
+    /// through the transport — not just the web-UI download chip.
+    /// `None` keeps the legacy web-only behavior (test fixtures,
+    /// managed-mode boots without transport plugins).
+    transports: Option<crate::transport_registry::HostTransportRegistry>,
 }
 
 impl ServerAttachmentApi {
@@ -53,18 +50,20 @@ impl ServerAttachmentApi {
             db,
             events,
             caller_conversation_id,
-            transport_resolver: None,
+            transports: None,
         }
     }
 
-    /// Builder-style attach the transport resolver so `send` fans
-    /// out to the originating transport. The dispatcher passes the
-    /// same resolver it already wires for `signal.send_message`.
-    pub fn with_transport_resolver(
+    /// Builder-style attach the host-transport registry so `send`
+    /// fans out to the originating transport. The dispatcher
+    /// passes `state.host_transports.clone()`. Channel-agnostic —
+    /// a Telegram/email/etc. plugin that registers a factory at
+    /// boot is auto-included with no edits here.
+    pub fn with_transports(
         mut self,
-        resolver: Option<std::sync::Arc<dyn crate::signal_transport::RpcEndpointResolver>>,
+        registry: Option<crate::transport_registry::HostTransportRegistry>,
     ) -> Self {
-        self.transport_resolver = resolver;
+        self.transports = registry;
         self
     }
 }
@@ -195,10 +194,12 @@ impl AttachmentApi for ServerAttachmentApi {
 }
 
 impl ServerAttachmentApi {
-    /// If the caller's conversation has a Signal binding, dispatch
-    /// the attachment through signal-cli. No-op for web-only
-    /// conversations and when no supervisor is wired. Errors log but
-    /// don't propagate — the web-UI chip already shipped.
+    /// If the caller's conversation has a binding for any
+    /// registered transport, fan the attachment out through it.
+    /// No-op for web-only conversations and when the registry is
+    /// empty. Errors log but don't propagate — the web-UI chip
+    /// already shipped, so a transport-side failure is a UX
+    /// degradation, not a correctness break.
     async fn bridge_to_originating_transport(
         &self,
         attachment_id: &str,
@@ -206,10 +207,9 @@ impl ServerAttachmentApi {
         caption: Option<&str>,
     ) {
         use execlaw_core::principal_groups::PrincipalGroupStore;
-        use execlaw_core::tool::TransportApi;
         use execlaw_core::transport_bindings::TransportBindingStore;
 
-        let Some(resolver) = self.transport_resolver.as_ref() else {
+        let Some(registry) = self.transports.as_ref() else {
             return;
         };
 
@@ -231,45 +231,33 @@ impl ServerAttachmentApi {
                 return;
             }
         };
-        let signal_binding = bindings
-            .iter()
-            .find(|b| b.channel == crate::signal_transport::SIGNAL_CHANNEL);
-        let Some(binding) = signal_binding else {
-            return; // web-only conversation
+        let Some((transport, channel, recipient)) = registry
+            .build_for_first_supported_binding(&self.db, &self.caller_conversation_id, &bindings)
+        else {
+            return; // web-only conversation OR registry has no factory for this channel
         };
-
-        let transport = crate::signal_transport::SignalCliTransport::new(
-            resolver.clone(),
-            self.db.clone(),
-            crate::signal_transport::SignalCliTransport::read_self_number_from_env(),
-            Some(binding.foreign_id.clone()),
-        )
-        .with_caller_conversation_id(self.caller_conversation_id.clone());
 
         let body = caption.unwrap_or(filename);
         if let Err(e) = transport
-            .send_with_attachments(
-                crate::signal_transport::SIGNAL_CHANNEL,
-                &binding.foreign_id,
-                body,
-                &[attachment_id.to_owned()],
-            )
+            .send_with_attachments(&channel, &recipient, body, &[attachment_id.to_owned()])
             .await
         {
             tracing::warn!(
                 target: "attachment_api::bridge",
                 conversation_id = %self.caller_conversation_id.as_str(),
-                recipient = %binding.foreign_id,
+                channel = %channel,
+                recipient = %recipient,
                 error = %e,
-                "Signal fan-out failed; web-UI chip remains visible to the operator",
+                "transport fan-out failed; web-UI chip remains visible to the operator",
             );
         } else {
             tracing::info!(
                 target: "attachment_api::bridge",
                 conversation_id = %self.caller_conversation_id.as_str(),
-                recipient = %binding.foreign_id,
+                channel = %channel,
+                recipient = %recipient,
                 attachment_id = %attachment_id,
-                "fanned attachment out via Signal",
+                "fanned attachment out via originating transport",
             );
         }
     }

@@ -813,6 +813,7 @@ pub fn test_app_state() -> AppState {
         // mock-backed supervisor construct AppState manually.
         backend_supervisor: None,
         sidecar_supervisor: None,
+        host_transports: crate::transport_registry::HostTransportRegistry::new(),
         voice_sessions: crate::voice_session::VoiceSessionRegistry::new(events.clone()),
         // Test fixtures use mock STT/TTS factories — production
         // wires real Whisper + Kokoro clients via

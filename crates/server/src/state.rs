@@ -131,6 +131,16 @@ pub struct AppState {
     /// Docker); the `/api/admin/sidecars` route returns 503 in
     /// that mode.
     pub sidecar_supervisor: Option<crate::sidecar_supervisor::SidecarSupervisor>,
+    /// Channel-keyed registry of host-side `TransportApi`
+    /// factories. Bridge call sites (chat text reply auto-bridge,
+    /// attachment fan-out, research-PDF dispatch) walk a
+    /// conversation's bindings and ask the registry for a
+    /// transport without naming Signal / WhatsApp / etc.
+    /// directly. Empty in test fixtures and managed-mode boot
+    /// paths that don't wire transport plugins; bridge sites
+    /// gracefully degrade to "no transport bridged this message"
+    /// (the web-side surface already shipped).
+    pub host_transports: crate::transport_registry::HostTransportRegistry,
     /// Phase 13.B — voice-session registry. Owns the per-session
     /// jitter buffer + lifecycle state. Always present (cheap to
     /// construct); no HTTP route depends on it being None vs Some.

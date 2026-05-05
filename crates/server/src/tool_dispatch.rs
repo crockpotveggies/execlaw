@@ -99,6 +99,13 @@ pub struct ChainedToolDispatch<B: BuiltinTools> {
     /// per-turn `SignalCliTransport` so `send` can populate
     /// signal-cli-rest-api's required `number` field.
     pub signal_self_number: Option<String>,
+    /// Channel-keyed transport registry. The `send_attachment`
+    /// built-in fans the file out across every channel the
+    /// conversation is reachable on (Signal today; future plugins
+    /// register at boot). Channel-agnostic — the dispatcher
+    /// hands the registry to ServerAttachmentApi which walks
+    /// bindings without naming Signal directly.
+    pub host_transports: Option<crate::transport_registry::HostTransportRegistry>,
 }
 
 impl<B: BuiltinTools> ChainedToolDispatch<B> {
@@ -120,6 +127,7 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             research_supervisor_wake: None,
             signal_transport_resolver: None,
             signal_self_number: None,
+            host_transports: None,
         }
     }
 
@@ -147,6 +155,7 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             research_supervisor_wake: None,
             signal_transport_resolver: None,
             signal_self_number: None,
+            host_transports: None,
         }
     }
 
@@ -237,6 +246,18 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
     ) -> Self {
         self.signal_transport_resolver = resolver;
         self.signal_self_number = self_number;
+        self
+    }
+
+    /// Wire the host-transport registry. Production call sites
+    /// pass `state.host_transports.clone()`; tests typically leave
+    /// this unset and the `send_attachment` path skips the fan-out
+    /// step (web-UI chip remains the only deliverable).
+    pub fn with_host_transports(
+        mut self,
+        registry: crate::transport_registry::HostTransportRegistry,
+    ) -> Self {
+        self.host_transports = Some(registry);
         self
     }
 
@@ -410,21 +431,19 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
         let needs_attachment_send = caps.iter().any(|c| matches!(c, Capability::AttachmentSend));
         if needs_attachment_send {
             if let Some(events) = self.events.as_ref() {
-                // Hand the attachment API the same transport resolver
-                // signal.send_message uses. The API fans `send` out
-                // through the originating transport when the caller's
-                // conversation is bound to one — so an agent that
-                // calls `send_attachment` on a Signal-bridged thread
-                // delivers the file to BOTH the web-UI chip AND the
-                // contact's Signal app, instead of leaving the
-                // contact stranded with an attachment they can't see.
+                // Hand the attachment API the host-transport
+                // registry so `send` fans out across every channel
+                // the conversation is reachable on. Channel-agnostic
+                // — a Telegram/email/etc. plugin that registers a
+                // factory at boot is auto-included with no edits to
+                // the attachment API.
                 ctx.attachments = Some(Arc::new(
                     crate::attachment_api::ServerAttachmentApi::new(
                         self.host.db().clone(),
                         events.clone(),
                         ctx.conversation_id.clone(),
                     )
-                    .with_transport_resolver(self.signal_transport_resolver.clone()),
+                    .with_transports(self.host_transports.clone()),
                 ));
             }
             // No bus → capability stays dormant. The tool body's

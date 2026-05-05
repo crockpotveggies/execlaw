@@ -1186,7 +1186,8 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
                     as std::sync::Arc<dyn crate::signal_transport::RpcEndpointResolver>
             }),
             crate::signal_transport::SignalCliTransport::read_self_number_from_env(),
-        ),
+        )
+        .with_host_transports(state.host_transports.clone()),
     );
 
     // Step 3.5 — lazy-spawn the runner if it's not registered yet.
@@ -1508,7 +1509,8 @@ async fn run_tool_capable_turn(
                     as std::sync::Arc<dyn crate::signal_transport::RpcEndpointResolver>
             }),
             crate::signal_transport::SignalCliTransport::read_self_number_from_env(),
-        ),
+        )
+        .with_host_transports(state.host_transports.clone()),
     );
     let exec = TurnExecutor::new((*inference).clone(), dispatch);
     // Phase 11.A — wire a phase observer that fans the runner's
@@ -2203,10 +2205,11 @@ async fn bridge_text_reply_to_originating_transport(
 ) -> Result<(), String> {
     use execlaw_core::events::{EventKind, ToolUsePayload};
     use execlaw_core::principal_groups::PrincipalGroupStore;
+    use execlaw_core::tool::TransportApi;
     use execlaw_core::transport_bindings::TransportBindingStore;
 
-    // Step 1: discover the originating transport binding for this
-    // conversation. No binding → not transport-triggered → exit.
+    // Step 1: discover the conversation's transport bindings. No
+    // bindings → not transport-triggered → exit.
     let pg_store = PrincipalGroupStore::new(&state.db);
     let pg_id = match pg_store.principal_group_id_for(cid.as_str()) {
         Ok(Some(id)) => id,
@@ -2216,14 +2219,19 @@ async fn bridge_text_reply_to_originating_transport(
     let bindings = binding_store
         .bindings_for_group_any_channel(&pg_id)
         .map_err(|e| format!("bindings_for_group: {e}"))?;
-    let signal_binding = bindings
-        .iter()
-        .find(|b| b.channel == crate::signal_transport::SIGNAL_CHANNEL);
-    let Some(binding) = signal_binding else {
-        return Ok(()); // no signal binding; no other transports support auto-bridge yet
+
+    // Step 2: ask the host-transport registry for a matching
+    // factory. Channel-agnostic — `signal` happens to be the only
+    // registered transport today, but the bridge no longer hardcodes
+    // it. Empty registry / web-only conversation → exit.
+    let Some((transport, channel, recipient)) = state
+        .host_transports
+        .build_for_first_supported_binding(&state.db, cid, &bindings)
+    else {
+        return Ok(());
     };
 
-    // Step 2: scan the conversation's events to find the most
+    // Step 3: scan the conversation's events to find the most
     // recent turn. We need (a) the last model_turn's text and
     // (b) any tool_use names emitted in the same turn.
     let log = event_log(state);
@@ -2233,15 +2241,9 @@ async fn bridge_text_reply_to_originating_transport(
     if last_seq.0 == 0 {
         return Ok(());
     }
-    // Replay from the start of this turn. We define "this turn" as
-    // events back to and including the most recent user_msg. For
-    // typical inbound this is 1 user_msg + 0..N tool_use/tool_result
-    // pairs + 1 model_turn — small.
     let events = log
         .replay_since(cid, EventSeq(0))
         .map_err(|e| format!("replay: {e}"))?;
-    // Walk backwards to find the boundary: the most recent user_msg
-    // marks the start of the current turn.
     let mut turn_start_idx = 0usize;
     for (i, ev) in events.iter().enumerate().rev() {
         if matches!(ev.kind, EventKind::UserMsg) {
@@ -2251,31 +2253,29 @@ async fn bridge_text_reply_to_originating_transport(
     }
     let turn = &events[turn_start_idx..];
 
-    // Step 3: bail if the agent already dispatched via a transport
-    // tool. Match on a small set of known recipient-determining
-    // tool names — future transports add their tool names here.
+    // Step 4: bail if the agent already dispatched via a transport-
+    // send tool in this turn. The set of tool names that count as
+    // "already dispatched" is per-channel; today's only entry is
+    // signal.* but as transports register their own send tools the
+    // list grows. We resolve it from the channel name so the bridge
+    // call site stays channel-agnostic.
     let already_dispatched = turn.iter().any(|ev| {
         if !matches!(ev.kind, EventKind::ToolUse) {
             return false;
         }
         ev.decode_payload::<ToolUsePayload>()
-            .map(|p| {
-                matches!(
-                    p.tool_name.as_str(),
-                    "signal.reply" | "signal.send_message"
-                )
-            })
+            .map(|p| is_send_tool_for_channel(&channel, &p.tool_name))
             .unwrap_or(false)
     });
     if already_dispatched {
         return Ok(());
     }
 
-    // Step 4: extract the model_turn text. Must be non-empty —
-    // signal.reply's contract is that the tool IS the reply, so a
-    // tool-using turn legitimately commits empty model_turn text.
-    // For our path (no transport tool used), empty text means the
-    // agent stayed silent and there's nothing to bridge.
+    // Step 5: extract the model_turn text. Must be non-empty —
+    // tool-using turns legitimately commit empty model_turn text
+    // (the tool IS the reply). For our path (no transport tool
+    // used), empty text means the agent stayed silent and there's
+    // nothing to bridge.
     let model_text = turn
         .iter()
         .filter_map(|ev| {
@@ -2292,40 +2292,40 @@ async fn bridge_text_reply_to_originating_transport(
         return Ok(());
     }
 
-    // Step 5: dispatch through the same SignalCliTransport the
-    // tool path uses. Constructing per-call is cheap (just a
-    // reqwest::Client + Arc clones). self_number resolves
-    // dynamically against /v1/accounts so we don't need the env
-    // override.
-    let supervisor = state.sidecar_supervisor.clone().ok_or_else(|| {
-        "sidecar supervisor unwired; cannot bridge text reply to Signal".to_owned()
-    })?;
-    let resolver: std::sync::Arc<
-        dyn crate::signal_transport::RpcEndpointResolver,
-    > = std::sync::Arc::new(supervisor);
-    let transport = crate::signal_transport::SignalCliTransport::new(
-        resolver,
-        state.db.clone(),
-        crate::signal_transport::SignalCliTransport::read_self_number_from_env(),
-        Some(binding.foreign_id.clone()),
-    );
-    use execlaw_core::tool::TransportApi;
+    // Step 6: dispatch via the registry-resolved transport.
     transport
-        .send(
-            crate::signal_transport::SIGNAL_CHANNEL,
-            &binding.foreign_id,
-            &model_text,
-        )
+        .send(&channel, &recipient, &model_text)
         .await
         .map_err(|e| format!("transport send: {e}"))?;
     tracing::info!(
         target: "chats::dispatch_external_turn",
         conversation_id = %cid.as_str(),
-        recipient = %binding.foreign_id,
+        channel = %channel,
+        recipient = %recipient,
         text_len = model_text.len(),
-        "auto-bridged agent text reply via Signal",
+        "auto-bridged agent text reply via originating transport",
     );
     Ok(())
+}
+
+/// Channel-keyed list of "send" tool names. When the agent calls
+/// one of these in a turn, the auto-bridge skips itself so the
+/// contact doesn't get the same content twice. Future transport
+/// plugins extend this map (today only signal ships host-side
+/// send tools); the bridge is forward-compatible because an
+/// unknown channel falls through to "no overlap, dispatch."
+fn is_send_tool_for_channel(channel: &str, tool_name: &str) -> bool {
+    match channel {
+        "signal" => matches!(tool_name, "signal.reply" | "signal.send_message"),
+        // Future: "whatsapp" => matches!(tool_name, "whatsapp.send_message"),
+        // etc. Lives here (not on the registry) because the registry's
+        // job is "give me a TransportApi"; this map is the inverse —
+        // "did the agent already use a tool that sends via this
+        // transport." Two different concerns; keeping them apart
+        // avoids forcing every transport to ship a name list it
+        // doesn't actually need.
+        _ => false,
+    }
 }
 
 /// Sender-id sentinel marking a UserMsg event the server-side

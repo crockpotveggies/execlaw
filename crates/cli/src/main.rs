@@ -1545,6 +1545,25 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     let research_workspace = execlaw_server::research::ResearchWorkspace::new(
         execlaw_server::research::ResearchWorkspace::default_root(),
     );
+    // Channel-keyed transport registry. Each plugin that needs
+    // host-side dispatch (signal-cli, future bridges) registers a
+    // factory here. Built once and shared with both AppState and
+    // ResearchSupervisor so the research runner can fan completed
+    // PDFs out without naming Signal.
+    let host_transports = {
+        let mut reg = execlaw_server::transport_registry::HostTransportRegistry::new();
+        if let Some(sup) = sidecar_supervisor.clone() {
+            let resolver: std::sync::Arc<
+                dyn execlaw_server::signal_transport::RpcEndpointResolver,
+            > = std::sync::Arc::new(sup);
+            reg.register(std::sync::Arc::new(
+                execlaw_server::signal_transport::SignalCliTransportFactory::new(resolver),
+            ));
+        }
+        tracing::info!(channels = reg.len(), "host-transport registry populated");
+        reg
+    };
+
     let research_supervisor = execlaw_server::research::ResearchSupervisor::new(
         db.clone(),
         inference.clone(),
@@ -1552,12 +1571,7 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         config.model_id.clone(),
         events.clone(),
     )
-    // Wire the sidecar supervisor so a research job that completes
-    // on a transport-bridged conversation auto-ships the PDF report
-    // back through the originating transport (Signal today).
-    // `None` skips the bridge — web-only conversations stay
-    // unaffected.
-    .with_sidecar_supervisor(sidecar_supervisor.clone());
+    .with_host_transports(Some(host_transports.clone()));
 
     // Phase C (2026-05-03) — auto-capture worker. The summarizer
     // talks to `BackendPurpose::Small` so the standard turn isn't
@@ -1593,7 +1607,8 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         webauthn,
         mcp_host,
         backend_supervisor,
-        sidecar_supervisor,
+        sidecar_supervisor: sidecar_supervisor.clone(),
+        host_transports,
         voice_sessions,
         voice_runtime,
         turn_cancel: execlaw_server::turn_cancel::TurnCancellationRegistry::new(),

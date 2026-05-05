@@ -86,11 +86,10 @@ pub struct JobRunCtx {
     /// checkpoint (between sub-queries / between HTTP calls /
     /// before the subagent call).
     pub cancel: CancellationToken,
-    /// Optional sidecar-supervisor handle so the synthesize phase
-    /// can ship the completed report PDF back through the
-    /// originating transport (Signal today). `None` skips the
-    /// transport-bridge step.
-    pub sidecar_supervisor: Option<crate::sidecar_supervisor::SidecarSupervisor>,
+    /// Host-transport registry. Threaded into PhaseDeps so the
+    /// synthesize phase can fan the report PDF out through every
+    /// registered transport bound to the conversation.
+    pub host_transports: Option<crate::transport_registry::HostTransportRegistry>,
 }
 
 /// System prompt for the planner LLM call. Asks for a strict JSON
@@ -149,7 +148,7 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
         inference,
         events,
         cancel,
-        sidecar_supervisor,
+        host_transports,
     } = ctx;
 
     // Earliest pre-flight cancel check. The supervisor spawns this
@@ -440,7 +439,7 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
         inference: client.clone(),
         model: model.clone(),
         cancel: cancel.clone(),
-        sidecar_supervisor: sidecar_supervisor.clone(),
+        host_transports: host_transports.clone(),
     };
     let notes = run_gather_phase(
         &phase_deps,
@@ -488,11 +487,12 @@ pub struct PhaseDeps {
     /// the caller has no real token to provide (advance endpoint
     /// for synthesize-only paths, tests, etc.).
     pub cancel: CancellationToken,
-    /// Optional sidecar supervisor handle for the
-    /// research-complete → originating-transport bridge (signal-
-    /// cli today). `None` skips the bridge step; the SPA-only
-    /// download chip stays the deliverable.
-    pub sidecar_supervisor: Option<crate::sidecar_supervisor::SidecarSupervisor>,
+    /// Host-transport registry used by the synthesize-phase tail
+    /// to bridge the report PDF back through any registered
+    /// transport bound to the conversation. Channel-agnostic —
+    /// adds a new transport plugin by registering its factory at
+    /// boot, no edits here. `None` skips the bridge step.
+    pub host_transports: Option<crate::transport_registry::HostTransportRegistry>,
 }
 
 /// Run the gather phase end-to-end: mark_gathering → run_gather →
@@ -522,7 +522,7 @@ pub async fn run_gather_phase(
         inference: client,
         model,
         cancel,
-        sidecar_supervisor: _,
+        host_transports: _,
     } = deps;
     // 2026-05-04 — resolve the active provider from
     // config_search_providers instead of hard-coding DDG. The
@@ -626,7 +626,7 @@ pub async fn run_synthesize_phase(
         inference: client,
         model,
         cancel,
-        sidecar_supervisor,
+        host_transports,
     } = deps;
     // Pre-flight cancel check. If the operator cancelled during
     // gather (or between phases), the row is already Cancelled —
@@ -761,22 +761,15 @@ pub async fn run_synthesize_phase(
     )?;
 
     // Transport bridge: when the research turn was triggered on a
-    // bridged conversation (Signal today; future plugins follow the
-    // same path), ship the report PDF + a one-line summary back
-    // through the originating transport. Without this the operator
-    // who kicked off research from their phone gets no follow-up —
-    // they'd have to open the web UI to download the PDF, defeating
-    // the point of being on Signal.
-    //
-    // Best-effort: a bridge failure logs a warning but doesn't
-    // mark the job failed (the PDF is still in the workspace + the
-    // SPA's download chip works). Lookup runs against the live
-    // `state_transport_bindings` table; no binding → silent skip
-    // (web-only conversations are the common case).
-    if let Some(supervisor) = sidecar_supervisor.as_ref() {
+    // bridged conversation, fan the report PDF + a one-line summary
+    // back through whatever transport the registry has a factory
+    // for. Channel-agnostic — the bridge no longer names Signal.
+    // Best-effort: a failure logs but doesn't mark the job failed
+    // (the SPA's download chip stays as a fallback).
+    if let Some(registry) = host_transports.as_ref() {
         bridge_research_pdf_to_originating_transport(
             db,
-            supervisor,
+            registry,
             conv_id,
             outcome.attachment_id.as_str(),
             query,
@@ -808,26 +801,17 @@ pub async fn run_synthesize_phase(
 
 /// Best-effort dispatch of the completed research-report PDF + a
 /// one-line summary back through the conversation's originating
-/// transport. Wired into the synthesize-phase tail so a research
-/// job kicked off from a Signal-bridged turn delivers the PDF
-/// directly to the contact's Signal thread instead of stranding
-/// them on a web-only download chip they can't see.
+/// transport. Channel-agnostic — walks the registry for any
+/// transport that has a factory for one of the conversation's
+/// bindings.
 ///
-/// Resolution chain:
-///   * conversation_id → principal_group_id (state_conversations).
-///   * principal_group_id → bindings (state_transport_bindings).
-///   * Pick the first signal-channel binding (today's only auto-
-///     bridged transport).
-/// Miss anywhere → silent skip (web-only conversations don't have
-/// a transport binding, that's the common case).
-///
-/// Errors are logged at `warn` and swallowed — the job is already
+/// Errors log at `warn` and are swallowed — the job is already
 /// marked Complete, the PDF is in the workspace, and the SPA's
 /// download chip still works. The bridge is a UX nicety, not a
 /// correctness step.
 async fn bridge_research_pdf_to_originating_transport(
     db: &Database,
-    supervisor: &crate::sidecar_supervisor::SidecarSupervisor,
+    registry: &crate::transport_registry::HostTransportRegistry,
     conversation_id: &execlaw_core::ids::ConversationId,
     attachment_id: &str,
     query: &str,
@@ -854,37 +838,22 @@ async fn bridge_research_pdf_to_originating_transport(
             return;
         }
     };
-    let signal_binding = bindings
-        .iter()
-        .find(|b| b.channel == crate::signal_transport::SIGNAL_CHANNEL);
-    let Some(binding) = signal_binding else {
-        return; // no signal binding; web-only conversation
+    let Some((transport, channel, recipient)) =
+        registry.build_for_first_supported_binding(db, conversation_id, &bindings)
+    else {
+        return; // web-only conversation OR registry has no factory for any binding's channel
     };
 
-    let resolver: std::sync::Arc<
-        dyn crate::signal_transport::RpcEndpointResolver,
-    > = std::sync::Arc::new(supervisor.clone());
-    let transport = crate::signal_transport::SignalCliTransport::new(
-        resolver,
-        db.clone(),
-        crate::signal_transport::SignalCliTransport::read_self_number_from_env(),
-        Some(binding.foreign_id.clone()),
-    )
-    .with_caller_conversation_id(conversation_id.clone());
-
     // Prose framing: a tight one-liner echoing the original query
-    // is enough — the PDF is the actual deliverable. The
-    // signal-cli wrapper accepts text + base64_attachments in the
-    // same /v2/send call so the contact sees the message + file
-    // as a single notification on their phone.
+    // is enough — the PDF is the actual deliverable.
     let summary = format!(
         "Deep-research report ready for: {}",
         truncate_for_error(query, 240)
     );
     match transport
         .send_with_attachments(
-            crate::signal_transport::SIGNAL_CHANNEL,
-            &binding.foreign_id,
+            &channel,
+            &recipient,
             &summary,
             &[attachment_id.to_owned()],
         )
@@ -894,18 +863,20 @@ async fn bridge_research_pdf_to_originating_transport(
             tracing::info!(
                 target: "research::bridge",
                 conversation_id = %conversation_id.as_str(),
-                recipient = %binding.foreign_id,
+                channel = %channel,
+                recipient = %recipient,
                 attachment_id = %attachment_id,
-                "auto-dispatched research PDF via Signal",
+                "auto-dispatched research PDF via originating transport",
             );
         }
         Err(e) => {
             tracing::warn!(
                 target: "research::bridge",
                 conversation_id = %conversation_id.as_str(),
-                recipient = %binding.foreign_id,
+                channel = %channel,
+                recipient = %recipient,
                 error = %e,
-                "research PDF Signal dispatch failed; SPA download chip remains the only deliverable",
+                "research PDF transport dispatch failed; SPA download chip remains the only deliverable",
             );
         }
     }
@@ -1606,7 +1577,7 @@ mod tests {
             inference: Arc::new(InferenceClient::new("http://127.0.0.1:0/v1")),
             model: "test-model".into(),
             cancel,
-            sidecar_supervisor: None,
+            host_transports: None,
         };
 
         // Must return Ok(()) cleanly without making the LLM call,
@@ -1757,7 +1728,7 @@ mod tests {
             inference: Arc::new(InferenceClient::new(format!("http://{addr}/v1"))),
             model: "test-model".into(),
             cancel,
-            sidecar_supervisor: None,
+            host_transports: None,
         };
 
         let notes = vec![ResearchNote {
@@ -1984,7 +1955,7 @@ mod tests {
             )),
             events: EventBus::new(),
             cancel,
-            sidecar_supervisor: None,
+            host_transports: None,
         };
 
         let row = run_job(ctx).await.expect("must short-circuit cleanly");

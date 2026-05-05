@@ -42,6 +42,7 @@ pub mod personality;
 pub mod plugins;
 pub mod principal_admit;
 pub mod research;
+pub mod transport_registry;
 pub mod research_admin;
 pub mod routes;
 pub mod routine_runner;
