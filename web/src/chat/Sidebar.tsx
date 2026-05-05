@@ -307,25 +307,14 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                             lineHeight: 1,
                             display: "inline-flex",
                             alignItems: "center",
+                            // 20% smaller than the surrounding section
+                            // header text — small enough to stay
+                            // visually subordinate to the "Threads"
+                            // label without losing tap-target.
+                            fontSize: "0.8em",
                         }}
                     >
-                        <i className="bi bi-funnel" aria-hidden />
-                        {hideExternal && (
-                            <span
-                                className="ms-1 execlaw-pill"
-                                data-testid="sidebar-threads-filters-active"
-                                style={{
-                                    background: "var(--bs-primary, #0d6efd)",
-                                    color: "white",
-                                    borderRadius: "10px",
-                                    padding: "0 0.4em",
-                                    fontSize: "0.7em",
-                                }}
-                                aria-label="Filters active"
-                            >
-                                ·
-                            </span>
-                        )}
+                        <i className="bi bi-sliders" aria-hidden />
                     </button>
                     {filtersOpen && (
                         <div
@@ -367,13 +356,6 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                                     </span>
                                 )}
                             </label>
-                            <div
-                                className="execlaw-muted"
-                                style={{ fontSize: "0.7rem", marginTop: "0.25rem" }}
-                            >
-                                Hides threads bridged through Signal, email,
-                                etc. Pinned threads always stay visible.
-                            </div>
                         </div>
                     )}
                 </div>
