@@ -233,6 +233,68 @@ describe("Sidebar", () => {
         localStorage.setItem("execlaw.access_token", "tok");
         localStorage.setItem("execlaw.refresh_token", "rtok");
         const calls: Array<{ url: string; method?: string; body?: unknown }> = [];
+        // 2026-05-04 — Sidebar fetches /api/chats on mount (so a
+        // refresh on a non-chat route still populates the thread
+        // list). The mock now flips between pre-pin and post-pin
+        // shapes based on whether the PATCH has fired yet — earlier
+        // versions of this test relied on the seeded `setThreads`
+        // sticking around through render, but Sidebar's mount fetch
+        // overwrites that seed.
+        let pinPatchFired = false;
+        const PRE_PIN_THREADS = [
+            // Pre-pin: recent first by last_seq; target second.
+            {
+                conversation_id: "conv-recent",
+                kind: "ControllerDM",
+                phase: "idle",
+                trust_class: "Controller",
+                modality: "Text",
+                display_name: "Recent",
+                is_pinned: false,
+                is_ephemeral: false,
+                ephemeral_expires_at: null,
+                last_seq: 99,
+            },
+            {
+                conversation_id: "conv-unpinned",
+                kind: "ControllerDM",
+                phase: "idle",
+                trust_class: "Controller",
+                modality: "Text",
+                display_name: "Trip plan",
+                is_pinned: false,
+                is_ephemeral: false,
+                ephemeral_expires_at: null,
+                last_seq: 6,
+            },
+        ];
+        const POST_PIN_THREADS = [
+            // After pin: server returns pinned-first.
+            {
+                conversation_id: "conv-unpinned",
+                kind: "ControllerDM",
+                phase: "idle",
+                trust_class: "Controller",
+                modality: "Text",
+                display_name: "Trip plan",
+                is_pinned: true,
+                is_ephemeral: false,
+                ephemeral_expires_at: null,
+                last_seq: 6,
+            },
+            {
+                conversation_id: "conv-recent",
+                kind: "ControllerDM",
+                phase: "idle",
+                trust_class: "Controller",
+                modality: "Text",
+                display_name: "Recent",
+                is_pinned: false,
+                is_ephemeral: false,
+                ephemeral_expires_at: null,
+                last_seq: 99,
+            },
+        ];
         const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
             calls.push({
                 url,
@@ -259,6 +321,7 @@ describe("Sidebar", () => {
                 url === "/api/chats/conv-unpinned" &&
                 init?.method === "PATCH"
             ) {
+                pinPatchFired = true;
                 return new Response(
                     JSON.stringify({
                         conversation_id: "conv-unpinned",
@@ -273,33 +336,9 @@ describe("Sidebar", () => {
             if (url === "/api/chats") {
                 return new Response(
                     JSON.stringify({
-                        threads: [
-                            // After pin: server returns pinned-first.
-                            {
-                                conversation_id: "conv-unpinned",
-                                kind: "ControllerDM",
-                                phase: "idle",
-                                trust_class: "Controller",
-                                modality: "Text",
-                                display_name: "Trip plan",
-                                is_pinned: true,
-                                is_ephemeral: false,
-                                ephemeral_expires_at: null,
-                                last_seq: 6,
-                            },
-                            {
-                                conversation_id: "conv-recent",
-                                kind: "ControllerDM",
-                                phase: "idle",
-                                trust_class: "Controller",
-                                modality: "Text",
-                                display_name: "Recent",
-                                is_pinned: false,
-                                is_ephemeral: false,
-                                ephemeral_expires_at: null,
-                                last_seq: 99,
-                            },
-                        ],
+                        threads: pinPatchFired
+                            ? POST_PIN_THREADS
+                            : PRE_PIN_THREADS,
                     }),
                     { status: 200 },
                 );
@@ -308,34 +347,24 @@ describe("Sidebar", () => {
         });
         vi.stubGlobal("fetch", fetchMock);
 
-        // Seed the store with pre-pin order: recent first, target second.
-        setThreads([
-            {
-                conversation_id: "conv-recent",
-                kind: "ControllerDM",
-                phase: "idle",
-                trust_class: "Controller",
-                modality: "Text",
-                display_name: "Recent",
-                is_pinned: false,
-                is_ephemeral: false,
-                ephemeral_expires_at: null,
-                last_seq: 99,
-            },
-            {
-                conversation_id: "conv-unpinned",
-                kind: "ControllerDM",
-                phase: "idle",
-                trust_class: "Controller",
-                modality: "Text",
-                display_name: "Trip plan",
-                is_pinned: false,
-                is_ephemeral: false,
-                ephemeral_expires_at: null,
-                last_seq: 6,
-            },
-        ]);
+        // Seed the store with pre-pin order so the first render
+        // already shows the right shape; the Sidebar's mount fetch
+        // will arrive shortly after with the same data.
+        setThreads(PRE_PIN_THREADS);
         rerender(<Sidebar onNewThread={() => {}} />);
+
+        // Wait for the mount-time GET /api/chats to settle so the
+        // post-mount Sidebar reflects PRE_PIN_THREADS deterministically
+        // before we click.
+        await waitFor(() => {
+            expect(
+                calls.some(
+                    (c) =>
+                        c.url === "/api/chats" &&
+                        (c.method ?? "GET") === "GET",
+                ),
+            ).toBe(true);
+        });
 
         // Pre-click: target sits in second position.
         let rows = screen.getAllByTestId("sidebar-thread");
@@ -366,9 +395,13 @@ describe("Sidebar", () => {
             expect(patchCall?.body).toEqual({ is_pinned: true });
         });
         await waitFor(() => {
-            expect(
-                calls.some((c) => c.url === "/api/chats" && (c.method ?? "GET") === "GET"),
-            ).toBe(true);
+            // Two GET /api/chats: one from Sidebar's mount-time fetch,
+            // one from the post-PATCH refresh that pin-on-click
+            // triggers. The second is what reorders the rows.
+            const getCalls = calls.filter(
+                (c) => c.url === "/api/chats" && (c.method ?? "GET") === "GET",
+            );
+            expect(getCalls.length).toBeGreaterThanOrEqual(2);
         });
         // After the refresh, the row order reflects the server's
         // is_pinned-DESC, last_seq-DESC ordering: pinned first, even

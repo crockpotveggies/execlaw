@@ -12,11 +12,19 @@ import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import {
     deleteThread,
+    getAlertCount,
+    listPendingApprovals,
     listThreads,
     patchThread,
     type UiPanelSummary,
 } from "../api/endpoints";
-import { setActiveThread, setThreads, useChatState } from "./store";
+import {
+    setActiveThread,
+    setAlertFiringCount,
+    setPendingApprovals,
+    setThreads,
+    useChatState,
+} from "./store";
 import { ThreadRowMenu } from "./ThreadRowMenu";
 
 const CONTROLLER_THREAD_PREFIX = "controller-thread:";
@@ -66,12 +74,71 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
         (s) => Object.keys(s.pendingApprovals).length,
     );
     // Firing-alert badge — operational anomalies surfaced through
-    // §10's alert pipeline. Polled by Chat.tsx every 60s and
-    // refreshed on focus.
+    // §10's alert pipeline. Loaded + polled by the Sidebar mount
+    // effect below so the badge tracks alerts on every route, not
+    // just /chat.
     const alertFiringCount = useChatState((s) => s.alertFiringCount);
 
     const [hideExternal, setHideExternal] = useState(false);
     const [moreExpanded, setMoreExpanded] = useState(false);
+
+    // 2026-05-04 — Sidebar owns the load of every piece of state it
+    // renders: thread list, pending-approval count, firing-alert
+    // count. Used to live in Chat.tsx, which meant a refresh on a
+    // non-chat route (/settings, /routines, /research, /skills) left
+    // the sidebar's thread list permanently empty. Hoisting the
+    // fetch here covers every route that mounts a Sidebar.
+    //
+    // Refetches on each Sidebar mount; navigation between routes
+    // unmounts/remounts each route's Sidebar instance, which gives
+    // the operator a fresh thread list whenever they come back to
+    // any chrome that includes the sidebar. The three calls fire in
+    // parallel — total wall-clock is one round-trip.
+    useEffect(() => {
+        if (auth.status !== "authenticated") return;
+        let cancelled = false;
+        (async () => {
+            try {
+                const [threadsResp, approvalsResp, alertCount] =
+                    await Promise.all([
+                        listThreads(getToken),
+                        listPendingApprovals(getToken),
+                        getAlertCount(getToken).catch(() => ({
+                            firing_count: 0,
+                        })),
+                    ]);
+                if (cancelled) return;
+                setThreads(threadsResp.threads);
+                setPendingApprovals(approvalsResp.approvals);
+                setAlertFiringCount(alertCount.firing_count);
+            } catch {
+                // Silent — a transient sidebar-load failure shouldn't
+                // pollute the route the operator is actually on.
+                // ConnectionBanner already covers the "server is
+                // unreachable" case.
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [auth.status, getToken]);
+
+    // Cheap firing-count poll every 60s so the badge tracks alerts
+    // that arrive while the operator is sitting on any sidebar-
+    // bearing route. Switch to WS-pushed alert events once the alert
+    // bus lands (§10.8).
+    useEffect(() => {
+        if (auth.status !== "authenticated") return;
+        const id = window.setInterval(async () => {
+            try {
+                const r = await getAlertCount(getToken);
+                setAlertFiringCount(r.firing_count);
+            } catch {
+                // Silent — transient failures shouldn't pollute the UI.
+            }
+        }, 60_000);
+        return () => window.clearInterval(id);
+    }, [auth.status, getToken]);
 
     const visibleThreads = threads.filter((t) => {
         // Always show pinned (Control thread).

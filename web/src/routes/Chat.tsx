@@ -18,7 +18,6 @@ import {
     getAlertCount,
     listCards,
     listMessages,
-    listPendingApprovals,
     listThreads,
     listUiPanels,
     patchThread,
@@ -62,7 +61,6 @@ import {
     setActiveThread,
     setAlertFiringCount,
     setMessages,
-    setPendingApprovals,
     setThreadProcessing,
     setThreads,
     setToolActivity,
@@ -165,58 +163,31 @@ export function Chat() {
     // Stable accessor used by everything that needs the live access token.
     const getToken = auth.getAccessToken;
 
-    // Initial + live thread list + pending approvals + plugin UI panels
-    // + firing-alert count for the sidebar badge.
+    // Plugin-declared UI panels for the Sidebar's "More" section.
+    // Loaded here (rather than inside Sidebar) because the panel set
+    // also drives the Composer's slash-command palette below; both
+    // surfaces share the prop. Threads / pending approvals / firing-
+    // alert count moved into Sidebar itself so a refresh on a non-
+    // chat route still populates them (was: only loaded on /chat).
     useEffect(() => {
         if (auth.status !== "authenticated") return;
         let cancelled = false;
         (async () => {
             try {
-                const [threadsResp, approvalsResp, panelsResp, alertCount] =
-                    await Promise.all([
-                        listThreads(getToken),
-                        listPendingApprovals(getToken),
-                        listUiPanels(getToken),
-                        getAlertCount(getToken).catch(() => ({
-                            firing_count: 0,
-                        })),
-                    ]);
-                if (!cancelled) {
-                    setThreads(threadsResp.threads);
-                    setPendingApprovals(approvalsResp.approvals);
-                    setUiPanels(panelsResp.panels);
-                    setAlertFiringCount(alertCount.firing_count);
-                }
+                const panelsResp = await listUiPanels(getToken);
+                if (!cancelled) setUiPanels(panelsResp.panels);
             } catch (e) {
                 if (!cancelled)
                     setTopError(
                         e instanceof Error
                             ? e.message
-                            : "couldn't load threads",
+                            : "couldn't load plugin panels",
                     );
             }
         })();
         return () => {
             cancelled = true;
         };
-    }, [auth.status, getToken]);
-
-    // Cheap firing-count poll every 60s so the badge tracks alerts
-    // that arrive while the user is sitting on the chat shell. The
-    // dedicated AlertsPage refreshes its own list when opened; this
-    // poll is just for the sidebar indicator. Switch to WS-pushed
-    // alert events once the alert bus lands (§10.8).
-    useEffect(() => {
-        if (auth.status !== "authenticated") return;
-        const id = window.setInterval(async () => {
-            try {
-                const r = await getAlertCount(getToken);
-                setAlertFiringCount(r.firing_count);
-            } catch {
-                // Silent — a transient failure shouldn't pollute the UI.
-            }
-        }, 60_000);
-        return () => window.clearInterval(id);
     }, [auth.status, getToken]);
 
     // Lazy load messages on active-thread change.
