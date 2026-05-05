@@ -149,6 +149,29 @@ pub struct RegisteredSidecar {
     pub rpc_port: u16,
     /// HTTP path on the RPC port the supervisor probes for liveness.
     pub rpc_health_path: String,
+    /// Environment variables to set in the spawned container, copied
+    /// from the manifest's `[[services]].env`. Plumbed through to
+    /// `ServiceSpec.env` at spawn time. Sidecars that need
+    /// configuration (e.g. signal-cli's `MODE=json-rpc`) declare
+    /// these so the operator doesn't have to.
+    pub env: Vec<(String, String)>,
+    /// Bind mounts copied from the manifest's `[[services]].mounts`.
+    /// Resolved against the plugin's stage directory and the
+    /// per-sidecar managed state directory at supervisor spawn
+    /// time — kept in raw `MountDecl` form here so the host paths
+    /// can be computed against the right roots without leaking
+    /// stage-path knowledge into the registry.
+    pub mounts: Vec<execlaw_plugin_sdk::manifest::MountDecl>,
+    /// Override for the container image's `ENTRYPOINT`. None means
+    /// "use the image's built-in entrypoint." Used by sidecars that
+    /// wrap the upstream entrypoint for in-container patching
+    /// (e.g. signal-cli's `enable-read-receipts.sh` wrapper).
+    pub entrypoint: Option<Vec<String>>,
+    /// Absolute path to the plugin's extracted stage directory at
+    /// the time of registration. Used to resolve `stage://` mount
+    /// sources to host paths the supervisor can pass to dockerd.
+    /// `None` for tests that register sidecars without a stage.
+    pub stage_path: Option<std::path::PathBuf>,
 }
 
 /// One `[[oauth_accounts]]` declaration cached in the registry so
@@ -410,6 +433,14 @@ impl HookRegistry {
                         image: s.image.clone(),
                         rpc_port: b.rpc_port,
                         rpc_health_path: b.rpc_health_path.clone(),
+                        env: s
+                            .env
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        mounts: s.mounts.clone(),
+                        entrypoint: s.entrypoint.clone(),
+                        stage_path: stage_path.map(|p| p.to_path_buf()),
                     },
                 );
             }

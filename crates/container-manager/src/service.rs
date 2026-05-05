@@ -34,8 +34,15 @@ pub struct ServiceSpec {
     /// Full image reference, e.g. `vllm/vllm-openai:v0.6.2`.
     pub image: String,
     /// Arguments passed as the container's `Cmd`. The image's
-    /// `ENTRYPOINT` is reused.
+    /// `ENTRYPOINT` is reused unless [`Self::entrypoint`] overrides
+    /// it.
     pub args: Vec<String>,
+    /// Override for the container image's `ENTRYPOINT`. When `None`,
+    /// the image's built-in entrypoint runs unchanged. Sidecars that
+    /// need to wrap the upstream entrypoint (e.g. patching a
+    /// supervisord config before exec'ing the original) set this to
+    /// the wrapper's argv (typically `["/bin/sh", "/wrapper.sh"]`).
+    pub entrypoint: Option<Vec<String>>,
     /// Environment variables as `(name, value)` pairs.
     pub env: Vec<(String, String)>,
     /// Operator-supplied GPU id; `None` runs CPU-only. The
@@ -479,6 +486,7 @@ impl ServiceController for BollardServiceController {
         let cfg = Config {
             image: Some(spec.image.clone()),
             cmd: Some(spec.args.clone()),
+            entrypoint: spec.entrypoint.clone(),
             env: Some(env),
             exposed_ports: Some(exposed),
             host_config: Some(host_config),
@@ -835,6 +843,7 @@ mod tests {
             name: "execlaw-backend-Standard".into(),
             image: "vllm/vllm-openai:v0.6.2".into(),
             args: vec!["--model".into(), "Qwen3.5-27B-AWQ".into()],
+            entrypoint: None,
             env: vec![("HF_HOME".into(), "/cache".into())],
             gpu_id: Some("0".into()),
             gpu_vendor: Some(GpuVendor::Nvidia),

@@ -198,6 +198,21 @@ pub struct ServiceDecl {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub ports: Vec<String>,
+    /// Bind mounts the supervisor wires into the spawned container.
+    /// Each entry resolves through [`MountDecl::source`] semantics —
+    /// stage-relative for shipped scripts, plugin-state for
+    /// persistent volumes, or absolute host paths for operator
+    /// overrides. Empty by default; sidecars that need persistent
+    /// state (e.g. signal-cli's account keystore) or shipped
+    /// scripts (e.g. an entrypoint wrapper) declare them here.
+    #[serde(default)]
+    pub mounts: Vec<MountDecl>,
+    /// Override the container image's `ENTRYPOINT`. When `None` (the
+    /// default), the image's built-in entrypoint runs. Sidecars that
+    /// need to wrap the upstream entrypoint (e.g. patching
+    /// supervisord configs before exec'ing the original) set this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<Vec<String>>,
     /// When present, this service is a **supervised sidecar** — a
     /// companion container the sidecar supervisor takes
     /// responsibility for: spawn, healthcheck, restart, alert on
@@ -217,6 +232,32 @@ pub struct ServiceDecl {
     /// them but the supervisor leaves them alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar: Option<SidecarMeta>,
+}
+
+/// One bind mount declared by a sidecar. Source paths come in three
+/// flavors so plugin authors don't need to hardcode absolute host
+/// paths the operator's machine doesn't necessarily share:
+///
+///   * `stage://relative/path` — resolves against the plugin's
+///     extracted stage directory. Used to mount shipped scripts,
+///     config files, or other read-only resources baked into the
+///     plugin zip. Defaults to read-only.
+///   * `state://name` — resolves to a managed per-sidecar host
+///     directory (`<execlaw>/sidecars/<plugin_id>/<sidecar_name>/<name>/`)
+///     that the supervisor creates on first spawn and persists
+///     across restarts. Used for stateful sidecar data (signal-cli
+///     account keystore, etc.). Read-write.
+///   * absolute `/path` — host-absolute. Operator-controlled,
+///     e.g. mounting a shared dataset into an OCR worker. Direct
+///     pass-through.
+///
+/// The `target` is always the absolute container-side path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MountDecl {
+    pub source: String,
+    pub target: String,
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// Sidecar-specific metadata on a `ServiceDecl`. Combined with the
@@ -990,7 +1031,7 @@ mod tests {
         let m = PluginManifest::parse(SIGNAL_MANIFEST)
             .expect("plugins/signal/plugin.toml must parse cleanly");
         assert_eq!(m.plugin.id, "signal");
-        assert_eq!(m.plugin.version, "0.2.0");
+        assert_eq!(m.plugin.version, "0.3.0");
         // Six tools mirror the selfhosted-claw integration. If we
         // add or remove one, this assertion forces a deliberate
         // update — the audit doc should stay in sync.

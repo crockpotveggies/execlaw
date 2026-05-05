@@ -1,7 +1,7 @@
 [plugin]
 id = "signal"
 name = "Signal"
-version = "0.2.0"
+version = "0.3.0"
 description = "Signal Messenger transport — send/reply/group operations via a host-managed signal-cli sidecar container."
 author = "execlaw"
 license = "AGPL-3.0-or-later"
@@ -12,18 +12,54 @@ license = "AGPL-3.0-or-later"
 # allocates a port in the 8501..=8600 pool and publishes
 # `127.0.0.1:<host_port>/v1/about` as the healthcheck URL.
 #
-# We use the bbernhard/signal-cli-rest-api image because it wraps
-# signal-cli's interactive CLI in an HTTP REST surface and is the de
-# facto community-maintained option for headless deployments. The
-# `/home/.local/share/signal-cli` directory inside the container holds
-# the registered account's keys + recent message store; for
-# Phase-3 dev this lives on a docker named volume managed by the
-# operator. Phase 4+ will read the encrypted account tarball from the
-# vault (`secret://signal/account.tar.gz`) on spawn.
+# 2026-05-05 (v0.3.0):
+#   * Pinned to `:latest` (BUILD_VERSION 0.98). The `:0.92` tag ships
+#     signal-cli 0.13.13, whose link command can no longer reach
+#     Signal's current bootstrap servers ("Link request error:
+#     Connection closed!"). The newer image bundles a compatible
+#     signal-cli build.
+#   * `MODE=json-rpc` is the only mode that produces a real QR PNG
+#     for `/v1/qrcodelink`; default `normal` mode returns a JSON 400
+#     ("Couldn't create QR code: no data to encode") which the SPA
+#     renders as a blank white square.
+#   * `JSON_RPC_TRUST_NEW_IDENTITIES=on-first-use` matches Signal
+#     Desktop's TOFU default for new contacts; required for the
+#     daemon to start cleanly.
+#   * `state://data` mounts a per-sidecar host directory for the
+#     account keystore so pairing survives container restarts. The
+#     supervisor materialises this under
+#     `~/.execlaw/sidecars/signal/signal-cli/data/`.
+#   * `stage://enable-read-receipts.sh` mounts a shipped wrapper
+#     script that patches supervisord's signal-cli daemon line to
+#     add `--send-read-receipts` after bbernhard's jsonrpc2-helper
+#     generates the config. Without this, signal-cli silently drops
+#     read receipts even though the bbernhard /v1/configuration
+#     endpoint claims they're on.
+#   * `entrypoint` overrides bbernhard's image entrypoint with the
+#     wrapper, which `exec`s the original entrypoint in the
+#     background then runs the read-receipts reconciler.
+#
+# Phase 4+ will source the account keystore from the encrypted
+# vault (`secret://signal/account.tar.gz`) instead of the bind mount.
 [[services]]
 name = "signal-cli"
-image = "bbernhard/signal-cli-rest-api:0.92"
+image = "bbernhard/signal-cli-rest-api:latest"
 ports = []
+entrypoint = ["/bin/sh", "/enable-read-receipts.sh"]
+
+[services.env]
+MODE = "json-rpc"
+JSON_RPC_TRUST_NEW_IDENTITIES = "on-first-use"
+
+[[services.mounts]]
+source = "state://data"
+target = "/home/.local/share/signal-cli"
+read_only = false
+
+[[services.mounts]]
+source = "stage://enable-read-receipts.sh"
+target = "/enable-read-receipts.sh"
+read_only = true
 
 [services.sidecar]
 rpc_port = 8080

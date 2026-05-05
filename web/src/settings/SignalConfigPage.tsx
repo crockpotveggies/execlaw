@@ -23,7 +23,7 @@
 // "starting" sidecar surfaces here instead of leaving the operator
 // confused why the QR endpoint 503s.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Button from "react-bootstrap/Button";
 import {
     getSignalStatus,
@@ -173,12 +173,65 @@ function PairingBlock({
 }): JSX.Element {
     const auth = useAuth();
     const [generation, setGeneration] = useState(0);
-    const sawScanRef = useRef(false);
+    const [qrBlobUrl, setQrBlobUrl] = useState<string | null>(null);
+    const [qrError, setQrError] = useState<string | null>(null);
+    const [qrLoading, setQrLoading] = useState(false);
+
+    // Fetch the QR via fetch() rather than letting <img src> load
+    // it directly: the upstream sidecar can return a non-2xx JSON
+    // error (e.g. signal-cli failed to reach Signal's bootstrap
+    // service because of a TLS-intercepting proxy on the host
+    // network), and a bare <img> swallows that as a broken image,
+    // surfacing as a confusing white square. Going through fetch
+    // lets us show the actual error.
+    useEffect(() => {
+        if (!sidecarRunning) return;
+        let cancelled = false;
+        let createdBlobUrl: string | null = null;
+        setQrLoading(true);
+        setQrError(null);
+        const tok = auth.getAccessToken();
+        const url = `${signalQrCodeLinkUrl(tok, "execlaw")}&_g=${generation}`;
+        void fetch(url)
+            .then(async (resp) => {
+                if (cancelled) return;
+                if (!resp.ok) {
+                    const text = await resp.text();
+                    let message = text;
+                    try {
+                        const j = JSON.parse(text) as { message?: string };
+                        if (j.message) message = j.message;
+                    } catch {
+                        // not JSON — keep raw text
+                    }
+                    setQrError(message || `HTTP ${resp.status}`);
+                    setQrBlobUrl(null);
+                    return;
+                }
+                const blob = await resp.blob();
+                if (cancelled) return;
+                createdBlobUrl = URL.createObjectURL(blob);
+                setQrBlobUrl(createdBlobUrl);
+                setQrError(null);
+            })
+            .catch((e) => {
+                if (cancelled) return;
+                setQrError(e instanceof Error ? e.message : String(e));
+                setQrBlobUrl(null);
+            })
+            .finally(() => {
+                if (!cancelled) setQrLoading(false);
+            });
+        return () => {
+            cancelled = true;
+            if (createdBlobUrl) URL.revokeObjectURL(createdBlobUrl);
+        };
+    }, [auth, generation, sidecarRunning]);
+
     // Refresh the QR src by bumping a generation suffix every
     // ~60s — signal-cli's pairing nonce expires after a window
     // and serving a stale image past that point would silently
-    // fail. The token-attached URL means the <img> reloads
-    // through the auth-aware SPA fetch.
+    // fail.
     useEffect(() => {
         const id = window.setInterval(() => {
             setGeneration((n) => n + 1);
@@ -186,11 +239,11 @@ function PairingBlock({
         return () => window.clearInterval(id);
     }, []);
 
-    const tok = auth.getAccessToken();
-    const qrUrl = useMemo(
-        () => `${signalQrCodeLinkUrl(tok, "execlaw")}&_g=${generation}`,
-        [tok, generation],
-    );
+    const looksLikeConnectivityIssue =
+        qrError !== null &&
+        /no data to encode|Connection closed|certificate|resolve host/i.test(
+            qrError,
+        );
 
     return (
         <div className="execlaw-card mb-3" data-testid="signal-pairing-block">
@@ -221,23 +274,77 @@ function PairingBlock({
                     Waiting for the sidecar to come up before generating the
                     QR…
                 </div>
+            ) : qrError !== null ? (
+                <div
+                    className="alert alert-danger small mb-3"
+                    data-testid="signal-pairing-qr-error"
+                >
+                    <div className="fw-semibold mb-1">
+                        Couldn&apos;t generate the device-link QR.
+                    </div>
+                    <div className="mb-2">
+                        Sidecar reported: <code>{qrError}</code>
+                    </div>
+                    {looksLikeConnectivityIssue && (
+                        <div className="mb-2">
+                            This usually means the signal-cli sidecar
+                            can&apos;t reach Signal&apos;s servers. Common
+                            causes:
+                            <ul className="mb-1 ps-3">
+                                <li>
+                                    Antivirus / security software on the host
+                                    is doing HTTPS scanning (signal-cli pins
+                                    Signal&apos;s certs and rejects any
+                                    intercepted TLS).
+                                </li>
+                                <li>
+                                    Corporate VPN, transparent proxy, or DNS
+                                    filter is blocking{" "}
+                                    <code>chat.signal.org</code> /{" "}
+                                    <code>
+                                        textsecure-service.whispersystems.org
+                                    </code>
+                                    .
+                                </li>
+                                <li>
+                                    The network the host is on doesn&apos;t
+                                    allow outbound traffic to Signal.
+                                </li>
+                            </ul>
+                        </div>
+                    )}
+                    <Button
+                        variant="outline-primary"
+                        size="sm"
+                        onClick={() => setGeneration((n) => n + 1)}
+                        data-testid="signal-pairing-retry"
+                    >
+                        Retry
+                    </Button>
+                </div>
             ) : (
                 <div className="d-flex flex-column align-items-center gap-2">
-                    <img
-                        src={qrUrl}
-                        alt="Signal device-link QR code"
-                        width={256}
-                        height={256}
-                        style={{
-                            background: "#fff",
-                            padding: "0.5rem",
-                            borderRadius: "0.5rem",
-                        }}
-                        onLoad={() => {
-                            sawScanRef.current = true;
-                        }}
-                        data-testid="signal-pairing-qr"
-                    />
+                    {qrLoading && qrBlobUrl === null ? (
+                        <div
+                            className="execlaw-muted small py-4"
+                            data-testid="signal-pairing-qr-loading"
+                        >
+                            Generating QR…
+                        </div>
+                    ) : qrBlobUrl !== null ? (
+                        <img
+                            src={qrBlobUrl}
+                            alt="Signal device-link QR code"
+                            width={256}
+                            height={256}
+                            style={{
+                                background: "#fff",
+                                padding: "0.5rem",
+                                borderRadius: "0.5rem",
+                            }}
+                            data-testid="signal-pairing-qr"
+                        />
+                    ) : null}
                     <Button
                         variant="outline-primary"
                         size="sm"

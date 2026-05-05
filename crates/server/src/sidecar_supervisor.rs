@@ -103,6 +103,9 @@ impl SidecarSlot {
             || self.registered.rpc_health_path != latest.rpc_health_path
             || self.registered.name != latest.name
             || self.registered.plugin_id != latest.plugin_id
+            || self.registered.env != latest.env
+            || self.registered.mounts != latest.mounts
+            || self.registered.entrypoint != latest.entrypoint
     }
 }
 
@@ -411,14 +414,30 @@ impl SidecarSupervisor {
                     }
                 },
             };
+            let mounts = match resolve_mounts(sidecar) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(
+                        sidecar = %sidecar.name,
+                        plugin_id = %sidecar.plugin_id,
+                        "sidecar mount resolution failed: {e}",
+                    );
+                    let new_status = ServiceStatus::CrashLooping {
+                        restart_count: MAX_RESTART_ATTEMPTS,
+                    };
+                    self.transition_status(&sidecar.name, slot, new_status);
+                    return;
+                }
+            };
             let spec = ServiceSpec {
                 name: container_name(&sidecar.plugin_id, &sidecar.name),
                 image: sidecar.image.clone(),
                 args: Vec::new(),
-                env: Vec::new(),
+                entrypoint: sidecar.entrypoint.clone(),
+                env: sidecar.env.clone(),
                 gpu_id: None,
                 gpu_vendor: None,
-                mounts: Vec::new(),
+                mounts,
                 host_port: port,
                 container_port: sidecar.rpc_port,
             };
@@ -658,6 +677,76 @@ impl SidecarSupervisor {
 /// `execlaw-…` convention finds sidecars where they expect.
 fn container_name(plugin_id: &str, name: &str) -> String {
     format!("execlaw-sidecar-{plugin_id}-{name}")
+}
+
+/// Translate a sidecar's [`MountDecl`] entries into the
+/// `HostMount` shape the container manager hands to dockerd.
+///
+/// Source schemes:
+///
+///   * `stage://<rel>` — joins `<rel>` against the plugin's stage
+///     directory (the extracted ZIP). Read-only by default since
+///     stage contents are immutable per-version. Errors if the
+///     sidecar wasn't registered with a stage_path.
+///   * `state://<name>` — resolves to
+///     `<execlaw>/sidecars/<plugin>/<sidecar>/<name>/`, creating it
+///     on first spawn so signal-cli's keystore (and similar)
+///     persists across container restarts.
+///   * absolute `/path` (or `C:\path` on Windows) — passed through
+///     to dockerd verbatim. For operator-controlled mounts.
+fn resolve_mounts(
+    sidecar: &execlaw_plugin_host::hook_registry::RegisteredSidecar,
+) -> Result<Vec<execlaw_container_manager::HostMount>, String> {
+    use execlaw_container_manager::HostMount;
+    let mut out = Vec::with_capacity(sidecar.mounts.len());
+    for m in &sidecar.mounts {
+        let (host_path, default_ro) = if let Some(rel) = m.source.strip_prefix("stage://") {
+            let stage = sidecar.stage_path.as_ref().ok_or_else(|| {
+                format!(
+                    "mount '{}' uses stage:// but sidecar was registered without a stage path",
+                    m.source
+                )
+            })?;
+            let p = stage.join(rel);
+            (p, true)
+        } else if let Some(name) = m.source.strip_prefix("state://") {
+            let base = state_dir_for(&sidecar.plugin_id, &sidecar.name);
+            let p = base.join(name);
+            std::fs::create_dir_all(&p)
+                .map_err(|e| format!("create sidecar state dir {}: {e}", p.display()))?;
+            (p, false)
+        } else if std::path::Path::new(&m.source).is_absolute() {
+            (std::path::PathBuf::from(&m.source), false)
+        } else {
+            return Err(format!(
+                "mount source '{}' must use stage://, state://, or be absolute",
+                m.source
+            ));
+        };
+        // Caller's `read_only` always wins; default depends on
+        // scheme so `state://` doesn't accidentally land RO.
+        let read_only = if m.read_only { true } else { default_ro };
+        out.push(HostMount {
+            host_path: host_path.to_string_lossy().into_owned(),
+            container_path: m.target.clone(),
+            read_only,
+        });
+    }
+    Ok(out)
+}
+
+/// Per-(plugin, sidecar) state root. Lives under
+/// `~/.execlaw/sidecars/<plugin>/<sidecar>/` so an operator who
+/// uninstalls + reinstalls keeps their account state intact.
+fn state_dir_for(plugin_id: &str, sidecar_name: &str) -> std::path::PathBuf {
+    use directories::UserDirs;
+    let home = UserDirs::new()
+        .map(|d| d.home_dir().to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join(".execlaw")
+        .join("sidecars")
+        .join(plugin_id)
+        .join(sidecar_name)
 }
 
 #[cfg(test)]

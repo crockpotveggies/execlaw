@@ -2,12 +2,15 @@
 //
 // Covers:
 //   * Loading state until /api/admin/signal/status resolves.
-//   * Not-paired branch renders the QR-code <img> with the
-//     bearer-token query-string fallback in the src attribute.
+//   * Not-paired branch fetches the QR PNG and renders it via a
+//     blob URL once the upstream sidecar returns 200.
+//   * Not-paired branch surfaces the upstream error (e.g. signal-cli
+//     can't reach Signal because of TLS interception) instead of
+//     showing a blank <img>.
 //   * Paired branch renders the registered number + Unlink button
 //     and confirms before firing DELETE.
 //   * Sidecar-not-running state surfaces the "waiting for sidecar"
-//     hint and skips the QR <img>.
+//     hint and skips the QR fetch.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -15,6 +18,13 @@ import { SignalConfigPage } from "../settings/SignalConfigPage";
 import { AuthProvider } from "../auth/AuthContext";
 
 let fetchMock: ReturnType<typeof vi.fn>;
+
+// jsdom doesn't ship URL.createObjectURL — stub it so the
+// component's blob-URL handoff resolves to a stable string we can
+// assert on.
+const blobUrl = "blob:mock://qr";
+const createObjectURL = vi.fn(() => blobUrl);
+const revokeObjectURL = vi.fn();
 
 const meResponse = () =>
     new Response(
@@ -56,14 +66,35 @@ beforeEach(() => {
     localStorage.setItem("execlaw.refresh_token", "tok");
     fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
+    createObjectURL.mockClear();
+    revokeObjectURL.mockClear();
+    // jsdom 24 doesn't define these — stub so the component can
+    // hand the fetched blob to <img src>.
+    (globalThis.URL as unknown as { createObjectURL: typeof createObjectURL }).createObjectURL =
+        createObjectURL;
+    (globalThis.URL as unknown as { revokeObjectURL: typeof revokeObjectURL }).revokeObjectURL =
+        revokeObjectURL;
 });
 
 afterEach(() => {
     vi.unstubAllGlobals();
 });
 
+function pngResponse() {
+    // 1x1 transparent PNG bytes — body content is irrelevant since
+    // we only assert the blob handoff happened.
+    const bytes = new Uint8Array([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    ]);
+    return new Response(bytes, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+    });
+}
+
 describe("SignalConfigPage", () => {
     it("renders the QR pairing block when no accounts are registered", async () => {
+        const qrCalls: string[] = [];
         fetchMock.mockImplementation(async (url: string) => {
             if (url === "/api/admin/me") return meResponse();
             if (url === "/api/admin/signal/status") {
@@ -74,6 +105,10 @@ describe("SignalConfigPage", () => {
                     fetch_error: null,
                 });
             }
+            if (url.startsWith("/api/admin/signal/qrcodelink")) {
+                qrCalls.push(url);
+                return pngResponse();
+            }
             return new Response("{}", { status: 200 });
         });
         mountPage();
@@ -82,14 +117,74 @@ describe("SignalConfigPage", () => {
                 screen.getByTestId("signal-pairing-block"),
             ).toBeInTheDocument();
         });
-        const qr = screen.getByTestId("signal-pairing-qr") as HTMLImageElement;
-        // Bearer-token query-string fallback so the raw <img>
-        // load can authenticate without an Authorization header.
-        expect(qr.src).toContain("/api/admin/signal/qrcodelink");
-        expect(qr.src).toContain("device_name=execlaw");
-        expect(qr.src).toContain("access_token=tok");
+        // QR is fetched (not <img src>) so the auth-bearing query-
+        // string URL still flows through fetch and an upstream
+        // failure can be surfaced as a real error message rather
+        // than a blank image. The fetched URL must still carry the
+        // bearer-token fallback for the access-token-aware proxy.
+        await waitFor(() => {
+            expect(qrCalls.length).toBeGreaterThan(0);
+        });
+        const qrUrl = qrCalls[0];
+        expect(qrUrl).toContain("/api/admin/signal/qrcodelink");
+        expect(qrUrl).toContain("device_name=execlaw");
+        expect(qrUrl).toContain("access_token=tok");
+        // PNG body → <img> renders the blob URL once the fetch
+        // resolves.
+        await waitFor(() => {
+            const qr = screen.getByTestId(
+                "signal-pairing-qr",
+            ) as HTMLImageElement;
+            expect(qr.src).toBe(blobUrl);
+        });
         // Paired block does NOT render in this state.
         expect(screen.queryByTestId("signal-paired-block")).toBeNull();
+    });
+
+    it("surfaces the upstream sidecar error when QR generation fails", async () => {
+        // Real failure mode: bbernhard's signal-cli was returning
+        // `{"error":"Couldn't create QR code: no data to encode"}`
+        // (signal-cli's link command couldn't reach Signal's
+        // bootstrap servers — old image version, network outage,
+        // etc.). Pre-fix, the SPA loaded this 400 response into a
+        // bare <img src> which silently fell back to a blank
+        // placeholder. The fix routes the QR through fetch and
+        // shows the actual error.
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/signal/status") {
+                return statusResponse({
+                    sidecar_status: "healthy",
+                    sidecar_rpc_url: "http://127.0.0.1:8501",
+                    registered_accounts: [],
+                    fetch_error: null,
+                });
+            }
+            if (url.startsWith("/api/admin/signal/qrcodelink")) {
+                return new Response(
+                    JSON.stringify({
+                        code: "sidecar_qr_failed",
+                        message:
+                            "signal-cli /v1/qrcodelink returned HTTP 400: Couldn't create QR code: no data to encode",
+                    }),
+                    {
+                        status: 502,
+                        headers: { "content-type": "application/json" },
+                    },
+                );
+            }
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("signal-pairing-qr-error"),
+            ).toBeInTheDocument();
+        });
+        const errBlock = screen.getByTestId("signal-pairing-qr-error");
+        expect(errBlock.textContent).toContain("no data to encode");
+        // QR <img> doesn't render when the upstream failed.
+        expect(screen.queryByTestId("signal-pairing-qr")).toBeNull();
     });
 
     it("renders the paired block + unlink button when an account is registered", async () => {
