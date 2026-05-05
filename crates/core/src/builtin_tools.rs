@@ -1848,13 +1848,18 @@ impl SendAttachmentTool {
             descriptor: ToolDescriptor {
                 name: "send_attachment".into(),
                 description:
-                    "Deliver a file to the user as an inline download chip in chat. Use this \
-                     to surface a deliverable (e.g. a deep-research PDF) so the user can save \
-                     it directly from the conversation. Pass the `attachment_id` returned by \
-                     the producing tool — for research, that's the `attachment_id` field on a \
-                     completed `research_status` result. Optional `caption` shows above the \
-                     file chip (defaults to the file basename). The chip carries a Download \
-                     button; the user can save the file with one click."
+                    "Deliver a file to the user. Use this whenever the user asks you to send / share / \
+                     resend a file (e.g. a deep-research PDF). The host fans the file out across every \
+                     channel the conversation is reachable on — the user gets it in the web UI as a \
+                     download chip AND on whichever transport the conversation is bridged through \
+                     (Signal, etc.) without you having to pick a channel-specific tool. \
+                     Pass the `attachment_id` returned by the producing tool — for research, that's \
+                     the `attachment_id` field on a completed `research_status` result. Optional \
+                     `caption` shows above the chip and as the message body on transports \
+                     (defaults to the file basename). \
+                     Prefer this over channel-specific send_message tools when your goal is just \
+                     to deliver a file — those are for sending text + attachment together to a \
+                     specific recipient on a specific channel."
                         .into(),
                 schema: json!({
                     "type": "object",

@@ -34,6 +34,17 @@ pub struct ServerAttachmentApi {
     db: Database,
     events: EventBus,
     caller_conversation_id: ConversationId,
+    /// When the caller's conversation is bound to a transport
+    /// (state_transport_bindings hit on the conversation's
+    /// principal_group), `send` ALSO ships the attachment through
+    /// that transport — not just the web-UI download chip. Without
+    /// this fan-out, an agent on a Signal-bridged conversation
+    /// asked to "resend that PDF" emits a card pair the operator
+    /// can only see in the web UI; the contact on Signal sees
+    /// nothing. `None` (no resolver wired) keeps the legacy
+    /// web-only behavior.
+    transport_resolver:
+        Option<std::sync::Arc<dyn crate::signal_transport::RpcEndpointResolver>>,
 }
 
 impl ServerAttachmentApi {
@@ -42,7 +53,19 @@ impl ServerAttachmentApi {
             db,
             events,
             caller_conversation_id,
+            transport_resolver: None,
         }
+    }
+
+    /// Builder-style attach the transport resolver so `send` fans
+    /// out to the originating transport. The dispatcher passes the
+    /// same resolver it already wires for `signal.send_message`.
+    pub fn with_transport_resolver(
+        mut self,
+        resolver: Option<std::sync::Arc<dyn crate::signal_transport::RpcEndpointResolver>>,
+    ) -> Self {
+        self.transport_resolver = resolver;
+        self
     }
 }
 
@@ -133,13 +156,31 @@ impl AttachmentApi for ServerAttachmentApi {
             &CardClosedPayload {
                 card_id,
                 state: CardState::Completed,
-                summary,
+                summary: summary.clone(),
                 details: Some(details),
                 attachment_id: Some(attachment_id.to_owned()),
                 error: None,
             },
         )
         .map_err(|e| ApiError::Storage(format!("emit attachment card close: {e}")))?;
+
+        // Transport fan-out: if the caller's conversation is bound
+        // to a transport (Signal today; future bridges follow), the
+        // file ALSO ships through the transport so the contact on
+        // their phone sees it. Best-effort: a transport-side error
+        // logs but doesn't fail the call — the web-UI chip is
+        // already committed and visible to the operator.
+        //
+        // Caption (when present) becomes the message body; an empty
+        // caption falls back to the filename so the contact sees
+        // something useful next to the file rather than a bare
+        // attachment with no context.
+        self.bridge_to_originating_transport(
+            attachment_id,
+            &filename,
+            title_caption.as_deref(),
+        )
+        .await;
 
         Ok(DeliveredAttachmentView {
             attachment_id: attachment_id.to_owned(),
@@ -150,6 +191,87 @@ impl AttachmentApi for ServerAttachmentApi {
             download_url,
             caption: title_caption,
         })
+    }
+}
+
+impl ServerAttachmentApi {
+    /// If the caller's conversation has a Signal binding, dispatch
+    /// the attachment through signal-cli. No-op for web-only
+    /// conversations and when no supervisor is wired. Errors log but
+    /// don't propagate — the web-UI chip already shipped.
+    async fn bridge_to_originating_transport(
+        &self,
+        attachment_id: &str,
+        filename: &str,
+        caption: Option<&str>,
+    ) {
+        use execlaw_core::principal_groups::PrincipalGroupStore;
+        use execlaw_core::tool::TransportApi;
+        use execlaw_core::transport_bindings::TransportBindingStore;
+
+        let Some(resolver) = self.transport_resolver.as_ref() else {
+            return;
+        };
+
+        let pg_store = PrincipalGroupStore::new(&self.db);
+        let pg_id = match pg_store.principal_group_id_for(self.caller_conversation_id.as_str()) {
+            Ok(Some(id)) => id,
+            _ => return,
+        };
+        let binding_store = TransportBindingStore::new(&self.db);
+        let bindings = match binding_store.bindings_for_group_any_channel(&pg_id) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "attachment_api::bridge",
+                    conversation_id = %self.caller_conversation_id.as_str(),
+                    error = %e,
+                    "binding lookup failed; web-UI chip remains the only deliverable",
+                );
+                return;
+            }
+        };
+        let signal_binding = bindings
+            .iter()
+            .find(|b| b.channel == crate::signal_transport::SIGNAL_CHANNEL);
+        let Some(binding) = signal_binding else {
+            return; // web-only conversation
+        };
+
+        let transport = crate::signal_transport::SignalCliTransport::new(
+            resolver.clone(),
+            self.db.clone(),
+            crate::signal_transport::SignalCliTransport::read_self_number_from_env(),
+            Some(binding.foreign_id.clone()),
+        )
+        .with_caller_conversation_id(self.caller_conversation_id.clone());
+
+        let body = caption.unwrap_or(filename);
+        if let Err(e) = transport
+            .send_with_attachments(
+                crate::signal_transport::SIGNAL_CHANNEL,
+                &binding.foreign_id,
+                body,
+                &[attachment_id.to_owned()],
+            )
+            .await
+        {
+            tracing::warn!(
+                target: "attachment_api::bridge",
+                conversation_id = %self.caller_conversation_id.as_str(),
+                recipient = %binding.foreign_id,
+                error = %e,
+                "Signal fan-out failed; web-UI chip remains visible to the operator",
+            );
+        } else {
+            tracing::info!(
+                target: "attachment_api::bridge",
+                conversation_id = %self.caller_conversation_id.as_str(),
+                recipient = %binding.foreign_id,
+                attachment_id = %attachment_id,
+                "fanned attachment out via Signal",
+            );
+        }
     }
 }
 

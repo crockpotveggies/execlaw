@@ -410,11 +410,22 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
         let needs_attachment_send = caps.iter().any(|c| matches!(c, Capability::AttachmentSend));
         if needs_attachment_send {
             if let Some(events) = self.events.as_ref() {
-                ctx.attachments = Some(Arc::new(crate::attachment_api::ServerAttachmentApi::new(
-                    self.host.db().clone(),
-                    events.clone(),
-                    ctx.conversation_id.clone(),
-                )));
+                // Hand the attachment API the same transport resolver
+                // signal.send_message uses. The API fans `send` out
+                // through the originating transport when the caller's
+                // conversation is bound to one — so an agent that
+                // calls `send_attachment` on a Signal-bridged thread
+                // delivers the file to BOTH the web-UI chip AND the
+                // contact's Signal app, instead of leaving the
+                // contact stranded with an attachment they can't see.
+                ctx.attachments = Some(Arc::new(
+                    crate::attachment_api::ServerAttachmentApi::new(
+                        self.host.db().clone(),
+                        events.clone(),
+                        ctx.conversation_id.clone(),
+                    )
+                    .with_transport_resolver(self.signal_transport_resolver.clone()),
+                ));
             }
             // No bus → capability stays dormant. The tool body's
             // own `ctx.attachments.is_none()` denial fires.
