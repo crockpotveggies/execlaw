@@ -391,33 +391,51 @@ pub async fn route_inbound_message(
         .map_err(|e| format!("binding lookup: {e}"))?
     {
         Some(pg_id) => {
-            // Existing binding. Read the canonical principal from
-            // the store — its trust class is authoritative.
+            // Existing binding. The canonical principal is whoever
+            // owns the principal_group the binding points at — NOT
+            // a principal id derived from the source number. After
+            // a reconcile (e.g. a "My identities" claim), the
+            // binding's group has been rebound to the controller,
+            // and the controller's principal id has nothing to do
+            // with `pri_signal_+1...`. Looking up by derived id
+            // would 404 and (pre-fix) drop the inbound as
+            // pseudo-Blocked, the symptom the operator hit after
+            // reconcile.
             //
-            // Audit fix (Phase 4 audit finding #2): if the principal
-            // row is MISSING (operator deleted it, migration
-            // glitch, etc.) we used to re-mint as UnknownPending.
-            // That silently downgrades a previously-Blocked principal
-            // to a cold-contact and leaks spam. Drop the inbound
-            // instead — better an operator-visible audit-log line
-            // than a quietly-routed message.
-            let pid = signal_principal_id(&msg.source_number);
-            let principal = match principals
-                .get(&pid)
-                .map_err(|e| format!("principal get: {e}"))?
-            {
+            // Resolution priority within the group:
+            //   1. Try `find_by_identifier(signal:<source_number>)` —
+            //      catches "My identities" mappings where the
+            //      controller's identifiers list contains this
+            //      handle.
+            //   2. Fall back to the group's first non-controller
+            //      member, then to the first member overall.
+            //
+            // If the group has zero members we treat that as a
+            // genuine integrity break (the reconciliation step
+            // forgot to populate membership) and drop the inbound
+            // with a loud warning so the operator can heal it
+            // explicitly. Re-minting an UnknownPending here would
+            // shadow the controller-owned binding.
+            let principal = resolve_principal_for_binding(
+                &state.db,
+                &principals,
+                &pg_id,
+                &msg.source_number,
+            )
+            .map_err(|e| format!("resolve binding principal: {e}"))?;
+            let principal = match principal {
                 Some(p) => p,
                 None => {
                     tracing::warn!(
                         target: "signal_inbound",
-                        principal_id = %pid.as_str(),
                         binding_pg_id = %pg_id,
-                        "binding exists but principal row missing — dropping inbound rather than \
-                         silently re-minting as UnknownPending (would downgrade a previously-\
-                         Blocked principal). Operator must heal the binding manually.",
+                        source = %msg.source_number,
+                        "binding exists but no resolvable principal — neither \
+                         find_by_identifier nor group membership produced a row. \
+                         Dropping inbound. Operator must heal the binding manually.",
                     );
                     return Ok(RouteOutcome::Blocked {
-                        principal_id: pid.as_str().to_owned(),
+                        principal_id: format!("orphan_binding:{}", msg.source_number),
                     });
                 }
             };
@@ -623,6 +641,73 @@ pub async fn route_inbound_message(
 /// stays identifiable in the principal store after a process bounce.
 fn signal_principal_id(source_number: &str) -> PrincipalId {
     PrincipalId::from(format!("pri_signal_{source_number}"))
+}
+
+/// Resolve the canonical principal for an inbound message landing on
+/// an existing transport binding. After reconcile rebinds a Signal
+/// handle from a stale UnknownPending principal to (e.g.) the
+/// Controller's group, the principal id derived from the source
+/// number is no longer authoritative — the principal_group's
+/// membership is.
+///
+/// Strategy:
+///   1. `find_by_identifier(signal:<source>)` — scans every
+///      principal's identifier list. For "My identities" the
+///      Controller will match here because the operator registered
+///      the handle on the controller principal.
+///   2. Group membership fallback. Read the
+///      `state_principal_group_members` rows for the binding's
+///      group; pick the first non-Controller principal (real DM
+///      sender), or the first member overall when the group is
+///      controller-only (the operator messaging from their own
+///      handle).
+///
+/// Returns `Ok(None)` when neither path produces a row — caller
+/// treats that as an integrity-break and drops the inbound rather
+/// than silently re-minting an UnknownPending.
+fn resolve_principal_for_binding(
+    db: &execlaw_core::db::Database,
+    principals: &PrincipalStore,
+    principal_group_id: &str,
+    source_number: &str,
+) -> Result<Option<Principal>, execlaw_core::db::DbError> {
+    // Step 1: identifier-based resolution.
+    let ident = Identifier {
+        transport: SIGNAL_CHANNEL.to_owned(),
+        handle: source_number.to_owned(),
+    };
+    if let Some(p) = principals.find_by_identifier(&ident)? {
+        return Ok(Some(p));
+    }
+
+    // Step 2: group-membership fallback.
+    let pg_store = PrincipalGroupStore::new(db);
+    let members = pg_store.members(principal_group_id)?;
+    if members.is_empty() {
+        return Ok(None);
+    }
+
+    // Score: prefer non-Controller members (real DM sender), then
+    // first member overall. We don't have the controller's id
+    // statically here; identify by trust class.
+    let mut chosen: Option<Principal> = None;
+    let mut controller_fallback: Option<Principal> = None;
+    for pid in &members {
+        if let Some(p) = principals.get(pid)? {
+            match &p.trust_level {
+                execlaw_core::principal::TrustLevel::Controller => {
+                    if controller_fallback.is_none() {
+                        controller_fallback = Some(p);
+                    }
+                }
+                _ => {
+                    chosen = Some(p);
+                    break;
+                }
+            }
+        }
+    }
+    Ok(chosen.or(controller_fallback))
 }
 
 /// Construct the per-route transport handle used for inbound
@@ -1799,6 +1884,81 @@ mod tests {
             PrincipalStore::new(&state.db).get(&pid).unwrap().is_none(),
             "route path must not silently mint a replacement principal",
         );
+    }
+
+    #[tokio::test]
+    async fn route_post_reconcile_resolves_via_my_identities_to_controller() {
+        // Regression: after reconcile rebinds a Signal handle from a
+        // stale UnknownPending principal to the controller's group
+        // (My-identities flow), `route_inbound_message` was deriving
+        // `pri_signal_+1...` from the source number and 404'ing in
+        // the principals table — then dropping the inbound as
+        // pseudo-Blocked. This left the operator's own messages
+        // unanswered after registering their handle.
+        //
+        // The fix resolves the principal via:
+        //   1. find_by_identifier → controller (because the operator
+        //      added signal:+1... to "My identities")
+        //   2. fallback to the binding's group members
+        // …rather than by deriving an id from the source number.
+        let state = test_app_state();
+        let now = chrono::Utc::now().timestamp();
+        let pstore = PrincipalStore::new(&state.db);
+
+        // Controller principal owns the signal handle (My identities
+        // mapping).
+        let controller_pid = PrincipalId::from("controller-x");
+        pstore
+            .upsert(&Principal {
+                id: controller_pid.clone(),
+                identifiers: vec![Identifier {
+                    transport: SIGNAL_CHANNEL.into(),
+                    handle: "+15554443333".into(),
+                }],
+                trust_level: CoreTrustLevel::Controller,
+                resolved_by: vec![],
+                metadata: serde_json::json!({}),
+                first_seen: now,
+                last_seen: Some(now),
+                controller_notes: None,
+            })
+            .unwrap();
+
+        // Group + binding point at the controller's group
+        // (post-reconcile state).
+        let pg = PrincipalGroupStore::new(&state.db)
+            .resolve(
+                &GroupKey {
+                    channel: SIGNAL_CHANNEL,
+                    native_group_id: None,
+                    principals: &[controller_pid.clone()],
+                    includes_controller: true,
+                },
+                now,
+            )
+            .unwrap();
+        TransportBindingStore::new(&state.db)
+            .insert_binding(SIGNAL_CHANNEL, "+15554443333", &pg.group_id, false, now)
+            .unwrap();
+        // CRITICAL: do NOT insert `pri_signal_+15554443333`. The
+        // pre-fix code looked it up here and 404'd; the new code
+        // must route through the controller.
+
+        let outcome = route_inbound_message(&state, &dm("+15554443333", "hello me"))
+            .await
+            .unwrap();
+        match outcome {
+            RouteOutcome::Dispatched { principal_id, .. } => {
+                assert_eq!(
+                    principal_id, "controller-x",
+                    "inbound must resolve to the controller, not a derived pri_signal_+ id",
+                );
+            }
+            other => panic!(
+                "expected Dispatched with controller principal; got {other:?} \
+                 (the pre-fix bug returned Blocked here)"
+            ),
+        }
     }
 
     #[tokio::test]

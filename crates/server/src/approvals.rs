@@ -382,22 +382,24 @@ async fn claim_as_me(
     let principals = PrincipalStore::new(&state.db);
     let now = chrono::Utc::now().timestamp();
 
-    // 1. Pull the stale principal's identifiers — those are what we
-    // attach to the controller. Drop early if the principal
-    // vanished (race with another approval response).
+    // 1. Pull the stale principal's identifiers. If the principal is
+    // already gone, that means reconcile ran between the cold-contact
+    // arriving and the operator clicking — the resolution we'd
+    // perform here has already happened (or is moot). Idempotent
+    // 200: log the situation, replay the queued message as a
+    // Controller turn (the binding now points at the controller's
+    // group), and return success so the SPA refreshes its list and
+    // drops the phantom approval entry.
     let stale = match principals.get(stale_pid) {
-        Ok(Some(p)) => p,
+        Ok(Some(p)) => Some(p),
         Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "stale_principal_missing",
-                        "message": "cold-contact principal vanished before approval",
-                    }
-                })),
-            )
-                .into_response();
+            tracing::info!(
+                target: "approvals::claim_as_me",
+                approval_id = %approval_id,
+                stale_pid = %stale_pid.as_str(),
+                "cold-contact principal already reconciled away — replaying queued message only",
+            );
+            None
         }
         Err(e) => return internal_error(&format!("principal get: {e}")),
     };
@@ -429,11 +431,15 @@ async fn claim_as_me(
     // controller (deduped). The reconcile pass below will then
     // merge the stale principal away, rebind the conversation,
     // and flip the awaiting_trust_decision phase to idle.
+    // When `stale` is None (already reconciled), this loop is a
+    // no-op — the controller already owns the identifier.
     let mut added_any = false;
-    for ident in &stale.identifiers {
-        if !controller_row.identifiers.contains(ident) {
-            controller_row.identifiers.push(ident.clone());
-            added_any = true;
+    if let Some(stale_row) = stale.as_ref() {
+        for ident in &stale_row.identifiers {
+            if !controller_row.identifiers.contains(ident) {
+                controller_row.identifiers.push(ident.clone());
+                added_any = true;
+            }
         }
     }
     if added_any {
@@ -774,16 +780,29 @@ pub async fn list_pending_approvals_handler(
             let Ok(p) = ev.decode_payload::<ColdContactReplayPayload>() else {
                 continue;
             };
-            // Filter out approvals whose principal has already been
-            // resolved (not UnknownPending anymore).
-            let still_pending = principals
+            // Filter out approvals that are no longer actionable:
+            //   * principal still exists AND is UnknownPending → pending
+            //   * principal still exists AND is anything else → resolved
+            //     (operator already approved/blocked, or trust changed
+            //     via another path)
+            //   * principal MISSING → reconciled away. Pre-fix this
+            //     defaulted to `pending=true`, so a cold-contact whose
+            //     principal got merged into the controller via the
+            //     My-identities reconcile flow kept appearing as a
+            //     phantom approval — clicking any verb errored
+            //     because the principal was gone, leaving the
+            //     operator stuck. The right answer is to drop it:
+            //     a vanished principal IS the resolution.
+            let principal_state = principals
                 .get(&PrincipalId::from(p.sender_principal_id.clone()))
                 .ok()
-                .flatten()
-                .map(|principal| {
+                .flatten();
+            let still_pending = match principal_state {
+                Some(principal) => {
                     matches!(principal.trust_level, CoreTrustLevel::UnknownPending { .. })
-                })
-                .unwrap_or(true);
+                }
+                None => false,
+            };
             if !still_pending {
                 continue;
             }
@@ -897,5 +916,105 @@ mod tests {
         let (status, body) = read_json(&app, Some(&token), "/api/admin/approvals").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["approvals"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_pending_filters_out_events_whose_principal_was_reconciled_away() {
+        // Regression: when reconcile (My-identities flow) deleted a
+        // stale UnknownPending principal, the cold_contact_arrived
+        // events for it stayed in the immutable event log. The
+        // pre-fix list filter defaulted "missing principal" to
+        // pending=true, so these phantoms kept appearing in the
+        // approvals list and the SPA's "This is me" / Trust /
+        // Block clicks all errored because the principal was gone.
+        // Post-fix: a vanished principal IS the resolution; drop
+        // the event from the list.
+        use execlaw_core::events::{EventKind, PendingEvent};
+        let state = test_app_state();
+        let app = build_router(state.clone());
+        let token = setup_get_token(&app).await;
+
+        // Seed a cold_contact_arrived event whose principal_id
+        // points at a row that doesn't exist (simulates post-
+        // reconcile state).
+        let cid = ConversationId::from("conv-phantom".to_owned());
+        let payload = ColdContactReplayPayload {
+            text: "Good morning".to_owned(),
+            sender_principal_id: "pri_signal_+15551234567".to_owned(),
+            approval_id: "appr-phantom-1".to_owned(),
+        };
+        let pending =
+            PendingEvent::encode(EventKind::ColdContactArrived, &payload, None).unwrap();
+        let log = event_log(&state);
+        log.commit_turn(&cid, EventSeq(0), vec![pending]).unwrap();
+
+        // Verify the principal IS missing (no upsert; the test
+        // simulates "reconcile already deleted it").
+        let principals = PrincipalStore::new(&state.db);
+        assert!(
+            principals
+                .get(&PrincipalId::from(payload.sender_principal_id.clone()))
+                .unwrap()
+                .is_none()
+        );
+
+        // Pending-list endpoint must NOT surface this event.
+        let (status, body) =
+            read_json(&app, Some(&token), "/api/admin/approvals").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["approvals"].as_array().unwrap().len(),
+            0,
+            "phantom approval (principal deleted by reconcile) must not appear in pending list"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pending_keeps_events_whose_principal_is_unknown_pending() {
+        // Counterpart to the phantom-filter test: when the principal
+        // EXISTS and is genuinely UnknownPending, the cold-contact
+        // event should appear in the pending list.
+        use execlaw_core::events::{EventKind, PendingEvent};
+        use execlaw_core::principal::{Principal, TrustLevel as CoreTrustLevel};
+
+        let state = test_app_state();
+        let app = build_router(state.clone());
+        let token = setup_get_token(&app).await;
+
+        let principals = PrincipalStore::new(&state.db);
+        let pid = PrincipalId::from("pri_signal_+15559998888");
+        principals
+            .upsert(&Principal {
+                id: pid.clone(),
+                identifiers: Vec::new(),
+                trust_level: CoreTrustLevel::UnknownPending {
+                    first_seen: 0,
+                    notification_event_seq: None,
+                },
+                resolved_by: Vec::new(),
+                metadata: serde_json::json!({}),
+                first_seen: 0,
+                last_seen: None,
+                controller_notes: None,
+            })
+            .unwrap();
+
+        let cid = ConversationId::from("conv-real".to_owned());
+        let payload = ColdContactReplayPayload {
+            text: "hi can we chat".to_owned(),
+            sender_principal_id: pid.as_str().to_owned(),
+            approval_id: "appr-real-1".to_owned(),
+        };
+        let pending =
+            PendingEvent::encode(EventKind::ColdContactArrived, &payload, None).unwrap();
+        let log = event_log(&state);
+        log.commit_turn(&cid, EventSeq(0), vec![pending]).unwrap();
+
+        let (status, body) =
+            read_json(&app, Some(&token), "/api/admin/approvals").await;
+        assert_eq!(status, StatusCode::OK);
+        let arr = body["approvals"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["approval_id"], "appr-real-1");
     }
 }
