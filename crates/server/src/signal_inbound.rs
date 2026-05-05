@@ -366,6 +366,19 @@ pub enum RouteOutcome {
         principal_id: String,
         conversation_id: String,
     },
+    /// Group-only outcome: sender is trusted but the inbound text
+    /// doesn't address the agent (no name match, no quoted reply).
+    /// The consumer persisted the message (so the agent's future
+    /// history replay sees it + the SPA's chat pane shows it) but
+    /// did NOT dispatch a turn — preventing the agent from chiming
+    /// in on conversations between other group members. Belt-and-
+    /// suspenders for operator instructions like "don't reply
+    /// unless directly addressed", which the model often ignores
+    /// when the text uses a different person's name.
+    GroupNotAddressed {
+        principal_id: String,
+        conversation_id: String,
+    },
     /// Sender is a known contact and their trust class admits an
     /// agent turn. The consumer committed the user message and
     /// dispatched a turn through the existing pipeline.
@@ -685,6 +698,91 @@ pub async fn route_inbound_message(
 /// stays identifiable in the principal store after a process bounce.
 fn signal_principal_id(source_number: &str) -> PrincipalId {
     PrincipalId::from(format!("pri_signal_{source_number}"))
+}
+
+/// True when the group-message text plausibly addresses the agent.
+///
+/// **Scope** — this matcher is ONLY consulted by the group-inbound
+/// route (`route_group_inbound`). Direct messages (1:1 inbound on
+/// `route_inbound_message`) are by definition addressed to the
+/// agent and never run through this filter, so a too-strict match
+/// here can never silence DMs.
+///
+/// Match rules (any one is sufficient):
+///   * The agent's full configured display name appears in the
+///     text (case-insensitive, word-boundary delimited).
+///   * The agent's first-word display name (e.g. `"Lena"` for
+///     `"Lena Executive Assistant"`) appears (same rules).
+///
+/// Word boundaries matter — without them, a contact named
+/// `"Helena"` or a verb like `"galena"` would falsely match
+/// `"Lena"` and the agent would respond to messages clearly
+/// directed at someone else. ASCII boundary check (alphanumeric
+/// or underscore) is fine for the realistic inputs (names);
+/// signal-cli's webhook delivers UTF-8 text, but any non-ASCII
+/// character on either side counts as a boundary too because we
+/// only inspect `.is_ascii_alphanumeric()`.
+///
+/// **Fall-open defaults** (return `true` so existing behaviour is
+/// preserved on every "I'm not sure" path):
+///   * Empty / whitespace-only `agent_name` — operator hasn't
+///     configured personality.
+///   * `agent_name` shorter than 2 chars after trim — too generic
+///     to safely match (would catch every "a" or "i" in any
+///     message).
+///   * Anything else weird upstream — the ONLY return-`false`
+///     path is a non-empty, ≥2-char name that genuinely doesn't
+///     appear with word-boundary delimiters.
+pub fn is_message_addressed_to_agent(text: &str, agent_name: &str) -> bool {
+    let trimmed = agent_name.trim();
+    if trimmed.chars().count() < 2 {
+        // Fall open on missing / dangerously-short names. Skip-
+        // dispatch is a destructive UX (operator's agent goes
+        // silent for unclear reasons) and the existing prompt-
+        // level instruction can still steer the model.
+        return true;
+    }
+    if contains_word_ci(text, trimmed) {
+        return true;
+    }
+    // First-word match — covers "Lena, can you ..." when the
+    // configured display_name is "Lena Executive Assistant".
+    // Skip the first-word path if the first word is too short
+    // (guards against single-letter first names false-matching
+    // every word that starts with that letter).
+    if let Some(first) = trimmed.split_whitespace().next() {
+        let first_chars = first.chars().count();
+        if first_chars >= 2 && first != trimmed && contains_word_ci(text, first) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Case-insensitive substring search with word-boundary delimiters
+/// on both sides. `needle` must be non-empty.
+fn contains_word_ci(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let h = haystack.to_lowercase();
+    let n = needle.to_lowercase();
+    let h_bytes = h.as_bytes();
+    let n_len = n.len();
+    let mut start = 0;
+    while let Some(pos) = h[start..].find(&n) {
+        let abs = start + pos;
+        let before_ok = abs == 0
+            || !h_bytes[abs - 1].is_ascii_alphanumeric() && h_bytes[abs - 1] != b'_';
+        let after = abs + n_len;
+        let after_ok = after == h_bytes.len()
+            || !h_bytes[after].is_ascii_alphanumeric() && h_bytes[after] != b'_';
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
 }
 
 /// Resolve the canonical principal for an inbound message landing on
@@ -1215,8 +1313,84 @@ async fn route_group_inbound(
         .await;
     }
 
-    // 5. Known sender — dispatch the turn against the GROUP's
-    //    conversation.
+    // 5. Group-only address filter. The agent shouldn't chime in
+    //    on conversations between other group members — operators
+    //    consistently report this as "the bot keeps replying to
+    //    messages that weren't directed at it." Soft prompt-level
+    //    instructions ("don't reply unless addressed") aren't
+    //    reliable; the model often pattern-matches its name onto
+    //    any inbound text. The filter below is a host-side
+    //    deterministic guard: read the operator's configured
+    //    `display_name` from the personality store, do a word-
+    //    boundary substring match, and skip dispatch when the
+    //    text doesn't reference the agent by name.
+    //
+    //    SAFETY: this branch is in `route_group_inbound` only —
+    //    1:1 DMs (`route_inbound_message`) are never filtered;
+    //    every DM is by definition addressed to the agent and
+    //    runs the same flow it always has. Any error reading the
+    //    personality (DB hiccup, missing row, blank name) falls
+    //    through to dispatch — the worst case is the agent
+    //    behaving exactly like it did pre-fix.
+    let agent_name: Option<String> = {
+        use execlaw_core::personality::PersonalityStore;
+        let store = PersonalityStore::new(&state.db);
+        match store.get_default() {
+            Ok(row) => Some(row.display_name),
+            Err(e) => {
+                tracing::debug!(
+                    target: "signal_inbound",
+                    error = %e,
+                    "personality lookup failed in group address filter; falling open",
+                );
+                None
+            }
+        }
+    };
+    let addressed = match agent_name.as_deref() {
+        Some(name) => is_message_addressed_to_agent(&msg.text, name),
+        // No personality row → fall open (preserve pre-fix
+        // behaviour rather than silencing every group message).
+        None => true,
+    };
+    if !addressed {
+        // Persist the inbound so the agent's future history-replay
+        // sees it (when a follow-up DOES address the agent it
+        // needs the prior context) AND the SPA's bridged-thread
+        // pane keeps showing every message. Best-effort: a commit
+        // failure logs but doesn't block the routing decision.
+        if let Err(e) = crate::chats::commit_inbound_user_msg_silently(
+            state,
+            &cid,
+            sender.id.as_str(),
+            &msg.text,
+            SIGNAL_CHANNEL,
+        )
+        .await
+        {
+            tracing::warn!(
+                target: "signal_inbound",
+                error = %e,
+                conversation_id = %cid.as_str(),
+                "silent commit of unaddressed group message failed; \
+                 the message won't appear in the agent's context",
+            );
+        }
+        tracing::info!(
+            target: "signal_inbound",
+            sender = %sender.id.as_str(),
+            group_id = %group_id,
+            agent_name = ?agent_name,
+            "group inbound did not address the agent; persisted but skipped dispatch",
+        );
+        return Ok(RouteOutcome::GroupNotAddressed {
+            principal_id: sender.id.as_str().to_owned(),
+            conversation_id: cid.as_str().to_owned(),
+        });
+    }
+
+    // 6. Known sender + addressed to agent — dispatch the turn
+    //    against the GROUP's conversation.
     crate::chats::dispatch_external_turn(
         state,
         &cid,
@@ -1875,6 +2049,286 @@ mod tests {
             .unwrap()
             .expect("principal must be minted");
         assert_eq!(p.trust_level.class_tag(), "UnknownPending");
+    }
+
+    // ---- group address filter ----------------------------------------
+
+    #[test]
+    fn matcher_addresses_agent_when_full_name_appears_with_word_boundaries() {
+        // The motivating case: agent name = "Lena Executive Assistant",
+        // user types "Lena, can you fetch my calendar?" — must dispatch.
+        assert!(is_message_addressed_to_agent(
+            "Lena, can you fetch my calendar?",
+            "Lena Executive Assistant",
+        ));
+        // Case-insensitive too.
+        assert!(is_message_addressed_to_agent(
+            "hey lena anyone home?",
+            "Lena Executive Assistant",
+        ));
+        // Full configured name as-is also matches.
+        assert!(is_message_addressed_to_agent(
+            "Hey Lena Executive Assistant, status?",
+            "Lena Executive Assistant",
+        ));
+    }
+
+    #[test]
+    fn matcher_skips_when_message_addresses_a_different_person() {
+        // The regression that prompted this fix: "Elyssa did you have
+        // any more questions for our guest?" must NOT trigger Lena's
+        // turn just because the agent is called "Lena".
+        assert!(!is_message_addressed_to_agent(
+            "Elyssa did you have any more questions for our guest?",
+            "Lena Executive Assistant",
+        ));
+        assert!(!is_message_addressed_to_agent(
+            "Bob, can you grab the door?",
+            "Lena Executive Assistant",
+        ));
+    }
+
+    #[test]
+    fn matcher_respects_word_boundaries_to_avoid_substring_false_positives() {
+        // "Helena" must NOT match "Lena" — different person in the
+        // group sharing a substring with the agent's name. Without
+        // word-boundary checks the filter would silently misroute.
+        assert!(!is_message_addressed_to_agent(
+            "Helena said she'd join later",
+            "Lena Executive Assistant",
+        ));
+        // Trailing punctuation IS a word boundary.
+        assert!(is_message_addressed_to_agent(
+            "Lena: status update?",
+            "Lena Executive Assistant",
+        ));
+        // But mid-word match still rejected.
+        assert!(!is_message_addressed_to_agent(
+            "the galena ore deposit",
+            "Lena Executive Assistant",
+        ));
+    }
+
+    #[test]
+    fn matcher_falls_open_for_blank_or_too_short_names() {
+        // Misconfigured / unconfigured personality must NOT silence
+        // the agent. Falling open preserves pre-fix behaviour: the
+        // soft prompt-level instruction is the only filter active.
+        assert!(is_message_addressed_to_agent("anything at all", ""));
+        assert!(is_message_addressed_to_agent("anything at all", "  "));
+        // Single-char names (operator typo, default seed) — fall open.
+        assert!(is_message_addressed_to_agent("we'll talk later", "A"));
+    }
+
+    #[test]
+    fn matcher_falls_open_when_first_word_is_dangerously_short() {
+        // Display name "X Y Z" with first word "X" — single-char
+        // first-word match would catch every "x" in any message.
+        // The first-word path requires ≥2 chars to engage.
+        assert!(!is_message_addressed_to_agent(
+            "we'll talk later",
+            "X Z Z Top",
+        ));
+    }
+
+    #[test]
+    fn matcher_first_word_path_handles_full_name_pattern() {
+        // First-name address with multi-word display_name: the
+        // motivating "Lena, ..." form when display_name is "Lena
+        // Executive Assistant".
+        assert!(is_message_addressed_to_agent(
+            "lena what's on for tomorrow?",
+            "Lena Executive Assistant",
+        ));
+    }
+
+    #[tokio::test]
+    async fn route_group_inbound_skips_dispatch_when_message_does_not_address_agent() {
+        // End-to-end: Configure personality with a non-default
+        // display_name, send a group inbound that doesn't reference
+        // it, assert the route outcome is GroupNotAddressed (so the
+        // agent never burns inference cycles answering a message
+        // not directed at it).
+        use execlaw_core::personality::{
+            PersonalityScopeKind, PersonalityStore, PersonalityUpsert,
+        };
+        let state = test_app_state();
+        let now = chrono::Utc::now().timestamp();
+        // Set the agent's display_name so the matcher has something
+        // to gate against.
+        // Read the default row, mutate display_name only, write back.
+        // Using the full upsert path (rather than direct SQL) keeps
+        // the test honest against schema migrations.
+        let store = PersonalityStore::new(&state.db);
+        let default_row = store.get_default().unwrap();
+        store
+            .upsert(
+                &PersonalityUpsert {
+                    scope_kind: PersonalityScopeKind::Default,
+                    scope_ref: "".into(),
+                    display_name: "Lena".into(),
+                    role: default_row.role,
+                    tone: default_row.tone,
+                    communication_style: default_row.communication_style,
+                    initiative: default_row.initiative,
+                    about_agent: default_row.about_agent,
+                    about_controller: default_row.about_controller,
+                    custom_instructions: default_row.custom_instructions,
+                    voice_id: default_row.voice_id,
+                    override_fields: std::collections::HashSet::new(),
+                },
+                now,
+            )
+            .unwrap();
+        // Promote the sender to a trusted Controller so the trust
+        // gate doesn't short-circuit before our filter.
+        let pid = signal_principal_id("+15554443333");
+        PrincipalStore::new(&state.db)
+            .upsert(&Principal {
+                id: pid.clone(),
+                identifiers: vec![Identifier {
+                    transport: SIGNAL_CHANNEL.into(),
+                    handle: "+15554443333".into(),
+                }],
+                trust_level: CoreTrustLevel::Controller,
+                resolved_by: vec![],
+                metadata: serde_json::json!({}),
+                first_seen: now,
+                last_seen: Some(now),
+                controller_notes: None,
+            })
+            .unwrap();
+        let mut msg = dm("+15554443333", "Elyssa did you have any more questions?");
+        msg.group_id = Some("g-skip-test".into());
+        let outcome = route_inbound_message(&state, &msg).await.unwrap();
+        assert!(
+            matches!(outcome, RouteOutcome::GroupNotAddressed { .. }),
+            "unaddressed group inbound must skip dispatch; got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_group_inbound_dispatches_when_message_names_the_agent() {
+        use execlaw_core::personality::{
+            PersonalityScopeKind, PersonalityStore, PersonalityUpsert,
+        };
+        let state = test_app_state();
+        let now = chrono::Utc::now().timestamp();
+        // Read the default row, mutate display_name only, write back.
+        // Using the full upsert path (rather than direct SQL) keeps
+        // the test honest against schema migrations.
+        let store = PersonalityStore::new(&state.db);
+        let default_row = store.get_default().unwrap();
+        store
+            .upsert(
+                &PersonalityUpsert {
+                    scope_kind: PersonalityScopeKind::Default,
+                    scope_ref: "".into(),
+                    display_name: "Lena".into(),
+                    role: default_row.role,
+                    tone: default_row.tone,
+                    communication_style: default_row.communication_style,
+                    initiative: default_row.initiative,
+                    about_agent: default_row.about_agent,
+                    about_controller: default_row.about_controller,
+                    custom_instructions: default_row.custom_instructions,
+                    voice_id: default_row.voice_id,
+                    override_fields: std::collections::HashSet::new(),
+                },
+                now,
+            )
+            .unwrap();
+        let pid = signal_principal_id("+15554443333");
+        PrincipalStore::new(&state.db)
+            .upsert(&Principal {
+                id: pid.clone(),
+                identifiers: vec![Identifier {
+                    transport: SIGNAL_CHANNEL.into(),
+                    handle: "+15554443333".into(),
+                }],
+                trust_level: CoreTrustLevel::Controller,
+                resolved_by: vec![],
+                metadata: serde_json::json!({}),
+                first_seen: now,
+                last_seen: Some(now),
+                controller_notes: None,
+            })
+            .unwrap();
+        let mut msg = dm("+15554443333", "Lena, what's the agenda?");
+        msg.group_id = Some("g-dispatch-test".into());
+        let outcome = route_inbound_message(&state, &msg).await.unwrap();
+        // Dispatched, NOT GroupNotAddressed — the message uses the
+        // agent's name so the filter passes.
+        assert!(
+            matches!(outcome, RouteOutcome::Dispatched { .. }),
+            "addressed group inbound must dispatch; got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_dm_path_is_unaffected_by_group_address_filter() {
+        // Critical safety invariant: DMs are by definition addressed
+        // to the agent. The filter MUST NOT touch the DM path —
+        // otherwise an operator who sets a custom display_name and
+        // sends a 1:1 message that doesn't repeat the agent's name
+        // would silently get nothing. Pin the route_inbound_message
+        // (no group_id) → Dispatched/ColdContact path so a future
+        // refactor can't accidentally extend the filter to DMs.
+        use execlaw_core::personality::{
+            PersonalityScopeKind, PersonalityStore, PersonalityUpsert,
+        };
+        let state = test_app_state();
+        let now = chrono::Utc::now().timestamp();
+        // Read the default row, mutate display_name only, write back.
+        // Using the full upsert path (rather than direct SQL) keeps
+        // the test honest against schema migrations.
+        let store = PersonalityStore::new(&state.db);
+        let default_row = store.get_default().unwrap();
+        store
+            .upsert(
+                &PersonalityUpsert {
+                    scope_kind: PersonalityScopeKind::Default,
+                    scope_ref: "".into(),
+                    display_name: "Lena".into(),
+                    role: default_row.role,
+                    tone: default_row.tone,
+                    communication_style: default_row.communication_style,
+                    initiative: default_row.initiative,
+                    about_agent: default_row.about_agent,
+                    about_controller: default_row.about_controller,
+                    custom_instructions: default_row.custom_instructions,
+                    voice_id: default_row.voice_id,
+                    override_fields: std::collections::HashSet::new(),
+                },
+                now,
+            )
+            .unwrap();
+        let pid = signal_principal_id("+15554443333");
+        PrincipalStore::new(&state.db)
+            .upsert(&Principal {
+                id: pid.clone(),
+                identifiers: vec![Identifier {
+                    transport: SIGNAL_CHANNEL.into(),
+                    handle: "+15554443333".into(),
+                }],
+                trust_level: CoreTrustLevel::Controller,
+                resolved_by: vec![],
+                metadata: serde_json::json!({}),
+                first_seen: now,
+                last_seen: Some(now),
+                controller_notes: None,
+            })
+            .unwrap();
+        // 1:1 DM — no group_id. Message text doesn't contain "Lena".
+        // The filter MUST NOT silence this.
+        let msg = dm("+15554443333", "what's on for today?");
+        let outcome = route_inbound_message(&state, &msg).await.unwrap();
+        // Outcome must NOT be GroupNotAddressed — that variant is
+        // group-only by construction.
+        assert!(
+            !matches!(outcome, RouteOutcome::GroupNotAddressed { .. }),
+            "DM path must never produce GroupNotAddressed; got {outcome:?}"
+        );
     }
 
     #[tokio::test]

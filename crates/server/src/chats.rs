@@ -2137,6 +2137,66 @@ pub async fn handle_cold_contact_for_inbound(
     Ok(())
 }
 
+/// Append an inbound `UserMsg` event WITHOUT running an agent turn,
+/// then publish `ChatMessageInbound` so the SPA's chat pane refreshes.
+///
+/// Why this exists: in a Signal group, every message lands here —
+/// even ones addressed to other humans in the group ("Elyssa, did
+/// you have any more questions?"). Pre-fix the agent fired a turn
+/// for each one and replied as if it had been addressed. The host-
+/// side filter in `signal_inbound::route_group_inbound` now skips
+/// the dispatch when the inbound text doesn't reference the agent's
+/// configured display name, but we STILL want to persist the
+/// message:
+///   * Conversation context — when someone DOES address the agent
+///     later ("Lena, what was the last thing Elyssa said?"), the
+///     agent's history-replay needs the unaddressed messages too.
+///   * SPA visibility — the operator viewing the Signal-bridged
+///     thread expects to see every group message, not just the
+///     ones the agent answered.
+///
+/// Best-effort with respect to the WS publish — the event-log
+/// commit is the load-bearing step. If the bus subscriber list is
+/// empty (no SPA tabs open), the publish is a no-op anyway.
+pub async fn commit_inbound_user_msg_silently(
+    state: &AppState,
+    cid: &ConversationId,
+    sender_principal_id: &str,
+    text: &str,
+    inbound_channel_origin: &str,
+) -> Result<(), String> {
+    let log = event_log(state);
+    let base_seq = log.last_seq(cid).map_err(|e| format!("last_seq: {e}"))?;
+    let user_event = EventRecord::new(
+        cid.clone(),
+        base_seq.next(),
+        EventKind::UserMsg,
+        &UserMessagePayload {
+            text: text.to_owned(),
+            sender_principal_id: Some(sender_principal_id.to_owned()),
+            channel_origin: Some(inbound_channel_origin.to_owned()),
+        },
+        Some(sender_principal_id.to_owned()),
+    )
+    .map_err(|e| format!("encode user_msg: {e}"))?;
+    log.append(&user_event)
+        .map_err(|e| format!("append user_msg: {e}"))?;
+
+    // Bump last_activity_at so the sidebar re-orders even though
+    // the agent didn't reply. The thread is "active" — the operator
+    // should see it move to the top of the list.
+    let store = ConversationStore::new(&state.db);
+    let _ = store.set_last_activity_at(cid, chrono::Utc::now().timestamp());
+
+    state.events.publish(UiEvent::ChatMessageInbound {
+        conversation_id: cid.as_str().to_owned(),
+        seq: user_event.seq.0,
+        text: text.to_owned(),
+        sender: Some(sender_principal_id.to_owned()),
+    });
+    Ok(())
+}
+
 /// Phase 4 — programmatic turn dispatch for an external transport
 /// (Signal today; future bridges fall through the same path).
 /// Generalises [`dispatch_routine_turn`] by parameterising on the
