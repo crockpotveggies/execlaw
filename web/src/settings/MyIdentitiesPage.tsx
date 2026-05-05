@@ -75,13 +75,18 @@ export function MyIdentitiesCard() {
                 listAvailableTransports(getToken),
             ]);
             setData(ids);
-            setTransports(ts.transports);
+            // Defensive default to `[]` so a malformed server
+            // response (or a stub mock returning `{}`) doesn't
+            // crash the dropdown render with an
+            // undefined-length read.
+            const list = ts.transports ?? [];
+            setTransports(list);
             // Default the dropdown to the first transport once the
             // list is known. Without this, the dropdown's value
             // would stay the empty string and the operator's first
             // Add click would 400 on missing transport.
             setTransport((prev) =>
-                prev !== "" || ts.transports.length === 0 ? prev : ts.transports[0].id,
+                prev !== "" || list.length === 0 ? prev : list[0].id,
             );
             setError(null);
         } catch (e) {

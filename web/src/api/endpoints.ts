@@ -2031,6 +2031,73 @@ export async function listAvailableTransports(
     );
 }
 
+// ---- /api/admin/signal/* (Phase 8 — operator pairing UI) ------------
+
+/// Live pairing/registration status for the supervised signal-cli
+/// sidecar. The Settings → Plugin → Signal page polls this every
+/// few seconds while the operator is on-page so a fresh QR scan
+/// surfaces as a populated `registered_accounts` list without a
+/// manual reload.
+export interface SignalStatusResponse {
+    /// Lower-cased supervisor status string (e.g. "starting",
+    /// "healthy", "crashlooping"). The SPA chips this so the
+    /// operator can correlate a stuck pairing flow with the
+    /// underlying sidecar lifecycle.
+    sidecar_status: string;
+    /// `127.0.0.1:<port>` once the supervisor mints one. Surfaced
+    /// in the chip's hover-detail, useful when triaging.
+    sidecar_rpc_url: string | null;
+    /// E.164 phone numbers signal-cli has on file. Empty list →
+    /// "not paired yet"; the SPA renders the QR link affordance.
+    registered_accounts: string[];
+    /// Populated when the proxy hop to /v1/accounts failed. Lets
+    /// the SPA render the actual error verbatim instead of a
+    /// blank "no accounts."
+    fetch_error: string | null;
+}
+
+export async function getSignalStatus(
+    tokenAccessor: () => string | null,
+): Promise<SignalStatusResponse> {
+    return apiFetch<SignalStatusResponse>(
+        "/api/admin/signal/status",
+        {},
+        tokenAccessor,
+    );
+}
+
+/// Build a query-stringed URL for `/api/admin/signal/qrcodelink`
+/// the SPA can shove directly into an `<img src>`. The endpoint
+/// streams PNG bytes from the supervised sidecar's
+/// `/v1/qrcodelink`. Bearer-token auth via the `?access_token=`
+/// query-string fallback (the SPA can't stamp `Authorization`
+/// headers on raw image src loads).
+export function signalQrCodeLinkUrl(
+    accessToken: string | null,
+    deviceName?: string,
+): string {
+    const params = new URLSearchParams();
+    if (deviceName && deviceName.trim().length > 0) {
+        params.set("device_name", deviceName.trim());
+    }
+    if (accessToken) {
+        params.set("access_token", accessToken);
+    }
+    const qs = params.toString();
+    return `/api/admin/signal/qrcodelink${qs ? `?${qs}` : ""}`;
+}
+
+export async function unregisterSignalAccount(
+    number: string,
+    tokenAccessor: () => string | null,
+): Promise<void> {
+    await apiFetch<unknown>(
+        `/api/admin/signal/accounts/${encodeURIComponent(number)}`,
+        { method: "DELETE", rawText: true },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/routines (Phase 10 — §5.6) -------------------------
 
 export type RoutineRunStatus = "Pending" | "Success" | "Failed" | "Skipped";

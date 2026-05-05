@@ -1,7 +1,7 @@
 [plugin]
 id = "signal"
 name = "Signal"
-version = "0.1.0"
+version = "0.2.0"
 description = "Signal Messenger transport — send/reply/group operations via a host-managed signal-cli sidecar container."
 author = "execlaw"
 license = "AGPL-3.0-or-later"
@@ -110,6 +110,15 @@ additions, no emoji, and no rephrasing. Args: { groupName: string }."""
 trust_floor = "Controller"
 latency = "medium"
 host_implemented = true
+
+# Settings → Plugin → Signal config page (Phase 8). The mount path
+# is the SPA route the PluginConfigRouter dispatches against; the
+# entry path is reserved for the future runtime-loaded panel
+# bundle (today the SPA's PluginConfigRouter has a hardcoded
+# KNOWN_CONFIGS map and the entry path is metadata only).
+[[ui_panels]]
+mount = "admin/plugins/signal"
+entry = "ui/panel.js"
 
 # As of Phase 5, every Signal tool is host-implemented. The rhai
 # stub file (main.rhai) is kept on disk as a defensive guard that

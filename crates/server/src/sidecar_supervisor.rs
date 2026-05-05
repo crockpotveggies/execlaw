@@ -512,8 +512,54 @@ impl SidecarSupervisor {
                     ServiceStatus::CrashLooping { restart_count },
                 );
             }
-            ServiceStatus::Pulling | ServiceStatus::Starting => {
+            ServiceStatus::Pulling => {
+                // Image still downloading — there's no container
+                // running to RPC against, just publish the status
+                // and wait.
                 self.transition_status(&sidecar.name, slot, inspect);
+            }
+            ServiceStatus::Starting => {
+                // Audit fix (2026-05-04): images without a Docker
+                // HEALTHCHECK declaration (bbernhard/signal-cli-rest-api
+                // is one) leave bollard's `inspect` returning Starting
+                // forever — Docker has no health data to report. The
+                // pre-fix supervisor only ran the RPC probe when
+                // inspect returned Healthy, so the sidecar was stuck in
+                // Starting indefinitely. Now we ALSO probe RPC during
+                // Starting: success promotes to Healthy without
+                // restart; failure stays Starting (gives slow-booting
+                // sidecars time without burning the restart cap, and a
+                // truly broken sidecar surfaces as a stuck-Starting
+                // status the operator can `kick` from the Sidecars
+                // page).
+                let url = format!(
+                    "http://127.0.0.1:{}{}",
+                    handle.host_port, sidecar.rpc_health_path
+                );
+                match self.controller.health_check(&url).await {
+                    Ok(true) => {
+                        info!(sidecar = %sidecar.name, "sidecar healthy via RPC probe (no Docker HEALTHCHECK)");
+                        slot.restart_attempts = 0;
+                        self.transition_status(&sidecar.name, slot, ServiceStatus::Healthy);
+                    }
+                    Ok(false) => {
+                        debug!(
+                            sidecar = %sidecar.name,
+                            url = %url,
+                            "RPC probe returned non-success during Starting; will retry next tick",
+                        );
+                        self.transition_status(&sidecar.name, slot, inspect);
+                    }
+                    Err(e) => {
+                        debug!(
+                            sidecar = %sidecar.name,
+                            url = %url,
+                            error = %e,
+                            "RPC probe errored during Starting; will retry next tick",
+                        );
+                        self.transition_status(&sidecar.name, slot, inspect);
+                    }
+                }
             }
             ServiceStatus::Healthy => {
                 // Validate via the sidecar's own RPC healthcheck —
@@ -523,7 +569,17 @@ impl SidecarSupervisor {
                     "http://127.0.0.1:{}{}",
                     handle.host_port, sidecar.rpc_health_path
                 );
-                let healthy = self.controller.health_check(&url).await.unwrap_or(false);
+                // Audit fix: capture the underlying error so an
+                // operator triaging a stuck sidecar sees "connection
+                // refused" / "got 500" rather than a generic boolean.
+                let healthy = match self.controller.health_check(&url).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(sidecar = %sidecar.name, url = %url, error = %e,
+                              "RPC health_check errored");
+                        false
+                    }
+                };
                 if healthy {
                     if !matches!(slot.status, ServiceStatus::Healthy) {
                         info!(sidecar = %sidecar.name, "sidecar healthy");
@@ -720,6 +776,69 @@ rpc_port = {port}
         assert_eq!(snap[0].status, ServiceStatus::Healthy);
         assert_eq!(snap[0].restart_attempts, 0);
         assert!(snap[0].rpc_url.is_some());
+    }
+
+    #[tokio::test]
+    async fn no_healthcheck_image_promotes_via_rpc_probe_during_starting() {
+        // Audit fix (2026-05-04): bbernhard/signal-cli-rest-api ships
+        // without a Docker HEALTHCHECK declaration, so bollard's
+        // `inspect` returns Starting forever. Pre-fix the supervisor
+        // only ran the RPC probe when inspect returned Healthy, so the
+        // sidecar got stuck in Starting indefinitely. Now we probe
+        // RPC during Starting and promote on success.
+        let mock = Arc::new(MockServiceController::new());
+        let reg = registry_with_sidecar("p-signal", "signal", 8080);
+        let sup = SidecarSupervisor::new(mock.clone(), reg);
+
+        // Tick 1: spawn → inspect returns Starting (default for
+        // running containers without HEALTHCHECK).
+        sup.reconcile_once().await;
+        // Tick 2: keep inspect at Starting, but pin RPC to success.
+        // The supervisor should promote to Healthy without waiting
+        // for inspect to ever return Healthy.
+        mock.pin_status(ServiceStatus::Starting).await;
+        mock.pin_health(true).await;
+        sup.reconcile_once().await;
+
+        let snap = sup.snapshot_status().await;
+        assert_eq!(
+            snap[0].status,
+            ServiceStatus::Healthy,
+            "Starting + RPC success must promote to Healthy even without Docker HEALTHCHECK",
+        );
+        assert_eq!(snap[0].restart_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn rpc_failure_during_starting_does_not_burn_restart_cap() {
+        // The flip-side of the no-HEALTHCHECK fix: when inspect is
+        // Starting and RPC ALSO fails, we shouldn't increment
+        // restart_attempts. A genuinely slow-booting sidecar
+        // (signal-cli takes ~30s on first run) would otherwise burn
+        // through MAX_RESTART_ATTEMPTS on cold start.
+        let mock = Arc::new(MockServiceController::new());
+        let reg = registry_with_sidecar("p-signal", "signal", 8080);
+        let sup = SidecarSupervisor::new(mock.clone(), reg);
+
+        sup.reconcile_once().await; // spawn
+        mock.pin_status(ServiceStatus::Starting).await;
+        mock.pin_health(false).await;
+
+        // Run several reconciles with RPC failing.
+        for _ in 0..5 {
+            sup.reconcile_once().await;
+        }
+
+        let snap = sup.snapshot_status().await;
+        assert_eq!(
+            snap[0].status,
+            ServiceStatus::Starting,
+            "should remain Starting while RPC keeps failing",
+        );
+        assert_eq!(
+            snap[0].restart_attempts, 0,
+            "Starting+RPC-fail must NOT burn the restart cap on slow boot",
+        );
     }
 
     #[tokio::test]

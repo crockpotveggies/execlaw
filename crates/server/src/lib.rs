@@ -57,6 +57,7 @@ pub mod settings_search;
 pub mod setup_preflight;
 pub mod sidecar_supervisor;
 pub mod sidecars_admin;
+pub mod signal_admin;
 pub mod signal_inbound;
 pub mod signal_tools;
 pub mod signal_transport;

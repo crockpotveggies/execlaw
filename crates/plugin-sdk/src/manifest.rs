@@ -990,6 +990,7 @@ mod tests {
         let m = PluginManifest::parse(SIGNAL_MANIFEST)
             .expect("plugins/signal/plugin.toml must parse cleanly");
         assert_eq!(m.plugin.id, "signal");
+        assert_eq!(m.plugin.version, "0.2.0");
         // Six tools mirror the selfhosted-claw integration. If we
         // add or remove one, this assertion forces a deliberate
         // update — the audit doc should stay in sync.
@@ -1061,6 +1062,15 @@ mod tests {
         assert_eq!(tr.transport_id, "signal");
         assert!(tr.supports_groups);
         assert!(tr.supports_attachments);
+        // Phase 8: a [[ui_panels]] entry registers the Settings →
+        // Plugin → Signal config page so the operator pairing UX
+        // is reachable from the standard plugin shell.
+        assert_eq!(
+            m.ui_panels.len(),
+            1,
+            "exactly one [[ui_panels]] entry expected on the signal plugin",
+        );
+        assert_eq!(m.ui_panels[0].mount, "admin/plugins/signal");
     }
 
     #[test]

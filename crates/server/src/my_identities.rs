@@ -599,5 +599,4 @@ supports_attachments = true
         // Phone-shaped placeholder.
         assert_eq!(signal["handle_placeholder"], "+15551234");
     }
-
 }
