@@ -18,6 +18,7 @@ import Form from "react-bootstrap/Form";
 import {
     getTrustPolicy,
     putTrustPolicy,
+    type AutoTrustClass,
     type MinTrustHint,
     type MixedTrustPolicy,
     type TrustPolicyView,
@@ -28,6 +29,7 @@ import { ErrorBanner } from "../components/ErrorBanner";
 interface FormState {
     auto_trust_contacts: boolean;
     min_trust_hint_for_auto_trust: MinTrustHint;
+    auto_trust_class: AutoTrustClass;
     mixed_trust_policy: MixedTrustPolicy;
     /** Newline-separated for the textarea; serialised as array on save. */
     identity_plugin_order: string;
@@ -38,6 +40,7 @@ function fromView(v: TrustPolicyView): FormState {
     return {
         auto_trust_contacts: v.auto_trust_contacts,
         min_trust_hint_for_auto_trust: v.min_trust_hint_for_auto_trust,
+        auto_trust_class: v.auto_trust_class,
         mixed_trust_policy: v.mixed_trust_policy,
         identity_plugin_order: v.identity_plugin_order.join("\n"),
         delegated_trust_default_ttl: v.delegated_trust_default_ttl,
@@ -48,6 +51,7 @@ function toView(f: FormState): TrustPolicyView {
     return {
         auto_trust_contacts: f.auto_trust_contacts,
         min_trust_hint_for_auto_trust: f.min_trust_hint_for_auto_trust,
+        auto_trust_class: f.auto_trust_class,
         mixed_trust_policy: f.mixed_trust_policy,
         identity_plugin_order: f.identity_plugin_order
             .split(/\r?\n/)
@@ -167,8 +171,9 @@ export function TrustPolicyPage() {
                     />
                     <Form.Text className="execlaw-muted">
                         When on, contacts whose trust hint clears the
-                        threshold below are promoted to KnownTrusted without
-                        prompting the controller.
+                        threshold below are admitted at the class set in
+                        &quot;Auto-trust class&quot; without prompting the
+                        controller.
                     </Form.Text>
                 </Form.Group>
 
@@ -193,6 +198,36 @@ export function TrustPolicyPage() {
                     <Form.Text className="execlaw-muted">
                         Plugin-supplied identity strength must reach at least
                         this level for auto-trust to fire.
+                    </Form.Text>
+                </Form.Group>
+
+                <Form.Group className="mb-3" controlId="trust-auto-class">
+                    <Form.Label className="small mb-1">
+                        Auto-trust class
+                    </Form.Label>
+                    <Form.Select
+                        value={form.auto_trust_class}
+                        onChange={(e) =>
+                            onChange(
+                                "auto_trust_class",
+                                e.target.value as AutoTrustClass,
+                            )
+                        }
+                        data-testid="trust-auto-class"
+                    >
+                        <option value="KnownLimited">
+                            KnownLimited · reply on the originating transport only
+                        </option>
+                        <option value="KnownTrusted">
+                            KnownTrusted · reply + memory + safe tools
+                        </option>
+                    </Form.Select>
+                    <Form.Text className="execlaw-muted">
+                        Trust class auto-admitted senders enter at. The
+                        conservative default is KnownLimited so a saved
+                        contact who messages the agent for the first time
+                        can&apos;t e.g. read memory without explicit operator
+                        opt-in.
                     </Form.Text>
                 </Form.Group>
 

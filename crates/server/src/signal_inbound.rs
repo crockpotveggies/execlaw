@@ -428,28 +428,59 @@ pub async fn route_inbound_message(
             (updated, pg_id)
         }
         None => {
-            // First-contact path: mint principal + group + binding
-            // atomically (ish — binding insert is the last step,
-            // so a crash mid-way leaves a principal/group orphan,
-            // not a phantom binding pointing nowhere).
-            let pid = signal_principal_id(&msg.source_number);
-            let principal = mint_unknown_principal(&pid, msg, now);
-            principals
-                .upsert(&principal)
-                .map_err(|e| format!("principal mint: {e}"))?;
+            // First-contact path: route through the shared admit
+            // helper before minting. This catches:
+            //   * The controller's own "My identities" mappings —
+            //     `signal:+16047005800` registered as a controller
+            //     identifier resolves to the Controller principal,
+            //     bypassing the cold-contact gate entirely.
+            //   * Identity-provider plugin matches (Google Contacts,
+            //     local address book) — when the operator's Trust
+            //     Policy enables auto-trust and a plugin vouches at
+            //     ≥ min_trust_hint, the sender is admitted as
+            //     KnownLimited (or KnownTrusted, configurable) and
+            //     the agent can reply immediately.
+            //   * Otherwise: UnknownPending mint, same as before.
+            let hint_pid = signal_principal_id(&msg.source_number);
+            let (principal, _flat_trust) = crate::principal_admit::admit_external_principal(
+                &state.db,
+                &state.plugin_host,
+                SIGNAL_CHANNEL,
+                &msg.source_number,
+                hint_pid.as_str(),
+            )
+            .await
+            .map_err(|e| format!("admit principal: {e}"))?;
+
+            // Group selection: if the resolved principal is the
+            // Controller, route to the controller's principal_group
+            // so the Signal thread joins the controller's existing
+            // conversation rather than spinning up an
+            // "external + signal" group. Otherwise key the group on
+            // the sender.
+            let is_controller = matches!(
+                principal.trust_level,
+                execlaw_core::principal::TrustLevel::Controller
+            );
             let pg = pg_store
                 .resolve(
                     &GroupKey {
                         channel: SIGNAL_CHANNEL,
                         native_group_id: None,
-                        principals: &[pid.clone()],
-                        includes_controller: false,
+                        principals: &[principal.id.clone()],
+                        includes_controller: is_controller,
                     },
                     now,
                 )
                 .map_err(|e| format!("principal_group mint: {e}"))?;
             let inserted = binding_store
-                .insert_binding(SIGNAL_CHANNEL, &msg.source_number, &pg.group_id, false, now)
+                .insert_binding(
+                    SIGNAL_CHANNEL,
+                    &msg.source_number,
+                    &pg.group_id,
+                    false,
+                    now,
+                )
                 .map_err(|e| format!("binding insert: {e}"))?;
             if !inserted {
                 // Race: another consumer (or a retried frame) won
@@ -468,9 +499,11 @@ pub async fn route_inbound_message(
                     .map_err(|e| format!("binding re-lookup: {e}"))?
                     .ok_or_else(|| "binding vanished after insert race".to_owned())?;
                 let canonical = principals
-                    .get(&pid)
+                    .get(&principal.id)
                     .map_err(|e| format!("principal refetch: {e}"))?
-                    .ok_or_else(|| "principal vanished after race-recovery refetch".to_owned())?;
+                    .ok_or_else(|| {
+                        "principal vanished after race-recovery refetch".to_owned()
+                    })?;
                 (canonical, pg_id)
             } else {
                 (principal, pg.group_id)
@@ -479,14 +512,21 @@ pub async fn route_inbound_message(
     };
 
     // 2. Resolve / mint a conversation. The Signal transport's
-    //    routing key is the source_number itself.
+    //    routing key is the source_number itself. `is_controller`
+    //    flows through from the admitted principal so a controller's
+    //    Signal message routes into a ControllerDM-shaped
+    //    conversation rather than an external one.
+    let is_controller_principal = matches!(
+        principal.trust_level,
+        execlaw_core::principal::TrustLevel::Controller
+    );
     let resolver = ConversationResolver::new(&state.db);
     let outcome = resolver
         .resolve_or_mint(&ResolveInput {
             plugin_id: SIGNAL_PLUGIN_ID,
             transport_handle: &msg.source_number,
             principal_id: principal.id.as_str(),
-            is_controller: false,
+            is_controller: is_controller_principal,
             idle_timeout_ms: SIGNAL_IDLE_TIMEOUT_MS,
             now,
         })

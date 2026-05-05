@@ -24,6 +24,7 @@ function policy(
     overrides: Partial<{
         auto_trust_contacts: boolean;
         min_trust_hint_for_auto_trust: string;
+        auto_trust_class: string;
         identity_plugin_order: string[];
         delegated_trust_default_ttl: string;
     }> = {},
@@ -32,6 +33,7 @@ function policy(
         auto_trust_contacts: overrides.auto_trust_contacts ?? true,
         min_trust_hint_for_auto_trust:
             overrides.min_trust_hint_for_auto_trust ?? "Contact",
+        auto_trust_class: overrides.auto_trust_class ?? "KnownLimited",
         mixed_trust_policy: "min_wins",
         identity_plugin_order: overrides.identity_plugin_order ?? [],
         delegated_trust_default_ttl:
@@ -82,6 +84,54 @@ describe("TrustPolicyPage", () => {
             (screen.getByTestId("trust-auto-toggle") as HTMLInputElement)
                 .checked,
         ).toBe(true);
+        // Default auto-trust class is KnownLimited so a saved
+        // contact's first inbound can reply but can't access memory
+        // until the operator explicitly elevates them.
+        expect(
+            (screen.getByTestId("trust-auto-class") as HTMLSelectElement)
+                .value,
+        ).toBe("KnownLimited");
+    });
+
+    it("PUTs auto_trust_class when the operator dials it up", async () => {
+        const calls: Array<{ url: string; init?: RequestInit }> = [];
+        fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+            calls.push({ url, init });
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/trust-policy" && init?.method === "PUT") {
+                return new Response(
+                    JSON.stringify(policy({ auto_trust_class: "KnownTrusted" })),
+                    { status: 200 },
+                );
+            }
+            if (url === "/api/admin/trust-policy")
+                return new Response(JSON.stringify(policy()), { status: 200 });
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        await waitFor(() => {
+            expect(screen.getByTestId("trust-auto-class")).toBeInTheDocument();
+        });
+        fireEvent.change(screen.getByTestId("trust-auto-class"), {
+            target: { value: "KnownTrusted" },
+        });
+        fireEvent.click(screen.getByTestId("trust-save"));
+        await waitFor(() => {
+            expect(
+                calls.some(
+                    (c) =>
+                        c.url === "/api/admin/trust-policy" &&
+                        c.init?.method === "PUT",
+                ),
+            ).toBe(true);
+        });
+        const put = calls.find(
+            (c) =>
+                c.url === "/api/admin/trust-policy" &&
+                c.init?.method === "PUT",
+        )!;
+        const body = JSON.parse((put.init?.body as string) ?? "{}");
+        expect(body.auto_trust_class).toBe("KnownTrusted");
     });
 
     it("PUTs the form, including the plugin-order array round-trip", async () => {

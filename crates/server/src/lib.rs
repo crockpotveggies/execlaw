@@ -40,6 +40,7 @@ pub mod oauth_sweeper;
 pub mod observability;
 pub mod personality;
 pub mod plugins;
+pub mod principal_admit;
 pub mod research;
 pub mod research_admin;
 pub mod routes;

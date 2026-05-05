@@ -20,7 +20,7 @@ use axum::response::Json;
 use axum::routing::get;
 use execlaw_core::audit::AuditStore;
 use execlaw_core::trust_policy::{
-    MinTrustHint, MixedTrustPolicy, TrustPolicy, TrustPolicyError, TrustPolicyStore,
+    AutoTrustClass, MinTrustHint, MixedTrustPolicy, TrustPolicy, TrustPolicyError, TrustPolicyStore,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -30,6 +30,9 @@ pub struct TrustPolicyView {
     pub auto_trust_contacts: bool,
     /// One of "Contact" | "Colleague" | "Organization".
     pub min_trust_hint_for_auto_trust: String,
+    /// One of "KnownLimited" | "KnownTrusted". Trust class an
+    /// auto-admitted (plugin-vouched) sender enters at.
+    pub auto_trust_class: String,
     /// One of "min_wins" (only value today; reserved for future).
     pub mixed_trust_policy: String,
     pub identity_plugin_order: Vec<String>,
@@ -42,6 +45,7 @@ impl From<&TrustPolicy> for TrustPolicyView {
         Self {
             auto_trust_contacts: p.auto_trust_contacts,
             min_trust_hint_for_auto_trust: p.min_trust_hint_for_auto_trust.as_str().to_owned(),
+            auto_trust_class: p.auto_trust_class.as_str().to_owned(),
             mixed_trust_policy: p.mixed_trust_policy.as_str().to_owned(),
             identity_plugin_order: p.identity_plugin_order.clone(),
             delegated_trust_default_ttl: p.delegated_trust_default_ttl.clone(),
@@ -53,9 +57,17 @@ impl From<&TrustPolicy> for TrustPolicyView {
 pub struct UpdateTrustPolicyRequest {
     pub auto_trust_contacts: bool,
     pub min_trust_hint_for_auto_trust: String,
+    /// Defaults to "KnownLimited" if omitted by an older client so
+    /// existing SPA versions don't break post-upgrade.
+    #[serde(default = "default_auto_trust_class")]
+    pub auto_trust_class: String,
     pub mixed_trust_policy: String,
     pub identity_plugin_order: Vec<String>,
     pub delegated_trust_default_ttl: String,
+}
+
+fn default_auto_trust_class() -> String {
+    "KnownLimited".to_owned()
 }
 
 impl From<TrustPolicyError> for ApiError {
@@ -119,6 +131,14 @@ pub async fn put_handler(
                 req.min_trust_hint_for_auto_trust
             ),
         })?;
+    let auto_class = AutoTrustClass::parse(&req.auto_trust_class).ok_or_else(|| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        code: "invalid_auto_trust_class",
+        message: format!(
+            "auto_trust_class must be KnownLimited|KnownTrusted, got '{}'",
+            req.auto_trust_class
+        ),
+    })?;
     let mixed = MixedTrustPolicy::parse(&req.mixed_trust_policy).ok_or_else(|| ApiError {
         status: StatusCode::BAD_REQUEST,
         code: "invalid_mixed_trust_policy",
@@ -131,6 +151,7 @@ pub async fn put_handler(
     let next = TrustPolicy {
         auto_trust_contacts: req.auto_trust_contacts,
         min_trust_hint_for_auto_trust: min_hint,
+        auto_trust_class: auto_class,
         mixed_trust_policy: mixed,
         identity_plugin_order: req.identity_plugin_order.clone(),
         delegated_trust_default_ttl: req.delegated_trust_default_ttl.clone(),
@@ -147,12 +168,14 @@ pub async fn put_handler(
         Some(&serde_json::json!({
             "auto_trust_contacts": prior.auto_trust_contacts,
             "min_trust_hint_for_auto_trust": prior.min_trust_hint_for_auto_trust.as_str(),
+            "auto_trust_class": prior.auto_trust_class.as_str(),
             "mixed_trust_policy": prior.mixed_trust_policy.as_str(),
             "delegated_trust_default_ttl": prior.delegated_trust_default_ttl,
         })),
         Some(&serde_json::json!({
             "auto_trust_contacts": next.auto_trust_contacts,
             "min_trust_hint_for_auto_trust": next.min_trust_hint_for_auto_trust.as_str(),
+            "auto_trust_class": next.auto_trust_class.as_str(),
             "mixed_trust_policy": next.mixed_trust_policy.as_str(),
             "delegated_trust_default_ttl": next.delegated_trust_default_ttl,
         })),
@@ -227,6 +250,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["auto_trust_contacts"], true);
         assert_eq!(v["min_trust_hint_for_auto_trust"], "Contact");
+        assert_eq!(v["auto_trust_class"], "KnownLimited");
         assert_eq!(v["mixed_trust_policy"], "min_wins");
         assert_eq!(v["delegated_trust_default_ttl"], "7d");
     }
@@ -238,6 +262,7 @@ mod tests {
         let body = serde_json::json!({
             "auto_trust_contacts": false,
             "min_trust_hint_for_auto_trust": "Colleague",
+            "auto_trust_class": "KnownTrusted",
             "mixed_trust_policy": "min_wins",
             "identity_plugin_order": ["plugin-a", "plugin-b"],
             "delegated_trust_default_ttl": "12h",
@@ -263,6 +288,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["auto_trust_contacts"], false);
         assert_eq!(v["min_trust_hint_for_auto_trust"], "Colleague");
+        assert_eq!(v["auto_trust_class"], "KnownTrusted");
         assert_eq!(v["delegated_trust_default_ttl"], "12h");
         assert_eq!(v["identity_plugin_order"][0], "plugin-a");
     }

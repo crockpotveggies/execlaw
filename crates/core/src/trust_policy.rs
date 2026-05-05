@@ -69,6 +69,34 @@ impl MixedTrustPolicy {
     }
 }
 
+/// Trust class an unknown sender is elevated to when an installed
+/// identity-provider plugin vouches for them and `auto_trust_contacts`
+/// is enabled. `KnownLimited` is the conservative default — the
+/// agent can reply on the originating transport but can't read/write
+/// memory or call non-trivial tools. Operators who want richer
+/// auto-admit behaviour can dial up to `KnownTrusted` from Settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AutoTrustClass {
+    KnownLimited,
+    KnownTrusted,
+}
+
+impl AutoTrustClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::KnownLimited => "KnownLimited",
+            Self::KnownTrusted => "KnownTrusted",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "KnownLimited" => Some(Self::KnownLimited),
+            "KnownTrusted" => Some(Self::KnownTrusted),
+            _ => None,
+        }
+    }
+}
+
 /// Resolved policy snapshot. Every field is populated; missing keys
 /// fall through to the documented defaults so consumers never need
 /// to handle a None.
@@ -76,6 +104,13 @@ impl MixedTrustPolicy {
 pub struct TrustPolicy {
     pub auto_trust_contacts: bool,
     pub min_trust_hint_for_auto_trust: MinTrustHint,
+    /// Trust class new contacts are admitted at when an
+    /// identity-provider plugin vouches for them. Defaults to the
+    /// conservative `KnownLimited` (reply-only) so a saved Google
+    /// Contact who messages the agent for the first time can't
+    /// e.g. read memory or call sensitive tools without explicit
+    /// operator opt-in.
+    pub auto_trust_class: AutoTrustClass,
     pub mixed_trust_policy: MixedTrustPolicy,
     /// Plugin ids in order of priority. First-match wins on tiebreak
     /// when multiple identity plugins claim the same handle.
@@ -90,6 +125,7 @@ impl TrustPolicy {
         Self {
             auto_trust_contacts: true,
             min_trust_hint_for_auto_trust: MinTrustHint::Contact,
+            auto_trust_class: AutoTrustClass::KnownLimited,
             mixed_trust_policy: MixedTrustPolicy::MinWins,
             identity_plugin_order: Vec::new(),
             delegated_trust_default_ttl: "7d".to_owned(),
@@ -112,6 +148,7 @@ pub enum TrustPolicyError {
 
 const KEY_AUTO_TRUST_CONTACTS: &str = "auto_trust_contacts";
 const KEY_MIN_TRUST_HINT: &str = "min_trust_hint_for_auto_trust";
+const KEY_AUTO_TRUST_CLASS: &str = "auto_trust_class";
 const KEY_MIXED_TRUST_POLICY: &str = "mixed_trust_policy";
 const KEY_IDENTITY_PLUGIN_ORDER: &str = "identity_plugin_order";
 const KEY_DELEGATED_TTL: &str = "delegated_trust_default_ttl";
@@ -165,6 +202,11 @@ impl<'db> TrustPolicyStore<'db> {
                 out.min_trust_hint_for_auto_trust = parsed;
             }
         }
+        if let Some(v) = self.kv.get(KEY_AUTO_TRUST_CLASS)? {
+            if let Some(parsed) = AutoTrustClass::parse(&v) {
+                out.auto_trust_class = parsed;
+            }
+        }
         if let Some(v) = self.kv.get(KEY_MIXED_TRUST_POLICY)? {
             if let Some(parsed) = MixedTrustPolicy::parse(&v) {
                 out.mixed_trust_policy = parsed;
@@ -209,6 +251,8 @@ impl<'db> TrustPolicyStore<'db> {
         self.kv
             .set(KEY_MIN_TRUST_HINT, p.min_trust_hint_for_auto_trust.as_str())?;
         self.kv
+            .set(KEY_AUTO_TRUST_CLASS, p.auto_trust_class.as_str())?;
+        self.kv
             .set(KEY_MIXED_TRUST_POLICY, p.mixed_trust_policy.as_str())?;
         self.kv.set(
             KEY_IDENTITY_PLUGIN_ORDER,
@@ -239,6 +283,7 @@ mod tests {
         let p = store.read().unwrap();
         assert!(p.auto_trust_contacts);
         assert_eq!(p.min_trust_hint_for_auto_trust, MinTrustHint::Contact);
+        assert_eq!(p.auto_trust_class, AutoTrustClass::KnownLimited);
         assert_eq!(p.mixed_trust_policy, MixedTrustPolicy::MinWins);
         assert!(p.identity_plugin_order.is_empty());
         assert_eq!(p.delegated_trust_default_ttl, "7d");
@@ -251,6 +296,7 @@ mod tests {
         let p = TrustPolicy {
             auto_trust_contacts: false,
             min_trust_hint_for_auto_trust: MinTrustHint::Colleague,
+            auto_trust_class: AutoTrustClass::KnownTrusted,
             mixed_trust_policy: MixedTrustPolicy::MinWins,
             identity_plugin_order: vec!["plugin-a".into(), "plugin-b".into()],
             delegated_trust_default_ttl: "12h".into(),

@@ -1927,10 +1927,18 @@ export async function resolveAlert(
 
 export type MinTrustHint = "Contact" | "Colleague" | "Organization";
 export type MixedTrustPolicy = "min_wins";
+export type AutoTrustClass = "KnownLimited" | "KnownTrusted";
 
 export interface TrustPolicyView {
     auto_trust_contacts: boolean;
     min_trust_hint_for_auto_trust: MinTrustHint;
+    /**
+     * Trust class auto-admitted senders (plugin-vouched at or above
+     * `min_trust_hint_for_auto_trust`) enter at. Defaults to
+     * `KnownLimited` — agent can reply on the originating transport
+     * but can't read/write memory or call non-trivial tools.
+     */
+    auto_trust_class: AutoTrustClass;
     mixed_trust_policy: MixedTrustPolicy;
     identity_plugin_order: string[];
     /** Duration string, e.g. "7d", "12h". */
