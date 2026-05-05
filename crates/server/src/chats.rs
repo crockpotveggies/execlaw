@@ -1441,26 +1441,38 @@ async fn run_tool_capable_turn(
     // Same description/schema plumbing fix as the runner-turn path
     // (delta #1) — without this the in-process tool-capable path
     // shipped `Plugin tool 'X' (latency: Y)` + an empty schema.
-    let tool_decls: Vec<ToolDeclaration> = state
+    //
+    // Tool catalog = built-ins ∪ plugin tools. Pre-fix this only
+    // included plugin tools, so a Controller messaging through the
+    // tool-capable path (typical for Signal-bridged turns when the
+    // operator has plugins installed) saw signal.* but NOT
+    // research_* / memory_* / etc. The dispatch chain already
+    // routes built-ins via `try_registry_builtin`; we just need to
+    // tell the model they're there.
+    let mut tool_decls: Vec<ToolDeclaration> = state
         .plugin_host
         .registry()
-        .all_tools()
+        .all_builtins()
         .iter()
         .map(|t| {
-            let description = t.description.clone().unwrap_or_else(|| {
-                format!(
-                    "Plugin tool '{}' from '{}' (latency: {}). The plugin manifest did not \
-                     supply a description; ask the operator to add one for better tool selection.",
-                    t.tool_name, t.plugin_id, t.latency,
-                )
-            });
-            let schema = t
-                .schema_json
-                .clone()
-                .unwrap_or_else(|| serde_json::json!({"type": "object"}));
-            ToolDeclaration::function(t.tool_name.clone(), description, schema)
+            let d = t.descriptor();
+            ToolDeclaration::function(d.name.clone(), d.description.clone(), d.schema.clone())
         })
         .collect();
+    tool_decls.extend(state.plugin_host.registry().all_tools().iter().map(|t| {
+        let description = t.description.clone().unwrap_or_else(|| {
+            format!(
+                "Plugin tool '{}' from '{}' (latency: {}). The plugin manifest did not \
+                 supply a description; ask the operator to add one for better tool selection.",
+                t.tool_name, t.plugin_id, t.latency,
+            )
+        });
+        let schema = t
+            .schema_json
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+        ToolDeclaration::function(t.tool_name.clone(), description, schema)
+    }));
 
     // Phase-8a: dispatch consults `config_tool_access` for every
     // call, so a tool the operator has restricted to (say)
