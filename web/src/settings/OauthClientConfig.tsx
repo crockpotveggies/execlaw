@@ -273,7 +273,7 @@ export function OauthClientConfig(props: OauthClientConfigProps) {
                             .
                         </div>
                     )}
-                    <div className="d-flex gap-2 mt-2">
+                    <div className="d-flex gap-2 mt-2 flex-wrap">
                         <Button
                             variant="outline-secondary"
                             size="sm"
@@ -281,6 +281,33 @@ export function OauthClientConfig(props: OauthClientConfigProps) {
                             disabled={busy !== null}
                         >
                             Refresh
+                        </Button>
+                        {/*
+                          Re-authorize: re-runs the connect flow even
+                          though tokens already exist. Server's
+                          connect_handler reconciles persisted scopes
+                          against the plugin manifest BEFORE building
+                          the authorize URL, and Google's `prompt=consent`
+                          forces a fresh consent prompt — together they
+                          guarantee the new grant carries any scopes the
+                          plugin gained on upgrade (e.g. google-calendar
+                          v0.1 → v0.2 added `calendar.events`). Without
+                          this button, an operator who connected on an
+                          older manifest had to Disconnect first, which
+                          felt destructive (and is — it briefly drops
+                          access mid-session).
+                        */}
+                        <Button
+                            variant="outline-primary"
+                            size="sm"
+                            onClick={() => void onConnect()}
+                            disabled={busy !== null}
+                            data-testid="reauthorize-button"
+                            title="Re-run the consent flow to grant any new scopes the plugin requires"
+                        >
+                            {busy === "connect"
+                                ? "Opening…"
+                                : "Re-authorize"}
                         </Button>
                         <Button
                             variant="outline-warning"

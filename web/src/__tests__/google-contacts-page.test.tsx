@@ -168,6 +168,15 @@ describe("GoogleContactsPage", () => {
         });
         expect(screen.getByText(/alice@example\.com/)).toBeInTheDocument();
         expect(screen.getByText(/Disconnect/i)).toBeInTheDocument();
+        // Re-authorize button must surface in the connected state —
+        // it's the operator's affordance for re-running the consent
+        // flow when a plugin upgrade adds new scopes (without it,
+        // the only path was Disconnect → Connect, which felt
+        // destructive). Test pins the testid so a future refactor
+        // doesn't quietly drop it.
+        expect(
+            screen.getByTestId("reauthorize-button"),
+        ).toBeInTheDocument();
         // The "needs connect" card must not also be present — the
         // states are mutually exclusive.
         expect(
