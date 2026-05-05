@@ -159,7 +159,11 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
         (t) => !t.is_pinned && t.kind !== "ControllerDM",
     ).length;
 
-    const panels = uiPanels ?? [];
+    // 2026-05-05 — `uiPanels` is still threaded through the prop
+    // for compat with callers (Chat / Settings still fetch the
+    // list) but we no longer render panel entries in the sidebar.
+    // See note inside the More section for why.
+    void uiPanels;
 
     return (
         <aside className="execlaw-sidebar">
@@ -235,9 +239,6 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                         aria-hidden
                     />
                     <span className="execlaw-thread-item__name">More</span>
-                    {panels.length > 0 && (
-                        <span className="execlaw-muted small">{panels.length}</span>
-                    )}
                 </button>
                 {moreExpanded && (
                     <div className="ps-3" data-testid="sidebar-more-panels">
@@ -247,28 +248,17 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                             label="Contacts"
                             testId="sidebar-contacts"
                         />
-                        {panels.length === 0 ? (
-                            <div className="execlaw-muted small px-2 py-1">
-                                No plugin panels installed.
-                            </div>
-                        ) : (
-                            panels.map((p) => (
-                                <Link
-                                    key={p.mount}
-                                    to={`/${p.mount}`}
-                                    className="execlaw-thread-item"
-                                    data-testid="sidebar-panel"
-                                >
-                                    <i
-                                        className="bi bi-puzzle execlaw-muted execlaw-thread-item__icon"
-                                        aria-hidden
-                                    />
-                                    <span className="execlaw-thread-item__name">
-                                        {p.plugin_id}
-                                    </span>
-                                </Link>
-                            ))
-                        )}
+                        {/*
+                          2026-05-05 — plugin UI panels were briefly
+                          rendered here, which broke the established
+                          "plugins are configured via the gear icon
+                          on Settings → Plugins" pattern. Each
+                          plugin's `[[ui_panels]]` declaration now
+                          surfaces only as a `has_settings_ui = true`
+                          flag on the plugins-list row, gating the
+                          gear icon next to the plugin's toggle.
+                          Sidebar panel cluttering retired.
+                        */}
                     </div>
                 )}
             </nav>

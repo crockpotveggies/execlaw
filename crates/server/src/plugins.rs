@@ -59,8 +59,10 @@ pub struct PluginSummary {
     pub updated_at: i64,
     /// True when the plugin's manifest declares any of the
     /// configurable hooks the SPA renders a settings page for —
-    /// today that's just `[[oauth_accounts]]`. The SPA shows a
-    /// gear icon on rows where this is true, navigating to
+    /// either `[[oauth_accounts]]` (existing Google plugins) or
+    /// `[[ui_panels]]` (generic per-plugin React panel mount,
+    /// used by Signal's QR pairing UI). The SPA shows a gear icon
+    /// on rows where this is true, navigating to
     /// `/settings/plugins/{plugin_id}`. Schema-driven
     /// `[[settings_fields]]` lands later and flips this true for
     /// plugins with operator-editable knobs but no OAuth.
@@ -265,6 +267,18 @@ fn sync_after_lifecycle_change(state: &AppState, plugin_id: &str) {
     }
 }
 
+/// Predicate for `PluginSummary.has_settings_ui`. Pulled out so a
+/// small unit test can pin the rule (a manifest with EITHER
+/// `[[oauth_accounts]]` or `[[ui_panels]]` earns the gear icon)
+/// without spinning the full DB-backed list_handler integration.
+///
+/// Pre-2026-05-05 we only checked `oauth_accounts`, so plugins
+/// with a custom panel and no OAuth client (Signal's QR pairing UI)
+/// had no gear icon and the operator had no obvious entry point.
+fn manifest_has_settings_ui(m: &execlaw_plugin_sdk::PluginManifest) -> bool {
+    !m.oauth_accounts.is_empty() || !m.ui_panels.is_empty()
+}
+
 /// `GET /api/admin/plugins`
 #[utoipa::path(
     get,
@@ -290,7 +304,7 @@ pub async fn list_handler(State(state): State<AppState>) -> impl IntoResponse {
                     let parsed = execlaw_plugin_sdk::PluginManifest::parse(&r.manifest_toml).ok();
                     let has_settings_ui = parsed
                         .as_ref()
-                        .map(|m| !m.oauth_accounts.is_empty())
+                        .map(manifest_has_settings_ui)
                         .unwrap_or(false);
                     let description = parsed
                         .as_ref()
@@ -668,6 +682,62 @@ entry = "ui/a.js"
         assert_eq!(panels[0]["mount"], "admin/plugins/a-thing");
         assert_eq!(panels[0]["entry"], "ui/a.js");
         assert_eq!(panels[1]["plugin_id"], "z-thing");
+    }
+
+    /// `manifest_has_settings_ui` decides whether the plugins-list
+    /// row gets a gear icon. Either `[[oauth_accounts]]` OR
+    /// `[[ui_panels]]` qualifies — Signal lands as a `[[ui_panels]]`-
+    /// only plugin and must light up the gear without an OAuth
+    /// client (which it doesn't have).
+    #[test]
+    fn manifest_has_settings_ui_true_for_oauth_or_panels() {
+        let oauth_only = execlaw_plugin_sdk::PluginManifest::parse(
+            r#"
+[plugin]
+id = "oauth-plugin"
+name = "OAuth Plugin"
+version = "1.0.0"
+
+[[oauth_accounts]]
+name = "controller"
+provider = "google"
+"#,
+        )
+        .unwrap();
+        assert!(manifest_has_settings_ui(&oauth_only));
+
+        let panels_only = execlaw_plugin_sdk::PluginManifest::parse(
+            r#"
+[plugin]
+id = "signal"
+name = "Signal"
+version = "0.2.0"
+
+[[ui_panels]]
+mount = "admin/plugins/signal"
+entry = "ui/panel.js"
+"#,
+        )
+        .unwrap();
+        assert!(
+            manifest_has_settings_ui(&panels_only),
+            "ui_panels-only plugins (e.g. Signal) must earn the gear icon",
+        );
+
+        let neither = execlaw_plugin_sdk::PluginManifest::parse(
+            r#"
+[plugin]
+id = "tools-only"
+name = "Tools only"
+version = "1.0.0"
+
+[[tools]]
+name = "noop"
+latency = "low"
+"#,
+        )
+        .unwrap();
+        assert!(!manifest_has_settings_ui(&neither));
     }
 
     /// A plugin with no `[[ui_panels]]` blocks contributes nothing — the

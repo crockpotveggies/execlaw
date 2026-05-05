@@ -199,28 +199,26 @@ describe("Sidebar", () => {
         expect(after[0]).toHaveAttribute("data-thread-id", "ctrl");
     });
 
-    // ---- plugin UI panels under "More" --------------------------------
+    // ---- plugin UI panels are NOT in the sidebar (2026-05-05) ----
+    //
+    // Plugin panels were briefly rendered as nav links under the
+    // "More" expand. That broke the established "configure plugins
+    // via the gear icon on Settings → Plugins" pattern: each
+    // plugin showed up TWICE (once in the plugins list, once in
+    // the sidebar's More section). The tests below pin the fix —
+    // panels declared in `[[ui_panels]]` must NOT surface as
+    // sidebar entries regardless of how many are installed.
 
-    it("expanding More reveals plugin UI panels when supplied", () => {
+    it("plugin panels are NOT rendered in the sidebar even when supplied", () => {
         const panels = [
             { plugin_id: "calendar", mount: "panels/calendar", entry: "ui.js" },
             { plugin_id: "search", mount: "panels/search", entry: "ui.js" },
         ];
         rerender(<Sidebar onNewThread={() => {}} uiPanels={panels} />);
-        // Panels collapsed by default.
+        fireEvent.click(screen.getByTestId("sidebar-more-toggle"));
+        // No panel rows render under More — the gear icon on the
+        // plugins page is the canonical config entry point.
         expect(screen.queryAllByTestId("sidebar-panel")).toHaveLength(0);
-        fireEvent.click(screen.getByTestId("sidebar-more-toggle"));
-        const links = screen.getAllByTestId("sidebar-panel");
-        expect(links).toHaveLength(2);
-        expect(links[0]).toHaveAttribute("href", "/panels/calendar");
-    });
-
-    it("More section shows the empty hint when no panels are installed", () => {
-        rerender(<Sidebar onNewThread={() => {}} uiPanels={[]} />);
-        fireEvent.click(screen.getByTestId("sidebar-more-toggle"));
-        expect(
-            screen.getByText(/no plugin panels installed/i),
-        ).toBeInTheDocument();
     });
 
     // ---- pinning regression tests (2026-04-28) -----------------------
