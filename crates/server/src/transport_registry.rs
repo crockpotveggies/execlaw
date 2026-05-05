@@ -118,6 +118,20 @@ impl HostTransportRegistry {
         bindings: &[TransportBinding],
     ) -> Option<(Arc<dyn TransportApi>, String, String)> {
         for binding in bindings {
+            // Skip group bindings. Auto-bridge sites (text reply,
+            // attachment fan-out, research-PDF dispatch) call
+            // `transport.send(channel, recipient, text)` with the
+            // binding's foreign_id as the recipient. For DMs that's
+            // a phone number signal-cli handles; for groups it's a
+            // base64 group_id that requires a different /v1/send-
+            // group path AND raises the trust question of "should
+            // the agent be implicitly broadcasting to N people?"
+            // Group replies must be explicit — the agent calls
+            // `signal.send_message` with an explicit group target
+            // when it actually means to post in the group.
+            if binding.is_group {
+                continue;
+            }
             let factory = match self.by_channel.get(&binding.channel) {
                 Some(f) => f,
                 None => continue,
@@ -314,6 +328,37 @@ mod tests {
         let mut names: Vec<&str> = r.channels().collect();
         names.sort();
         assert_eq!(names, vec!["email", "signal"]);
+    }
+
+    #[test]
+    fn registry_skips_group_bindings() {
+        // Auto-bridge sites only handle DM-shaped sends (the
+        // transport's `send(recipient, text)` path). Group sends
+        // need explicit agent intent and a different signal-cli
+        // endpoint. Pin the skip so a future refactor doesn't
+        // accidentally try to broadcast the agent's text reply to
+        // every group member.
+        let mut r = HostTransportRegistry::new();
+        let (sf, sb, _) = CountingFactory::new("signal");
+        r.register(Arc::new(sf));
+        let db = fresh_db();
+        let cid = ConversationId::from("c-1");
+        // Only a group binding present → registry skips it,
+        // returns None.
+        let mut group_binding = b("signal", "BASE64_GROUP_ID");
+        group_binding.is_group = true;
+        let got = r.build_for_first_supported_binding(&db, &cid, &[group_binding]);
+        assert!(got.is_none(), "group bindings must be skipped");
+        assert_eq!(sb.load(Ordering::Relaxed), 0);
+
+        // Mixed: group first, DM second → DM wins.
+        let mut group_first = b("signal", "GROUP_X");
+        group_first.is_group = true;
+        let dm = b("signal", "+15551234567");
+        let got =
+            r.build_for_first_supported_binding(&db, &cid, &[group_first, dm]);
+        assert!(got.is_some());
+        assert_eq!(got.unwrap().2, "+15551234567");
     }
 
     #[test]

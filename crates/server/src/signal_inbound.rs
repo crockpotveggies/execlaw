@@ -1074,28 +1074,36 @@ async fn route_group_inbound(
         }
     };
 
-    // 2. Resolve or mint the SENDER's principal. The binding doesn't
-    //    point here — we just need the principal row for trust
-    //    evaluation + the user_msg event's sender field.
-    let sender_pid = signal_principal_id(&msg.source_number);
-    let sender = match principals
-        .get(&sender_pid)
-        .map_err(|e| format!("sender principal get: {e}"))?
+    // 2. Resolve or mint the SENDER's principal via the shared
+    //    admit helper. Pre-fix we just derived `pri_signal_<phone>`
+    //    and minted UnknownPending, which meant a controller posting
+    //    in a group-they're-in (their own number registered in
+    //    "My identities") landed as a cold contact instead of being
+    //    recognized. The helper now handles every lookup path:
+    //      * principal-by-id (returning sender)
+    //      * principal-by-identifier (controller via "My identities"
+    //        — the missing piece for groups)
+    //      * Trust-policy plugin admit (Google Contacts etc.)
+    //      * UnknownPending mint when nothing matches.
+    let hint_pid = signal_principal_id(&msg.source_number);
+    let (sender, _flat_trust) = crate::principal_admit::admit_external_principal(
+        &state.db,
+        &state.plugin_host,
+        SIGNAL_CHANNEL,
+        &msg.source_number,
+        hint_pid.as_str(),
+    )
+    .await
+    .map_err(|e| format!("admit group sender: {e}"))?;
+    // Bump last_seen so dashboards reflect activity. The helper
+    // already wrote the row on a fresh mint; for the by-id /
+    // by-identifier hit paths the row exists with the wrong
+    // last_seen. Best-effort upsert.
     {
-        Some(p) => {
-            let mut updated = p.clone();
-            updated.last_seen = Some(now);
-            let _ = principals.upsert(&updated);
-            updated
-        }
-        None => {
-            let p = mint_unknown_principal(&sender_pid, msg, now);
-            principals
-                .upsert(&p)
-                .map_err(|e| format!("sender principal mint: {e}"))?;
-            p
-        }
-    };
+        let mut updated = sender.clone();
+        updated.last_seen = Some(now);
+        let _ = principals.upsert(&updated);
+    }
 
     // 3. Resolve / mint the conversation. Keyed by GROUP, not
     //    sender, so all members' posts share one thread.
