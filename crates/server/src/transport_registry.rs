@@ -63,19 +63,28 @@ pub trait HostTransportFactory: Send + Sync {
     fn channel(&self) -> &str;
 
     /// Build a [`TransportApi`] scoped to one conversation +
-    /// recipient. Failures are rare (resolver refused, transport
-    /// disabled mid-call) — the caller treats `None` as "no
-    /// transport available right now," skips the bridge, and
-    /// continues. The caller already committed any web-side
-    /// surfaces (card pair / model_turn) so a missed bridge
-    /// degrades gracefully rather than failing the user-visible
-    /// flow.
+    /// recipient. Returns `(transport, wire_recipient)` —
+    /// `wire_recipient` is the recipient string callers should pass
+    /// to `transport.send` / `transport.send_with_attachments` /
+    /// `transport.start_typing`. The factory transforms the binding's
+    /// `foreign_id` for the on-wire format if needed (e.g.
+    /// signal-cli's group recipient is the binding's `internal_id`
+    /// re-base64-encoded with a `group.` prefix; DM recipients pass
+    /// through unchanged).
+    ///
+    /// Failures are rare (resolver refused, transport disabled
+    /// mid-call) — the caller treats `None` as "no transport
+    /// available right now," skips the bridge, and continues. The
+    /// caller already committed any web-side surfaces (card pair /
+    /// model_turn) so a missed bridge degrades gracefully rather
+    /// than failing the user-visible flow.
     fn build(
         &self,
         db: &Database,
         conversation_id: &ConversationId,
         foreign_id: &str,
-    ) -> Option<Arc<dyn TransportApi>>;
+        is_group: bool,
+    ) -> Option<(Arc<dyn TransportApi>, String)>;
 }
 
 /// The registry. Cheap to clone (every entry is `Arc`). Plant on
@@ -101,13 +110,19 @@ impl HostTransportRegistry {
 
     /// Walk `bindings` in order and return a transport for the
     /// first binding whose channel has a registered factory. The
-    /// per-binding `foreign_id` flows into [`HostTransportFactory::build`]
-    /// so transports that key on recipient (signal-cli's
-    /// per-message addressing) get it without the bridge site
-    /// having to thread it.
+    /// per-binding `foreign_id` and `is_group` flag flow into
+    /// [`HostTransportFactory::build`] so transports that key on
+    /// recipient (signal-cli's per-message addressing) get them
+    /// without the bridge site having to thread them.
     ///
-    /// Returns `(transport, foreign_id)` so the caller can dispatch
-    /// straight to `transport.send(channel, foreign_id, text)`.
+    /// Returns `(transport, channel, wire_recipient)` so the caller
+    /// can dispatch straight to
+    /// `transport.send(channel, wire_recipient, text)`. The factory
+    /// is responsible for transforming `foreign_id` to the on-wire
+    /// recipient format when required by the transport (e.g.
+    /// signal-cli expects the `group.<base64>` form for groups, not
+    /// the binding's `internal_id` form).
+    ///
     /// `None` when none of the conversation's bindings have a
     /// registered transport (web-only conversation, transport
     /// plugin not installed).
@@ -118,28 +133,14 @@ impl HostTransportRegistry {
         bindings: &[TransportBinding],
     ) -> Option<(Arc<dyn TransportApi>, String, String)> {
         for binding in bindings {
-            // Skip group bindings. Auto-bridge sites (text reply,
-            // attachment fan-out, research-PDF dispatch) call
-            // `transport.send(channel, recipient, text)` with the
-            // binding's foreign_id as the recipient. For DMs that's
-            // a phone number signal-cli handles; for groups it's a
-            // base64 group_id that requires a different /v1/send-
-            // group path AND raises the trust question of "should
-            // the agent be implicitly broadcasting to N people?"
-            // Group replies must be explicit — the agent calls
-            // `signal.send_message` with an explicit group target
-            // when it actually means to post in the group.
-            if binding.is_group {
-                continue;
-            }
             let factory = match self.by_channel.get(&binding.channel) {
                 Some(f) => f,
                 None => continue,
             };
-            if let Some(transport) =
-                factory.build(db, conversation_id, &binding.foreign_id)
+            if let Some((transport, wire_recipient)) =
+                factory.build(db, conversation_id, &binding.foreign_id, binding.is_group)
             {
-                return Some((transport, binding.channel.clone(), binding.foreign_id.clone()));
+                return Some((transport, binding.channel.clone(), wire_recipient));
             }
         }
         None
@@ -235,10 +236,19 @@ mod tests {
             _db: &Database,
             _cid: &ConversationId,
             foreign_id: &str,
-        ) -> Option<Arc<dyn TransportApi>> {
+            is_group: bool,
+        ) -> Option<(Arc<dyn TransportApi>, String)> {
             self.builds.fetch_add(1, Ordering::Relaxed);
             *self.last_recipient.lock().unwrap() = Some(foreign_id.to_owned());
-            Some(Arc::new(StubTransport))
+            // Mock the signal-cli "encode group ids as group.<b64>"
+            // transformation so tests can pin both passthrough and
+            // transformed recipients.
+            let wire = if is_group {
+                format!("GROUP_OF:{foreign_id}")
+            } else {
+                foreign_id.to_owned()
+            };
+            Some((Arc::new(StubTransport), wire))
         }
     }
 
@@ -331,34 +341,36 @@ mod tests {
     }
 
     #[test]
-    fn registry_skips_group_bindings() {
-        // Auto-bridge sites only handle DM-shaped sends (the
-        // transport's `send(recipient, text)` path). Group sends
-        // need explicit agent intent and a different signal-cli
-        // endpoint. Pin the skip so a future refactor doesn't
-        // accidentally try to broadcast the agent's text reply to
-        // every group member.
+    fn registry_passes_is_group_flag_to_factory() {
+        // Group bindings and DM bindings both flow through the
+        // registry; the factory is responsible for transforming the
+        // foreign_id into the on-wire recipient format. Pin that
+        // (a) groups are not skipped, and (b) the factory's wire
+        // recipient propagates back through the registry.
         let mut r = HostTransportRegistry::new();
         let (sf, sb, _) = CountingFactory::new("signal");
         r.register(Arc::new(sf));
         let db = fresh_db();
         let cid = ConversationId::from("c-1");
-        // Only a group binding present → registry skips it,
-        // returns None.
-        let mut group_binding = b("signal", "BASE64_GROUP_ID");
+
+        // DM binding → recipient passes through unchanged.
+        let dm = b("signal", "+15551234567");
+        let got = r.build_for_first_supported_binding(&db, &cid, &[dm]);
+        assert!(got.is_some());
+        let (_t, ch, wire) = got.unwrap();
+        assert_eq!(ch, "signal");
+        assert_eq!(wire, "+15551234567");
+
+        // Group binding → factory transforms foreign_id (mock uses
+        // a `GROUP_OF:` prefix; the real Signal factory base64-
+        // encodes the bytes and prefixes `group.`).
+        let mut group_binding = b("signal", "BASE64_INTERNAL_ID");
         group_binding.is_group = true;
         let got = r.build_for_first_supported_binding(&db, &cid, &[group_binding]);
-        assert!(got.is_none(), "group bindings must be skipped");
-        assert_eq!(sb.load(Ordering::Relaxed), 0);
-
-        // Mixed: group first, DM second → DM wins.
-        let mut group_first = b("signal", "GROUP_X");
-        group_first.is_group = true;
-        let dm = b("signal", "+15551234567");
-        let got =
-            r.build_for_first_supported_binding(&db, &cid, &[group_first, dm]);
         assert!(got.is_some());
-        assert_eq!(got.unwrap().2, "+15551234567");
+        let (_t, _ch, wire) = got.unwrap();
+        assert_eq!(wire, "GROUP_OF:BASE64_INTERNAL_ID");
+        assert_eq!(sb.load(Ordering::Relaxed), 2);
     }
 
     #[test]

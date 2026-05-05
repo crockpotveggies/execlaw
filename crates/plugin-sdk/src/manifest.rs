@@ -1031,7 +1031,7 @@ mod tests {
         let m = PluginManifest::parse(SIGNAL_MANIFEST)
             .expect("plugins/signal/plugin.toml must parse cleanly");
         assert_eq!(m.plugin.id, "signal");
-        assert_eq!(m.plugin.version, "0.3.4");
+        assert_eq!(m.plugin.version, "0.3.5");
         // Six tools mirror the selfhosted-claw integration. If we
         // add or remove one, this assertion forces a deliberate
         // update — the audit doc should stay in sync.

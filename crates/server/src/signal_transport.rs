@@ -1036,7 +1036,34 @@ impl crate::transport_registry::HostTransportFactory for SignalCliTransportFacto
         db: &execlaw_core::Database,
         conversation_id: &execlaw_core::ids::ConversationId,
         foreign_id: &str,
-    ) -> Option<std::sync::Arc<dyn execlaw_core::tool::TransportApi>> {
+        is_group: bool,
+    ) -> Option<(
+        std::sync::Arc<dyn execlaw_core::tool::TransportApi>,
+        String,
+    )> {
+        // Wire-recipient transformation: signal-cli's inbound
+        // `groupInfo.groupId` (= `internal_id`) is single-base64.
+        // The /v2/send `recipients` field rejects that form and
+        // requires the longer outbound `id` form, which is
+        // `group.` + base64-of-bytes-of-internal-id (verified by
+        // probing /v1/groups: the same conceptual group_id appears
+        // as both `internal_id: "raw_b64"` and `id: "group.<b64-of-
+        // raw_b64-bytes>"`). Without this transform every auto-
+        // bridge to a Signal group silently 400s with "Failed to
+        // send message" and the contact never sees the agent's
+        // reply.
+        //
+        // DM recipients (E.164 phone numbers, signal:user:<uuid>
+        // jids) pass through unchanged.
+        let wire_recipient = if is_group {
+            use base64::Engine;
+            format!(
+                "group.{}",
+                base64::engine::general_purpose::STANDARD.encode(foreign_id.as_bytes())
+            )
+        } else {
+            foreign_id.to_owned()
+        };
         let transport = SignalCliTransport::new(
             self.resolver.clone(),
             db.clone(),
@@ -1045,10 +1072,10 @@ impl crate::transport_registry::HostTransportFactory for SignalCliTransportFacto
             // `/v1/accounts` when this is None — the common case
             // post-pairing.
             SignalCliTransport::read_self_number_from_env(),
-            Some(foreign_id.to_owned()),
+            Some(wire_recipient.clone()),
         )
         .with_caller_conversation_id(conversation_id.clone());
-        Some(std::sync::Arc::new(transport))
+        Some((std::sync::Arc::new(transport), wire_recipient))
     }
 }
 
@@ -2073,5 +2100,66 @@ mod tests {
         assert!(matches!(err, ApiError::NotFound(_)));
         // No HTTP call fired.
         assert_eq!(mock.recorded.lock().unwrap().len(), 0);
+    }
+
+    // ---- HostTransportFactory: group recipient encoding ------------
+
+    /// Pin the inbound→outbound group_id transformation. signal-cli's
+    /// inbound `groupInfo.groupId` is the single-base64 `internal_id`,
+    /// which the binding store persists verbatim. Outbound /v2/send
+    /// `recipients` rejects that form and requires the longer `id`
+    /// shape — `group.` + base64-of-bytes-of-internal-id. Without
+    /// this transform, every auto-bridge to a Signal group silently
+    /// 400s with "Failed to send message" and the contact never sees
+    /// the agent's reply (the regression the operator hit on
+    /// 2026-05-05). Pinning so a future refactor can't quietly drop
+    /// it again.
+    #[test]
+    fn factory_encodes_group_recipient_with_double_base64_and_group_prefix() {
+        use crate::transport_registry::HostTransportFactory;
+        use base64::Engine;
+        let resolver = Arc::new(StaticEndpointResolver("http://nowhere".into()));
+        let factory = SignalCliTransportFactory::new(resolver);
+        let db = fresh_db();
+        let cid = execlaw_core::ids::ConversationId::from("c-1");
+
+        // The exact internal_id form the inbound consumer wrote
+        // into state_transport_bindings when route_group_inbound
+        // landed (mirrors the signal-cli /v1/groups response's
+        // `internal_id` field).
+        let internal_id = "KrOVgwZ5mWq17pGg1W5rmx/BW+Uun6pCT41o7EfiHbA=";
+
+        let (_t, wire_recipient) = factory
+            .build(&db, &cid, internal_id, true)
+            .expect("factory must mint a transport for a group binding");
+        let expected = format!(
+            "group.{}",
+            base64::engine::general_purpose::STANDARD.encode(internal_id.as_bytes())
+        );
+        assert_eq!(wire_recipient, expected);
+        assert!(wire_recipient.starts_with("group."));
+    }
+
+    /// DM bindings (E.164 phone, signal:user:<uuid>) must NOT be
+    /// reshaped — signal-cli expects the raw recipient string for
+    /// 1:1 sends. Pin the no-op so the group transform never grows
+    /// to also touch DMs.
+    #[test]
+    fn factory_passes_dm_recipient_through_unchanged() {
+        use crate::transport_registry::HostTransportFactory;
+        let resolver = Arc::new(StaticEndpointResolver("http://nowhere".into()));
+        let factory = SignalCliTransportFactory::new(resolver);
+        let db = fresh_db();
+        let cid = execlaw_core::ids::ConversationId::from("c-1");
+
+        let (_t, wire) = factory
+            .build(&db, &cid, "+15551234567", false)
+            .expect("factory must mint for DM");
+        assert_eq!(wire, "+15551234567");
+
+        let (_t, wire) = factory
+            .build(&db, &cid, "signal:user:abcdef-uuid", false)
+            .expect("factory must mint for jid");
+        assert_eq!(wire, "signal:user:abcdef-uuid");
     }
 }
