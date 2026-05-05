@@ -145,8 +145,22 @@ impl ResearchWorkspace {
         // YYYY-MM-DD format. Falls back to a sanitised version of
         // the `title` parameter when the markdown has no usable H1.
         let stem = derive_report_filename_stem(markdown, title);
-        let date = chrono::Utc::now().format("%Y-%m-%d");
-        let filename = format!("{stem}-{date}.pdf");
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        // 2026-05-04 — filename collision suffix. Each research
+        // job gets its own per-job_id workspace dir, so two jobs
+        // never write to the same on-disk path. But the FILENAME
+        // (the part the browser uses as the save-as default via
+        // `Content-Disposition: attachment; filename=…`) is shared
+        // when the same topic is researched twice on the same day —
+        // operator's Downloads folder ends up with two `best-
+        // evergreen-ground-covers-2026-05-04.pdf` clones (or worse,
+        // a silent overwrite if the browser doesn't dedup). Walk
+        // the workspace root once and append " (2)", " (3)", …
+        // until we find a stem nobody else has used. The check is
+        // O(n) over per-job dirs, which is fine — synthesise runs
+        // exactly once per job and the workspace is bounded by the
+        // retention sweeper.
+        let filename = unique_report_filename(&self.root, &stem, &date);
         let path = dir.join(filename);
         render_markdown_to_pdf(markdown, title, &path)
             .map_err(|e| WorkspaceError::Encoding(format!("pdf render: {e}")))?;
@@ -182,7 +196,10 @@ impl ResearchWorkspace {
 // Phase D PDF rendering — pure-Rust markdown subset → PDF
 // -----------------------------------------------------------------
 
-use printpdf::{BuiltinFont, IndirectFontRef, Mm, PdfDocument, PdfDocumentReference, PdfLayerReference, PdfPageIndex};
+use printpdf::{
+    BuiltinFont, IndirectFontRef, Mm, PdfDocument, PdfDocumentReference, PdfLayerReference,
+    PdfPageIndex,
+};
 
 const PAGE_W: f32 = 216.0; // mm — US Letter
 const PAGE_H: f32 = 279.0;
@@ -280,7 +297,11 @@ fn render_markdown_to_pdf(
         let text_pdf_safe = normalise_for_winansi(&text);
 
         // Word-wrap and emit each visual line.
-        let wrap_w = if size >= 14.0 { WRAP_WIDTH * 7 / 10 } else { WRAP_WIDTH };
+        let wrap_w = if size >= 14.0 {
+            WRAP_WIDTH * 7 / 10
+        } else {
+            WRAP_WIDTH
+        };
         for visual in textwrap::wrap(&text_pdf_safe, wrap_w) {
             if y - line_h < MARGIN_BOTTOM {
                 let (np, nl) = doc.add_page(Mm(PAGE_W), Mm(PAGE_H), "Layer");
@@ -381,6 +402,64 @@ fn derive_report_filename_stem(markdown: &str, title: &str) -> String {
     stem
 }
 
+/// Build a unique-across-the-workspace report filename of the form
+/// `{stem}-{date}.pdf`, appending ` (2)`, ` (3)`, … to the stem when
+/// an existing report already used that name. Each research job
+/// gets its own per-job_id subdir under `root`, so the same
+/// filename won't *overwrite* anything on disk — but the
+/// `Content-Disposition` filename the operator's browser sees is
+/// just the basename, so two reports with the same `{stem}-{date}`
+/// would land in the operator's Downloads folder as duplicates
+/// (or be silently clobbered, depending on the browser's dedup).
+///
+/// Walks `root`'s direct children (each is a per-job dir) once and
+/// collects the set of `.pdf` filenames in use. The check is O(n)
+/// in the number of per-job dirs; the retention sweeper bounds
+/// that count, and synthesise runs exactly once per job, so the
+/// extra IO is negligible.
+fn unique_report_filename(root: &Path, stem: &str, date: &str) -> String {
+    let candidate = |i: usize| -> String {
+        if i == 1 {
+            format!("{stem}-{date}.pdf")
+        } else {
+            format!("{stem} ({i})-{date}.pdf")
+        }
+    };
+    // Best-effort directory walk. If the workspace root doesn't
+    // exist yet (first-ever synthesise call), the iterator is
+    // empty and the first-suffix candidate is returned.
+    let existing: std::collections::HashSet<String> = match std::fs::read_dir(root) {
+        Ok(it) => it
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .flat_map(|e| std::fs::read_dir(e.path()).into_iter().flatten())
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().map(|s| s.to_owned()))
+            .filter(|n| n.ends_with(".pdf"))
+            .collect(),
+        Err(_) => std::collections::HashSet::new(),
+    };
+    let mut i = 1usize;
+    loop {
+        let name = candidate(i);
+        if !existing.contains(&name) {
+            return name;
+        }
+        i += 1;
+        // Defence-in-depth bound — pathological case where
+        // thousands of same-topic-same-day reports exist would
+        // still terminate. 1000 is well above any reasonable
+        // operator workflow.
+        if i > 1000 {
+            // Fall back to a millisecond-precision suffix so we
+            // never spin forever; almost-impossible to reach in
+            // practice.
+            let ms = chrono::Utc::now().timestamp_millis();
+            return format!("{stem}-{date}-{ms}.pdf");
+        }
+    }
+}
+
 /// Pull the first `# Heading` line out of a markdown document.
 /// Returns None if the doc has no level-1 heading. We deliberately
 /// only consider H1 (not H2) because synthesised reports always
@@ -438,18 +517,18 @@ pub fn normalise_for_winansi(s: &str) -> String {
             // Quotes
             '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => out.push('\''), // single quote variants
             '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => out.push('"'), // double quote variants
-            '\u{2032}' => out.push('\''), // prime
-            '\u{2033}' => out.push('"'),  // double prime
+            '\u{2032}' => out.push('\''),                                       // prime
+            '\u{2033}' => out.push('"'),                                        // double prime
 
             // Spaces + invisible
             '\u{00A0}' | '\u{2007}' | '\u{2009}' | '\u{200A}' | '\u{202F}' => out.push(' '), // various spaces
-            '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' => {}                          // zero-width chars: drop
-            '\u{2028}' | '\u{2029}' => out.push('\n'),                                       // line separator / paragraph separator
+            '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' => {} // zero-width chars: drop
+            '\u{2028}' | '\u{2029}' => out.push('\n'), // line separator / paragraph separator
 
             // Punctuation
             '\u{2026}' => out.push_str("..."), // ellipsis
             '\u{2022}' | '\u{2023}' | '\u{25E6}' | '\u{2043}' => out.push('*'), // bullets
-            '\u{00B7}' => out.push('-'), // middle dot
+            '\u{00B7}' => out.push('-'),       // middle dot
             '\u{00B0}' => out.push_str("deg"), // degree sign
 
             // Arrows
@@ -575,7 +654,12 @@ fn strip_emphasis(s: &str) -> String {
 // Type aliases used only to keep the public function signature
 // readable; nothing depends on them externally.
 #[allow(dead_code)]
-type _PdfRefs = (PdfDocumentReference, PdfPageIndex, PdfLayerReference, IndirectFontRef);
+type _PdfRefs = (
+    PdfDocumentReference,
+    PdfPageIndex,
+    PdfLayerReference,
+    IndirectFontRef,
+);
 
 #[cfg(test)]
 mod tests {
@@ -708,7 +792,10 @@ mod tests {
         }
         let path = ws.write_report_pdf(&id, &long, "Long report").unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        assert!(bytes.len() > 5000, "multi-page pdf should be substantially bigger");
+        assert!(
+            bytes.len() > 5000,
+            "multi-page pdf should be substantially bigger"
+        );
     }
 
     /// 2026-05-04 — header rendering covers h1 through h6 (was:
@@ -809,6 +896,63 @@ mod tests {
         assert_eq!(stem, "research-report");
     }
 
+    /// 2026-05-04 — filename collision suffix. Two research jobs on
+    /// the same topic the same day must produce DIFFERENT on-disk
+    /// filenames so the operator's downloads folder doesn't end up
+    /// with two identically-named PDFs. Each job has its own per-
+    /// job_id workspace dir, so on-disk paths don't clobber, but the
+    /// `Content-Disposition` filename uses just the basename.
+    #[test]
+    fn write_report_pdf_appends_suffix_on_filename_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = ResearchWorkspace::new(tmp.path());
+        let md = "# Best Evergreen Ground Covers\n\nBody.";
+
+        let id1 = ResearchJobId::new();
+        let p1 = ws
+            .write_report_pdf(&id1, md, "Research report — first")
+            .unwrap();
+        let n1 = p1.file_name().unwrap().to_string_lossy().into_owned();
+
+        let id2 = ResearchJobId::new();
+        let p2 = ws
+            .write_report_pdf(&id2, md, "Research report — second")
+            .unwrap();
+        let n2 = p2.file_name().unwrap().to_string_lossy().into_owned();
+
+        let id3 = ResearchJobId::new();
+        let p3 = ws
+            .write_report_pdf(&id3, md, "Research report — third")
+            .unwrap();
+        let n3 = p3.file_name().unwrap().to_string_lossy().into_owned();
+
+        assert_ne!(
+            n1, n2,
+            "second report must have a unique filename: {n1} vs {n2}"
+        );
+        assert_ne!(n1, n3, "third report must also be unique: {n1} vs {n3}");
+        assert_ne!(n2, n3, "third must be unique from second: {n2} vs {n3}");
+
+        // Suffix scheme: " (2)", " (3)", … injected before the date.
+        assert!(n1.starts_with("best-evergreen-"), "got {n1}");
+        assert!(n2.contains("(2)"), "second filename must contain (2): {n2}");
+        assert!(n3.contains("(3)"), "third filename must contain (3): {n3}");
+    }
+
+    #[test]
+    fn unique_report_filename_returns_bare_stem_when_root_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let name = super::unique_report_filename(tmp.path(), "alpha", "2026-05-04");
+        assert_eq!(name, "alpha-2026-05-04.pdf");
+    }
+
+    #[test]
+    fn unique_report_filename_returns_bare_stem_when_root_does_not_exist() {
+        let nonexistent = std::path::PathBuf::from("Z:\\does-not-exist-on-purpose");
+        let name = super::unique_report_filename(&nonexistent, "alpha", "2026-05-04");
+        assert_eq!(name, "alpha-2026-05-04.pdf");
+    }
+
     #[test]
     fn write_report_pdf_uses_friendly_filename_with_date() {
         let tmp = tempfile::tempdir().unwrap();
@@ -842,14 +986,20 @@ mod tests {
         let input = "Recommend evergreen ground covers – the survey";
         let out = normalise_for_winansi(input);
         assert!(!out.contains('\u{2013}'), "en-dash must be replaced");
-        assert!(out.contains(" - "), "should be replaced with ASCII hyphen, got {out:?}");
+        assert!(
+            out.contains(" - "),
+            "should be replaced with ASCII hyphen, got {out:?}"
+        );
     }
 
     #[test]
     fn normalise_for_winansi_handles_em_dash_with_double_hyphen() {
         let input = "first — second";
         let out = normalise_for_winansi(input);
-        assert!(out.contains(" -- "), "em-dash should become double-hyphen, got {out:?}");
+        assert!(
+            out.contains(" -- "),
+            "em-dash should become double-hyphen, got {out:?}"
+        );
     }
 
     #[test]

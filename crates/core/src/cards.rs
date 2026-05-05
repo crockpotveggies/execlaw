@@ -34,14 +34,21 @@
 //!
 //! 2026-04-29.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Card type discriminator. The web SPA's renderer registry keys on
 /// this. Plugins can register additional kinds via the SDK's
 /// `register_card_kind` call (forthcoming alongside the SDK's
 /// programmatic-tool builder); the host treats unknown kinds as
 /// `LongRunningTask` to keep the catalog stable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Wire form is snake_case (`"research"`, `"long_running_task"`, …) —
+/// matched verbatim by the SPA's renderer registry. The custom
+/// Serialize / Deserialize impls below emit snake_case and accept
+/// BOTH snake_case and the legacy default-serde PascalCase
+/// (`"Research"`) so older rmp-encoded event-log rows still
+/// project cleanly after the format change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CardKind {
     /// Generic catch-all. Use this when no more specific kind
     /// applies — the SPA renders a basic progress card with title,
@@ -81,16 +88,29 @@ impl CardKind {
 
     pub fn parse(s: &str) -> Self {
         match s {
-            "long_running_task" => Self::LongRunningTask,
-            "research" => Self::Research,
-            "shell_session" => Self::ShellSession,
-            "file_pipeline" => Self::FilePipeline,
-            "attachment" => Self::Attachment,
+            "long_running_task" | "LongRunningTask" => Self::LongRunningTask,
+            "research" | "Research" => Self::Research,
+            "shell_session" | "ShellSession" => Self::ShellSession,
+            "file_pipeline" | "FilePipeline" => Self::FilePipeline,
+            "attachment" | "Attachment" => Self::Attachment,
             // Unknown kind from the wire — render as the generic
             // catch-all so the SPA still shows progress without the
             // operator seeing a broken-render placeholder.
             _ => Self::LongRunningTask,
         }
+    }
+}
+
+impl Serialize for CardKind {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for CardKind {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(Self::parse(&s))
     }
 }
 
@@ -157,7 +177,9 @@ pub enum CardAction {
     /// Generic "open detail" affordance — for cards backed by a
     /// dedicated page (e.g. `/research/<job_id>`), this carries the
     /// path the SPA navigates to.
-    OpenDetail { href: String },
+    OpenDetail {
+        href: String,
+    },
 }
 
 impl CardAction {
@@ -400,10 +422,7 @@ impl Card {
     /// `None` if the event isn't an Opened (the projection layer
     /// should never call this with a Progressed/Closed before an
     /// Opened, but the defensive shape avoids a panic).
-    pub fn from_opened(
-        conversation_id: impl Into<String>,
-        ev: &CardEvent,
-    ) -> Option<Self> {
+    pub fn from_opened(conversation_id: impl Into<String>, ev: &CardEvent) -> Option<Self> {
         match ev {
             CardEvent::Opened(p, ts) => Some(Self {
                 card_id: p.card_id.clone(),
@@ -555,7 +574,10 @@ mod tests {
         // A future plugin emitting an unrecognised kind must NOT
         // crash the SPA / projection — fall back to the generic
         // renderer.
-        assert_eq!(CardKind::parse("ai_pipelining_with_jazz"), CardKind::LongRunningTask);
+        assert_eq!(
+            CardKind::parse("ai_pipelining_with_jazz"),
+            CardKind::LongRunningTask
+        );
         assert_eq!(CardKind::parse(""), CardKind::LongRunningTask);
     }
 
@@ -599,8 +621,7 @@ mod tests {
 
     #[test]
     fn apply_progressed_merges_state_progress_and_phase() {
-        let mut card =
-            Card::from_opened("c1", &opened("a", CardKind::LongRunningTask)).unwrap();
+        let mut card = Card::from_opened("c1", &opened("a", CardKind::LongRunningTask)).unwrap();
         let ev = CardEvent::Progressed(
             CardProgressedPayload {
                 card_id: "a".into(),
@@ -623,8 +644,7 @@ mod tests {
 
     #[test]
     fn apply_progress_clamps_to_zero_one() {
-        let mut card =
-            Card::from_opened("c1", &opened("a", CardKind::LongRunningTask)).unwrap();
+        let mut card = Card::from_opened("c1", &opened("a", CardKind::LongRunningTask)).unwrap();
         card.apply(&progress("a", 1.5, None, 200));
         assert_eq!(card.progress, Some(1.0));
         card.apply(&progress("a", -0.3, None, 300));
@@ -633,8 +653,7 @@ mod tests {
 
     #[test]
     fn apply_with_wrong_card_id_is_a_no_op() {
-        let mut card =
-            Card::from_opened("c1", &opened("a", CardKind::LongRunningTask)).unwrap();
+        let mut card = Card::from_opened("c1", &opened("a", CardKind::LongRunningTask)).unwrap();
         let original = card.clone();
         let ev = progress("DIFFERENT", 0.9, None, 999);
         assert!(!card.apply(&ev));
@@ -643,8 +662,7 @@ mod tests {
 
     #[test]
     fn apply_closed_writes_terminal_state_and_summary() {
-        let mut card =
-            Card::from_opened("c1", &opened("a", CardKind::Research)).unwrap();
+        let mut card = Card::from_opened("c1", &opened("a", CardKind::Research)).unwrap();
         card.apply(&progress("a", 0.4, Some("Gathering"), 200));
         let ev = CardEvent::Closed(
             CardClosedPayload {
@@ -667,8 +685,7 @@ mod tests {
 
     #[test]
     fn apply_failed_carries_error_message() {
-        let mut card =
-            Card::from_opened("c1", &opened("a", CardKind::LongRunningTask)).unwrap();
+        let mut card = Card::from_opened("c1", &opened("a", CardKind::LongRunningTask)).unwrap();
         let ev = CardEvent::Closed(
             CardClosedPayload {
                 card_id: "a".into(),
@@ -687,8 +704,7 @@ mod tests {
 
     #[test]
     fn apply_full_sequence_replays_to_final_state() {
-        let mut card =
-            Card::from_opened("c1", &opened("a", CardKind::Research)).unwrap();
+        let mut card = Card::from_opened("c1", &opened("a", CardKind::Research)).unwrap();
         for ev in [
             progress("a", 0.1, Some("Planning"), 110),
             progress("a", 0.4, Some("Gathering"), 200),
@@ -738,5 +754,40 @@ mod tests {
     fn default_policy_is_silent() {
         // Default for SMS / WhatsApp / voice.
         assert_eq!(CardUpdatePolicy::default(), CardUpdatePolicy::Silent);
+    }
+
+    /// 2026-05-04: `Card`'s JSON wire form (used by
+    /// `GET /api/chats/:id/cards` for SPA hydration after refresh)
+    /// must emit `kind` as snake_case so it matches the SPA's
+    /// renderer registry keys (`"research"`, `"long_running_task"`,
+    /// …). Default-derived serde would emit `"Research"` PascalCase
+    /// and the SPA would fall back to `LongRunningTaskCard`, hiding
+    /// the ResearchCard's inline Download button on every refresh.
+    #[test]
+    fn cardkind_json_is_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&CardKind::Research).unwrap(),
+            "\"research\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CardKind::LongRunningTask).unwrap(),
+            "\"long_running_task\"",
+        );
+        assert_eq!(
+            serde_json::to_string(&CardKind::Attachment).unwrap(),
+            "\"attachment\""
+        );
+    }
+
+    /// Round-trip across both wire forms — the SPA emits snake_case
+    /// (matching `as_str()`), but legacy rmp-encoded event-log rows
+    /// written before this change carry PascalCase. Deserialize must
+    /// accept BOTH so historic rows still project.
+    #[test]
+    fn cardkind_deserialize_accepts_both_snake_and_pascal_case() {
+        let snake: CardKind = serde_json::from_str("\"research\"").unwrap();
+        assert_eq!(snake, CardKind::Research);
+        let pascal: CardKind = serde_json::from_str("\"Research\"").unwrap();
+        assert_eq!(pascal, CardKind::Research);
     }
 }
