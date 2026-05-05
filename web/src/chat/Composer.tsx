@@ -16,6 +16,16 @@ import { VoiceCaptureButton } from "./VoiceCaptureButton";
 
 interface Props {
     disabled?: boolean;
+    /**
+     * Channel name (e.g. "signal") when this thread is bridged to a
+     * non-web transport. Drops the textarea/send/mic chrome entirely
+     * and renders a "Thread is managed on …" notice instead — the
+     * operator's outbound on a Signal-bridged thread MUST flow
+     * through Signal itself, not the web composer.
+     *
+     * `null` / `undefined` for normal web threads.
+     */
+    bridgedChannel?: string | null;
     onSend: (text: string) => Promise<void> | void;
     /**
      * Phase 13.A — voice-mode wire. Returns true when the bytes
@@ -59,6 +69,7 @@ interface Props {
 
 export function Composer({
     disabled,
+    bridgedChannel,
     onSend,
     sendVoiceFrame,
     sendVoiceControl,
@@ -66,6 +77,37 @@ export function Composer({
     busy,
     onStop,
 }: Props) {
+    // Bridged-channel short-circuit. Render a flat, non-interactive
+    // notice in place of the composer chip. Mirrors the chip's
+    // outer dimensions (max-width, padding, border-radius via the
+    // shared `.execlaw-composer__shell` class) so swapping back to
+    // the live composer when the operator opens an unbridged thread
+    // doesn't reflow the chat region.
+    if (bridgedChannel) {
+        const channelLabel =
+            bridgedChannel.charAt(0).toUpperCase() + bridgedChannel.slice(1);
+        return (
+            <div
+                className="execlaw-composer__shell execlaw-composer__shell--bridged"
+                data-testid="composer-bridged-notice"
+                data-channel={bridgedChannel}
+                role="status"
+                aria-live="polite"
+                style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    color: "#7d8590",
+                    fontSize: "0.875rem",
+                    padding: "0.85rem 1rem",
+                    cursor: "not-allowed",
+                }}
+            >
+                <i className="bi bi-info-circle" aria-hidden style={{ marginRight: "0.5rem" }} />
+                Thread is managed on {channelLabel}
+            </div>
+        );
+    }
     const [text, setText] = useState("");
     const [submitting, setSubmitting] = useState(false);
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);

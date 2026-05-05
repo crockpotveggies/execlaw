@@ -1556,8 +1556,26 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
             let resolver: std::sync::Arc<
                 dyn execlaw_server::signal_transport::RpcEndpointResolver,
             > = std::sync::Arc::new(sup);
+            // Source the SPA-sidebar icon from the bundled signal
+            // plugin manifest so a packaging bump (operator overrides
+            // `[transport].icon = "telephone"` for their fork) doesn't
+            // require a host rebuild. Falls back to the
+            // `default_signal_icon()` constant if the manifest can't
+            // be parsed (manifest gone missing in a stripped build,
+            // dev-time edit broke the file, etc.) — a benign visual
+            // default beats a boot crash.
+            const SIGNAL_MANIFEST: &str =
+                include_str!("../../../plugins/signal/plugin.toml");
+            let icon = execlaw_plugin_sdk::manifest::PluginManifest::parse(SIGNAL_MANIFEST)
+                .ok()
+                .and_then(|m| m.transport.and_then(|t| t.icon))
+                .unwrap_or_else(|| {
+                    execlaw_server::signal_transport::default_signal_icon().to_owned()
+                });
             reg.register(std::sync::Arc::new(
-                execlaw_server::signal_transport::SignalCliTransportFactory::new(resolver),
+                execlaw_server::signal_transport::SignalCliTransportFactory::with_icon(
+                    resolver, icon,
+                ),
             ));
         }
         tracing::info!(channels = reg.len(), "host-transport registry populated");

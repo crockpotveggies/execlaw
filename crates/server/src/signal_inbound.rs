@@ -200,6 +200,14 @@ struct SignalGroupInfo {
     #[serde(rename = "groupId")]
     #[serde(default)]
     group_id: Option<String>,
+    /// Group's user-facing name (signal-cli's `groupName`). Used as
+    /// the conversation's `display_name` on first-mint so the SPA's
+    /// sidebar shows "Family chat" instead of "New chat · 7596ad".
+    /// Optional because not every group has a title (rare, but a
+    /// nameless group should still route).
+    #[serde(rename = "groupName")]
+    #[serde(default)]
+    group_name: Option<String>,
 }
 
 /// Decoded inbound message ready for routing. Built from
@@ -221,6 +229,12 @@ pub struct InboundDataMessage {
     /// `Some(group_id)` for group inbound; `None` for 1:1 DMs. Phase
     /// 4 routes `Some` to a deferred-skip path.
     pub group_id: Option<String>,
+    /// Group title (`groupName` on the wire). Populated alongside
+    /// `group_id` when the message landed in a Signal group; `None`
+    /// for 1:1 DMs or for groups whose name is empty. Used by the
+    /// group-routing path to seed the conversation's `display_name`
+    /// on first-mint.
+    pub group_name: Option<String>,
     /// Sender's signal-cli timestamp in milliseconds, when present.
     pub sender_timestamp_ms: Option<i64>,
     /// Phase 6 — attachment metadata extracted from the data
@@ -305,12 +319,26 @@ pub fn decode_frame(body: &str, expected_account: Option<&str>) -> Option<Inboun
         // Pure receipt / typing / sync — nothing to surface.
         return None;
     }
-    let group_id = dm.group_info.and_then(|g| g.group_id);
+    let (group_id, group_name) = match dm.group_info {
+        Some(g) => (
+            g.group_id,
+            g.group_name.and_then(|s| {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_owned())
+                }
+            }),
+        ),
+        None => (None, None),
+    };
     Some(InboundDataMessage {
         source_number: env.source_number.unwrap_or(env.source),
         source_name: env.source_name,
         text,
         group_id,
+        group_name,
         sender_timestamp_ms: env.timestamp,
         attachments,
     })
@@ -554,6 +582,15 @@ pub async fn route_inbound_message(
     // Make sure the conversation row exists (resolve_or_mint may have
     // returned a fresh id without inserting state_conversations).
     crate::chats::ensure_conversation_for(&state.db, &cid);
+    // Seed the sidebar label with the contact's signal-cli display
+    // name on first-mint. The controller may rename the thread later
+    // via `PATCH /api/chats/{id}` — the seeder is a no-op when the
+    // column is already set, so the rename sticks.
+    crate::chats::seed_conversation_display_name_if_unset(
+        &state.db,
+        &cid,
+        msg.source_name.as_deref(),
+    );
     pg_store
         .bind_conversation(cid.as_str(), &principal_group_id)
         .map_err(|e| format!("bind conversation: {e}"))?;
@@ -1120,6 +1157,15 @@ async fn route_group_inbound(
         .map_err(|e| format!("group conversation resolve: {e}"))?;
     let cid = outcome.conversation_id().clone();
     crate::chats::ensure_conversation_for(&state.db, &cid);
+    // Seed the sidebar label from signal-cli's `groupName`. Like the
+    // DM path, this is a no-op once the column is set so a controller
+    // rename via `PATCH /api/chats/{id}` survives subsequent inbound
+    // messages from the same group.
+    crate::chats::seed_conversation_display_name_if_unset(
+        &state.db,
+        &cid,
+        msg.group_name.as_deref(),
+    );
     pg_store
         .bind_conversation(cid.as_str(), &group_pg_id)
         .map_err(|e| format!("bind group conversation: {e}"))?;
@@ -1620,6 +1666,59 @@ mod tests {
     }
 
     #[test]
+    fn decode_picks_up_group_name_when_present_and_trims_whitespace() {
+        // signal-cli's `groupInfo` can include a `groupName` field
+        // alongside `groupId`. The group routing path uses it to
+        // seed the conversation's `display_name` so the SPA's
+        // sidebar shows "Family chat" instead of "New chat · 7596ad".
+        // Pin: the trimming step + the non-empty filter (an empty
+        // string from a nameless group must surface as `None`).
+        let body = serde_json::json!({
+            "account": "+15551234567",
+            "envelope": {
+                "source": "+15559998888",
+                "sourceNumber": "+15559998888",
+                "timestamp": 1700000000000_i64,
+                "dataMessage": {
+                    "timestamp": 1700000000000_i64,
+                    "message": "hi family",
+                    "groupInfo": {
+                        "groupId": "group-base64-id",
+                        "groupName": "  Family chat  ",
+                    }
+                }
+            }
+        })
+        .to_string();
+        let decoded = decode_frame(&body, Some("+15551234567")).expect("must decode");
+        assert_eq!(decoded.group_id.as_deref(), Some("group-base64-id"));
+        assert_eq!(decoded.group_name.as_deref(), Some("Family chat"));
+    }
+
+    #[test]
+    fn decode_drops_empty_group_name() {
+        let body = serde_json::json!({
+            "account": "+15551234567",
+            "envelope": {
+                "source": "+15559998888",
+                "sourceNumber": "+15559998888",
+                "timestamp": 1700000000000_i64,
+                "dataMessage": {
+                    "timestamp": 1700000000000_i64,
+                    "message": "hi",
+                    "groupInfo": {
+                        "groupId": "group-base64-id",
+                        "groupName": "   ",
+                    }
+                }
+            }
+        })
+        .to_string();
+        let decoded = decode_frame(&body, Some("+15551234567")).expect("must decode");
+        assert!(decoded.group_name.is_none());
+    }
+
+    #[test]
     fn decode_returns_none_for_unparseable_garbage() {
         assert!(decode_frame("not json at all", None).is_none());
         assert!(decode_frame("{}", None).is_none());
@@ -1649,6 +1748,7 @@ mod tests {
             source_name: Some("Alice".into()),
             text: text.to_owned(),
             group_id: None,
+            group_name: None,
             sender_timestamp_ms: Some(1700000000000),
             attachments: vec![],
         }

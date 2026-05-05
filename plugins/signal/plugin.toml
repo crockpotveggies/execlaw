@@ -1,7 +1,7 @@
 [plugin]
 id = "signal"
 name = "Signal"
-version = "0.3.5"
+version = "0.3.6"
 description = "Signal Messenger transport — send/reply/group operations via a host-managed signal-cli sidecar container."
 author = "execlaw"
 license = "AGPL-3.0-or-later"
@@ -72,6 +72,13 @@ rpc_health_path = "/v1/about"
 transport_id = "signal"
 supports_attachments = true
 supports_groups = true
+# Bootstrap Icons name (sans `bi-` prefix). Renders next to Signal-
+# bridged thread titles in the sidebar so the operator can distinguish
+# Signal threads from Web / future-WhatsApp / future-email at a glance.
+# `chat-quote` reads as a messaging app and matches Signal's bubble
+# motif; the host falls back to `phone` if a transport plugin omits
+# this field.
+icon = "chat-quote"
 
 [[tools]]
 name = "signal.send_message"

@@ -62,6 +62,17 @@ pub trait HostTransportFactory: Send + Sync {
     /// normalises before write, so we don't here.
     fn channel(&self) -> &str;
 
+    /// Bootstrap-icons name (without the `bi-` prefix) the SPA
+    /// renders next to thread titles bridged on this transport.
+    /// Sourced from the plugin manifest's `[transport].icon` field
+    /// at registration time. Default "phone" matches the manifest
+    /// fallback so a transport plugin that omits the field still
+    /// renders SOMETHING distinct from the (icon-less) web Control
+    /// thread.
+    fn icon(&self) -> &str {
+        "phone"
+    }
+
     /// Build a [`TransportApi`] scoped to one conversation +
     /// recipient. Returns `(transport, wire_recipient)` —
     /// `wire_recipient` is the recipient string callers should pass
@@ -144,6 +155,16 @@ impl HostTransportRegistry {
             }
         }
         None
+    }
+
+    /// Bootstrap-icons name registered for `channel`, or `None` when
+    /// the channel has no factory. The SPA's sidebar uses this to
+    /// render a per-channel marker next to bridged thread titles —
+    /// returning the manifest-supplied icon (or the trait default
+    /// "phone") so the operator can distinguish Signal / WhatsApp /
+    /// future-email at a glance.
+    pub fn icon_for(&self, channel: &str) -> Option<&str> {
+        self.by_channel.get(channel).map(|f| f.icon())
     }
 
     /// Number of registered channels. Used by tests + an optional

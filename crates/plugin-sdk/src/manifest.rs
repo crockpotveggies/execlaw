@@ -150,6 +150,16 @@ pub struct TransportDecl {
     pub supports_attachments: bool,
     #[serde(default)]
     pub supports_groups: bool,
+    /// Bootstrap-icons name (without the `bi-` prefix) the SPA renders
+    /// next to thread titles for conversations bridged on this
+    /// transport. Lets the operator visually distinguish "Web chat",
+    /// "Signal group", "WhatsApp", etc. at a glance. Defaults to
+    /// `"phone"` when omitted — picked because most external-channel
+    /// transports are phone-based messengers; plugins SHOULD override
+    /// with a more specific icon (e.g. `"chat-quote"` for Signal,
+    /// `"envelope"` for email).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1031,7 +1041,13 @@ mod tests {
         let m = PluginManifest::parse(SIGNAL_MANIFEST)
             .expect("plugins/signal/plugin.toml must parse cleanly");
         assert_eq!(m.plugin.id, "signal");
-        assert_eq!(m.plugin.version, "0.3.5");
+        assert_eq!(m.plugin.version, "0.3.6");
+        // The transport icon must propagate from manifest → SDK so
+        // the SPA's sidebar can render a Signal-shaped marker on
+        // bridged threads. Pin the literal so a typo in the manifest
+        // (or a renamed Bootstrap-icons class) gets caught here.
+        let transport = m.transport.as_ref().expect("[transport] must be present");
+        assert_eq!(transport.icon.as_deref(), Some("chat-quote"));
         // Six tools mirror the selfhosted-claw integration. If we
         // add or remove one, this assertion forces a deliberate
         // update — the audit doc should stay in sync.

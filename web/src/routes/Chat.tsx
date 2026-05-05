@@ -1114,6 +1114,7 @@ function ActiveThreadPane({
                 />
                 <Composer
                     onSend={onSend}
+                    bridgedChannel={thread?.transport_channel ?? null}
                     sendVoiceFrame={sendVoiceFrame}
                     sendVoiceControl={sendVoiceControl}
                     voiceReadiness={voiceReadiness}

@@ -1018,18 +1018,51 @@ impl TransportApi for SignalCliTransport {
 /// SignalCliTransport mint.
 pub struct SignalCliTransportFactory {
     resolver: std::sync::Arc<dyn RpcEndpointResolver>,
+    /// Bootstrap-icons name (sans `bi-` prefix) sourced from the
+    /// signal plugin manifest's `[transport].icon` field. Surfaced
+    /// via the [`HostTransportFactory::icon`] override so the
+    /// chats-list endpoint can stamp it on every Signal-bridged
+    /// thread for the SPA sidebar to render. Owned (not borrowed)
+    /// because the manifest the operator loaded at boot is decoded
+    /// then dropped — the factory outlives it.
+    icon: String,
 }
 
 impl SignalCliTransportFactory {
     pub fn new(resolver: std::sync::Arc<dyn RpcEndpointResolver>) -> Self {
-        Self { resolver }
+        Self::with_icon(resolver, default_signal_icon())
     }
+
+    /// Construct with an explicit icon — used by `cli/main.rs` after
+    /// it parses the bundled plugin manifest. The default constructor
+    /// falls back to `default_signal_icon()` for tests + fixtures
+    /// that don't load the manifest.
+    pub fn with_icon(
+        resolver: std::sync::Arc<dyn RpcEndpointResolver>,
+        icon: impl Into<String>,
+    ) -> Self {
+        Self {
+            resolver,
+            icon: icon.into(),
+        }
+    }
+}
+
+/// Default Bootstrap-icons name for Signal threads when the manifest
+/// doesn't supply one. Matches the value shipped in
+/// `plugins/signal/plugin.toml` so the icon stays consistent across
+/// boot paths (cli, fixtures, tests).
+pub fn default_signal_icon() -> &'static str {
+    "chat-quote"
 }
 
 #[async_trait::async_trait]
 impl crate::transport_registry::HostTransportFactory for SignalCliTransportFactory {
     fn channel(&self) -> &str {
         SIGNAL_CHANNEL
+    }
+    fn icon(&self) -> &str {
+        &self.icon
     }
     fn build(
         &self,

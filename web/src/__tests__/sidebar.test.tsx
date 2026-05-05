@@ -167,10 +167,16 @@ describe("Sidebar", () => {
                 ephemeral_expires_at: null,
                 last_seq: 5,
             },
-            // External — should be filtered when hide-external is on.
+            // External — bridged on Signal. Filter keys on
+            // `transport_channel` (presence of a transport binding),
+            // NOT on `kind` — the inbound path stamps `kind`
+            // generically (ConversationKind::ControllerDM) for every
+            // mint, so kind-based filtering left bridged threads
+            // visible. The transport_channel field is the source of
+            // truth; this fixture pins it.
             {
                 conversation_id: "ext-1",
-                kind: "ExternalWithOutsider",
+                kind: "ControllerDM",
                 phase: "idle",
                 trust_class: "KnownLimited",
                 modality: "Text",
@@ -179,6 +185,8 @@ describe("Sidebar", () => {
                 is_ephemeral: false,
                 ephemeral_expires_at: null,
                 last_seq: 3,
+                transport_channel: "signal",
+                transport_icon: "chat-quote",
             },
         ]);
         rerender(<Sidebar onNewThread={() => {}} />);

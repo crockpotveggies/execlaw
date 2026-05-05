@@ -1973,6 +1973,63 @@ pub fn ensure_conversation_for(db: &execlaw_core::Database, cid: &ConversationId
     ensure_conversation(&store, cid);
 }
 
+/// Seed `display_name` on the conversation row when (and only when)
+/// the column is currently NULL. Used by transport inbound paths
+/// (Signal DM = contact's `source_name`, Signal group = `groupName`)
+/// so a freshly-bridged thread shows "Alice" / "Family chat" in the
+/// sidebar instead of the generic "New chat · 7596ad" fallback.
+///
+/// Skips silently in three cases that all mean "leave the row alone":
+///   * No conversation row yet (first-mint hasn't landed).
+///   * Row already has a display_name — the controller may have
+///     renamed it via `PATCH /api/chats/{id}`; respect that.
+///   * `name` itself is empty / whitespace-only — pointless write.
+///
+/// Best-effort: errors swallow with a debug log. Display name is a
+/// UX nicety, not a correctness step; failing the inbound route over
+/// a sidebar label would be the wrong trade-off.
+pub fn seed_conversation_display_name_if_unset(
+    db: &execlaw_core::Database,
+    cid: &ConversationId,
+    name: Option<&str>,
+) {
+    let trimmed = match name {
+        Some(s) => s.trim(),
+        None => return,
+    };
+    if trimmed.is_empty() {
+        return;
+    }
+    let store = ConversationStore::new(db);
+    match store.get(cid) {
+        Ok(Some(row)) => {
+            if row.display_name.is_some() {
+                return;
+            }
+            if let Err(e) = store.set_display_name(cid, Some(trimmed)) {
+                tracing::debug!(
+                    target: "chats::seed_display_name",
+                    conversation_id = %cid.as_str(),
+                    error = %e,
+                    "failed to seed display_name; sidebar will show fallback",
+                );
+            }
+        }
+        Ok(None) => {
+            // Row not yet inserted — caller should have run
+            // `ensure_conversation_for` first. Leave silently.
+        }
+        Err(e) => {
+            tracing::debug!(
+                target: "chats::seed_display_name",
+                conversation_id = %cid.as_str(),
+                error = %e,
+                "conversation lookup failed during display_name seed",
+            );
+        }
+    }
+}
+
 /// Phase 4 — cold-contact handler scoped to a non-HTTP caller (the
 /// Signal inbound consumer). Mirrors the existing `handle_cold_contact`
 /// (axum response shape) but takes plain args + returns a `Result`
@@ -3268,6 +3325,22 @@ pub struct ThreadSummaryView {
     /// Wall-clock unix-seconds of the last committed turn. Sidebar
     /// orders by this (recency); zero for never-touched conversations.
     pub last_activity_at: i64,
+    /// Channel name (`signal`, `whatsapp`, `email`, ...) for threads
+    /// bridged onto a non-web transport. `None` for web-only chats
+    /// (Control thread, ad-hoc threads created in the SPA). The
+    /// sidebar's "External channels" filter and per-row icon both
+    /// key on this — the binding store is the source of truth, not
+    /// the conversation `kind` column (which the inbound path stamps
+    /// generically, see `chats::ensure_conversation`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_channel: Option<String>,
+    /// Bootstrap-icons name (sans `bi-` prefix) the SPA renders next
+    /// to the title for bridged threads. Resolved through
+    /// `HostTransportRegistry::icon_for(channel)`, which returns the
+    /// plugin-manifest-supplied value or the trait-default `"phone"`.
+    /// `None` when `transport_channel` is `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_icon: Option<String>,
 }
 
 impl From<ThreadSummary> for ThreadSummaryView {
@@ -3284,6 +3357,11 @@ impl From<ThreadSummary> for ThreadSummaryView {
             ephemeral_expires_at: s.ephemeral_expires_at,
             last_seq: s.last_seq.0,
             last_activity_at: s.last_activity_at,
+            // Filled in by `list_threads` after a binding lookup;
+            // `From` impls don't have DB access, so the conversion
+            // produces None and the handler stamps the real values.
+            transport_channel: None,
+            transport_icon: None,
         }
     }
 }
@@ -3310,12 +3388,39 @@ pub async fn list_threads(
     State(state): State<AppState>,
     _user: crate::auth_extract::AuthedUser,
 ) -> impl IntoResponse {
+    use execlaw_core::principal_groups::PrincipalGroupStore;
+    use execlaw_core::transport_bindings::TransportBindingStore;
+
     let store = ConversationStore::new(&state.db);
     let summaries = match store.list_thread_summaries() {
         Ok(s) => s,
         Err(e) => return err_500(&format!("list_thread_summaries: {e}")),
     };
-    let threads: Vec<ThreadSummaryView> = summaries.into_iter().map(Into::into).collect();
+    // Stamp transport_channel + transport_icon by walking each
+    // conversation's bindings. N+1 lookups but N is sidebar-bounded
+    // (~50 max in practice); a JOIN-based shortcut isn't worth the
+    // schema coupling. The first non-empty binding wins — same
+    // precedence rule the auto-bridge uses.
+    let pg_store = PrincipalGroupStore::new(&state.db);
+    let binding_store = TransportBindingStore::new(&state.db);
+    let mut threads: Vec<ThreadSummaryView> = Vec::with_capacity(summaries.len());
+    for s in summaries {
+        let mut view: ThreadSummaryView = s.into();
+        if let Ok(Some(pg_id)) =
+            pg_store.principal_group_id_for(&view.conversation_id)
+        {
+            if let Ok(bindings) = binding_store.bindings_for_group_any_channel(&pg_id) {
+                if let Some(b) = bindings.first() {
+                    view.transport_channel = Some(b.channel.clone());
+                    view.transport_icon = state
+                        .host_transports
+                        .icon_for(&b.channel)
+                        .map(str::to_owned);
+                }
+            }
+        }
+        threads.push(view);
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!(ThreadListResponse { threads })),
@@ -4054,6 +4159,55 @@ mod tests {
     async fn json_body<T: for<'de> serde::Deserialize<'de>>(body: Body) -> T {
         let bytes = body::to_bytes(body, usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn seed_display_name_writes_only_when_unset_and_trims() {
+        // Mint a conversation row, then exercise the four shapes the
+        // seeder is supposed to handle:
+        //   1. None / empty / whitespace input → no-op (column stays NULL).
+        //   2. Real string on a row that's still NULL → writes the
+        //      trimmed value.
+        //   3. Same call again → no-op (column already set; the
+        //      transport inbound path runs this on every message and
+        //      must NOT clobber a controller rename).
+        //   4. Caller-supplied controller rename → preserved across
+        //      a follow-up seeder pass with a different inbound name.
+        let state = test_app_state();
+        let cid = ConversationId::from("conv-seed-test");
+        ensure_conversation_for(&state.db, &cid);
+        let store = ConversationStore::new(&state.db);
+
+        // 1a. None — silent.
+        seed_conversation_display_name_if_unset(&state.db, &cid, None);
+        assert!(store.get(&cid).unwrap().unwrap().display_name.is_none());
+        // 1b. Empty / whitespace.
+        seed_conversation_display_name_if_unset(&state.db, &cid, Some("   "));
+        assert!(store.get(&cid).unwrap().unwrap().display_name.is_none());
+
+        // 2. First non-empty value lands.
+        seed_conversation_display_name_if_unset(&state.db, &cid, Some("  Alice  "));
+        assert_eq!(
+            store.get(&cid).unwrap().unwrap().display_name.as_deref(),
+            Some("Alice")
+        );
+
+        // 3. Idempotent — every subsequent inbound calls the seeder;
+        //    it must not overwrite.
+        seed_conversation_display_name_if_unset(&state.db, &cid, Some("Bob"));
+        assert_eq!(
+            store.get(&cid).unwrap().unwrap().display_name.as_deref(),
+            Some("Alice")
+        );
+
+        // 4. Controller renames via the existing PATCH path → the
+        //    seeder respects that rename on the next inbound.
+        store.set_display_name(&cid, Some("Family chat")).unwrap();
+        seed_conversation_display_name_if_unset(&state.db, &cid, Some("Some Other Name"));
+        assert_eq!(
+            store.get(&cid).unwrap().unwrap().display_name.as_deref(),
+            Some("Family chat")
+        );
     }
 
     #[tokio::test]

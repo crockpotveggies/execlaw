@@ -177,12 +177,15 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
         // current route.
         if (t.conversation_id === activeIdRaw) return true;
         if (!hideExternal) return true;
-        // hideExternal=true → show only ControllerDM-shaped threads.
-        return t.kind === "ControllerDM";
+        // hideExternal=true → hide threads bridged onto a non-web
+        // transport. Source of truth is `transport_channel` from the
+        // server (presence of a `state_transport_bindings` row), NOT
+        // the conversation `kind` — the inbound path stamps `kind`
+        // generically (see chats::ensure_conversation), so kind-based
+        // filtering left Signal groups visible when the toggle was
+        // off (the regression that prompted this rewrite).
+        return !t.transport_channel;
     });
-    const externalCount = threads.filter(
-        (t) => !t.is_pinned && t.kind !== "ControllerDM",
-    ).length;
 
     // 2026-05-05 — `uiPanels` is still threaded through the prop
     // for compat with callers (Chat / Settings still fetch the
@@ -405,6 +408,8 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                                 isPinned={t.is_pinned}
                                 isEphemeral={t.is_ephemeral}
                                 isRenaming={isRenaming}
+                                transportChannel={t.transport_channel ?? null}
+                                transportIcon={t.transport_icon ?? null}
                                 onActivate={() => {
                                     setActiveThread(t.conversation_id);
                                     navigate(
@@ -634,6 +639,14 @@ interface ThreadRowProps {
     isPinned: boolean;
     isEphemeral: boolean;
     isRenaming: boolean;
+    /// Channel name (e.g. "signal") for bridged threads, or `null`
+    /// for web-only chats. Drives the per-row marker icon next to
+    /// the label so the operator can spot Signal threads at a
+    /// glance.
+    transportChannel: string | null;
+    /// Bootstrap-icons name (sans `bi-` prefix) supplied by the
+    /// transport plugin's manifest, or `null` for web-only chats.
+    transportIcon: string | null;
     onActivate: () => void;
     onStartRename: () => void;
     onCommitRename: (next: string) => void;
@@ -651,6 +664,8 @@ function ThreadRow({
     isPinned,
     isEphemeral,
     isRenaming,
+    transportChannel,
+    transportIcon,
     onActivate,
     onStartRename,
     onCommitRename,
@@ -724,6 +739,14 @@ function ThreadRow({
                 />
             ) : (
                 <span className="execlaw-thread-item__name">{label}</span>
+            )}
+            {transportChannel && transportIcon && (
+                <i
+                    className={`bi bi-${transportIcon} execlaw-muted`}
+                    title={`Bridged on ${transportChannel}`}
+                    aria-label={`Bridged on ${transportChannel}`}
+                    style={{ marginLeft: "0.25rem" }}
+                />
             )}
             {isEphemeral && (
                 <i

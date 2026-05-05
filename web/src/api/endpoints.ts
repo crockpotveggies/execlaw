@@ -149,6 +149,18 @@ export interface ThreadSummary {
     /// Optional only because tests + older fixtures don't supply it;
     /// new code paths always send it.
     last_activity_at?: number;
+    /// Channel name (e.g. "signal") for threads bridged onto a
+    /// non-web transport. Absent for web-only chats (Control thread
+    /// + ad-hoc threads created in the SPA). Drives the sidebar's
+    /// "External channels" filter and per-row icon, and also gates
+    /// the chat composer (input is disabled with "Thread is managed
+    /// on …" copy when set, since outbound goes through the bridge).
+    transport_channel?: string;
+    /// Bootstrap-icons name (sans `bi-` prefix) supplied by the
+    /// transport plugin's manifest — `chat-quote` for Signal,
+    /// `phone` as the host fallback when a plugin omits the field.
+    /// Only present when `transport_channel` is set.
+    transport_icon?: string;
 }
 
 export interface ThreadListResponse {
