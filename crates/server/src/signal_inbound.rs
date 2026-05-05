@@ -1069,44 +1069,70 @@ fn mint_unknown_principal(pid: &PrincipalId, msg: &InboundDataMessage, now: i64)
 // Consumer task
 // -----------------------------------------------------------------
 
+/// Best-effort GET `/v1/accounts` against the supervised sidecar.
+/// Returns the first registered E.164 number, or `None` for any
+/// failure (sidecar not running, daemon not up yet, no account
+/// paired). The consumer treats `None` as "not paired yet — sleep
+/// and try again next tick" so a freshly-installed plugin sits
+/// idle until the operator scans a QR rather than crash-looping.
+async fn fetch_first_account(client: &reqwest::Client, port: u16) -> Option<String> {
+    let url = format!("http://127.0.0.1:{port}/v1/accounts");
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let arr: Vec<String> = resp.json().await.ok()?;
+    arr.into_iter().next()
+}
+
 /// Spawn the inbound consumer on `state`'s tokio runtime, returning
 /// the `JoinHandle` so the boot orchestrator can await on shutdown.
 /// `stop` is the same `Notify` the sidecar supervisor watches —
 /// `stop.notify_waiters()` shuts both down cleanly.
 ///
-/// Returns `None` when `EXECLAW_SIGNAL_CONTROLLER_NUMBER` is unset
-/// (no point spawning a subscriber against an empty number) or when
-/// `state.sidecar_supervisor` is `None` (test fixture / managed-mode
-/// install with no Docker reachable). The boot path treats both as
-/// "Signal inbound disabled today; outbound still works once the
-/// operator wires the env var."
+/// Returns `None` only when `state.sidecar_supervisor` is `None`
+/// (test fixture / managed-mode install with no Docker reachable).
+/// The self-number is resolved dynamically per connect attempt
+/// against the sidecar's `/v1/accounts` endpoint — it doesn't
+/// require any env var, and it picks up the operator's pairing
+/// without a server restart.
 pub fn spawn_signal_inbound_consumer(
     state: AppState,
     stop: Arc<Notify>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let supervisor = state.sidecar_supervisor.clone()?;
-    let self_number = crate::signal_transport::SignalCliTransport::read_self_number_from_env()?;
     Some(tokio::spawn(async move {
-        run_consumer_loop(state, supervisor, self_number, stop).await;
+        run_consumer_loop(state, supervisor, None, stop).await;
     }))
 }
 
 /// Drive the connect-read-reconnect loop. Public for tests that
 /// want to exercise the loop without going through `tokio::spawn`.
+///
+/// `self_number_override`: when `Some`, the loop uses it verbatim
+/// (test paths, env-var override). When `None`, the loop fetches
+/// `/v1/accounts` against the sidecar on each connect attempt and
+/// uses the first registered number — auto-tracks pairing without
+/// restart.
 pub async fn run_consumer_loop(
     state: AppState,
     supervisor: crate::sidecar_supervisor::SidecarSupervisor,
-    self_number: String,
+    self_number_override: Option<String>,
     stop: Arc<Notify>,
 ) {
     use tokio_tungstenite::tungstenite::Message;
 
     tracing::info!(
         target: "signal_inbound",
-        self_number = %self_number,
+        override_self_number = ?self_number_override,
         "signal inbound consumer starting",
     );
     let mut backoff = RECONNECT_MIN;
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
 
     'outer: loop {
         tokio::select! {
@@ -1130,6 +1156,29 @@ pub async fn run_consumer_loop(
                     _ = tokio::time::sleep(SIDECAR_POLL_INTERVAL) => continue 'outer,
                 }
             }
+        };
+
+        // 1b. Resolve self-number. Operator's env-var override wins
+        //     (matches the existing outbound contract); otherwise
+        //     dial /v1/accounts to discover the paired number. When
+        //     no account is paired yet, sleep + retry — the consumer
+        //     can sit idle here for hours during a fresh install
+        //     waiting for the operator to scan a QR.
+        let self_number = match self_number_override.clone() {
+            Some(n) => n,
+            None => match fetch_first_account(&http_client, port).await {
+                Some(n) => n,
+                None => {
+                    tracing::debug!(
+                        target: "signal_inbound",
+                        "no Signal account paired yet; sleeping then retrying"
+                    );
+                    tokio::select! {
+                        _ = stop.notified() => return,
+                        _ = tokio::time::sleep(SIDECAR_POLL_INTERVAL) => continue 'outer,
+                    }
+                }
+            },
         };
         let url = format!("ws://127.0.0.1:{port}/v1/receive/{self_number}");
 

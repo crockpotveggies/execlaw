@@ -204,6 +204,44 @@ impl SignalCliTransport {
         Some(trimmed.to_owned())
     }
 
+    /// Resolve the controller's self-number, preferring the explicit
+    /// override (`self_number`, populated from the env var when set)
+    /// and falling back to whatever signal-cli has registered on
+    /// disk (`/v1/accounts`). The fallback path is the common case
+    /// post-pairing — the operator just scanned a QR and the
+    /// daemon now reports the number; without this dynamic lookup
+    /// every send would fail with "env var unset" forcing a server
+    /// restart per pairing.
+    async fn resolve_self_number(&self, base_url: &str) -> Result<String, ApiError> {
+        if let Some(n) = self.self_number.as_deref() {
+            return Ok(n.to_owned());
+        }
+        let url = format!("{base_url}/v1/accounts");
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| ApiError::Storage(format!("signal-cli /v1/accounts: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(ApiError::Storage(format!(
+                "signal-cli /v1/accounts returned HTTP {}",
+                resp.status()
+            )));
+        }
+        let arr: Vec<String> = resp
+            .json()
+            .await
+            .map_err(|e| ApiError::Storage(format!("parse /v1/accounts: {e}")))?;
+        arr.into_iter().next().ok_or_else(|| {
+            ApiError::Validation(
+                "no Signal account is paired yet — open Settings → Plugins → Signal \
+                 and scan a QR code to link your phone before sending."
+                    .into(),
+            )
+        })
+    }
+
     /// POST `/v2/send` with the canonical signal-cli-rest-api body
     /// shape. Surfaced as a method (not inlined into `send`) so the
     /// adversarial tests can exercise both happy + sad paths
@@ -214,14 +252,7 @@ impl SignalCliTransport {
         recipient: &str,
         text: &str,
     ) -> Result<String, ApiError> {
-        let number = self.self_number.as_deref().ok_or_else(|| {
-            ApiError::Validation(
-                "EXECLAW_SIGNAL_CONTROLLER_NUMBER is unset; \
-                 set it to the controller's registered Signal number \
-                 (e.g. +15551234567) before sending Signal messages."
-                    .into(),
-            )
-        })?;
+        let number = self.resolve_self_number(base_url).await?;
         let body = serde_json::json!({
             "number": number,
             "recipients": [recipient],
@@ -269,7 +300,7 @@ impl SignalCliTransport {
     /// method body into one. Returns the same
     /// `signal-cli sidecar … not running yet` storage error from
     /// `send` when the supervisor hasn't published a port.
-    async fn resolve_endpoint(&self) -> Result<(String, &str), ApiError> {
+    async fn resolve_endpoint(&self) -> Result<(String, String), ApiError> {
         let base_url = self
             .resolver
             .rpc_base_url(&self.sidecar_name)
@@ -283,14 +314,7 @@ impl SignalCliTransport {
                     crate::sidecar_supervisor::MAX_RESTART_ATTEMPTS,
                 ))
             })?;
-        let number = self.self_number.as_deref().ok_or_else(|| {
-            ApiError::Validation(
-                "EXECLAW_SIGNAL_CONTROLLER_NUMBER is unset; \
-                 set it to the controller's registered Signal number \
-                 (e.g. +15551234567) before performing Signal group ops."
-                    .into(),
-            )
-        })?;
+        let number = self.resolve_self_number(&base_url).await?;
         Ok((base_url, number))
     }
 
@@ -1070,8 +1094,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_returns_validation_err_when_self_number_unset() {
-        let mock = spawn_mock(201, serde_json::json!({ "timestamp": 0 })).await;
+    async fn send_returns_validation_err_when_no_account_paired() {
+        // No env override AND no account on disk → /v1/accounts
+        // returns []. The transport must surface a clear "scan a
+        // QR" message rather than dispatching against an empty
+        // self-number (which would 400 from signal-cli with a
+        // confusing payload).
+        let mock = spawn_mock(200, serde_json::json!([])).await;
         let resolver = Arc::new(StaticEndpointResolver(format!("http://{}", mock.addr)));
         let t = transport_with_resolver(resolver, None, None);
         let err = t
@@ -1081,15 +1110,94 @@ mod tests {
         match err {
             ApiError::Validation(msg) => {
                 assert!(
-                    msg.contains("EXECLAW_SIGNAL_CONTROLLER_NUMBER"),
+                    msg.contains("no Signal account is paired"),
                     "got: {msg}"
                 );
             }
             other => panic!("expected Validation, got {other:?}"),
         }
-        // Mock should NOT have been hit — the validation error must
-        // fail-fast before any network call.
-        assert_eq!(mock.recorded.lock().unwrap().len(), 0);
+        // /v1/accounts hit, /v2/send NOT hit.
+        let paths: Vec<String> = mock
+            .recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
+        assert!(paths.iter().any(|p| p == "/v1/accounts"));
+        assert!(!paths.iter().any(|p| p == "/v2/send"));
+    }
+
+    #[tokio::test]
+    async fn send_falls_back_to_paired_account_when_env_override_unset() {
+        // Real production path post-pairing: env var unset, but
+        // /v1/accounts reports the operator's number after they
+        // scanned a QR. The transport must dispatch using THAT
+        // number instead of erroring out.
+        use axum::{
+            Json, Router,
+            extract::Request,
+            http::StatusCode,
+            response::IntoResponse,
+            routing::any,
+        };
+        use std::sync::Mutex;
+        let recorded: Arc<Mutex<Vec<MockRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = recorded.clone();
+        let app: Router = Router::new().fallback(any(
+            move |req: Request| {
+                let captured = captured.clone();
+                async move {
+                    let path = req.uri().path().to_owned();
+                    let body_bytes = axum::body::to_bytes(req.into_body(), 65_536)
+                        .await
+                        .unwrap_or_default();
+                    let body_v: serde_json::Value = if body_bytes.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null)
+                    };
+                    captured.lock().unwrap().push(MockRequest {
+                        path: path.clone(),
+                        body: body_v,
+                    });
+                    if path == "/v1/accounts" {
+                        return (
+                            StatusCode::OK,
+                            Json(serde_json::json!(["+12369995414"])),
+                        )
+                            .into_response();
+                    }
+                    if path == "/v2/send" {
+                        return (
+                            StatusCode::CREATED,
+                            Json(serde_json::json!({ "timestamp": 42_i64 })),
+                        )
+                            .into_response();
+                    }
+                    (StatusCode::NOT_FOUND, Json(serde_json::Value::Null)).into_response()
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _h = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let resolver = Arc::new(StaticEndpointResolver(format!("http://{addr}")));
+        let t = transport_with_resolver(resolver, None, None);
+        let id = t
+            .send(SIGNAL_CHANNEL, "+15559998888", "hi")
+            .await
+            .expect("send should succeed using paired account");
+        assert_eq!(id, "42");
+        // /v2/send body must carry the discovered self-number.
+        let recorded = recorded.lock().unwrap();
+        let send_call = recorded
+            .iter()
+            .find(|r| r.path == "/v2/send")
+            .expect("must POST /v2/send");
+        assert_eq!(send_call.body["number"], "+12369995414");
     }
 
     #[tokio::test]
