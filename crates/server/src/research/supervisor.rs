@@ -72,6 +72,14 @@ pub struct ResearchSupervisor {
     /// where a row landed via a path that didn't kick (DB-direct
     /// insert in tests, future routine-fired research, etc.).
     pub wake: Arc<Notify>,
+    /// Sidecar supervisor handle used to dispatch the completed
+    /// research report PDF back through the originating transport
+    /// (Signal today; future bridges follow the same path). When
+    /// `None` the runner skips the transport-bridge step and the
+    /// SPA-only download chip is the only deliverable. Wired by
+    /// `cli/main.rs` when Docker is available; tests / managed-mode
+    /// callers leave it `None`.
+    pub sidecar_supervisor: Option<crate::sidecar_supervisor::SidecarSupervisor>,
 }
 
 impl ResearchSupervisor {
@@ -90,7 +98,20 @@ impl ResearchSupervisor {
             events,
             cancel_tokens: Arc::new(DashMap::new()),
             wake: Arc::new(Notify::new()),
+            sidecar_supervisor: None,
         }
+    }
+
+    /// Builder-style setter for the sidecar supervisor handle.
+    /// Threaded through to the runner so a research-complete event
+    /// on a transport-bridged conversation auto-dispatches the
+    /// report PDF back via the originating bridge.
+    pub fn with_sidecar_supervisor(
+        mut self,
+        sup: Option<crate::sidecar_supervisor::SidecarSupervisor>,
+    ) -> Self {
+        self.sidecar_supervisor = sup;
+        self
     }
 
     /// Wake the supervisor's tick loop immediately. Called after
@@ -242,6 +263,7 @@ impl ResearchSupervisor {
         let model = self.model.clone();
         let inference_resolver = self.inference.clone();
         let events = self.events.clone();
+        let sidecar_supervisor = self.sidecar_supervisor.clone();
         // Mint + register a cancellation token so the cancel admin
         // endpoint can short-circuit the gather phase mid-flight.
         // The spawned task removes its entry on exit (any path —
@@ -262,6 +284,7 @@ impl ResearchSupervisor {
                 inference,
                 events,
                 cancel: cancel.clone(),
+                sidecar_supervisor,
             };
             let result = run_job(ctx).await;
             tokens.remove(&job_id_key);

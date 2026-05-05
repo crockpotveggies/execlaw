@@ -1551,7 +1551,13 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         research_workspace.clone(),
         config.model_id.clone(),
         events.clone(),
-    );
+    )
+    // Wire the sidecar supervisor so a research job that completes
+    // on a transport-bridged conversation auto-ships the PDF report
+    // back through the originating transport (Signal today).
+    // `None` skips the bridge — web-only conversations stay
+    // unaffected.
+    .with_sidecar_supervisor(sidecar_supervisor.clone());
 
     // Phase C (2026-05-03) — auto-capture worker. The summarizer
     // talks to `BackendPurpose::Small` so the standard turn isn't

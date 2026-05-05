@@ -86,6 +86,11 @@ pub struct JobRunCtx {
     /// checkpoint (between sub-queries / between HTTP calls /
     /// before the subagent call).
     pub cancel: CancellationToken,
+    /// Optional sidecar-supervisor handle so the synthesize phase
+    /// can ship the completed report PDF back through the
+    /// originating transport (Signal today). `None` skips the
+    /// transport-bridge step.
+    pub sidecar_supervisor: Option<crate::sidecar_supervisor::SidecarSupervisor>,
 }
 
 /// System prompt for the planner LLM call. Asks for a strict JSON
@@ -144,6 +149,7 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
         inference,
         events,
         cancel,
+        sidecar_supervisor,
     } = ctx;
 
     // Earliest pre-flight cancel check. The supervisor spawns this
@@ -434,6 +440,7 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
         inference: client.clone(),
         model: model.clone(),
         cancel: cancel.clone(),
+        sidecar_supervisor: sidecar_supervisor.clone(),
     };
     let notes = run_gather_phase(
         &phase_deps,
@@ -481,6 +488,11 @@ pub struct PhaseDeps {
     /// the caller has no real token to provide (advance endpoint
     /// for synthesize-only paths, tests, etc.).
     pub cancel: CancellationToken,
+    /// Optional sidecar supervisor handle for the
+    /// research-complete → originating-transport bridge (signal-
+    /// cli today). `None` skips the bridge step; the SPA-only
+    /// download chip stays the deliverable.
+    pub sidecar_supervisor: Option<crate::sidecar_supervisor::SidecarSupervisor>,
 }
 
 /// Run the gather phase end-to-end: mark_gathering → run_gather →
@@ -510,6 +522,7 @@ pub async fn run_gather_phase(
         inference: client,
         model,
         cancel,
+        sidecar_supervisor: _,
     } = deps;
     // 2026-05-04 — resolve the active provider from
     // config_search_providers instead of hard-coding DDG. The
@@ -613,6 +626,7 @@ pub async fn run_synthesize_phase(
         inference: client,
         model,
         cancel,
+        sidecar_supervisor,
     } = deps;
     // Pre-flight cancel check. If the operator cancelled during
     // gather (or between phases), the row is already Cancelled —
@@ -746,6 +760,30 @@ pub async fn run_synthesize_phase(
         },
     )?;
 
+    // Transport bridge: when the research turn was triggered on a
+    // bridged conversation (Signal today; future plugins follow the
+    // same path), ship the report PDF + a one-line summary back
+    // through the originating transport. Without this the operator
+    // who kicked off research from their phone gets no follow-up —
+    // they'd have to open the web UI to download the PDF, defeating
+    // the point of being on Signal.
+    //
+    // Best-effort: a bridge failure logs a warning but doesn't
+    // mark the job failed (the PDF is still in the workspace + the
+    // SPA's download chip works). Lookup runs against the live
+    // `state_transport_bindings` table; no binding → silent skip
+    // (web-only conversations are the common case).
+    if let Some(supervisor) = sidecar_supervisor.as_ref() {
+        bridge_research_pdf_to_originating_transport(
+            db,
+            supervisor,
+            conv_id,
+            outcome.attachment_id.as_str(),
+            query,
+        )
+        .await;
+    }
+
     // 2026-05-04 (rev 9): the separate Attachment card emit is
     // gone. The PDF deliverable now renders as an inline Download
     // button on the ResearchCard itself (see web/src/cards/
@@ -766,6 +804,111 @@ pub async fn run_synthesize_phase(
     // attachment composition, ad-hoc file delivery from the
     // agent, etc.). Just not this code path.
     Ok(())
+}
+
+/// Best-effort dispatch of the completed research-report PDF + a
+/// one-line summary back through the conversation's originating
+/// transport. Wired into the synthesize-phase tail so a research
+/// job kicked off from a Signal-bridged turn delivers the PDF
+/// directly to the contact's Signal thread instead of stranding
+/// them on a web-only download chip they can't see.
+///
+/// Resolution chain:
+///   * conversation_id → principal_group_id (state_conversations).
+///   * principal_group_id → bindings (state_transport_bindings).
+///   * Pick the first signal-channel binding (today's only auto-
+///     bridged transport).
+/// Miss anywhere → silent skip (web-only conversations don't have
+/// a transport binding, that's the common case).
+///
+/// Errors are logged at `warn` and swallowed — the job is already
+/// marked Complete, the PDF is in the workspace, and the SPA's
+/// download chip still works. The bridge is a UX nicety, not a
+/// correctness step.
+async fn bridge_research_pdf_to_originating_transport(
+    db: &Database,
+    supervisor: &crate::sidecar_supervisor::SidecarSupervisor,
+    conversation_id: &execlaw_core::ids::ConversationId,
+    attachment_id: &str,
+    query: &str,
+) {
+    use execlaw_core::principal_groups::PrincipalGroupStore;
+    use execlaw_core::tool::TransportApi;
+    use execlaw_core::transport_bindings::TransportBindingStore;
+
+    let pg_store = PrincipalGroupStore::new(db);
+    let pg_id = match pg_store.principal_group_id_for(conversation_id.as_str()) {
+        Ok(Some(id)) => id,
+        _ => return,
+    };
+    let binding_store = TransportBindingStore::new(db);
+    let bindings = match binding_store.bindings_for_group_any_channel(&pg_id) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                target: "research::bridge",
+                conversation_id = %conversation_id.as_str(),
+                error = %e,
+                "binding lookup failed; skipping transport bridge of research PDF",
+            );
+            return;
+        }
+    };
+    let signal_binding = bindings
+        .iter()
+        .find(|b| b.channel == crate::signal_transport::SIGNAL_CHANNEL);
+    let Some(binding) = signal_binding else {
+        return; // no signal binding; web-only conversation
+    };
+
+    let resolver: std::sync::Arc<
+        dyn crate::signal_transport::RpcEndpointResolver,
+    > = std::sync::Arc::new(supervisor.clone());
+    let transport = crate::signal_transport::SignalCliTransport::new(
+        resolver,
+        db.clone(),
+        crate::signal_transport::SignalCliTransport::read_self_number_from_env(),
+        Some(binding.foreign_id.clone()),
+    )
+    .with_caller_conversation_id(conversation_id.clone());
+
+    // Prose framing: a tight one-liner echoing the original query
+    // is enough — the PDF is the actual deliverable. The
+    // signal-cli wrapper accepts text + base64_attachments in the
+    // same /v2/send call so the contact sees the message + file
+    // as a single notification on their phone.
+    let summary = format!(
+        "Deep-research report ready for: {}",
+        truncate_for_error(query, 240)
+    );
+    match transport
+        .send_with_attachments(
+            crate::signal_transport::SIGNAL_CHANNEL,
+            &binding.foreign_id,
+            &summary,
+            &[attachment_id.to_owned()],
+        )
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(
+                target: "research::bridge",
+                conversation_id = %conversation_id.as_str(),
+                recipient = %binding.foreign_id,
+                attachment_id = %attachment_id,
+                "auto-dispatched research PDF via Signal",
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "research::bridge",
+                conversation_id = %conversation_id.as_str(),
+                recipient = %binding.foreign_id,
+                error = %e,
+                "research PDF Signal dispatch failed; SPA download chip remains the only deliverable",
+            );
+        }
+    }
 }
 
 async fn call_planner(
@@ -1463,6 +1606,7 @@ mod tests {
             inference: Arc::new(InferenceClient::new("http://127.0.0.1:0/v1")),
             model: "test-model".into(),
             cancel,
+            sidecar_supervisor: None,
         };
 
         // Must return Ok(()) cleanly without making the LLM call,
@@ -1613,6 +1757,7 @@ mod tests {
             inference: Arc::new(InferenceClient::new(format!("http://{addr}/v1"))),
             model: "test-model".into(),
             cancel,
+            sidecar_supervisor: None,
         };
 
         let notes = vec![ResearchNote {
@@ -1839,6 +1984,7 @@ mod tests {
             )),
             events: EventBus::new(),
             cancel,
+            sidecar_supervisor: None,
         };
 
         let row = run_job(ctx).await.expect("must short-circuit cleanly");
