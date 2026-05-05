@@ -198,17 +198,24 @@ describe("Sidebar", () => {
         expect(
             screen.getByTestId("sidebar-threads-filters-menu"),
         ).toBeInTheDocument();
-        // External count badge shows up inside the menu when there's
-        // at least one external thread.
-        expect(screen.getByTestId("sidebar-external-count").textContent).toBe(
-            "1",
-        );
 
-        const toggle = screen.getByTestId(
-            "sidebar-hide-external",
-        ) as HTMLInputElement;
+        // The toggle is a button now (not a checkbox) — pressing it
+        // flips the on/off label and applies the filter.
+        const toggle = screen.getByTestId("sidebar-hide-external");
+        const stateLabel = screen.getByTestId(
+            "sidebar-hide-external-state",
+        );
+        // "External channels [on]" reads as "external channels are
+        // currently visible." Pressing the row toggles to "off"
+        // which hides them.
+        expect(stateLabel.textContent).toBe("on");
+        expect(toggle).toHaveAttribute("aria-pressed", "false");
+
         fireEvent.click(toggle);
-        expect(toggle.checked).toBe(true);
+        expect(toggle).toHaveAttribute("aria-pressed", "true");
+        expect(
+            screen.getByTestId("sidebar-hide-external-state").textContent,
+        ).toBe("off");
         const after = screen.getAllByTestId("sidebar-thread");
         expect(after).toHaveLength(1);
         expect(after[0]).toHaveAttribute("data-thread-id", "ctrl");

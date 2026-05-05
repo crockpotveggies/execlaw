@@ -321,48 +321,61 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                                 top: "100%",
                                 right: 0,
                                 zIndex: 100,
-                                minWidth: "16rem",
+                                minWidth: "13rem",
                                 marginTop: "0.25rem",
-                                padding: "0.5rem 0.75rem",
-                                // Lift the menu visibly above the
-                                // sidebar surface. `$bg-elev` (the
-                                // theme's "elevated" tone) reads as
-                                // a clearly-distinct surface against
-                                // the sidebar's `$bg-surface`. Drop-
-                                // shadow + a 1px highlight border
-                                // give the menu enough definition
-                                // that the operator can tell it's
-                                // an interactive popover, not just
-                                // an inline section.
+                                padding: "0.25rem",
                                 background: "#1f2630",
                                 border: "1px solid #30363d",
                                 boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+                                // Reset the section-header text
+                                // styling we inherited from the
+                                // wrapping `.execlaw-sidebar__section`
+                                // div (uppercase, 0.6rem, muted).
+                                // The menu is a full popover — its
+                                // contents should read as regular
+                                // page text, not as a sub-heading
+                                // of the heading that hosts it.
+                                textTransform: "none",
+                                letterSpacing: "normal",
+                                fontSize: "0.875rem",
+                                fontWeight: 400,
+                                color: "#e6edf3",
                             }}
                         >
-                            <label
-                                className="d-flex align-items-center gap-2 m-0"
-                                style={{ cursor: "pointer" }}
+                            <button
+                                type="button"
+                                onClick={() =>
+                                    setHideExternal((v) => !v)
+                                }
+                                data-testid="sidebar-hide-external"
+                                aria-pressed={hideExternal}
+                                className="d-flex align-items-center w-100"
+                                style={{
+                                    background: "transparent",
+                                    border: "none",
+                                    color: "inherit",
+                                    padding: "0.4rem 0.6rem",
+                                    borderRadius: "0.25rem",
+                                    cursor: "pointer",
+                                    textAlign: "left",
+                                }}
                             >
-                                <input
-                                    type="checkbox"
-                                    checked={hideExternal}
-                                    onChange={(e) =>
-                                        setHideExternal(e.target.checked)
-                                    }
-                                    data-testid="sidebar-hide-external"
-                                />
-                                <span className="flex-grow-1 small">
-                                    Hide external channels
+                                <span className="flex-grow-1">
+                                    External channels
                                 </span>
-                                {externalCount > 0 && (
-                                    <span
-                                        className="execlaw-muted small"
-                                        data-testid="sidebar-external-count"
-                                    >
-                                        {externalCount}
-                                    </span>
-                                )}
-                            </label>
+                                <span
+                                    data-testid="sidebar-hide-external-state"
+                                    style={{
+                                        fontWeight: 600,
+                                        color: hideExternal
+                                            ? "#7d8590"
+                                            : "#3fb950",
+                                        marginLeft: "0.5rem",
+                                    }}
+                                >
+                                    {hideExternal ? "off" : "on"}
+                                </span>
+                            </button>
                         </div>
                     )}
                 </div>
