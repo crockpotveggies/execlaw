@@ -307,11 +307,6 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                             lineHeight: 1,
                             display: "inline-flex",
                             alignItems: "center",
-                            // 20% smaller than the surrounding section
-                            // header text — small enough to stay
-                            // visually subordinate to the "Threads"
-                            // label without losing tap-target.
-                            fontSize: "0.8em",
                         }}
                     >
                         <i className="bi bi-sliders" aria-hidden />
@@ -329,7 +324,19 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                                 minWidth: "16rem",
                                 marginTop: "0.25rem",
                                 padding: "0.5rem 0.75rem",
-                                boxShadow: "0 4px 12px rgba(0,0,0,0.12)",
+                                // Lift the menu visibly above the
+                                // sidebar surface. `$bg-elev` (the
+                                // theme's "elevated" tone) reads as
+                                // a clearly-distinct surface against
+                                // the sidebar's `$bg-surface`. Drop-
+                                // shadow + a 1px highlight border
+                                // give the menu enough definition
+                                // that the operator can tell it's
+                                // an interactive popover, not just
+                                // an inline section.
+                                background: "#1f2630",
+                                border: "1px solid #30363d",
+                                boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
                             }}
                         >
                             <label
