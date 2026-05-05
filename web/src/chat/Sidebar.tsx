@@ -18,6 +18,7 @@ import {
     patchThread,
     type UiPanelSummary,
 } from "../api/endpoints";
+import { useConnectionStatus } from "../api/connection";
 import {
     setActiveThread,
     setAlertFiringCount,
@@ -164,6 +165,7 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
         <aside className="execlaw-sidebar">
             <div className="execlaw-sidebar__head">
                 <h1 className="execlaw-brand h6 mb-0">execlaw</h1>
+                <BrandStatusIndicator alertCount={alertFiringCount} />
             </div>
 
             <nav className="execlaw-sidebar__nav">
@@ -216,15 +218,6 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                         label="Approvals"
                         testId="sidebar-approvals"
                         badge={pendingApprovalCount}
-                    />
-                )}
-                {alertFiringCount > 0 && (
-                    <SidebarNavLink
-                        to="/settings/alerts"
-                        icon="bi-bell-fill"
-                        label="Alerts"
-                        testId="sidebar-alerts"
-                        badge={alertFiringCount}
                     />
                 )}
                 <button
@@ -445,6 +438,64 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                 </button>
             </div>
         </aside>
+    );
+}
+
+// Inline status indicator that lives next to the brand wordmark.
+// Three states, in priority order:
+//   * disconnected (server unreachable / WS reconnecting) — wifi-off
+//     icon. Wins over alerts because if the SPA can't reach the
+//     control plane, the alert count it last cached is stale.
+//   * firing alerts > 0 — alert-triangle icon. Click to jump to
+//     /settings/alerts; this is the replacement for the conditional
+//     "Alerts" nav row that used to appear only when alerts were
+//     active.
+//   * healthy — small green dot. Always visible so the operator has
+//     a steady "everything is fine" signal in the same spot.
+function BrandStatusIndicator({ alertCount }: { alertCount: number }) {
+    const conn = useConnectionStatus();
+    if (conn !== "online") {
+        const label =
+            conn === "offline"
+                ? "Server unreachable"
+                : "Reconnecting to server";
+        return (
+            <span
+                className="execlaw-brand-status is-disconnected"
+                role="status"
+                aria-label={label}
+                title={label}
+                data-testid="sidebar-brand-status"
+                data-state="disconnected"
+            >
+                <i className="bi bi-wifi-off" aria-hidden />
+            </span>
+        );
+    }
+    if (alertCount > 0) {
+        const label = `${alertCount} firing alert${alertCount === 1 ? "" : "s"}`;
+        return (
+            <Link
+                to="/settings/alerts"
+                className="execlaw-brand-status is-alert"
+                aria-label={label}
+                title={label}
+                data-testid="sidebar-brand-status"
+                data-state="alert"
+            >
+                <i className="bi bi-exclamation-triangle-fill" aria-hidden />
+            </Link>
+        );
+    }
+    return (
+        <Link
+            to="/settings/alerts"
+            className="execlaw-brand-status is-ok"
+            aria-label="Online — open alerts"
+            title="Online — open alerts"
+            data-testid="sidebar-brand-status"
+            data-state="ok"
+        />
     );
 }
 

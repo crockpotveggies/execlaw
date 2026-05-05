@@ -417,6 +417,59 @@ body {
 
 .execlaw-sidebar__head {
     padding: 1.1rem 1rem 0.75rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+// Inline status pip rendered next to the `execlaw` wordmark. Default
+// state is a small green dot; flips to an alert-triangle when there
+// are firing alerts (clickable, links to /settings/alerts), and to a
+// wifi-off glyph when the SPA has lost its connection to the control
+// plane. Sized to feel like a piece of the wordmark — not a button.
+.execlaw-brand-status {
+    flex: 0 0 auto;
+    width: 0.48rem;
+    height: 0.48rem;
+    border-radius: 999px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+    text-decoration: none;
+
+    &.is-ok {
+        background-color: $success;
+        box-shadow: 0 0 6px rgba($success, 0.55);
+    }
+
+    // Alert + disconnected variants render an icon glyph, so we
+    // expand the box past the 0.6rem dot footprint and drop the
+    // background fill — the icon does the visual work.
+    &.is-alert,
+    &.is-disconnected {
+        width: auto;
+        height: auto;
+        background-color: transparent;
+        box-shadow: none;
+        font-size: 0.95rem;
+    }
+
+    &.is-alert {
+        color: $danger;
+        // Pulse so it catches the eye without being noisy.
+        animation: execlaw-brand-status-pulse 1.6s ease-in-out infinite;
+        &:hover { color: color.adjust($danger, $lightness: 6%); }
+    }
+
+    &.is-disconnected {
+        color: $warning;
+    }
+}
+
+@keyframes execlaw-brand-status-pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.55; }
 }
 
 .execlaw-sidebar__nav {
