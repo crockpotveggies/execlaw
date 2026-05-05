@@ -2536,10 +2536,35 @@ pub(crate) fn build_turn_context_prose(
     origin_channel: Option<&str>,
 ) -> String {
     let mut out = String::from("## Turn context\n\n");
+    // Date framing matters more than it looks. Earlier prompts
+    // emitted only the ISO timestamp ("2026-05-05T13:00:00Z");
+    // models with a sub-2026 training cutoff recognized 2026 as
+    // "future relative to me," second-guessed the system prompt,
+    // and refused tasks ("I cannot do research about 2026 because
+    // it's a future year"). Two-line fix:
+    //   1. Render the date in human-prose form alongside the ISO
+    //      timestamp — the model's tokenizer chunks "May 5, 2026"
+    //      and "2026-05-05" differently, and the prose form
+    //      reinforces "this is the actual current date" against a
+    //      stale training prior.
+    //   2. Add an explicit cutoff-confusion guard so the model
+    //      doesn't refuse tasks that reference dates past its
+    //      training data. Frames training data as a starting point,
+    //      not a ceiling, and points at web_search / research as
+    //      the right tools for "I don't know about events after my
+    //      cutoff."
     out.push_str(&format!(
-        "* Current UTC time: {}\n",
+        "* Current date: {} (UTC: {})\n",
+        now_utc.format("%A, %B %-d, %Y"),
         now_utc.format("%Y-%m-%dT%H:%M:%SZ"),
     ));
+    out.push_str(
+        "* The current date above is authoritative — treat it as the real \
+         present, not a hypothetical. If your training data ended before this \
+         date, that's expected; for facts about events past your training \
+         cutoff use `web_search` or `research_start`. Do NOT push back on the \
+         date or refuse tasks because they reference \"future\" years.\n",
+    );
     out.push_str(&format!("* Conversation id: `{conversation_id}`\n"));
     if let Some(p) = sender_principal_id {
         out.push_str(&format!("* From principal: `{p}`\n"));
@@ -4309,10 +4334,40 @@ mod tests {
             .with_timezone(&chrono::Utc);
         let prose =
             super::build_turn_context_prose(now, "conv-abc", Some("controller"), "Controller", None);
+        // ISO timestamp still present (precise form for any tool
+        // call that needs it).
         assert!(prose.contains("2026-05-02T10:23:45Z"));
+        // Human-prose date form too — reinforces the date against
+        // a stale training-data prior. May 2 2026 was a Saturday.
+        assert!(prose.contains("Saturday, May 2, 2026"));
         assert!(prose.contains("conv-abc"));
         assert!(prose.contains("controller"));
         assert!(prose.contains("Controller"));
+    }
+
+    #[test]
+    fn build_turn_context_prose_includes_date_cutoff_guard() {
+        // Regression: agent kept refusing tasks that referenced
+        // 2026 because its training cutoff predates 2026. The
+        // guard tells the model the date above is authoritative
+        // and points at search tools for post-cutoff facts.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-02T10:23:45Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let prose = super::build_turn_context_prose(
+            now,
+            "conv-abc",
+            None,
+            "Controller",
+            None,
+        );
+        assert!(
+            prose.contains("authoritative") && prose.contains("training cutoff"),
+            "guard against training-cutoff date refusals must be in the prose"
+        );
+        // Points at the right escape valves so the model knows
+        // there's a path for genuine post-cutoff knowledge gaps.
+        assert!(prose.contains("web_search") || prose.contains("research_start"));
     }
 
     #[test]
