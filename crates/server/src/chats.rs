@@ -2559,11 +2559,8 @@ pub(crate) fn build_turn_context_prose(
         now_utc.format("%Y-%m-%dT%H:%M:%SZ"),
     ));
     out.push_str(
-        "* The current date above is authoritative — treat it as the real \
-         present, not a hypothetical. If your training data ended before this \
-         date, that's expected; for facts about events past your training \
-         cutoff use `web_search` or `research_start`. Do NOT push back on the \
-         date or refuse tasks because they reference \"future\" years.\n",
+        "* Date above is real, not hypothetical — for post-cutoff facts use \
+         `web_search` or `research_start`.\n",
     );
     out.push_str(&format!("* Conversation id: `{conversation_id}`\n"));
     if let Some(p) = sender_principal_id {
@@ -4361,12 +4358,14 @@ mod tests {
             "Controller",
             None,
         );
+        // Tight one-liner reframes the date as real (not
+        // hypothetical) and points at the search escape valves.
+        // Order matters less than presence of both signals.
         assert!(
-            prose.contains("authoritative") && prose.contains("training cutoff"),
-            "guard against training-cutoff date refusals must be in the prose"
+            prose.contains("real, not hypothetical")
+                || prose.contains("not hypothetical"),
+            "the date-is-real reframe must be in the prose"
         );
-        // Points at the right escape valves so the model knows
-        // there's a path for genuine post-cutoff knowledge gaps.
         assert!(prose.contains("web_search") || prose.contains("research_start"));
     }
 
