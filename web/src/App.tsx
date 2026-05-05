@@ -1,6 +1,7 @@
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { AuthProvider } from "./auth/AuthContext";
 import { AppBoot } from "./routes/AppBoot";
+import { Approvals } from "./routes/Approvals";
 import { Chat } from "./routes/Chat";
 import { ConnectionBanner } from "./routes/ConnectionBanner";
 import { Login } from "./routes/Login";
@@ -89,6 +90,14 @@ export function App() {
                         element={
                             <RequireSetupComplete>
                                 <Skills />
+                            </RequireSetupComplete>
+                        }
+                    />
+                    <Route
+                        path="/approvals"
+                        element={
+                            <RequireSetupComplete>
+                                <Approvals />
                             </RequireSetupComplete>
                         }
                     />

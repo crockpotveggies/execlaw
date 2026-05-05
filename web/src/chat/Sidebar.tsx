@@ -217,7 +217,7 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                 />
                 {pendingApprovalCount > 0 && (
                     <SidebarNavLink
-                        to="/chat"
+                        to="/approvals"
                         icon="bi-shield-exclamation"
                         label="Approvals"
                         testId="sidebar-approvals"

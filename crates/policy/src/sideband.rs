@@ -54,6 +54,13 @@ pub enum ApprovalVerb {
     Block,
     /// For cold-contact: drop this message, re-prompt on the next one.
     IgnoreOnce,
+    /// For cold-contact: this is the controller messaging from a
+    /// not-yet-registered handle. Adds the binding's
+    /// `(channel, foreign_id)` to the controller's "My identities"
+    /// (which triggers reconcile to merge the stale UnknownPending
+    /// principal away and rebind the conversation), then replays the
+    /// queued message through the controller turn dispatcher.
+    ClaimAsMe,
 }
 
 /// The payload signed into the approval token (JWT claims).

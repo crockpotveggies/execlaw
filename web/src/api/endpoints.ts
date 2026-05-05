@@ -1675,10 +1675,29 @@ export async function listPendingApprovals(
     );
 }
 
+/**
+ * Cold-contact approval verbs the controller can apply via
+ * /api/admin/approvals/{id}/respond. The serde format on the Rust
+ * side is snake_case so wire values match the variant names below.
+ *
+ *   - trust          → admit as KnownTrusted (full safe-tools)
+ *   - trust_limited  → admit as KnownLimited (reply on this transport only)
+ *   - claim_as_me    → controller's own handle; add to My identities,
+ *                      reconcile, replay queued message as Controller turn
+ *   - block          → flip principal to Blocked
+ *   - ignore_once    → un-park without changing trust; future inbound
+ *                      from this handle will re-prompt
+ */
+export type ApprovalVerb =
+    | "trust"
+    | "trust_limited"
+    | "claim_as_me"
+    | "block"
+    | "ignore_once";
+
 export interface RespondApprovalRequest {
-    /** "Trust" | "TrustLimited" | "Block" | "TrustOnce" — server-defined. */
-    verb: string;
-    /** TrustLimited only. */
+    verb: ApprovalVerb;
+    /** trust_limited only. */
     allowed_topics?: string[];
     /** Optional reason recorded with the approval. */
     reason?: string;

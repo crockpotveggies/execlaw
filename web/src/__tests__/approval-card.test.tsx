@@ -15,12 +15,17 @@ describe("ApprovalCard", () => {
         expect(container.firstChild).toBeNull();
     });
 
-    it("renders the four canonical verb buttons", () => {
+    it("renders the canonical verb buttons (snake_case wire values matching the server enum)", () => {
         render(<ApprovalCard approval={sample} />);
-        expect(screen.getByTestId("approval-verb-Trust")).toBeInTheDocument();
-        expect(screen.getByTestId("approval-verb-TrustLimited")).toBeInTheDocument();
-        expect(screen.getByTestId("approval-verb-TrustOnce")).toBeInTheDocument();
-        expect(screen.getByTestId("approval-verb-Block")).toBeInTheDocument();
+        // Wire values are snake_case per the server's
+        // `#[serde(rename_all = "snake_case")]` on ApprovalVerb. The
+        // pre-fix card sent PascalCase names that the server
+        // silently rejected — this test pins the contract.
+        expect(screen.getByTestId("approval-verb-trust")).toBeInTheDocument();
+        expect(screen.getByTestId("approval-verb-trust_limited")).toBeInTheDocument();
+        expect(screen.getByTestId("approval-verb-claim_as_me")).toBeInTheDocument();
+        expect(screen.getByTestId("approval-verb-ignore_once")).toBeInTheDocument();
+        expect(screen.getByTestId("approval-verb-block")).toBeInTheDocument();
     });
 
     it("includes the original sender id + truncated message", () => {
@@ -36,15 +41,28 @@ describe("ApprovalCard", () => {
     it("clicking a verb button calls onRespond with verb + approval id", () => {
         const onRespond = vi.fn();
         render(<ApprovalCard approval={sample} onRespond={onRespond} />);
-        fireEvent.click(screen.getByTestId("approval-verb-Trust"));
-        expect(onRespond).toHaveBeenCalledWith("appr-123", "Trust");
-        fireEvent.click(screen.getByTestId("approval-verb-Block"));
-        expect(onRespond).toHaveBeenLastCalledWith("appr-123", "Block");
+        fireEvent.click(screen.getByTestId("approval-verb-trust"));
+        expect(onRespond).toHaveBeenCalledWith("appr-123", "trust");
+        fireEvent.click(screen.getByTestId("approval-verb-block"));
+        expect(onRespond).toHaveBeenLastCalledWith("appr-123", "block");
+    });
+
+    it("claim_as_me is a distinct verb, separate from trust", () => {
+        const onRespond = vi.fn();
+        render(<ApprovalCard approval={sample} onRespond={onRespond} />);
+        fireEvent.click(screen.getByTestId("approval-verb-claim_as_me"));
+        expect(onRespond).toHaveBeenCalledWith("appr-123", "claim_as_me");
     });
 
     it("disables verbs while busy", () => {
         render(<ApprovalCard approval={sample} busy />);
-        for (const verb of ["Trust", "TrustLimited", "TrustOnce", "Block"]) {
+        for (const verb of [
+            "trust",
+            "trust_limited",
+            "claim_as_me",
+            "ignore_once",
+            "block",
+        ]) {
             const btn = screen.getByTestId(`approval-verb-${verb}`);
             expect((btn as HTMLButtonElement).disabled).toBe(true);
         }

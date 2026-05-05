@@ -1,40 +1,59 @@
-// Inline approval card — slides in just above the composer when the
-// active thread has a pending approval (cold-contact). Verbs map
-// directly to the server's ApprovalVerb enum: Trust / TrustLimited /
-// Block / TrustOnce.
+// Inline approval card — slides in above the composer when the
+// active thread has a pending cold-contact approval. Wire values
+// match the server's ApprovalVerb enum (snake_case); see
+// `crates/policy/src/sideband.rs`.
 
 import Button from "react-bootstrap/Button";
-import type { PendingApprovalSummary } from "../api/endpoints";
+import type { ApprovalVerb, PendingApprovalSummary } from "../api/endpoints";
 
 const VERBS: ReadonlyArray<{
-    verb: "Trust" | "TrustLimited" | "Block" | "TrustOnce";
+    verb: ApprovalVerb;
     label: string;
     icon: string;
     variant: string;
+    title: string;
 }> = [
-    { verb: "Trust", label: "Trust", icon: "bi-shield-check", variant: "outline-success" },
     {
-        verb: "TrustLimited",
+        verb: "trust",
+        label: "Trust",
+        icon: "bi-shield-check",
+        variant: "outline-success",
+        title: "Admit as KnownTrusted: full safe-tools + memory access",
+    },
+    {
+        verb: "trust_limited",
         label: "Limited",
         icon: "bi-shield-shaded",
         variant: "outline-warning",
+        title: "Admit as KnownLimited: agent can reply on this transport only",
     },
     {
-        verb: "TrustOnce",
-        label: "Trust once",
+        verb: "claim_as_me",
+        label: "This is me",
+        icon: "bi-person-check",
+        variant: "outline-primary",
+        title: "Adds this handle to your My identities so future inbound resolves to you",
+    },
+    {
+        verb: "ignore_once",
+        label: "Ignore once",
         icon: "bi-shield-slash",
         variant: "outline-secondary",
+        title: "Drop this message; re-prompt on the next inbound from this handle",
     },
-    { verb: "Block", label: "Block", icon: "bi-shield-x", variant: "outline-danger" },
+    {
+        verb: "block",
+        label: "Block",
+        icon: "bi-shield-x",
+        variant: "outline-danger",
+        title: "Block universally — future inbound silently audit-logged",
+    },
 ];
 
 interface Props {
     approval: PendingApprovalSummary | null;
     busy?: boolean;
-    onRespond?: (
-        approvalId: string,
-        verb: "Trust" | "TrustLimited" | "Block" | "TrustOnce",
-    ) => void;
+    onRespond?: (approvalId: string, verb: ApprovalVerb) => void;
 }
 
 export function ApprovalCard({ approval, busy, onRespond }: Props) {
@@ -59,6 +78,7 @@ export function ApprovalCard({ approval, busy, onRespond }: Props) {
                         size="sm"
                         variant={v.variant}
                         disabled={busy}
+                        title={v.title}
                         onClick={() => onRespond?.(approval.approval_id, v.verb)}
                         data-testid={`approval-verb-${v.verb}`}
                     >

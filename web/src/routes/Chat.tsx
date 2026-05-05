@@ -25,6 +25,7 @@ import {
     postMessage,
     postStopTurn,
     respondApproval,
+    type ApprovalVerb,
     type UiPanelSummary,
 } from "../api/endpoints";
 import { WsClient, type WsEvent } from "../api/ws";
@@ -1027,10 +1028,7 @@ function ActiveThreadPane({
     // (see WelcomeView's incognito toggle) — once a chat exists in
     // the event log, it stays in the event log.
     const onApprovalRespond = useCallback(
-        async (
-            approvalId: string,
-            verb: "Trust" | "TrustLimited" | "Block" | "TrustOnce",
-        ) => {
+        async (approvalId: string, verb: ApprovalVerb) => {
             setApprovalBusy(true);
             try {
                 await respondApproval(approvalId, { verb }, getToken);

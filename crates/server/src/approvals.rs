@@ -230,6 +230,9 @@ pub async fn respond_handler(
             )
                 .into_response();
         }
+        ApprovalVerb::ClaimAsMe => {
+            return claim_as_me(state, approval_id, &cid, &pid, original_text).await;
+        }
         // The non-cold-contact verbs (Approve / Edit / Reject) land
         // with the Rule-of-Two + sensitive-tool-call flows in Phase 3+.
         other => {
@@ -240,7 +243,7 @@ pub async fn respond_handler(
                         "code": "unsupported_verb",
                         "message": format!(
                             "verb {:?} is not supported for cold-contact approvals; \
-                             use Trust / TrustLimited / Block / IgnoreOnce",
+                             use Trust / TrustLimited / ClaimAsMe / Block / IgnoreOnce",
                             other
                         ),
                     }
@@ -287,7 +290,7 @@ pub async fn respond_handler(
         state.events.publish(UiEvent::ChatMessageInbound {
             conversation_id: cid.as_str().to_owned(),
             seq: log.last_seq(&cid).map(|s| s.0).unwrap_or(0),
-            text: original_text,
+            text: original_text.clone(),
             sender: Some(sender_principal_id.clone()),
         });
     }
@@ -298,6 +301,37 @@ pub async fn respond_handler(
         if let Ok(Some(mut row)) = cstore.get(&cid) {
             row.phase = Phase::Idle;
             let _ = cstore.upsert(&row);
+        }
+    }
+
+    // Replay the queued message through the agent so the controller
+    // doesn't have to ask the contact to re-send. Pre-fix, the
+    // approval flipped trust + un-parked the conversation but no
+    // turn ever ran — the contact would just see "you read this 5
+    // minutes ago" with no reply. Now we dispatch_external_turn
+    // with the freshly-promoted principal so the agent answers
+    // what was actually asked.
+    if matches!(outcome, "trust" | "trust_limited") {
+        let promoted = match principals.get(&pid) {
+            Ok(Some(p)) => p,
+            _ => {
+                return internal_error("post-trust principal lookup failed");
+            }
+        };
+        let trust_flat = execlaw_policy::trust::TrustLevel::parse(promoted.trust_level.class_tag())
+            .unwrap_or(execlaw_policy::trust::TrustLevel::UnknownPending);
+        if let Err(e) =
+            crate::chats::dispatch_external_turn(&state, &cid, &promoted, trust_flat, &original_text)
+                .await
+        {
+            tracing::warn!(
+                target: "approvals",
+                conversation_id = %cid.as_str(),
+                error = %e,
+                "post-approval replay through dispatch_external_turn failed; \
+                 trust transition stands but the agent didn't run a turn — \
+                 operator can ask the contact to re-send",
+            );
         }
     }
 
@@ -327,6 +361,144 @@ struct TrustChangedPayload {
     new_class: String,
     approval_id: String,
     reason: Option<String>,
+}
+
+/// "This is me" — the controller is messaging the agent from a
+/// not-yet-registered handle. Adds the cold-contact's
+/// `(transport, handle)` to the controller's identifiers, then
+/// calls `principal_admit::reconcile_against_my_identities` which
+/// merges the stale UnknownPending principal into the controller,
+/// rebinds the binding + conversation, and unsticks the
+/// `awaiting_trust_decision` phase. After reconcile the queued
+/// message is dispatched through the controller turn handler so
+/// the agent answers immediately.
+async fn claim_as_me(
+    state: AppState,
+    approval_id: String,
+    cid: &ConversationId,
+    stale_pid: &PrincipalId,
+    original_text: String,
+) -> axum::response::Response {
+    let principals = PrincipalStore::new(&state.db);
+    let now = chrono::Utc::now().timestamp();
+
+    // 1. Pull the stale principal's identifiers — those are what we
+    // attach to the controller. Drop early if the principal
+    // vanished (race with another approval response).
+    let stale = match principals.get(stale_pid) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "stale_principal_missing",
+                        "message": "cold-contact principal vanished before approval",
+                    }
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => return internal_error(&format!("principal get: {e}")),
+    };
+
+    // 2. Resolve the controller principal id via the same accessor
+    // `add_my_identifier` uses. Lazy-create when the controller's
+    // explicit row doesn't exist yet (matches the existing My-
+    // identities semantics).
+    let controller_pid = match crate::routes::controller_principal_id(&state.db) {
+        Ok(p) => p,
+        Err(e) => return internal_error(&format!("controller principal: {}", e.message)),
+    };
+    let mut controller_row = match principals.get(&controller_pid) {
+        Ok(Some(p)) => p,
+        Ok(None) => execlaw_core::principal::Principal {
+            id: controller_pid.clone(),
+            identifiers: Vec::new(),
+            trust_level: CoreTrustLevel::Controller,
+            resolved_by: Vec::new(),
+            metadata: serde_json::json!({}),
+            first_seen: now,
+            last_seen: Some(now),
+            controller_notes: None,
+        },
+        Err(e) => return internal_error(&format!("controller principal lookup: {e}")),
+    };
+
+    // 3. Add every identifier from the stale principal to the
+    // controller (deduped). The reconcile pass below will then
+    // merge the stale principal away, rebind the conversation,
+    // and flip the awaiting_trust_decision phase to idle.
+    let mut added_any = false;
+    for ident in &stale.identifiers {
+        if !controller_row.identifiers.contains(ident) {
+            controller_row.identifiers.push(ident.clone());
+            added_any = true;
+        }
+    }
+    if added_any {
+        controller_row.last_seen = Some(now);
+        if let Err(e) = principals.upsert(&controller_row) {
+            return internal_error(&format!("controller upsert: {e}"));
+        }
+    }
+
+    // 4. Reconcile.
+    let report = match crate::principal_admit::reconcile_against_my_identities(&state.db) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                target: "approvals::claim_as_me",
+                error = %e,
+                "reconcile after claim_as_me failed; controller now owns the identifier \
+                 but the stale principal may still shadow it",
+            );
+            crate::principal_admit::ReconcileReport::default()
+        }
+    };
+    tracing::info!(
+        target: "approvals::claim_as_me",
+        approval_id = %approval_id,
+        merged = report.merged.len(),
+        bindings_repointed = report.bindings_repointed,
+        conversations_repointed = report.conversations_repointed,
+        "claim_as_me reconcile complete",
+    );
+
+    // 5. Replay the queued message as the controller. After
+    // reconcile the conversation is bound to the controller's
+    // group; dispatch_external_turn with the controller principal
+    // runs the same pipeline a fresh inbound from the controller
+    // would.
+    let controller_now = match principals.get(&controller_pid) {
+        Ok(Some(p)) => p,
+        _ => return internal_error("controller principal vanished mid-claim"),
+    };
+    let trust_flat = execlaw_policy::trust::TrustLevel::Controller;
+    if let Err(e) =
+        crate::chats::dispatch_external_turn(&state, cid, &controller_now, trust_flat, &original_text)
+            .await
+    {
+        tracing::warn!(
+            target: "approvals::claim_as_me",
+            conversation_id = %cid.as_str(),
+            error = %e,
+            "dispatch_external_turn replay failed after claim_as_me; \
+             trust transition stands but no turn ran",
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(ApprovalResponse {
+            approval_id,
+            principal_id: controller_pid.as_str().to_owned(),
+            conversation_id: cid.as_str().to_owned(),
+            new_trust_class: "Controller".into(),
+            outcome: "claim_as_me".into(),
+        })),
+    )
+        .into_response()
 }
 
 /// Scan conversations for a ColdContactArrived event matching this
