@@ -182,6 +182,17 @@ pub struct RegisteredOauthAccount {
     pub plugin_id: String,
     pub account_name: String,
     pub provider: String,
+    /// Scopes the plugin's manifest currently requires. Surfaced
+    /// here (not just provider+name) so the OAuth admin path can
+    /// compare them against the persisted `state_oauth_clients`
+    /// row's stale snapshot — when a plugin upgrade adds scopes
+    /// (e.g. google-calendar v0.1 read-only → v0.2 with
+    /// `calendar.events`), the persisted row never auto-syncs
+    /// without this field, leaving write tools 401-ing because
+    /// Google issued the token under the old narrower set. The
+    /// connect handler reads this and reconciles before each
+    /// authorize URL build.
+    pub scopes: Vec<String>,
 }
 
 /// Result of [`HookRegistry::lookup_any`]. The dispatch layer pattern-
@@ -479,6 +490,7 @@ impl HookRegistry {
                     plugin_id: plugin_id.clone(),
                     account_name: a.name.clone(),
                     provider: a.provider.clone(),
+                    scopes: a.scopes.clone(),
                 })
                 .collect();
             w.oauth_accounts.insert(plugin_id.clone(), cached);

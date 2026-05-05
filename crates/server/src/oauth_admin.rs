@@ -288,11 +288,59 @@ pub async fn connect_handler(
 ) -> Result<Json<ConnectResponse>, ApiError> {
     require_controller(&state, &user)?;
     let cs = OauthClientStore::new(&state.db);
-    let client = cs.get(&plugin_id, &account_name)?.ok_or_else(|| ApiError {
+    let mut client = cs.get(&plugin_id, &account_name)?.ok_or_else(|| ApiError {
         status: StatusCode::NOT_FOUND,
         code: "oauth_not_found",
         message: format!("no oauth client for {plugin_id}/{account_name}"),
     })?;
+
+    // Manifest-driven scope sync. Without this, a plugin upgrade
+    // that adds new scopes (google-calendar v0.1 read-only → v0.2
+    // with `calendar.events`) leaves the persisted client row stuck
+    // at the old narrower set. The next connect builds an authorize
+    // URL with stale scopes, Google issues a token without the new
+    // permissions, and write tools 401 forever — the symptom that
+    // prompted this fix. Reconciling here makes the manifest
+    // (which the operator can audit on disk before installing the
+    // plugin) the source of truth for what scopes get requested.
+    //
+    // Take the union: persisted ∪ manifest. Operators who deliberately
+    // ADDED a scope (rare; today the SPA always pushes the manifest
+    // list) keep their addition. The common case — manifest is a
+    // strict superset — collapses to "use manifest scopes".
+    {
+        let accounts = state.plugin_host.registry().oauth_accounts_for(&plugin_id);
+        if let Some(decl) = accounts.into_iter().find(|a| a.account_name == account_name) {
+            if !decl.scopes.is_empty() {
+                let persisted = client.scopes();
+                let mut merged: Vec<String> = persisted.clone();
+                let mut changed = false;
+                for s in &decl.scopes {
+                    if !merged.iter().any(|p| p == s) {
+                        merged.push(s.clone());
+                        changed = true;
+                    }
+                }
+                if changed {
+                    let json = serde_json::to_string(&merged).unwrap_or_else(|_| "[]".into());
+                    client.scopes_json = json;
+                    let _ = cs.upsert(&client);
+                    tracing::info!(
+                        target: "oauth_admin::connect",
+                        plugin_id = %plugin_id,
+                        account_name = %account_name,
+                        added = ?decl
+                            .scopes
+                            .iter()
+                            .filter(|s| !persisted.iter().any(|p| p == *s))
+                            .collect::<Vec<_>>(),
+                        "synced persisted oauth scopes from manifest before authorize",
+                    );
+                }
+            }
+        }
+    }
+
     // Random state token — base64-url(32 bytes) so it's URL-safe
     // without escaping.
     let mut bytes = [0u8; 32];
@@ -752,6 +800,134 @@ mod tests {
         assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
         assert!(url.contains("state=")); // CSRF token present
         assert!(url.contains("client_id=cid"));
+    }
+
+    #[tokio::test]
+    async fn connect_syncs_persisted_scopes_from_manifest_on_drift() {
+        // Pin the scope-drift fix: an operator who connected the
+        // plugin under v0.1 (read-only) and then upgraded to v0.2
+        // (which added a write scope) had stale persisted scopes
+        // that locked the next OAuth grant into the old narrow set.
+        // Connect now reconciles persisted ∪ manifest BEFORE building
+        // the authorize URL so the next consent prompt requests the
+        // expanded scopes.
+        use execlaw_plugin_sdk::manifest::{
+            OauthAccountDecl, PluginHeader, PluginManifest,
+        };
+
+        let state = test_app_state();
+
+        // Register a plugin manifest with a richer scope set than
+        // what the operator's persisted client carries. The cached
+        // manifest scopes are what `connect_handler` should sync
+        // into `state_oauth_clients.scopes_json`.
+        let manifest = PluginManifest {
+            plugin: PluginHeader {
+                id: "plugin-google-calendar".into(),
+                name: "Google Calendar".into(),
+                version: "0.2.1".into(),
+                description: None,
+                author: None,
+                homepage: None,
+                license: None,
+                core_version: None,
+            },
+            tools: vec![],
+            transport: None,
+            identity_provider: None,
+            inference_backend: None,
+            hardware_probe: None,
+            ui_panels: vec![],
+            chat_components: vec![],
+            event_subscriptions: vec![],
+            services: vec![],
+            oauth_accounts: vec![OauthAccountDecl {
+                name: "controller".into(),
+                provider: "google".into(),
+                scopes: vec![
+                    "https://www.googleapis.com/auth/calendar.readonly".into(),
+                    "https://www.googleapis.com/auth/calendar.events".into(),
+                    "openid".into(),
+                    "email".into(),
+                ],
+                proactive_refresh_window: None,
+                warn_before_expiry: vec![],
+                token_store: None,
+            }],
+            alert_sources: vec![],
+            health_checks: vec![],
+            skills: vec![],
+            runtime: None,
+        };
+        state
+            .plugin_host
+            .registry()
+            .enable_with_stage(&manifest, None)
+            .expect("register manifest");
+
+        let app = build_router(state.clone());
+        let tok = setup_controller_token(&app).await;
+
+        // Persist the v0.1 client config — read-only only.
+        let body = serde_json::json!({
+            "provider": "google",
+            "client_id": "cid",
+            "client_secret": "secret",
+            "redirect_uri": "http://localhost:3030/api/oauth/google/callback",
+            "scopes": ["https://www.googleapis.com/auth/calendar.readonly"],
+        });
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/admin/oauth/clients/plugin-google-calendar/controller")
+                    .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Connect — handler should silently expand the persisted
+        // scopes BEFORE building the authorize URL.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/admin/oauth/clients/plugin-google-calendar/controller/connect")
+                    .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let url = v["authorize_url"].as_str().unwrap();
+        // The URL-encoded scope param must contain the new write
+        // scope (`%2F` is the encoded `/`). Without the sync, this
+        // assertion fails — the regression test that pins the fix.
+        assert!(
+            url.contains("calendar.events"),
+            "authorize_url must include the manifest's write scope; got: {url}"
+        );
+        assert!(url.contains("calendar.readonly"));
+
+        // The persisted row must now reflect the union — so the
+        // SPA's next GET /clients reflects the live scope set.
+        let cs = OauthClientStore::new(&state.db);
+        let row = cs
+            .get("plugin-google-calendar", "controller")
+            .unwrap()
+            .expect("client row must exist after upsert");
+        let scopes = row.scopes();
+        assert!(scopes.iter().any(|s| s == "https://www.googleapis.com/auth/calendar.events"));
+        assert!(scopes.iter().any(|s| s == "https://www.googleapis.com/auth/calendar.readonly"));
+        assert!(scopes.iter().any(|s| s == "openid"));
+        assert!(scopes.iter().any(|s| s == "email"));
     }
 
     #[tokio::test]

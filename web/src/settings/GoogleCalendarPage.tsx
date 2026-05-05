@@ -8,8 +8,17 @@
 import type { PluginConfigProps } from "./PluginConfigBase";
 import { OauthClientConfig } from "./OauthClientConfig";
 
+// Mirror plugins/google-calendar/plugin.toml's [[oauth_accounts]]
+// scopes. `calendar.events` is required for create/update/delete
+// (the plugin lost write access in v0.1 because it shipped with
+// `calendar.readonly` only). Keep this list in sync with the manifest;
+// the connect handler also reconciles persisted scopes against the
+// manifest as a defence in depth, but the SPA's Save still has to
+// post the right list so the visible OAuth client config doesn't
+// claim "read-only".
 const SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
     "openid",
     "email",
 ];
@@ -28,11 +37,12 @@ export function GoogleCalendarPage({
             description={
                 <>
                     Connects the <code>{pluginId}</code> plugin to your Google
-                    account. The <code>calendar.list_calendars</code> and{" "}
-                    <code>calendar.list_events</code> tools become available
-                    on chat turns. Read-only — write operations land when the
-                    operator-confirm flow for outbound calendar mutations is
-                    wired.
+                    account. Exposes seven calendar tools to the agent —{" "}
+                    <code>list_calendars</code>, <code>list_events</code>,{" "}
+                    <code>check_availability</code>, <code>get_event</code>,{" "}
+                    <code>create_event</code>, <code>update_event</code>,{" "}
+                    <code>delete_event</code>. Mutations send invitation /
+                    update notifications when attendees are present.
                 </>
             }
             setupSteps={
@@ -73,8 +83,13 @@ export function GoogleCalendarPage({
                     <li>
                         Paste the resulting client ID + secret above and
                         click Save, then Connect Account. The consent screen
-                        will request the{" "}
-                        <code>calendar.readonly</code> scope.
+                        will request the <code>calendar.readonly</code> +{" "}
+                        <code>calendar.events</code> scopes — the latter is
+                        required for <code>create_event</code> /{" "}
+                        <code>update_event</code> / <code>delete_event</code>.
+                        If you previously connected on v0.1 (read-only), use
+                        Disconnect first so Google re-prompts with the new
+                        scope set.
                     </li>
                 </ol>
             }

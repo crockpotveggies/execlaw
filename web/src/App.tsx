@@ -1,5 +1,6 @@
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { AuthProvider } from "./auth/AuthContext";
+import { AlertWatcher } from "./routes/AlertWatcher";
 import { AppBoot } from "./routes/AppBoot";
 import { Approvals } from "./routes/Approvals";
 import { Chat } from "./routes/Chat";
@@ -17,6 +18,17 @@ export function App() {
         <AuthProvider>
             <BrowserRouter>
                 <ConnectionBanner />
+                {/*
+                  Persistent alert-event WS subscription. Lives at the
+                  App level (NOT inside any per-route component) so the
+                  brand-status indicator next to the execlaw logo
+                  updates in real-time on every route — without it the
+                  alert count only refreshed via the Sidebar's 60s
+                  poll once the operator left /chat (where Chat.tsx's
+                  own WS used to be the only one). Headless — see
+                  routes/AlertWatcher.tsx for the rationale.
+                */}
+                <AlertWatcher />
                 <Routes>
                     <Route path="/" element={<AppBoot />} />
                     <Route path="/setup" element={<SetupWizard />} />
