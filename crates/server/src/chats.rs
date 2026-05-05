@@ -2091,7 +2091,174 @@ pub async fn dispatch_external_turn(
         Ok(_) => idle_guard.disarm_after_publishing_idle(),
         Err(_) => drop(idle_guard),
     }
+
+    // Transport bridge: when the turn was triggered by an inbound
+    // transport message, the agent's text reply needs to flow BACK
+    // out via the same transport. The `signal.reply` tool exists for
+    // this but the model frequently forgets to call it — without
+    // this auto-dispatch, the agent's reply only lands in the
+    // conversation log + the SPA's web view, not on the channel
+    // the contact is actually on. Best-effort: a dispatch failure
+    // logs but doesn't fail the turn (the text is already
+    // committed to the conversation).
+    if result.is_ok() {
+        if let Err(e) = bridge_text_reply_to_originating_transport(state, cid).await {
+            tracing::warn!(
+                target: "chats::dispatch_external_turn",
+                conversation_id = %cid.as_str(),
+                error = %e,
+                "auto-dispatch of agent text reply via originating transport failed",
+            );
+        }
+    }
     result.map(|_| ())
+}
+
+/// Look at the most recent turn in `cid` and, when (a) it produced
+/// a non-empty `model_turn` text response and (b) the agent did NOT
+/// already call a transport-send tool (signal.reply,
+/// signal.send_message — and any future per-transport reply tools),
+/// dispatch that text via the originating transport so the inbound
+/// contact actually gets a reply on their channel.
+///
+/// "Most recent turn" = events from the last `user_msg` to the last
+/// committed event for the conversation. The lookup is short
+/// (one or a few events for a typical inbound) so the linear scan
+/// is fine.
+///
+/// Idempotent against double-call: if the agent already dispatched
+/// via signal.reply / signal.send_message, the bridge backs off and
+/// does nothing — the contact saw the tool's send, the bridge
+/// would just duplicate it.
+async fn bridge_text_reply_to_originating_transport(
+    state: &AppState,
+    cid: &ConversationId,
+) -> Result<(), String> {
+    use execlaw_core::events::{EventKind, ToolUsePayload};
+    use execlaw_core::principal_groups::PrincipalGroupStore;
+    use execlaw_core::transport_bindings::TransportBindingStore;
+
+    // Step 1: discover the originating transport binding for this
+    // conversation. No binding → not transport-triggered → exit.
+    let pg_store = PrincipalGroupStore::new(&state.db);
+    let pg_id = match pg_store.principal_group_id_for(cid.as_str()) {
+        Ok(Some(id)) => id,
+        _ => return Ok(()),
+    };
+    let binding_store = TransportBindingStore::new(&state.db);
+    let bindings = binding_store
+        .bindings_for_group_any_channel(&pg_id)
+        .map_err(|e| format!("bindings_for_group: {e}"))?;
+    let signal_binding = bindings
+        .iter()
+        .find(|b| b.channel == crate::signal_transport::SIGNAL_CHANNEL);
+    let Some(binding) = signal_binding else {
+        return Ok(()); // no signal binding; no other transports support auto-bridge yet
+    };
+
+    // Step 2: scan the conversation's events to find the most
+    // recent turn. We need (a) the last model_turn's text and
+    // (b) any tool_use names emitted in the same turn.
+    let log = event_log(state);
+    let last_seq = log
+        .last_seq(cid)
+        .map_err(|e| format!("last_seq: {e}"))?;
+    if last_seq.0 == 0 {
+        return Ok(());
+    }
+    // Replay from the start of this turn. We define "this turn" as
+    // events back to and including the most recent user_msg. For
+    // typical inbound this is 1 user_msg + 0..N tool_use/tool_result
+    // pairs + 1 model_turn — small.
+    let events = log
+        .replay_since(cid, EventSeq(0))
+        .map_err(|e| format!("replay: {e}"))?;
+    // Walk backwards to find the boundary: the most recent user_msg
+    // marks the start of the current turn.
+    let mut turn_start_idx = 0usize;
+    for (i, ev) in events.iter().enumerate().rev() {
+        if matches!(ev.kind, EventKind::UserMsg) {
+            turn_start_idx = i;
+            break;
+        }
+    }
+    let turn = &events[turn_start_idx..];
+
+    // Step 3: bail if the agent already dispatched via a transport
+    // tool. Match on a small set of known recipient-determining
+    // tool names — future transports add their tool names here.
+    let already_dispatched = turn.iter().any(|ev| {
+        if !matches!(ev.kind, EventKind::ToolUse) {
+            return false;
+        }
+        ev.decode_payload::<ToolUsePayload>()
+            .map(|p| {
+                matches!(
+                    p.tool_name.as_str(),
+                    "signal.reply" | "signal.send_message"
+                )
+            })
+            .unwrap_or(false)
+    });
+    if already_dispatched {
+        return Ok(());
+    }
+
+    // Step 4: extract the model_turn text. Must be non-empty —
+    // signal.reply's contract is that the tool IS the reply, so a
+    // tool-using turn legitimately commits empty model_turn text.
+    // For our path (no transport tool used), empty text means the
+    // agent stayed silent and there's nothing to bridge.
+    let model_text = turn
+        .iter()
+        .filter_map(|ev| {
+            if !matches!(ev.kind, EventKind::ModelTurn) {
+                return None;
+            }
+            ev.decode_payload::<RealModelTurnPayload>()
+                .ok()
+                .map(|p| p.text)
+        })
+        .last()
+        .unwrap_or_default();
+    if model_text.trim().is_empty() {
+        return Ok(());
+    }
+
+    // Step 5: dispatch through the same SignalCliTransport the
+    // tool path uses. Constructing per-call is cheap (just a
+    // reqwest::Client + Arc clones). self_number resolves
+    // dynamically against /v1/accounts so we don't need the env
+    // override.
+    let supervisor = state.sidecar_supervisor.clone().ok_or_else(|| {
+        "sidecar supervisor unwired; cannot bridge text reply to Signal".to_owned()
+    })?;
+    let resolver: std::sync::Arc<
+        dyn crate::signal_transport::RpcEndpointResolver,
+    > = std::sync::Arc::new(supervisor);
+    let transport = crate::signal_transport::SignalCliTransport::new(
+        resolver,
+        state.db.clone(),
+        crate::signal_transport::SignalCliTransport::read_self_number_from_env(),
+        Some(binding.foreign_id.clone()),
+    );
+    use execlaw_core::tool::TransportApi;
+    transport
+        .send(
+            crate::signal_transport::SIGNAL_CHANNEL,
+            &binding.foreign_id,
+            &model_text,
+        )
+        .await
+        .map_err(|e| format!("transport send: {e}"))?;
+    tracing::info!(
+        target: "chats::dispatch_external_turn",
+        conversation_id = %cid.as_str(),
+        recipient = %binding.foreign_id,
+        text_len = model_text.len(),
+        "auto-bridged agent text reply via Signal",
+    );
+    Ok(())
 }
 
 /// Sender-id sentinel marking a UserMsg event the server-side
