@@ -263,6 +263,39 @@ pub async fn add_handler(
     row.last_seen = Some(now);
     store.upsert(&row).map_err(db_err)?;
 
+    // Reconcile any stale UnknownPending principals already
+    // claiming this handle. Before this hook a controller who
+    // registered an identifier AFTER an inbound from that handle
+    // had created a cold-contact principal would still see the
+    // stale row win the next inbound's by-id lookup. Reconcile
+    // re-points the bindings + conversations and drops the stale
+    // principal so future inbounds resolve to the controller.
+    //
+    // Best-effort: a reconcile failure shouldn't roll back the
+    // identifier add (the operator already saw success on the
+    // upsert). Log the report for diagnostics.
+    match crate::principal_admit::reconcile_against_my_identities(&state.db) {
+        Ok(report) => {
+            if !report.merged.is_empty() {
+                tracing::info!(
+                    target: "my_identities",
+                    added = %format!("{transport}:{handle}"),
+                    merged = report.merged.len(),
+                    bindings_repointed = report.bindings_repointed,
+                    conversations_repointed = report.conversations_repointed,
+                    "reconciled stale UnknownPending principals against new identifier",
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "my_identities",
+                error = %e,
+                "reconcile after identifier add failed; stale principals (if any) will retry on next reconcile",
+            );
+        }
+    }
+
     let _ = AuditStore::new(&state.db).insert(
         &user.user_id,
         "principals",

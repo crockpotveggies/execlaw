@@ -222,6 +222,36 @@ impl<'db> PrincipalStore<'db> {
         Ok(all.into_iter().find(|p| p.identifiers.contains(ident)))
     }
 
+    /// Find every principal that carries the given identifier. Used
+    /// by reconcile to detect stale UnknownPending rows shadowing a
+    /// controller-asserted "My identities" mapping (or any other
+    /// higher-trust principal that owns the same handle). Returns
+    /// matches in stable id order so the caller can dedupe
+    /// deterministically.
+    pub fn find_all_by_identifier(
+        &self,
+        ident: &Identifier,
+    ) -> Result<Vec<Principal>, DbError> {
+        let all = self.list_all()?;
+        Ok(all
+            .into_iter()
+            .filter(|p| p.identifiers.contains(ident))
+            .collect())
+    }
+
+    /// Delete a principal by id. Returns `true` when a row was
+    /// removed. Use only after the caller has rebound any
+    /// `state_transport_bindings` and `state_conversations` that
+    /// referenced this principal's group — `state_principal_group_members`
+    /// rows are NOT touched here (the caller drops the group via
+    /// [`PrincipalGroupStore::delete`] which cascades members).
+    pub fn delete(&self, id: &PrincipalId) -> Result<bool, DbError> {
+        self.db.with_conn(|c| {
+            let n = c.execute("DELETE FROM principals WHERE id = ?1", params![id.as_str()])?;
+            Ok(n > 0)
+        })
+    }
+
     /// Enumerate every principal. Small-table operation — the
     /// principals table grows with contacts, not messages.
     pub fn list_all(&self) -> Result<Vec<Principal>, DbError> {

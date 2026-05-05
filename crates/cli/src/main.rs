@@ -1707,6 +1707,26 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         tokio::spawn(async move { sup.run(stop).await });
     }
 
+    // Boot reconcile pass — merges any stale UnknownPending
+    // principals shadowing a "My identities" mapping that was
+    // added after the first cold-contact for that handle. Cheap
+    // (single principals scan) and idempotent; safe to run on
+    // every boot.
+    match execlaw_server::principal_admit::reconcile_against_my_identities(&state.db) {
+        Ok(report) if !report.merged.is_empty() => {
+            tracing::info!(
+                merged = report.merged.len(),
+                bindings_repointed = report.bindings_repointed,
+                conversations_repointed = report.conversations_repointed,
+                "boot reconcile merged stale UnknownPending principals into canonical claimants",
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "boot reconcile failed; will retry on next add_my_identifier");
+        }
+    }
+
     // Phase 4 — Signal inbound consumer. Subscribes to the
     // supervised signal-cli sidecar's `/v1/receive/<self_number>`
     // WebSocket and routes each inbound `dataMessage` through the

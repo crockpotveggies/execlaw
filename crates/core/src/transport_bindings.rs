@@ -203,6 +203,39 @@ impl<'db> TransportBindingStore<'db> {
         })
     }
 
+    /// Channel-agnostic variant of [`bindings_for_group`] — every
+    /// transport that bound onto this principal_group, regardless
+    /// of channel. Used by `principal_admit::reconcile` which
+    /// needs to repoint every binding pointing at a stale group
+    /// without enumerating channels itself.
+    pub fn bindings_for_group_any_channel(
+        &self,
+        principal_group_id: &str,
+    ) -> Result<Vec<TransportBinding>, DbError> {
+        self.db.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT channel, foreign_id, principal_group_id, is_group, \
+                        created_at, last_seen_at \
+                 FROM state_transport_bindings \
+                 WHERE principal_group_id = ?1 \
+                 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![principal_group_id], |r| {
+                    Ok(TransportBinding {
+                        channel: r.get(0)?,
+                        foreign_id: r.get(1)?,
+                        principal_group_id: r.get(2)?,
+                        is_group: r.get::<_, i64>(3)? != 0,
+                        created_at: r.get(4)?,
+                        last_seen_at: r.get::<_, Option<i64>>(5)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
     /// Bump `last_seen_at` for one binding without changing anything
     /// else. Called after a successful inbound ingest or outbound
     /// dispatch — tells retention this binding is still hot.

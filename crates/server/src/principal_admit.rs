@@ -42,11 +42,14 @@ use chrono::Utc;
 use execlaw_core::db::DbError;
 use execlaw_core::ids::{PluginId, PrincipalId};
 use execlaw_core::principal::{Identifier, Principal, PrincipalStore, TrustLevel as CoreTrustLevel};
+use execlaw_core::principal_groups::PrincipalGroupStore;
+use execlaw_core::transport_bindings::TransportBindingStore;
 use execlaw_core::trust_policy::{
     AutoTrustClass, MinTrustHint, TrustPolicy, TrustPolicyStore,
 };
 use execlaw_plugin_host::PluginHost;
 use execlaw_policy::trust::TrustLevel;
+use rusqlite::params;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdmitError {
@@ -258,6 +261,287 @@ fn trust_hint_rank(h: MinTrustHint) -> u32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Reconcile: merge stale UnknownPending rows into higher-trust principals
+// that own the same identifier.
+// ---------------------------------------------------------------------------
+
+/// What [`reconcile_against_my_identities`] did, for the operator's
+/// audit log + the SPA's "Settings → My identities" save toast.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// Stale UnknownPending principals merged away. Each entry is
+    /// `(stale_pid, target_pid)`.
+    pub merged: Vec<(String, String)>,
+    /// Bindings re-pointed to the canonical principal_group.
+    pub bindings_repointed: usize,
+    /// Conversations re-bound + (when phased into
+    /// awaiting_trust_decision) flipped back to idle.
+    pub conversations_repointed: usize,
+}
+
+/// Walk the `principals` table and merge every UnknownPending row
+/// whose identifiers are also present on a higher-trust principal
+/// (typically the Controller via the operator's "My identities"
+/// mapping).
+///
+/// This exists because identifier resolution is point-in-time:
+/// when the operator adds `signal:+1...` to My identities AFTER
+/// the inbound consumer has already minted an UnknownPending row
+/// for that handle, the inbound binding still points at the stale
+/// row. The next message would by-id-hit the stale row before the
+/// helper's by-identifier check could rebind it. Reconcile fixes
+/// the historical state in-place.
+///
+/// Steps per merge candidate:
+///   1. Repoint every transport binding from `stale.principal_group`
+///      to `target.principal_group`. Re-resolves the target group
+///      with the controller's membership when the target is the
+///      Controller (so the conversation lands as ControllerDM).
+///   2. Repoint every conversation bound to the stale group at the
+///      target group. Conversations stuck in
+///      `awaiting_trust_decision` are flipped to `idle` so the
+///      operator isn't stranded staring at a never-resolving
+///      approval.
+///   3. Delete the stale principal_group + its membership rows.
+///   4. Delete the stale principal row.
+///
+/// The walk is intentionally read-modify-write: we don't take a
+/// global lock, and a concurrent inbound writer could theoretically
+/// race our rebind. In practice reconcile runs at boot or at the
+/// instant the operator adds an identifier, both of which are
+/// quiescent windows for that specific handle. A second reconcile
+/// pass would clean up anything we missed.
+pub fn reconcile_against_my_identities(
+    db: &execlaw_core::db::Database,
+) -> Result<ReconcileReport, DbError> {
+    let principals = PrincipalStore::new(db);
+    let pg_store = PrincipalGroupStore::new(db);
+    let bindings = TransportBindingStore::new(db);
+    let now = Utc::now().timestamp();
+
+    let all = principals.list_all()?;
+
+    // Build a quick lookup: for every identifier, which principals
+    // claim it? Identifiers used by exactly one principal are
+    // skipped; only the duplicates are merge candidates.
+    let mut by_ident: std::collections::HashMap<Identifier, Vec<Principal>> =
+        std::collections::HashMap::new();
+    for p in &all {
+        for ident in &p.identifiers {
+            by_ident
+                .entry(ident.clone())
+                .or_default()
+                .push(p.clone());
+        }
+    }
+
+    let mut report = ReconcileReport::default();
+    // Track stale principals we've already merged so a principal
+    // claiming multiple identifiers (each duplicated) doesn't get
+    // processed twice.
+    let mut already_merged: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (ident, claimants) in &by_ident {
+        if claimants.len() < 2 {
+            continue;
+        }
+        // Pick the canonical winner: highest trust rank wins, with
+        // Controller pinned at the top. Ties break on first-seen
+        // (oldest principal — typically the explicit "My identities"
+        // controller row, since the UnknownPending row was minted
+        // after the controller registered the handle).
+        let mut sorted = claimants.clone();
+        sorted.sort_by(|a, b| {
+            trust_rank_for(&b.trust_level)
+                .cmp(&trust_rank_for(&a.trust_level))
+                .then_with(|| a.first_seen.cmp(&b.first_seen))
+        });
+        let target = &sorted[0];
+        // Skip when the highest-trust claimant is itself
+        // UnknownPending — there's no canonical winner to merge
+        // toward, so leave them alone (operator can manually
+        // resolve if it ever happens).
+        if matches!(target.trust_level, CoreTrustLevel::UnknownPending { .. }) {
+            continue;
+        }
+
+        for stale in sorted.iter().skip(1) {
+            if !matches!(stale.trust_level, CoreTrustLevel::UnknownPending { .. }) {
+                // Only merge AWAY from UnknownPending. A duplicate
+                // where both sides are non-UnknownPending is an
+                // operator data-entry mistake — surface (eventually)
+                // rather than silently rebind.
+                continue;
+            }
+            if already_merged.contains(stale.id.as_str()) {
+                continue;
+            }
+            let stale_pid = stale.id.as_str().to_owned();
+            let target_pid = target.id.as_str().to_owned();
+            tracing::info!(
+                target: "principal_admit::reconcile",
+                identifier = ?ident,
+                stale_pid = %stale_pid,
+                target_pid = %target_pid,
+                "merging stale UnknownPending principal into canonical claimant",
+            );
+
+            // Find every principal_group that has the stale
+            // principal as a member. Each gets retired. (There
+            // should be exactly one — the singleton group minted
+            // at first-contact — but the helper handles the
+            // multi-group case defensively.)
+            let stale_groups = list_groups_for_member(db, &stale.id)?;
+
+            for stale_group_id in &stale_groups {
+                // Resolve / mint the canonical target group. For
+                // Controller the membership includes_controller=true
+                // so the conversation lands as ControllerDM; for
+                // any other higher-trust principal we route through
+                // a singleton group keyed on that principal.
+                let is_controller = matches!(target.trust_level, CoreTrustLevel::Controller);
+                let target_group = pg_store
+                    .resolve(
+                        &execlaw_core::principal_groups::GroupKey {
+                            channel: "signal", // identifier transport drives membership; signal is the only
+                                                // first-contact-minting transport today. Future transports
+                                                // should call reconcile per their own channel.
+                            native_group_id: None,
+                            principals: &[target.id.clone()],
+                            includes_controller: is_controller,
+                        },
+                        now,
+                    )?;
+                if target_group.group_id == *stale_group_id {
+                    continue;
+                }
+
+                // Step 1: repoint every binding pointed at the stale
+                // group → the target group.
+                let bound = bindings.bindings_for_group_any_channel(stale_group_id)?;
+                for b in &bound {
+                    bindings.repoint_binding(
+                        &b.channel,
+                        &b.foreign_id,
+                        &target_group.group_id,
+                        now,
+                    )?;
+                    report.bindings_repointed += 1;
+                }
+
+                // Step 2: repoint every conversation bound to the
+                // stale group → the target group, and unstick the
+                // ones parked in awaiting_trust_decision.
+                let convs = list_conversations_for_group(db, stale_group_id)?;
+                for cid in &convs {
+                    pg_store.bind_conversation(cid, &target_group.group_id)?;
+                    flip_awaiting_trust_to_idle(db, cid, target.trust_level.class_tag(), now)?;
+                    report.conversations_repointed += 1;
+                }
+
+                // Step 3: drop the stale group + its members. We
+                // delete after the rebinds so a crash mid-loop
+                // leaves a recoverable state (next reconcile
+                // re-finds the same merge candidate).
+                drop_group_members(db, stale_group_id)?;
+                let _ = pg_store.delete(stale_group_id);
+            }
+
+            // Step 4: delete the stale principal row itself.
+            let _ = principals.delete(&stale.id);
+            already_merged.insert(stale_pid.clone());
+            report.merged.push((stale_pid, target_pid));
+        }
+    }
+
+    Ok(report)
+}
+
+fn trust_rank_for(t: &CoreTrustLevel) -> u32 {
+    match t {
+        CoreTrustLevel::Controller => 100,
+        CoreTrustLevel::Delegated { .. } => 80,
+        CoreTrustLevel::KnownTrusted { .. } => 60,
+        CoreTrustLevel::KnownLimited { .. } => 40,
+        CoreTrustLevel::Blocked { .. } => 20, // explicit decisions outrank UnknownPending
+        CoreTrustLevel::UnknownPending { .. } => 1,
+    }
+}
+
+fn list_groups_for_member(
+    db: &execlaw_core::db::Database,
+    pid: &PrincipalId,
+) -> Result<Vec<String>, DbError> {
+    db.with_conn(|c| {
+        let mut stmt = c.prepare_cached(
+            "SELECT group_id FROM state_principal_group_members WHERE principal_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![pid.as_str()], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    })
+}
+
+fn list_conversations_for_group(
+    db: &execlaw_core::db::Database,
+    group_id: &str,
+) -> Result<Vec<String>, DbError> {
+    db.with_conn(|c| {
+        let mut stmt = c.prepare_cached(
+            "SELECT conversation_id FROM state_conversations WHERE principal_group_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![group_id], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    })
+}
+
+/// Flip a conversation's `phase` from `awaiting_trust_decision` to
+/// `idle` and refresh its `trust_class` to whatever the merge
+/// target's trust class is. Other phases are left alone — only the
+/// stuck-on-cold-contact case needs rescuing.
+fn flip_awaiting_trust_to_idle(
+    db: &execlaw_core::db::Database,
+    conversation_id: &str,
+    new_trust_class: &str,
+    now: i64,
+) -> Result<(), DbError> {
+    db.with_conn(|c| {
+        c.execute(
+            "UPDATE state_conversations \
+             SET phase = CASE phase \
+                            WHEN 'awaiting_trust_decision' THEN 'idle' \
+                            ELSE phase \
+                         END, \
+                 trust_class = ?2, \
+                 last_activity_at = ?3 \
+             WHERE conversation_id = ?1",
+            params![conversation_id, new_trust_class, now],
+        )?;
+        Ok(())
+    })
+}
+
+fn drop_group_members(
+    db: &execlaw_core::db::Database,
+    group_id: &str,
+) -> Result<(), DbError> {
+    db.with_conn(|c| {
+        c.execute(
+            "DELETE FROM state_principal_group_members WHERE group_id = ?1",
+            params![group_id],
+        )?;
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +699,183 @@ mod tests {
         .unwrap();
         assert_eq!(got.id.as_str(), "controller-x");
         assert_eq!(flat, TrustLevel::Controller);
+    }
+
+    #[test]
+    fn reconcile_merges_stale_unknown_pending_into_controller() {
+        // Replays the user's exact bug: an inbound Signal message
+        // arrived BEFORE the controller registered the matching
+        // "My identities" entry. The route_inbound_message path
+        // minted `pri_signal_+1...` as UnknownPending and parked
+        // its conversation in awaiting_trust_decision. After the
+        // controller adds `signal:+1...`, reconcile must merge the
+        // stale row and unstick the conversation.
+        use execlaw_core::conversation::{
+            ConversationKind, ConversationRow, ConversationStore, Phase,
+        };
+        use execlaw_core::ids::ConversationId;
+        use execlaw_core::principal::Identifier;
+        use execlaw_core::principal_groups::{GroupKey, PrincipalGroupStore};
+        use execlaw_core::transport_bindings::TransportBindingStore;
+
+        let db = fresh_db();
+        let principals = PrincipalStore::new(&db);
+        let pg_store = PrincipalGroupStore::new(&db);
+        let bindings = TransportBindingStore::new(&db);
+        let conversations = ConversationStore::new(&db);
+        let now = 100;
+
+        // Fixture: stale UnknownPending principal + group + binding
+        // + conversation (the cold-contact-arrived state).
+        let stale_pid = PrincipalId::from("pri_signal_+15551234567");
+        let stale_principal = Principal {
+            id: stale_pid.clone(),
+            identifiers: vec![Identifier {
+                transport: "signal".into(),
+                handle: "+15551234567".into(),
+            }],
+            trust_level: CoreTrustLevel::UnknownPending {
+                first_seen: now,
+                notification_event_seq: None,
+            },
+            resolved_by: Vec::new(),
+            metadata: serde_json::json!({}),
+            first_seen: now,
+            last_seen: Some(now),
+            controller_notes: None,
+        };
+        principals.upsert(&stale_principal).unwrap();
+        let stale_group = pg_store
+            .resolve(
+                &GroupKey {
+                    channel: "signal",
+                    native_group_id: None,
+                    principals: &[stale_pid.clone()],
+                    includes_controller: false,
+                },
+                now,
+            )
+            .unwrap();
+        bindings
+            .insert_binding("signal", "+15551234567", &stale_group.group_id, false, now)
+            .unwrap();
+        let cid = ConversationId::from_string("conv-stuck");
+        let row = ConversationRow {
+            conversation_id: cid.clone(),
+            kind: ConversationKind::ControllerDM,
+            last_seq: execlaw_core::ids::EventSeq(0),
+            phase: Phase::AwaitingTrustDecision,
+            controller_id: None,
+            trust_class: "UnknownPending".into(),
+            snapshot_blob: None,
+            snapshot_seq: None,
+            lease_owner: None,
+            lease_expires: None,
+            modality: execlaw_core::conversation::Modality::Text,
+            display_name: None,
+            is_pinned: false,
+            is_ephemeral: false,
+            ephemeral_expires_at: None,
+            last_activity_at: now,
+        };
+        conversations.upsert(&row).unwrap();
+        pg_store
+            .bind_conversation(cid.as_str(), &stale_group.group_id)
+            .unwrap();
+
+        // Operator action: register the same handle on the
+        // controller principal — exactly what add_my_identifier
+        // does.
+        let controller_pid = PrincipalId::from("controller-x");
+        let controller = Principal {
+            id: controller_pid.clone(),
+            identifiers: vec![Identifier {
+                transport: "signal".into(),
+                handle: "+15551234567".into(),
+            }],
+            trust_level: CoreTrustLevel::Controller,
+            resolved_by: Vec::new(),
+            metadata: serde_json::json!({}),
+            first_seen: now - 1,
+            last_seen: Some(now),
+            controller_notes: None,
+        };
+        principals.upsert(&controller).unwrap();
+
+        // Reconcile.
+        let report = reconcile_against_my_identities(&db).unwrap();
+        assert_eq!(report.merged.len(), 1);
+        assert_eq!(report.merged[0].0, "pri_signal_+15551234567");
+        assert_eq!(report.merged[0].1, "controller-x");
+        assert!(report.bindings_repointed >= 1);
+        assert!(report.conversations_repointed >= 1);
+
+        // Stale principal is gone.
+        assert!(principals.get(&stale_pid).unwrap().is_none());
+        // Binding now points at a controller-owned group.
+        let target_pg = pg_store
+            .resolve(
+                &GroupKey {
+                    channel: "signal",
+                    native_group_id: None,
+                    principals: &[controller_pid.clone()],
+                    includes_controller: true,
+                },
+                now,
+            )
+            .unwrap();
+        let pg = bindings
+            .lookup_principal_group("signal", "+15551234567")
+            .unwrap();
+        assert_eq!(pg, Some(target_pg.group_id.clone()));
+        // Conversation is unstuck (phase=idle, trust_class=Controller).
+        let updated = conversations.get(&cid).unwrap().unwrap();
+        assert_eq!(updated.phase, Phase::Idle);
+        assert_eq!(updated.trust_class, "Controller");
+        // principal_group_id lives on the row in the schema but not
+        // on the typed projection — query separately.
+        let bound_pg = pg_store
+            .principal_group_id_for(cid.as_str())
+            .unwrap()
+            .expect("conversation should be bound to a principal_group");
+        assert_eq!(bound_pg, target_pg.group_id);
+
+        // A second reconcile pass is a no-op — the stale row is
+        // gone, nothing to merge.
+        let report2 = reconcile_against_my_identities(&db).unwrap();
+        assert!(report2.merged.is_empty());
+    }
+
+    #[test]
+    fn reconcile_skips_unique_identifiers() {
+        // No duplicate identifier → no merge candidate → empty
+        // report. Cheap path that matters because reconcile runs
+        // on every boot.
+        let db = fresh_db();
+        let principals = PrincipalStore::new(&db);
+        let p = Principal {
+            id: PrincipalId::from("only-one"),
+            identifiers: vec![Identifier {
+                transport: "signal".into(),
+                handle: "+15550000001".into(),
+            }],
+            trust_level: CoreTrustLevel::UnknownPending {
+                first_seen: 0,
+                notification_event_seq: None,
+            },
+            resolved_by: Vec::new(),
+            metadata: serde_json::json!({}),
+            first_seen: 0,
+            last_seen: None,
+            controller_notes: None,
+        };
+        principals.upsert(&p).unwrap();
+        let report = reconcile_against_my_identities(&db).unwrap();
+        assert!(report.merged.is_empty());
+        assert_eq!(report.bindings_repointed, 0);
+        assert_eq!(report.conversations_repointed, 0);
+        // Original principal is still there.
+        assert!(principals.get(&p.id).unwrap().is_some());
     }
 
     #[tokio::test]
