@@ -2050,6 +2050,13 @@ export interface SignalStatusResponse {
     /// E.164 phone numbers signal-cli has on file. Empty list →
     /// "not paired yet"; the SPA renders the QR link affordance.
     registered_accounts: string[];
+    /// Phone numbers persisted to the sidecar's host-side
+    /// accounts.json. When this exceeds `registered_accounts` the
+    /// running daemon's in-memory state has drifted from disk —
+    /// signal-cli upstream bug after device-link succeeds. The SPA
+    /// detects the gap and POSTs to /finalize-pairing to force a
+    /// daemon restart that picks up the new account on cold load.
+    accounts_on_disk: string[];
     /// Populated when the proxy hop to /v1/accounts failed. Lets
     /// the SPA render the actual error verbatim instead of a
     /// blank "no accounts."
@@ -2094,6 +2101,21 @@ export async function unregisterSignalAccount(
     await apiFetch<unknown>(
         `/api/admin/signal/accounts/${encodeURIComponent(number)}`,
         { method: "DELETE", rawText: true },
+        tokenAccessor,
+    );
+}
+
+/// Trigger the supervisor to restart the signal-cli sidecar so the
+/// daemon re-reads accounts from disk. Workaround for an upstream
+/// signal-cli bug that leaves the running daemon out of sync after
+/// a successful device-link. The SPA auto-fires this when it sees
+/// `accounts_on_disk` outpace `registered_accounts`.
+export async function finalizeSignalPairing(
+    tokenAccessor: () => string | null,
+): Promise<void> {
+    await apiFetch<unknown>(
+        "/api/admin/signal/finalize-pairing",
+        { method: "POST", rawText: true },
         tokenAccessor,
     );
 }

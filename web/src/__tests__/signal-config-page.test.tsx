@@ -43,11 +43,13 @@ interface StatusFixture {
     sidecar_status: string;
     sidecar_rpc_url: string | null;
     registered_accounts: string[];
+    accounts_on_disk?: string[];
     fetch_error: string | null;
 }
 
 function statusResponse(s: StatusFixture) {
-    return new Response(JSON.stringify(s), { status: 200 });
+    const body = { accounts_on_disk: s.accounts_on_disk ?? [], ...s };
+    return new Response(JSON.stringify(body), { status: 200 });
 }
 
 function mountPage() {
@@ -280,6 +282,70 @@ describe("SignalConfigPage", () => {
         expect(
             screen.getByTestId("signal-sidecar-status").textContent,
         ).toBe("starting");
+    });
+
+    it("auto-finalizes pairing when accounts.json drifts from /v1/accounts", async () => {
+        // Real failure mode: signal-cli's link command writes the
+        // new account to accounts.json on disk, but the running
+        // daemon throws UnsupportedOperationException trying to
+        // mutate its in-memory account map (signal-cli upstream
+        // bug). The SPA detects the drift via accounts_on_disk vs
+        // registered_accounts and POSTs /finalize-pairing to
+        // restart the daemon.
+        const calls: Array<{ url: string; init?: RequestInit }> = [];
+        fetchMock.mockImplementation(
+            async (url: string, init?: RequestInit) => {
+                calls.push({ url, init });
+                if (url === "/api/admin/me") return meResponse();
+                if (url === "/api/admin/signal/status") {
+                    return statusResponse({
+                        sidecar_status: "healthy",
+                        sidecar_rpc_url: "http://127.0.0.1:8501",
+                        registered_accounts: [],
+                        accounts_on_disk: ["+12369995414"],
+                        fetch_error: null,
+                    });
+                }
+                if (
+                    url === "/api/admin/signal/finalize-pairing" &&
+                    init?.method === "POST"
+                ) {
+                    return new Response("", { status: 202 });
+                }
+                if (url.startsWith("/api/admin/signal/qrcodelink")) {
+                    return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), {
+                        status: 200,
+                        headers: { "content-type": "image/png" },
+                    });
+                }
+                return new Response("{}", { status: 200 });
+            },
+        );
+        mountPage();
+        await waitFor(() => {
+            const finalize = calls.find(
+                (c) =>
+                    c.url === "/api/admin/signal/finalize-pairing" &&
+                    c.init?.method === "POST",
+            );
+            expect(finalize).toBeDefined();
+        });
+        // The "finalising" banner shows up while the restart is in
+        // flight so the operator sees something is happening.
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("signal-finalizing-banner"),
+            ).toBeInTheDocument();
+        });
+        // We must NOT spam /finalize-pairing on every poll tick —
+        // the ref-guard ensures exactly one POST per drift episode.
+        await new Promise((r) => setTimeout(r, 50));
+        const finalizeCalls = calls.filter(
+            (c) =>
+                c.url === "/api/admin/signal/finalize-pairing" &&
+                c.init?.method === "POST",
+        );
+        expect(finalizeCalls.length).toBe(1);
     });
 
     it("surfaces a /v1/accounts fetch error verbatim", async () => {

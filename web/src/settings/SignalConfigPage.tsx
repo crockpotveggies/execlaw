@@ -23,9 +23,10 @@
 // "starting" sidecar surfaces here instead of leaving the operator
 // confused why the QR endpoint 503s.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Button from "react-bootstrap/Button";
 import {
+    finalizeSignalPairing,
     getSignalStatus,
     signalQrCodeLinkUrl,
     unregisterSignalAccount,
@@ -46,6 +47,12 @@ export function SignalConfigPage(_props: PluginConfigProps): JSX.Element {
     const [status, setStatus] = useState<SignalStatusResponse | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [busy, setBusy] = useState(false);
+    const [finalizing, setFinalizing] = useState(false);
+    // Guard against firing /finalize-pairing on every poll tick
+    // while the daemon is restarting. We allow exactly one
+    // auto-finalize per drift episode; if it happens again later
+    // (e.g. a second device link) the ref resets when drift clears.
+    const finalizeFiredRef = useRef(false);
 
     const refresh = useCallback(async () => {
         try {
@@ -64,6 +71,41 @@ export function SignalConfigPage(_props: PluginConfigProps): JSX.Element {
         }, POLL_INTERVAL_MS);
         return () => window.clearInterval(id);
     }, [refresh]);
+
+    // Auto-finalize when accounts.json on disk has paired numbers
+    // the running daemon's /v1/accounts hasn't surfaced. Workaround
+    // for the upstream signal-cli `addManager` immutable-collection
+    // bug: the link succeeds, the keystore writes to disk, but the
+    // daemon's in-memory map can't accept the new account. A clean
+    // restart re-reads disk and the pairing materialises.
+    useEffect(() => {
+        if (status === null) return;
+        const onDisk = status.accounts_on_disk ?? [];
+        const reported = status.registered_accounts ?? [];
+        const drift = onDisk.length > reported.length;
+        if (!drift) {
+            finalizeFiredRef.current = false;
+            return;
+        }
+        if (finalizeFiredRef.current) return;
+        finalizeFiredRef.current = true;
+        setFinalizing(true);
+        void finalizeSignalPairing(getAccessToken)
+            .catch((e) => {
+                // Restart already in flight is fine; surface other
+                // errors so the operator sees them.
+                setError(e instanceof Error ? e.message : String(e));
+                finalizeFiredRef.current = false;
+            })
+            .finally(() => {
+                // The supervisor needs ~5–15s for the container to
+                // come back up. Keep the "finalising" banner up
+                // until the next poll observes the daemon reporting
+                // the new account, which clears `drift` above and
+                // resets `finalizeFiredRef`.
+                window.setTimeout(() => setFinalizing(false), 8_000);
+            });
+    }, [status, getAccessToken]);
 
     const onUnregister = useCallback(
         async (number: string) => {
@@ -101,6 +143,16 @@ export function SignalConfigPage(_props: PluginConfigProps): JSX.Element {
             ) : (
                 <>
                     <SidecarStatusBlock status={status} />
+                    {finalizing && (
+                        <div
+                            className="alert alert-info small mb-3"
+                            data-testid="signal-finalizing-banner"
+                        >
+                            <strong>Finalising pairing…</strong> Restarting
+                            the signal-cli daemon so it picks up your newly
+                            linked device. This usually takes 5–15 seconds.
+                        </div>
+                    )}
                     {status.registered_accounts.length === 0 ? (
                         <PairingBlock
                             sidecarRunning={status.sidecar_rpc_url !== null}

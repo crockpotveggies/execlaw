@@ -28,7 +28,7 @@ use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{delete, get};
+use axum::routing::{delete, get, post};
 use execlaw_core::users::UserRole;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -47,6 +47,16 @@ pub struct SignalStatusResponse {
     /// Empty when no account is registered yet — the SPA's pairing
     /// flow surfaces a QR-code link affordance.
     pub registered_accounts: Vec<String>,
+    /// Phone numbers present in the sidecar's persisted
+    /// `accounts.json` on the host. When this count exceeds
+    /// [`registered_accounts`](Self::registered_accounts) the
+    /// running daemon's in-memory state has drifted from disk —
+    /// signature of the upstream signal-cli `addManager`
+    /// `UnsupportedOperationException` bug after a successful
+    /// device-link. The SPA uses this to auto-trigger
+    /// `/finalize-pairing` (which restarts the daemon to re-read
+    /// disk).
+    pub accounts_on_disk: Vec<String>,
     /// Set when the sidecar isn't reachable so the SPA can surface
     /// the underlying error verbatim instead of trying to render a
     /// blank "no accounts" view.
@@ -140,12 +150,54 @@ pub async fn status_handler(
             Err(e) => fetch_error = Some(e),
         }
     }
+    let accounts_on_disk = read_accounts_on_disk().unwrap_or_default();
     Ok(Json(SignalStatusResponse {
         sidecar_status,
         sidecar_rpc_url,
         registered_accounts: accounts,
+        accounts_on_disk,
         fetch_error,
     }))
+}
+
+/// Read the persisted account list from the sidecar's host-side
+/// state directory. The supervisor mounts
+/// `~/.execlaw/sidecars/signal/signal-cli/data/` into the container
+/// at `/home/.local/share/signal-cli/`, so signal-cli's writes are
+/// directly visible to us.
+///
+/// Returns `Ok(numbers)` when the file is present and parses as
+/// signal-cli's `accounts.json` schema (`{ accounts: [{ number,
+/// ... }] }`); returns `Err` for any IO or JSON failure so the
+/// caller can fall through to an empty list.
+fn read_accounts_on_disk() -> Result<Vec<String>, String> {
+    use directories::UserDirs;
+    let path = UserDirs::new()
+        .ok_or_else(|| "no home dir".to_owned())?
+        .home_dir()
+        .join(".execlaw")
+        .join("sidecars")
+        .join("signal")
+        .join(SIGNAL_SIDECAR_NAME)
+        .join("data")
+        .join("accounts.json");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let s = std::fs::read_to_string(&path).map_err(|e| format!("read accounts.json: {e}"))?;
+    #[derive(Deserialize)]
+    struct AccountsFile {
+        #[serde(default)]
+        accounts: Vec<AccountRow>,
+    }
+    #[derive(Deserialize)]
+    struct AccountRow {
+        #[serde(default)]
+        number: Option<String>,
+    }
+    let parsed: AccountsFile =
+        serde_json::from_str(&s).map_err(|e| format!("parse accounts.json: {e}"))?;
+    Ok(parsed.accounts.into_iter().filter_map(|a| a.number).collect())
 }
 
 /// GET `/v1/accounts` against the supervised sidecar. Returns the
@@ -242,6 +294,46 @@ pub async fn qrcodelink_handler(
         header::HeaderValue::from_static("no-store"),
     );
     Ok((StatusCode::OK, headers, Body::from(bytes)).into_response())
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/admin/signal/finalize-pairing",
+    responses((
+        status = 202,
+        description = "Sidecar restart initiated; new account will appear after the daemon reloads"
+    )),
+    security(("bearer_jwt" = [])),
+    tag = "signal-admin"
+)]
+pub async fn finalize_pairing_handler(
+    State(state): State<AppState>,
+    user: AuthedUser,
+) -> Result<StatusCode, ApiError> {
+    require_controller(&user)?;
+    let supervisor = state.sidecar_supervisor.as_ref().ok_or_else(|| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "supervisor_unwired",
+        message: "sidecar supervisor is not running".into(),
+    })?;
+    // Workaround for upstream signal-cli bug: after a successful
+    // device-link the running daemon throws
+    // `UnsupportedOperationException` when trying to add the new
+    // account to its in-memory map (immutable collection mutation
+    // — see signal-cli's MultiAccountManagerImpl.addManager). The
+    // account IS persisted to accounts.json on disk; a clean daemon
+    // restart re-reads it on cold start via a code path that
+    // doesn't trip the bug, and `/v1/accounts` then reports the
+    // pairing.
+    supervisor
+        .restart_sidecar(SIGNAL_SIDECAR_NAME)
+        .await
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "restart_failed",
+            message: format!("restart sidecar: {e}"),
+        })?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 #[utoipa::path(
@@ -345,6 +437,10 @@ pub fn signal_admin_router() -> Router<AppState> {
     Router::new()
         .route("/api/admin/signal/status", get(status_handler))
         .route("/api/admin/signal/qrcodelink", get(qrcodelink_handler))
+        .route(
+            "/api/admin/signal/finalize-pairing",
+            post(finalize_pairing_handler),
+        )
         .route(
             "/api/admin/signal/accounts/{number}",
             delete(unregister_handler),

@@ -212,6 +212,44 @@ impl SidecarSupervisor {
         }
     }
 
+    /// Operator-initiated restart: stop the live container and clear
+    /// the slot's handle so the next reconcile spawns fresh. The
+    /// host_port stays pinned so any URL the caller had keeps
+    /// working post-restart, and restart_attempts is reset because
+    /// this is intentional, not crash recovery.
+    ///
+    /// Used by the Signal admin endpoint to work around an upstream
+    /// signal-cli bug: after a successful device-link the running
+    /// daemon throws `UnsupportedOperationException` when adding the
+    /// new account to its in-memory map, leaving the on-disk
+    /// keystore ahead of what `/v1/accounts` reports. A clean
+    /// daemon restart re-reads accounts on cold start (different
+    /// code path) and the new pairing materialises.
+    pub async fn restart_sidecar(&self, name: &str) -> Result<(), String> {
+        let handle_to_stop = {
+            let mut slots = self.slots.lock().await;
+            let slot = slots
+                .get_mut(name)
+                .ok_or_else(|| format!("no registered sidecar named '{name}'"))?;
+            slot.restart_attempts = 0;
+            slot.status = ServiceStatus::Stopped;
+            slot.handle.take()
+        };
+        if let Some(handle) = handle_to_stop {
+            if let Err(e) = self.controller.stop(&handle).await {
+                warn!(
+                    sidecar = %name,
+                    "stop during operator-initiated restart failed: {e}",
+                );
+                // Continue anyway — the next reconcile will force-
+                // remove the stale name and create_container will
+                // succeed because docker auto-cleans the dead handle.
+            }
+        }
+        self.kick();
+        Ok(())
+    }
+
     /// Look up the published host port for a single supervised
     /// sidecar by name. Returns `Some(port)` only when the sidecar
     /// has been spawned at least once (the supervisor mints its
