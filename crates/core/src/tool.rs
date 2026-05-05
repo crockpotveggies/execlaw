@@ -1030,6 +1030,33 @@ pub trait TransportApi: Send + Sync {
             "send_with_attachments not supported by this transport".into(),
         ))
     }
+
+    /// Send a "typing started" indicator to `recipient`. Most chat
+    /// transports auto-clear the indicator after a few seconds at
+    /// the protocol level (Signal: ~5 seconds; Slack: ~5 seconds);
+    /// callers that want a sustained "typing" state during a long
+    /// turn should refresh on a cadence shorter than the protocol
+    /// timeout. The host wraps this in [`TypingIndicatorGuard`] in
+    /// `chats.rs` for the agent-turn use case.
+    ///
+    /// Default impl is a silent no-op so transports that don't
+    /// support typing (email, voice, future bridges) don't have to
+    /// override. Errors are surfaced as `ApiError` for the rare
+    /// transport-side failure (sidecar crashed mid-call); the
+    /// agent-turn caller treats failures as best-effort and
+    /// continues.
+    async fn start_typing(&self, channel: &str, recipient: &str) -> Result<(), ApiError> {
+        let _ = (channel, recipient);
+        Ok(())
+    }
+
+    /// Send a "typing stopped" indicator. Some protocols emit an
+    /// explicit stop frame (Signal); others let the protocol-level
+    /// timeout elapse. Default no-op for transports without typing.
+    async fn stop_typing(&self, channel: &str, recipient: &str) -> Result<(), ApiError> {
+        let _ = (channel, recipient);
+        Ok(())
+    }
 }
 
 /// Result of [`TransportApi::fetch_attachment`]. Carries the raw

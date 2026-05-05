@@ -294,6 +294,40 @@ impl SignalCliTransport {
             .unwrap_or_else(|| body.to_string()))
     }
 
+    /// PUT (start) / DELETE (stop) the bbernhard typing-indicator
+    /// endpoint. Signal's typing protocol auto-clears after
+    /// ~5 seconds without a refresh, so the agent-turn caller
+    /// loops on a < 5s cadence; the explicit DELETE on turn-end
+    /// gives a snappy "stopped typing" rather than waiting for
+    /// the timeout.
+    async fn put_typing_indicator(
+        &self,
+        recipient: &str,
+        active: bool,
+    ) -> Result<(), ApiError> {
+        let (base_url, number) = self.resolve_endpoint().await?;
+        let url = format!("{base_url}/v1/typing-indicator/{number}");
+        let body = serde_json::json!({ "recipient": recipient });
+        let req = if active {
+            self.client.put(&url).json(&body)
+        } else {
+            self.client.delete(&url).json(&body)
+        };
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ApiError::Storage(format!("signal-cli typing-indicator: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(ApiError::Storage(format!(
+                "signal-cli /v1/typing-indicator returned HTTP {status}: {}",
+                truncate_for_log(&body_text, 240)
+            )));
+        }
+        Ok(())
+    }
+
     /// Resolve the supervised sidecar's base URL + the controller's
     /// self-number in one go. Every group-RPC method needs both;
     /// extracting the call collapses six lines of boilerplate per
@@ -518,6 +552,20 @@ impl TransportApi for SignalCliTransport {
             return Ok(None);
         }
         Ok(self.current_chat_id.clone())
+    }
+
+    async fn start_typing(&self, channel: &str, recipient: &str) -> Result<(), ApiError> {
+        if channel != SIGNAL_CHANNEL {
+            return Ok(());
+        }
+        self.put_typing_indicator(recipient, true).await
+    }
+
+    async fn stop_typing(&self, channel: &str, recipient: &str) -> Result<(), ApiError> {
+        if channel != SIGNAL_CHANNEL {
+            return Ok(());
+        }
+        self.put_typing_indicator(recipient, false).await
     }
 
     // ---- Phase 5 group ops ----------------------------------------

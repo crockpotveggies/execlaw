@@ -1,7 +1,7 @@
 [plugin]
 id = "signal"
 name = "Signal"
-version = "0.3.2"
+version = "0.3.3"
 description = "Signal Messenger transport — send/reply/group operations via a host-managed signal-cli sidecar container."
 author = "execlaw"
 license = "AGPL-3.0-or-later"

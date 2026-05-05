@@ -2110,6 +2110,14 @@ pub async fn dispatch_external_turn(
         phase: Phase::Thinking.as_str().to_owned(),
     });
     let idle_guard = IdlePhaseGuard::new(state.events.clone(), cid_str.clone());
+    // Show "typing…" on the originating transport (Signal etc.)
+    // for the duration of the turn so the contact sees activity
+    // instead of silence while the agent thinks + tools run. The
+    // guard's refresh loop pings every 4s (under Signal's ~5s
+    // typing-indicator timeout) and the guard's Drop sends an
+    // explicit stop so the indicator clears immediately when the
+    // turn returns.
+    let _typing_guard = TypingIndicatorGuard::for_conversation(state, cid).await;
 
     let sender = Some(principal.id.as_str().to_owned());
     let caller_caps: Vec<String> = policy
@@ -2311,6 +2319,109 @@ async fn bridge_text_reply_to_originating_transport(
     Ok(())
 }
 
+/// RAII handle that keeps a "typing…" indicator alive on the
+/// conversation's originating transport for the duration of an
+/// agent turn. Drop the guard to send the explicit "stop" frame.
+///
+/// Behaviour:
+///
+///   * `for_conversation` looks up the conversation's first
+///     registered transport binding via the host-transport
+///     registry. No binding (or no registered factory) → returns
+///     a no-op guard whose drop is free.
+///   * Otherwise spawns a refresh loop on tokio that pings
+///     `start_typing` every 4 seconds (under Signal's ~5s
+///     protocol timeout) until the guard is dropped.
+///   * Drop sends `CancellationToken::cancel()`; the loop's
+///     final iteration calls `stop_typing` so the contact sees
+///     "stopped typing" immediately rather than waiting for the
+///     timeout.
+///
+/// Channel-agnostic: any transport that overrides
+/// `TransportApi::start_typing` / `stop_typing` automatically
+/// gets a typing indicator with no edits here.
+pub(crate) struct TypingIndicatorGuard {
+    cancel: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl TypingIndicatorGuard {
+    /// Best-effort: any failure (no binding, transport doesn't
+    /// implement typing, sidecar unreachable mid-call) is silently
+    /// degraded — the agent still runs the turn. We don't surface
+    /// errors to the caller because typing is a UX nicety, not a
+    /// correctness step.
+    pub async fn for_conversation(
+        state: &AppState,
+        cid: &ConversationId,
+    ) -> TypingIndicatorGuard {
+        use execlaw_core::principal_groups::PrincipalGroupStore;
+        use execlaw_core::transport_bindings::TransportBindingStore;
+
+        // 1. Discover the conversation's bindings.
+        let pg_store = PrincipalGroupStore::new(&state.db);
+        let pg_id = match pg_store.principal_group_id_for(cid.as_str()) {
+            Ok(Some(id)) => id,
+            _ => return TypingIndicatorGuard { cancel: None },
+        };
+        let binding_store = TransportBindingStore::new(&state.db);
+        let bindings = match binding_store.bindings_for_group_any_channel(&pg_id) {
+            Ok(v) => v,
+            Err(_) => return TypingIndicatorGuard { cancel: None },
+        };
+
+        // 2. Ask the registry for a transport.
+        let Some((transport, channel, recipient)) = state
+            .host_transports
+            .build_for_first_supported_binding(&state.db, cid, &bindings)
+        else {
+            return TypingIndicatorGuard { cancel: None };
+        };
+
+        // 3. Spawn the refresh loop.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task_cancel = cancel.clone();
+        tokio::spawn(async move {
+            // 4-second cadence: under Signal's ~5s typing-
+            // indicator timeout so the contact never sees the
+            // indicator flicker off mid-turn.
+            const REFRESH_INTERVAL: std::time::Duration =
+                std::time::Duration::from_secs(4);
+            loop {
+                // Fire (refresh). Errors here are common during
+                // sidecar restarts; log at debug so a slow
+                // restart doesn't fill the operator's log.
+                if let Err(e) = transport.start_typing(&channel, &recipient).await {
+                    tracing::debug!(
+                        target: "chats::typing_indicator",
+                        channel = %channel,
+                        recipient = %recipient,
+                        error = %e,
+                        "start_typing failed; will retry on next refresh tick",
+                    );
+                }
+                tokio::select! {
+                    _ = task_cancel.cancelled() => break,
+                    _ = tokio::time::sleep(REFRESH_INTERVAL) => continue,
+                }
+            }
+            // Explicit stop so the contact sees "stopped typing"
+            // immediately. Best-effort.
+            let _ = transport.stop_typing(&channel, &recipient).await;
+        });
+        TypingIndicatorGuard {
+            cancel: Some(cancel),
+        }
+    }
+}
+
+impl Drop for TypingIndicatorGuard {
+    fn drop(&mut self) {
+        if let Some(c) = self.cancel.take() {
+            c.cancel();
+        }
+    }
+}
+
 /// Channel-keyed list of "send" tool names. When the agent calls
 /// one of these in a turn, the auto-bridge skips itself so the
 /// contact doesn't get the same content twice. Future transport
@@ -2384,6 +2495,11 @@ pub async fn dispatch_clarification_turn(
         phase: Phase::Thinking.as_str().to_owned(),
     });
     let idle_guard = IdlePhaseGuard::new(state.events.clone(), cid_str.clone());
+    // Typing indicator on the originating transport for the
+    // duration of the clarification turn. Same shape as
+    // `dispatch_external_turn` — no-op for web-only conversations
+    // and any conversation without a registered transport binding.
+    let _typing_guard = TypingIndicatorGuard::for_conversation(state, cid).await;
 
     // System-framed prompt. The model sees this as the "user" turn
     // (we reuse the routine path for plumbing) but the framing is
@@ -3938,6 +4054,24 @@ mod tests {
     async fn json_body<T: for<'de> serde::Deserialize<'de>>(body: Body) -> T {
         let bytes = body::to_bytes(body, usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn typing_indicator_guard_is_no_op_for_web_only_conversation() {
+        // No transport binding on the conversation → registry has
+        // nothing to build → guard's `cancel` stays None and Drop
+        // is free. Pin this so a future refactor doesn't
+        // accidentally make every web-chat turn pay the cost of a
+        // spawned typing-loop task.
+        let state = test_app_state();
+        let cid = ConversationId::from("conv-web-only");
+        let guard = TypingIndicatorGuard::for_conversation(&state, &cid).await;
+        assert!(
+            guard.cancel.is_none(),
+            "no transport binding → no spawned task; guard must be a no-op"
+        );
+        // Drop runs to completion without panicking.
+        drop(guard);
     }
 
     async fn send(app: axum::Router, text: &str) -> (StatusCode, serde_json::Value) {
