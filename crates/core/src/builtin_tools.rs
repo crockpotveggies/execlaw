@@ -1655,8 +1655,11 @@ impl ResearchStartTool {
                      gather / synthesise phases run in the background. For sub-minute focused \
                      work use `delegate_task` instead.\n\n\
                      WHAT TO TELL THE USER: briefly acknowledge that you've started the \
-                     research and that the plan card will appear inline as it progresses. \
-                     End your turn — do NOT call `research_status` in a loop.\n\n\
+                     research and that you'll deliver the report when it's ready. Don't \
+                     describe the UI surface (no \"plan card,\" \"chip,\" \"download \
+                     button\" — those phrases assume a web client; the user might be on \
+                     Signal, email, or another transport). End your turn — do NOT call \
+                     `research_status` in a loop.\n\n\
                      CLARIFICATION FLOW (event-driven, no action needed from you on the \
                      start turn): if the planner judges the query too vague to plan, the \
                      server will wake you in a follow-up turn with a system-orchestrator \
@@ -1665,10 +1668,12 @@ impl ResearchStartTool {
                      `research_clarify(job_id, answer)` to resume the job. The original \
                      research_start job stays alive across the pause — never call \
                      research_start a second time for the same query.\n\n\
-                     COMPLETION: when the synthesise phase finishes, the runner emits the \
-                     PDF attachment via the inline `Attachment` card. You don't have to do \
-                     anything to deliver it, but you can call `send_attachment(attachment_id)` \
-                     if a downstream user wants the file re-surfaced explicitly."
+                     COMPLETION: when the synthesise phase finishes, the runner auto- \
+                     delivers the PDF report through whichever channel(s) the conversation \
+                     is reachable on (web download chip + Signal attachment + future \
+                     transports). You don't need to call `send_attachment` for the \
+                     completion event. Only call `send_attachment(attachment_id)` if a \
+                     downstream user explicitly asks you to re-surface the file."
                         .into(),
                 schema: json!({
                     "type": "object",
@@ -1752,12 +1757,12 @@ impl ResearchStatusTool {
                     "Poll a deep-research job's status. Returns the current row including \
                      the plan (if landed), the workspace path, the attachment id of the \
                      final report (if complete), and any error.\n\n\
-                     DELIVERY: when status flips to `complete`, the row's `attachment_id` \
-                     points at the rendered PDF. Call `send_attachment(attachment_id, caption)` \
-                     to deliver it to the user as an inline download chip in chat. The chip \
-                     replaces what used to be a giant inline markdown blob — operators get a \
-                     compact filename + Download button. Always send the attachment after \
-                     research completes; do not paste the report text into your reply."
+                     DELIVERY: the host auto-dispatches the PDF via every channel the \
+                     conversation is reachable on the moment status flips to `complete` — \
+                     you do NOT need to call `send_attachment` to surface the completion \
+                     deliverable. Only call `send_attachment(attachment_id)` if the user \
+                     explicitly asks you to resend the file later. Never paste the raw \
+                     report text into your reply — the PDF is the deliverable."
                         .into(),
                 schema: json!({
                     "type": "object",

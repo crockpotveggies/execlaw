@@ -671,6 +671,7 @@ async fn run_real_turn(
         cid.as_str(),
         sender_principal_id.as_deref(),
         sender_trust.as_str(),
+        inbound_channel_origin,
     );
     let composed_system = assemble_system_prompt(
         &state.db,
@@ -1018,6 +1019,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         cid.as_str(),
         sender_principal_id.as_deref(),
         caller_trust.as_str(),
+        inbound_channel_origin,
     );
     let composed_system = assemble_system_prompt(
         &state.db,
@@ -1552,6 +1554,7 @@ async fn run_tool_capable_turn(
         cid.as_str(),
         sender_principal_id.as_deref(),
         caller_trust.as_str(),
+        inbound_channel_origin,
     );
     let cfg = TurnConfig {
         model: ModelId(state.config.model_id.clone()),
@@ -2473,6 +2476,22 @@ pub async fn dispatch_clarification_turn(
             text: prompt.clone(),
             sender: Some(SYSTEM_ORCHESTRATOR_ACTOR.to_owned()),
         });
+        // Auto-bridge the agent's clarification reply through the
+        // conversation's originating transport. Without this the
+        // research planner's clarification questions land only in
+        // the web event log — Signal-bridged users never see them
+        // and the research stalls. Mirrors the same hook
+        // dispatch_external_turn fires after a transport-triggered
+        // turn. Best-effort: a bridge failure logs but doesn't
+        // fail the turn (the assistant text is already committed).
+        if let Err(e) = bridge_text_reply_to_originating_transport(state, cid).await {
+            tracing::warn!(
+                target: "chats::dispatch_clarification_turn",
+                conversation_id = %cid.as_str(),
+                error = %e,
+                "auto-bridge of clarification reply via originating transport failed",
+            );
+        }
         state.events.publish(UiEvent::ChatMessageOutbound {
             conversation_id: cid.as_str().to_owned(),
             seq: *assistant_seq,
@@ -2514,6 +2533,7 @@ pub(crate) fn build_turn_context_prose(
     conversation_id: &str,
     sender_principal_id: Option<&str>,
     sender_trust: &str,
+    origin_channel: Option<&str>,
 ) -> String {
     let mut out = String::from("## Turn context\n\n");
     out.push_str(&format!(
@@ -2525,6 +2545,27 @@ pub(crate) fn build_turn_context_prose(
         out.push_str(&format!("* From principal: `{p}`\n"));
     }
     out.push_str(&format!("* Trust class: `{sender_trust}`\n"));
+    if let Some(ch) = origin_channel {
+        out.push_str(&format!("* Origin channel: `{ch}`\n"));
+        if ch != "web" {
+            // Channel-awareness nudge so the model doesn't ship
+            // web-UI specific phrasing ("the card will appear",
+            // "click the download button") to a user on a
+            // text-only transport. The host auto-bridges plain
+            // text replies, so the model can answer naturally
+            // without picking a channel-specific tool.
+            out.push_str(&format!(
+                "* This turn was triggered by an inbound message on the `{ch}` channel. \
+                 The host will auto-deliver your text reply back through `{ch}` — \
+                 reply naturally as you would in any chat. Do NOT describe web-UI \
+                 surfaces (no \"card,\" \"chip,\" \"download button,\" \"sidebar\") \
+                 since the user is not in a browser. File deliverables (research \
+                 PDFs, etc.) are auto-attached to your reply by the host.\n",
+            ));
+        }
+    } else {
+        out.push_str("* Origin channel: `web`\n");
+    }
     out
 }
 
@@ -4267,7 +4308,7 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
         let prose =
-            super::build_turn_context_prose(now, "conv-abc", Some("controller"), "Controller");
+            super::build_turn_context_prose(now, "conv-abc", Some("controller"), "Controller", None);
         assert!(prose.contains("2026-05-02T10:23:45Z"));
         assert!(prose.contains("conv-abc"));
         assert!(prose.contains("controller"));
@@ -4280,10 +4321,51 @@ mod tests {
         // yet; the line just disappears rather than emitting "From
         // principal: `none`" which the model could misread.
         let now = chrono::Utc::now();
-        let prose = super::build_turn_context_prose(now, "conv-x", None, "Controller");
+        let prose = super::build_turn_context_prose(now, "conv-x", None, "Controller", None);
         assert!(!prose.contains("From principal"));
         assert!(prose.contains("conv-x"));
         assert!(prose.contains("Controller"));
+    }
+
+    #[test]
+    fn build_turn_context_prose_signal_origin_emits_no_card_phrasing_nudge() {
+        // Regression: the agent kept saying "the plan card will
+        // appear inline" on Signal. The per-turn context now tells
+        // the model the origin channel + warns against web-UI
+        // surface phrasing when the user is on a transport-bridged
+        // conversation. Pin both signals so a future refactor
+        // doesn't quietly drop them.
+        let now = chrono::Utc::now();
+        let prose = super::build_turn_context_prose(
+            now,
+            "conv-x",
+            Some("controller"),
+            "Controller",
+            Some("signal"),
+        );
+        assert!(prose.contains("Origin channel: `signal`"));
+        // The "do NOT describe web-UI surfaces" nudge is the
+        // model-side fix for the "plan card will appear inline"
+        // phrasing leaking into Signal threads.
+        assert!(prose.to_lowercase().contains("not describe web-ui"));
+    }
+
+    #[test]
+    fn build_turn_context_prose_web_origin_omits_channel_nudge() {
+        // Web-origin turns are the default; the nudge-against-card-
+        // phrasing only fires for non-web channels so we don't
+        // confuse web users with channel-aware copy that doesn't
+        // apply to them.
+        let now = chrono::Utc::now();
+        let prose = super::build_turn_context_prose(
+            now,
+            "conv-x",
+            Some("controller"),
+            "Controller",
+            None,
+        );
+        assert!(prose.contains("Origin channel: `web`"));
+        assert!(!prose.to_lowercase().contains("not describe web-ui"));
     }
 
     #[test]
