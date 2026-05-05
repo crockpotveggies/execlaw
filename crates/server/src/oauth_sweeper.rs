@@ -141,8 +141,9 @@ impl OauthSweeper {
             .get(&tokens.plugin_id, &tokens.account_name)
             .map_err(|e| SweeperError::Other(e.to_string()))?
             .ok_or(SweeperError::NoClient)?;
-        let provider = pick_provider(&client.provider)
-            .ok_or_else(|| SweeperError::Other(format!("unknown provider '{}'", client.provider)))?;
+        let provider = pick_provider(&client.provider).ok_or_else(|| {
+            SweeperError::Other(format!("unknown provider '{}'", client.provider))
+        })?;
         let grant = provider
             .refresh_access_token(&RefreshParams {
                 client_id: client.client_id.clone(),

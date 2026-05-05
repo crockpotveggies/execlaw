@@ -309,10 +309,8 @@ mod tests {
 
     #[test]
     fn inbound_frame_distinguishes_response_request_notification() {
-        let response: InboundFrame = serde_json::from_str(
-            r#"{"jsonrpc":"2.0","id":1,"result":{"x":1}}"#,
-        )
-        .unwrap();
+        let response: InboundFrame =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"result":{"x":1}}"#).unwrap();
         assert!(response.id.is_some());
         assert!(response.method.is_none());
         assert!(response.result.is_some());

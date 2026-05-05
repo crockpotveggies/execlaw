@@ -37,9 +37,24 @@ fn fresh_store() -> SkillStore {
 /// matching a realistic selective query rather than the degenerate
 /// every-doc-matches case.
 const TOPICS: &[&str] = &[
-    "research", "scaffold", "deploy", "debug", "refactor", "review",
-    "migrate", "benchmark", "audit", "rollback", "snapshot", "trace",
-    "lint", "fuzz", "profile", "schema", "encrypt", "compose",
+    "research",
+    "scaffold",
+    "deploy",
+    "debug",
+    "refactor",
+    "review",
+    "migrate",
+    "benchmark",
+    "audit",
+    "rollback",
+    "snapshot",
+    "trace",
+    "lint",
+    "fuzz",
+    "profile",
+    "schema",
+    "encrypt",
+    "compose",
 ];
 
 fn seed_n(store: &SkillStore, n: usize) {
@@ -77,8 +92,7 @@ fn seed_n(store: &SkillStore, n: usize) {
 
 fn bench_scanner(c: &mut Criterion) {
     let mut group = c.benchmark_group("skill_scanner");
-    let clean_body =
-        "This is a perfectly ordinary skill body describing how to scaffold a new Rust crate \
+    let clean_body = "This is a perfectly ordinary skill body describing how to scaffold a new Rust crate \
          using cargo new and conventional layout choices the team has standardized on. \
          The description goes on for a couple of sentences to give the entropy heuristic \
          realistic input rather than a tiny string.";

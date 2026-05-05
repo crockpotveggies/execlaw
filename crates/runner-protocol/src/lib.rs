@@ -387,7 +387,13 @@ mod tests {
         ];
         for (variant, wire) in cases {
             let s = serde_json::to_string(&variant).unwrap();
-            assert!(s.contains(wire), "{:?} should serialise as {}: {}", variant, wire, s);
+            assert!(
+                s.contains(wire),
+                "{:?} should serialise as {}: {}",
+                variant,
+                wire,
+                s
+            );
             let back: ShutdownReason = serde_json::from_str(&s).unwrap();
             assert_eq!(back, variant);
         }

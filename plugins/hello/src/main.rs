@@ -93,11 +93,9 @@ fn main() {
             }
         };
         let resp_json = match handle(&req) {
-            Ok(result) => serde_json::to_string(&RpcOk {
-                id: req.id,
-                result,
-            })
-            .unwrap_or_else(|_| "{}".into()),
+            Ok(result) => {
+                serde_json::to_string(&RpcOk { id: req.id, result }).unwrap_or_else(|_| "{}".into())
+            }
             Err((code, message)) => serde_json::to_string(&RpcErr {
                 id: req.id,
                 error: RpcErrBody { code, message },

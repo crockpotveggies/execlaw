@@ -1048,9 +1048,7 @@ mod tests {
         // milliseconds against port 1). The cleanup must happen on
         // the failure path too.
         use crate::research::{ResearchSupervisor, ResearchWorkspace};
-        use execlaw_core::backends::{
-            BackendMode, BackendPurpose, BackendStore, BackendUpsert,
-        };
+        use execlaw_core::backends::{BackendMode, BackendPurpose, BackendStore, BackendUpsert};
         let mut state = test_app_state();
         let cid = seed_conv(&state, "conv-advance-leak");
         let store = ResearchJobStore::new(&state.db);

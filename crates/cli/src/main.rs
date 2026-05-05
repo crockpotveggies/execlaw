@@ -443,13 +443,7 @@ async fn ensure_runner_image_fresh(image: &str) -> anyhow::Result<()> {
     // exit on miss. We don't go through bollard here because the
     // path also needs `docker build` and that's only via the CLI.
     let inspect = std::process::Command::new("docker")
-        .args([
-            "image",
-            "inspect",
-            "--format",
-            "{{.Created}}",
-            image,
-        ])
+        .args(["image", "inspect", "--format", "{{.Created}}", image])
         .output();
     let needs_build = match inspect {
         Ok(out) if out.status.success() => {
@@ -1168,11 +1162,7 @@ fn resolve_bind(cli: Option<String>, db: Option<String>) -> (String, &'static st
     ("127.0.0.1:3030".to_string(), "default")
 }
 
-async fn cmd_serve(
-    bind: Option<String>,
-    db_path: PathBuf,
-    no_encrypt: bool,
-) -> anyhow::Result<()> {
+async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> anyhow::Result<()> {
     let db = open_db(&db_path, no_encrypt)?;
     execlaw_core::MigrationRunner::new(&db).apply_all()?;
 
@@ -1283,6 +1273,22 @@ async fn cmd_serve(
         }
     }
 
+    // 2026-05-04 — Phase 3 (signal sidecar): register the two
+    // host-implemented Signal tools as builtins so they can reach
+    // `ctx.transport`. The plugin manifest declares them with
+    // `host_implemented = true` so the rhai tier doesn't try to
+    // dispatch them; this register call binds the actual
+    // implementations. Group ops (list/create/add/leave) stay in
+    // the rhai stub until Phase 5.
+    {
+        let now = chrono::Utc::now().timestamp();
+        let tools = execlaw_server::signal_tools::signal_builtin_tools();
+        match execlaw_plugin_host::register_builtins(plugin_host.registry(), &db, now, tools) {
+            Ok(landed) => tracing::info!(count = landed.len(), "signal tools registered"),
+            Err(e) => return Err(anyhow::anyhow!("register signal tools failed: {e}")),
+        }
+    }
+
     // 2026-05-03 — Phase A: register the skill subsystem's tool
     // surface (skills.list/view/resource/search + admin-gated
     // create/update/promote/archive). Uses the same
@@ -1295,12 +1301,7 @@ async fn cmd_serve(
     {
         let now = chrono::Utc::now().timestamp();
         let tools = execlaw_skills::skill_tools(skill_store.clone());
-        match execlaw_plugin_host::register_builtins(
-            plugin_host.registry(),
-            &db,
-            now,
-            tools,
-        ) {
+        match execlaw_plugin_host::register_builtins(plugin_host.registry(), &db, now, tools) {
             Ok(landed) => tracing::info!(count = landed.len(), "skill tools registered"),
             Err(e) => return Err(anyhow::anyhow!("register skill tools failed: {e}")),
         }
@@ -1372,9 +1373,7 @@ async fn cmd_serve(
         match execlaw_container_manager::BollardServiceController::connect() {
             Ok(ctrl) => Some(std::sync::Arc::new(ctrl)),
             Err(e) => {
-                tracing::warn!(
-                    "container supervisors disabled — Docker daemon unreachable: {e}"
-                );
+                tracing::warn!("container supervisors disabled — Docker daemon unreachable: {e}");
                 None
             }
         };
@@ -1405,11 +1404,8 @@ async fn cmd_serve(
             .read_secondary_hf_caches()
             .unwrap_or_default();
         let token = std::env::var("HF_TOKEN").ok();
-        let downloader = execlaw_container_manager::HfDownloader::new(
-            primary_cache.clone(),
-            secondaries,
-            token,
-        );
+        let downloader =
+            execlaw_container_manager::HfDownloader::new(primary_cache.clone(), secondaries, token);
         execlaw_server::backend_supervisor::BackendSupervisor::new(db.clone(), ctrl.clone())
             .with_hf_downloader(downloader, primary_cache)
     });
@@ -1711,6 +1707,29 @@ async fn cmd_serve(
         tokio::spawn(async move { sup.run(stop).await });
     }
 
+    // Phase 4 — Signal inbound consumer. Subscribes to the
+    // supervised signal-cli sidecar's `/v1/receive/<self_number>`
+    // WebSocket and routes each inbound `dataMessage` through the
+    // existing trust pipeline. Returns `None` (and logs a warning)
+    // when EXECLAW_SIGNAL_CONTROLLER_NUMBER is unset OR the sidecar
+    // supervisor isn't wired — both are operator-config gaps, not
+    // crash conditions.
+    if execlaw_server::signal_inbound::spawn_signal_inbound_consumer(
+        state.clone(),
+        sweep_stop.clone(),
+    )
+    .is_some()
+    {
+        tracing::info!("signal inbound consumer spawned");
+    } else {
+        // Configuration gap, not normal operation — surface at
+        // `warn` so it shows up in the operator's log scan even
+        // if they haven't filtered for the signal_inbound target.
+        tracing::warn!(
+            "signal inbound consumer disabled (EXECLAW_SIGNAL_CONTROLLER_NUMBER unset or sidecar supervisor unavailable)"
+        );
+    }
+
     // Phase 13.D — voice-session reaper. Drops idle voice sessions
     // (operator closed the tab mid-mic) every REAP_INTERVAL so the
     // registry doesn't accumulate ghost entries. Both the
@@ -2009,10 +2028,7 @@ mod tests {
 
     #[test]
     fn resolve_bind_prefers_cli_over_db() {
-        let (bind, src) = resolve_bind(
-            Some("0.0.0.0:9000".into()),
-            Some("127.0.0.1:3030".into()),
-        );
+        let (bind, src) = resolve_bind(Some("0.0.0.0:9000".into()), Some("127.0.0.1:3030".into()));
         assert_eq!(bind, "0.0.0.0:9000");
         assert_eq!(src, "cli");
     }

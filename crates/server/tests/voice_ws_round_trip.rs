@@ -35,20 +35,12 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 fn build_state(transcript: &'static str) -> AppState {
     let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
     MigrationRunner::new(&db).apply_all().unwrap();
-    let stage_root = std::env::temp_dir().join(format!(
-        "execlaw-test-voice-ws-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let stage_root =
+        std::env::temp_dir().join(format!("execlaw-test-voice-ws-{}", uuid::Uuid::new_v4()));
     let events = EventBus::new();
-    let stt: SttFactory = Arc::new(move || {
-        Box::new(MockStt::new(Vec::new(), transcript.to_owned()))
-    });
-    let tts: TtsFactory = Arc::new(|| {
-        (
-            Box::new(MockTts::default()) as Box<dyn TtsClient>,
-            None,
-        )
-    });
+    let stt: SttFactory =
+        Arc::new(move || Box::new(MockStt::new(Vec::new(), transcript.to_owned())));
+    let tts: TtsFactory = Arc::new(|| (Box::new(MockTts::default()) as Box<dyn TtsClient>, None));
     AppState {
         db: db.clone(),
         config: Arc::new(ServerConfig::default()),
@@ -56,16 +48,14 @@ fn build_state(transcript: &'static str) -> AppState {
         refresh_store: Arc::new(RefreshStore::new(db.clone())),
         events: events.clone(),
         event_log_hmac_key: Some(Arc::new(b"execlaw-test-hmac-key-32-bytes!!".to_vec())),
-        inference: Arc::new(
-            execlaw_server::inference_resolver::InferenceResolver::new(None),
-        ),
+        inference: Arc::new(execlaw_server::inference_resolver::InferenceResolver::new(
+            None,
+        )),
         plugin_host: PluginHost::new(db.clone(), HookRegistry::new(), stage_root),
         webauthn: None,
         mcp_host: execlaw_server::mcp_host::McpHost::new(db),
         backend_supervisor: None,
-        voice_sessions: execlaw_server::voice_session::VoiceSessionRegistry::new(
-            events.clone(),
-        ),
+        voice_sessions: execlaw_server::voice_session::VoiceSessionRegistry::new(events.clone()),
         voice_runtime: VoiceRuntime::new(events, stt, tts),
         turn_cancel: execlaw_server::turn_cancel::TurnCancellationRegistry::new(),
         runner_supervisor: None,
@@ -201,9 +191,13 @@ async fn ws_disconnect_mid_utterance_cleans_up_voice_session() {
 
     // Open a session by sending a binary frame.
     let payload = vec![0u8; 320];
-    ws.send(WsMessage::Binary(frame_bytes("disconnect-victim", 0, &payload)))
-        .await
-        .unwrap();
+    ws.send(WsMessage::Binary(frame_bytes(
+        "disconnect-victim",
+        0,
+        &payload,
+    )))
+    .await
+    .unwrap();
 
     // Wait briefly for the registry to register the session, then
     // close the WS without sending voice_stop.

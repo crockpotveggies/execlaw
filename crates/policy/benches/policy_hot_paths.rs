@@ -55,20 +55,12 @@ fn bench_spotlight(c: &mut Criterion) {
     let large: String = "xyz ".repeat(4096); // ~16 KB
 
     let mut group = c.benchmark_group("spotlight_wrap");
-    group.bench_function("tiny_11_bytes", |b| {
-        b.iter(|| spot.wrap(black_box(tiny)))
-    });
-    group.bench_function("medium_1_3k", |b| {
-        b.iter(|| spot.wrap(black_box(&medium)))
-    });
-    group.bench_function("large_16k", |b| {
-        b.iter(|| spot.wrap(black_box(&large)))
-    });
+    group.bench_function("tiny_11_bytes", |b| b.iter(|| spot.wrap(black_box(tiny))));
+    group.bench_function("medium_1_3k", |b| b.iter(|| spot.wrap(black_box(&medium))));
+    group.bench_function("large_16k", |b| b.iter(|| spot.wrap(black_box(&large))));
     group.finish();
 
-    c.bench_function("spotlight_generate", |b| {
-        b.iter(Spotlight::generate)
-    });
+    c.bench_function("spotlight_generate", |b| b.iter(Spotlight::generate));
 }
 
 fn bench_input_guard(c: &mut Criterion) {

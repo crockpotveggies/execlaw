@@ -22,13 +22,13 @@ use crate::auth_extract::AuthedUser;
 use crate::events::UiEvent;
 use crate::routes::ApiError;
 use crate::state::AppState;
+use axum::Router;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, post};
-use axum::Router;
-use execlaw_core::alerts::{AlertRow, AlertStatus, AlertStore, Severity};
 use execlaw_core::AlertId;
+use execlaw_core::alerts::{AlertRow, AlertStatus, AlertStore, Severity};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -288,7 +288,7 @@ mod tests {
     use super::*;
     use crate::routes::{build_router, test_app_state};
     use axum::body::{self, Body};
-    use axum::http::{header, Method, Request};
+    use axum::http::{Method, Request, header};
     use execlaw_core::alerts::{AlertRow, AlertStatus, AlertStore, Severity};
     use execlaw_core::ids::AlertId;
     use tower::ServiceExt;
@@ -474,12 +474,7 @@ mod tests {
         // unrelated test events first; we only require ours appears).
         let mut found = false;
         for _ in 0..16 {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                rx.recv(),
-            )
-            .await
-            {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
                 Ok(Ok(crate::events::UiEvent::AlertResolved { alert_id })) => {
                     if alert_id == id.as_str() {
                         found = true;

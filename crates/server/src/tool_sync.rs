@@ -14,9 +14,9 @@
 //! defaults on first insert and never overwrites the operator's
 //! `enabled` / `allowed_classes` choices.
 
+use execlaw_core::Database;
 use execlaw_core::mcp_servers::McpServerRow;
 use execlaw_core::tool_access::{ToolAccessSeed, ToolAccessStore, ToolSource};
-use execlaw_core::Database;
 use execlaw_plugin_host::PluginHost;
 
 /// Default allowlist for plugin-supplied tools. Plugins ship "open"
@@ -142,22 +142,15 @@ mod tests {
     /// becomes the `first_seen_at` value the registrar stamps; tests
     /// that exercise idempotency pass a marker timestamp here so
     /// follow-on sync calls can prove they preserved it.
-    fn fresh_host_with_core_builtins(
-        register_now: i64,
-    ) -> (Database, PluginHost, usize) {
+    fn fresh_host_with_core_builtins(register_now: i64) -> (Database, PluginHost, usize) {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
         MigrationRunner::new(&db).apply_all().unwrap();
-        let stage = std::env::temp_dir().join(format!(
-            "execlaw-tool-sync-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let stage =
+            std::env::temp_dir().join(format!("execlaw-tool-sync-test-{}", uuid::Uuid::new_v4()));
         let host = PluginHost::new(db.clone(), HookRegistry::new(), stage);
-        let landed = execlaw_plugin_host::register_core_builtins(
-            host.registry(),
-            &db,
-            register_now,
-        )
-        .unwrap();
+        let landed =
+            execlaw_plugin_host::register_core_builtins(host.registry(), &db, register_now)
+                .unwrap();
         let count = landed.len();
         (db, host, count)
     }

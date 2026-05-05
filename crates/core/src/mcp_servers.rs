@@ -437,7 +437,12 @@ mod tests {
         let store = McpServerStore::new(&db);
         store.insert(&stdio_seed("svc"), 100).unwrap();
         store
-            .set_status("svc", McpServerStatus::Error, Some("connection refused"), 110)
+            .set_status(
+                "svc",
+                McpServerStatus::Error,
+                Some("connection refused"),
+                110,
+            )
             .unwrap();
         let row = store.get("svc").unwrap().unwrap();
         assert_eq!(row.status, McpServerStatus::Error);

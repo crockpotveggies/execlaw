@@ -14,12 +14,10 @@
 //! 2026-04-29.
 
 use async_trait::async_trait;
+use execlaw_core::Database;
 use execlaw_core::events::{EventKind, EventLog, PendingEvent};
 use execlaw_core::ids::ConversationId;
-use execlaw_core::tool::{
-    ApiError, SubagentApi, SubagentRequest, SubagentResponse,
-};
-use execlaw_core::Database;
+use execlaw_core::tool::{ApiError, SubagentApi, SubagentRequest, SubagentResponse};
 use execlaw_inference_api::{ChatMessage, ChatRequest, InferenceClient, ModelId};
 use serde::Serialize;
 use std::sync::Arc;
@@ -99,17 +97,13 @@ impl InferenceSubagentApi {
         buf
     }
 
-    fn emit_event<P: Serialize>(
-        &self,
-        kind: EventKind,
-        payload: &P,
-    ) -> Result<(), ApiError> {
+    fn emit_event<P: Serialize>(&self, kind: EventKind, payload: &P) -> Result<(), ApiError> {
         let log = EventLog::new(&self.db);
         let base = log
             .last_seq(&self.conversation_id)
             .map_err(|e| ApiError::Storage(format!("last_seq: {e}")))?;
-        let bytes = rmp_serde::to_vec(payload)
-            .map_err(|e| ApiError::Storage(format!("encode: {e}")))?;
+        let bytes =
+            rmp_serde::to_vec(payload).map_err(|e| ApiError::Storage(format!("encode: {e}")))?;
         let pending = PendingEvent {
             kind,
             payload: bytes,
@@ -123,10 +117,7 @@ impl InferenceSubagentApi {
 
 #[async_trait]
 impl SubagentApi for InferenceSubagentApi {
-    async fn delegate(
-        &self,
-        req: &SubagentRequest,
-    ) -> Result<SubagentResponse, ApiError> {
+    async fn delegate(&self, req: &SubagentRequest) -> Result<SubagentResponse, ApiError> {
         if req.task.trim().is_empty() {
             return Err(ApiError::Validation("task is empty".into()));
         }
@@ -149,8 +140,7 @@ impl SubagentApi for InferenceSubagentApi {
         // task. The child sees no parent history; that's the
         // point — context isolation is the whole reason for using
         // a subagent.
-        let mut messages: Vec<ChatMessage> =
-            vec![ChatMessage::system(SUBAGENT_SYSTEM_PROMPT)];
+        let mut messages: Vec<ChatMessage> = vec![ChatMessage::system(SUBAGENT_SYSTEM_PROMPT)];
         if let Some(ctx) = req.context.as_ref().filter(|s| !s.trim().is_empty()) {
             messages.push(ChatMessage::user(format!("Context:\n{ctx}")));
         }

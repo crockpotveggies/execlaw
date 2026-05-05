@@ -102,7 +102,7 @@ impl HttpWebFetchApi {
     /// Also sets `Accept` and `Accept-Language` headers since some
     /// sites also bot-detect on those being absent.
     pub fn new() -> Self {
-        use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE};
+        use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, HeaderMap, HeaderValue};
         let mut headers = HeaderMap::new();
         headers.insert(
             ACCEPT,
@@ -193,10 +193,7 @@ fn is_private_or_local_ip(ip: &IpAddr) -> bool {
 
 /// Validate a URL's scheme + host. Returns the parsed `Url` on
 /// success.
-fn validate_url(
-    url_str: &str,
-    allow_loopback: bool,
-) -> Result<reqwest::Url, ApiError> {
+fn validate_url(url_str: &str, allow_loopback: bool) -> Result<reqwest::Url, ApiError> {
     let url = reqwest::Url::parse(url_str)
         .map_err(|e| ApiError::Validation(format!("invalid URL: {e}")))?;
     match url.scheme() {
@@ -214,9 +211,7 @@ fn validate_url(
     match host {
         Host::Domain(d) => {
             let lower = d.to_ascii_lowercase();
-            if !allow_loopback
-                && (lower == "localhost" || lower.ends_with(".localhost"))
-            {
+            if !allow_loopback && (lower == "localhost" || lower.ends_with(".localhost")) {
                 return Err(ApiError::Validation(
                     "localhost addresses are not allowed".into(),
                 ));
@@ -256,11 +251,7 @@ fn validate_url(
 
 fn content_type_allowed(ct: &str) -> bool {
     let ct_lower = ct.to_ascii_lowercase();
-    let primary = ct_lower
-        .split(';')
-        .next()
-        .unwrap_or(&ct_lower)
-        .trim();
+    let primary = ct_lower.split(';').next().unwrap_or(&ct_lower).trim();
     ALLOWED_CONTENT_TYPE_PREFIXES
         .iter()
         .any(|p| primary.starts_with(p))
@@ -302,8 +293,7 @@ impl WebFetchApi for HttpWebFetchApi {
         let mut buf: Vec<u8> = Vec::with_capacity(8_192);
         let mut truncated = false;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|e| ApiError::Storage(format!("body read: {e}")))?;
+            let chunk = chunk.map_err(|e| ApiError::Storage(format!("body read: {e}")))?;
             let remaining = self.max_bytes.saturating_sub(buf.len());
             if chunk.len() > remaining {
                 buf.extend_from_slice(&chunk[..remaining]);
@@ -349,8 +339,7 @@ mod tests {
 
     #[test]
     fn validate_url_rejects_localhost_by_default() {
-        let err =
-            validate_url("http://localhost:8080/path", false).unwrap_err();
+        let err = validate_url("http://localhost:8080/path", false).unwrap_err();
         match err {
             ApiError::Validation(msg) => assert!(msg.contains("localhost")),
             other => panic!("expected Validation, got {other:?}"),
@@ -422,7 +411,8 @@ mod tests {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut buf = [0u8; 1024];
             let _ = sock.read(&mut buf).await;
-            let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
+            let resp =
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
             let _ = sock.write_all(resp).await;
         });
         let api = HttpWebFetchApi::new().allow_loopback(true);

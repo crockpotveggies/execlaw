@@ -19,9 +19,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{Router, routing::get};
 use execlaw_core::audit::AuditStore;
-use execlaw_core::users::{
-    UserRole, UserRow, UserStore, normalize_username,
-};
+use execlaw_core::users::{UserRole, UserRow, UserStore, normalize_username};
 use execlaw_vault::hash_password;
 use serde::{Deserialize, Serialize};
 
@@ -81,10 +79,7 @@ const PASSWORD_MIN_LEN: usize = 8;
     security(("bearer_jwt" = [])),
     tag = "users"
 )]
-pub async fn list_handler(
-    State(state): State<AppState>,
-    _user: AuthedUser,
-) -> impl IntoResponse {
+pub async fn list_handler(State(state): State<AppState>, _user: AuthedUser) -> impl IntoResponse {
     let store = UserStore::new(&state.db);
     match store.list_all() {
         Ok(rows) => {
@@ -147,9 +142,7 @@ pub async fn invite_handler(
         return error(
             StatusCode::BAD_REQUEST,
             "password_too_short",
-            &format!(
-                "initial_password must be at least {PASSWORD_MIN_LEN} characters"
-            ),
+            &format!("initial_password must be at least {PASSWORD_MIN_LEN} characters"),
         );
     }
     if req.display_name.trim().is_empty() {
@@ -249,20 +242,14 @@ pub async fn delete_handler(
     let target = match store.get_by_id(&target_id) {
         Ok(Some(u)) => u,
         Ok(None) => {
-            return error(
-                StatusCode::NOT_FOUND,
-                "not_found",
-                "no user with that id",
-            );
+            return error(StatusCode::NOT_FOUND, "not_found", "no user with that id");
         }
         Err(e) => return internal(&format!("get user: {e}")),
     };
     // Last-controller invariant: deleting the only Controller would
     // leave the install unmanaged.
     if target.role == UserRole::Controller {
-        let n = store
-            .count_by_role(UserRole::Controller)
-            .unwrap_or(0);
+        let n = store.count_by_role(UserRole::Controller).unwrap_or(0);
         if n <= 1 {
             return error(
                 StatusCode::FORBIDDEN,
@@ -467,7 +454,10 @@ pub async fn reset_user_password_handler(
 pub fn users_router() -> Router<AppState> {
     Router::new()
         .route("/api/admin/users", get(list_handler))
-        .route("/api/admin/users/invite", axum::routing::post(invite_handler))
+        .route(
+            "/api/admin/users/invite",
+            axum::routing::post(invite_handler),
+        )
         .route(
             "/api/admin/users/{user_id}",
             axum::routing::delete(delete_handler),
@@ -486,11 +476,7 @@ pub fn users_router() -> Router<AppState> {
 // Helpers
 // -----------------------------------------------------------------------
 
-fn error(
-    status: StatusCode,
-    code: &str,
-    message: &str,
-) -> axum::response::Response {
+fn error(status: StatusCode, code: &str, message: &str) -> axum::response::Response {
     (
         status,
         Json(serde_json::json!({
@@ -511,8 +497,8 @@ mod tests {
     use crate::routes::{build_router, test_app_state};
     use axum::body::{self, Body};
     use axum::http::{Method, Request, header};
-    use tower::ServiceExt;
     use execlaw_vault::hash_password as hash_pw;
+    use tower::ServiceExt;
 
     /// Set up a controller via /api/setup and return a token.
     async fn setup_controller(app: &axum::Router) -> String {
@@ -582,8 +568,7 @@ mod tests {
     #[tokio::test]
     async fn list_users_requires_auth() {
         let app = build_router(test_app_state());
-        let (status, _) =
-            json_request(&app, Method::GET, "/api/admin/users", None, None).await;
+        let (status, _) = json_request(&app, Method::GET, "/api/admin/users", None, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
@@ -816,14 +801,8 @@ mod tests {
 
         // controller-second deletes the original (also Controller).
         // Two existed → count drops to 1, allowed.
-        let (_, me_body) = json_request(
-            &app,
-            Method::GET,
-            "/api/admin/me",
-            Some(&token),
-            None,
-        )
-        .await;
+        let (_, me_body) =
+            json_request(&app, Method::GET, "/api/admin/me", Some(&token), None).await;
         let original_id = me_body["user_id"].as_str().unwrap().to_owned();
         let (status, _) = json_request(
             &app,

@@ -8,14 +8,14 @@
 use crate::auth_extract::AuthedUser;
 use crate::routes::ApiError;
 use crate::state::AppState;
+use axum::Router;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, post};
-use axum::Router;
 use execlaw_core::audit::AuditStore;
 use execlaw_core::mcp_servers::{
-    validate_id, McpServerInsert, McpServerRow, McpServerStore, McpTransport,
+    McpServerInsert, McpServerRow, McpServerStore, McpTransport, validate_id,
 };
 use execlaw_policy::trust::TrustLevel;
 use serde::{Deserialize, Serialize};
@@ -205,9 +205,7 @@ pub async fn update_handler(
         .map_err(ApiError::from)?
         .ok_or_else(|| not_found(&id))?;
     let now = chrono::Utc::now().timestamp();
-    let updated = store
-        .update(&id, &insert, now)
-        .map_err(ApiError::from)?;
+    let updated = store.update(&id, &insert, now).map_err(ApiError::from)?;
     if !updated {
         return Err(not_found(&id));
     }
@@ -273,7 +271,10 @@ fn build_insert(req: &McpServerWriteRequest) -> Result<McpServerInsert, ApiError
     let transport = McpTransport::parse(&req.transport).ok_or_else(|| ApiError {
         status: StatusCode::BAD_REQUEST,
         code: "invalid_transport",
-        message: format!("transport must be 'stdio' or 'streamable_http' (got '{}')", req.transport),
+        message: format!(
+            "transport must be 'stdio' or 'streamable_http' (got '{}')",
+            req.transport
+        ),
     })?;
     if transport == McpTransport::Stdio && req.command.is_none() {
         return Err(ApiError {
@@ -346,7 +347,10 @@ fn internal(msg: &str) -> ApiError {
 
 pub fn mcp_admin_router() -> Router<AppState> {
     Router::new()
-        .route("/api/admin/mcp/servers", get(list_handler).post(create_handler))
+        .route(
+            "/api/admin/mcp/servers",
+            get(list_handler).post(create_handler),
+        )
         .route("/api/admin/mcp/servers/{id}", post(update_handler))
         .route("/api/admin/mcp/servers/{id}/delete", post(delete_handler))
 }

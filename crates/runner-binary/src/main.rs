@@ -58,8 +58,7 @@ fn main() -> Result<()> {
 async fn async_main() -> Result<()> {
     init_tracing();
 
-    let cfg = RunnerConfig::from_env()
-        .context("loading runner configuration from environment")?;
+    let cfg = RunnerConfig::from_env().context("loading runner configuration from environment")?;
 
     tracing::info!(
         group_id = %cfg.group_id,
@@ -83,8 +82,7 @@ async fn async_main() -> Result<()> {
 
     // Per-turn cancel flags. The demux loop sets one when it sees
     // CancelTurn; the running turn polls it.
-    let cancel_flags: Arc<Mutex<CancelFlags>> =
-        Arc::new(Mutex::new(CancelFlags::default()));
+    let cancel_flags: Arc<Mutex<CancelFlags>> = Arc::new(Mutex::new(CancelFlags::default()));
 
     // Per-turn tool-result mailbox. Keyed by `turn_id`. When the
     // demux sees `ServerToRunner::ToolCallResult` it routes by

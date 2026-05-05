@@ -15,15 +15,13 @@
 use crate::auth_extract::AuthedUser;
 use crate::routes::ApiError;
 use crate::state::AppState;
+use axum::Router;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, post};
-use axum::Router;
 use execlaw_core::skills_config::{SkillsConfig, SkillsConfigStore, SkillsConfigUpdate};
-use execlaw_skills::{
-    NewSkillVersion, ProposalId, ProposalState, SkillStore, Strictness,
-};
+use execlaw_skills::{NewSkillVersion, ProposalId, ProposalState, SkillStore, Strictness};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -124,14 +122,20 @@ pub async fn list_handler(
 }
 
 /// Pull every row including archived; used when include_archived=true.
-fn list_all_for_admin(store: &SkillStore) -> Result<Vec<SkillListEntry>, execlaw_skills::SkillError> {
+fn list_all_for_admin(
+    store: &SkillStore,
+) -> Result<Vec<SkillListEntry>, execlaw_skills::SkillError> {
     use rusqlite::params;
-    let names: Vec<String> = store.db().with_conn(|c| {
-        let mut stmt = c.prepare("SELECT name FROM state_skills ORDER BY name")?;
-        let rows = stmt.query_map(params![], |r| r.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }).map_err(execlaw_skills::SkillError::Db)?;
+    let names: Vec<String> = store
+        .db()
+        .with_conn(|c| {
+            let mut stmt = c.prepare("SELECT name FROM state_skills ORDER BY name")?;
+            let rows = stmt
+                .query_map(params![], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .map_err(execlaw_skills::SkillError::Db)?;
     let mut out = Vec::with_capacity(names.len());
     for name in names {
         if let Some(s) = store.get(&name)? {
@@ -450,10 +454,8 @@ pub async fn list_versions_handler(
     }
     // Build a map from version_id -> version number so we can render
     // parent_version_id as an inline parent_version.
-    let id_to_num: std::collections::HashMap<i64, u32> = versions
-        .iter()
-        .map(|v| (v.id.0, v.version))
-        .collect();
+    let id_to_num: std::collections::HashMap<i64, u32> =
+        versions.iter().map(|v| (v.id.0, v.version)).collect();
     let out: Vec<SkillVersionView> = versions
         .iter()
         .map(|v| SkillVersionView {
@@ -464,7 +466,9 @@ pub async fn list_versions_handler(
             authored_by: v.authored_by.clone(),
             authored_at: v.authored_at,
             promotion_notes: v.promotion_notes.clone(),
-            parent_version: v.parent_version_id.and_then(|p| id_to_num.get(&p.0).copied()),
+            parent_version: v
+                .parent_version_id
+                .and_then(|p| id_to_num.get(&p.0).copied()),
         })
         .collect();
     Ok(Json(SkillVersionListResponse { versions: out }))
@@ -613,7 +617,10 @@ pub async fn reject_proposal_handler(
 pub fn skills_admin_router() -> Router<AppState> {
     Router::new()
         .route("/api/admin/skills", get(list_handler))
-        .route("/api/admin/skills/config", get(get_config_handler).put(update_config_handler))
+        .route(
+            "/api/admin/skills/config",
+            get(get_config_handler).put(update_config_handler),
+        )
         .route("/api/admin/skills/proposals", get(list_proposals_handler))
         .route(
             "/api/admin/skills/proposals/{id}/approve",

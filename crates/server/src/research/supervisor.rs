@@ -162,8 +162,7 @@ impl ResearchSupervisor {
         let db = self.db.clone();
         let recovered = tokio::task::spawn_blocking(move || {
             let now = chrono::Utc::now().timestamp();
-            ResearchJobStore::new(&db)
-                .mark_failed_where_active("service interrupted", now)
+            ResearchJobStore::new(&db).mark_failed_where_active("service interrupted", now)
         })
         .await
         .map_err(|e| format!("join: {e}"))?

@@ -13,11 +13,11 @@
 use crate::auth_extract::AuthedUser;
 use crate::routes::ApiError;
 use crate::state::AppState;
+use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::get;
-use axum::Router;
 use execlaw_core::audit::AuditStore;
 use execlaw_core::trust_policy::{
     MinTrustHint, MixedTrustPolicy, TrustPolicy, TrustPolicyError, TrustPolicyStore,
@@ -41,10 +41,7 @@ impl From<&TrustPolicy> for TrustPolicyView {
     fn from(p: &TrustPolicy) -> Self {
         Self {
             auto_trust_contacts: p.auto_trust_contacts,
-            min_trust_hint_for_auto_trust: p
-                .min_trust_hint_for_auto_trust
-                .as_str()
-                .to_owned(),
+            min_trust_hint_for_auto_trust: p.min_trust_hint_for_auto_trust.as_str().to_owned(),
             mixed_trust_policy: p.mixed_trust_policy.as_str().to_owned(),
             identity_plugin_order: p.identity_plugin_order.clone(),
             delegated_trust_default_ttl: p.delegated_trust_default_ttl.clone(),
@@ -113,16 +110,15 @@ pub async fn put_handler(
 ) -> Result<Json<TrustPolicyView>, ApiError> {
     require_controller(&state, &user)?;
 
-    let min_hint = MinTrustHint::parse(&req.min_trust_hint_for_auto_trust).ok_or_else(|| {
-        ApiError {
+    let min_hint =
+        MinTrustHint::parse(&req.min_trust_hint_for_auto_trust).ok_or_else(|| ApiError {
             status: StatusCode::BAD_REQUEST,
             code: "invalid_min_trust_hint",
             message: format!(
                 "min_trust_hint_for_auto_trust must be Contact|Colleague|Organization, got '{}'",
                 req.min_trust_hint_for_auto_trust
             ),
-        }
-    })?;
+        })?;
     let mixed = MixedTrustPolicy::parse(&req.mixed_trust_policy).ok_or_else(|| ApiError {
         status: StatusCode::BAD_REQUEST,
         code: "invalid_mixed_trust_policy",
@@ -193,7 +189,7 @@ mod tests {
     use super::*;
     use crate::routes::{build_router, test_app_state};
     use axum::body::{self, Body};
-    use axum::http::{header, Method, Request};
+    use axum::http::{Method, Request, header};
     use tower::ServiceExt;
 
     async fn setup_controller_token(app: &axum::Router) -> String {

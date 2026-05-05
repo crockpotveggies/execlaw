@@ -194,8 +194,8 @@ fn load_script_against_mock(mock_url: &str) -> String {
     path.pop();
     path.pop();
     path.push("plugins/google-calendar/main.rhai");
-    let original = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("could not read {path:?}: {e}"));
+    let original =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("could not read {path:?}: {e}"));
     original
         .replace(
             r#""https://www.googleapis.com/calendar/v3/users/me/calendarList""#,
@@ -270,17 +270,22 @@ async fn list_calendars_errors_when_no_oauth_token() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn second_list_calendars_with_same_token_hits_cache() {
-    let (url, calls) = spawn_mock(&[(
-        "/calendar/v3/users/me/calendarList",
-        SAMPLE_CALENDARS,
-    )]);
+    let (url, calls) = spawn_mock(&[("/calendar/v3/users/me/calendarList", SAMPLE_CALENDARS)]);
     let plugin = build_plugin(&url);
     let _ = plugin
-        .tool_call("calendar.list_calendars", serde_json::json!({}), oauth("tok"))
+        .tool_call(
+            "calendar.list_calendars",
+            serde_json::json!({}),
+            oauth("tok"),
+        )
         .await
         .unwrap();
     let _ = plugin
-        .tool_call("calendar.list_calendars", serde_json::json!({}), oauth("tok"))
+        .tool_call(
+            "calendar.list_calendars",
+            serde_json::json!({}),
+            oauth("tok"),
+        )
         .await
         .unwrap();
     assert_eq!(*calls.lock().unwrap(), 1);
@@ -288,17 +293,22 @@ async fn second_list_calendars_with_same_token_hits_cache() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn token_rotation_invalidates_calendars_cache() {
-    let (url, calls) = spawn_mock(&[(
-        "/calendar/v3/users/me/calendarList",
-        SAMPLE_CALENDARS,
-    )]);
+    let (url, calls) = spawn_mock(&[("/calendar/v3/users/me/calendarList", SAMPLE_CALENDARS)]);
     let plugin = build_plugin(&url);
     let _ = plugin
-        .tool_call("calendar.list_calendars", serde_json::json!({}), oauth("token-A"))
+        .tool_call(
+            "calendar.list_calendars",
+            serde_json::json!({}),
+            oauth("token-A"),
+        )
         .await
         .unwrap();
     let _ = plugin
-        .tool_call("calendar.list_calendars", serde_json::json!({}), oauth("token-B"))
+        .tool_call(
+            "calendar.list_calendars",
+            serde_json::json!({}),
+            oauth("token-B"),
+        )
         .await
         .unwrap();
     assert_eq!(*calls.lock().unwrap(), 2);
@@ -309,10 +319,7 @@ async fn token_rotation_invalidates_calendars_cache() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn list_events_default_args_uses_primary_calendar_and_7_day_window() {
-    let (url, _) = spawn_mock(&[(
-        "/calendar/v3/calendars/primary/events",
-        SAMPLE_EVENTS,
-    )]);
+    let (url, _) = spawn_mock(&[("/calendar/v3/calendars/primary/events", SAMPLE_EVENTS)]);
     let plugin = build_plugin(&url);
     let r = plugin
         .tool_call(
@@ -379,10 +386,7 @@ async fn list_events_caps_max_results_at_100() {
     // and verify the response shape comes back without error.
     // (The clamp itself is unit-tested via the 100 boundary in
     // an integration sense — the API would error on >2500 anyway.)
-    let (url, _) = spawn_mock(&[(
-        "/calendar/v3/calendars/primary/events",
-        SAMPLE_EVENTS,
-    )]);
+    let (url, _) = spawn_mock(&[("/calendar/v3/calendars/primary/events", SAMPLE_EVENTS)]);
     let plugin = build_plugin(&url);
     let r = plugin
         .tool_call(
@@ -411,17 +415,10 @@ async fn unknown_tool_throws() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn list_events_handles_empty_response() {
-    let (url, _) = spawn_mock(&[(
-        "/calendar/v3/calendars/primary/events",
-        r#"{"items":[]}"#,
-    )]);
+    let (url, _) = spawn_mock(&[("/calendar/v3/calendars/primary/events", r#"{"items":[]}"#)]);
     let plugin = build_plugin(&url);
     let r = plugin
-        .tool_call(
-            "calendar.list_events",
-            serde_json::json!({}),
-            oauth("tok"),
-        )
+        .tool_call("calendar.list_events", serde_json::json!({}), oauth("tok"))
         .await
         .unwrap();
     assert_eq!(r["events"].as_array().unwrap().len(), 0);
@@ -435,10 +432,8 @@ async fn list_events_passes_query_string_through_to_the_api() {
     // The mock matches on path prefix and ignores the query string;
     // we use the recording mock so we can assert the `?q=` param
     // was sent.
-    let (url, recorded, _) = spawn_mock_recording(&[(
-        "/calendar/v3/calendars/primary/events",
-        SAMPLE_EVENTS,
-    )]);
+    let (url, recorded, _) =
+        spawn_mock_recording(&[("/calendar/v3/calendars/primary/events", SAMPLE_EVENTS)]);
     let plugin = build_plugin(&url);
     let _ = plugin
         .tool_call(
@@ -476,10 +471,7 @@ const SAMPLE_FREEBUSY: &str = r#"{
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn check_availability_posts_freebusy_with_default_calendars() {
-    let (url, recorded, _) = spawn_mock_recording(&[(
-        "/calendar/v3/freeBusy",
-        SAMPLE_FREEBUSY,
-    )]);
+    let (url, recorded, _) = spawn_mock_recording(&[("/calendar/v3/freeBusy", SAMPLE_FREEBUSY)]);
     let plugin = build_plugin(&url);
     let r = plugin
         .tool_call(
@@ -501,15 +493,15 @@ async fn check_availability_posts_freebusy_with_default_calendars() {
     assert_eq!(body["timeMax"], "2026-05-03T00:00:00Z");
     assert_eq!(body["items"][0]["id"], "primary");
     // Response is passed through unchanged.
-    assert_eq!(r["calendars"]["primary"]["busy"][0]["start"], "2026-05-02T15:00:00Z");
+    assert_eq!(
+        r["calendars"]["primary"]["busy"][0]["start"],
+        "2026-05-02T15:00:00Z"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn check_availability_accepts_explicit_calendar_ids() {
-    let (url, recorded, _) = spawn_mock_recording(&[(
-        "/calendar/v3/freeBusy",
-        SAMPLE_FREEBUSY,
-    )]);
+    let (url, recorded, _) = spawn_mock_recording(&[("/calendar/v3/freeBusy", SAMPLE_FREEBUSY)]);
     let plugin = build_plugin(&url);
     let _ = plugin
         .tool_call(
@@ -526,7 +518,10 @@ async fn check_availability_accepts_explicit_calendar_ids() {
     let req = recorded.lock().unwrap();
     let body: serde_json::Value = serde_json::from_str(&req[0].body).unwrap();
     assert_eq!(body["items"].as_array().unwrap().len(), 2);
-    assert_eq!(body["items"][1]["id"], "team-shared@group.calendar.google.com");
+    assert_eq!(
+        body["items"][1]["id"],
+        "team-shared@group.calendar.google.com"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -584,11 +579,7 @@ async fn get_event_returns_normalised_payload() {
 async fn get_event_requires_event_id() {
     let plugin = build_plugin("http://127.0.0.1:1");
     let err = plugin
-        .tool_call(
-            "calendar.get_event",
-            serde_json::json!({}),
-            oauth("tok"),
-        )
+        .tool_call("calendar.get_event", serde_json::json!({}), oauth("tok"))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("event_id"), "got: {err}");
@@ -599,10 +590,8 @@ async fn get_event_requires_event_id() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_event_posts_full_body_and_url_encodes_calendar() {
-    let (url, recorded, _) = spawn_mock_recording(&[(
-        "/calendar/v3/calendars/primary/events",
-        SAMPLE_SINGLE_EVENT,
-    )]);
+    let (url, recorded, _) =
+        spawn_mock_recording(&[("/calendar/v3/calendars/primary/events", SAMPLE_SINGLE_EVENT)]);
     let plugin = build_plugin(&url);
     let r = plugin
         .tool_call(
@@ -639,10 +628,8 @@ async fn create_event_posts_full_body_and_url_encodes_calendar() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_event_with_attendees_appends_send_notifications() {
-    let (url, recorded, _) = spawn_mock_recording(&[(
-        "/calendar/v3/calendars/primary/events",
-        SAMPLE_SINGLE_EVENT,
-    )]);
+    let (url, recorded, _) =
+        spawn_mock_recording(&[("/calendar/v3/calendars/primary/events", SAMPLE_SINGLE_EVENT)]);
     let plugin = build_plugin(&url);
     let _ = plugin
         .tool_call(
@@ -770,10 +757,8 @@ async fn delete_event_issues_delete_and_returns_deleted_true() {
     // content-length 0, which the script's decode_response treats as
     // a UNIT response — the script ignores it and returns
     // {deleted: true} unconditionally on a non-error.
-    let (url, recorded, _) = spawn_mock_recording(&[(
-        "/calendar/v3/calendars/primary/events/evt-99",
-        "",
-    )]);
+    let (url, recorded, _) =
+        spawn_mock_recording(&[("/calendar/v3/calendars/primary/events/evt-99", "")]);
     let plugin = build_plugin(&url);
     let r = plugin
         .tool_call(
@@ -792,10 +777,8 @@ async fn delete_event_issues_delete_and_returns_deleted_true() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delete_event_url_encodes_event_id() {
-    let (url, recorded, _) = spawn_mock_recording(&[(
-        "/calendar/v3/calendars/primary/events/weird%2Fid",
-        "",
-    )]);
+    let (url, recorded, _) =
+        spawn_mock_recording(&[("/calendar/v3/calendars/primary/events/weird%2Fid", "")]);
     let plugin = build_plugin(&url);
     let _ = plugin
         .tool_call(
@@ -806,18 +789,17 @@ async fn delete_event_url_encodes_event_id() {
         .await
         .unwrap();
     let req = recorded.lock().unwrap();
-    assert_eq!(req[0].path, "/calendar/v3/calendars/primary/events/weird%2Fid");
+    assert_eq!(
+        req[0].path,
+        "/calendar/v3/calendars/primary/events/weird%2Fid"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delete_event_requires_event_id() {
     let plugin = build_plugin("http://127.0.0.1:1");
     let err = plugin
-        .tool_call(
-            "calendar.delete_event",
-            serde_json::json!({}),
-            oauth("tok"),
-        )
+        .tool_call("calendar.delete_event", serde_json::json!({}), oauth("tok"))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("event_id"), "got: {err}");

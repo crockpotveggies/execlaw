@@ -6,16 +6,36 @@ description = "Signal Messenger transport — send/reply/group operations via a 
 author = "execlaw"
 license = "AGPL-3.0-or-later"
 
-# Phase-1 stub: the manifest declares the tool surface so the agent
-# catalogue, humaniser, and trust-floor enforcement light up the moment
-# the plugin is enabled. The actual tool implementations return
-# `{ "error": "signal sidecar not yet running" }` until the sidecar
-# supervisor lands (see docs/sidecar-supervisor-design.md).
+# Phase 3 (2026-05-04): the supervised signal-cli sidecar is now
+# declared. The sidecar supervisor (Phase 2b) takes responsibility for
+# spawning, healthchecking, and restarting this container. The host
+# allocates a port in the 8501..=8600 pool and publishes
+# `127.0.0.1:<host_port>/v1/about` as the healthcheck URL.
 #
-# `[transport]` is intentionally omitted on this stub — declaring it
-# would register a `signal` transport in the hook registry and the
-# routing layer would start trying to deliver messages through a
-# non-existent sidecar. We add it back when the supervisor ships.
+# We use the bbernhard/signal-cli-rest-api image because it wraps
+# signal-cli's interactive CLI in an HTTP REST surface and is the de
+# facto community-maintained option for headless deployments. The
+# `/home/.local/share/signal-cli` directory inside the container holds
+# the registered account's keys + recent message store; for
+# Phase-3 dev this lives on a docker named volume managed by the
+# operator. Phase 4+ will read the encrypted account tarball from the
+# vault (`secret://signal/account.tar.gz`) on spawn.
+[[services]]
+name = "signal-cli"
+image = "bbernhard/signal-cli-rest-api:0.92"
+ports = []
+
+[services.sidecar]
+rpc_port = 8080
+rpc_health_path = "/v1/about"
+
+# Outbound transport on this plugin. Declared so the routing layer
+# knows `signal:` group bindings dispatch through this plugin's
+# tools; inbound consumer wiring (Phase 4) reads the same record.
+[transport]
+transport_id = "signal"
+supports_attachments = true
+supports_groups = true
 
 [[tools]]
 name = "signal.send_message"
@@ -27,6 +47,12 @@ Args: { to: string (name, phone, or `signal:user:<uuid>` JID), \
 text: string }."""
 trust_floor = "Controller"
 latency = "low"
+# Phase 3: implementation lives in the host crate as an
+# `Arc<dyn ToolImpl>` builtin so it can reach the host-side
+# `TransportApi` capability that rhai scripts can't access. The
+# manifest declaration stays for catalog/attribution; dispatch goes
+# through the builtin.
+host_implemented = true
 
 [[tools]]
 name = "signal.reply"
@@ -43,6 +69,7 @@ conversation's principal_group.  Args: { text: string }."""
 # (send_message is the dangerous one — that's the tool that lets you
 # message OTHER people, hence Controller-only.)
 latency = "low"
+host_implemented = true
 
 [[tools]]
 name = "signal.list_groups"
@@ -50,6 +77,7 @@ description = """List Signal groups the controller is a member of. \
 Returns: { groups: [{ id, name, member_count }] }."""
 trust_floor = "Controller"
 latency = "medium"
+host_implemented = true
 
 [[tools]]
 name = "signal.create_group"
@@ -60,6 +88,7 @@ and no rephrasing. Args: { title?: string, members: string[] (names \
 or phone numbers), message?: string (initial post) }."""
 trust_floor = "Controller"
 latency = "medium"
+host_implemented = true
 
 [[tools]]
 name = "signal.add_group_members"
@@ -70,6 +99,7 @@ with no additions, no emoji, and no rephrasing. Args: \
 { groupName: string, members: string[] (names or phone numbers) }."""
 trust_floor = "Controller"
 latency = "medium"
+host_implemented = true
 
 [[tools]]
 name = "signal.leave_group"
@@ -79,7 +109,12 @@ your final reply to the user MUST be exactly that ack_text with no \
 additions, no emoji, and no rephrasing. Args: { groupName: string }."""
 trust_floor = "Controller"
 latency = "medium"
+host_implemented = true
 
+# As of Phase 5, every Signal tool is host-implemented. The rhai
+# stub file (main.rhai) is kept on disk as a defensive guard that
+# fails loudly if the dispatcher ever forwards a host-implemented
+# tool to the rhai layer — see `plugins/signal/main.rhai`.
 [runtime]
 tier = "script"
 source = "main.rhai"

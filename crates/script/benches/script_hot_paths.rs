@@ -53,12 +53,9 @@ fn bench_script_parse(c: &mut Criterion) {
     let factory = ScriptEngine::new();
     c.bench_function("script_plugin_parse_small", |b| {
         b.iter(|| {
-            let _ = ScriptPlugin::from_source(
-                black_box("p"),
-                black_box(NULL_MATCH_SCRIPT),
-                &factory,
-            )
-            .unwrap();
+            let _ =
+                ScriptPlugin::from_source(black_box("p"), black_box(NULL_MATCH_SCRIPT), &factory)
+                    .unwrap();
         });
     });
 
@@ -79,12 +76,8 @@ fn bench_script_parse(c: &mut Criterion) {
             let bench_name = format!("script_plugin_parse_{name}");
             c.bench_function(&bench_name, |b| {
                 b.iter(|| {
-                    let _ = ScriptPlugin::from_source(
-                        black_box(name),
-                        black_box(&real),
-                        &factory,
-                    )
-                    .unwrap();
+                    let _ = ScriptPlugin::from_source(black_box(name), black_box(&real), &factory)
+                        .unwrap();
                 });
             });
         }

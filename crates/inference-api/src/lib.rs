@@ -328,9 +328,7 @@ impl InferenceClient {
         req: &ChatRequest,
     ) -> Result<
         std::pin::Pin<
-            Box<
-                dyn futures::Stream<Item = Result<ChatStreamChunk, InferenceError>> + Send,
-            >,
+            Box<dyn futures::Stream<Item = Result<ChatStreamChunk, InferenceError>> + Send>,
         >,
         InferenceError,
     > {

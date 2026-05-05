@@ -98,10 +98,7 @@ impl ContactBook {
                     let mut map = HashMap::new();
                     for c in contacts {
                         for ident in &c.identifiers {
-                            map.insert(
-                                (ident.transport.clone(), ident.handle.clone()),
-                                c.clone(),
-                            );
+                            map.insert((ident.transport.clone(), ident.handle.clone()), c.clone());
                         }
                     }
                     map
@@ -117,15 +114,11 @@ impl ContactBook {
     }
 
     fn lookup(&self, transport: &str, handle: &str) -> Option<&Contact> {
-        self.by_id
-            .get(&(transport.to_owned(), handle.to_owned()))
+        self.by_id.get(&(transport.to_owned(), handle.to_owned()))
     }
 }
 
-fn handle(
-    book: &ContactBook,
-    req: &RpcRequest,
-) -> Result<serde_json::Value, (i32, String)> {
+fn handle(book: &ContactBook, req: &RpcRequest) -> Result<serde_json::Value, (i32, String)> {
     match req.method.as_str() {
         "identity.resolve" => {
             let transport = req
@@ -187,11 +180,7 @@ fn main() {
             }
         };
         let resp = match handle(&book, &req) {
-            Ok(result) => serde_json::to_string(&RpcOk {
-                id: req.id,
-                result,
-            })
-            .unwrap_or_default(),
+            Ok(result) => serde_json::to_string(&RpcOk { id: req.id, result }).unwrap_or_default(),
             Err((code, message)) => serde_json::to_string(&RpcErr {
                 id: req.id,
                 error: RpcErrBody { code, message },

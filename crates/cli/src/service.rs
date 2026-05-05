@@ -32,8 +32,8 @@
 use crate::default_data_dir;
 use anyhow::Context;
 use service_manager::{
-    ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager,
-    ServiceStartCtx, ServiceStopCtx, ServiceUninstallCtx,
+    ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager, ServiceStartCtx, ServiceStopCtx,
+    ServiceUninstallCtx,
 };
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -56,8 +56,8 @@ fn label() -> ServiceLabel {
 }
 
 fn manager(system: bool) -> anyhow::Result<Box<dyn ServiceManager>> {
-    let mut mgr = <dyn ServiceManager>::native()
-        .context("no native service manager available on this OS")?;
+    let mut mgr =
+        <dyn ServiceManager>::native().context("no native service manager available on this OS")?;
     // Windows SCM is system-only — there's no "user-level" service
     // concept on Windows. Coerce to System and emit a notice on
     // `install` so the operator knows their `--system` flag was
@@ -171,11 +171,9 @@ pub fn install(system: bool, bind: Option<String>, db: Option<PathBuf>) -> anyho
 /// `service install --bind X` so the value persists across service
 /// restarts and matches what Settings → General would write.
 fn write_bind_to_db(db_path: &PathBuf, bind: &str) -> anyhow::Result<()> {
-    use execlaw_core::general_settings::{
-        GeneralSettingsStore, GeneralSettingsUpdate,
-    };
-    let db = crate::open_db(db_path, false)
-        .with_context(|| format!("open {}", db_path.display()))?;
+    use execlaw_core::general_settings::{GeneralSettingsStore, GeneralSettingsUpdate};
+    let db =
+        crate::open_db(db_path, false).with_context(|| format!("open {}", db_path.display()))?;
     execlaw_core::MigrationRunner::new(&db).apply_all()?;
     let store = GeneralSettingsStore::new(&db);
     store
@@ -285,15 +283,10 @@ pub fn status(system: bool) -> anyhow::Result<()> {
 /// - Linux:   `systemctl` says "Access denied" or "EACCES"
 /// - macOS:   `launchctl` returns "Permission denied" or
 ///   "Operation not permitted"
-fn decorate_permission_error(
-    err: std::io::Error,
-    system: bool,
-    verb: &str,
-) -> anyhow::Error {
+fn decorate_permission_error(err: std::io::Error, system: bool, verb: &str) -> anyhow::Error {
     let denied = is_access_denied(&err);
     if !denied {
-        return anyhow::Error::new(err)
-            .context(format!("could not {verb} `{SERVICE_LABEL}`"));
+        return anyhow::Error::new(err).context(format!("could not {verb} `{SERVICE_LABEL}`"));
     }
     let hint = if cfg!(target_os = "windows") {
         // Windows SCM is system-only; --system is implied.
@@ -340,8 +333,7 @@ fn is_access_denied(err: &std::io::Error) -> bool {
     // + "<stderr>"). Concatenate both so we don't miss the literal
     // "Access is denied." text from `sc.exe`.
     let mut combined = err.to_string().to_ascii_lowercase();
-    let mut source: Option<&dyn std::error::Error> =
-        std::error::Error::source(err);
+    let mut source: Option<&dyn std::error::Error> = std::error::Error::source(err);
     while let Some(s) = source {
         combined.push_str(" | ");
         combined.push_str(&s.to_string().to_ascii_lowercase());
@@ -384,12 +376,10 @@ mod windows_runtime {
     use std::time::Duration;
     use windows_service::define_windows_service;
     use windows_service::service::{
-        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState,
-        ServiceStatus, ServiceType,
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
     };
-    use windows_service::service_control_handler::{
-        self, ServiceControlHandlerResult,
-    };
+    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::service_dispatcher;
 
     /// Args captured from `execlaw service run` and consumed by the
@@ -442,8 +432,7 @@ mod windows_runtime {
         status_handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state: ServiceState::Running,
-            controls_accepted: ServiceControlAccept::STOP
-                | ServiceControlAccept::SHUTDOWN,
+            controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
             exit_code: ServiceExitCode::Win32(0),
             checkpoint: 0,
             wait_hint: Duration::default(),
@@ -536,10 +525,7 @@ mod tests {
     #[test]
     fn is_access_denied_matches_kind_and_raw_os_error() {
         // 1. ErrorKind::PermissionDenied — most direct signal.
-        let e1 = std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "EACCES",
-        );
+        let e1 = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "EACCES");
         assert!(is_access_denied(&e1));
         // 2. Sub-process stderr text from sc.exe — kind is Other.
         let e2 = std::io::Error::other(
@@ -548,20 +534,14 @@ mod tests {
         );
         assert!(is_access_denied(&e2));
         // 3. Stderr text from systemctl.
-        let e3 = std::io::Error::other(
-            "Failed to start execlaw.service: Access denied",
-        );
+        let e3 = std::io::Error::other("Failed to start execlaw.service: Access denied");
         assert!(is_access_denied(&e3));
         // 4. macOS launchctl text.
-        let e4 = std::io::Error::other(
-            "/bin/launchctl bootstrap returned: Operation not permitted",
-        );
+        let e4 =
+            std::io::Error::other("/bin/launchctl bootstrap returned: Operation not permitted");
         assert!(is_access_denied(&e4));
         // 5. Generic "not found" — doesn't match.
-        let e5 = std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "service not registered",
-        );
+        let e5 = std::io::Error::new(std::io::ErrorKind::NotFound, "service not registered");
         assert!(!is_access_denied(&e5));
     }
 
@@ -587,8 +567,7 @@ mod tests {
             // the access-denied branch but the hint is the
             // platform-specific one.
             assert!(
-                msg.contains("user-level service directory")
-                    || msg.contains("sudo"),
+                msg.contains("user-level service directory") || msg.contains("sudo"),
                 "non-Windows path must include the dir/sudo hint; got: {msg}"
             );
         }
@@ -610,8 +589,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn decorate_permission_denied_with_system_includes_sudo_hint() {
-        let io_err =
-            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "EACCES");
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "EACCES");
         let err = decorate_permission_error(io_err, true, "install");
         let msg = format!("{err:#}");
         assert!(msg.contains("sudo"));
@@ -620,8 +598,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn decorate_permission_denied_user_level_includes_dir_hint() {
-        let io_err =
-            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "EACCES");
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "EACCES");
         let err = decorate_permission_error(io_err, false, "install");
         let msg = format!("{err:#}");
         // User-level install hint should mention the writable check

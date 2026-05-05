@@ -30,9 +30,7 @@
 //! orchestration without needing a model.
 
 use clap::Parser;
-use execlaw_inference_api::{
-    ChatMessage, ChatRequest, InferenceClient, ModelId,
-};
+use execlaw_inference_api::{ChatMessage, ChatRequest, InferenceClient, ModelId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -88,8 +86,8 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let rubric_text = std::fs::read_to_string(&cli.rubric)
         .map_err(|e| anyhow::anyhow!("read rubric {:?}: {e}", cli.rubric))?;
-    let rubric: Rubric = toml::from_str(&rubric_text)
-        .map_err(|e| anyhow::anyhow!("parse rubric: {e}"))?;
+    let rubric: Rubric =
+        toml::from_str(&rubric_text).map_err(|e| anyhow::anyhow!("parse rubric: {e}"))?;
 
     let base_url = cli
         .base_url
@@ -116,7 +114,12 @@ async fn main() -> anyhow::Result<()> {
         };
         let matched = actual.trim().eq_ignore_ascii_case(case.expected.trim());
         let mark = if matched { "PASS" } else { "FAIL" };
-        println!("[{mark:>4}] {} — expected={} actual={}", case.id, case.expected, actual.trim());
+        println!(
+            "[{mark:>4}] {} — expected={} actual={}",
+            case.id,
+            case.expected,
+            actual.trim()
+        );
         results.push(CaseResult {
             id: case.id.clone(),
             expected: case.expected.clone(),
@@ -144,14 +147,11 @@ async fn run_one(
     model: &str,
     case: &RubricCase,
 ) -> anyhow::Result<String> {
-    let system = case
-        .system
-        .clone()
-        .unwrap_or_else(|| {
-            "You are an evaluation judge. Respond with exactly one word: \
+    let system = case.system.clone().unwrap_or_else(|| {
+        "You are an evaluation judge. Respond with exactly one word: \
              PASS or FAIL. No other output."
-                .to_owned()
-        });
+            .to_owned()
+    });
     let req = ChatRequest {
         model: ModelId(model.to_owned()),
         messages: vec![

@@ -93,11 +93,7 @@ impl WebSearchApi for SearxNGSearchApi {
     fn provider_id(&self) -> &str {
         "searxng"
     }
-    async fn search(
-        &self,
-        query: &str,
-        max_results: u32,
-    ) -> Result<Vec<SearchResult>, ApiError> {
+    async fn search(&self, query: &str, max_results: u32) -> Result<Vec<SearchResult>, ApiError> {
         if self.base_url.is_empty() {
             return Err(ApiError::Validation(
                 "SearxNG base_url is empty; configure it in Settings → Search".into(),
@@ -182,7 +178,10 @@ mod tests {
 
     #[test]
     fn provider_id_is_searxng() {
-        assert_eq!(SearxNGSearchApi::new("https://x.example.com").provider_id(), "searxng");
+        assert_eq!(
+            SearxNGSearchApi::new("https://x.example.com").provider_id(),
+            "searxng"
+        );
     }
 
     #[test]

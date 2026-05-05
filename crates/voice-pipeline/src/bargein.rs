@@ -165,10 +165,7 @@ mod tests {
     fn backchannel_past_cap_still_confirms() {
         let cfg = BargeInConfig::default();
         // elapsed = 500ms, > max_backchannel_ms (400ms)
-        assert_eq!(
-            decide(&cfg, 500, "yeah", false),
-            BargeInDecision::Confirm
-        );
+        assert_eq!(decide(&cfg, 500, "yeah", false), BargeInDecision::Confirm);
     }
 
     /// Empty transcript past the rescind delay with user still speaking

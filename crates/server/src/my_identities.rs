@@ -24,18 +24,16 @@
 //!     a single identifier.
 
 use crate::auth_extract::AuthedUser;
-use crate::routes::{controller_principal_id, ApiError};
+use crate::routes::{ApiError, controller_principal_id};
 use crate::state::AppState;
+use axum::Router;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::get;
-use axum::Router;
-use execlaw_core::audit::AuditStore;
-use execlaw_core::principal::{
-    Identifier, Principal, PrincipalStore, TrustLevel,
-};
 use execlaw_core::PrincipalId;
+use execlaw_core::audit::AuditStore;
+use execlaw_core::principal::{Identifier, Principal, PrincipalStore, TrustLevel};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -51,10 +49,106 @@ pub struct MyIdentitiesResponse {
     pub identifiers: Vec<IdentifierView>,
 }
 
+/// One transport the SPA can populate the "My identities" dropdown
+/// with. Built-in entries (`web`, `voice`) come from the platform;
+/// plugin entries reflect installed `[transport]` declarations
+/// (Signal, future WhatsApp / Matrix / etc.). The SPA renders
+/// `label` to the operator and submits `id` back via the add form.
+#[derive(Debug, Serialize, Clone, ToSchema)]
+pub struct AvailableTransportView {
+    /// Channel id — same string the inbound consumer sets on
+    /// `state_transport_bindings.channel`. The SPA submits this
+    /// verbatim back through the add form.
+    pub id: String,
+    /// Operator-facing label. Built-ins hardcode a friendly
+    /// rendering; plugin transports use the plugin's manifest
+    /// `[plugin].name`.
+    pub label: String,
+    /// Source attribution so the SPA can chip "(plugin)" /
+    /// "(built-in)" in the dropdown — useful when an operator is
+    /// debugging "why is Signal not showing up here." `None` for
+    /// built-in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
+    /// Suggested handle placeholder — e.g. `+15551234` for Signal,
+    /// `you@example.com` for email. Empty string when the bridge
+    /// doesn't have a stable handle shape.
+    pub handle_placeholder: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AvailableTransportsResponse {
+    pub transports: Vec<AvailableTransportView>,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AddIdentifierRequest {
     pub transport: String,
     pub handle: String,
+}
+
+/// `GET /api/admin/me/transports` — the dropdown's data source for
+/// Settings → User → My Identities. Returns ONLY plugin-registered
+/// `[transport]` declarations.
+///
+/// Why no built-ins: the only candidates would be `web` and
+/// `voice`, but the controller is already authenticated to the
+/// SPA — there's no inbound-resolution surface for either. Adding
+/// them as identity options would tell the operator "your already-
+/// authenticated session needs an identifier to resolve to you,"
+/// which is incoherent. The whole point of My Identities is
+/// bridging EXTERNAL transports (Signal, future WhatsApp, etc.)
+/// onto the controller principal so an inbound message bypasses
+/// cold-contact. An empty list is the correct empty state — the
+/// SPA renders an "install a transport plugin" hint.
+#[utoipa::path(
+    get,
+    path = "/api/admin/me/transports",
+    responses((status = 200, description = "Transports available for identity binding", body = AvailableTransportsResponse)),
+    security(("bearer_jwt" = [])),
+    tag = "my-identities"
+)]
+pub async fn list_transports_handler(
+    State(state): State<AppState>,
+    _user: AuthedUser,
+) -> Result<Json<AvailableTransportsResponse>, ApiError> {
+    let registry = state.plugin_host.registry();
+    let out: Vec<AvailableTransportView> = registry
+        .all_transports()
+        .into_iter()
+        .map(|t| AvailableTransportView {
+            handle_placeholder: handle_placeholder_for(&t.transport_id),
+            label: pretty_label_for(&t.transport_id),
+            plugin_id: Some(t.plugin_id),
+            id: t.transport_id,
+        })
+        .collect();
+    Ok(Json(AvailableTransportsResponse { transports: out }))
+}
+
+/// Title-case fallback so `signal` renders as `Signal` even when
+/// the registry doesn't carry the plugin's display name. Plugins
+/// that want a different label (e.g. "Microsoft Teams") will
+/// eventually override via a `[transport].label` manifest knob —
+/// the existing `[transport]` block doesn't carry one yet, so we
+/// title-case as a stop-gap.
+fn pretty_label_for(transport_id: &str) -> String {
+    let mut chars = transport_id.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        None => transport_id.to_owned(),
+    }
+}
+
+/// Best-effort handle hint — the operator sees this as the form
+/// field's placeholder. Phone-number transports default to E.164;
+/// everything else falls back to a generic "handle" prompt.
+fn handle_placeholder_for(transport_id: &str) -> String {
+    match transport_id {
+        "signal" | "whatsapp" | "sms" => "+15551234".into(),
+        "email" => "you@example.com".into(),
+        _ => "handle".into(),
+    }
 }
 
 #[utoipa::path(
@@ -217,25 +311,20 @@ pub async fn delete_handler(
     let mut row = store.get(&pid).map_err(db_err)?.ok_or(ApiError {
         status: StatusCode::NOT_FOUND,
         code: "no_identifier",
-        message: format!(
-            "controller has no identifier {transport}:{handle}",
-        ),
+        message: format!("controller has no identifier {transport}:{handle}",),
     })?;
     let target = Identifier {
         transport: transport.to_lowercase(),
         handle: handle.clone(),
     };
     let before_len = row.identifiers.len();
-    row.identifiers.retain(|i| {
-        !(i.transport == target.transport && i.handle == target.handle)
-    });
+    row.identifiers
+        .retain(|i| !(i.transport == target.transport && i.handle == target.handle));
     if row.identifiers.len() == before_len {
         return Err(ApiError {
             status: StatusCode::NOT_FOUND,
             code: "no_identifier",
-            message: format!(
-                "controller has no identifier {transport}:{handle}",
-            ),
+            message: format!("controller has no identifier {transport}:{handle}",),
         });
     }
     row.last_seen = Some(chrono::Utc::now().timestamp());
@@ -287,6 +376,7 @@ pub fn my_identities_router() -> Router<AppState> {
             "/api/admin/me/identifiers/{transport}/{handle}",
             axum::routing::delete(delete_handler),
         )
+        .route("/api/admin/me/transports", get(list_transports_handler))
 }
 
 #[cfg(test)]
@@ -294,7 +384,7 @@ mod tests {
     use super::*;
     use crate::routes::{build_router, test_app_state};
     use axum::body::{self, Body};
-    use axum::http::{header, Method, Request};
+    use axum::http::{Method, Request, header};
     use tower::ServiceExt;
 
     async fn setup_controller_token(app: &axum::Router) -> String {
@@ -331,10 +421,12 @@ mod tests {
         let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["identifiers"].as_array().unwrap().len(), 0);
-        assert!(v["controller_principal_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("controller-"));
+        assert!(
+            v["controller_principal_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("controller-")
+        );
     }
 
     #[tokio::test]
@@ -424,4 +516,88 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
+
+    // ---- Dynamic transport list (2026-05-04) -----------------------
+
+    #[tokio::test]
+    async fn list_transports_is_empty_when_no_plugin_transport_registered() {
+        // Fresh test fixture: no plugin transports installed.
+        // Endpoint returns an empty list — the SPA renders the
+        // "install a transport plugin" hint. Deliberately no
+        // built-in entries: the controller is already
+        // authenticated to the web shell, so `web` / `voice` would
+        // be incoherent identity surfaces (you don't bind your own
+        // already-authenticated session as an external identity).
+        let app = build_router(test_app_state());
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/admin/me/transports")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["transports"].as_array().unwrap().len(),
+            0,
+            "fresh install must surface no transport options",
+        );
+    }
+
+    #[tokio::test]
+    async fn list_transports_surfaces_plugin_registered_signal_transport() {
+        use execlaw_plugin_sdk::PluginManifest;
+        let state = test_app_state();
+        // Simulate enable: register the Signal plugin's
+        // `[transport]` declaration directly on the registry. The
+        // plugin install path normally does this; we bypass the
+        // staging step for test isolation.
+        let manifest = PluginManifest::parse(
+            r#"
+[plugin]
+id = "signal"
+name = "Signal"
+version = "0.1.0"
+
+[transport]
+transport_id = "signal"
+supports_groups = true
+supports_attachments = true
+"#,
+        )
+        .unwrap();
+        state.plugin_host.registry().enable(&manifest).unwrap();
+
+        let app = build_router(state);
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/admin/me/transports")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let transports = v["transports"].as_array().unwrap();
+        let ids: Vec<&str> = transports
+            .iter()
+            .map(|t| t.get("id").and_then(|v| v.as_str()).unwrap())
+            .collect();
+        assert!(ids.contains(&"signal"), "got {ids:?}");
+        // The Signal entry carries plugin_id = "signal" so the SPA
+        // can attribute it to the plugin in the dropdown chip.
+        let signal = transports.iter().find(|t| t["id"] == "signal").unwrap();
+        assert_eq!(signal["plugin_id"], "signal");
+        // Title-cased label fallback so the dropdown reads "Signal"
+        // not "signal".
+        assert_eq!(signal["label"], "Signal");
+        // Phone-shaped placeholder.
+        assert_eq!(signal["handle_placeholder"], "+15551234");
+    }
+
 }

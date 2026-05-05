@@ -29,8 +29,8 @@
 //!     between chunks is sufficient.
 
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Default)]
 pub struct TurnCancellationRegistry {

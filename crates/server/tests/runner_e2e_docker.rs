@@ -21,13 +21,9 @@ use axum::{Router, extract::State, routing::get};
 use execlaw_core::Database;
 use execlaw_core::db::DbConfig;
 use execlaw_core::migrations::MigrationRunner;
-use execlaw_runner_protocol::{
-    PROTOCOL_VERSION, RegistrationAck, RunnerToServer,
-};
+use execlaw_runner_protocol::{PROTOCOL_VERSION, RegistrationAck, RunnerToServer};
 use execlaw_server::events::EventBus;
-use execlaw_server::runner_spawn::{
-    BollardRunnerLauncher, RunnerLauncher, RunnerSpec,
-};
+use execlaw_server::runner_spawn::{BollardRunnerLauncher, RunnerLauncher, RunnerSpec};
 use execlaw_server::runner_supervisor::RunnerSupervisor;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -48,10 +44,7 @@ async fn spawn_test_ws_server() -> (RunnerSupervisor, String) {
         supervisor: supervisor.clone(),
     };
     let app: Router = Router::new()
-        .route(
-            "/api/runner/register/{group_id}",
-            get(register_handler),
-        )
+        .route("/api/runner/register/{group_id}", get(register_handler))
         .with_state(state);
     // Bind to all interfaces so the runner container can reach us
     // via host.docker.internal.
@@ -137,9 +130,7 @@ async fn ensure_runner_spawns_real_docker_container_and_handshakes() {
     // Give axum's serve task a moment to bind.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let launcher = Arc::new(
-        BollardRunnerLauncher::new().expect("docker reachable"),
-    );
+    let launcher = Arc::new(BollardRunnerLauncher::new().expect("docker reachable"));
 
     let group_id = format!("e2e-{}", uuid::Uuid::new_v4());
     eprintln!("[e2e] spawning runner for group {group_id}");
@@ -174,7 +165,9 @@ async fn ensure_runner_spawns_real_docker_container_and_handshakes() {
     // Confirm Docker has it.
     let containers = launcher.list_runner_volumes().await.unwrap();
     assert!(
-        containers.iter().any(|n| n == &format!("execlaw-runner-{group_id}")),
+        containers
+            .iter()
+            .any(|n| n == &format!("execlaw-runner-{group_id}")),
         "workspace volume should exist; got {containers:?}"
     );
 
@@ -192,7 +185,9 @@ async fn ensure_runner_spawns_real_docker_container_and_handshakes() {
     // Volume gone after reap.
     let after = launcher.list_runner_volumes().await.unwrap();
     assert!(
-        !after.iter().any(|n| n == &format!("execlaw-runner-{group_id}")),
+        !after
+            .iter()
+            .any(|n| n == &format!("execlaw-runner-{group_id}")),
         "volume should have been removed; still present: {after:?}"
     );
 }

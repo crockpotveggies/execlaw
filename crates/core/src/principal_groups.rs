@@ -116,11 +116,7 @@ impl<'db> PrincipalGroupStore<'db> {
     ///
     /// Updates `last_active_at` to `now` so the supervisor's reaper
     /// has a fresh timestamp.
-    pub fn resolve(
-        &self,
-        key: &GroupKey<'_>,
-        now: i64,
-    ) -> Result<PrincipalGroup, DbError> {
+    pub fn resolve(&self, key: &GroupKey<'_>, now: i64) -> Result<PrincipalGroup, DbError> {
         let hash = principal_set_hash(key.principals);
 
         // Phase 1: lookup existing row.
@@ -170,14 +166,11 @@ impl<'db> PrincipalGroupStore<'db> {
             })?;
 
         let (group_id, created_at, _stored_hash) = match existing {
-            Some((gid, _native, stored_hash, created, _last)) => {
-                (gid, created, stored_hash)
-            }
+            Some((gid, _native, stored_hash, created, _last)) => (gid, created, stored_hash),
             None => {
                 // Insert fresh.
                 let gid = mint_group_id();
-                let includes_controller_i: i64 =
-                    if key.includes_controller { 1 } else { 0 };
+                let includes_controller_i: i64 = if key.includes_controller { 1 } else { 0 };
                 self.db.with_conn(|c| {
                     c.execute(
                         "INSERT INTO state_principal_groups \
@@ -248,8 +241,7 @@ impl<'db> PrincipalGroupStore<'db> {
     ) -> Result<(), DbError> {
         // Dedupe and sort the input so the wipe-and-rewrite below
         // doesn't see duplicates.
-        let mut seen: Vec<&str> =
-            principals.iter().map(PrincipalId::as_str).collect();
+        let mut seen: Vec<&str> = principals.iter().map(PrincipalId::as_str).collect();
         seen.sort_unstable();
         seen.dedup();
 
@@ -389,11 +381,7 @@ impl<'db> PrincipalGroupStore<'db> {
 
     /// Bind a `state_conversations.conversation_id` to a `group_id`.
     /// Idempotent — no-op when the column already matches.
-    pub fn bind_conversation(
-        &self,
-        conversation_id: &str,
-        group_id: &str,
-    ) -> Result<(), DbError> {
+    pub fn bind_conversation(&self, conversation_id: &str, group_id: &str) -> Result<(), DbError> {
         self.db.with_conn(|c| {
             c.execute(
                 "UPDATE state_conversations \
@@ -402,6 +390,35 @@ impl<'db> PrincipalGroupStore<'db> {
                 params![group_id, conversation_id],
             )?;
             Ok(())
+        })
+    }
+
+    /// Reverse of [`bind_conversation`]: read the
+    /// `state_conversations.principal_group_id` column for a given
+    /// conversation. Returns `Ok(None)` when the row exists but the
+    /// column is NULL (a controller-initiated conversation that has
+    /// no transport binding yet) AND when no row exists at all —
+    /// callers don't need to distinguish, and conflating spares one
+    /// query path.
+    ///
+    /// Phase 4 hot path: `tool_dispatch::build_ctx_for` calls this
+    /// every time the dispatcher hands a `Capability::Transport`
+    /// tool a `ToolCtx`, so it composes the per-turn lookup that
+    /// resolves `signal.reply`'s recipient. The query hits the
+    /// conversation-id PK so the cost is one B-tree seek.
+    pub fn principal_group_id_for(&self, conversation_id: &str) -> Result<Option<String>, DbError> {
+        self.db.with_conn(|c| {
+            let result: Result<Option<String>, rusqlite::Error> = c.query_row(
+                "SELECT principal_group_id FROM state_conversations \
+                 WHERE conversation_id = ?1",
+                params![conversation_id],
+                |r| r.get::<_, Option<String>>(0),
+            );
+            match result {
+                Ok(opt) => Ok(opt),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(DbError::from(e)),
+            }
         })
     }
 }

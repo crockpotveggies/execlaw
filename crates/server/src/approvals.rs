@@ -609,10 +609,7 @@ pub async fn list_pending_approvals_handler(
                 .ok()
                 .flatten()
                 .map(|principal| {
-                    matches!(
-                        principal.trust_level,
-                        CoreTrustLevel::UnknownPending { .. }
-                    )
+                    matches!(principal.trust_level, CoreTrustLevel::UnknownPending { .. })
                 })
                 .unwrap_or(true);
             if !still_pending {
@@ -708,8 +705,7 @@ mod tests {
     async fn list_principals_returns_empty_on_fresh_db() {
         let app = build_router(test_app_state());
         let token = setup_get_token(&app).await;
-        let (status, body) =
-            read_json(&app, Some(&token), "/api/admin/principals").await;
+        let (status, body) = read_json(&app, Some(&token), "/api/admin/principals").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["principals"].is_array());
         assert_eq!(body["principals"].as_array().unwrap().len(), 0);
@@ -726,8 +722,7 @@ mod tests {
     async fn list_pending_approvals_returns_empty_on_fresh_db() {
         let app = build_router(test_app_state());
         let token = setup_get_token(&app).await;
-        let (status, body) =
-            read_json(&app, Some(&token), "/api/admin/approvals").await;
+        let (status, body) = read_json(&app, Some(&token), "/api/admin/approvals").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["approvals"].as_array().unwrap().len(), 0);
     }

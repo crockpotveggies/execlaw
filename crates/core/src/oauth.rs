@@ -461,7 +461,10 @@ mod tests {
         let got = s.get(&c.plugin_id, &c.account_name).unwrap().unwrap();
         assert_eq!(got.client_id, c.client_id);
         assert_eq!(got.client_secret, c.client_secret);
-        assert_eq!(got.scopes(), vec!["https://www.googleapis.com/auth/contacts.readonly"]);
+        assert_eq!(
+            got.scopes(),
+            vec!["https://www.googleapis.com/auth/contacts.readonly"]
+        );
     }
 
     #[test]
@@ -538,7 +541,10 @@ mod tests {
             updated_at: 200,
         })
         .unwrap();
-        let got = ts.get("plugin-google-contacts", "controller").unwrap().unwrap();
+        let got = ts
+            .get("plugin-google-contacts", "controller")
+            .unwrap()
+            .unwrap();
         assert_eq!(got.access_token, "second");
         assert_eq!(got.refresh_token.as_deref(), Some("rt-1"));
         assert_eq!(got.account_email.as_deref(), Some("user@example.com"));

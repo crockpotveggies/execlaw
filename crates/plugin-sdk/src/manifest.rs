@@ -110,6 +110,28 @@ pub struct ToolDecl {
     /// people — selfhosted-claw learned this the hard way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_floor: Option<String>,
+    /// Phase 3 (signal sidecar): when `true`, the tool's
+    /// implementation lives in the host crate as an
+    /// `Arc<dyn ToolImpl>` builtin — the plugin manifest only
+    /// declares its presence so install/upgrade can validate the
+    /// sidecar dependency, set per-tool metadata (description,
+    /// trust_floor), and surface the tool under the plugin's
+    /// attribution in catalog UIs. The plugin's runtime
+    /// (rhai/subprocess) is **not** consulted on dispatch.
+    ///
+    /// Practically, the registry's `enable_with_stage` skips
+    /// inserting a host-implemented tool into `tools_by_name`,
+    /// which means a builtin the host registers under the same
+    /// name is no longer a conflict. Used today by
+    /// `signal.send_message` and `signal.reply` — tools that need
+    /// the host-side `TransportApi` capability that rhai scripts
+    /// can't reach. Group ops stay rhai-implemented.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub host_implemented: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -964,8 +986,7 @@ mod tests {
         // caught at `cargo test` time, not at install time. This
         // mirrors the same "shipped manifest" smoke test we'd want
         // for every bundled plugin once we factor it out.
-        const SIGNAL_MANIFEST: &str =
-            include_str!("../../../plugins/signal/plugin.toml");
+        const SIGNAL_MANIFEST: &str = include_str!("../../../plugins/signal/plugin.toml");
         let m = PluginManifest::parse(SIGNAL_MANIFEST)
             .expect("plugins/signal/plugin.toml must parse cleanly");
         assert_eq!(m.plugin.id, "signal");
@@ -995,6 +1016,51 @@ mod tests {
             reply.trust_floor.is_none(),
             "signal.reply must NOT pin a trust floor"
         );
+        // Phase 5: every Signal tool is host-implemented. They
+        // need the TransportApi capability that rhai scripts
+        // can't access. The rhai stub on disk is a defensive
+        // guard, not a dispatch target.
+        assert!(
+            send.host_implemented,
+            "signal.send_message must be host-implemented (Phase 3)"
+        );
+        assert!(
+            reply.host_implemented,
+            "signal.reply must be host-implemented (Phase 3)"
+        );
+        for name in [
+            "signal.list_groups",
+            "signal.create_group",
+            "signal.add_group_members",
+            "signal.leave_group",
+        ] {
+            let t = m
+                .tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} must be declared"));
+            assert!(
+                t.host_implemented,
+                "{name} must be host-implemented (Phase 5)"
+            );
+        }
+        // Sidecar declaration: signal-cli supervised on /v1/about.
+        let signal_cli = m
+            .services
+            .iter()
+            .find(|s| s.name == "signal-cli")
+            .expect("[[services]] signal-cli must be declared");
+        let sidecar = signal_cli
+            .sidecar
+            .as_ref()
+            .expect("signal-cli must be a supervised sidecar");
+        assert_eq!(sidecar.rpc_port, 8080);
+        assert_eq!(sidecar.rpc_health_path, "/v1/about");
+        // Outbound transport binding.
+        let tr = m.transport.as_ref().expect("[transport] must be declared");
+        assert_eq!(tr.transport_id, "signal");
+        assert!(tr.supports_groups);
+        assert!(tr.supports_attachments);
     }
 
     #[test]

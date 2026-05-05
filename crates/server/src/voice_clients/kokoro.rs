@@ -206,15 +206,12 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    type FixtureBodyFactory =
-        Arc<dyn Fn(usize) -> (u16, &'static str, Vec<u8>) + Send + Sync>;
+    type FixtureBodyFactory = Arc<dyn Fn(usize) -> (u16, &'static str, Vec<u8>) + Send + Sync>;
 
     /// Fixture HTTP server that responds with raw bytes (so we can
     /// return PCM blobs alongside the OpenAI-compat error JSON).
     /// `body_factory` returns `(status, content_type, body_bytes)`.
-    async fn spawn_pcm_fixture(
-        body_factory: FixtureBodyFactory,
-    ) -> (String, Arc<AtomicUsize>) {
+    async fn spawn_pcm_fixture(body_factory: FixtureBodyFactory) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let counter = Arc::new(AtomicUsize::new(0));
@@ -280,10 +277,8 @@ mod tests {
     async fn synthesize_returns_samples_from_pcm_response() {
         let pcm = pcm_blob(&[100i16, 200, -300]);
         let pcm_clone = pcm.clone();
-        let (base, calls) = spawn_pcm_fixture(Arc::new(move |_n| {
-            (200, "audio/pcm", pcm_clone.clone())
-        }))
-        .await;
+        let (base, calls) =
+            spawn_pcm_fixture(Arc::new(move |_n| (200, "audio/pcm", pcm_clone.clone()))).await;
         let mut client = KokoroClient::new(base, "bf_emma+am_michael");
         let audio = client.synthesize("hello").await.unwrap();
         assert_eq!(audio.text, "hello");
@@ -297,10 +292,8 @@ mod tests {
     #[tokio::test]
     async fn synthesize_empty_text_short_circuits_without_http() {
         let pcm = pcm_blob(&[1i16]);
-        let (base, calls) = spawn_pcm_fixture(Arc::new(move |_n| {
-            (200, "audio/pcm", pcm.clone())
-        }))
-        .await;
+        let (base, calls) =
+            spawn_pcm_fixture(Arc::new(move |_n| (200, "audio/pcm", pcm.clone()))).await;
         let mut client = KokoroClient::new(base, "bf_emma");
         let audio = client.synthesize("   ").await.unwrap();
         assert!(audio.samples.is_empty());
@@ -315,10 +308,8 @@ mod tests {
     #[tokio::test]
     async fn synthesize_returns_err_on_5xx() {
         let body = b"{\"error\":\"oom\"}".to_vec();
-        let (base, _) = spawn_pcm_fixture(Arc::new(move |_n| {
-            (500, "application/json", body.clone())
-        }))
-        .await;
+        let (base, _) =
+            spawn_pcm_fixture(Arc::new(move |_n| (500, "application/json", body.clone()))).await;
         let mut client = KokoroClient::new(base, "bf_emma");
         let r = client.synthesize("hello").await;
         assert!(r.is_err());
@@ -375,10 +366,8 @@ mod tests {
         // completes must not retroactively zero out the audio.
         let pcm = pcm_blob(&[100i16, 200]);
         let pcm_clone = pcm.clone();
-        let (base, _) = spawn_pcm_fixture(Arc::new(move |_n| {
-            (200, "audio/pcm", pcm_clone.clone())
-        }))
-        .await;
+        let (base, _) =
+            spawn_pcm_fixture(Arc::new(move |_n| (200, "audio/pcm", pcm_clone.clone()))).await;
         let mut client = KokoroClient::new(base, "bf_emma");
         let audio = client.synthesize("hi").await.unwrap();
         assert_eq!(audio.samples, vec![100i16, 200]);
@@ -436,7 +425,10 @@ mod tests {
                     break;
                 }
             }
-            captured_clone.lock().unwrap().extend_from_slice(&buf[..total]);
+            captured_clone
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buf[..total]);
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: audio/pcm\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 pcm.len()

@@ -136,7 +136,10 @@ async fn test_register_handler(
     })
 }
 
-fn build_request(url: &str, secret: &[u8]) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+fn build_request(
+    url: &str,
+    secret: &[u8],
+) -> tokio_tungstenite::tungstenite::handshake::client::Request {
     let mut req = url.into_client_request().unwrap();
     let bearer = format!("Bearer {}", hex::encode(secret));
     req.headers_mut()
@@ -273,4 +276,3 @@ async fn forward_turn_round_trips_token_delta_to_runner_and_event_bus() {
 
     socket.close(None).await.ok();
 }
-

@@ -163,9 +163,7 @@ impl EphemeralSweeper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::{
-        ConversationKind, ConversationRow, Modality, Phase,
-    };
+    use crate::conversation::{ConversationKind, ConversationRow, Modality, Phase};
     use crate::db::DbConfig;
     use crate::events::{EventKind, EventLog, EventRecord};
     use crate::ids::EventSeq;
@@ -371,8 +369,7 @@ mod tests {
         convs.mark_ephemeral(&cid, Some(1)).unwrap();
         append_n_events(&db, &cid, 2);
 
-        let sweeper =
-            EphemeralSweeper::with_interval(db.clone(), Duration::from_millis(10));
+        let sweeper = EphemeralSweeper::with_interval(db.clone(), Duration::from_millis(10));
         let stop = Arc::new(Notify::new());
 
         let stop_clone = stop.clone();

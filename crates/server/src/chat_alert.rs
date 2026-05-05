@@ -36,12 +36,7 @@ const FINGERPRINT_PREFIX: &str = "chats:turn_failure:";
 /// kinds (`"runner"`, `"tool"`, `"real"`, `"stub"`) so the panel
 /// row reads "runner turn failed" rather than a generic "turn
 /// failed" — same source, different fingerprint suffix.
-pub fn fire_turn_failure(
-    db: &Database,
-    which_turn: &str,
-    root_cause: &str,
-    conversation_id: &str,
-) {
+pub fn fire_turn_failure(db: &Database, which_turn: &str, root_cause: &str, conversation_id: &str) {
     let store = AlertStore::new(db);
     let now = chrono::Utc::now().timestamp();
     let fingerprint = format!(
@@ -89,7 +84,10 @@ pub fn resolve_turn_failure_alerts(db: &Database) {
         }
     };
     let now = chrono::Utc::now().timestamp();
-    for row in firing.iter().filter(|a| a.fingerprint.starts_with(FINGERPRINT_PREFIX)) {
+    for row in firing
+        .iter()
+        .filter(|a| a.fingerprint.starts_with(FINGERPRINT_PREFIX))
+    {
         let _ = store.resolve(&row.id, "chats", now);
     }
 }
@@ -143,9 +141,7 @@ mod tests {
         // The exact shape `format!("{e:#}")` produces for an
         // `anyhow::Error` chain.
         assert_eq!(
-            extract_root_cause(
-                "runner turn failed: opening inference stream: 400 Bad Request"
-            ),
+            extract_root_cause("runner turn failed: opening inference stream: 400 Bad Request"),
             "400 Bad Request",
         );
     }

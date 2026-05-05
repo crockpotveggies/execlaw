@@ -52,7 +52,9 @@ pub(crate) fn register(
         let pid = plugin_id.to_owned();
         engine.register_fn(
             "http_get",
-            move |url: ImmutableString, query: Map, bearer: ImmutableString|
+            move |url: ImmutableString,
+                  query: Map,
+                  bearer: ImmutableString|
                   -> Result<Dynamic, Box<EvalAltResult>> {
                 http_get_impl(&agent, &pid, &url, &query, &bearer, allow_loopback)
             },
@@ -65,7 +67,9 @@ pub(crate) fn register(
         let pid = plugin_id.to_owned();
         engine.register_fn(
             "http_post",
-            move |url: ImmutableString, body: Dynamic, bearer: ImmutableString|
+            move |url: ImmutableString,
+                  body: Dynamic,
+                  bearer: ImmutableString|
                   -> Result<Dynamic, Box<EvalAltResult>> {
                 http_post_impl(&agent, &pid, &url, body, &bearer, allow_loopback)
             },
@@ -83,7 +87,9 @@ pub(crate) fn register(
         let pid = plugin_id.to_owned();
         engine.register_fn(
             "http_patch",
-            move |url: ImmutableString, body: Dynamic, bearer: ImmutableString|
+            move |url: ImmutableString,
+                  body: Dynamic,
+                  bearer: ImmutableString|
                   -> Result<Dynamic, Box<EvalAltResult>> {
                 http_patch_impl(&agent, &pid, &url, body, &bearer, allow_loopback)
             },
@@ -102,7 +108,9 @@ pub(crate) fn register(
         let pid = plugin_id.to_owned();
         engine.register_fn(
             "http_delete",
-            move |url: ImmutableString, query: Map, bearer: ImmutableString|
+            move |url: ImmutableString,
+                  query: Map,
+                  bearer: ImmutableString|
                   -> Result<Dynamic, Box<EvalAltResult>> {
                 http_delete_impl(&agent, &pid, &url, &query, &bearer, allow_loopback)
             },
@@ -116,9 +124,21 @@ pub(crate) fn register(
         let cache = cache.clone();
         engine.register_fn(
             "http_get_cached",
-            move |url: ImmutableString, query: Map, bearer: ImmutableString, ttl_secs: i64|
+            move |url: ImmutableString,
+                  query: Map,
+                  bearer: ImmutableString,
+                  ttl_secs: i64|
                   -> Result<Dynamic, Box<EvalAltResult>> {
-                http_get_cached_impl(&agent, &cache, &pid, &url, &query, &bearer, ttl_secs, allow_loopback)
+                http_get_cached_impl(
+                    &agent,
+                    &cache,
+                    &pid,
+                    &url,
+                    &query,
+                    &bearer,
+                    ttl_secs,
+                    allow_loopback,
+                )
             },
         );
     }
@@ -126,7 +146,10 @@ pub(crate) fn register(
     // ---- String ---------------------------------------------------
 
     engine.register_fn("digits_only", |s: ImmutableString| -> ImmutableString {
-        s.chars().filter(|c| c.is_ascii_digit()).collect::<String>().into()
+        s.chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .into()
     });
 
     engine.register_fn("lower", |s: ImmutableString| -> ImmutableString {
@@ -198,8 +221,8 @@ pub(crate) fn register(
         let mut out = String::with_capacity(s.len());
         for b in s.as_bytes() {
             let c = *b;
-            let unreserved = c.is_ascii_alphanumeric()
-                || c == b'-' || c == b'.' || c == b'_' || c == b'~';
+            let unreserved =
+                c.is_ascii_alphanumeric() || c == b'-' || c == b'.' || c == b'_' || c == b'~';
             if unreserved {
                 out.push(c as char);
             } else {
@@ -244,7 +267,9 @@ fn http_get_impl(
     if !bearer.is_empty() {
         req = req.set("Authorization", &format!("Bearer {bearer}"));
     }
-    let resp = req.call().map_err(|e| ureq_to_eval_err(plugin_id, "http_get", url, e))?;
+    let resp = req
+        .call()
+        .map_err(|e| ureq_to_eval_err(plugin_id, "http_get", url, e))?;
     decode_response(plugin_id, url, resp)
 }
 
@@ -370,9 +395,7 @@ fn validate_url(
     match host {
         Host::Domain(d) => {
             let lower = d.to_ascii_lowercase();
-            if !allow_loopback
-                && (lower == "localhost" || lower.ends_with(".localhost"))
-            {
+            if !allow_loopback && (lower == "localhost" || lower.ends_with(".localhost")) {
                 return Err(bad("loopback hostname not allowed"));
             }
             // Defense-in-depth: a hostname that's actually a
@@ -480,16 +503,14 @@ fn decode_response(
     Ok(json_to_rhai(&parsed))
 }
 
-fn ureq_to_eval_err(
-    plugin_id: &str,
-    op: &str,
-    url: &str,
-    e: ureq::Error,
-) -> Box<EvalAltResult> {
+fn ureq_to_eval_err(plugin_id: &str, op: &str, url: &str, e: ureq::Error) -> Box<EvalAltResult> {
     let msg = match e {
         ureq::Error::Status(code, resp) => {
             let body = resp.into_string().unwrap_or_default();
-            format!("{op} [{plugin_id}] {url} returned {code}: {}", truncate(&body, 400))
+            format!(
+                "{op} [{plugin_id}] {url} returned {code}: {}",
+                truncate(&body, 400)
+            )
         }
         ureq::Error::Transport(t) => {
             format!("{op} [{plugin_id}] {url}: {t}")
@@ -636,9 +657,7 @@ mod tests {
         let factory = ScriptEngine::new();
         let engine = factory.build_for_plugin("test");
         // 1700000000 = 2023-11-14T22:13:20Z
-        let s: ImmutableString = engine
-            .eval("unix_to_rfc3339(1700000000)")
-            .unwrap();
+        let s: ImmutableString = engine.eval("unix_to_rfc3339(1700000000)").unwrap();
         assert_eq!(s.as_str(), "2023-11-14T22:13:20Z");
     }
 
@@ -686,7 +705,11 @@ mod tests {
         let names: rhai::Array = engine.eval(script).unwrap();
         let strs: Vec<String> = names
             .into_iter()
-            .map(|d| d.try_cast::<ImmutableString>().map(|s| s.to_string()).unwrap_or_default())
+            .map(|d| {
+                d.try_cast::<ImmutableString>()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
+            })
             .collect();
         assert_eq!(strs, vec!["Alice".to_string(), "Bob".to_string()]);
     }
@@ -786,10 +809,7 @@ mod tests {
             "http://[fe80::1]/",
         ] {
             let script = format!(r#"http_get("{url}", #{{ }}, "")"#);
-            let err = engine
-                .eval::<Dynamic>(&script)
-                .unwrap_err()
-                .to_string();
+            let err = engine.eval::<Dynamic>(&script).unwrap_err().to_string();
             assert!(
                 err.contains("not allowed"),
                 "URL {url} should be SSRF-rejected; got: {err}"
@@ -803,10 +823,7 @@ mod tests {
         let engine = factory.build_for_plugin("ssrf-test");
         for url in ["file:///etc/passwd", "gopher://x/", "ftp://x/"] {
             let script = format!(r#"http_get("{url}", #{{ }}, "")"#);
-            let err = engine
-                .eval::<Dynamic>(&script)
-                .unwrap_err()
-                .to_string();
+            let err = engine.eval::<Dynamic>(&script).unwrap_err().to_string();
             assert!(
                 err.contains("not allowed") && err.contains("http"),
                 "URL {url} should be scheme-rejected; got: {err}"

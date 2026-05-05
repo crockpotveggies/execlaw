@@ -90,7 +90,9 @@ pub trait ModelAdapter: Send + Sync {
 
 /// Pull the first choice's text + finish_reason + tool_calls from a
 /// vLLM/OpenAI-shaped response, dropping the rest.
-pub(crate) fn first_choice(resp: &ChatResponse) -> (String, Option<String>, Vec<execlaw_inference_api::ToolCall>) {
+pub(crate) fn first_choice(
+    resp: &ChatResponse,
+) -> (String, Option<String>, Vec<execlaw_inference_api::ToolCall>) {
     let model_id = resp.model.clone();
     let _ = model_id;
     if let Some(choice) = resp.choices.first() {

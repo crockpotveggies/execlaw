@@ -72,14 +72,17 @@ pub async fn logs_handler(
     _user: crate::auth_extract::AuthedUser,
     Query(q): Query<LogsQuery>,
 ) -> impl IntoResponse {
-    let level = q.level.as_deref().and_then(|s| match s.to_ascii_lowercase().as_str() {
-        "trace" => Some(LogLevel::Trace),
-        "debug" => Some(LogLevel::Debug),
-        "info" => Some(LogLevel::Info),
-        "warn" | "warning" => Some(LogLevel::Warn),
-        "error" => Some(LogLevel::Error),
-        _ => None,
-    });
+    let level = q
+        .level
+        .as_deref()
+        .and_then(|s| match s.to_ascii_lowercase().as_str() {
+            "trace" => Some(LogLevel::Trace),
+            "debug" => Some(LogLevel::Debug),
+            "info" => Some(LogLevel::Info),
+            "warn" | "warning" => Some(LogLevel::Warn),
+            "error" => Some(LogLevel::Error),
+            _ => None,
+        });
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
     let store = LogStore::new(&state.db);
     let rows = match store.query(
@@ -109,12 +112,13 @@ pub async fn logs_handler(
             conversation_id: r.conversation_id,
             plugin_id: r.plugin_id,
             message: r.message,
-            fields: r
-                .fields_json
-                .and_then(|b| serde_json::from_slice(&b).ok()),
+            fields: r.fields_json.and_then(|b| serde_json::from_slice(&b).ok()),
         })
         .collect();
-    (StatusCode::OK, Json(serde_json::json!(LogsResponse { entries })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(LogsResponse { entries })),
+    )
         .into_response()
 }
 
@@ -192,7 +196,10 @@ pub async fn eval_flags_handler(
             notes: r.notes,
         })
         .collect();
-    (StatusCode::OK, Json(serde_json::json!(FlagsResponse { flags })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(FlagsResponse { flags })),
+    )
         .into_response()
 }
 
@@ -271,7 +278,10 @@ pub async fn audit_handler(
             new_json: r.new_json,
         })
         .collect();
-    (StatusCode::OK, Json(serde_json::json!(AuditResponse { entries })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(AuditResponse { entries })),
+    )
         .into_response()
 }
 
@@ -339,14 +349,12 @@ mod tests {
 
         let token = setup_get_token(&app).await;
         // 2. Fresh DB → empty entries.
-        let (status, body) =
-            read_json(&app, Some(&token), "/api/admin/logs").await;
+        let (status, body) = read_json(&app, Some(&token), "/api/admin/logs").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["entries"].is_array());
         assert_eq!(body["entries"].as_array().unwrap().len(), 0);
         // 3. With a level filter, still 200, still empty.
-        let (status, body) =
-            read_json(&app, Some(&token), "/api/admin/logs?level=warn").await;
+        let (status, body) = read_json(&app, Some(&token), "/api/admin/logs?level=warn").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["entries"].as_array().unwrap().len(), 0);
     }
@@ -358,18 +366,13 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
         let token = setup_get_token(&app).await;
-        let (status, body) =
-            read_json(&app, Some(&token), "/api/admin/eval/flags").await;
+        let (status, body) = read_json(&app, Some(&token), "/api/admin/eval/flags").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["flags"].is_array());
         assert_eq!(body["flags"].as_array().unwrap().len(), 0);
         // Label filter accepted; empty result.
-        let (status, body) = read_json(
-            &app,
-            Some(&token),
-            "/api/admin/eval/flags?label=regression",
-        )
-        .await;
+        let (status, body) =
+            read_json(&app, Some(&token), "/api/admin/eval/flags?label=regression").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["flags"].as_array().unwrap().len(), 0);
     }

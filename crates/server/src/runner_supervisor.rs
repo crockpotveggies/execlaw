@@ -551,8 +551,7 @@ impl RunnerSupervisor {
         // Wait briefly for the WS to actually close (registry
         // entry to disappear). Cap at 5s — runner has had its
         // chance.
-        let close_deadline =
-            tokio::time::Instant::now() + Duration::from_secs(5);
+        let close_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < close_deadline {
             if self.get(group_id).is_none() {
                 break;
@@ -581,19 +580,14 @@ impl RunnerSupervisor {
         let mut wiped_volume = false;
         let wipe = matches!(
             reason,
-            ShutdownReason::IdleReap
-                | ShutdownReason::OperatorWipe
-                | ShutdownReason::GroupDeleted
+            ShutdownReason::IdleReap | ShutdownReason::OperatorWipe | ShutdownReason::GroupDeleted
         );
         if wipe {
             // Sanity: never wipe the controller's workspace via
             // an idle reap (defence-in-depth — earlier check
             // should've caught it).
             if handle.controller_runner && reason == ShutdownReason::IdleReap {
-                warn!(
-                    group_id,
-                    "controller workspace wipe blocked at last gate"
-                );
+                warn!(group_id, "controller workspace wipe blocked at last gate");
             } else {
                 match launcher.wipe_volume(group_id).await {
                     Ok(_) => {
@@ -677,7 +671,10 @@ impl RunnerSupervisor {
             }
         }
         if !reaped.is_empty() {
-            info!(reaped_count = reaped.len(), "runner supervisor: idle-reaped runners");
+            info!(
+                reaped_count = reaped.len(),
+                "runner supervisor: idle-reaped runners"
+            );
         }
         reaped
     }
@@ -760,7 +757,10 @@ impl RunnerSupervisor {
     /// `ensure(group_id)` to spawn one — that path lands when the
     /// real bollard spawn is wired in).
     pub fn get(&self, group_id: &str) -> Option<RunnerHandle> {
-        self.inner.runners.get(group_id).map(|kv| kv.value().clone())
+        self.inner
+            .runners
+            .get(group_id)
+            .map(|kv| kv.value().clone())
     }
 
     /// Snapshot every live runner. Used by the reaper sweep + the
@@ -803,10 +803,7 @@ impl RunnerSupervisor {
         // lands in that window saw `tx = None` → SendError → 500.
         // We retry briefly; if the tx never attaches, treat the
         // handle as stale and remove it so the next turn respawns.
-        if !handle
-            .wait_until_tx_attached(Duration::from_secs(2))
-            .await
-        {
+        if !handle.wait_until_tx_attached(Duration::from_secs(2)).await {
             warn!(
                 group_id,
                 "forward_turn: tx never attached within 2s; pruning stale handle"
@@ -818,9 +815,7 @@ impl RunnerSupervisor {
         // Build the per-turn event channel + register it with the
         // runner's read-loop dispatcher.
         let (tx, rx) = mpsc::unbounded_channel::<TurnEvent>();
-        handle
-            .turn_streams
-            .insert(request.turn_id.clone(), tx);
+        handle.turn_streams.insert(request.turn_id.clone(), tx);
         {
             let mut s = handle.state.write().await;
             s.in_flight_turns.insert(request.turn_id.clone());
@@ -877,11 +872,9 @@ impl RunnerSupervisor {
         // Only remove if the registry entry is the SAME handle —
         // a concurrent `accept_registration` may have already
         // replaced it with a fresh one we shouldn't clobber.
-        self.inner
-            .runners
-            .remove_if(group_id, |_, existing| {
-                Arc::ptr_eq(&existing.tx, &handle.tx)
-            });
+        self.inner.runners.remove_if(group_id, |_, existing| {
+            Arc::ptr_eq(&existing.tx, &handle.tx)
+        });
     }
 
     /// Operator-driven turn cancellation (the existing stop button
@@ -900,11 +893,7 @@ impl RunnerSupervisor {
 
     /// Reply to a tool-call request. Dispatched by the chat
     /// handler after `ChainedToolDispatch::call()` returns.
-    pub async fn submit_tool_result(
-        &self,
-        group_id: &str,
-        result: ToolCallResult,
-    ) -> bool {
+    pub async fn submit_tool_result(&self, group_id: &str, result: ToolCallResult) -> bool {
         let Some(handle) = self.get(group_id) else {
             return false;
         };
@@ -922,7 +911,10 @@ impl RunnerSupervisor {
         let snap = self.snapshot();
         for handle in snap {
             if handle.is_reapable(now, IDLE_TTL).await {
-                if let Err(e) = self.reap_group(&handle.group_id, ShutdownReason::IdleReap).await {
+                if let Err(e) = self
+                    .reap_group(&handle.group_id, ShutdownReason::IdleReap)
+                    .await
+                {
                     warn!(group_id = %handle.group_id, error = %e, "reap_group failed");
                     continue;
                 }
@@ -930,7 +922,10 @@ impl RunnerSupervisor {
             }
         }
         if !reaped.is_empty() {
-            info!(reaped_count = reaped.len(), "runner supervisor reaped idle runners");
+            info!(
+                reaped_count = reaped.len(),
+                "runner supervisor reaped idle runners"
+            );
         }
         reaped
     }
@@ -1035,7 +1030,9 @@ impl RunnerSupervisor {
                     turn_id = %turn_id,
                     "max-turn watchdog: cancelling stuck turn"
                 );
-                let frame = ServerToRunner::CancelTurn { turn_id: turn_id.clone() };
+                let frame = ServerToRunner::CancelTurn {
+                    turn_id: turn_id.clone(),
+                };
                 let _ = send_to_runner(&handle, frame).await;
             }
         }
@@ -1156,10 +1153,12 @@ impl RunnerSupervisor {
                 conversation_id,
                 phase,
             } => {
-                self.inner.events.publish(UiEvent::ConversationPhaseChanged {
-                    conversation_id: conversation_id.clone(),
-                    phase: phase.clone(),
-                });
+                self.inner
+                    .events
+                    .publish(UiEvent::ConversationPhaseChanged {
+                        conversation_id: conversation_id.clone(),
+                        phase: phase.clone(),
+                    });
                 if let Some(tx) = handle.turn_streams.get(&turn_id) {
                     let _ = tx.send(TurnEvent::Phase { phase });
                 }
@@ -1228,10 +1227,7 @@ impl RunnerSupervisor {
                 cancelled,
             } => {
                 if let Some(tx) = handle.turn_streams.get(&turn_id) {
-                    let _ = tx.send(TurnEvent::Error {
-                        message,
-                        cancelled,
-                    });
+                    let _ = tx.send(TurnEvent::Error { message, cancelled });
                 }
                 self.finish_turn(&handle, &turn_id).await;
             }
@@ -1259,8 +1255,11 @@ impl RunnerSupervisor {
         };
         // Tear down every in-flight turn with an Error frame so
         // the chat handler sees a clean end.
-        let to_close: Vec<String> =
-            handle.turn_streams.iter().map(|kv| kv.key().clone()).collect();
+        let to_close: Vec<String> = handle
+            .turn_streams
+            .iter()
+            .map(|kv| kv.key().clone())
+            .collect();
         for turn_id in to_close {
             if let Some((_, tx)) = handle.turn_streams.remove(&turn_id) {
                 let _ = tx.send(TurnEvent::Error {
@@ -1293,10 +1292,7 @@ impl RunnerSupervisor {
 /// Returns Err when no channel is attached (runner registered but
 /// the WS writer task hasn't claimed it yet — vanishingly small
 /// window; treat as a transient error).
-async fn send_to_runner(
-    handle: &RunnerHandle,
-    frame: ServerToRunner,
-) -> Result<(), SendError> {
+async fn send_to_runner(handle: &RunnerHandle, frame: ServerToRunner) -> Result<(), SendError> {
     let guard = handle.tx.lock().await;
     let tx = guard.as_ref().ok_or(SendError::NotAttached)?;
     tx.send(frame).map_err(|_| SendError::Closed)?;
@@ -1496,9 +1492,7 @@ mod tests {
         let s = fresh_supervisor();
         let h = RunnerHandle::test_handle("g-controller", true);
         s.inner.runners.insert("g-controller".into(), h);
-        let result = s
-            .reap_group("g-controller", ShutdownReason::IdleReap)
-            .await;
+        let result = s.reap_group("g-controller", ShutdownReason::IdleReap).await;
         assert!(matches!(result, Err(ReapError::ControllerProtected)));
     }
 
@@ -1683,10 +1677,7 @@ mod tests {
         s.drop_registration("g-1").await;
         // The pending turn channel got an Error frame.
         match turn_rx.recv().await.unwrap() {
-            TurnEvent::Error {
-                message,
-                cancelled,
-            } => {
+            TurnEvent::Error { message, cancelled } => {
                 assert!(message.contains("disconnected"));
                 assert!(!cancelled);
             }
@@ -1739,7 +1730,9 @@ mod tests {
         // The known group's volume was preserved.
         let after = launcher.list_runner_volumes().await.unwrap();
         assert!(
-            after.iter().any(|v| v == &format!("execlaw-runner-{}", known.group_id))
+            after
+                .iter()
+                .any(|v| v == &format!("execlaw-runner-{}", known.group_id))
         );
         assert!(!after.iter().any(|v| v == "execlaw-runner-orphan-1"));
     }

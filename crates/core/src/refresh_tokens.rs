@@ -348,10 +348,7 @@ mod tests {
         let _expired = store.issue("u", "s", -10).unwrap();
         let live = store.issue("u", "s", 3600).unwrap();
 
-        let sweeper = RefreshTokenSweeper::with_interval(
-            db.clone(),
-            Duration::from_millis(20),
-        );
+        let sweeper = RefreshTokenSweeper::with_interval(db.clone(), Duration::from_millis(20));
         let stop = Arc::new(Notify::new());
         let stop_clone = stop.clone();
         let sweeper_clone = sweeper.clone();

@@ -2004,6 +2004,33 @@ export async function deleteMyIdentifier(
     );
 }
 
+/// One transport the operator can bind a handle against. Built-in
+/// entries (`web`, `voice`) come from the platform; plugin entries
+/// reflect installed `[transport]` declarations. The list is
+/// fetched live so the dropdown reflects the actual install state
+/// — operators don't see "Signal" until the Signal plugin is
+/// installed + enabled.
+export interface AvailableTransportView {
+    id: string;
+    label: string;
+    plugin_id?: string;
+    handle_placeholder: string;
+}
+
+export interface AvailableTransportsResponse {
+    transports: AvailableTransportView[];
+}
+
+export async function listAvailableTransports(
+    tokenAccessor: () => string | null,
+): Promise<AvailableTransportsResponse> {
+    return apiFetch<AvailableTransportsResponse>(
+        "/api/admin/me/transports",
+        {},
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/routines (Phase 10 — §5.6) -------------------------
 
 export type RoutineRunStatus = "Pending" | "Success" | "Failed" | "Skipped";

@@ -213,7 +213,10 @@ fn caller_owns_conversation(
 }
 
 pub fn attachments_router() -> Router<AppState> {
-    Router::new().route("/api/attachments/{attachment_id}", get(get_attachment_handler))
+    Router::new().route(
+        "/api/attachments/{attachment_id}",
+        get(get_attachment_handler),
+    )
 }
 
 #[cfg(test)]
@@ -318,7 +321,11 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "application/pdf"
         );
         let dispo = resp
@@ -327,7 +334,10 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert!(dispo.starts_with("attachment;"), "must be a save-as response");
+        assert!(
+            dispo.starts_with("attachment;"),
+            "must be a save-as response"
+        );
         assert!(dispo.contains(".pdf"), "filename must carry the extension");
         let bytes = body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         assert!(
@@ -451,7 +461,9 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
-                    .uri(format!("/api/attachments/{att_id}?access_token=not-a-real-jwt"))
+                    .uri(format!(
+                        "/api/attachments/{att_id}?access_token=not-a-real-jwt"
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )

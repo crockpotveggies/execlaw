@@ -154,11 +154,7 @@ impl VoiceSessionRegistry {
 
     /// Process one parsed frame. Returns chunks ready for the STT
     /// pipeline + lifecycle hints the caller publishes.
-    pub async fn observe_frame(
-        &self,
-        header: &VoiceFrameHeader,
-        payload: &[u8],
-    ) -> FrameOutcome {
+    pub async fn observe_frame(&self, header: &VoiceFrameHeader, payload: &[u8]) -> FrameOutcome {
         let now = Instant::now();
         let mut inner = self.inner.lock().await;
         let mut outcome = FrameOutcome::default();
@@ -222,9 +218,7 @@ impl VoiceSessionRegistry {
                 outcome.evicted_seqs.push(oldest_seq);
                 session.next_expected_seq = oldest_seq.wrapping_add(1);
                 // Re-drain — the bump may have unblocked more.
-                while let Some(payload) =
-                    session.pending.remove(&session.next_expected_seq)
-                {
+                while let Some(payload) = session.pending.remove(&session.next_expected_seq) {
                     outcome.released.push(OrderedAudioChunk {
                         session: header.session.clone(),
                         seq: session.next_expected_seq,
@@ -233,8 +227,7 @@ impl VoiceSessionRegistry {
                         channels: session.channels,
                         payload,
                     });
-                    session.next_expected_seq =
-                        session.next_expected_seq.wrapping_add(1);
+                    session.next_expected_seq = session.next_expected_seq.wrapping_add(1);
                 }
                 // If we unblocked the sentinel that triggered the
                 // overflow, we're done.
@@ -292,9 +285,7 @@ impl VoiceSessionRegistry {
     /// waiting for the real `SESSION_IDLE_TIMEOUT`. Production code
     /// goes through the public methods.
     #[cfg(test)]
-    pub async fn private_inner_for_test(
-        &self,
-    ) -> tokio::sync::MutexGuard<'_, Inner> {
+    pub async fn private_inner_for_test(&self) -> tokio::sync::MutexGuard<'_, Inner> {
         self.inner.lock().await
     }
 
@@ -371,7 +362,10 @@ mod tests {
         // 0, 2, 1, 3 — should release as 0, then 1+2 together,
         // then 3.
         let o0 = reg.observe_frame(&header("s1", 0), b"a").await;
-        assert_eq!(o0.released.iter().map(|c| c.seq).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(
+            o0.released.iter().map(|c| c.seq).collect::<Vec<_>>(),
+            vec![0]
+        );
         let o2 = reg.observe_frame(&header("s1", 2), b"c").await;
         assert!(o2.released.is_empty(), "seq 2 must wait for seq 1");
         let o1 = reg.observe_frame(&header("s1", 1), b"b").await;
@@ -381,7 +375,10 @@ mod tests {
             "filling the gap releases the backlog in seq order",
         );
         let o3 = reg.observe_frame(&header("s1", 3), b"d").await;
-        assert_eq!(o3.released.iter().map(|c| c.seq).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(
+            o3.released.iter().map(|c| c.seq).collect::<Vec<_>>(),
+            vec![3]
+        );
     }
 
     #[tokio::test]

@@ -352,7 +352,8 @@ mod tests {
         assert!(!d.capability_set.contains(&"memory.read"));
         assert!(!d.capability_set.contains(&"memory.write"));
         assert!(
-            d.capability_set.contains(&"messaging.reply_current_transport"),
+            d.capability_set
+                .contains(&"messaging.reply_current_transport"),
             "even KnownLimited must be able to reply on current transport"
         );
     }
@@ -419,7 +420,10 @@ mod tests {
     /// return None so unknown trust classes don't silently default.
     #[test]
     fn trust_parse_rejects_unknown_tags() {
-        assert_eq!(TrustLevel::parse("Controller"), Some(TrustLevel::Controller));
+        assert_eq!(
+            TrustLevel::parse("Controller"),
+            Some(TrustLevel::Controller)
+        );
         assert_eq!(TrustLevel::parse("Blocked"), Some(TrustLevel::Blocked));
         assert_eq!(TrustLevel::parse("Admin"), None);
         assert_eq!(TrustLevel::parse(""), None);

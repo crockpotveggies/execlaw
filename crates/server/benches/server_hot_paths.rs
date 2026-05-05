@@ -142,10 +142,8 @@ fn bench_voice_observe_frame(c: &mut Criterion) {
                 channels: 1,
                 ts_ms: None,
             };
-            let outcome = rt.block_on(registry.observe_frame(
-                black_box(&header),
-                black_box(&payload),
-            ));
+            let outcome =
+                rt.block_on(registry.observe_frame(black_box(&header), black_box(&payload)));
             black_box(outcome);
             seq = seq.wrapping_add(1);
         })
@@ -166,8 +164,7 @@ fn bench_voice_ingest_chunks(c: &mut Criterion) {
 
     c.bench_function("voice/ingest_chunks_pcm16_320samples", |b| {
         let bus = EventBus::new();
-        let stt: SttFactory =
-            Arc::new(|| Box::new(MockStt::new(Vec::new(), String::new())));
+        let stt: SttFactory = Arc::new(|| Box::new(MockStt::new(Vec::new(), String::new())));
         let tts: TtsFactory =
             Arc::new(|| (Box::new(MockTts::default()) as Box<dyn TtsClient>, None));
         let runtime = VoiceRuntime::new(bus, stt, tts);
@@ -228,10 +225,8 @@ fn bench_runner_principal_group_hash(c: &mut Criterion) {
 fn bench_runner_supervisor_lookup(c: &mut Criterion) {
     use execlaw_server::events::EventBus;
     use execlaw_server::runner_supervisor::RunnerSupervisor;
-    let db = execlaw_core::Database::open(
-        &execlaw_core::db::DbConfig::in_memory_unencrypted(),
-    )
-    .unwrap();
+    let db =
+        execlaw_core::Database::open(&execlaw_core::db::DbConfig::in_memory_unencrypted()).unwrap();
     execlaw_core::MigrationRunner::new(&db).apply_all().unwrap();
     let sup = RunnerSupervisor::new(db, EventBus::new());
     // Seed 64 supervisor entries via the public auth path so the
@@ -262,12 +257,9 @@ fn bench_runner_frame_codec(c: &mut Criterion) {
     c.bench_function("runner_frame_encode_token_delta", |b| {
         b.iter(|| serde_json::to_string(black_box(&token_delta)).unwrap())
     });
-    let encoded =
-        serde_json::to_string(&token_delta).unwrap();
+    let encoded = serde_json::to_string(&token_delta).unwrap();
     c.bench_function("runner_frame_decode_token_delta", |b| {
-        b.iter(|| {
-            serde_json::from_str::<RunnerToServer>(black_box(&encoded)).unwrap()
-        })
+        b.iter(|| serde_json::from_str::<RunnerToServer>(black_box(&encoded)).unwrap())
     });
     c.bench_function("runner_frame_encode_cancel", |b| {
         b.iter(|| serde_json::to_string(black_box(&cancel)).unwrap())
@@ -342,6 +334,331 @@ fn bench_research_extract_readable_text(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3 — Signal outbound dispatch.
+//
+// Budget: sub-1ms per `signal.send_message` invocation against an
+// in-process axum mock standing in for the supervised signal-cli
+// sidecar. Empirical baseline on Windows / reqwest+axum loopback is
+// ~480µs, dominated by the HTTP round-trip and JSON ser/de — the
+// pure dispatch logic (arg parse, capability lookup, binding query,
+// outcome construction) lives in the ~50µs noise floor below that.
+// Real signal-cli end-to-end is 50–500ms (Signal's servers), so any
+// regression that pushes us past 1ms means we're holding up the
+// agent's tool result for no good reason.
+//
+// What's NOT measured: the network round-trip to a real signal-cli
+// container (signal-cli's own crypto + network is ~50–500 ms;
+// dominated by Signal's servers, not us). The bench pins our
+// CONTRIBUTION to the latency: arg parsing, capability lookup,
+// binding-store query, JSON serialise, reqwest send, response
+// parse. A regression here means we slowed our own dispatch path,
+// not signal-cli.
+// ---------------------------------------------------------------------------
+
+fn bench_signal_send_outbound(c: &mut Criterion) {
+    use execlaw_core::Database;
+    use execlaw_core::db::DbConfig;
+    use execlaw_core::ids::ConversationId;
+    use execlaw_core::migrations::MigrationRunner;
+    use execlaw_core::tool::{Clock, SystemClock, ToolCtx, ToolImpl};
+    use execlaw_core::transport_bindings::TransportBindingStore;
+    use execlaw_server::signal_tools::SignalSendMessageTool;
+    use execlaw_server::signal_transport::{
+        SIGNAL_CHANNEL, SignalCliTransport, StaticEndpointResolver,
+    };
+    use std::sync::Arc;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // In-process axum mock standing in for signal-cli-rest-api.
+    let mock_url = rt.block_on(async {
+        use axum::Router;
+        use axum::routing::post;
+        let app: Router = Router::new().route(
+            "/v2/send",
+            post(|| async { axum::Json(serde_json::json!({ "timestamp": 1700000000_i64 })) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    });
+
+    // Seed an in-memory DB with one binding so resolve_recipient
+    // hits the canonical path. Bench measures the FULL outbound
+    // dispatch — args → resolve → send — not just the HTTP call.
+    let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+    MigrationRunner::new(&db).apply_all().unwrap();
+    TransportBindingStore::new(&db)
+        .insert_binding(SIGNAL_CHANNEL, "+15559998888", "pg-bench", false, 0)
+        .unwrap();
+
+    let resolver: Arc<dyn execlaw_server::signal_transport::RpcEndpointResolver> =
+        Arc::new(StaticEndpointResolver(mock_url));
+    let tool = SignalSendMessageTool::new();
+
+    c.bench_function("signal/send_message_outbound", |b| {
+        // Plain `block_on` per-iter — `Bencher::to_async` requires
+        // criterion's `async_tokio` feature which isn't enabled in
+        // the workspace. The cost of `block_on`-spinning on the
+        // outer thread is in the noise next to the per-iter HTTP
+        // round-trip; correctness pinned by the unit-test pass.
+        b.iter(|| {
+            rt.block_on(async {
+                let transport = Arc::new(SignalCliTransport::new(
+                    resolver.clone(),
+                    db.clone(),
+                    Some("+15551234567".into()),
+                    None,
+                ));
+                let mut ctx = ToolCtx::empty(
+                    ConversationId::from_string("conv-bench"),
+                    "Controller",
+                    Arc::new(SystemClock) as Arc<dyn Clock>,
+                );
+                ctx.transport = Some(transport);
+                let outcome = tool
+                    .invoke(
+                        ctx,
+                        serde_json::json!({ "to": "+15559998888", "text": "hi" }),
+                    )
+                    .await;
+                black_box(outcome);
+            });
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — Signal inbound decode.
+//
+// Budget: sub-50µs per WS frame. The consumer is loop-driven on the
+// WS read path; every inbound message — including the receipts and
+// typing indicators we drop at decode time — pays the decode cost.
+// A regression here means the consumer's read loop slows for every
+// contact's keystroke, which over a busy day accumulates.
+//
+// Doesn't measure the route step (that's `route_inbound_message` and
+// dominated by SQLite which has its own bench in core). Pure JSON
+// shape detection.
+// ---------------------------------------------------------------------------
+
+fn bench_signal_inbound_decode(c: &mut Criterion) {
+    let text_frame = serde_json::json!({
+        "account": "+15551234567",
+        "envelope": {
+            "source": "+15559998888",
+            "sourceNumber": "+15559998888",
+            "sourceName": "Alice",
+            "timestamp": 1700000000000_i64,
+            "dataMessage": {
+                "timestamp": 1700000000000_i64,
+                "message": "hi from a friend, what's the weather like today?",
+                "groupInfo": null,
+            }
+        }
+    })
+    .to_string();
+    let typing_frame = serde_json::json!({
+        "account": "+15551234567",
+        "envelope": {
+            "source": "+15559998888",
+            "timestamp": 1700000000000_i64,
+            "typingMessage": {
+                "action": "STARTED",
+                "timestamp": 1700000000000_i64,
+            }
+        }
+    })
+    .to_string();
+
+    c.bench_function("signal/decode_text_frame", |b| {
+        b.iter(|| {
+            let out = execlaw_server::signal_inbound::decode_frame(
+                black_box(&text_frame),
+                Some("+15551234567"),
+            );
+            black_box(out);
+        });
+    });
+
+    c.bench_function("signal/decode_typing_drop", |b| {
+        // Drop path: every typing indicator hits this. Should be
+        // strictly faster than the text path (no String allocation
+        // for the body).
+        b.iter(|| {
+            let out = execlaw_server::signal_inbound::decode_frame(
+                black_box(&typing_frame),
+                Some("+15551234567"),
+            );
+            black_box(out);
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 — Signal group-name resolution.
+//
+// Budget: sub-200µs per `signal.add_group_members` / `signal.leave_group`
+// invocation EXCLUDING the sidecar HTTP round-trip. Both tools call
+// `transport.list_groups()` to map `groupName` → `group_id`; the
+// matcher walks every group and exact-name compares. With 100s of
+// groups in a busy operator's account this is an O(n) scan that runs
+// before every group mutation.
+//
+// The bench measures the matcher cost only — `list_groups` is mocked
+// to return a static vec so we isolate the in-memory filter cost from
+// the HTTP path. A regression here means renaming a contact-list
+// entry slows a destructive op the operator already feels nervous
+// about (leaving a group on the agent's behalf).
+// ---------------------------------------------------------------------------
+
+fn bench_signal_group_name_resolution(c: &mut Criterion) {
+    use async_trait::async_trait;
+    use execlaw_core::tool::{ApiError, TransportApi, TransportGroupSummary};
+
+    /// Static fixture: pretend the controller is in 200 groups,
+    /// only one of which matches the lookup name. Models a busy
+    /// operator's group list.
+    struct StaticGroupList(Vec<TransportGroupSummary>);
+
+    #[async_trait]
+    impl TransportApi for StaticGroupList {
+        async fn resolve_recipient(&self, _: &str, _: &str) -> Result<String, ApiError> {
+            unreachable!()
+        }
+        async fn send(&self, _: &str, _: &str, _: &str) -> Result<String, ApiError> {
+            unreachable!()
+        }
+        async fn current_chat_id(&self, _: &str) -> Result<Option<String>, ApiError> {
+            Ok(None)
+        }
+        async fn list_groups(&self, _: &str) -> Result<Vec<TransportGroupSummary>, ApiError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let groups: Vec<TransportGroupSummary> = (0..200)
+        .map(|i| TransportGroupSummary {
+            id: format!("group-base64-{i:04x}"),
+            name: Some(format!("Group {i}")),
+            member_count: 5,
+        })
+        .collect();
+    let transport: Box<dyn TransportApi> = Box::new(StaticGroupList(groups));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    c.bench_function("signal/group_name_resolution_200_groups", |b| {
+        b.iter(|| {
+            // resolve_group_id is private to signal_tools, but the
+            // hot-path inlines list_groups + filter — replicate it
+            // here so the bench measures the same instructions
+            // without depending on a pub helper.
+            rt.block_on(async {
+                let groups = transport.list_groups("signal").await.unwrap();
+                let target = black_box("Group 137");
+                let matches: Vec<_> = groups
+                    .into_iter()
+                    .filter(|g| g.name.as_deref() == Some(target))
+                    .collect();
+                black_box(matches);
+            });
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6 — Signal inbound decode WITH attachments.
+//
+// Budget: sub-100µs per frame even when the data message carries
+// 10 attachments. The decode runs on every WS frame; an attachment-
+// heavy group chat (member sharing several photos at once) must
+// not spike the consumer's per-message cost.
+// ---------------------------------------------------------------------------
+
+fn bench_signal_inbound_decode_with_attachments(c: &mut Criterion) {
+    let attachments: Vec<serde_json::Value> = (0..10)
+        .map(|i| {
+            serde_json::json!({
+                "id": format!("att-base64-{i:04x}"),
+                "contentType": "image/jpeg",
+                "filename": format!("photo_{i}.jpg"),
+                "size": 1_500_000,
+            })
+        })
+        .collect();
+    let frame = serde_json::json!({
+        "account": "+15551234567",
+        "envelope": {
+            "source": "+15559998888",
+            "sourceNumber": "+15559998888",
+            "sourceName": "Alice",
+            "timestamp": 1700000000000_i64,
+            "dataMessage": {
+                "timestamp": 1700000000000_i64,
+                "message": "check out my vacation pics",
+                "groupInfo": null,
+                "attachments": attachments,
+            }
+        }
+    })
+    .to_string();
+
+    c.bench_function("signal/decode_text_frame_with_10_attachments", |b| {
+        b.iter(|| {
+            let out = execlaw_server::signal_inbound::decode_frame(
+                black_box(&frame),
+                Some("+15551234567"),
+            );
+            black_box(out);
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7 — Outbound attachment base64 encode.
+//
+// Budget: sub-5ms per outbound send carrying a single 500KB
+// attachment (a typical photo). The encode dominates the in-process
+// CPU cost on `signal.send_message` with attachments; the
+// HTTP round-trip dominates the wall-clock side.
+//
+// We bench the pure encode path so a regression — e.g., a future
+// refactor that switches base64 engines or adds a copy — surfaces
+// without any signal-cli mock noise.
+// ---------------------------------------------------------------------------
+
+fn bench_signal_outbound_attachment_encode(c: &mut Criterion) {
+    use base64::Engine;
+    // 500 KiB of pseudo-random bytes — typical jpeg payload size.
+    // Random pattern resists base64-engine-specific shortcuts on
+    // long all-zeros runs.
+    let bytes: Vec<u8> = (0..512 * 1024)
+        .map(|i| ((i * 2654435761_usize) % 256) as u8)
+        .collect();
+    let engine = base64::engine::general_purpose::STANDARD;
+    c.bench_function("signal/outbound_attachment_encode_500kb", |b| {
+        b.iter(|| {
+            let encoded = engine.encode(black_box(&bytes));
+            // Mirror the format!() the transport uses so the
+            // bench captures both the encode + the data-URL
+            // string concatenation.
+            let url = format!("data:image/jpeg;base64,{encoded}");
+            black_box(url);
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_jwt_access,
@@ -353,5 +670,10 @@ criterion_group!(
     bench_runner_frame_codec,
     bench_research_parse_ddg_html,
     bench_research_extract_readable_text,
+    bench_signal_send_outbound,
+    bench_signal_inbound_decode,
+    bench_signal_group_name_resolution,
+    bench_signal_inbound_decode_with_attachments,
+    bench_signal_outbound_attachment_encode,
 );
 criterion_main!(benches);

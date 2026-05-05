@@ -19,9 +19,7 @@ use crate::tool_apis_search_exa::ExaSearchApi;
 use crate::tool_apis_search_searxng::SearxNGSearchApi;
 use crate::tool_apis_search_tavily::TavilySearchApi;
 use execlaw_core::Database;
-use execlaw_core::search_providers::{
-    SearchProviderKind, SearchProviderRow, SearchProviderStore,
-};
+use execlaw_core::search_providers::{SearchProviderKind, SearchProviderRow, SearchProviderStore};
 use execlaw_core::tool::WebSearchApi;
 use serde_json::Value;
 use std::sync::Arc;

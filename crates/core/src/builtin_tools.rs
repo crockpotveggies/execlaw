@@ -982,10 +982,9 @@ impl DeleteRoutineTool {
         Self {
             descriptor: ToolDescriptor {
                 name: "routine_delete".into(),
-                description:
-                    "Permanently delete a routine. Returns `{deleted: true}` on success, \
+                description: "Permanently delete a routine. Returns `{deleted: true}` on success, \
                      `{deleted: false}` if no routine matched."
-                        .into(),
+                    .into(),
                 schema: json!({
                     "type": "object",
                     "properties": {
@@ -1830,11 +1829,7 @@ fn default_allowed_for_attachment_send() -> Vec<String> {
     // attachments only when it has spawn-class trust. A future
     // tightening could split this further, but for now: agents that
     // can spawn research can also deliver the resulting PDF.
-    vec![
-        "Controller".into(),
-        "Owner".into(),
-        "KnownTrusted".into(),
-    ]
+    vec!["Controller".into(), "Owner".into(), "KnownTrusted".into()]
 }
 
 pub struct SendAttachmentTool {
@@ -1898,15 +1893,10 @@ impl ToolImpl for SendAttachmentTool {
         let api = match ctx.attachments.as_ref() {
             Some(a) => a,
             None => {
-                return ToolOutcome::denied(
-                    "attachment_send capability not granted to this tool",
-                );
+                return ToolOutcome::denied("attachment_send capability not granted to this tool");
             }
         };
-        match api
-            .send(&args.attachment_id, args.caption.as_deref())
-            .await
-        {
+        match api.send(&args.attachment_id, args.caption.as_deref()).await {
             Ok(view) => ToolOutcome::Ok(json!({
                 "attachment_id": view.attachment_id,
                 "filename": view.filename,
@@ -3711,7 +3701,10 @@ mod tests {
             .await;
         match out {
             ToolOutcome::Ok(v) => {
-                assert_eq!(v["job"]["status"], "pending", "should re-enter pending queue");
+                assert_eq!(
+                    v["job"]["status"], "pending",
+                    "should re-enter pending queue"
+                );
                 let q = v["job"]["query"].as_str().unwrap();
                 assert!(q.contains("ground covers"), "original query preserved");
                 assert!(q.contains("Zone 6"), "clarification appended");

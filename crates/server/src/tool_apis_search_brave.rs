@@ -94,11 +94,7 @@ impl WebSearchApi for BraveSearchApi {
     fn provider_id(&self) -> &str {
         "brave"
     }
-    async fn search(
-        &self,
-        query: &str,
-        max_results: u32,
-    ) -> Result<Vec<SearchResult>, ApiError> {
+    async fn search(&self, query: &str, max_results: u32) -> Result<Vec<SearchResult>, ApiError> {
         if self.api_key.is_empty() {
             return Err(ApiError::Validation(
                 "Brave api_key is empty; configure it in Settings → Search".into(),

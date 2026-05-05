@@ -48,15 +48,17 @@ impl<'db> AuditStore<'db> {
     ) -> Result<i64, DbError> {
         let now = chrono::Utc::now().timestamp();
         let old_blob = match old {
-            Some(v) => Some(serde_json::to_vec(v).map_err(|e| {
-                DbError::Serde(format!("encoding old_json: {e}"))
-            })?),
+            Some(v) => Some(
+                serde_json::to_vec(v)
+                    .map_err(|e| DbError::Serde(format!("encoding old_json: {e}")))?,
+            ),
             None => None,
         };
         let new_blob = match new {
-            Some(v) => Some(serde_json::to_vec(v).map_err(|e| {
-                DbError::Serde(format!("encoding new_json: {e}"))
-            })?),
+            Some(v) => Some(
+                serde_json::to_vec(v)
+                    .map_err(|e| DbError::Serde(format!("encoding new_json: {e}")))?,
+            ),
             None => None,
         };
         self.db.with_conn(|c| {
@@ -71,11 +73,7 @@ impl<'db> AuditStore<'db> {
 
     /// Recent entries, newest-first. Optional `since_ts` lower bound
     /// (inclusive) and a hard cap; the SPA paginates by ts.
-    pub fn list(
-        &self,
-        since_ts: Option<i64>,
-        limit: i64,
-    ) -> Result<Vec<AuditEntry>, DbError> {
+    pub fn list(&self, since_ts: Option<i64>, limit: i64) -> Result<Vec<AuditEntry>, DbError> {
         let limit = limit.clamp(1, 1000);
         self.db.with_conn(|c| {
             let mut stmt = c.prepare_cached(
@@ -178,9 +176,7 @@ mod tests {
     fn since_ts_filters_older_rows() {
         let db = fresh_db();
         let store = AuditStore::new(&db);
-        store
-            .insert("a", "t", "old", None, None)
-            .unwrap();
+        store.insert("a", "t", "old", None, None).unwrap();
         // Far-future since_ts should exclude every row.
         let rows = store.list(Some(9_999_999_999), 100).unwrap();
         assert!(rows.is_empty());

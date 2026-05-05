@@ -153,7 +153,10 @@ impl<'db> SearchProviderStore<'db> {
 
     /// Look up a single row by kind. `None` when the kind has no
     /// row in the table.
-    pub fn get(&self, kind: SearchProviderKind) -> Result<Option<SearchProviderRow>, SearchProviderError> {
+    pub fn get(
+        &self,
+        kind: SearchProviderKind,
+    ) -> Result<Option<SearchProviderRow>, SearchProviderError> {
         let kind_str = kind.as_str().to_owned();
         let row = self.db.with_conn(|c| {
             let row = c
@@ -216,7 +219,11 @@ impl<'db> SearchProviderStore<'db> {
     /// `is_default` off on every other row in the same statement.
     /// Returns `true` when the row transitioned, `false` when no
     /// such row exists (caller can decide whether to upsert first).
-    pub fn set_default(&self, kind: SearchProviderKind, now: i64) -> Result<bool, SearchProviderError> {
+    pub fn set_default(
+        &self,
+        kind: SearchProviderKind,
+        now: i64,
+    ) -> Result<bool, SearchProviderError> {
         let kind_str = kind.as_str().to_owned();
         let n = self.db.with_conn(|c| {
             let n = c.execute(
@@ -248,7 +255,9 @@ impl<'db> SearchProviderStore<'db> {
     }
 }
 
-fn row_from_sqlite(r: &rusqlite::Row) -> rusqlite::Result<Result<SearchProviderRow, SearchProviderError>> {
+fn row_from_sqlite(
+    r: &rusqlite::Row,
+) -> rusqlite::Result<Result<SearchProviderRow, SearchProviderError>> {
     let kind_str: String = r.get(0)?;
     let kind = match SearchProviderKind::parse(&kind_str) {
         Some(k) => k,

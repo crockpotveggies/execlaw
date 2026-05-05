@@ -46,8 +46,8 @@ impl<'db> EvalFlaggedStore<'db> {
                 row.from_seq, row.to_seq
             )));
         }
-        let tags_json = serde_json::to_vec(&row.tags)
-            .map_err(|e| DbError::Serde(format!("tags: {e}")))?;
+        let tags_json =
+            serde_json::to_vec(&row.tags).map_err(|e| DbError::Serde(format!("tags: {e}")))?;
         self.db.with_conn(|c| {
             c.execute(
                 "INSERT INTO eval_flagged \
@@ -96,8 +96,12 @@ impl<'db> EvalFlaggedStore<'db> {
             };
             let mut stmt = c.prepare_cached(sql)?;
             let rows = match label_param {
-                Some(l) => stmt.query_map(params![l], row_to_flag)?.collect::<Result<Vec<_>, _>>()?,
-                None => stmt.query_map([], row_to_flag)?.collect::<Result<Vec<_>, _>>()?,
+                Some(l) => stmt
+                    .query_map(params![l], row_to_flag)?
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => stmt
+                    .query_map([], row_to_flag)?
+                    .collect::<Result<Vec<_>, _>>()?,
             };
             let mut out = Vec::with_capacity(rows.len());
             for (row, tags_json) in rows {
@@ -117,7 +121,9 @@ fn row_to_flag(r: &rusqlite::Row<'_>) -> rusqlite::Result<(EvalFlagRow, Vec<u8>)
     let from_seq: i64 = r.get(2)?;
     let to_seq: i64 = r.get(3)?;
     let label: String = r.get(4)?;
-    let tags_json: Vec<u8> = r.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_else(|| b"[]".to_vec());
+    let tags_json: Vec<u8> = r
+        .get::<_, Option<Vec<u8>>>(5)?
+        .unwrap_or_else(|| b"[]".to_vec());
     let flagged_by: String = r.get(6)?;
     let flagged_at: i64 = r.get(7)?;
     let notes: Option<String> = r.get(8)?;

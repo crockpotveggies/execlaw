@@ -48,9 +48,7 @@ impl RetentionPolicy {
     /// to the default so a corrupt row can't accidentally disable
     /// retention (which would be a silent operator-data-leak risk).
     pub fn from_days(raw: u32) -> Self {
-        if raw == INFINITE_RETENTION
-            || ALLOWED_RETENTION_DAYS.contains(&raw)
-        {
+        if raw == INFINITE_RETENTION || ALLOWED_RETENTION_DAYS.contains(&raw) {
             Self { days: raw }
         } else {
             Self {
@@ -91,11 +89,7 @@ impl RetentionPolicy {
         if self.days == INFINITE_RETENTION {
             return None;
         }
-        Some(
-            now_unix
-                .saturating_sub(self.days as i64 * 86_400)
-                .max(0),
-        )
+        Some(now_unix.saturating_sub(self.days as i64 * 86_400).max(0))
     }
 
     /// Same as [`cutoff_for_now`] but in milliseconds — used by the

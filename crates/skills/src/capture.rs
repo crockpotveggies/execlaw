@@ -26,15 +26,11 @@
 use crate::model::{
     NewProposal, NewSkill, NewSkillVersion, ProposalKind, RegistrationKind, SkillError,
 };
-use crate::sanitizer::{sanitize_step, SanitizationReport, SanitizedStep};
+use crate::sanitizer::{SanitizationReport, SanitizedStep, sanitize_step};
 use crate::scanner::Strictness;
 use crate::store::SkillStore;
-use crate::summarizer::{
-    DraftSkillProposal, SkillSummarizer, SummarizerOutput, SummarizerPrompt,
-};
-use execlaw_core::events::{
-    EventKind, EventLog, EventRecord, ToolResultPayload, ToolUsePayload,
-};
+use crate::summarizer::{DraftSkillProposal, SkillSummarizer, SummarizerOutput, SummarizerPrompt};
+use execlaw_core::events::{EventKind, EventLog, EventRecord, ToolResultPayload, ToolUsePayload};
 use execlaw_core::ids::{ConversationId, EventSeq};
 use execlaw_core::skills_config::{SkillsConfig, SkillsConfigStore};
 use serde_json::Value as JsonValue;
@@ -178,7 +174,11 @@ impl AutoCaptureWorker {
         // 1. Config gate.
         let cfg = match SkillsConfigStore::new(&self.db).get() {
             Ok(c) => c,
-            Err(e) => return CaptureOutcome::Error { message: e.to_string() },
+            Err(e) => {
+                return CaptureOutcome::Error {
+                    message: e.to_string(),
+                };
+            }
         };
         if !cfg.auto_capture_enabled && !cfg.auto_capture_dry_run {
             return CaptureOutcome::Disabled;
@@ -188,7 +188,11 @@ impl AutoCaptureWorker {
         let log = EventLog::new(&self.db);
         let events = match log.replay_since(&req.conversation_id, EventSeq(0)) {
             Ok(v) => v,
-            Err(e) => return CaptureOutcome::Error { message: e.to_string() },
+            Err(e) => {
+                return CaptureOutcome::Error {
+                    message: e.to_string(),
+                };
+            }
         };
 
         // 3. Slice from the last UserMsg up to until_seq.
@@ -333,9 +337,13 @@ impl AutoCaptureWorker {
             Err(SkillError::AlreadyExists(_)) | Err(SkillError::Db(_)) => {
                 // Treat all DB errors that look like name conflicts
                 // as a soft conflict; bubble everything else up.
-                CaptureOutcome::Conflict { name: proposal.name }
+                CaptureOutcome::Conflict {
+                    name: proposal.name,
+                }
             }
-            Err(e) => CaptureOutcome::Error { message: e.to_string() },
+            Err(e) => CaptureOutcome::Error {
+                message: e.to_string(),
+            },
         }
     }
 
@@ -349,8 +357,15 @@ impl AutoCaptureWorker {
 
 #[derive(Debug, Clone)]
 enum TrajectoryEntry {
-    ToolUse { ordinal: u32, name: String, args: JsonValue },
-    ToolResult { ordinal: u32, outcome: Result<JsonValue, String> },
+    ToolUse {
+        ordinal: u32,
+        name: String,
+        args: JsonValue,
+    },
+    ToolResult {
+        ordinal: u32,
+        outcome: Result<JsonValue, String>,
+    },
 }
 
 impl TrajectoryEntry {
@@ -440,7 +455,12 @@ fn pair_and_sanitize(
     let mut had_failure = false;
     let mut steps = Vec::new();
     for t in trajectory {
-        if let TrajectoryEntry::ToolUse { ordinal, name, args } = t {
+        if let TrajectoryEntry::ToolUse {
+            ordinal,
+            name,
+            args,
+        } = t
+        {
             // A tool_use without a matching tool_result is treated
             // as a failure (the conversation FSM normally synthesizes
             // a cancellation result; we still classify it as failure
@@ -467,7 +487,10 @@ fn log_outcome(req: &CaptureRequest, outcome: &CaptureOutcome) {
                 "auto-capture disabled; skipping turn"
             );
         }
-        BelowThreshold { tool_calls, threshold } => {
+        BelowThreshold {
+            tool_calls,
+            threshold,
+        } => {
             tracing::debug!(
                 conversation_id = %req.conversation_id.as_str(),
                 tool_calls,
@@ -532,12 +555,12 @@ mod tests {
     use super::*;
     use crate::summarizer::{DraftSkillProposal, SummarizerOutput};
     use async_trait::async_trait;
+    use execlaw_core::Database;
     use execlaw_core::db::DbConfig;
     use execlaw_core::events::{EventLog, EventRecord};
     use execlaw_core::ids::{ConversationId, EventSeq};
     use execlaw_core::migrations::MigrationRunner;
     use execlaw_core::skills_config::{SkillsConfigStore, SkillsConfigUpdate};
-    use execlaw_core::Database;
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -599,7 +622,14 @@ mod tests {
         .unwrap();
     }
 
-    fn append_tool_use(log: &EventLog, cid: &ConversationId, seq: i64, ordinal: u32, name: &str, args: serde_json::Value) {
+    fn append_tool_use(
+        log: &EventLog,
+        cid: &ConversationId,
+        seq: i64,
+        ordinal: u32,
+        name: &str,
+        args: serde_json::Value,
+    ) {
         log.append(
             &EventRecord::new(
                 cid.clone(),
@@ -617,7 +647,13 @@ mod tests {
         .unwrap();
     }
 
-    fn append_tool_result(log: &EventLog, cid: &ConversationId, seq: i64, ordinal: u32, outcome: Result<serde_json::Value, String>) {
+    fn append_tool_result(
+        log: &EventLog,
+        cid: &ConversationId,
+        seq: i64,
+        ordinal: u32,
+        outcome: Result<serde_json::Value, String>,
+    ) {
         log.append(
             &EventRecord::new(
                 cid.clone(),
@@ -678,7 +714,10 @@ mod tests {
         let outcome = run(&db, &store, summ.clone(), &cid, 3).await;
         assert!(matches!(
             outcome,
-            CaptureOutcome::BelowThreshold { tool_calls: 1, threshold: 5 }
+            CaptureOutcome::BelowThreshold {
+                tool_calls: 1,
+                threshold: 5
+            }
         ));
         assert_eq!(summ.calls(), 0);
     }
@@ -711,7 +750,14 @@ mod tests {
         append_user(&log, &cid, 1, "scaffold a crate");
         for i in 0..3 {
             let s = 2 + i * 2;
-            append_tool_use(&log, &cid, s, i as u32, "shell", json!({"cmd": "cargo new"}));
+            append_tool_use(
+                &log,
+                &cid,
+                s,
+                i as u32,
+                "shell",
+                json!({"cmd": "cargo new"}),
+            );
             append_tool_result(&log, &cid, s + 1, i as u32, Ok(json!({"ok": true})));
         }
         let summ = Arc::new(MockSummarizer::new(SummarizerOutput::Draft(
@@ -732,7 +778,10 @@ mod tests {
         // Skill landed.
         let g = store.get("dev/scaffold").unwrap().unwrap();
         assert_eq!(g.source, "agent:test-run");
-        assert_eq!(g.current_version.body_md, "1. cargo new\n2. cd\n3. cargo check");
+        assert_eq!(
+            g.current_version.body_md,
+            "1. cargo new\n2. cd\n3. cargo check"
+        );
     }
 
     #[tokio::test]
@@ -814,7 +863,10 @@ mod tests {
             },
         )));
         let outcome = run(&db, &store, summ, &cid, 100).await;
-        assert!(matches!(outcome, CaptureOutcome::Blocked { .. }), "{outcome:?}");
+        assert!(
+            matches!(outcome, CaptureOutcome::Blocked { .. }),
+            "{outcome:?}"
+        );
         assert!(store.get("leak/sneaky").unwrap().is_none());
     }
 
@@ -857,7 +909,10 @@ mod tests {
             },
         )));
         let outcome = run(&db, &store, summ, &cid, 100).await;
-        assert!(matches!(outcome, CaptureOutcome::Conflict { .. }), "{outcome:?}");
+        assert!(
+            matches!(outcome, CaptureOutcome::Conflict { .. }),
+            "{outcome:?}"
+        );
         // Admin's row is unchanged.
         let g = store.get("x/dup").unwrap().unwrap();
         assert_eq!(g.current_version.body_md, "by admin");
@@ -1004,10 +1059,7 @@ mod tests {
         #[async_trait]
         impl SkillSummarizer for PanicOnceSummarizer {
             async fn summarize(&self, _p: SummarizerPrompt) -> Result<SummarizerOutput, String> {
-                let n = self
-                    .calls
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                    + 1;
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 if n == 1 {
                     panic!("simulated summarizer crash");
                 }

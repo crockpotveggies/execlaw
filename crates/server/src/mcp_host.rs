@@ -23,14 +23,10 @@
 
 use crate::tool_sync::default_mcp_classes_for;
 use dashmap::DashMap;
-use execlaw_core::mcp_servers::{
-    McpServerRow, McpServerStatus, McpServerStore, McpTransport,
-};
-use execlaw_core::tool_access::{ToolAccessSeed, ToolAccessStore, ToolSource};
 use execlaw_core::Database;
-use execlaw_mcp_client::{
-    McpClient, McpError, McpNotification, McpResult, McpTool, StdioSpec,
-};
+use execlaw_core::mcp_servers::{McpServerRow, McpServerStatus, McpServerStore, McpTransport};
+use execlaw_core::tool_access::{ToolAccessSeed, ToolAccessStore, ToolSource};
+use execlaw_mcp_client::{McpClient, McpError, McpNotification, McpResult, McpTool, StdioSpec};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
@@ -156,11 +152,7 @@ impl McpHost {
     /// the right server actor. Returns the raw JSON value of the
     /// `tools/call` result so the dispatch chain can hand it back as
     /// a tool_result payload.
-    pub async fn call_tool(
-        &self,
-        prefixed: &str,
-        args: Value,
-    ) -> Result<Value, String> {
+    pub async fn call_tool(&self, prefixed: &str, args: Value) -> Result<Value, String> {
         let (server_id, remote_name) = parse_prefixed_tool_name(prefixed)
             .ok_or_else(|| format!("not an MCP tool name: '{prefixed}'"))?;
         let handle = self
@@ -169,9 +161,10 @@ impl McpHost {
             .get(server_id)
             .map(|kv| kv.value().clone())
             .ok_or_else(|| format!("MCP server '{server_id}' not connected"))?;
-        let client = handle.client.lock().await.clone().ok_or_else(|| {
-            format!("MCP server '{server_id}' has no live connection right now")
-        })?;
+        let client =
+            handle.client.lock().await.clone().ok_or_else(|| {
+                format!("MCP server '{server_id}' has no live connection right now")
+            })?;
         let r = client
             .call_tool(remote_name, args)
             .await
@@ -220,8 +213,7 @@ async fn actor_loop(
             cwd: row.cwd.as_ref().map(std::path::PathBuf::from),
         };
         let connect_shutdown = Arc::new(Notify::new());
-        let client_result =
-            McpClient::stdio(&spec, connect_shutdown.clone()).await;
+        let client_result = McpClient::stdio(&spec, connect_shutdown.clone()).await;
         match client_result {
             Ok(client) => {
                 let client = Arc::new(client);

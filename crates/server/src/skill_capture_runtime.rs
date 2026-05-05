@@ -12,8 +12,8 @@
 //! inference client.
 
 use async_trait::async_trait;
-use execlaw_core::backends::BackendPurpose;
 use execlaw_core::Database;
+use execlaw_core::backends::BackendPurpose;
 use execlaw_inference_api::{ChatMessage, ChatRequest, ModelId};
 use execlaw_skills::{
     AutoCaptureSink, AutoCaptureWorker, SkillStore, SkillSummarizer, SummarizerOutput,
@@ -112,10 +112,7 @@ pub fn spawn_reuse_update_worker(
     skill_store: Arc<SkillStore>,
     inference: Arc<crate::inference_resolver::InferenceResolver>,
     model_id: ModelId,
-) -> (
-    execlaw_skills::ReuseUpdateSink,
-    tokio::task::JoinHandle<()>,
-) {
+) -> (execlaw_skills::ReuseUpdateSink, tokio::task::JoinHandle<()>) {
     let summarizer: Arc<dyn SkillSummarizer> =
         Arc::new(InferenceSummarizer::new(inference, db.clone(), model_id));
     let worker = Arc::new(execlaw_skills::ReuseUpdateWorker::new(

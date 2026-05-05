@@ -33,7 +33,7 @@ const DEFAULT_TIMEOUT_S: u64 = 20;
 /// rate-limit and surface a discriminating error so the caller
 /// knows the problem isn't an underspecified query.
 const DDG_ANOMALY_FINGERPRINTS: &[&str] = &[
-    "anomaly-modal",                     // CSS class on the modal
+    "anomaly-modal",                      // CSS class on the modal
     "Unfortunately, bots use DuckDuckGo", // intro copy
     "DDG-anomaly",                        // analytics tag
 ];
@@ -271,9 +271,7 @@ pub fn parse_ddg_html(html: &str, max_results: usize) -> Vec<SearchResult> {
             Some(h) => h,
             None => continue,
         };
-        let title = decode_entities(&squeeze_whitespace(
-            &link.text().collect::<String>(),
-        ));
+        let title = decode_entities(&squeeze_whitespace(&link.text().collect::<String>()));
         if title.is_empty() {
             continue;
         }
@@ -300,11 +298,7 @@ impl WebSearchApi for DuckDuckGoSearchApi {
     fn provider_id(&self) -> &str {
         "duckduckgo"
     }
-    async fn search(
-        &self,
-        query: &str,
-        max_results: u32,
-    ) -> Result<Vec<SearchResult>, ApiError> {
+    async fn search(&self, query: &str, max_results: u32) -> Result<Vec<SearchResult>, ApiError> {
         // Up to 2 attempts: the first hits the limiter once, and
         // if DDG serves the anomaly interstitial OR the parser
         // returns 0 results, we back off briefly and retry once
@@ -324,13 +318,7 @@ impl WebSearchApi for DuckDuckGoSearchApi {
             }
             self.rate_limit_gate().await;
             let body = [("q", query), ("kl", "us-en")];
-            let resp = match self
-                .client
-                .post(DDG_HTML_ENDPOINT)
-                .form(&body)
-                .send()
-                .await
-            {
+            let resp = match self.client.post(DDG_HTML_ENDPOINT).form(&body).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     last_err = Some(ApiError::Storage(format!("network: {e}")));
@@ -567,8 +555,14 @@ mod tests {
             unwrap_ddg_redirect("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com&rut=x"),
             "https://example.com"
         );
-        assert_eq!(unwrap_ddg_redirect("//example.com/foo"), "https://example.com/foo");
-        assert_eq!(unwrap_ddg_redirect("https://example.com"), "https://example.com");
+        assert_eq!(
+            unwrap_ddg_redirect("//example.com/foo"),
+            "https://example.com/foo"
+        );
+        assert_eq!(
+            unwrap_ddg_redirect("https://example.com"),
+            "https://example.com"
+        );
     }
 
     #[test]
@@ -590,10 +584,7 @@ mod tests {
 
     #[test]
     fn squeeze_whitespace_collapses_runs_of_indentation() {
-        assert_eq!(
-            squeeze_whitespace("  hello\n   world  \t\t"),
-            "hello world"
-        );
+        assert_eq!(squeeze_whitespace("  hello\n   world  \t\t"), "hello world");
         assert_eq!(squeeze_whitespace(""), "");
     }
 

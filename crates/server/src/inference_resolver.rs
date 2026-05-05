@@ -29,8 +29,8 @@
 //! Per-purpose routing for Small / Voice* lands when the runner
 //! grows modality-aware backend selection.
 
-use execlaw_core::backends::{BackendMode, BackendPurpose, BackendStore};
 use execlaw_core::Database;
+use execlaw_core::backends::{BackendMode, BackendPurpose, BackendStore};
 use execlaw_inference_api::InferenceClient;
 use std::sync::Arc;
 
@@ -63,18 +63,12 @@ impl InferenceResolver {
     ///     bootstrap fallback. External-mode rows that the operator
     ///     never finished configuring fall through to the global
     ///     URL, which is the pre-Phase-12 behaviour.
-    pub fn resolve(
-        &self,
-        db: &Database,
-        purpose: BackendPurpose,
-    ) -> Option<Arc<InferenceClient>> {
+    pub fn resolve(&self, db: &Database, purpose: BackendPurpose) -> Option<Arc<InferenceClient>> {
         let store = BackendStore::new(db);
         let row = store.get(purpose).ok().flatten();
         match row {
             Some(r) => match r.endpoint {
-                Some(url) if !url.trim().is_empty() => {
-                    Some(Arc::new(InferenceClient::new(url)))
-                }
+                Some(url) if !url.trim().is_empty() => Some(Arc::new(InferenceClient::new(url))),
                 _ => {
                     // No endpoint. Managed-mode rows surface as None
                     // so the operator sees "supervisor hasn't come
@@ -94,9 +88,9 @@ impl InferenceResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use execlaw_core::MigrationRunner;
     use execlaw_core::backends::{BackendStore, BackendUpsert};
     use execlaw_core::db::DbConfig;
-    use execlaw_core::MigrationRunner;
 
     fn fresh_db() -> Database {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
@@ -166,7 +160,12 @@ mod tests {
         // catches them. Pre-Phase-12 behaviour.
         let db = fresh_db();
         let store = BackendStore::new(&db);
-        upsert_row(&store, BackendPurpose::Standard, BackendMode::External, None);
+        upsert_row(
+            &store,
+            BackendPurpose::Standard,
+            BackendMode::External,
+            None,
+        );
         let bootstrap = Arc::new(InferenceClient::new("http://boot:8000/v1"));
         let resolver = InferenceResolver::new(Some(bootstrap));
         let got = resolver.resolve(&db, BackendPurpose::Standard).unwrap();

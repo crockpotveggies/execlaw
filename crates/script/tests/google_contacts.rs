@@ -76,8 +76,8 @@ fn load_script_against_mock(mock_url: &str) -> String {
     path.pop(); // crates/
     path.pop(); // workspace root
     path.push("plugins/google-contacts/main.rhai");
-    let original = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("could not read {path:?}: {e}"));
+    let original =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("could not read {path:?}: {e}"));
     original.replace(
         r#""https://people.googleapis.com/v1/people/me/connections""#,
         &format!(r#""{mock_url}/v1/people/me/connections""#),
@@ -134,7 +134,11 @@ async fn identity_resolve_matches_email_case_insensitive() {
     // Inbound handle has surrounding whitespace + uppercase chars
     // — the script's normalise path lowercases and trims.
     let r = plugin
-        .identity_resolve("email", "  ALICE@Example.COM  ", oauth_with_token("ya29.tok"))
+        .identity_resolve(
+            "email",
+            "  ALICE@Example.COM  ",
+            oauth_with_token("ya29.tok"),
+        )
         .await
         .unwrap();
     assert_eq!(r["match"]["display_name"], "Alice Smith");
@@ -196,11 +200,7 @@ async fn identity_resolve_returns_stable_principal_id_across_calls() {
         .await
         .unwrap();
     let r2 = plugin
-        .identity_resolve(
-            "phone",
-            "+1-555-123-4567",
-            oauth_with_token("ya29.tok"),
-        )
+        .identity_resolve("phone", "+1-555-123-4567", oauth_with_token("ya29.tok"))
         .await
         .unwrap();
     // Both lookups land on Alice; principal_id derives from

@@ -232,10 +232,7 @@ impl<'db> TransportBindingStore<'db> {
     /// isn't reliably on across our codebase.
     /// Returns the number of bindings actually removed (useful for
     /// the supervisor's audit log).
-    pub fn forget_principal_group(
-        &self,
-        principal_group_id: &str,
-    ) -> Result<usize, DbError> {
+    pub fn forget_principal_group(&self, principal_group_id: &str) -> Result<usize, DbError> {
         self.db.with_conn(|c| {
             let n = c.execute(
                 "DELETE FROM state_transport_bindings \
@@ -249,11 +246,7 @@ impl<'db> TransportBindingStore<'db> {
     /// Single-binding delete by natural key. Used when an operator
     /// manually unbinds a contact from a group via the admin UI.
     /// Returns true iff a row was actually removed.
-    pub fn delete_binding(
-        &self,
-        channel: &str,
-        foreign_id: &str,
-    ) -> Result<bool, DbError> {
+    pub fn delete_binding(&self, channel: &str, foreign_id: &str) -> Result<bool, DbError> {
         self.db.with_conn(|c| {
             let n = c.execute(
                 "DELETE FROM state_transport_bindings \
@@ -392,8 +385,12 @@ mod tests {
         // bindings.
         let db = fresh_db();
         let store = TransportBindingStore::new(&db);
-        store.insert_binding("signal", "j", "pg", false, 1_000).unwrap();
-        store.insert_binding("signal", "j", "pg", false, 9_999).unwrap();
+        store
+            .insert_binding("signal", "j", "pg", false, 1_000)
+            .unwrap();
+        store
+            .insert_binding("signal", "j", "pg", false, 9_999)
+            .unwrap();
         let row = store.bindings_for_group("pg", "signal").unwrap();
         assert_eq!(row[0].created_at, 1_000);
     }
@@ -472,9 +469,7 @@ mod tests {
         // was nothing here" (nothing to log).
         let db = fresh_db();
         let store = TransportBindingStore::new(&db);
-        let displaced = store
-            .repoint_binding("signal", "ghost", "pg-x", 1)
-            .unwrap();
+        let displaced = store.repoint_binding("signal", "ghost", "pg-x", 1).unwrap();
         assert!(displaced.is_none());
     }
 
@@ -482,7 +477,9 @@ mod tests {
     fn touch_binding_updates_last_seen_only() {
         let db = fresh_db();
         let store = TransportBindingStore::new(&db);
-        store.insert_binding("signal", "j", "pg", false, 1_000).unwrap();
+        store
+            .insert_binding("signal", "j", "pg", false, 1_000)
+            .unwrap();
         let n = store.touch_binding("signal", "j", 5_000).unwrap();
         assert_eq!(n, 1);
         let bindings = store.bindings_for_group("pg", "signal").unwrap();
@@ -585,12 +582,20 @@ mod tests {
         // the one the operator probably remembers).
         let db = fresh_db();
         let store = TransportBindingStore::new(&db);
-        store.insert_binding("signal", "first", "pg", false, 1).unwrap();
-        store.insert_binding("signal", "second", "pg", false, 2).unwrap();
-        store.insert_binding("signal", "third", "pg", false, 3).unwrap();
+        store
+            .insert_binding("signal", "first", "pg", false, 1)
+            .unwrap();
+        store
+            .insert_binding("signal", "second", "pg", false, 2)
+            .unwrap();
+        store
+            .insert_binding("signal", "third", "pg", false, 3)
+            .unwrap();
         let rows = store.bindings_for_group("pg", "signal").unwrap();
         assert_eq!(
-            rows.iter().map(|b| b.foreign_id.as_str()).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|b| b.foreign_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["first", "second", "third"],
         );
     }
@@ -603,8 +608,12 @@ mod tests {
         // alone, not stuck forever because last_seen_at is NULL.
         let db = fresh_db();
         let store = TransportBindingStore::new(&db);
-        store.insert_binding("signal", "old", "pg-1", false, 100).unwrap();
-        store.insert_binding("signal", "fresh", "pg-2", false, 5_000).unwrap();
+        store
+            .insert_binding("signal", "old", "pg-1", false, 100)
+            .unwrap();
+        store
+            .insert_binding("signal", "fresh", "pg-2", false, 5_000)
+            .unwrap();
         // insert_binding sets last_seen_at = now. Force NULL to
         // exercise the COALESCE branch directly.
         db.with_conn(|c| {
@@ -629,7 +638,9 @@ mod tests {
         // shouldn't pick it up.
         let db = fresh_db();
         let store = TransportBindingStore::new(&db);
-        store.insert_binding("signal", "fresh", "pg", false, 100).unwrap();
+        store
+            .insert_binding("signal", "fresh", "pg", false, 100)
+            .unwrap();
         store.touch_binding("signal", "fresh", 9_000).unwrap();
         let idle = store.list_idle_bindings("signal", 5_000).unwrap();
         assert!(idle.is_empty(), "fresh binding should not be idle");
@@ -642,7 +653,9 @@ mod tests {
         // used `<=` which would have reaped this row.
         let db = fresh_db();
         let store = TransportBindingStore::new(&db);
-        store.insert_binding("signal", "edge", "pg", false, 100).unwrap();
+        store
+            .insert_binding("signal", "edge", "pg", false, 100)
+            .unwrap();
         store.touch_binding("signal", "edge", 5_000).unwrap();
         let idle = store.list_idle_bindings("signal", 5_000).unwrap();
         assert!(

@@ -145,11 +145,14 @@ pub async fn run_synthesize(ctx: SynthesizeCtx) -> Result<SynthesizeOutcome, Syn
         tools: None,
         chat_template_kwargs: None,
     };
-    let adapter = execlaw_model_adapter::adapter_for(
-        execlaw_model_adapter::ModelFamily::detect(&model),
-    );
+    let adapter =
+        execlaw_model_adapter::adapter_for(execlaw_model_adapter::ModelFamily::detect(&model));
     let adapted = adapter
-        .chat(&inference, chat_req, execlaw_model_adapter::OutputHint::Markdown)
+        .chat(
+            &inference,
+            chat_req,
+            execlaw_model_adapter::OutputHint::Markdown,
+        )
         .await
         .map_err(|e| SynthesizeError::Inference(e.to_string()))?;
     let report_markdown = adapted.content;

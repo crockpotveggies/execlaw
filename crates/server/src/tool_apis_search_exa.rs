@@ -102,11 +102,7 @@ impl WebSearchApi for ExaSearchApi {
     fn provider_id(&self) -> &str {
         "exa"
     }
-    async fn search(
-        &self,
-        query: &str,
-        max_results: u32,
-    ) -> Result<Vec<SearchResult>, ApiError> {
+    async fn search(&self, query: &str, max_results: u32) -> Result<Vec<SearchResult>, ApiError> {
         if self.api_key.is_empty() {
             return Err(ApiError::Validation(
                 "Exa api_key is empty; configure it in Settings → Search".into(),
@@ -262,7 +258,10 @@ mod tests {
     fn snippet_from_text_collapses_whitespace_and_truncates_at_cap() {
         let s = "Hello\n\n  world  with    long whitespace runs and a tail beyond the cap";
         let out = snippet_from_text(s, 30);
-        assert!(out.chars().count() <= 31, "should respect cap (+ellipsis): {out}");
+        assert!(
+            out.chars().count() <= 31,
+            "should respect cap (+ellipsis): {out}"
+        );
         assert!(!out.contains("\n"), "should drop newlines: {out}");
         // Multiple spaces collapse.
         assert!(!out.contains("  "));

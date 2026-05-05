@@ -56,9 +56,7 @@ impl Spotlight {
     /// tiny-input bench (§0 axiom #14).
     pub fn wrap(&self, content: &str) -> String {
         let needs_strip = content.contains(&*self.open) || content.contains(&*self.close);
-        let mut out = String::with_capacity(
-            self.open.len() + self.close.len() + content.len() + 2,
-        );
+        let mut out = String::with_capacity(self.open.len() + self.close.len() + content.len() + 2);
         out.push_str(&self.open);
         out.push('\n');
         if needs_strip {

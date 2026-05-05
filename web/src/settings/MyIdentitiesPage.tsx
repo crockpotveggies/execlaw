@@ -15,6 +15,14 @@
 // (heading + add form + current-identifiers list); `MyIdentitiesPage`
 // stays exported as a thin wrapper so the existing route + tests
 // continue to work after the redirect lands.
+//
+// 2026-05-04 — transport dropdown is now sourced from
+// `GET /api/admin/me/transports` rather than a hardcoded list. The
+// previous hardcoded set listed transports the operator couldn't
+// actually use without first installing a plugin (Signal, email,
+// sms), which read as "this is broken" rather than "install the
+// plugin first." Now: built-in entries (web, voice) ship with the
+// platform; plugin transports populate as plugins are installed.
 
 import { useCallback, useEffect, useState } from "react";
 import Button from "react-bootstrap/Button";
@@ -22,20 +30,14 @@ import Form from "react-bootstrap/Form";
 import {
     addMyIdentifier,
     deleteMyIdentifier,
+    listAvailableTransports,
     listMyIdentifiers,
+    type AvailableTransportView,
     type IdentifierView,
     type MyIdentitiesResponse,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
-
-const TRANSPORT_HINTS = [
-    { value: "signal", label: "Signal", placeholder: "+15551234" },
-    { value: "email", label: "Email", placeholder: "you@example.com" },
-    { value: "sms", label: "SMS", placeholder: "+15551234" },
-    { value: "voice", label: "Voice", placeholder: "+15551234" },
-    { value: "web", label: "Web session", placeholder: "session-id" },
-];
 
 /// Thin wrapper kept so `/settings/my-identities` (now redirected
 /// from the Settings shell) and the existing test that mounts
@@ -55,15 +57,32 @@ export function MyIdentitiesCard() {
     const getToken = auth.getAccessToken;
 
     const [data, setData] = useState<MyIdentitiesResponse | null>(null);
+    const [transports, setTransports] = useState<AvailableTransportView[] | null>(
+        null,
+    );
     const [error, setError] = useState<string | null>(null);
-    const [transport, setTransport] = useState("signal");
+    const [transport, setTransport] = useState("");
     const [handle, setHandle] = useState("");
     const [busy, setBusy] = useState(false);
 
     const refresh = useCallback(async () => {
         try {
-            const r = await listMyIdentifiers(getToken);
-            setData(r);
+            // Fetch identifiers + available transports in parallel —
+            // they're independent reads and the dropdown should
+            // render the moment either resolves.
+            const [ids, ts] = await Promise.all([
+                listMyIdentifiers(getToken),
+                listAvailableTransports(getToken),
+            ]);
+            setData(ids);
+            setTransports(ts.transports);
+            // Default the dropdown to the first transport once the
+            // list is known. Without this, the dropdown's value
+            // would stay the empty string and the operator's first
+            // Add click would 400 on missing transport.
+            setTransport((prev) =>
+                prev !== "" || ts.transports.length === 0 ? prev : ts.transports[0].id,
+            );
             setError(null);
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e));
@@ -116,7 +135,7 @@ export function MyIdentitiesCard() {
     );
 
     const placeholder =
-        TRANSPORT_HINTS.find((t) => t.value === transport)?.placeholder ??
+        transports?.find((t) => t.id === transport)?.handle_placeholder ??
         "handle";
 
     return (
@@ -149,12 +168,25 @@ export function MyIdentitiesCard() {
                         onChange={(e) => setTransport(e.target.value)}
                         data-testid="my-identities-transport"
                         style={{ minWidth: "10rem" }}
+                        disabled={
+                            transports === null || transports.length === 0
+                        }
                     >
-                        {TRANSPORT_HINTS.map((t) => (
-                            <option key={t.value} value={t.value}>
-                                {t.label}
-                            </option>
-                        ))}
+                        {transports === null ? (
+                            <option value="">Loading…</option>
+                        ) : transports.length === 0 ? (
+                            <option value="">No transports available</option>
+                        ) : (
+                            transports.map((t) => (
+                                <option
+                                    key={t.id}
+                                    value={t.id}
+                                    data-plugin-id={t.plugin_id ?? ""}
+                                >
+                                    {t.label}
+                                </option>
+                            ))
+                        )}
                     </Form.Select>
                 </Form.Group>
                 <Form.Group className="flex-grow-1" controlId="ident-handle">
@@ -171,12 +203,24 @@ export function MyIdentitiesCard() {
                     variant="primary"
                     size="sm"
                     onClick={() => void onAdd()}
-                    disabled={busy || handle.trim() === ""}
+                    disabled={
+                        busy || handle.trim() === "" || transport === ""
+                    }
                     data-testid="my-identities-add"
                 >
                     Add
                 </Button>
             </div>
+            {transports !== null && transports.length === 0 && (
+                <div
+                    className="execlaw-muted small mb-3"
+                    data-testid="my-identities-no-transports"
+                >
+                    No transports available. Install a transport plugin
+                    (e.g. Signal) under <strong>Settings → Plugins</strong>{" "}
+                    to populate this dropdown.
+                </div>
+            )}
 
             <div className="execlaw-muted small mb-2">
                 Current identifiers

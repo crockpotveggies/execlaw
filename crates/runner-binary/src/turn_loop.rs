@@ -19,18 +19,16 @@
 use crate::connect::ConnectionTx;
 use anyhow::{Context, Result, anyhow};
 use execlaw_inference_api::{
-    ChatMessage, ChatRequest, ChatStreamChoice, InferenceClient, ModelId, Role,
-    ToolCall, ToolCallFunction, ToolCallDelta,
+    ChatMessage, ChatRequest, ChatStreamChoice, InferenceClient, ModelId, Role, ToolCall,
+    ToolCallDelta, ToolCallFunction,
 };
-use execlaw_runner_protocol::{
-    RunnerToServer, ToolCallResult, ToolOutcome, TurnRequest,
-};
+use execlaw_runner_protocol::{RunnerToServer, ToolCallResult, ToolOutcome, TurnRequest};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 /// One cancel flag per in-flight `turn_id`. Main loop sets the flag
 /// when it sees `CancelTurn`; the running turn task polls between
@@ -217,10 +215,8 @@ pub async fn run_turn(
             // remembers any reasoning it emitted alongside the
             // call. tool_calls carries the structured calls the
             // model produced.
-            let assistant_calls: Vec<ToolCall> = tool_calls
-                .iter()
-                .map(ToolCallAcc::finalize)
-                .collect();
+            let assistant_calls: Vec<ToolCall> =
+                tool_calls.iter().map(ToolCallAcc::finalize).collect();
             messages.push(ChatMessage {
                 role: Role::Assistant,
                 content: if text_acc.is_empty() {

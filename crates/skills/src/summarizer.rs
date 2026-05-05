@@ -104,7 +104,11 @@ pub fn build_prompt(prompt: &SummarizerPrompt) -> (String, String) {
         user.push_str("  args: ");
         user.push_str(&compact_json(&step.args_json));
         user.push('\n');
-        user.push_str(if step.outcome_ok { "  ok:   " } else { "  err:  " });
+        user.push_str(if step.outcome_ok {
+            "  ok:   "
+        } else {
+            "  err:  "
+        });
         user.push_str(&compact_json(&step.result_json));
         user.push_str("\n\n");
     }
@@ -187,7 +191,11 @@ pub fn build_improvement_prompt(
         user.push_str("  args: ");
         user.push_str(&compact_json(&step.args_json));
         user.push('\n');
-        user.push_str(if step.outcome_ok { "  ok:   " } else { "  err:  " });
+        user.push_str(if step.outcome_ok {
+            "  ok:   "
+        } else {
+            "  err:  "
+        });
         user.push_str(&compact_json(&step.result_json));
         user.push_str("\n\n");
     }
@@ -275,11 +283,7 @@ pub fn parse_response(reply: &str) -> SummarizerOutput {
     }
 
     if let Some(b) = body_section {
-        let trimmed = b
-            .trim()
-            .trim_end_matches("---END---")
-            .trim()
-            .to_string();
+        let trimmed = b.trim().trim_end_matches("---END---").trim().to_string();
         if !trimmed.is_empty() {
             body = Some(trimmed);
         }
@@ -472,9 +476,8 @@ body without end marker";
 
     #[test]
     fn parser_returns_skip_for_freeform_prose() {
-        let out = parse_response(
-            "Sure! Based on the trajectory I think this would be a great skill...",
-        );
+        let out =
+            parse_response("Sure! Based on the trajectory I think this would be a great skill...");
         assert!(matches!(out, SummarizerOutput::Skip { .. }));
     }
 

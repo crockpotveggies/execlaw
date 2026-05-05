@@ -169,10 +169,7 @@ fn commit_card_event<T: serde::Serialize>(
     // seqs. We always commit exactly one card event per call, so
     // grab the last seq (defensive against future tool-pairing
     // synthesis prepending cancellation results before our event).
-    let seq = written
-        .last()
-        .map(|e| e.seq.0)
-        .unwrap_or(base_seq.0 + 1);
+    let seq = written.last().map(|e| e.seq.0).unwrap_or(base_seq.0 + 1);
     Ok(seq)
 }
 
@@ -198,8 +195,7 @@ pub fn project_cards_for_conversation(
     // the log; we materialise to a Vec at the end and sort by
     // opened_at so the SPA's chronological render matches the live
     // bus ordering.
-    let mut by_id: std::collections::HashMap<String, Card> =
-        std::collections::HashMap::new();
+    let mut by_id: std::collections::HashMap<String, Card> = std::collections::HashMap::new();
     for ev in events {
         let ev_seq = ev.seq.0;
         let (card_id, card_event) = match ev.kind {
@@ -232,8 +228,7 @@ pub fn project_cards_for_conversation(
         // NOT updated on CardProgressed (intermediate Gather/
         // Synth ticks would otherwise pop the card on every
         // sub-query, which is too noisy).
-        let bumps_surface_seq =
-            matches!(card_event, CardEvent::Opened(..) | CardEvent::Closed(..));
+        let bumps_surface_seq = matches!(card_event, CardEvent::Opened(..) | CardEvent::Closed(..));
         if let Some(c) = by_id.get_mut(&card_id) {
             c.apply(&card_event);
             if bumps_surface_seq {
@@ -254,7 +249,11 @@ pub fn project_cards_for_conversation(
     // in the same tick (the runner often emits CardOpened back-
     // to-back during a single phase) would otherwise return in
     // non-deterministic HashMap iteration order.
-    out.sort_by(|a, b| a.opened_at.cmp(&b.opened_at).then_with(|| a.card_id.cmp(&b.card_id)));
+    out.sort_by(|a, b| {
+        a.opened_at
+            .cmp(&b.opened_at)
+            .then_with(|| a.card_id.cmp(&b.card_id))
+    });
     Ok(out)
 }
 
@@ -298,8 +297,10 @@ pub fn project_card(
         };
         match (&mut card, &card_event) {
             (None, CardEvent::Opened(..)) => {
-                card = Card::from_opened(cid.as_str(), &card_event)
-                    .map(|mut c| { c.event_seq = Some(ev_seq); c });
+                card = Card::from_opened(cid.as_str(), &card_event).map(|mut c| {
+                    c.event_seq = Some(ev_seq);
+                    c
+                });
             }
             (Some(c), _) => {
                 c.apply(&card_event);
@@ -744,7 +745,9 @@ mod tests {
         )
         .unwrap();
         let after_open = project_cards_for_conversation(&db, &cid).unwrap();
-        let open_seq = after_open[0].event_seq.expect("event_seq populated on open");
+        let open_seq = after_open[0]
+            .event_seq
+            .expect("event_seq populated on open");
         assert!(open_seq > 0);
 
         // Progressed — must NOT bump.

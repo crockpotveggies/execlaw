@@ -26,12 +26,12 @@
 use crate::auth_extract::AuthedUser;
 use crate::routes::ApiError;
 use crate::state::AppState;
+use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, post};
-use axum::Router;
-use execlaw_container_manager::{detect, GpuDevice};
+use execlaw_container_manager::{GpuDevice, detect};
 use execlaw_core::audit::AuditStore;
 use execlaw_core::general_settings::GeneralSettingsStore;
 use serde::Serialize;
@@ -116,8 +116,9 @@ fn detect_disk_free() -> (Option<u64>, Option<String>) {
     // EXECLAW_HF_CACHE wins; otherwise `<data_dir>/hf-cache`.
     let path = match std::env::var("EXECLAW_HF_CACHE") {
         Ok(p) => Some(std::path::PathBuf::from(p)),
-        Err(_) => directories::ProjectDirs::from("", "", "execlaw")
-            .map(|d| d.data_dir().join("hf-cache")),
+        Err(_) => {
+            directories::ProjectDirs::from("", "", "execlaw").map(|d| d.data_dir().join("hf-cache"))
+        }
     };
     let Some(path) = path else {
         return (None, None);
@@ -256,7 +257,7 @@ mod tests {
     use super::*;
     use crate::routes::{build_router, test_app_state};
     use axum::body::{self, Body};
-    use axum::http::{header, Method, Request, StatusCode};
+    use axum::http::{Method, Request, StatusCode, header};
     use tower::ServiceExt;
 
     async fn setup_controller_token(app: &axum::Router) -> String {
@@ -312,8 +313,7 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert!(
-            resp.status() == StatusCode::UNAUTHORIZED
-                || resp.status() == StatusCode::FORBIDDEN,
+            resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN,
             "expected 401/403, got {}",
             resp.status()
         );
@@ -351,7 +351,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         // Store carries the timestamp.
-        assert!(GeneralSettingsStore::new(&state.db).wizard_dismissed().unwrap());
+        assert!(
+            GeneralSettingsStore::new(&state.db)
+                .wizard_dismissed()
+                .unwrap()
+        );
 
         // Ping now says pong.
         let resp = app
@@ -377,8 +381,7 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert!(
-            resp.status() == StatusCode::UNAUTHORIZED
-                || resp.status() == StatusCode::FORBIDDEN,
+            resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN,
             "expected 401/403, got {}",
             resp.status()
         );
@@ -416,7 +419,10 @@ mod tests {
             // Sanity: a real probe on a dev host should return more
             // than 1 KB. If we get exactly 0, the fs4 probe lied or
             // the volume is genuinely full — either way worth a warn.
-            assert!(b > 0, "disk_free_bytes should be positive on a working host");
+            assert!(
+                b > 0,
+                "disk_free_bytes should be positive on a working host"
+            );
         }
     }
 

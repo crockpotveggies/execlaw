@@ -140,24 +140,25 @@ pub async fn list_clients_handler(
 ) -> Result<Json<OauthClientsResponse>, ApiError> {
     require_controller(&state, &user)?;
     let db = state.db.clone();
-    let clients = tokio::task::spawn_blocking(move || -> Result<Vec<OauthClientView>, OauthError> {
-        let cs = OauthClientStore::new(&db);
-        let ts = OauthTokenStore::new(&db);
-        let rows = list_all_clients(&db)?;
-        let mut out = Vec::with_capacity(rows.len());
-        for c in rows {
-            let toks = ts.get(&c.plugin_id, &c.account_name)?;
-            out.push(client_view(&c, toks.as_ref()));
-        }
-        let _ = cs;
-        Ok(out)
-    })
-    .await
-    .map_err(|e| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        code: "join",
-        message: e.to_string(),
-    })??;
+    let clients =
+        tokio::task::spawn_blocking(move || -> Result<Vec<OauthClientView>, OauthError> {
+            let cs = OauthClientStore::new(&db);
+            let ts = OauthTokenStore::new(&db);
+            let rows = list_all_clients(&db)?;
+            let mut out = Vec::with_capacity(rows.len());
+            for c in rows {
+                let toks = ts.get(&c.plugin_id, &c.account_name)?;
+                out.push(client_view(&c, toks.as_ref()));
+            }
+            let _ = cs;
+            Ok(out)
+        })
+        .await
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "join",
+            message: e.to_string(),
+        })??;
     Ok(Json(OauthClientsResponse { clients }))
 }
 
@@ -296,8 +297,7 @@ pub async fn connect_handler(
     // without escaping.
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
-    let state_token =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let state_token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
     let now = chrono::Utc::now().timestamp();
     OauthPendingStore::new(&state.db).insert(&OauthPending {
         state_token: state_token.clone(),
@@ -594,10 +594,7 @@ pub fn oauth_admin_router() -> Router<AppState> {
             "/api/admin/oauth/clients/{plugin_id}/{account_name}/disconnect",
             post(disconnect_handler),
         )
-        .route(
-            "/api/oauth/{provider}/callback",
-            get(callback_handler),
-        )
+        .route("/api/oauth/{provider}/callback", get(callback_handler))
 }
 
 #[cfg(test)]
@@ -857,7 +854,17 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         // Client config is still there; tokens are gone.
-        assert!(OauthClientStore::new(&state.db).get("p", "a").unwrap().is_some());
-        assert!(OauthTokenStore::new(&state.db).get("p", "a").unwrap().is_none());
+        assert!(
+            OauthClientStore::new(&state.db)
+                .get("p", "a")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            OauthTokenStore::new(&state.db)
+                .get("p", "a")
+                .unwrap()
+                .is_none()
+        );
     }
 }

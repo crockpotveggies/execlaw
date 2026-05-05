@@ -286,7 +286,12 @@ mod tests {
         let store = ToolAccessStore::new(&db);
         store
             .upsert_seen(
-                &seed("set_thread_name", ToolSource::Builtin, None, &["Controller", "KnownTrusted"]),
+                &seed(
+                    "set_thread_name",
+                    ToolSource::Builtin,
+                    None,
+                    &["Controller", "KnownTrusted"],
+                ),
                 100,
             )
             .unwrap();
@@ -304,7 +309,12 @@ mod tests {
         let store = ToolAccessStore::new(&db);
         store
             .upsert_seen(
-                &seed("create_pr", ToolSource::Mcp, Some("github"), &["Controller"]),
+                &seed(
+                    "create_pr",
+                    ToolSource::Mcp,
+                    Some("github"),
+                    &["Controller"],
+                ),
                 100,
             )
             .unwrap();
@@ -319,7 +329,12 @@ mod tests {
         // Source resyncs (e.g. MCP server reconnect) — must NOT overwrite.
         store
             .upsert_seen(
-                &seed("create_pr", ToolSource::Mcp, Some("github"), &["Controller"]),
+                &seed(
+                    "create_pr",
+                    ToolSource::Mcp,
+                    Some("github"),
+                    &["Controller"],
+                ),
                 200,
             )
             .unwrap();
@@ -327,7 +342,10 @@ mod tests {
         assert_eq!(row.allowed_classes, vec!["Controller", "KnownTrusted"]);
         // last_seen_at advances even though the policy didn't.
         assert_eq!(row.last_seen_at, 200);
-        assert_eq!(row.first_seen_at, 100, "first_seen must NOT shift on resync");
+        assert_eq!(
+            row.first_seen_at, 100,
+            "first_seen must NOT shift on resync"
+        );
     }
 
     #[test]
@@ -341,7 +359,14 @@ mod tests {
             )
             .unwrap();
         assert!(store.mark_removed("flaky_tool", 150).unwrap());
-        assert!(store.get("flaky_tool").unwrap().unwrap().removed_at.is_some());
+        assert!(
+            store
+                .get("flaky_tool")
+                .unwrap()
+                .unwrap()
+                .removed_at
+                .is_some()
+        );
         // Source resync brings it back.
         store
             .upsert_seen(
@@ -349,7 +374,14 @@ mod tests {
                 200,
             )
             .unwrap();
-        assert!(store.get("flaky_tool").unwrap().unwrap().removed_at.is_none());
+        assert!(
+            store
+                .get("flaky_tool")
+                .unwrap()
+                .unwrap()
+                .removed_at
+                .is_none()
+        );
     }
 
     #[test]
@@ -406,7 +438,12 @@ mod tests {
             .unwrap();
         assert_eq!(removed, 2);
         // Survivors: p2 plugin tool + builtin.
-        let names: Vec<_> = store.list_all().unwrap().into_iter().map(|r| r.tool_name).collect();
+        let names: Vec<_> = store
+            .list_all()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.tool_name)
+            .collect();
         assert_eq!(names, vec!["t4", "t3"]);
     }
 

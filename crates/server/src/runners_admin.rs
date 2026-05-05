@@ -14,11 +14,11 @@
 use crate::auth_extract::AuthedUser;
 use crate::routes::ApiError;
 use crate::state::AppState;
+use axum::Router;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, post};
-use axum::Router;
 
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct GroupRunnerView {
@@ -125,7 +125,10 @@ pub async fn restart_group_handler(
     // boot wires it) handles the kill. Volume is PRESERVED — that's
     // the contract for OperatorRestart.
     let _ = supervisor
-        .reap_group(&group_id, execlaw_runner_protocol::ShutdownReason::OperatorRestart)
+        .reap_group(
+            &group_id,
+            execlaw_runner_protocol::ShutdownReason::OperatorRestart,
+        )
         .await;
     let _ = execlaw_core::audit::AuditStore::new(&state.db).insert(
         &user.user_id,
@@ -180,7 +183,10 @@ pub async fn wipe_group_handler(
     // sends the right Shutdown reason; the cli's reaper picks it
     // up + does the kill + volume rm.
     let _ = supervisor
-        .reap_group(&group_id, execlaw_runner_protocol::ShutdownReason::OperatorWipe)
+        .reap_group(
+            &group_id,
+            execlaw_runner_protocol::ShutdownReason::OperatorWipe,
+        )
         .await;
     let _ = execlaw_core::audit::AuditStore::new(&state.db).insert(
         &user.user_id,
@@ -273,7 +279,9 @@ mod tests {
             crate::runner_supervisor::RunnerSupervisor::new(state.db.clone(), state.events.clone());
         // Seed one runner via the public auth path.
         let (sec, _) = supervisor.register_pending_spawn("g-test");
-        let _ = supervisor.accept_registration("g-test", &sec, true).unwrap();
+        let _ = supervisor
+            .accept_registration("g-test", &sec, true)
+            .unwrap();
         state.runner_supervisor = Some(supervisor);
 
         let app = build_router(state);
@@ -297,12 +305,10 @@ mod tests {
     #[tokio::test]
     async fn restart_group_returns_404_when_unknown() {
         let mut state = test_app_state();
-        state.runner_supervisor = Some(
-            crate::runner_supervisor::RunnerSupervisor::new(
-                state.db.clone(),
-                state.events.clone(),
-            ),
-        );
+        state.runner_supervisor = Some(crate::runner_supervisor::RunnerSupervisor::new(
+            state.db.clone(),
+            state.events.clone(),
+        ));
         let app = build_router(state);
         let tok = setup_token(&app).await;
         let req = Request::builder()

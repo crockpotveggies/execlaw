@@ -257,9 +257,11 @@ impl HfDownloader {
                 .run_download(&model_id_for_task, tx.clone(), started)
                 .await
             {
-                let _ = tx.send(DownloadEvent::Failed {
-                    error: e.to_string(),
-                }).await;
+                let _ = tx
+                    .send(DownloadEvent::Failed {
+                        error: e.to_string(),
+                    })
+                    .await;
             }
         });
         Ok(DownloadStream {
@@ -406,30 +408,21 @@ impl HfDownloader {
         Ok(())
     }
 
-    async fn resolve_revision(
-        &self,
-        model_id: &str,
-        revision: &str,
-    ) -> Result<String, HfError> {
+    async fn resolve_revision(&self, model_id: &str, revision: &str) -> Result<String, HfError> {
         // The HF API returns a 200 with a JSON payload that
         // includes `sha`. We use that as the revision id.
         #[derive(Deserialize)]
         struct RevisionResponse {
             sha: String,
         }
-        let url = format!(
-            "https://huggingface.co/api/models/{model_id}/revision/{revision}"
-        );
+        let url = format!("https://huggingface.co/api/models/{model_id}/revision/{revision}");
         let mut req = self.inner.http.get(&url);
         if let Some(t) = &self.inner.token {
             req = req.bearer_auth(t);
         }
         let resp = req.send().await?;
         if !resp.status().is_success() {
-            return Err(HfError::Api(format!(
-                "GET {url} → {}",
-                resp.status()
-            )));
+            return Err(HfError::Api(format!("GET {url} → {}", resp.status())));
         }
         let body: RevisionResponse = resp.json().await?;
         Ok(body.sha)
@@ -452,19 +445,15 @@ impl HfDownloader {
             path: String,
             size: Option<u64>,
         }
-        let url = format!(
-            "https://huggingface.co/api/models/{model_id}/tree/{revision}?recursive=true"
-        );
+        let url =
+            format!("https://huggingface.co/api/models/{model_id}/tree/{revision}?recursive=true");
         let mut req = self.inner.http.get(&url);
         if let Some(t) = &self.inner.token {
             req = req.bearer_auth(t);
         }
         let resp = req.send().await?;
         if !resp.status().is_success() {
-            return Err(HfError::Api(format!(
-                "GET {url} → {}",
-                resp.status()
-            )));
+            return Err(HfError::Api(format!("GET {url} → {}", resp.status())));
         }
         let entries: Vec<TreeEntry> = resp.json().await?;
         Ok(entries
@@ -534,19 +523,14 @@ impl HfDownloader {
     ) -> Result<u64, HfError> {
         // HF resolves LFS files via `/resolve/<rev>/<path>` redirects;
         // reqwest follows them automatically.
-        let url = format!(
-            "https://huggingface.co/{model_id}/resolve/{revision}/{rel_path}"
-        );
+        let url = format!("https://huggingface.co/{model_id}/resolve/{revision}/{rel_path}");
         let mut req = self.inner.http.get(&url);
         if let Some(t) = &self.inner.token {
             req = req.bearer_auth(t);
         }
         let mut resp = req.send().await?;
         if !resp.status().is_success() {
-            return Err(HfError::Http(format!(
-                "GET {url} → {}",
-                resp.status()
-            )));
+            return Err(HfError::Http(format!("GET {url} → {}", resp.status())));
         }
         // Stream into a temp file alongside the dest so a crash
         // mid-download doesn't leave a half-written final path.
@@ -700,7 +684,10 @@ mod tests {
             repo_dir_name("Qwen/Qwen2.5-7B-Instruct-AWQ"),
             "models--Qwen--Qwen2.5-7B-Instruct-AWQ"
         );
-        assert_eq!(repo_dir_name("bert-base-uncased"), "models--bert-base-uncased");
+        assert_eq!(
+            repo_dir_name("bert-base-uncased"),
+            "models--bert-base-uncased"
+        );
     }
 
     #[test]

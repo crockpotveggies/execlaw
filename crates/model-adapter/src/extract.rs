@@ -16,8 +16,7 @@ use regex::Regex;
 /// continue to use `crate::think_filter::ThinkBlockFilter` (in
 /// `execlaw-server`) which tracks state across chunks.
 pub fn split_think_block(s: &str) -> (Option<String>, String) {
-    static THINK: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"(?s)<think>(.*?)</think>").unwrap());
+    static THINK: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)<think>(.*?)</think>").unwrap());
     let mut reasoning_parts: Vec<String> = Vec::new();
     let mut visible = String::with_capacity(s.len());
     let mut last = 0usize;
@@ -64,7 +63,12 @@ pub fn strip_thinking_process_preamble(s: &str) -> String {
     // phrase mid-prose.
     if start > 0 {
         let before = &s[..start];
-        if !before.chars().rev().take_while(|c| *c != '\n').all(|c| c.is_whitespace()) {
+        if !before
+            .chars()
+            .rev()
+            .take_while(|c| *c != '\n')
+            .all(|c| c.is_whitespace())
+        {
             return s.to_string();
         }
     }
@@ -94,7 +98,9 @@ pub fn strip_code_fences(s: &str) -> String {
     let mut working = trimmed.to_string();
     // Common leading fences. `\n`-prefix variants caught by the
     // trim above; case-insensitive lang hint normalized to lowercase.
-    for prefix in ["```json", "```JSON", "```Json", "```yaml", "```YAML", "```text", "```"] {
+    for prefix in [
+        "```json", "```JSON", "```Json", "```yaml", "```YAML", "```text", "```",
+    ] {
         if let Some(rest) = working.strip_prefix(prefix) {
             working = rest.trim_start().to_string();
             break;
@@ -181,9 +187,8 @@ mod tests {
 
     #[test]
     fn split_think_block_handles_multiple_blocks() {
-        let (r, v) = split_think_block(
-            "<think>step 1</think>visible<think>step 2</think>more visible",
-        );
+        let (r, v) =
+            split_think_block("<think>step 1</think>visible<think>step 2</think>more visible");
         assert_eq!(r.as_deref(), Some("step 1\n\nstep 2"));
         assert_eq!(v, "visiblemore visible");
     }

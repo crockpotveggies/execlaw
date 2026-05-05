@@ -32,6 +32,26 @@ function listResponse(
     );
 }
 
+interface TransportFixture {
+    id: string;
+    label: string;
+    plugin_id?: string;
+    handle_placeholder: string;
+}
+
+const DEFAULT_TRANSPORTS: TransportFixture[] = [
+    {
+        id: "signal",
+        label: "Signal",
+        plugin_id: "signal",
+        handle_placeholder: "+15551234",
+    },
+];
+
+function transportsResponse(transports: TransportFixture[] = DEFAULT_TRANSPORTS) {
+    return new Response(JSON.stringify({ transports }), { status: 200 });
+}
+
 function mountPage() {
     return render(
         <AuthProvider>
@@ -56,6 +76,7 @@ describe("MyIdentitiesPage", () => {
         fetchMock.mockImplementation(async (url: string) => {
             if (url === "/api/admin/me") return meResponse();
             if (url === "/api/admin/me/identifiers") return listResponse([]);
+            if (url === "/api/admin/me/transports") return transportsResponse();
             return new Response("{}", { status: 200 });
         });
         mountPage();
@@ -72,6 +93,7 @@ describe("MyIdentitiesPage", () => {
         fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
             calls.push({ url, init });
             if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/me/transports") return transportsResponse();
             if (
                 url === "/api/admin/me/identifiers" &&
                 init?.method === "POST"
@@ -96,6 +118,8 @@ describe("MyIdentitiesPage", () => {
                 screen.getByTestId("my-identities-empty"),
             ).toBeInTheDocument();
         });
+        // Signal is the default — only entry in the list now that
+        // built-ins are gone.
         fireEvent.change(screen.getByTestId("my-identities-handle"), {
             target: { value: "+15551234" },
         });
@@ -120,9 +144,9 @@ describe("MyIdentitiesPage", () => {
         let deleted = false;
         fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
             if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/me/transports") return transportsResponse();
             if (
-                url ===
-                    "/api/admin/me/identifiers/signal/%2B15551234" &&
+                url === "/api/admin/me/identifiers/signal/%2B15551234" &&
                 init?.method === "DELETE"
             ) {
                 deleted = true;
@@ -148,5 +172,110 @@ describe("MyIdentitiesPage", () => {
             ).toBeInTheDocument();
         });
         confirmSpy.mockRestore();
+    });
+
+    // --- Dynamic transport list (2026-05-04) ----------------------
+
+    it("populates dropdown options from /api/admin/me/transports", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/me/identifiers") return listResponse([]);
+            if (url === "/api/admin/me/transports") {
+                return transportsResponse([
+                    {
+                        id: "signal",
+                        label: "Signal",
+                        plugin_id: "signal",
+                        handle_placeholder: "+15551234",
+                    },
+                    {
+                        id: "whatsapp",
+                        label: "Whatsapp",
+                        plugin_id: "whatsapp",
+                        handle_placeholder: "+15551234",
+                    },
+                ]);
+            }
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("my-identities-empty"),
+            ).toBeInTheDocument();
+        });
+        const select = screen.getByTestId(
+            "my-identities-transport",
+        ) as HTMLSelectElement;
+        const opts = Array.from(select.options).map((o) => o.value);
+        expect(opts).toEqual(["signal", "whatsapp"]);
+        // No "(built-in)" chip — every entry is plugin-sourced now
+        // that built-ins were retired.
+        for (const opt of select.options) {
+            expect(opt.textContent).not.toContain("(built-in)");
+        }
+    });
+
+    it("shows a no-transports hint when the registry is empty", async () => {
+        // Simulates a fresh install before any plugin lands AND
+        // before the built-in fallback is wired — pure-empty case.
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/me/identifiers") return listResponse([]);
+            if (url === "/api/admin/me/transports") {
+                return transportsResponse([]);
+            }
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("my-identities-no-transports"),
+            ).toBeInTheDocument();
+        });
+        const select = screen.getByTestId(
+            "my-identities-transport",
+        ) as HTMLSelectElement;
+        expect(select.disabled).toBe(true);
+        const addBtn = screen.getByTestId("my-identities-add");
+        expect((addBtn as HTMLButtonElement).disabled).toBe(true);
+    });
+
+    it("uses the transport's handle_placeholder as the input hint", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/me/identifiers") return listResponse([]);
+            if (url === "/api/admin/me/transports") {
+                return transportsResponse([
+                    {
+                        id: "signal",
+                        label: "Signal",
+                        plugin_id: "signal",
+                        handle_placeholder: "+15551234",
+                    },
+                    {
+                        id: "email",
+                        label: "Email",
+                        plugin_id: "email-plugin",
+                        handle_placeholder: "you@example.com",
+                    },
+                ]);
+            }
+            return new Response("{}", { status: 200 });
+        });
+        mountPage();
+        const handle = await waitFor(() =>
+            screen.getByTestId("my-identities-handle"),
+        );
+        // First entry is signal — placeholder is the phone shape.
+        expect((handle as HTMLInputElement).placeholder).toBe("+15551234");
+        fireEvent.change(screen.getByTestId("my-identities-transport"), {
+            target: { value: "email" },
+        });
+        await waitFor(() => {
+            expect((handle as HTMLInputElement).placeholder).toBe(
+                "you@example.com",
+            );
+        });
     });
 });

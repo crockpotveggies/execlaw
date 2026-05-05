@@ -9,7 +9,7 @@
 //! sampling requests.
 
 use crate::error::{McpError, McpResult};
-use crate::protocol::{InboundFrame, RpcRequest, RpcNotification};
+use crate::protocol::{InboundFrame, RpcNotification, RpcRequest};
 use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -114,7 +114,11 @@ impl StdioTransport {
     /// Read one frame. Returns `None` on EOF (server exited cleanly).
     pub async fn read_frame(&mut self) -> McpResult<Option<InboundFrame>> {
         let mut line = String::new();
-        let n = self.stdout.read_line(&mut line).await.map_err(McpError::Io)?;
+        let n = self
+            .stdout
+            .read_line(&mut line)
+            .await
+            .map_err(McpError::Io)?;
         if n == 0 {
             return Ok(None);
         }
@@ -139,11 +143,8 @@ impl StdioTransport {
     /// the child ignores us.
     pub async fn shutdown(mut self) -> McpResult<()> {
         let _ = self.stdin.shutdown().await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            self.child.wait(),
-        )
-        .await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_millis(500), self.child.wait()).await;
         Ok(())
     }
 }

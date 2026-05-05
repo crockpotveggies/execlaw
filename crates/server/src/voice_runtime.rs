@@ -68,10 +68,8 @@ pub struct VoiceSessionState {
 /// session without having to bake in reqwest. Production wires them
 /// to the real `WhisperClient::new` / `KokoroClient::new`; tests
 /// inject mocks.
-pub type SttFactory =
-    Arc<dyn Fn() -> Box<dyn SttClient> + Send + Sync>;
-pub type TtsFactory =
-    Arc<dyn Fn() -> (Box<dyn TtsClient>, Option<InterruptHandle>) + Send + Sync>;
+pub type SttFactory = Arc<dyn Fn() -> Box<dyn SttClient> + Send + Sync>;
+pub type TtsFactory = Arc<dyn Fn() -> (Box<dyn TtsClient>, Option<InterruptHandle>) + Send + Sync>;
 
 /// Per-server runtime.
 #[derive(Clone)]
@@ -83,11 +81,7 @@ pub struct VoiceRuntime {
 }
 
 impl VoiceRuntime {
-    pub fn new(
-        events: EventBus,
-        stt_factory: SttFactory,
-        tts_factory: TtsFactory,
-    ) -> Self {
+    pub fn new(events: EventBus, stt_factory: SttFactory, tts_factory: TtsFactory) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             events,
@@ -187,19 +181,17 @@ impl VoiceRuntime {
         }
         let mut sessions = self.inner.lock().await;
         for chunk in chunks {
-            let state = sessions
-                .entry(chunk.session.clone())
-                .or_insert_with(|| {
-                    let (tts, interrupt) = (self.tts_factory)();
-                    VoiceSessionState {
-                        stt: (self.stt_factory)(),
-                        tts,
-                        inbound_sample_rate: chunk.sample_rate,
-                        interrupt,
-                        outbound_seq: 0,
-                        last_inbound_seq: None,
-                    }
-                });
+            let state = sessions.entry(chunk.session.clone()).or_insert_with(|| {
+                let (tts, interrupt) = (self.tts_factory)();
+                VoiceSessionState {
+                    stt: (self.stt_factory)(),
+                    tts,
+                    inbound_sample_rate: chunk.sample_rate,
+                    interrupt,
+                    outbound_seq: 0,
+                    last_inbound_seq: None,
+                }
+            });
 
             // De-dup defensively. The registry shouldn't replay seqs,
             // but a paranoid check here means a registry bug can't
@@ -231,8 +223,8 @@ impl VoiceRuntime {
             if samples.is_empty() {
                 continue;
             }
-            let duration_ms = (samples.len() as u64 * 1000)
-                / state.inbound_sample_rate.max(1) as u64;
+            let duration_ms =
+                (samples.len() as u64 * 1000) / state.inbound_sample_rate.max(1) as u64;
             let audio = AudioChunk {
                 start_ms: 0,
                 end_ms: duration_ms,
@@ -261,11 +253,8 @@ impl VoiceRuntime {
     /// session can also acquire the lock during synthesize and bump
     /// the InterruptHandle, which the runtime checks before
     /// publishing each outbound chunk.
-    pub async fn finalize_utterance<F, Fut>(
-        &self,
-        session_id: &str,
-        agent_reply: F,
-    ) where
+    pub async fn finalize_utterance<F, Fut>(&self, session_id: &str, agent_reply: F)
+    where
         F: FnOnce(String) -> Fut + Send,
         Fut: std::future::Future<Output = String> + Send,
     {
@@ -276,7 +265,10 @@ impl VoiceRuntime {
         {
             let mut sessions = self.inner.lock().await;
             let Some(state) = sessions.get_mut(session_id) else {
-                debug!(session = session_id, "finalize_utterance for unknown session");
+                debug!(
+                    session = session_id,
+                    "finalize_utterance for unknown session"
+                );
                 return;
             };
             match state.stt.flush().await {
@@ -310,10 +302,7 @@ impl VoiceRuntime {
 
         // Snapshot the cancel epoch BEFORE the agent reply so an
         // interrupt that lands during the LLM turn is observed.
-        let cancel_epoch_before = cancel_handle
-            .as_ref()
-            .map(|h| h.epoch_value())
-            .unwrap_or(0);
+        let cancel_epoch_before = cancel_handle.as_ref().map(|h| h.epoch_value()).unwrap_or(0);
 
         // Run the agent callback OUTSIDE the lock.
         let reply = agent_reply(final_text).await;
@@ -480,8 +469,8 @@ fn encode_pcm16_le(samples: &[i16]) -> Vec<u8> {
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
-    use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
     STANDARD.encode(bytes)
 }
 
@@ -548,7 +537,8 @@ mod tests {
     async fn ingest_chunks_creates_session_lazily() {
         let (rt, _bus) = make_runtime_with_mocks(vec![], "hi".into());
         assert_eq!(rt.live_count().await, 0);
-        rt.ingest_chunks(&[pcm_chunk("s1", 0, &[100i16; 320])]).await;
+        rt.ingest_chunks(&[pcm_chunk("s1", 0, &[100i16; 320])])
+            .await;
         assert_eq!(rt.live_count().await, 1);
     }
 

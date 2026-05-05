@@ -309,7 +309,9 @@ mod tests {
     fn claim_is_mutually_exclusive() {
         let db = fresh_db();
         let store = OutboxStore::new(&db);
-        let id = store.enqueue(&mk_row(&ConversationId::from("c"), 0)).unwrap();
+        let id = store
+            .enqueue(&mk_row(&ConversationId::from("c"), 0))
+            .unwrap();
         assert!(store.claim(id).unwrap(), "first claim should succeed");
         assert!(!store.claim(id).unwrap(), "second claim must fail");
     }
@@ -320,7 +322,9 @@ mod tests {
     fn record_failure_retries_under_budget_then_dead_letters() {
         let db = fresh_db();
         let store = OutboxStore::new(&db);
-        let id = store.enqueue(&mk_row(&ConversationId::from("c"), 0)).unwrap();
+        let id = store
+            .enqueue(&mk_row(&ConversationId::from("c"), 0))
+            .unwrap();
 
         // Under budget: status returns to pending, row has next_attempt_at set.
         let retrying = store.record_failure(id, "boom", 3, 60).unwrap();
@@ -357,15 +361,19 @@ mod tests {
         let cid = ConversationId::from("c");
 
         // Row 1: due now.
-        let _ = store.enqueue(&OutboxRow {
-            next_attempt_at: Some(100),
-            ..mk_row(&cid, 0)
-        }).unwrap();
+        let _ = store
+            .enqueue(&OutboxRow {
+                next_attempt_at: Some(100),
+                ..mk_row(&cid, 0)
+            })
+            .unwrap();
         // Row 2: due far in the future.
-        let _ = store.enqueue(&OutboxRow {
-            next_attempt_at: Some(10_000_000),
-            ..mk_row(&cid, 1)
-        }).unwrap();
+        let _ = store
+            .enqueue(&OutboxRow {
+                next_attempt_at: Some(10_000_000),
+                ..mk_row(&cid, 1)
+            })
+            .unwrap();
         // Row 3: no schedule — always ready.
         let _ = store.enqueue(&mk_row(&cid, 2)).unwrap();
 
@@ -381,7 +389,9 @@ mod tests {
     fn mark_delivered_clears_error() {
         let db = fresh_db();
         let store = OutboxStore::new(&db);
-        let id = store.enqueue(&mk_row(&ConversationId::from("c"), 0)).unwrap();
+        let id = store
+            .enqueue(&mk_row(&ConversationId::from("c"), 0))
+            .unwrap();
         // First record a failure so last_error is non-null.
         let _ = store.record_failure(id, "transient", 5, 1).unwrap();
         // Claim is required in production but the SQL works without; drive

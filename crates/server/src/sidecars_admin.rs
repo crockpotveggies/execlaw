@@ -17,11 +17,11 @@ use crate::auth_extract::AuthedUser;
 use crate::routes::ApiError;
 use crate::sidecar_supervisor::SidecarRuntimeStatus;
 use crate::state::AppState;
+use axum::Router;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, post};
-use axum::Router;
 
 /// Single sidecar's status row, as the SPA expects it. Shape mirrors
 /// `SidecarRuntimeStatus` but stringifies the `ServiceStatus` so the

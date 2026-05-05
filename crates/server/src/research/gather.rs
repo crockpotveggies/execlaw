@@ -30,7 +30,7 @@
 
 use crate::cards::{CardEmitError, progress_card_and_broadcast};
 use crate::events::EventBus;
-use crate::research::readability_extract::{extract_readable_text, ExtractionOutcome};
+use crate::research::readability_extract::{ExtractionOutcome, extract_readable_text};
 use crate::research::workspace::{ResearchWorkspace, WorkspaceError};
 use execlaw_core::Database;
 use execlaw_core::cards::{CardProgressedPayload, CardState};

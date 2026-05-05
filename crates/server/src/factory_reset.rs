@@ -282,8 +282,7 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert!(
-            resp.status() == StatusCode::UNAUTHORIZED
-                || resp.status() == StatusCode::CONFLICT,
+            resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::CONFLICT,
             "post-reset login should not succeed; got {}",
             resp.status(),
         );
@@ -315,14 +314,8 @@ mod tests {
             .db
             .with_conn(|c| {
                 let n: i64 = c
-                    .query_row(
-                        "SELECT COUNT(*) FROM config_general",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .map_err(|e| {
-                        execlaw_core::DbError::Config(e.to_string())
-                    })?;
+                    .query_row("SELECT COUNT(*) FROM config_general", [], |r| r.get(0))
+                    .map_err(|e| execlaw_core::DbError::Config(e.to_string()))?;
                 Ok(n)
             })
             .unwrap();
@@ -342,8 +335,7 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert!(
-            resp.status() == StatusCode::UNAUTHORIZED
-                || resp.status() == StatusCode::FORBIDDEN,
+            resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN,
             "unauth call must be rejected; got {}",
             resp.status(),
         );

@@ -80,31 +80,33 @@ fn spawn_mock_calendar_api() -> (String, Arc<Mutex<u32>>) {
     let addr = listener.local_addr().unwrap();
     let calls = Arc::new(Mutex::new(0u32));
     let calls_w = calls.clone();
-    std::thread::spawn(move || loop {
-        let Ok((mut sock, _)) = listener.accept() else {
-            break;
-        };
-        let mut buf = [0u8; 16384];
-        let n = sock.read(&mut buf).unwrap_or(0);
-        *calls_w.lock().unwrap() += 1;
-        let req = std::str::from_utf8(&buf[..n]).unwrap_or("");
-        let path = req
-            .lines()
-            .next()
-            .and_then(|l| l.split_whitespace().nth(1))
-            .unwrap_or("/");
-        let body: &str = if path.starts_with("/calendar/v3/users/me/calendarList") {
-            SAMPLE_CALENDARS
-        } else if path.contains("/events") {
-            SAMPLE_EVENTS
-        } else {
-            r#"{"items":[]}"#
-        };
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = sock.write_all(resp.as_bytes());
+    std::thread::spawn(move || {
+        loop {
+            let Ok((mut sock, _)) = listener.accept() else {
+                break;
+            };
+            let mut buf = [0u8; 16384];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            *calls_w.lock().unwrap() += 1;
+            let req = std::str::from_utf8(&buf[..n]).unwrap_or("");
+            let path = req
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("/");
+            let body: &str = if path.starts_with("/calendar/v3/users/me/calendarList") {
+                SAMPLE_CALENDARS
+            } else if path.contains("/events") {
+                SAMPLE_EVENTS
+            } else {
+                r#"{"items":[]}"#
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes());
+        }
     });
     (format!("http://{addr}"), calls)
 }
@@ -119,14 +121,12 @@ fn load_plugin_files(mock_url: &str) -> (String, String) {
         .parent()
         .unwrap()
         .to_path_buf();
-    let manifest = std::fs::read_to_string(
-        workspace_root.join("plugins/google-calendar/plugin.toml"),
-    )
-    .expect("plugins/google-calendar/plugin.toml must exist");
-    let original_script = std::fs::read_to_string(
-        workspace_root.join("plugins/google-calendar/main.rhai"),
-    )
-    .expect("plugins/google-calendar/main.rhai must exist");
+    let manifest =
+        std::fs::read_to_string(workspace_root.join("plugins/google-calendar/plugin.toml"))
+            .expect("plugins/google-calendar/plugin.toml must exist");
+    let original_script =
+        std::fs::read_to_string(workspace_root.join("plugins/google-calendar/main.rhai"))
+            .expect("plugins/google-calendar/main.rhai must exist");
     let rewritten = original_script
         .replace(
             r#""https://www.googleapis.com/calendar/v3/users/me/calendarList""#,
@@ -164,7 +164,9 @@ fn build_app(stage_root: PathBuf) -> (axum::Router, AppState) {
         refresh_store: Arc::new(RefreshStore::new(db.clone())),
         events: events.clone(),
         event_log_hmac_key: Some(Arc::new(b"execlaw-test-hmac-key-32-bytes!!".to_vec())),
-        inference: Arc::new(execlaw_server::inference_resolver::InferenceResolver::new(None)),
+        inference: Arc::new(execlaw_server::inference_resolver::InferenceResolver::new(
+            None,
+        )),
         plugin_host: PluginHost::with_script_engine(
             db.clone(),
             HookRegistry::new(),
@@ -309,11 +311,7 @@ async fn google_calendar_plugin_full_install_and_dispatch_roundtrip() {
     // Returns Err since the plugin's tool_call throws on missing token.
     let err = state
         .plugin_host
-        .call_tool(
-            "calendar.list_calendars",
-            serde_json::json!({}),
-            &["*"],
-        )
+        .call_tool("calendar.list_calendars", serde_json::json!({}), &["*"])
         .await
         .unwrap_err();
     assert!(
@@ -325,11 +323,7 @@ async fn google_calendar_plugin_full_install_and_dispatch_roundtrip() {
     seed_oauth(&state.db, "ya29.fake");
     let res = state
         .plugin_host
-        .call_tool(
-            "calendar.list_calendars",
-            serde_json::json!({}),
-            &["*"],
-        )
+        .call_tool("calendar.list_calendars", serde_json::json!({}), &["*"])
         .await
         .expect("calendar.list_calendars should succeed with token + caps");
     let cals = res["calendars"].as_array().unwrap();
@@ -340,11 +334,7 @@ async fn google_calendar_plugin_full_install_and_dispatch_roundtrip() {
     // ---- 6. call_tool calendar.list_events default args ---------
     let res = state
         .plugin_host
-        .call_tool(
-            "calendar.list_events",
-            serde_json::json!({}),
-            &["*"],
-        )
+        .call_tool("calendar.list_events", serde_json::json!({}), &["*"])
         .await
         .expect("calendar.list_events should succeed");
     let events = res["events"].as_array().unwrap();

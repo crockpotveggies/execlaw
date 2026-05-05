@@ -116,9 +116,7 @@ pub fn load_or_create_master_key_with_fallback(
             // (likely from before the fix or from an OS-level
             // re-imaging). Re-mirror the file's key into the keyring
             // so the next boot is unambiguous.
-            tracing::warn!(
-                "keyring + master.key disagree; preferring file and refreshing keyring",
-            );
+            tracing::warn!("keyring + master.key disagree; preferring file and refreshing keyring",);
             let _ = try_persist_to_keyring(&k_file);
             // Suppress the unused-binding lint.
             let _ = k_ring;
@@ -239,8 +237,7 @@ mod tests {
     fn first_run_returns_32_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("master.key");
-        let key =
-            load_or_create_master_key_with_fallback(&path).expect("first-run should succeed");
+        let key = load_or_create_master_key_with_fallback(&path).expect("first-run should succeed");
         assert_eq!(key.len(), 32);
     }
 
@@ -302,8 +299,7 @@ mod tests {
         let path = dir.path().join("master.key");
         // Sanity: file does not exist before the call.
         assert!(!path.exists());
-        let key = load_or_create_master_key_with_fallback(&path)
-            .expect("first-run should succeed");
+        let key = load_or_create_master_key_with_fallback(&path).expect("first-run should succeed");
         assert!(
             path.exists(),
             "drift-resistance: master.key must be written even when keyring accepts the key",

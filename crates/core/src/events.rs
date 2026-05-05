@@ -333,7 +333,10 @@ impl KeyRing {
     pub fn single(id: i64, key: Vec<u8>) -> Self {
         let mut keys = std::collections::HashMap::new();
         keys.insert(id, key);
-        Self { keys, current_id: id }
+        Self {
+            keys,
+            current_id: id,
+        }
     }
 
     /// Register an additional key without changing `current_id`. Used
@@ -384,10 +387,7 @@ impl KeyRing {
 
 impl<'db> EventLog<'db> {
     pub fn new(db: &'db Database) -> Self {
-        Self {
-            db,
-            key_ring: None,
-        }
+        Self { db, key_ring: None }
     }
 
     /// Attach a single HMAC key — convenience wrapper that builds a
@@ -422,12 +422,7 @@ impl<'db> EventLog<'db> {
 
     /// Verify a loaded event row. No-op (returns Ok) when no ring is
     /// attached or when the stored tag is NULL (legacy rows).
-    fn verify(
-        &self,
-        ev: &EventRecord,
-        tag: Option<Vec<u8>>,
-        key_id: i64,
-    ) -> Result<(), DbError> {
+    fn verify(&self, ev: &EventRecord, tag: Option<Vec<u8>>, key_id: i64) -> Result<(), DbError> {
         let Some(ring) = self.key_ring.as_ref() else {
             return Ok(());
         };
@@ -493,27 +488,26 @@ impl<'db> EventLog<'db> {
         // Pull the rows that still need signatures. Linear scan is
         // fine — back-fill runs at most once per fleet, before the
         // operator flips the column constraint.
-        let null_rows: Vec<NullTagRow> =
-            self.db.with_conn(|c| {
-                let mut stmt = c.prepare(
-                    "SELECT conversation_id, seq, kind, payload, committed_at, actor \
+        let null_rows: Vec<NullTagRow> = self.db.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT conversation_id, seq, kind, payload, committed_at, actor \
                      FROM state_events \
                      WHERE tag IS NULL",
-                )?;
-                let rows = stmt
-                    .query_map([], |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, i64>(1)?,
-                            r.get::<_, String>(2)?,
-                            r.get::<_, Vec<u8>>(3)?,
-                            r.get::<_, i64>(4)?,
-                            r.get::<_, Option<String>>(5)?,
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })?;
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Vec<u8>>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
 
         let mut signed = 0usize;
         for (conv_id, seq, kind_str, payload, committed_at, actor) in null_rows {
@@ -580,9 +574,7 @@ impl<'db> EventLog<'db> {
     /// dev-environment key and accepting that history is degraded).
     pub fn resign_all_with_current_key(&self) -> Result<BackfillReport, DbError> {
         let ring = self.key_ring.as_ref().ok_or_else(|| {
-            DbError::Config(
-                "resign_all_with_current_key requires a KeyRing".into(),
-            )
+            DbError::Config("resign_all_with_current_key requires a KeyRing".into())
         })?;
         let key = ring.current_key().ok_or_else(|| {
             DbError::Config("KeyRing has no key registered for current_id".into())
@@ -1234,7 +1226,10 @@ mod tests {
     fn event_kind_parse_unknown_maps_to_other() {
         // Forward-compat contract: unknown kinds MUST map to `Other` so
         // replay can continue.
-        assert_eq!(EventKind::parse("this_kind_does_not_exist"), EventKind::Other);
+        assert_eq!(
+            EventKind::parse("this_kind_does_not_exist"),
+            EventKind::Other
+        );
         assert_eq!(EventKind::parse(""), EventKind::Other);
     }
 
@@ -1560,9 +1555,7 @@ mod tests {
         ring = KeyRing::single(99, b"different-32-bytes-long!!!!!!!!!".to_vec());
         let log = EventLog::new(&db).with_key_ring(ring);
         let err = log.replay_since(&cid, EventSeq(0)).unwrap_err();
-        assert!(
-            matches!(err, DbError::TamperDetected(msg) if msg.contains("isn't in the ring")),
-        );
+        assert!(matches!(err, DbError::TamperDetected(msg) if msg.contains("isn't in the ring")),);
     }
 
     /// set_current() refuses an id that hasn't been registered first —
@@ -1688,7 +1681,10 @@ mod tests {
             )
             .unwrap();
         let ring = KeyRing::single(42, b"some-key-32-bytes-long!!!!!!!!!!".to_vec());
-        EventLog::new(&db).with_key_ring(ring).backfill_null_tags().unwrap();
+        EventLog::new(&db)
+            .with_key_ring(ring)
+            .backfill_null_tags()
+            .unwrap();
         let stored: i64 = db
             .with_conn(|c| {
                 let id: i64 = c

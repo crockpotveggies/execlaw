@@ -198,17 +198,22 @@ impl<'db> TrustPolicyStore<'db> {
             }
         }
 
-        self.kv
-            .set(
-                KEY_AUTO_TRUST_CONTACTS,
-                if p.auto_trust_contacts { "true" } else { "false" },
-            )?;
+        self.kv.set(
+            KEY_AUTO_TRUST_CONTACTS,
+            if p.auto_trust_contacts {
+                "true"
+            } else {
+                "false"
+            },
+        )?;
         self.kv
             .set(KEY_MIN_TRUST_HINT, p.min_trust_hint_for_auto_trust.as_str())?;
         self.kv
             .set(KEY_MIXED_TRUST_POLICY, p.mixed_trust_policy.as_str())?;
-        self.kv
-            .set(KEY_IDENTITY_PLUGIN_ORDER, &p.identity_plugin_order.join(","))?;
+        self.kv.set(
+            KEY_IDENTITY_PLUGIN_ORDER,
+            &p.identity_plugin_order.join(","),
+        )?;
         self.kv
             .set(KEY_DELEGATED_TTL, &p.delegated_trust_default_ttl)?;
         Ok(())

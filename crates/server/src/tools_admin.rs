@@ -11,11 +11,11 @@
 use crate::auth_extract::AuthedUser;
 use crate::routes::ApiError;
 use crate::state::AppState;
+use axum::Router;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, patch};
-use axum::Router;
 use execlaw_core::tool_access::{ToolAccessRow, ToolAccessStore};
 use execlaw_policy::trust::TrustLevel;
 use serde::{Deserialize, Serialize};
@@ -137,11 +137,14 @@ pub async fn update_handler(
     }
 
     let store = ToolAccessStore::new(&state.db);
-    let prior = store.get(&tool_name).map_err(ApiError::from)?.ok_or_else(|| ApiError {
-        status: StatusCode::NOT_FOUND,
-        code: "tool_not_found",
-        message: format!("no tool registered as '{tool_name}'"),
-    })?;
+    let prior = store
+        .get(&tool_name)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "tool_not_found",
+            message: format!("no tool registered as '{tool_name}'"),
+        })?;
     let updated = store
         .set_policy(&tool_name, req.enabled, &req.allowed_classes)
         .map_err(ApiError::from)?;
@@ -154,11 +157,14 @@ pub async fn update_handler(
             message: format!("'{tool_name}' was removed mid-update"),
         });
     }
-    let after = store.get(&tool_name).map_err(ApiError::from)?.ok_or_else(|| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        code: "tool_lookup_after_update",
-        message: "tool disappeared after update".into(),
-    })?;
+    let after = store
+        .get(&tool_name)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "tool_lookup_after_update",
+            message: "tool disappeared after update".into(),
+        })?;
 
     let audit = execlaw_core::audit::AuditStore::new(&state.db);
     let _ = audit.insert(

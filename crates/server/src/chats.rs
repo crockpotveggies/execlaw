@@ -19,8 +19,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use execlaw_core::backends::BackendPurpose;
 use execlaw_core::conversation::{
-    ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
-    ThreadSummary,
+    ConversationKind, ConversationRow, ConversationStore, Modality, Phase, ThreadSummary,
 };
 use execlaw_core::events::{EventKind, EventLog, EventRecord, PendingEvent};
 use execlaw_core::ids::{ConversationId, EventSeq};
@@ -277,10 +276,7 @@ pub async fn send_message(
     // indicator stuck on "thinking" forever. Disarmed on the
     // success path so the explicit Idle publish lands BEFORE
     // ChatMessageOutbound (typing-dots-stop-a-beat-before-reply UX).
-    let idle_guard = IdlePhaseGuard::new(
-        state.events.clone(),
-        cid.as_str().to_owned(),
-    );
+    let idle_guard = IdlePhaseGuard::new(state.events.clone(), cid.as_str().to_owned());
 
     // 2026-04-28 — register a per-turn cancellation flag. The streaming
     // path polls this between SSE chunks and exits the loop early when
@@ -298,9 +294,7 @@ pub async fn send_message(
     // when no row covers the requested purpose. Resolved freshly on
     // each turn so a Backends save propagates without a server
     // restart.
-    let inference_for_turn = state
-        .inference
-        .resolve(&state.db, BackendPurpose::Standard);
+    let inference_for_turn = state.inference.resolve(&state.db, BackendPurpose::Standard);
 
     // Phase 16: per-principal-group runner routing. Eligibility:
     //   * supervisor configured (`RUNNERS_ENABLED=1` on boot), AND
@@ -314,8 +308,7 @@ pub async fn send_message(
     // in-process executor. The legacy `run_tool_capable_turn` arm
     // stays as a safety net for the supervisor-disabled config and
     // for tests that exercise the in-process path directly.
-    let runner_eligible = state.runner_supervisor.is_some()
-        && inference_for_turn.is_some();
+    let runner_eligible = state.runner_supervisor.is_some() && inference_for_turn.is_some();
     let runner_routed = if runner_eligible {
         match resolve_chat_group(&state, &cid, &principal).await {
             Ok(group_id) => Some(group_id),
@@ -328,75 +321,48 @@ pub async fn send_message(
         None
     };
 
-    let (user_msg_seq, assistant_text, assistant_seq) = match (
-        inference_for_turn,
-        runner_routed.as_deref(),
-    ) {
-        (Some(_inference), Some(group_id)) => {
-            // The supervisor is fetched from `state` inside
-            // `run_runner_turn` now (the prior signature passed it
-            // redundantly). We still gate the branch on
-            // `runner_eligible` upstream so the function's
-            // `ok_or_else` should never fire here.
-            match run_runner_turn(RunnerTurnCtx {
-                state: &state,
-                group_id,
-                cid: &cid,
-                user_text: &req.text,
-                sender_principal_id: req.sender_principal_id.clone(),
-                spotlight_content,
-                cancel_flag: cancel_flag.clone(),
-                caller_caps: caller_caps.clone(),
-                caller_trust: sender_trust,
-            })
-            .await
-            {
-                Ok(out) => out,
-                Err(e) => {
-                    let chain = format!("{e:#}");
-                    crate::chat_alert::fire_turn_failure(
-                        &state.db,
-                        "runner",
-                        crate::chat_alert::extract_root_cause(&chain),
-                        cid.as_str(),
-                    );
-                    return err_500(&format!("runner turn failed: {chain}"));
+    let (user_msg_seq, assistant_text, assistant_seq) =
+        match (inference_for_turn, runner_routed.as_deref()) {
+            (Some(_inference), Some(group_id)) => {
+                // The supervisor is fetched from `state` inside
+                // `run_runner_turn` now (the prior signature passed it
+                // redundantly). We still gate the branch on
+                // `runner_eligible` upstream so the function's
+                // `ok_or_else` should never fire here.
+                match run_runner_turn(RunnerTurnCtx {
+                    state: &state,
+                    group_id,
+                    cid: &cid,
+                    user_text: &req.text,
+                    sender_principal_id: req.sender_principal_id.clone(),
+                    spotlight_content,
+                    cancel_flag: cancel_flag.clone(),
+                    caller_caps: caller_caps.clone(),
+                    caller_trust: sender_trust,
+                })
+                .await
+                {
+                    Ok(out) => out,
+                    Err(e) => {
+                        let chain = format!("{e:#}");
+                        crate::chat_alert::fire_turn_failure(
+                            &state.db,
+                            "runner",
+                            crate::chat_alert::extract_root_cause(&chain),
+                            cid.as_str(),
+                        );
+                        return err_500(&format!("runner turn failed: {chain}"));
+                    }
                 }
             }
-        }
-        (Some(inference), None) if use_tool_path => match run_tool_capable_turn(
-            &state,
-            inference.clone(),
-            &cid,
-            &req.text,
-            req.sender_principal_id.clone(),
-            caller_caps.clone(),
-            sender_trust,
-        )
-        .await
-        {
-            Ok(out) => out,
-            Err(e) => {
-                let chain = format!("{e:#}");
-                crate::chat_alert::fire_turn_failure(
-                    &state.db,
-                    "tool",
-                    crate::chat_alert::extract_root_cause(&chain),
-                    cid.as_str(),
-                );
-                return err_500(&format!("tool-capable turn failed: {chain}"));
-            }
-        },
-        (Some(inference), None) => {
-            match run_real_turn(
+            (Some(inference), None) if use_tool_path => match run_tool_capable_turn(
                 &state,
                 inference.clone(),
                 &cid,
                 &req.text,
                 req.sender_principal_id.clone(),
+                caller_caps.clone(),
                 sender_trust,
-                spotlight_content,
-                cancel_flag.clone(),
             )
             .await
             {
@@ -405,28 +371,55 @@ pub async fn send_message(
                     let chain = format!("{e:#}");
                     crate::chat_alert::fire_turn_failure(
                         &state.db,
-                        "real",
+                        "tool",
                         crate::chat_alert::extract_root_cause(&chain),
                         cid.as_str(),
                     );
-                    return err_500(&format!("turn failed: {chain}"));
+                    return err_500(&format!("tool-capable turn failed: {chain}"));
+                }
+            },
+            (Some(inference), None) => {
+                match run_real_turn(
+                    &state,
+                    inference.clone(),
+                    &cid,
+                    &req.text,
+                    req.sender_principal_id.clone(),
+                    sender_trust,
+                    spotlight_content,
+                    cancel_flag.clone(),
+                )
+                .await
+                {
+                    Ok(out) => out,
+                    Err(e) => {
+                        let chain = format!("{e:#}");
+                        crate::chat_alert::fire_turn_failure(
+                            &state.db,
+                            "real",
+                            crate::chat_alert::extract_root_cause(&chain),
+                            cid.as_str(),
+                        );
+                        return err_500(&format!("turn failed: {chain}"));
+                    }
                 }
             }
-        }
-        (None, _) => match run_stub_turn(&state, &cid, &req.text, req.sender_principal_id.clone()) {
-            Ok(out) => out,
-            Err(e) => {
-                let chain = format!("{e:#}");
-                crate::chat_alert::fire_turn_failure(
-                    &state.db,
-                    "stub",
-                    crate::chat_alert::extract_root_cause(&chain),
-                    cid.as_str(),
-                );
-                return err_500(&format!("stub turn failed: {chain}"));
+            (None, _) => {
+                match run_stub_turn(&state, &cid, &req.text, req.sender_principal_id.clone()) {
+                    Ok(out) => out,
+                    Err(e) => {
+                        let chain = format!("{e:#}");
+                        crate::chat_alert::fire_turn_failure(
+                            &state.db,
+                            "stub",
+                            crate::chat_alert::extract_root_cause(&chain),
+                            cid.as_str(),
+                        );
+                        return err_500(&format!("stub turn failed: {chain}"));
+                    }
+                }
             }
-        },
-    };
+        };
     // Reaching here means the turn succeeded — clear any open
     // chat-failure alerts so the operator's badge resets without a
     // manual ack. Cheap when there's nothing firing (one DB SELECT).
@@ -495,14 +488,16 @@ pub async fn send_message(
         match skill_store.close_open_invocations(cid.as_str(), "success", 0, now_ms) {
             Ok(closures) => {
                 for (inv_id, sk_id) in closures {
-                    state.reuse_update.enqueue(execlaw_skills::ReuseUpdateRequest {
-                        conversation_id: cid.clone(),
-                        invocation_id: inv_id,
-                        skill_id: sk_id,
-                        until_seq: execlaw_core::ids::EventSeq(assistant_seq),
-                        run_id: format!("turn-{}-{}", cid.as_str(), assistant_seq),
-                        outcome: "success".into(),
-                    });
+                    state
+                        .reuse_update
+                        .enqueue(execlaw_skills::ReuseUpdateRequest {
+                            conversation_id: cid.clone(),
+                            invocation_id: inv_id,
+                            skill_id: sk_id,
+                            until_seq: execlaw_core::ids::EventSeq(assistant_seq),
+                            run_id: format!("turn-{}-{}", cid.as_str(), assistant_seq),
+                            outcome: "success".into(),
+                        });
                 }
             }
             Err(e) => {
@@ -731,11 +726,10 @@ async fn run_real_turn(
             "enable_thinking": reasoning_enabled,
         })),
     };
-    let adapter = execlaw_model_adapter::adapter_for(
-        execlaw_model_adapter::ModelFamily::detect(&state.config.model_id),
-    );
-    let req = adapter
-        .prepare_request(base_req, execlaw_model_adapter::OutputHint::Conversation);
+    let adapter = execlaw_model_adapter::adapter_for(execlaw_model_adapter::ModelFamily::detect(
+        &state.config.model_id,
+    ));
+    let req = adapter.prepare_request(base_req, execlaw_model_adapter::OutputHint::Conversation);
     let mut stream = inference
         .chat_completions_stream(&req)
         .await
@@ -924,9 +918,7 @@ pub(crate) struct RunnerTurnCtx<'a> {
     pub caller_trust: TrustLevel,
 }
 
-pub(crate) async fn run_runner_turn(
-    ctx: RunnerTurnCtx<'_>,
-) -> Result<(i64, String, i64), String> {
+pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, String, i64), String> {
     let RunnerTurnCtx {
         state,
         group_id,
@@ -1071,42 +1063,31 @@ pub(crate) async fn run_runner_turn(
         .iter()
         .map(|t| {
             let d = t.descriptor();
-            ToolDeclaration::function(
-                d.name.clone(),
-                d.description.clone(),
-                d.schema.clone(),
-            )
+            ToolDeclaration::function(d.name.clone(), d.description.clone(), d.schema.clone())
         })
         .collect();
-    tool_decls.extend(
-        state
-            .plugin_host
-            .registry()
-            .all_tools()
-            .iter()
-            .map(|t| {
-                // Pre-fix this advertised every plugin tool as
-                // `Plugin tool 'X' (latency: Y)` with an empty
-                // `{"type":"object"}` schema — the model couldn't
-                // tell what any of them did. Now we ship the
-                // manifest's `description` + the JSON Schema loaded
-                // at register time. Falls back only when the plugin
-                // itself omitted them.
-                let description = t.description.clone().unwrap_or_else(|| {
-                    format!(
-                        "Plugin tool '{}' from '{}' (latency: {}). \
+    tool_decls.extend(state.plugin_host.registry().all_tools().iter().map(|t| {
+        // Pre-fix this advertised every plugin tool as
+        // `Plugin tool 'X' (latency: Y)` with an empty
+        // `{"type":"object"}` schema — the model couldn't
+        // tell what any of them did. Now we ship the
+        // manifest's `description` + the JSON Schema loaded
+        // at register time. Falls back only when the plugin
+        // itself omitted them.
+        let description = t.description.clone().unwrap_or_else(|| {
+            format!(
+                "Plugin tool '{}' from '{}' (latency: {}). \
                          The plugin manifest did not supply a description; \
                          ask the operator to add one for better tool selection.",
-                        t.tool_name, t.plugin_id, t.latency,
-                    )
-                });
-                let schema = t
-                    .schema_json
-                    .clone()
-                    .unwrap_or_else(|| serde_json::json!({"type": "object"}));
-                ToolDeclaration::function(t.tool_name.clone(), description, schema)
-            }),
-    );
+                t.tool_name, t.plugin_id, t.latency,
+            )
+        });
+        let schema = t
+            .schema_json
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+        ToolDeclaration::function(t.tool_name.clone(), description, schema)
+    }));
 
     // Trust-class string the runner copies into log lines + the
     // model's "from:" header. The flat policy tag is canonical.
@@ -1172,6 +1153,13 @@ pub(crate) async fn run_runner_turn(
         .with_events(state.events.clone())
         .with_research_supervisor_wake_opt(
             state.research_supervisor.as_ref().map(|s| s.wake.clone()),
+        )
+        .with_signal_transport_opt(
+            state.sidecar_supervisor.as_ref().map(|s| {
+                std::sync::Arc::new(s.clone())
+                    as std::sync::Arc<dyn crate::signal_transport::RpcEndpointResolver>
+            }),
+            crate::signal_transport::SignalCliTransport::read_self_number_from_env(),
         ),
     );
 
@@ -1258,7 +1246,11 @@ pub(crate) async fn run_runner_turn(
             TurnEvent::Phase { .. } => {
                 // Same.
             }
-            TurnEvent::ToolCallRequest { call_id, tool_name, args } => {
+            TurnEvent::ToolCallRequest {
+                call_id,
+                tool_name,
+                args,
+            } => {
                 // 2026-04-28: dispatch via the same ChainedToolDispatch
                 // the in-process executor uses, so plugin/MCP/built-in
                 // tool routing + the per-tool config_tool_access gate
@@ -1292,7 +1284,11 @@ pub(crate) async fn run_runner_turn(
                     conversation_id: cid.as_str().to_owned(),
                     tool_name: tool_name.clone(),
                     label: humanise_tool_call(&tool_name, &args),
-                    status: if ok { "finished".into() } else { "failed".into() },
+                    status: if ok {
+                        "finished".into()
+                    } else {
+                        "failed".into()
+                    },
                 });
 
                 let result = execlaw_runner_protocol::ToolCallResult {
@@ -1315,10 +1311,9 @@ pub(crate) async fn run_runner_turn(
                 // `encode` is generic; `serde_json::Value` is
                 // Serialize so it round-trips through rmp the
                 // same way a typed payload would.
-                let pending_ev = execlaw_core::events::PendingEvent::encode(
-                    kind_enum, &payload, actor,
-                )
-                .map_err(|e| format!("encode runner event: {e}"))?;
+                let pending_ev =
+                    execlaw_core::events::PendingEvent::encode(kind_enum, &payload, actor)
+                        .map_err(|e| format!("encode runner event: {e}"))?;
                 pending.push(pending_ev);
             }
             TurnEvent::Complete {
@@ -1331,10 +1326,7 @@ pub(crate) async fn run_runner_turn(
                 got_complete = true;
                 break;
             }
-            TurnEvent::Error {
-                message,
-                cancelled,
-            } => {
+            TurnEvent::Error { message, cancelled } => {
                 error_message = Some(message);
                 was_cancelled = cancelled;
                 break;
@@ -1450,6 +1442,13 @@ async fn run_tool_capable_turn(
         .with_events(state.events.clone())
         .with_research_supervisor_wake_opt(
             state.research_supervisor.as_ref().map(|s| s.wake.clone()),
+        )
+        .with_signal_transport_opt(
+            state.sidecar_supervisor.as_ref().map(|s| {
+                std::sync::Arc::new(s.clone())
+                    as std::sync::Arc<dyn crate::signal_transport::RpcEndpointResolver>
+            }),
+            crate::signal_transport::SignalCliTransport::read_self_number_from_env(),
         ),
     );
     let exec = TurnExecutor::new((*inference).clone(), dispatch);
@@ -1511,10 +1510,7 @@ async fn run_tool_capable_turn(
         max_tokens: Some(4096),
         max_tool_rounds: state.config.max_tool_rounds,
         tools: tool_decls,
-        event_log_hmac_key: state
-            .event_log_hmac_key
-            .as_ref()
-            .map(|k| (**k).clone()),
+        event_log_hmac_key: state.event_log_hmac_key.as_ref().map(|k| (**k).clone()),
         phase_observer: Some(phase_observer),
         // Read reasoning toggle from the Standard backend row;
         // defaults to false when the row isn't configured. The
@@ -1595,10 +1591,7 @@ async fn resolve_sender(
     // plugin via PluginHost::resolve_identity (§2.14); if any
     // vouches for the sender with a Contact-class trust hint, we
     // auto-admit as KnownTrusted. Otherwise UnknownPending.
-    let matches = state
-        .plugin_host
-        .resolve_identity("web", raw)
-        .await;
+    let matches = state.plugin_host.resolve_identity("web", raw).await;
     let now = chrono::Utc::now().timestamp();
     // Pick the highest-confidence match whose trust_hint would admit
     // the sender (Contact / Colleague / Family / Organization — not
@@ -1909,9 +1902,7 @@ pub async fn dispatch_routine_turn(
 
     let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
     // Phase 12.E — same per-turn resolver as send_message uses.
-    let inference_for_turn = state
-        .inference
-        .resolve(&state.db, BackendPurpose::Standard);
+    let inference_for_turn = state.inference.resolve(&state.db, BackendPurpose::Standard);
     let result = match inference_for_turn {
         Some(inference) if has_plugin_tools => {
             run_tool_capable_turn(
@@ -1974,6 +1965,206 @@ pub async fn dispatch_routine_turn(
         }
     }
     mapped
+}
+
+/// Phase 4 — public wrapper over the file-private `ensure_conversation`
+/// helper. The Signal inbound consumer needs to make sure the
+/// `state_conversations` row exists before it binds the conversation
+/// to a principal_group; exposing the helper avoids duplicating the
+/// default-row construction.
+pub fn ensure_conversation_for(db: &execlaw_core::Database, cid: &ConversationId) {
+    let store = ConversationStore::new(db);
+    ensure_conversation(&store, cid);
+}
+
+/// Phase 4 — cold-contact handler scoped to a non-HTTP caller (the
+/// Signal inbound consumer). Mirrors the existing `handle_cold_contact`
+/// (axum response shape) but takes plain args + returns a `Result`
+/// so the consumer can log errors and continue rather than format
+/// an HTTP body.
+///
+/// Behavior matches the HTTP path step-for-step:
+///   1. Commit a `ColdContactArrived` event into the conversation log.
+///   2. Transition the conversation phase to `AwaitingTrustDecision`.
+///   3. Fire an `AlertFired` UI event so the controller's SPA / a
+///      Phase-8 sideband-transport plugin surfaces an approval card.
+///
+/// The text is the inbound message body — stamped on the event
+/// payload so the controller can read what the cold contact said
+/// before deciding whether to admit them.
+pub async fn handle_cold_contact_for_inbound(
+    state: &AppState,
+    cid: &ConversationId,
+    principal: &Principal,
+    text: &str,
+) -> Result<(), String> {
+    use execlaw_core::conversation::Phase as CPhase;
+
+    let log = event_log(state);
+    let approval_id = format!("appr-{}", uuid::Uuid::new_v4());
+    let payload = ColdContactPayload {
+        text: text.to_owned(),
+        sender_principal_id: principal.id.as_str().to_owned(),
+        approval_id: approval_id.clone(),
+    };
+    let pending = PendingEvent::encode(
+        EventKind::ColdContactArrived,
+        &payload,
+        Some(principal.id.as_str().to_owned()),
+    )
+    .map_err(|e| format!("encode cold_contact: {e}"))?;
+    let base_seq = log.last_seq(cid).map_err(|e| format!("last_seq: {e}"))?;
+    log.commit_turn(cid, base_seq, vec![pending])
+        .map_err(|e| format!("commit cold_contact: {e}"))?;
+
+    let store = ConversationStore::new(&state.db);
+    if let Ok(Some(mut row)) = store.get(cid) {
+        row.phase = CPhase::AwaitingTrustDecision;
+        row.last_seq = log.last_seq(cid).unwrap_or(row.last_seq);
+        let _ = store.upsert(&row);
+        let _ = store.set_last_activity_at(cid, chrono::Utc::now().timestamp());
+    }
+
+    state.events.publish(UiEvent::AlertFired {
+        alert_id: approval_id,
+        severity: "Warning".into(),
+        source: "core.cold_contact".into(),
+        title: format!(
+            "New Signal contact wants to talk — approve?: {}",
+            principal.id.as_str()
+        ),
+    });
+    Ok(())
+}
+
+/// Phase 4 — programmatic turn dispatch for an external transport
+/// (Signal today; future bridges fall through the same path).
+/// Generalises [`dispatch_routine_turn`] by parameterising on the
+/// resolved sender + trust class instead of forcing Controller.
+///
+/// Trust translation:
+///   * The caller has already resolved the sender's trust class
+///     (via [`crate::signal_inbound::route_inbound_message`] or
+///     equivalent).
+///   * `evaluate_turn` is re-run here so the capability set + the
+///     planner-executor split + spotlighting all come from the same
+///     pure policy function the chat handler uses — no behavioural
+///     drift between "controller typed this" and "Signal contact
+///     said this".
+///
+/// `Blocked` and `UnknownPending` callers are a programming error —
+/// the caller must have routed those through `drop` / cold-contact
+/// before reaching here. Returns `Err` rather than silently doing
+/// the wrong thing.
+pub async fn dispatch_external_turn(
+    state: &AppState,
+    cid: &ConversationId,
+    principal: &Principal,
+    sender_trust: TrustLevel,
+    text: &str,
+) -> Result<(), String> {
+    use execlaw_policy::trust::{TurnPolicyInput, evaluate_turn};
+
+    if matches!(
+        sender_trust,
+        TrustLevel::Blocked | TrustLevel::UnknownPending
+    ) {
+        return Err(format!(
+            "dispatch_external_turn called with non-routable trust class {sender_trust:?}; \
+             caller must drop / cold-contact those classes before reaching here",
+        ));
+    }
+
+    let store = ConversationStore::new(&state.db);
+    ensure_conversation(&store, cid);
+    refresh_conversation_kind(&store, cid, principal.trust_level.class_tag());
+
+    let policy = evaluate_turn(TurnPolicyInput {
+        effective_trust: sender_trust,
+        sender_trust,
+        voice: false,
+        accesses_sensitive_data: false,
+        produces_external_effect: false,
+    });
+    if policy.drop_turn {
+        // Defensive — we already gated Blocked above, but the
+        // policy engine's drop_turn is the source of truth and may
+        // gain other reasons in the future.
+        return Ok(());
+    }
+    if policy.require_approval {
+        // Rule-of-Two breach without a cold contact. Surface as an
+        // alert so the controller can review; do NOT run the turn.
+        state.events.publish(UiEvent::AlertFired {
+            alert_id: format!("appr-{}", uuid::Uuid::new_v4()),
+            severity: "Warning".into(),
+            source: "core.rule_of_two_breach".into(),
+            title: format!(
+                "Inbound Signal turn from {} would breach rule-of-two",
+                principal.id.as_str()
+            ),
+        });
+        return Ok(());
+    }
+
+    let cid_str = cid.as_str().to_owned();
+    state.events.publish(UiEvent::ConversationPhaseChanged {
+        conversation_id: cid_str.clone(),
+        phase: Phase::Thinking.as_str().to_owned(),
+    });
+    let idle_guard = IdlePhaseGuard::new(state.events.clone(), cid_str.clone());
+
+    let sender = Some(principal.id.as_str().to_owned());
+    let caller_caps: Vec<String> = policy
+        .capability_set
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    let caller_trust = sender_trust;
+
+    let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
+    let inference_for_turn = state.inference.resolve(&state.db, BackendPurpose::Standard);
+    let result = match inference_for_turn {
+        Some(inference) if has_plugin_tools => {
+            run_tool_capable_turn(
+                state,
+                inference.clone(),
+                cid,
+                text,
+                sender.clone(),
+                caller_caps,
+                caller_trust,
+            )
+            .await
+        }
+        Some(inference) => {
+            let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
+                state.turn_cancel.clone(),
+                cid_str.clone(),
+            );
+            let cancel_flag = cancel_guard.flag.clone();
+            let res = run_real_turn(
+                state,
+                inference.clone(),
+                cid,
+                text,
+                sender.clone(),
+                caller_trust,
+                false,
+                cancel_flag,
+            )
+            .await;
+            drop(cancel_guard);
+            res
+        }
+        None => run_stub_turn(state, cid, text, sender.clone()),
+    };
+
+    match &result {
+        Ok(_) => idle_guard.disarm_after_publishing_idle(),
+        Err(_) => drop(idle_guard),
+    }
+    result.map(|_| ())
 }
 
 /// Sender-id sentinel marking a UserMsg event the server-side
@@ -2064,9 +2255,7 @@ pub async fn dispatch_clarification_turn(
     let caller_trust = TrustLevel::Controller;
 
     let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
-    let inference_for_turn = state
-        .inference
-        .resolve(&state.db, BackendPurpose::Standard);
+    let inference_for_turn = state.inference.resolve(&state.db, BackendPurpose::Standard);
     let result = match inference_for_turn {
         Some(inference) if has_plugin_tools => {
             run_tool_capable_turn(
@@ -2262,7 +2451,8 @@ pub(crate) fn humanise_tool_call(tool_name: &str, args: &serde_json::Value) -> S
             None => "Creating a routine".into(),
         },
         "routine_list" => "Listing routines".into(),
-        "routine_get" | "routine_pause" | "routine_resume" | "routine_update" | "routine_delete" => {
+        "routine_get" | "routine_pause" | "routine_resume" | "routine_update"
+        | "routine_delete" => {
             // routine_<verb> — fold them into one phrasing.
             let verb = tool_name.trim_start_matches("routine_");
             let pretty = match verb {
@@ -2273,7 +2463,14 @@ pub(crate) fn humanise_tool_call(tool_name: &str, args: &serde_json::Value) -> S
                 "delete" => "deleting",
                 _ => verb,
             };
-            format!("{} a routine", pretty.chars().next().map(|c| c.to_uppercase().collect::<String>() + &pretty[c.len_utf8()..]).unwrap_or_else(|| pretty.into()))
+            format!(
+                "{} a routine",
+                pretty
+                    .chars()
+                    .next()
+                    .map(|c| c.to_uppercase().collect::<String>() + &pretty[c.len_utf8()..])
+                    .unwrap_or_else(|| pretty.into())
+            )
         }
         // === Signal plugin ===
         // These need bespoke phrasings because the generic
@@ -2910,10 +3107,7 @@ async fn run_incognito_send(
         conversation_id: cid.as_str().to_owned(),
         phase: Phase::Thinking.as_str().to_owned(),
     });
-    let idle_guard = IdlePhaseGuard::new(
-        state.events.clone(),
-        cid.as_str().to_owned(),
-    );
+    let idle_guard = IdlePhaseGuard::new(state.events.clone(), cid.as_str().to_owned());
     let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
         state.turn_cancel.clone(),
         cid.as_str().to_owned(),
@@ -2946,11 +3140,11 @@ async fn run_incognito_send(
             "enable_thinking": reasoning_enabled,
         })),
     };
-    let adapter = execlaw_model_adapter::adapter_for(
-        execlaw_model_adapter::ModelFamily::detect(&state.config.model_id),
-    );
-    let chat_req = adapter
-        .prepare_request(base_req, execlaw_model_adapter::OutputHint::Conversation);
+    let adapter = execlaw_model_adapter::adapter_for(execlaw_model_adapter::ModelFamily::detect(
+        &state.config.model_id,
+    ));
+    let chat_req =
+        adapter.prepare_request(base_req, execlaw_model_adapter::OutputHint::Conversation);
     let mut stream = match inference.chat_completions_stream(&chat_req).await {
         Ok(s) => s,
         Err(e) => return err_500(&format!("incognito stream open: {e}")),
@@ -3137,21 +3331,20 @@ pub async fn generate_title(
             .into_response();
     }
 
-    let inference =
-        match state.inference.resolve(&state.db, BackendPurpose::Standard) {
-            Some(c) => c,
-            None => {
-                return (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "conversation_id": conversation_id,
-                        "title": null,
-                        "skipped": true,
-                    })),
-                )
-                    .into_response();
-            }
-        };
+    let inference = match state.inference.resolve(&state.db, BackendPurpose::Standard) {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "title": null,
+                    "skipped": true,
+                })),
+            )
+                .into_response();
+        }
+    };
 
     let system = "You produce very short titles for chat conversations. \
                   Reply with ONLY the title — 3 to 5 words, no quotes, no \
@@ -3161,16 +3354,11 @@ pub async fn generate_title(
     let user_prompt = if assistant_text.is_empty() {
         format!("First message: {user_text}\n\nTitle:")
     } else {
-        format!(
-            "First message: {user_text}\n\nAssistant reply: {assistant_text}\n\nTitle:"
-        )
+        format!("First message: {user_text}\n\nAssistant reply: {assistant_text}\n\nTitle:")
     };
     let req = ChatRequest {
         model: ModelId(state.config.model_id.clone()),
-        messages: vec![
-            ChatMessage::system(system),
-            ChatMessage::user(user_prompt),
-        ],
+        messages: vec![ChatMessage::system(system), ChatMessage::user(user_prompt)],
         tools: None,
         stream: false,
         temperature: Some(0.2),
@@ -3180,9 +3368,9 @@ pub async fn generate_title(
         // never wants reasoning).
         chat_template_kwargs: None,
     };
-    let adapter = execlaw_model_adapter::adapter_for(
-        execlaw_model_adapter::ModelFamily::detect(&state.config.model_id),
-    );
+    let adapter = execlaw_model_adapter::adapter_for(execlaw_model_adapter::ModelFamily::detect(
+        &state.config.model_id,
+    ));
     let adapted = match adapter
         .chat(&inference, req, execlaw_model_adapter::OutputHint::Plain)
         .await
@@ -3253,9 +3441,7 @@ fn sanitize_generated_title(raw: &str) -> String {
         s = first_line.trim().to_owned();
     }
     // Trailing period/comma/semicolon — strip.
-    s = s
-        .trim_end_matches(['.', ',', ';', ':'])
-        .to_owned();
+    s = s.trim_end_matches(['.', ',', ';', ':']).to_owned();
     if s.chars().count() > 60 {
         s = s.chars().take(60).collect::<String>().trim().to_owned();
     }
@@ -3518,9 +3704,7 @@ mod tests {
         // refused → 500. That status delta is the regression
         // canary if anyone accidentally re-introduces
         // `state.inference` as a single Option.
-        use execlaw_core::backends::{
-            BackendMode, BackendPurpose, BackendStore, BackendUpsert,
-        };
+        use execlaw_core::backends::{BackendMode, BackendPurpose, BackendStore, BackendUpsert};
 
         let state = crate::routes::test_app_state();
         // Plant a Backends row pointing at a port nothing's
@@ -3641,8 +3825,7 @@ mod tests {
             let actor = m["actor"].as_str();
             let text = m["text"].as_str().unwrap_or("");
             assert!(
-                !(kind == "user_msg"
-                    && actor == Some(SYSTEM_ORCHESTRATOR_ACTOR)),
+                !(kind == "user_msg" && actor == Some(SYSTEM_ORCHESTRATOR_ACTOR)),
                 "synthetic orchestrator user_msg leaked into list_messages: {m:?}",
             );
             assert!(
@@ -3689,10 +3872,7 @@ mod tests {
         // 200-char query becomes "first 60 chars…" so the loader
         // pill stays one line.
         let long: String = "a".repeat(200);
-        let label = super::humanise_tool_call(
-            "web_search",
-            &serde_json::json!({"query": long}),
-        );
+        let label = super::humanise_tool_call("web_search", &serde_json::json!({"query": long}));
         let inside = label
             .trim_start_matches("Searching the web for “")
             .trim_end_matches("”");
@@ -3864,13 +4044,8 @@ mod tests {
         // Turn context goes LAST so the most-recent runtime facts
         // (time, sender, trust) sit closest to the user message.
         let state = test_app_state();
-        let prompt = super::assemble_system_prompt(
-            &state.db,
-            None,
-            "BASE",
-            "ROUTING",
-            "TURN_CONTEXT_HERE",
-        );
+        let prompt =
+            super::assemble_system_prompt(&state.db, None, "BASE", "ROUTING", "TURN_CONTEXT_HERE");
         let routing_at = prompt.find("ROUTING").unwrap();
         let ctx_at = prompt.find("TURN_CONTEXT_HERE").unwrap();
         assert!(
@@ -3884,12 +4059,8 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2026-05-02T10:23:45Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let prose = super::build_turn_context_prose(
-            now,
-            "conv-abc",
-            Some("controller"),
-            "Controller",
-        );
+        let prose =
+            super::build_turn_context_prose(now, "conv-abc", Some("controller"), "Controller");
         assert!(prose.contains("2026-05-02T10:23:45Z"));
         assert!(prose.contains("conv-abc"));
         assert!(prose.contains("controller"));
@@ -3902,12 +4073,7 @@ mod tests {
         // yet; the line just disappears rather than emitting "From
         // principal: `none`" which the model could misread.
         let now = chrono::Utc::now();
-        let prose = super::build_turn_context_prose(
-            now,
-            "conv-x",
-            None,
-            "Controller",
-        );
+        let prose = super::build_turn_context_prose(now, "conv-x", None, "Controller");
         assert!(!prose.contains("From principal"));
         assert!(prose.contains("conv-x"));
         assert!(prose.contains("Controller"));
@@ -3945,26 +4111,17 @@ mod tests {
     fn rewrite_url_swaps_loopback_for_host_gateway_alias() {
         // 127.0.0.1 → host alias.
         assert_eq!(
-            super::rewrite_url_with_alias(
-                "http://127.0.0.1:8101/v1",
-                "host.docker.internal",
-            ),
+            super::rewrite_url_with_alias("http://127.0.0.1:8101/v1", "host.docker.internal",),
             "http://host.docker.internal:8101/v1",
         );
         // localhost → host alias (case-insensitive on the host).
         assert_eq!(
-            super::rewrite_url_with_alias(
-                "http://localhost:11434/v1",
-                "host.docker.internal",
-            ),
+            super::rewrite_url_with_alias("http://localhost:11434/v1", "host.docker.internal",),
             "http://host.docker.internal:11434/v1",
         );
         // Custom alias passes through to the output.
         assert_eq!(
-            super::rewrite_url_with_alias(
-                "http://127.0.0.1:8101/v1",
-                "host.lima.internal",
-            ),
+            super::rewrite_url_with_alias("http://127.0.0.1:8101/v1", "host.lima.internal",),
             "http://host.lima.internal:8101/v1",
         );
         // Real DNS / private-net IPs untouched.
@@ -3976,10 +4133,7 @@ mod tests {
             "http://infer.execlaw.local:8000/v1",
         );
         assert_eq!(
-            super::rewrite_url_with_alias(
-                "http://192.168.1.50:8000/v1",
-                "host.docker.internal",
-            ),
+            super::rewrite_url_with_alias("http://192.168.1.50:8000/v1", "host.docker.internal",),
             "http://192.168.1.50:8000/v1",
         );
     }
@@ -4003,15 +4157,13 @@ mod tests {
         // A conversation-scope tone override must show up in the
         // composed prompt for that conversation but not for others.
         let state = test_app_state();
-        let store =
-            execlaw_core::personality::PersonalityStore::new(&state.db);
+        let store = execlaw_core::personality::PersonalityStore::new(&state.db);
         let mut over_fields = std::collections::HashSet::new();
         over_fields.insert(execlaw_core::personality::PersonalityField::Tone);
         store
             .upsert(
                 &execlaw_core::personality::PersonalityUpsert {
-                    scope_kind:
-                        execlaw_core::personality::PersonalityScopeKind::Conversation,
+                    scope_kind: execlaw_core::personality::PersonalityScopeKind::Conversation,
                     scope_ref: "conv-pirate".into(),
                     display_name: "".into(),
                     role: "".into(),
@@ -4028,13 +4180,7 @@ mod tests {
             )
             .unwrap();
 
-        let pirate = super::assemble_system_prompt(
-            &state.db,
-            Some("conv-pirate"),
-            "BASE",
-            "",
-            "",
-        );
+        let pirate = super::assemble_system_prompt(&state.db, Some("conv-pirate"), "BASE", "", "");
         let plain = super::assemble_system_prompt(&state.db, None, "BASE", "", "");
         assert!(pirate.contains("# Tone\nPirate"));
         assert!(!plain.contains("Pirate"));
@@ -4130,14 +4276,9 @@ mod tests {
         // should still see both boundary events.
         let state = crate::routes::test_app_state();
         let mut rx = state.events.subscribe();
-        let outcome = super::dispatch_routine_turn(
-            &state,
-            "rt-test",
-            None,
-            "do the thing",
-        )
-        .await
-        .expect("stub turn fallback should succeed");
+        let outcome = super::dispatch_routine_turn(&state, "rt-test", None, "do the thing")
+            .await
+            .expect("stub turn fallback should succeed");
         assert!(
             outcome.conversation_id.starts_with("routine-rt-test-"),
             "auto-mint convention: {}",
@@ -4147,12 +4288,7 @@ mod tests {
         let mut saw_thinking = false;
         let mut saw_idle = false;
         for _ in 0..32 {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                rx.recv(),
-            )
-            .await
-            {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
                 Ok(Ok(UiEvent::ConversationPhaseChanged { phase, .. })) => {
                     if phase == "thinking" {
                         saw_thinking = true;
@@ -4234,18 +4370,23 @@ mod tests {
         use execlaw_core::ids::ConversationId;
 
         // Same key: replay succeeds.
-        let good_log = EventLog::new(&db).with_hmac_key(
-            state.event_log_hmac_key.as_ref().unwrap().as_ref().clone(),
-        );
+        let good_log = EventLog::new(&db)
+            .with_hmac_key(state.event_log_hmac_key.as_ref().unwrap().as_ref().clone());
         let got = good_log
-            .replay_since(&ConversationId::from("conv1"), execlaw_core::ids::EventSeq(0))
+            .replay_since(
+                &ConversationId::from("conv1"),
+                execlaw_core::ids::EventSeq(0),
+            )
             .unwrap();
         assert_eq!(got.len(), 2);
 
         // Different key: TamperDetected.
         let bad_log = EventLog::new(&db).with_hmac_key(b"wrong-key".to_vec());
         let err = bad_log
-            .replay_since(&ConversationId::from("conv1"), execlaw_core::ids::EventSeq(0))
+            .replay_since(
+                &ConversationId::from("conv1"),
+                execlaw_core::ids::EventSeq(0),
+            )
             .unwrap_err();
         assert!(matches!(err, execlaw_core::DbError::TamperDetected(_)));
     }
@@ -4282,9 +4423,8 @@ mod tests {
         use execlaw_core::ids::{ConversationId, EventSeq};
 
         let state = test_app_state();
-        let log = EventLog::new(&state.db).with_hmac_key(
-            state.event_log_hmac_key.as_ref().unwrap().as_ref().clone(),
-        );
+        let log = EventLog::new(&state.db)
+            .with_hmac_key(state.event_log_hmac_key.as_ref().unwrap().as_ref().clone());
         let cid = ConversationId::from("crash-conv");
 
         // Commit a turn that emits a tool_use without a matching
@@ -4317,11 +4457,7 @@ mod tests {
         let uses: Vec<u32> = events
             .iter()
             .filter(|e| e.kind == EventKind::ToolUse)
-            .map(|e| {
-                e.decode_payload::<ToolUsePayload>()
-                    .unwrap()
-                    .ordinal
-            })
+            .map(|e| e.decode_payload::<ToolUsePayload>().unwrap().ordinal)
             .collect();
         let results: Vec<(u32, bool)> = events
             .iter()
@@ -4605,7 +4741,10 @@ mod tests {
                 _ => break,
             }
         }
-        assert!(saw_alert, "expected AlertFired with source core.cold_contact");
+        assert!(
+            saw_alert,
+            "expected AlertFired with source core.cold_contact"
+        );
     }
 
     /// Adversarial: an injection attempt from an untrusted sender
@@ -4802,9 +4941,7 @@ required_capabilities = []
         app: &axum::Router,
         token: Option<&str>,
     ) -> (StatusCode, serde_json::Value) {
-        let mut req = Request::builder()
-            .method(Method::GET)
-            .uri("/api/chats");
+        let mut req = Request::builder().method(Method::GET).uri("/api/chats");
         if let Some(t) = token {
             req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
         }

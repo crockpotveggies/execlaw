@@ -674,15 +674,10 @@ mod tests {
         );
         let cid2 = ConversationId::from("conv-phase-obs");
         let cfg2 = TurnConfig {
-            phase_observer: Some(
-                recorder.clone() as std::sync::Arc<dyn PhaseObserver>,
-            ),
+            phase_observer: Some(recorder.clone() as std::sync::Arc<dyn PhaseObserver>),
             ..cfg.clone()
         };
-        let _ = exec2
-            .run_turn(&db, &cid2, "go", None, &cfg2)
-            .await
-            .unwrap();
+        let _ = exec2.run_turn(&db, &cid2, "go", None, &cfg2).await.unwrap();
         let seen = recorder.seen.lock().unwrap().clone();
         // One round → AwaitingTool then Thinking.
         assert_eq!(

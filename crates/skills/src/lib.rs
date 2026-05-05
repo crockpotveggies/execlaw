@@ -44,10 +44,7 @@ pub mod store;
 pub mod summarizer;
 pub mod tools;
 
-pub use capture::{
-    AutoCaptureSink, AutoCaptureWorker, CaptureOutcome, CaptureRequest,
-};
-pub use reuse_update::{ReuseUpdateRequest, ReuseUpdateSink, ReuseUpdateWorker};
+pub use capture::{AutoCaptureSink, AutoCaptureWorker, CaptureOutcome, CaptureRequest};
 pub use import::{
     ImportFailure, ImportReport, import_plugin_skills, namespaced_name, sanitize_local_name,
 };
@@ -56,11 +53,12 @@ pub use model::{
     RegistrationKind, ResourceBlob, Skill, SkillError, SkillId, SkillIndexEntry, SkillMatch,
     SkillProposal, SkillResource, SkillState, SkillVersion, SkillView, VersionId,
 };
+pub use reuse_update::{ReuseUpdateRequest, ReuseUpdateSink, ReuseUpdateWorker};
 pub use sanitizer::{SanitizationReport, SanitizedStep, sanitize_step};
 pub use scanner::{Finding, FindingKind, ScanInput, ScanVerdict, Severity, Strictness, scan};
 pub use store::SkillStore;
 pub use summarizer::{
-    DraftSkillProposal, SkillSummarizer, SummarizerOutput, SummarizerPrompt, build_improvement_prompt,
-    build_prompt, parse_response,
+    DraftSkillProposal, SkillSummarizer, SummarizerOutput, SummarizerPrompt,
+    build_improvement_prompt, build_prompt, parse_response,
 };
 pub use tools::skill_tools;

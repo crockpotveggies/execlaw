@@ -25,9 +25,7 @@ use crate::events::EventBus;
 use async_trait::async_trait;
 use execlaw_core::Database;
 use execlaw_core::attachments::AttachmentStore;
-use execlaw_core::cards::{
-    CardAction, CardClosedPayload, CardKind, CardOpenedPayload, CardState,
-};
+use execlaw_core::cards::{CardAction, CardClosedPayload, CardKind, CardOpenedPayload, CardState};
 // CardAction includes only its enum variants; no separate Kind type.
 use execlaw_core::ids::{AttachmentId, ConversationId};
 use execlaw_core::tool::{ApiError, AttachmentApi, DeliveredAttachmentView};
@@ -62,9 +60,7 @@ impl AttachmentApi for ServerAttachmentApi {
             .await
             .map_err(|e| ApiError::Storage(format!("join: {e}")))?
             .map_err(|e| ApiError::Storage(e.to_string()))?
-            .ok_or_else(|| {
-                ApiError::NotFound(format!("no attachment '{attachment_id}'"))
-            })?;
+            .ok_or_else(|| ApiError::NotFound(format!("no attachment '{attachment_id}'")))?;
 
         // Trust scope: refuse to deliver an attachment that belongs
         // to a different conversation. NotFound (not NotAuthorized)
@@ -94,9 +90,7 @@ impl AttachmentApi for ServerAttachmentApi {
             .map(|c| c.trim())
             .filter(|c| !c.is_empty())
             .map(str::to_owned);
-        let title = title_caption
-            .clone()
-            .unwrap_or_else(|| filename.clone());
+        let title = title_caption.clone().unwrap_or_else(|| filename.clone());
         let summary = format!(
             "{filename} ({mime})",
             filename = filename,
@@ -296,7 +290,11 @@ mod tests {
             other => panic!("expected CardOpened, got {other:?}"),
         }
         match evt2 {
-            crate::events::UiEvent::CardClosed { state, attachment_id, .. } => {
+            crate::events::UiEvent::CardClosed {
+                state,
+                attachment_id,
+                ..
+            } => {
                 assert_eq!(state, "Completed");
                 assert_eq!(attachment_id.as_deref(), Some(att_id.as_str()));
             }

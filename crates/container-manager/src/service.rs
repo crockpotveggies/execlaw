@@ -179,11 +179,8 @@ pub trait ServiceController: Send + Sync {
     /// logs" affordance. Best-effort: callers must tolerate Ok(empty)
     /// for containers that haven't emitted anything yet, and Err
     /// only for protocol-level failures (Docker daemon unreachable).
-    async fn tail_logs(
-        &self,
-        handle: &ServiceHandle,
-        lines: usize,
-    ) -> Result<String, ServiceError>;
+    async fn tail_logs(&self, handle: &ServiceHandle, lines: usize)
+    -> Result<String, ServiceError>;
 
     /// Look up an existing container by name. Returns
     /// `Ok(Some(handle))` when a container with that name exists
@@ -256,9 +253,7 @@ impl ServiceController for BollardServiceController {
             StopContainerOptions,
         };
         use bollard::image::CreateImageOptions;
-        use bollard::secret::{
-            DeviceRequest, HostConfig, HostConfigLogConfig, PortBinding,
-        };
+        use bollard::secret::{DeviceRequest, HostConfig, HostConfigLogConfig, PortBinding};
         use futures_util::StreamExt;
         use std::collections::HashMap;
 
@@ -419,13 +414,11 @@ impl ServiceController for BollardServiceController {
                 // error which the supervisor reports as CrashLooping
                 // — the operator gets a real signal instead of a
                 // silent CPU fallback that pretends to be GPU mode.
-                devices = Some(vec![
-                    bollard::secret::DeviceMapping {
-                        path_on_host: Some("/dev/dri".into()),
-                        path_in_container: Some("/dev/dri".into()),
-                        cgroup_permissions: Some("rwm".into()),
-                    },
-                ]);
+                devices = Some(vec![bollard::secret::DeviceMapping {
+                    path_on_host: Some("/dev/dri".into()),
+                    path_in_container: Some("/dev/dri".into()),
+                    cgroup_permissions: Some("rwm".into()),
+                }]);
             }
             // AMD or no vendor → no device passthrough. The container
             // runs CPU-only; the inference image's startup script
@@ -471,19 +464,18 @@ impl ServiceController for BollardServiceController {
             log_config: Some(HostConfigLogConfig {
                 typ: Some("json-file".into()),
                 config: Some(
-                    [("max-size".into(), "10m".into()), ("max-file".into(), "3".into())]
-                        .into_iter()
-                        .collect(),
+                    [
+                        ("max-size".into(), "10m".into()),
+                        ("max-file".into(), "3".into()),
+                    ]
+                    .into_iter()
+                    .collect(),
                 ),
             }),
             ..Default::default()
         };
 
-        let env: Vec<String> = spec
-            .env
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect();
+        let env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
         let cfg = Config {
             image: Some(spec.image.clone()),
             cmd: Some(spec.args.clone()),
@@ -558,10 +550,7 @@ impl ServiceController for BollardServiceController {
                     // the in-container service has finished
                     // bootstrapping.
                     Ok(ServiceStatus::Starting)
-                } else if restart_count >= 3
-                    || exit_code != 0
-                    || state.dead.unwrap_or(false)
-                {
+                } else if restart_count >= 3 || exit_code != 0 || state.dead.unwrap_or(false) {
                     Ok(ServiceStatus::CrashLooping { restart_count })
                 } else {
                     Ok(ServiceStatus::Stopped)
@@ -600,11 +589,7 @@ impl ServiceController for BollardServiceController {
             .await
         {
             Ok(info) => {
-                let running = info
-                    .state
-                    .as_ref()
-                    .and_then(|s| s.running)
-                    .unwrap_or(false);
+                let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
                 if !running {
                     // Container exists but is stopped / dead. Caller
                     // proceeds to spawn fresh, which force-removes
@@ -624,8 +609,7 @@ impl ServiceController for BollardServiceController {
                 }))
             }
             Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 404,
-                ..
+                status_code: 404, ..
             }) => Ok(None),
             Err(e) => Err(ServiceError::Runtime(format!("inspect (adopt): {e}"))),
         }
@@ -663,9 +647,7 @@ impl ServiceController for BollardServiceController {
                     // Container removed mid-read isn't fatal — return
                     // whatever we collected so far.
                     if out.is_empty() {
-                        return Err(ServiceError::Runtime(format!(
-                            "logs stream: {e}"
-                        )));
+                        return Err(ServiceError::Runtime(format!("logs stream: {e}")));
                     }
                     break;
                 }

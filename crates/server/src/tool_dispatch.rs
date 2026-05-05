@@ -84,6 +84,21 @@ pub struct ChainedToolDispatch<B: BuiltinTools> {
     /// for the next scheduled tick. `None` short-circuits to the
     /// tick-only path (fine for tests).
     pub research_supervisor_wake: Option<Arc<tokio::sync::Notify>>,
+    /// Phase 3 — Signal transport endpoint resolver. Production
+    /// wires the [`crate::sidecar_supervisor::SidecarSupervisor`]
+    /// here; tests pass a `StaticEndpointResolver` that points at
+    /// an in-process axum mock. `None` keeps `Capability::Transport`
+    /// dormant — `signal.send_message` and `signal.reply` surface
+    /// `Denied("transport capability not granted")`. Wraps in
+    /// `Arc<dyn>` rather than the concrete supervisor so non-signal
+    /// transports can land here later without churn.
+    pub signal_transport_resolver: Option<Arc<dyn crate::signal_transport::RpcEndpointResolver>>,
+    /// Phase 3 — controller's registered Signal phone number,
+    /// e.g. `+15551234567`. Read once at boot from
+    /// `EXECLAW_SIGNAL_CONTROLLER_NUMBER`; flowed through the
+    /// per-turn `SignalCliTransport` so `send` can populate
+    /// signal-cli-rest-api's required `number` field.
+    pub signal_self_number: Option<String>,
 }
 
 impl<B: BuiltinTools> ChainedToolDispatch<B> {
@@ -103,6 +118,8 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             inference: None,
             events: None,
             research_supervisor_wake: None,
+            signal_transport_resolver: None,
+            signal_self_number: None,
         }
     }
 
@@ -128,6 +145,8 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             inference: None,
             events: None,
             research_supervisor_wake: None,
+            signal_transport_resolver: None,
+            signal_self_number: None,
         }
     }
 
@@ -184,11 +203,40 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
     /// claiming the new Pending row — which is the dominant source
     /// of "the agent took a while to come back with the
     /// clarification question" wall-clock latency.
-    pub fn with_research_supervisor_wake(
-        mut self,
-        wake: Arc<tokio::sync::Notify>,
-    ) -> Self {
+    pub fn with_research_supervisor_wake(mut self, wake: Arc<tokio::sync::Notify>) -> Self {
         self.research_supervisor_wake = Some(wake);
+        self
+    }
+
+    /// Phase 3 — wire the Signal transport. `resolver` is the
+    /// supervised sidecar's host-port lookup (production passes the
+    /// `SidecarSupervisor`); `self_number` is the controller's
+    /// registered Signal number, read at dispatcher construction
+    /// time from `EXECLAW_SIGNAL_CONTROLLER_NUMBER`. Either `None`
+    /// keeps the transport capability dormant — calls return
+    /// `Denied`.
+    pub fn with_signal_transport(
+        mut self,
+        resolver: Arc<dyn crate::signal_transport::RpcEndpointResolver>,
+        self_number: Option<String>,
+    ) -> Self {
+        self.signal_transport_resolver = Some(resolver);
+        self.signal_self_number = self_number;
+        self
+    }
+
+    /// Convenience: pass `Option<Arc<dyn ...>>` directly so the
+    /// production call site can avoid an `if-let` ladder. The
+    /// supervisor lives behind `AppState::sidecar_supervisor:
+    /// Option<...>`, so the caller is already holding an
+    /// `Option`-wrapped value; this lets it flow through unchanged.
+    pub fn with_signal_transport_opt(
+        mut self,
+        resolver: Option<Arc<dyn crate::signal_transport::RpcEndpointResolver>>,
+        self_number: Option<String>,
+    ) -> Self {
+        self.signal_transport_resolver = resolver;
+        self.signal_self_number = self_number;
         self
     }
 
@@ -319,9 +367,47 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
                 now,
             )));
         }
-        let needs_attachment_send = caps
-            .iter()
-            .any(|c| matches!(c, Capability::AttachmentSend));
+        let needs_transport = caps.iter().any(|c| matches!(c, Capability::Transport));
+        if needs_transport {
+            if let Some(resolver) = self.signal_transport_resolver.as_ref() {
+                // Phase 4 — resolve `current_chat_id` from the
+                // conversation's `principal_group_id`. The chain:
+                //   1. conversation_id → state_conversations.principal_group_id
+                //   2. principal_group_id + "signal" → state_transport_bindings.foreign_id
+                // A miss at either step (controller-initiated chat,
+                // group with no Signal binding, etc.) leaves
+                // `current_chat_id = None` and `signal.reply` returns
+                // `no_inbound_context` — the tool's own precondition
+                // surface, not a silent dispatch against the wrong
+                // recipient.
+                let pg_store =
+                    execlaw_core::principal_groups::PrincipalGroupStore::new(self.host.db());
+                let binding_store =
+                    execlaw_core::transport_bindings::TransportBindingStore::new(self.host.db());
+                let current_chat_id = pg_store
+                    .principal_group_id_for(ctx.conversation_id.as_str())
+                    .ok()
+                    .flatten()
+                    .and_then(|pg_id| {
+                        binding_store
+                            .bindings_for_group(&pg_id, crate::signal_transport::SIGNAL_CHANNEL)
+                            .ok()
+                            .and_then(|mut v| v.pop().map(|b| b.foreign_id))
+                    });
+                let transport = crate::signal_transport::SignalCliTransport::new(
+                    resolver.clone(),
+                    self.host.db().clone(),
+                    self.signal_self_number.clone(),
+                    current_chat_id,
+                )
+                .with_caller_conversation_id(ctx.conversation_id.clone());
+                ctx.transport = Some(Arc::new(transport));
+            }
+            // No resolver wired (test fixture / boot order race) →
+            // ctx.transport stays None and the tool body's own
+            // capability-not-granted denial fires.
+        }
+        let needs_attachment_send = caps.iter().any(|c| matches!(c, Capability::AttachmentSend));
         if needs_attachment_send {
             if let Some(events) = self.events.as_ref() {
                 ctx.attachments = Some(Arc::new(crate::attachment_api::ServerAttachmentApi::new(

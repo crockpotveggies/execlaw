@@ -195,7 +195,10 @@ mod tests {
         assert_eq!(sanitize_local_name("Query/Builder"), "query-builder");
         assert_eq!(sanitize_local_name("query!!builder"), "query-builder");
         assert_eq!(sanitize_local_name("--leading-dashes--"), "leading-dashes");
-        assert_eq!(sanitize_local_name("MULTI___under___score"), "multi-under-score");
+        assert_eq!(
+            sanitize_local_name("MULTI___under___score"),
+            "multi-under-score"
+        );
     }
 
     #[test]
@@ -230,7 +233,11 @@ mod tests {
     fn safe_resolve_rejects_absolute() {
         let dir = tempdir().unwrap();
         // Use a platform-appropriate absolute path.
-        let abs = if cfg!(windows) { "C:\\foo" } else { "/etc/passwd" };
+        let abs = if cfg!(windows) {
+            "C:\\foo"
+        } else {
+            "/etc/passwd"
+        };
         let r = safe_resolve(dir.path(), abs);
         assert!(r.is_err());
     }
@@ -240,11 +247,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let r = safe_resolve(dir.path(), "skills/sub/foo.md");
         assert!(r.is_ok());
-        assert!(
-            r.unwrap()
-                .strip_prefix(dir.path())
-                .is_ok()
-        );
+        assert!(r.unwrap().strip_prefix(dir.path()).is_ok());
     }
 
     // --- end-to-end import ---
@@ -282,13 +285,13 @@ mod tests {
         assert!(report.failed.is_empty(), "failures: {:?}", report.failed);
         assert_eq!(
             report.imported,
-            vec![
-                "postgres-toolkit/query-builder",
-                "postgres-toolkit/migrate"
-            ]
+            vec!["postgres-toolkit/query-builder", "postgres-toolkit/migrate"]
         );
 
-        let g = store.get("postgres-toolkit/query-builder").unwrap().unwrap();
+        let g = store
+            .get("postgres-toolkit/query-builder")
+            .unwrap()
+            .unwrap();
         assert_eq!(g.registration_kind, RegistrationKind::Shipped);
         assert_eq!(g.owning_plugin_id.as_deref(), Some("postgres-toolkit"));
         assert_eq!(g.state, SkillState::Trial);
@@ -419,10 +422,7 @@ mod tests {
         let report = import_plugin_skills(&store, "p", &decls, dir.path(), 1);
         assert_eq!(report.imported.len(), 0);
         assert_eq!(report.failed.len(), 1);
-        assert!(matches!(
-            report.failed[0].error,
-            SkillError::Blocked { .. }
-        ));
+        assert!(matches!(report.failed[0].error, SkillError::Blocked { .. }));
     }
 
     // --- archive cascade ---

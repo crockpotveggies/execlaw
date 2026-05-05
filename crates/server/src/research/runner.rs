@@ -328,13 +328,7 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
             // emits a `CardProgressed{phase: AwaitingInput}` (NOT a
             // CardClosed) so the SPA can render the paused state.
             await_input_for_clarification(
-                &db,
-                &events,
-                &job_id,
-                &conv_id,
-                &card_id,
-                &row.query,
-                &question,
+                &db, &events, &job_id, &conv_id, &card_id, &row.query, &question,
             )
             .await;
             let final_row = {
@@ -345,9 +339,7 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
                     .map_err(|e| ResearchRunnerError::Inference(format!("join: {e}")))??
             };
             return final_row.ok_or_else(|| {
-                ResearchRunnerError::Store(ResearchError::NotFound(
-                    job_id.as_str().to_owned(),
-                ))
+                ResearchRunnerError::Store(ResearchError::NotFound(job_id.as_str().to_owned()))
             });
         }
         Err(e) => {
@@ -528,8 +520,7 @@ pub async fn run_gather_phase(
     // Settings → Search was silently ignored on research jobs.
     // Reported as "DDG anomaly bot-detection" failures despite
     // Brave being the configured default.
-    let search: Arc<dyn WebSearchApi> =
-        crate::search_resolver::resolve_active_provider(db);
+    let search: Arc<dyn WebSearchApi> = crate::search_resolver::resolve_active_provider(db);
     let fetch: Arc<dyn WebFetchApi> = Arc::new(HttpWebFetchApi::new());
     let subagent: Arc<dyn SubagentApi> = Arc::new(InferenceSubagentApi::new(
         client.clone(),
@@ -796,11 +787,14 @@ async fn call_planner(
         // for Qwen3); leave None here so the adapter's choice wins.
         chat_template_kwargs: None,
     };
-    let adapter = execlaw_model_adapter::adapter_for(
-        execlaw_model_adapter::ModelFamily::detect(model),
-    );
+    let adapter =
+        execlaw_model_adapter::adapter_for(execlaw_model_adapter::ModelFamily::detect(model));
     let adapted = adapter
-        .chat(client, req, execlaw_model_adapter::OutputHint::StructuredJson)
+        .chat(
+            client,
+            req,
+            execlaw_model_adapter::OutputHint::StructuredJson,
+        )
         .await
         .map_err(|e| ResearchRunnerError::Inference(e.to_string()))?;
     parse_plan(&adapted.content)
@@ -1154,7 +1148,9 @@ async fn await_input_for_clarification(
                 "clarification_question": question,
             })),
             actions: None,
-            summary: Some("Awaiting clarification — the agent will relay the planner's question.".into()),
+            summary: Some(
+                "Awaiting clarification — the agent will relay the planner's question.".into(),
+            ),
         },
     );
     if let Err(e) = progressed {
@@ -1333,7 +1329,11 @@ mod tests {
         let raw = format!("Thinking Process:\n{}", "a".repeat(5000));
         let err = parse_plan(&raw).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.len() < 1000, "error message must be bounded; got {} chars", msg.len());
+        assert!(
+            msg.len() < 1000,
+            "error message must be bounded; got {} chars",
+            msg.len()
+        );
         assert!(msg.contains("no parseable JSON") || msg.contains("text was:"));
     }
 
@@ -1701,7 +1701,9 @@ mod tests {
         store.claim_next_pending("card-mf", 110).unwrap();
         // Pre-cancel — simulates the race where the operator cancel
         // landed before this gather-failure path runs mark_failed.
-        store.cancel_active(&id, Some("operator note"), 120).unwrap();
+        store
+            .cancel_active(&id, Some("operator note"), 120)
+            .unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
         crate::cards::open_card(

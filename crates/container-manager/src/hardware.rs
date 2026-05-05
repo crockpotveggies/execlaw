@@ -102,8 +102,7 @@ pub struct HardwareProfile {
 pub fn detect() -> HardwareProfile {
     match hardware_query::HardwareInfo::query() {
         Ok(hw) => {
-            let mut gpus: Vec<GpuDevice> =
-                hw.gpus().iter().map(GpuDevice::from_query).collect();
+            let mut gpus: Vec<GpuDevice> = hw.gpus().iter().map(GpuDevice::from_query).collect();
             apply_vram_corrections(&mut gpus);
             HardwareProfile {
                 gpus,
@@ -111,9 +110,7 @@ pub fn detect() -> HardwareProfile {
             }
         }
         Err(e) => {
-            tracing::warn!(
-                "hardware-query failed: {e}; reporting no GPUs (CPU-only fallback)"
-            );
+            tracing::warn!("hardware-query failed: {e}; reporting no GPUs (CPU-only fallback)");
             HardwareProfile {
                 gpus: Vec::new(),
                 source: SysfsSource::HardwareQuery,
@@ -569,11 +566,9 @@ mod tests {
         //   PCI\VEN_10DE&DEV_2230&SUBSYS_145910DE&REV_A1\4&8BD6E8D&0&0008
         //   PCI\VEN_8086&DEV_E20B&SUBSYS_11008086&REV_00\6&2421D8B7&0&000800E8
         // The user reported these rendering as multi-line badge text.
-        let pnp =
-            "PCI\\VEN_10DE&DEV_2230&SUBSYS_145910DE&REV_A1\\4&8BD6E8D&0&0008";
+        let pnp = "PCI\\VEN_10DE&DEV_2230&SUBSYS_145910DE&REV_A1\\4&8BD6E8D&0&0008";
         assert_eq!(extract_clean_device_hex(pnp), "0x2230");
-        let arc =
-            "PCI\\VEN_8086&DEV_E20B&SUBSYS_11008086&REV_00\\6&2421D8B7&0&000800E8";
+        let arc = "PCI\\VEN_8086&DEV_E20B&SUBSYS_11008086&REV_00\\6&2421D8B7&0&000800E8";
         assert_eq!(extract_clean_device_hex(arc), "0xe20b");
     }
 

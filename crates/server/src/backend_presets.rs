@@ -146,7 +146,10 @@ fn whisper_model_size_field() -> PresetField {
     PresetField {
         kind: "model_size".into(),
         label: "Model size".into(),
-        choices: WHISPER_MODEL_SIZES.iter().map(|s| (*s).to_owned()).collect(),
+        choices: WHISPER_MODEL_SIZES
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect(),
         default: WHISPER_DEFAULT_SIZE.into(),
         arg_template: "--model-size={value}".into(),
     }
@@ -338,10 +341,7 @@ pub fn all_presets() -> Vec<BackendPreset> {
 /// its vendor matches the detected GPU. CPU presets are recommended
 /// only when no GPU was detected; on GPU-equipped hosts the GPU-
 /// specific preset wins.
-pub fn presets_for(
-    purpose: BackendPurpose,
-    detected_vendors: &[GpuVendor],
-) -> Vec<PresetWithFlag> {
+pub fn presets_for(purpose: BackendPurpose, detected_vendors: &[GpuVendor]) -> Vec<PresetWithFlag> {
     let purpose_str = purpose.as_str();
     // Only count vendors we actually ship presets for. AMD hosts
     // *would* show up in `detected_vendors` if a Radeon were
@@ -363,7 +363,10 @@ pub fn presets_for(
                 "cpu" => !has_supported_gpu,
                 _ => false,
             };
-            PresetWithFlag { preset: p, recommended }
+            PresetWithFlag {
+                preset: p,
+                recommended,
+            }
         })
         .collect()
 }

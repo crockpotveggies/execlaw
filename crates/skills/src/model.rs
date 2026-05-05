@@ -327,7 +327,9 @@ pub enum SkillError {
     #[error(transparent)]
     Db(#[from] execlaw_core::db::DbError),
 
-    #[error("invalid skill name {0:?}: must match `<namespace>/<name>` (lowercase a-z, 0-9, hyphen)")]
+    #[error(
+        "invalid skill name {0:?}: must match `<namespace>/<name>` (lowercase a-z, 0-9, hyphen)"
+    )]
     InvalidName(String),
 
     #[error("skill not found: {0}")]
@@ -431,18 +433,18 @@ mod tests {
     #[test]
     fn validate_skill_name_rejects_uppercase_punctuation_and_double_slash() {
         for bad in [
-            "Research/Sources",          // uppercase
-            "research/gather sources",   // space
-            "research//double",          // empty middle segment
-            "/leading-slash",            // empty first segment
-            "trailing/",                 // empty last segment
-            "no-slash-at-all",           // no slash
-            "too/many/slashes",          // multiple slashes
-            "-leading-hyphen/name",      // leading hyphen
-            "name/-leading-hyphen",      // leading hyphen in second
-            "a/b!",                      // punctuation
-            "ab",                        // too short
-            &"x".repeat(200),            // too long
+            "Research/Sources",        // uppercase
+            "research/gather sources", // space
+            "research//double",        // empty middle segment
+            "/leading-slash",          // empty first segment
+            "trailing/",               // empty last segment
+            "no-slash-at-all",         // no slash
+            "too/many/slashes",        // multiple slashes
+            "-leading-hyphen/name",    // leading hyphen
+            "name/-leading-hyphen",    // leading hyphen in second
+            "a/b!",                    // punctuation
+            "ab",                      // too short
+            &"x".repeat(200),          // too long
         ] {
             assert!(
                 validate_skill_name(bad).is_err(),

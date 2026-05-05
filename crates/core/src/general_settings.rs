@@ -75,27 +75,28 @@ impl<'a> GeneralSettingsStore<'a> {
     /// so this should never return `None` in production; the
     /// `Result<Option<_>>` shape is defensive against migration drift.
     pub fn get(&self) -> Result<Option<GeneralSettings>, GeneralSettingsError> {
-        self.db.with_conn(|c| {
-            let mut stmt = c.prepare(
-                "SELECT start_on_boot, bind_address, updated_at, \
+        self.db
+            .with_conn(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT start_on_boot, bind_address, updated_at, \
                         setup_wizard_dismissed_at, history_retention_days \
                  FROM config_general WHERE id = 1",
-            )?;
-            let row = stmt
-                .query_row([], |r| {
-                    let raw_retention: i64 = r.get(4)?;
-                    Ok(GeneralSettings {
-                        start_on_boot: r.get::<_, i64>(0)? != 0,
-                        bind_address: r.get(1)?,
-                        updated_at: r.get(2)?,
-                        setup_wizard_dismissed_at: r.get(3)?,
-                        history_retention_days: raw_retention.max(0) as u32,
+                )?;
+                let row = stmt
+                    .query_row([], |r| {
+                        let raw_retention: i64 = r.get(4)?;
+                        Ok(GeneralSettings {
+                            start_on_boot: r.get::<_, i64>(0)? != 0,
+                            bind_address: r.get(1)?,
+                            updated_at: r.get(2)?,
+                            setup_wizard_dismissed_at: r.get(3)?,
+                            history_retention_days: raw_retention.max(0) as u32,
+                        })
                     })
-                })
-                .ok();
-            Ok(row)
-        })
-        .map_err(GeneralSettingsError::from)
+                    .ok();
+                Ok(row)
+            })
+            .map_err(GeneralSettingsError::from)
     }
 
     /// Cheap "is the first-run wizard considered complete?" probe.
@@ -134,7 +135,9 @@ impl<'a> GeneralSettingsStore<'a> {
                 .ok();
             Ok(v)
         })?;
-        let Some(raw) = raw else { return Ok(Vec::new()) };
+        let Some(raw) = raw else {
+            return Ok(Vec::new());
+        };
         if raw.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -181,9 +184,13 @@ impl<'a> GeneralSettingsStore<'a> {
                 )));
             }
         }
-        let payload =
-            serde_json::to_string(&paths.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>())
-                .unwrap_or_else(|_| "[]".to_owned());
+        let payload = serde_json::to_string(
+            &paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| "[]".to_owned());
         self.db.with_conn(|c| {
             c.execute(
                 "UPDATE config_general SET hf_secondary_caches_json = ?1, updated_at = ?2 WHERE id = 1",
@@ -198,10 +205,7 @@ impl<'a> GeneralSettingsStore<'a> {
     /// twice just rewrites the timestamp. The wizard's "Skip for
     /// now" button calls this immediately before navigating to
     /// /chat.
-    pub fn dismiss_setup_wizard(
-        &self,
-        now: i64,
-    ) -> Result<GeneralSettings, GeneralSettingsError> {
+    pub fn dismiss_setup_wizard(&self, now: i64) -> Result<GeneralSettings, GeneralSettingsError> {
         self.update(
             &GeneralSettingsUpdate {
                 setup_wizard_dismissed: Some(true),
@@ -239,13 +243,12 @@ impl<'a> GeneralSettingsStore<'a> {
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .ok();
-            let (cur_boot, cur_bind, cur_dismissed, cur_retention) = current
-                .unwrap_or((
-                    1,
-                    "127.0.0.1:3030".to_owned(),
-                    None,
-                    crate::retention::DEFAULT_RETENTION_DAYS as i64,
-                ));
+            let (cur_boot, cur_bind, cur_dismissed, cur_retention) = current.unwrap_or((
+                1,
+                "127.0.0.1:3030".to_owned(),
+                None,
+                crate::retention::DEFAULT_RETENTION_DAYS as i64,
+            ));
             let new_boot = upd.start_on_boot.map(|b| b as i64).unwrap_or(cur_boot);
             let new_bind = upd.bind_address.clone().unwrap_or(cur_bind);
             let new_dismissed: Option<i64> = match upd.setup_wizard_dismissed {

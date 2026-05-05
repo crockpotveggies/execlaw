@@ -30,10 +30,24 @@ fn bench_bargein(c: &mut Criterion) {
         b.iter(|| is_backchannel(black_box("hold on let me check that for you")))
     });
     c.bench_function("decide_wait", |b| {
-        b.iter(|| decide(black_box(&cfg), black_box(50), black_box(""), black_box(true)))
+        b.iter(|| {
+            decide(
+                black_box(&cfg),
+                black_box(50),
+                black_box(""),
+                black_box(true),
+            )
+        })
     });
     c.bench_function("decide_rescind", |b| {
-        b.iter(|| decide(black_box(&cfg), black_box(150), black_box("yeah"), black_box(false)))
+        b.iter(|| {
+            decide(
+                black_box(&cfg),
+                black_box(150),
+                black_box("yeah"),
+                black_box(false),
+            )
+        })
     });
     c.bench_function("decide_confirm", |b| {
         b.iter(|| {
@@ -78,20 +92,12 @@ fn bench_conversation_kind_derive(c: &mut Criterion) {
     });
     group.bench_function("group_with_controller_present", |b| {
         b.iter(|| {
-            ConversationKind::derive(black_box(&[
-                "Controller",
-                "KnownTrusted",
-                "KnownTrusted",
-            ]))
+            ConversationKind::derive(black_box(&["Controller", "KnownTrusted", "KnownTrusted"]))
         })
     });
     group.bench_function("mixed_trust", |b| {
         b.iter(|| {
-            ConversationKind::derive(black_box(&[
-                "Controller",
-                "KnownLimited",
-                "KnownTrusted",
-            ]))
+            ConversationKind::derive(black_box(&["Controller", "KnownLimited", "KnownTrusted"]))
         })
     });
     group.finish();

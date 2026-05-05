@@ -59,9 +59,9 @@ impl ScriptPlugin {
         engine_factory: &ScriptEngine,
     ) -> ScriptResult<Self> {
         let engine = engine_factory.build_for_plugin(plugin_id);
-        let ast = engine.compile(source).map_err(|e| {
-            ScriptError::ParseError(format!("[{plugin_id}] compile: {e}"))
-        })?;
+        let ast = engine
+            .compile(source)
+            .map_err(|e| ScriptError::ParseError(format!("[{plugin_id}] compile: {e}")))?;
         Ok(Self {
             inner: Arc::new(ScriptPluginInner {
                 plugin_id: plugin_id.to_owned(),
@@ -148,10 +148,7 @@ impl ScriptPlugin {
                     if msg.contains("Function not found") {
                         ScriptError::MissingFunction(function)
                     } else {
-                        ScriptError::Runtime(format!(
-                            "[{}] {function}: {e}",
-                            inner.plugin_id,
-                        ))
+                        ScriptError::Runtime(format!("[{}] {function}: {e}", inner.plugin_id,))
                     }
                 })
         })
@@ -213,7 +210,10 @@ mod tests {
         let factory = ScriptEngine::new();
         let plugin = ScriptPlugin::from_source("test", src, &factory).unwrap();
         let mut oauth = serde_json::Map::new();
-        oauth.insert("controller".into(), serde_json::Value::String("ya29".into()));
+        oauth.insert(
+            "controller".into(),
+            serde_json::Value::String("ya29".into()),
+        );
         let r = plugin
             .identity_resolve("email", "alice@x.com", oauth)
             .await
@@ -234,7 +234,10 @@ mod tests {
             .identity_resolve("email", "x", serde_json::Map::new())
             .await
             .unwrap_err();
-        assert!(matches!(err, ScriptError::MissingFunction("identity_resolve")));
+        assert!(matches!(
+            err,
+            ScriptError::MissingFunction("identity_resolve")
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

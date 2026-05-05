@@ -19,7 +19,7 @@ use crate::events::UiEvent;
 use crate::state::AppState;
 use chrono::{DurationRound, TimeDelta, TimeZone, Utc};
 use execlaw_core::routines::{
-    next_fire_after, parse_cron, parse_timezone, RoutineRunStatus, RoutineStore,
+    RoutineRunStatus, RoutineStore, next_fire_after, parse_cron, parse_timezone,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -115,11 +115,7 @@ impl Inner {
         .await;
 
         let (dispatch_status, dispatch_error, conversation_id) = match outcome {
-            Ok(o) => (
-                RoutineRunStatus::Success,
-                None,
-                Some(o.conversation_id),
-            ),
+            Ok(o) => (RoutineRunStatus::Success, None, Some(o.conversation_id)),
             Err(e) => (
                 RoutineRunStatus::Failed,
                 Some(e),
@@ -188,7 +184,9 @@ mod tests {
     #[tokio::test]
     async fn tick_once_advances_next_run_at_for_every_due_routine() {
         let state = crate::routes::test_app_state();
-        let inner = Inner { state: state.clone() };
+        let inner = Inner {
+            state: state.clone(),
+        };
         let store = RoutineStore::new(&state.db);
         let now = Utc::now().timestamp();
 
@@ -214,7 +212,9 @@ mod tests {
     #[tokio::test]
     async fn tick_once_skips_disabled_routines() {
         let state = crate::routes::test_app_state();
-        let inner = Inner { state: state.clone() };
+        let inner = Inner {
+            state: state.clone(),
+        };
         let store = RoutineStore::new(&state.db);
         let now = Utc::now().timestamp();
 
@@ -245,7 +245,9 @@ mod tests {
     async fn tick_once_publishes_pending_then_terminal_event() {
         let state = crate::routes::test_app_state();
         let mut rx = state.events.subscribe();
-        let inner = Inner { state: state.clone() };
+        let inner = Inner {
+            state: state.clone(),
+        };
         let store = RoutineStore::new(&state.db);
         let now = Utc::now().timestamp();
 
@@ -259,12 +261,7 @@ mod tests {
         let mut pending_run_id: Option<String> = None;
         let mut terminal_seen = false;
         for _ in 0..32 {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                rx.recv(),
-            )
-            .await
-            {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
                 Ok(Ok(UiEvent::RoutineRunChanged {
                     routine_id,
                     run_id,
@@ -294,7 +291,9 @@ mod tests {
     #[tokio::test]
     async fn tick_once_isolates_failure_per_routine() {
         let state = crate::routes::test_app_state();
-        let inner = Inner { state: state.clone() };
+        let inner = Inner {
+            state: state.clone(),
+        };
         let store = RoutineStore::new(&state.db);
         let now = Utc::now().timestamp();
 
@@ -308,14 +307,16 @@ mod tests {
 
         // Corrupt the broken one's cron AFTER the upsert so the
         // recompute step fails for that row only.
-        state.db.with_conn(|c| {
-            c.execute(
-                "UPDATE config_routines SET schedule_cron = 'lol bad' WHERE id = ?1",
-                rusqlite::params![broken_id],
-            )?;
-            Ok(())
-        })
-        .unwrap();
+        state
+            .db
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE config_routines SET schedule_cron = 'lol bad' WHERE id = ?1",
+                    rusqlite::params![broken_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
 
         inner.tick_once().await.unwrap();
 
@@ -331,7 +332,9 @@ mod tests {
         // The runner should record Success and capture the
         // freshly-minted conversation_id in the run row.
         let state = crate::routes::test_app_state();
-        let inner = Inner { state: state.clone() };
+        let inner = Inner {
+            state: state.clone(),
+        };
         let store = RoutineStore::new(&state.db);
         let now = Utc::now().timestamp();
 

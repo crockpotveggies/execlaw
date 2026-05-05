@@ -27,8 +27,7 @@ use axum::response::Json;
 use axum::routing::get;
 use execlaw_core::audit::AuditStore;
 use execlaw_core::general_settings::{
-    GeneralSettings, GeneralSettingsError, GeneralSettingsStore,
-    GeneralSettingsUpdate,
+    GeneralSettings, GeneralSettingsError, GeneralSettingsStore, GeneralSettingsUpdate,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -110,11 +109,14 @@ pub async fn get_handler(
     _user: AuthedUser,
 ) -> Result<Json<GeneralSettingsView>, ApiError> {
     let store = GeneralSettingsStore::new(&state.db);
-    let row = store.get().map_err(ApiError::from)?.ok_or_else(|| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        code: "general_settings_missing",
-        message: "config_general singleton row missing — migration 0017 didn't run".into(),
-    })?;
+    let row = store
+        .get()
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "general_settings_missing",
+            message: "config_general singleton row missing — migration 0017 didn't run".into(),
+        })?;
     Ok(Json(row.into()))
 }
 
@@ -160,12 +162,15 @@ pub async fn put_handler(
         &user.user_id,
         "config_general",
         "general",
-        prior.as_ref().map(|p| {
-            serde_json::json!({
-                "start_on_boot": p.start_on_boot,
-                "bind_address": p.bind_address,
+        prior
+            .as_ref()
+            .map(|p| {
+                serde_json::json!({
+                    "start_on_boot": p.start_on_boot,
+                    "bind_address": p.bind_address,
+                })
             })
-        }).as_ref(),
+            .as_ref(),
         Some(&serde_json::json!({
             "start_on_boot": saved.start_on_boot,
             "bind_address": saved.bind_address,

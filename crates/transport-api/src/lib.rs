@@ -56,10 +56,7 @@ pub trait Transport: Send + Sync {
     /// `update.conversation_id`. Errors from this method are logged
     /// and swallowed — a transport that can't show typing dots is
     /// not a reason to abort the turn.
-    async fn on_phase_changed(
-        &self,
-        _update: ConversationPhaseUpdate,
-    ) -> anyhow::Result<()> {
+    async fn on_phase_changed(&self, _update: ConversationPhaseUpdate) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -90,10 +87,7 @@ mod tests {
         async fn send(&self, _: ConversationEvent) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn on_phase_changed(
-            &self,
-            update: ConversationPhaseUpdate,
-        ) -> anyhow::Result<()> {
+        async fn on_phase_changed(&self, update: ConversationPhaseUpdate) -> anyhow::Result<()> {
             self.last_was_processing
                 .store(update.is_processing, Ordering::SeqCst);
             if update.is_processing {

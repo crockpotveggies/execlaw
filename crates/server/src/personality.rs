@@ -23,15 +23,15 @@
 use crate::auth_extract::AuthedUser;
 use crate::routes::ApiError;
 use crate::state::AppState;
+use axum::Router;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::get;
-use axum::Router;
 use execlaw_core::audit::AuditStore;
 use execlaw_core::personality::{
-    compose_system_prompt, PersonalityError, PersonalityField, PersonalityRow, PersonalityScopeKind,
-    PersonalityStore, PersonalityUpsert,
+    PersonalityError, PersonalityField, PersonalityRow, PersonalityScopeKind, PersonalityStore,
+    PersonalityUpsert, compose_system_prompt,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -419,13 +419,16 @@ fn do_upsert(
         &user.user_id,
         "config_personality",
         &row_id,
-        prior.as_ref().map(|r| {
-            serde_json::json!({
-                "version": r.version,
-                "display_name": r.display_name,
-                "tone": r.tone,
+        prior
+            .as_ref()
+            .map(|r| {
+                serde_json::json!({
+                    "version": r.version,
+                    "display_name": r.display_name,
+                    "tone": r.tone,
+                })
             })
-        }).as_ref(),
+            .as_ref(),
         Some(&serde_json::json!({
             "version": row.version,
             "display_name": row.display_name,
@@ -476,7 +479,7 @@ mod tests {
     use super::*;
     use crate::routes::{build_router, test_app_state};
     use axum::body::{self, Body};
-    use axum::http::{header, Method, Request};
+    use axum::http::{Method, Request, header};
     use tower::ServiceExt;
 
     async fn setup_controller_token(app: &axum::Router) -> String {

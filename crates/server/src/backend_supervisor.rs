@@ -26,10 +26,10 @@ use execlaw_container_manager::{
     DownloadEvent, GpuVendor, HfDownloader, HostMount, ServiceController, ServiceError,
     ServiceHandle, ServiceSpec, ServiceStatus,
 };
+use execlaw_core::Database;
 use execlaw_core::alerts::{AlertRow, AlertStatus, AlertStore, Severity};
 use execlaw_core::backends::{BackendMode, BackendPurpose, BackendRow, BackendStore};
 use execlaw_core::ids::AlertId;
-use execlaw_core::Database;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -268,9 +268,10 @@ impl Default for ManagedSlot {
 /// blob produces a placeholder spec that the supervisor refuses to
 /// spawn (status stays `Stopped` until the operator fixes it).
 fn spec_from_row(row: &BackendRow) -> Result<ServiceSpec, String> {
-    let obj = row.model_spec_json.as_object().ok_or_else(|| {
-        "model_spec_json must be a JSON object for managed mode".to_string()
-    })?;
+    let obj = row
+        .model_spec_json
+        .as_object()
+        .ok_or_else(|| "model_spec_json must be a JSON object for managed mode".to_string())?;
     let image = obj
         .get("image")
         .and_then(|v| v.as_str())
@@ -326,10 +327,7 @@ fn spec_from_row(row: &BackendRow) -> Result<ServiceSpec, String> {
                 .filter_map(|m| {
                     let host = m.get("host_path")?.as_str()?.to_owned();
                     let container = m.get("container_path")?.as_str()?.to_owned();
-                    let read_only = m
-                        .get("read_only")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true);
+                    let read_only = m.get("read_only").and_then(|v| v.as_bool()).unwrap_or(true);
                     Some(HostMount {
                         host_path: host,
                         container_path: container,
@@ -697,8 +695,7 @@ impl BackendSupervisor {
             // intuition: "the container is already running; leave
             // it alone."
             if slot.handle.is_none() {
-                let expected_name =
-                    format!("execlaw-backend-{}", row.purpose.as_str());
+                let expected_name = format!("execlaw-backend-{}", row.purpose.as_str());
                 match self
                     .controller
                     .try_adopt(&expected_name, host_port_for(row.purpose))
@@ -786,11 +783,7 @@ impl BackendSupervisor {
                             }
                             // Done — inspect failure. Drop the task
                             // either way before falling through.
-                            let failure = task
-                                .failure
-                                .lock()
-                                .await
-                                .clone();
+                            let failure = task.failure.lock().await.clone();
                             slot.download_task = None;
                             slot.download_progress = None;
                             if let Some(err) = failure {
@@ -828,8 +821,7 @@ impl BackendSupervisor {
                                 model = %model_id,
                                 "model not in host cache; starting download"
                             );
-                            let task =
-                                spawn_download_task(downloader.clone(), &model_id);
+                            let task = spawn_download_task(downloader.clone(), &model_id);
                             slot.download_task = Some(task);
                             slot.stage = LifecycleStage::DownloadingModel;
                             slot.status = ServiceStatus::Pulling;
@@ -900,11 +892,7 @@ impl BackendSupervisor {
                     slot.handle = None;
                     slot.status = ServiceStatus::Stopped;
                     slot.stage = LifecycleStage::Idle;
-                    let _ = store.set_endpoint(
-                        row.purpose,
-                        None,
-                        chrono::Utc::now().timestamp(),
-                    );
+                    let _ = store.set_endpoint(row.purpose, None, chrono::Utc::now().timestamp());
                 }
                 ServiceStatus::CrashLooping { restart_count } => {
                     slot.status = ServiceStatus::CrashLooping { restart_count };
@@ -949,22 +937,13 @@ impl BackendSupervisor {
                             .map(|l| l.trim().to_owned());
                     }
                     slot.last_log_tail = Some(log_tail);
-                    emit_crashloop_alert(
-                        &self.db,
-                        row.purpose,
-                        &image_for_alert,
-                        &detail,
-                    );
+                    emit_crashloop_alert(&self.db, row.purpose, &image_for_alert, &detail);
                     if slot.restart_attempts < MAX_RESTART_ATTEMPTS {
                         // Stop + drop handle so the next tick respawns.
                         let _ = self.controller.stop(&handle).await;
                         slot.handle = None;
                     }
-                    let _ = store.set_endpoint(
-                        row.purpose,
-                        None,
-                        chrono::Utc::now().timestamp(),
-                    );
+                    let _ = store.set_endpoint(row.purpose, None, chrono::Utc::now().timestamp());
                 }
                 ServiceStatus::Stopped => {
                     slot.status = ServiceStatus::Stopped;
@@ -1021,8 +1000,7 @@ impl BackendSupervisor {
                             // are mounted under vLLM's OpenAPI
                             // server. Whisper / Kokoro images use
                             // the same convention.
-                            let endpoint =
-                                format!("{}/v1", handle.endpoint_url("http"));
+                            let endpoint = format!("{}/v1", handle.endpoint_url("http"));
                             // Write the URL back so the runner's
                             // next call picks it up. Idempotent —
                             // the row is left alone if the URL
@@ -1044,9 +1022,9 @@ impl BackendSupervisor {
                             // "loading model" we stay there until
                             // /health succeeds.
                             if !matches!(slot.stage, LifecycleStage::LoadingModel) {
-                                if let Some(promoted) = classify_stage_from_log(
-                                    slot.last_log_line.as_deref(),
-                                ) {
+                                if let Some(promoted) =
+                                    classify_stage_from_log(slot.last_log_line.as_deref())
+                                {
                                     slot.stage = promoted;
                                 } else if matches!(slot.stage, LifecycleStage::PullingImage) {
                                     // We've moved past pull (handle
@@ -1060,9 +1038,9 @@ impl BackendSupervisor {
                             warn!(purpose = %key, "health probe error: {e}");
                             slot.status = ServiceStatus::Starting;
                             if !matches!(slot.stage, LifecycleStage::LoadingModel) {
-                                if let Some(promoted) = classify_stage_from_log(
-                                    slot.last_log_line.as_deref(),
-                                ) {
+                                if let Some(promoted) =
+                                    classify_stage_from_log(slot.last_log_line.as_deref())
+                                {
                                     slot.stage = promoted;
                                 } else if matches!(slot.stage, LifecycleStage::PullingImage) {
                                     slot.stage = LifecycleStage::ContainerStarting;
@@ -1153,12 +1131,7 @@ fn alert_fingerprint(purpose: BackendPurpose, image: &str) -> String {
 }
 
 /// Best-effort: a DB hiccup here must NOT block the reconcile loop.
-fn emit_crashloop_alert(
-    db: &Database,
-    purpose: BackendPurpose,
-    image: &str,
-    detail: &str,
-) {
+fn emit_crashloop_alert(db: &Database, purpose: BackendPurpose, image: &str, detail: &str) {
     let store = AlertStore::new(db);
     let now = chrono::Utc::now().timestamp();
     let fingerprint = alert_fingerprint(purpose, image);
@@ -1237,16 +1210,9 @@ pub(crate) fn extract_model_id(row: &BackendRow) -> Option<String> {
 /// doesn't already carry one for `/root/.cache/huggingface`. Also
 /// injects `HF_HOME` env so HF libraries inside the container
 /// resolve the cache without any extra config.
-pub(crate) fn attach_hf_cache_mount(
-    spec: &mut ServiceSpec,
-    primary_cache: &std::path::Path,
-) {
+pub(crate) fn attach_hf_cache_mount(spec: &mut ServiceSpec, primary_cache: &std::path::Path) {
     const CONTAINER_HF: &str = "/root/.cache/huggingface";
-    if !spec
-        .mounts
-        .iter()
-        .any(|m| m.container_path == CONTAINER_HF)
-    {
+    if !spec.mounts.iter().any(|m| m.container_path == CONTAINER_HF) {
         spec.mounts.push(HostMount {
             host_path: primary_cache.to_string_lossy().into_owned(),
             container_path: CONTAINER_HF.to_owned(),
@@ -1263,8 +1229,7 @@ pub(crate) fn attach_hf_cache_mount(
     // immediately instead of silently re-downloading (which would
     // defeat the host-side download we just did).
     if !spec.env.iter().any(|(k, _)| k == "HF_HUB_OFFLINE") {
-        spec.env
-            .push(("HF_HUB_OFFLINE".to_owned(), "1".to_owned()));
+        spec.env.push(("HF_HUB_OFFLINE".to_owned(), "1".to_owned()));
     }
 }
 
@@ -1347,9 +1312,9 @@ fn tail_truncate(s: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use execlaw_container_manager::MockServiceController;
+    use execlaw_core::MigrationRunner;
     use execlaw_core::backends::{BackendStore, BackendUpsert};
     use execlaw_core::db::DbConfig;
-    use execlaw_core::MigrationRunner;
 
     fn fresh_db() -> Database {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
@@ -1463,10 +1428,9 @@ mod tests {
             "llama3_json",
         );
         assert_eq!(
-            default_tool_parser_for_args(&[
-                "--model".into(),
-                "meta-llama/Meta-Llama-3-70B".into(),
-            ]),
+            default_tool_parser_for_args(
+                &["--model".into(), "meta-llama/Meta-Llama-3-70B".into(),]
+            ),
             "llama3_json",
         );
     }
@@ -1570,8 +1534,11 @@ mod tests {
             // `/v1` suffix matches the OpenAI-base-URL contract the
             // inference-api client expects.
             Some(
-                format!("http://127.0.0.1:{}/v1", host_port_for(BackendPurpose::Standard))
-                    .as_str()
+                format!(
+                    "http://127.0.0.1:{}/v1",
+                    host_port_for(BackendPurpose::Standard)
+                )
+                .as_str()
             )
         );
         assert_eq!(mock.spawn_count().await, 1);
@@ -1666,10 +1633,8 @@ mod tests {
         // First spawn lands fine, but pin the inspect to
         // CrashLooping so every reconcile re-attempts.
         sup.reconcile_once().await;
-        mock.pin_status(ServiceStatus::CrashLooping {
-            restart_count: 5,
-        })
-        .await;
+        mock.pin_status(ServiceStatus::CrashLooping { restart_count: 5 })
+            .await;
         for _ in 0..6 {
             sup.reconcile_once().await;
         }
@@ -2008,22 +1973,26 @@ mod tests {
         assert_eq!(spec.mounts.len(), 1);
         assert_eq!(spec.mounts[0].container_path, "/root/.cache/huggingface");
         assert!(spec.mounts[0].read_only);
-        assert!(spec.env.iter().any(|(k, v)| k == "HF_HOME"
-            && v == "/root/.cache/huggingface"));
-        assert!(spec
-            .env
-            .iter()
-            .any(|(k, v)| k == "HF_HUB_OFFLINE" && v == "1"));
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "HF_HOME" && v == "/root/.cache/huggingface")
+        );
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "HF_HUB_OFFLINE" && v == "1")
+        );
 
         // Calling again is a no-op (idempotent).
         attach_hf_cache_mount(&mut spec, &cache);
         assert_eq!(spec.mounts.len(), 1);
+        assert_eq!(spec.env.iter().filter(|(k, _)| k == "HF_HOME").count(), 1);
         assert_eq!(
-            spec.env.iter().filter(|(k, _)| k == "HF_HOME").count(),
-            1
-        );
-        assert_eq!(
-            spec.env.iter().filter(|(k, _)| k == "HF_HUB_OFFLINE").count(),
+            spec.env
+                .iter()
+                .filter(|(k, _)| k == "HF_HUB_OFFLINE")
+                .count(),
             1
         );
     }

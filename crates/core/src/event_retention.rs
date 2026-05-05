@@ -122,11 +122,7 @@ impl EventRetentionSweeper {
         }
     }
 
-    pub fn with_config(
-        db: Database,
-        interval: Duration,
-        retention: Duration,
-    ) -> Self {
+    pub fn with_config(db: Database, interval: Duration, retention: Duration) -> Self {
         Self {
             db,
             interval,
@@ -260,11 +256,7 @@ mod tests {
     fn count_convs(db: &Database) -> i64 {
         db.with_conn(|c| {
             let v: i64 = c
-                .query_row(
-                    "SELECT COUNT(*) FROM state_conversations",
-                    [],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT COUNT(*) FROM state_conversations", [], |r| r.get(0))
                 .unwrap();
             Ok(v)
         })
@@ -275,9 +267,9 @@ mod tests {
     fn sweep_deletes_events_past_retention_window() {
         let db = fresh_db();
         let cid = seed_conv(&db, "c1", 1000, false, false);
-        seed_event(&db, &cid, 1, 100);   // old
-        seed_event(&db, &cid, 2, 200);   // old
-        seed_event(&db, &cid, 3, 1500);  // recent
+        seed_event(&db, &cid, 1, 100); // old
+        seed_event(&db, &cid, 2, 200); // old
+        seed_event(&db, &cid, 3, 1500); // recent
         // now=2000, retention=500 → cutoff=1500. 100 + 200 dropped;
         // 1500 stays (NOT strictly less).
         let r = sweep_once(&db, 2000, 500).unwrap();

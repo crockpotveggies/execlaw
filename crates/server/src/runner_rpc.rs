@@ -20,9 +20,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
-use execlaw_runner_protocol::{
-    PROTOCOL_VERSION, RegistrationAck, RunnerToServer, ServerToRunner,
-};
+use execlaw_runner_protocol::{PROTOCOL_VERSION, RegistrationAck, RunnerToServer, ServerToRunner};
 use futures::{SinkExt, StreamExt};
 use std::time::SystemTime;
 use tokio::sync::mpsc;
@@ -51,8 +49,7 @@ pub async fn register_runner(
     let bearer = match headers.get(AUTHORIZATION) {
         Some(v) => v.to_str().unwrap_or_default().to_owned(),
         None => {
-            return (StatusCode::UNAUTHORIZED, "missing authorization header")
-                .into_response();
+            return (StatusCode::UNAUTHORIZED, "missing authorization header").into_response();
         }
     };
     let hex_secret = match bearer.strip_prefix("Bearer ") {
@@ -92,11 +89,8 @@ pub async fn register_runner(
     // registration. v1 just defers it to first reap-pass lookup.
     let controller_runner = false;
 
-    let _handle = match supervisor.accept_registration(
-        &group_id,
-        &secret_bytes,
-        controller_runner,
-    ) {
+    let _handle = match supervisor.accept_registration(&group_id, &secret_bytes, controller_runner)
+    {
         Ok(h) => h,
         Err(RegistrationError::NoPendingSpawn) => {
             return (
@@ -106,8 +100,7 @@ pub async fn register_runner(
                 .into_response();
         }
         Err(RegistrationError::SecretMismatch) => {
-            return (StatusCode::UNAUTHORIZED, "registration secret mismatch")
-                .into_response();
+            return (StatusCode::UNAUTHORIZED, "registration secret mismatch").into_response();
         }
     };
 
@@ -120,11 +113,7 @@ pub async fn register_runner(
     })
 }
 
-async fn handle_runner_ws(
-    socket: WebSocket,
-    supervisor: RunnerSupervisor,
-    group_id: String,
-) {
+async fn handle_runner_ws(socket: WebSocket, supervisor: RunnerSupervisor, group_id: String) {
     info!(group_id = %group_id, "runner WS upgraded");
     let (mut ws_tx, mut ws_rx) = socket.split();
 
@@ -152,10 +141,8 @@ async fn handle_runner_ws(
 
     // Outbound channel: supervisor → runner. Writer task drains it
     // and writes to the WS.
-    let (out_tx, mut out_rx): (
-        ServerToRunnerTx,
-        mpsc::UnboundedReceiver<ServerToRunner>,
-    ) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx): (ServerToRunnerTx, mpsc::UnboundedReceiver<ServerToRunner>) =
+        mpsc::unbounded_channel();
     supervisor.attach_tx(&group_id, out_tx).await;
 
     let group_id_writer = group_id.clone();

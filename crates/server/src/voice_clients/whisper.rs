@@ -273,10 +273,8 @@ mod tests {
 
     #[tokio::test]
     async fn push_then_flush_round_trips_via_http_fixture() {
-        let (base, calls) = spawn_http_fixture(Arc::new(|_n| {
-            (200, r#"{"text":"hello world"}"#.to_owned())
-        }))
-        .await;
+        let (base, calls) =
+            spawn_http_fixture(Arc::new(|_n| (200, r#"{"text":"hello world"}"#.to_owned()))).await;
         let mut client = WhisperClient::new(base);
         client.push(&one_chunk(160)).await; // ~10ms at 16kHz
         client.push(&one_chunk(160)).await;
@@ -323,10 +321,8 @@ mod tests {
 
     #[tokio::test]
     async fn reset_clears_buffer_without_calling_http() {
-        let (base, calls) = spawn_http_fixture(Arc::new(|_n| {
-            (200, r#"{"text":"won't run"}"#.to_owned())
-        }))
-        .await;
+        let (base, calls) =
+            spawn_http_fixture(Arc::new(|_n| (200, r#"{"text":"won't run"}"#.to_owned()))).await;
         let mut client = WhisperClient::new(base);
         client.push(&one_chunk(640)).await;
         assert_eq!(client.buffered_samples(), 640);
@@ -346,10 +342,8 @@ mod tests {
         // OpenAI-compat shims sometimes return text/plain when
         // misconfigured; our parser should treat non-JSON as an
         // empty final rather than panicking.
-        let (base, _) = spawn_http_fixture(Arc::new(|_n| {
-            (200, "not json at all".to_owned())
-        }))
-        .await;
+        let (base, _) =
+            spawn_http_fixture(Arc::new(|_n| (200, "not json at all".to_owned()))).await;
         let mut client = WhisperClient::new(base);
         client.push(&one_chunk(160)).await;
         match client.flush().await {
@@ -360,10 +354,8 @@ mod tests {
 
     #[tokio::test]
     async fn flush_trims_whitespace_around_text() {
-        let (base, _) = spawn_http_fixture(Arc::new(|_n| {
-            (200, r#"{"text":"  hello  "}"#.to_owned())
-        }))
-        .await;
+        let (base, _) =
+            spawn_http_fixture(Arc::new(|_n| (200, r#"{"text":"  hello  "}"#.to_owned()))).await;
         let mut client = WhisperClient::new(base);
         client.push(&one_chunk(160)).await;
         match client.flush().await {
@@ -403,7 +395,10 @@ mod tests {
                     break;
                 }
             }
-            captured_clone.lock().unwrap().extend_from_slice(&buf[..total]);
+            captured_clone
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buf[..total]);
             let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"text\":\"ok\"}";
             let _ = stream.write_all(resp.as_bytes()).await;
             let _ = stream.shutdown().await;

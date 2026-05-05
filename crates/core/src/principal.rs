@@ -164,13 +164,31 @@ impl<'db> PrincipalStore<'db> {
     #[allow(clippy::type_complexity)]
     pub fn get(&self, id: &PrincipalId) -> Result<Option<Principal>, DbError> {
         self.db.with_conn(|c| {
-            let got: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64, Option<i64>, Option<String>)> = c
+            let got: Option<(
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                i64,
+                Option<i64>,
+                Option<String>,
+            )> = c
                 .query_row(
                     "SELECT identifiers_json, trust_level_json, resolved_by_json, metadata_json, \
                             first_seen, last_seen, controller_notes \
                      FROM principals WHERE id = ?1",
                     params![id.as_str()],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                        ))
+                    },
                 )
                 .ok();
             let Some((idents, trust, resolved, meta, first, last, notes)) = got else {
@@ -442,7 +460,11 @@ mod tests {
         store.upsert(&p).unwrap();
         let got = store.get(&p.id).unwrap().unwrap();
         match got.trust_level {
-            TrustLevel::Delegated { by, scope, expires_at } => {
+            TrustLevel::Delegated {
+                by,
+                scope,
+                expires_at,
+            } => {
                 assert_eq!(by.as_str(), "controller");
                 assert_eq!(scope.capabilities.len(), 2);
                 assert_eq!(expires_at, Some(2_000_000));
@@ -455,11 +477,18 @@ mod tests {
     fn find_by_identifier_returns_match() {
         let db = fresh_db();
         let store = PrincipalStore::new(&db);
-        store.upsert(&mk_principal("p1", TrustLevel::Controller)).unwrap();
-        store.upsert(&mk_principal("p2", TrustLevel::UnknownPending {
-            first_seen: 0,
-            notification_event_seq: None,
-        })).unwrap();
+        store
+            .upsert(&mk_principal("p1", TrustLevel::Controller))
+            .unwrap();
+        store
+            .upsert(&mk_principal(
+                "p2",
+                TrustLevel::UnknownPending {
+                    first_seen: 0,
+                    notification_event_seq: None,
+                },
+            ))
+            .unwrap();
 
         let hit = store
             .find_by_identifier(&Identifier {

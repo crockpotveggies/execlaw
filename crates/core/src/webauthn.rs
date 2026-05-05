@@ -305,7 +305,10 @@ mod tests {
                 .unwrap();
         }
         let err = store.insert(&mk_row("cred-overflow", "u1", "k"));
-        assert!(matches!(err, Err(DbError::Config(_))), "cap returns Config error, not Sqlite");
+        assert!(
+            matches!(err, Err(DbError::Config(_))),
+            "cap returns Config error, not Sqlite"
+        );
     }
 
     #[test]

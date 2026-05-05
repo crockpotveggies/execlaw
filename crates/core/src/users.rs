@@ -321,9 +321,7 @@ mod tests {
         let db = fresh_db();
         let store = UserStore::new(&db);
         assert!(!store.any_exist().unwrap());
-        store
-            .insert(&mk_user("c1", UserRole::Controller))
-            .unwrap();
+        store.insert(&mk_user("c1", UserRole::Controller)).unwrap();
         assert!(store.any_exist().unwrap());
     }
 
@@ -356,9 +354,7 @@ mod tests {
     fn touch_login_updates_last_login_at() {
         let db = fresh_db();
         let store = UserStore::new(&db);
-        store
-            .insert(&mk_user("c1", UserRole::Controller))
-            .unwrap();
+        store.insert(&mk_user("c1", UserRole::Controller)).unwrap();
         store.touch_login("c1", 999).unwrap();
         let got = store.get_by_id("c1").unwrap().unwrap();
         assert_eq!(got.last_login_at, Some(999));
@@ -458,18 +454,19 @@ mod tests {
 
     #[test]
     fn normalize_username_rejects_disallowed_characters() {
-        for bad in ["has space", "j@l", "with.dot", "ümlaut", "with/slash", "emo😀ji"] {
-            assert!(
-                normalize_username(bad).is_err(),
-                "should reject '{bad}'"
-            );
+        for bad in [
+            "has space",
+            "j@l",
+            "with.dot",
+            "ümlaut",
+            "with/slash",
+            "emo😀ji",
+        ] {
+            assert!(normalize_username(bad).is_err(), "should reject '{bad}'");
         }
         // Allowed forms.
         for ok in ["jlong", "j_long", "j-long", "user42"] {
-            assert!(
-                normalize_username(ok).is_ok(),
-                "should accept '{ok}'"
-            );
+            assert!(normalize_username(ok).is_ok(), "should accept '{ok}'");
         }
     }
 

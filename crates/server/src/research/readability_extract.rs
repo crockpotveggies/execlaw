@@ -103,16 +103,16 @@ pub fn extract_readable_text(
     // Construct + parse. Both can error; treat either as a fallback
     // signal rather than propagating to the worker (we'd rather
     // have raw-text-truncated content than nothing for this URL).
-    let mut readability = match Readability::new(trimmed_html, document_url, Some(Config::default()))
-    {
-        Ok(r) => r,
-        Err(e) => {
-            return ExtractionOutcome::Fallback {
-                text: clip_chars(&strip_tags_lossy(trimmed_html), max_chars),
-                reason: format!("readability init failed: {e}"),
-            };
-        }
-    };
+    let mut readability =
+        match Readability::new(trimmed_html, document_url, Some(Config::default())) {
+            Ok(r) => r,
+            Err(e) => {
+                return ExtractionOutcome::Fallback {
+                    text: clip_chars(&strip_tags_lossy(trimmed_html), max_chars),
+                    reason: format!("readability init failed: {e}"),
+                };
+            }
+        };
     let article = match readability.parse() {
         Ok(a) => a,
         Err(e) => {
@@ -133,7 +133,10 @@ pub fn extract_readable_text(
     if article.length < 200 {
         return ExtractionOutcome::Fallback {
             text: clip_chars(&strip_tags_lossy(trimmed_html), max_chars),
-            reason: format!("readability returned degenerate article ({} chars)", article.length),
+            reason: format!(
+                "readability returned degenerate article ({} chars)",
+                article.length
+            ),
         };
     }
 
@@ -240,7 +243,10 @@ mod tests {
             other => panic!("expected Article, got {other:?}"),
         };
         // Article body must be present.
-        assert!(text.contains("creeping thyme"), "body content missing: {text}");
+        assert!(
+            text.contains("creeping thyme"),
+            "body content missing: {text}"
+        );
         assert!(text.contains("pachysandra"), "body content missing");
         assert!(text.contains("Drought-tolerant"), "body content missing");
         // Nav must NOT be present.
@@ -303,7 +309,10 @@ mod tests {
                 // empty body, the text must be effectively empty —
                 // the gather worker treats that the same as fallback
                 // in practice. Allow it but assert tiny.
-                assert!(text.len() < 200, "implausibly large article from empty body: {text}");
+                assert!(
+                    text.len() < 200,
+                    "implausibly large article from empty body: {text}"
+                );
             }
         }
     }

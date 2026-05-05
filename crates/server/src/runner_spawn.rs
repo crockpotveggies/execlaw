@@ -87,8 +87,7 @@ pub trait RunnerLauncher: Send + Sync {
     /// Returns Ok(bytes_freed) on a successful remove (None when
     /// the daemon doesn't tell us). Ok(0) when the volume was
     /// already gone.
-    async fn wipe_volume(&self, group_id: &str)
-        -> Result<Option<u64>, LauncherError>;
+    async fn wipe_volume(&self, group_id: &str) -> Result<Option<u64>, LauncherError>;
     /// Returns the volume names currently tracked by the daemon
     /// that match the `execlaw-runner-` prefix.
     async fn list_runner_volumes(&self) -> Result<Vec<String>, LauncherError>;
@@ -129,9 +128,7 @@ impl BollardRunnerLauncher {
 #[async_trait]
 impl RunnerLauncher for BollardRunnerLauncher {
     async fn spawn(&self, spec: &RunnerSpec) -> Result<RunnerHandleId, LauncherError> {
-        use bollard::container::{
-            Config, CreateContainerOptions, StartContainerOptions,
-        };
+        use bollard::container::{Config, CreateContainerOptions, StartContainerOptions};
         use bollard::secret::HostConfig;
 
         let volume = volume_name_for(&spec.group_id);
@@ -174,9 +171,7 @@ impl RunnerLauncher for BollardRunnerLauncher {
             binds: Some(vec![format!("{}:/workspace", volume)]),
             memory: spec.memory_bytes,
             network_mode: spec.network.clone(),
-            extra_hosts: Some(vec![
-                "host.docker.internal:host-gateway".to_owned(),
-            ]),
+            extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_owned()]),
             ..Default::default()
         };
 
@@ -246,10 +241,7 @@ impl RunnerLauncher for BollardRunnerLauncher {
         Ok(())
     }
 
-    async fn wipe_volume(
-        &self,
-        group_id: &str,
-    ) -> Result<Option<u64>, LauncherError> {
+    async fn wipe_volume(&self, group_id: &str) -> Result<Option<u64>, LauncherError> {
         let name = volume_name_for(group_id);
         // Ignore 404 — the volume might already be gone.
         let _ = self.docker.remove_volume(&name, None).await;
@@ -361,10 +353,7 @@ impl RunnerLauncher for MockRunnerLauncher {
         Ok(())
     }
 
-    async fn wipe_volume(
-        &self,
-        group_id: &str,
-    ) -> Result<Option<u64>, LauncherError> {
+    async fn wipe_volume(&self, group_id: &str) -> Result<Option<u64>, LauncherError> {
         let mut s = self.inner.lock().await;
         let name = volume_name_for(group_id);
         s.wiped.push(name.clone());

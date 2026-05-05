@@ -21,19 +21,19 @@
 
 use crate::error::{McpError, McpResult};
 use crate::protocol::{
-    error_codes, methods, notifications, CallToolParams, CallToolResult, ClientCapabilities,
-    ClientInfo, InboundFrame, InitializeParams, InitializeResult, ListResourcesResult,
-    ListToolsResult, McpResource, McpTool, ReadResourceParams, ReadResourceResult, RpcId,
-    RpcNotification, RpcRequest, ServerCapabilities, PROTOCOL_VERSION,
+    CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, InboundFrame, InitializeParams,
+    InitializeResult, ListResourcesResult, ListToolsResult, McpResource, McpTool, PROTOCOL_VERSION,
+    ReadResourceParams, ReadResourceResult, RpcId, RpcNotification, RpcRequest, ServerCapabilities,
+    error_codes, methods, notifications,
 };
 use crate::stdio::{StdioSpec, StdioTransport};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 /// Default per-request timeout. MCP servers sometimes do real work
@@ -83,10 +83,7 @@ impl McpClient {
     /// Spawn an stdio MCP server, run the initialize handshake, and
     /// return a handle. The actor runs until `shutdown` is notified
     /// or the child closes its stdout.
-    pub async fn stdio(
-        spec: &StdioSpec,
-        shutdown: Arc<tokio::sync::Notify>,
-    ) -> McpResult<Self> {
+    pub async fn stdio(spec: &StdioSpec, shutdown: Arc<tokio::sync::Notify>) -> McpResult<Self> {
         let mut transport = StdioTransport::spawn(spec).await?;
 
         // Pending request id → oneshot sender map. Built first so the
@@ -219,9 +216,7 @@ impl McpClient {
     }
 
     pub async fn list_resources(&self) -> McpResult<Vec<McpResource>> {
-        let result: ListResourcesResult = self
-            .call(methods::RESOURCES_LIST, None)
-            .await?;
+        let result: ListResourcesResult = self.call(methods::RESOURCES_LIST, None).await?;
         Ok(result.resources)
     }
 
@@ -232,11 +227,7 @@ impl McpClient {
 
     /// Generic request/response. Internal use; public methods above
     /// are typed wrappers.
-    async fn call<T: DeserializeOwned>(
-        &self,
-        method: &str,
-        params: Option<Value>,
-    ) -> McpResult<T> {
+    async fn call<T: DeserializeOwned>(&self, method: &str, params: Option<Value>) -> McpResult<T> {
         let _ = self.inner.next_id.fetch_add(0, Ordering::SeqCst); // touch to keep `next_id` field used
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
@@ -389,10 +380,7 @@ fn forward_notification(method: &str, notifs: &broadcast::Sender<McpNotification
     }
 }
 
-async fn fail_pending(
-    pending: &Arc<PendingMap>,
-    err_template: McpError,
-) {
+async fn fail_pending(pending: &Arc<PendingMap>, err_template: McpError) {
     let mut map = pending.lock().await;
     let drained: Vec<_> = map.drain().collect();
     drop(map);
@@ -405,4 +393,3 @@ async fn fail_pending(
         let _ = tx.send(Err(e));
     }
 }
-

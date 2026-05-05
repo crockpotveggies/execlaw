@@ -26,9 +26,7 @@ use crate::model::{
 use crate::scanner::Strictness;
 use crate::store::SkillStore;
 use async_trait::async_trait;
-use execlaw_core::tool::{
-    ToolCtx, ToolDescriptor, ToolImpl, ToolLatency, ToolOutcome, ToolSource,
-};
+use execlaw_core::tool::{ToolCtx, ToolDescriptor, ToolImpl, ToolLatency, ToolOutcome, ToolSource};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -162,12 +160,11 @@ impl SkillsViewTool {
         Self {
             descriptor: ToolDescriptor {
                 name: "skills.view".into(),
-                description:
-                    "Load the full body of a skill into context. Returns the markdown \
+                description: "Load the full body of a skill into context. Returns the markdown \
                      instructions plus a list of bundled resource paths (fetch each via \
                      `skills.resource(name, path)`). Calling this records an activation \
                      event used for skill-usage analytics."
-                        .into(),
+                    .into(),
                 schema: json!({
                     "type": "object",
                     "properties": {
@@ -573,7 +570,10 @@ impl ToolImpl for SkillsUpdateTool {
             promotion_notes: args.promotion_notes,
         };
         let now_ms = ctx.clock.now_unix() * 1000;
-        match self.store.add_version(&args.name, v, Strictness::Strict, now_ms) {
+        match self
+            .store
+            .add_version(&args.name, v, Strictness::Strict, now_ms)
+        {
             Ok(id) => ToolOutcome::ok(json!({ "version_id": id.raw(), "name": args.name })),
             Err(e) => skill_error_to_outcome(e),
         }
@@ -601,10 +601,9 @@ impl SkillsPromoteTool {
         Self {
             descriptor: ToolDescriptor {
                 name: "skills.promote".into(),
-                description:
-                    "Promote a skill from `trial` to `stable` (admin only). Idempotent: \
+                description: "Promote a skill from `trial` to `stable` (admin only). Idempotent: \
                      promoting an already-stable skill is a no-op."
-                        .into(),
+                    .into(),
                 schema: json!({
                     "type": "object",
                     "properties": {
@@ -743,10 +742,7 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     {
         table[*b as usize] = i as u8;
     }
-    let cleaned: Vec<u8> = s
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
+    let cleaned: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     let mut bytes = cleaned.as_slice();
     while bytes.last() == Some(&b'=') {
         bytes = &bytes[..bytes.len() - 1];
@@ -784,11 +780,7 @@ mod tests {
     }
 
     fn ctx_for(trust: &str) -> ToolCtx {
-        ToolCtx::empty(
-            ConversationId::from("conv-1"),
-            trust,
-            Arc::new(SystemClock),
-        )
+        ToolCtx::empty(ConversationId::from("conv-1"), trust, Arc::new(SystemClock))
     }
 
     fn create_args(name: &str, body: &str) -> Value {
@@ -823,7 +815,9 @@ mod tests {
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["name"], "a/x");
 
-        let r = view.invoke(ctx_for("Controller"), json!({"name": "a/x"})).await;
+        let r = view
+            .invoke(ctx_for("Controller"), json!({"name": "a/x"}))
+            .await;
         let v = match r {
             ToolOutcome::Ok(v) => v,
             other => panic!("view failed: {other:?}"),
@@ -840,7 +834,10 @@ mod tests {
         let r = create
             .invoke(ctx_for("KnownTrusted"), create_args("a/no", "body"))
             .await;
-        assert!(matches!(r, ToolOutcome::Denied { .. }), "expected Denied, got {r:?}");
+        assert!(
+            matches!(r, ToolOutcome::Denied { .. }),
+            "expected Denied, got {r:?}"
+        );
     }
 
     #[tokio::test]
@@ -881,13 +878,19 @@ mod tests {
         let r = create
             .invoke(
                 ctx_for("Controller"),
-                create_args("a/leak", "use sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz to call"),
+                create_args(
+                    "a/leak",
+                    "use sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz to call",
+                ),
             )
             .await;
         match r {
             ToolOutcome::Err { code, message } => {
                 assert_eq!(code, "secret_scanner_blocked");
-                assert!(message.contains("vault"), "error message should hint at vault syntax");
+                assert!(
+                    message.contains("vault"),
+                    "error message should hint at vault syntax"
+                );
             }
             other => panic!("expected scanner block, got {other:?}"),
         }
@@ -936,13 +939,21 @@ mod tests {
             .invoke(ctx_for("Controller"), json!({"name":"a/lifecycle"}))
             .await;
         let v = list.invoke(ctx_for("Controller"), json!({})).await;
-        let val = if let ToolOutcome::Ok(v) = v { v } else { panic!() };
+        let val = if let ToolOutcome::Ok(v) = v {
+            v
+        } else {
+            panic!()
+        };
         assert_eq!(val["skills"][0]["state"], "stable");
         let _ = archive
             .invoke(ctx_for("Controller"), json!({"name":"a/lifecycle"}))
             .await;
         let v = list.invoke(ctx_for("Controller"), json!({})).await;
-        let val = if let ToolOutcome::Ok(v) = v { v } else { panic!() };
+        let val = if let ToolOutcome::Ok(v) = v {
+            v
+        } else {
+            panic!()
+        };
         assert_eq!(val["skills"].as_array().unwrap().len(), 0);
     }
 
@@ -1006,8 +1017,14 @@ mod tests {
             )
             .await;
         assert!(matches!(r, ToolOutcome::Ok(_)), "update failed: {r:?}");
-        let r = view.invoke(ctx_for("Controller"), json!({"name": "a/u"})).await;
-        let v = if let ToolOutcome::Ok(v) = r { v } else { panic!() };
+        let r = view
+            .invoke(ctx_for("Controller"), json!({"name": "a/u"}))
+            .await;
+        let v = if let ToolOutcome::Ok(v) = r {
+            v
+        } else {
+            panic!()
+        };
         assert_eq!(v["body_md"], "v2 body");
         assert_eq!(v["version"], 2);
     }
@@ -1100,7 +1117,11 @@ mod tests {
         let r = search
             .invoke(ctx_for("Controller"), json!({"query": "research sources"}))
             .await;
-        let v = if let ToolOutcome::Ok(v) = r { v } else { panic!() };
+        let v = if let ToolOutcome::Ok(v) = r {
+            v
+        } else {
+            panic!()
+        };
         let matches = v["matches"].as_array().unwrap();
         assert!(!matches.is_empty(), "expected hits: {v:?}");
         assert_eq!(matches[0]["name"], "research/sources");

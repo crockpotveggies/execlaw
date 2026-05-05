@@ -44,17 +44,17 @@ pub mod principal_groups;
 pub mod refresh_tokens;
 pub mod research;
 pub mod retention;
-pub mod search_providers;
 pub mod routine_run_retention;
 pub mod routines;
+pub mod search_providers;
 pub mod skills_config;
 pub mod tool;
 pub mod tool_access;
 pub mod tool_apis;
 pub mod transport_bindings;
 pub mod transport_conversations;
-pub mod trust_policy;
 pub mod transport_cursor;
+pub mod trust_policy;
 pub mod users;
 pub mod vault_row;
 pub mod webauthn;
@@ -62,7 +62,7 @@ pub mod webauthn;
 pub use db::{Database, DbConfig, DbError};
 pub use events::{EventKind, EventLog, EventRecord};
 pub use ids::{
-    AlertId, AttachmentId, ConversationId, EventSeq, IdempotencyKey, IncidentId,
-    PluginId, PrincipalId, ResearchJobId, TurnSeq,
+    AlertId, AttachmentId, ConversationId, EventSeq, IdempotencyKey, IncidentId, PluginId,
+    PrincipalId, ResearchJobId, TurnSeq,
 };
 pub use migrations::{MigrationError, MigrationRunner};

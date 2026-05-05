@@ -414,9 +414,7 @@ mod tests {
     fn refresh_token_survives_wrapper_recreate() {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
         MigrationRunner::new(&db).apply_all().unwrap();
-        let tok = RefreshStore::new(db.clone())
-            .issue("u", "s", 60)
-            .unwrap();
+        let tok = RefreshStore::new(db.clone()).issue("u", "s", 60).unwrap();
         // Drop the first wrapper, build a fresh one — same behaviour
         // a server restart would see if it re-opened the same DB.
         let restarted = RefreshStore::new(db);

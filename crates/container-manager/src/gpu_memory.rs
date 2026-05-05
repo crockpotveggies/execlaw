@@ -71,11 +71,12 @@ pub fn nvidia_memory_mb_via_nvml() -> Vec<u64> {
 /// `model_name` reported by hardware-query.
 #[cfg(windows)]
 pub fn intel_memory_mb_via_registry() -> Vec<(String, u64)> {
-    use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
+    use winreg::enums::HKEY_LOCAL_MACHINE;
 
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    let display_class_path = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
+    let display_class_path =
+        r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
     let Ok(class_key) = hklm.open_subkey(display_class_path) else {
         debug!("display class registry key not found; skipping intel VRAM override");
         return Vec::new();
@@ -87,9 +88,7 @@ pub fn intel_memory_mb_via_registry() -> Vec<(String, u64)> {
         let Ok(adapter_key) = class_key.open_subkey(&sub) else {
             continue;
         };
-        let driver_desc: String = adapter_key
-            .get_value("DriverDesc")
-            .unwrap_or_default();
+        let driver_desc: String = adapter_key.get_value("DriverDesc").unwrap_or_default();
         if driver_desc.is_empty() {
             continue;
         }

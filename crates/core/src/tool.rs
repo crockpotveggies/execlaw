@@ -799,11 +799,8 @@ pub trait ResearchApi: Send + Sync {
     ///     caller OR is not currently in `awaiting_input` (the
     ///     `awaiting_input` guard prevents double-resume races and
     ///     resuming a Cancelled row).
-    async fn clarify(
-        &self,
-        job_id: &str,
-        clarification: &str,
-    ) -> Result<ResearchJobView, ApiError>;
+    async fn clarify(&self, job_id: &str, clarification: &str)
+    -> Result<ResearchJobView, ApiError>;
 }
 
 /// Caller-facing summary of an attachment after `send_attachment`
@@ -891,21 +888,12 @@ pub trait TransportApi: Send + Sync {
     /// registry first, then fall back to the bridge's own contact
     /// list (signal-cli has one, signal-cli's `--contact` lookup).
     /// Returns `ApiError::NotFound` when nothing matches.
-    async fn resolve_recipient(
-        &self,
-        channel: &str,
-        free_form: &str,
-    ) -> Result<String, ApiError>;
+    async fn resolve_recipient(&self, channel: &str, free_form: &str) -> Result<String, ApiError>;
 
     /// Dispatch `text` to `recipient` (a canonical foreign id).
     /// Returns the bridge's message id for read-receipt /
     /// idempotency correlation; the supervisor logs it.
-    async fn send(
-        &self,
-        channel: &str,
-        recipient: &str,
-        text: &str,
-    ) -> Result<String, ApiError>;
+    async fn send(&self, channel: &str, recipient: &str, text: &str) -> Result<String, ApiError>;
 
     /// The current turn's inbound foreign id, if the turn was
     /// triggered by an inbound message on this transport. Mirror of
@@ -920,10 +908,169 @@ pub trait TransportApi: Send + Sync {
     /// without forcing every consumer to migrate. The cost of the
     /// extra `await` on a synchronous-cache hit is one Rust function
     /// call.
-    async fn current_chat_id(
+    async fn current_chat_id(&self, channel: &str) -> Result<Option<String>, ApiError>;
+
+    // ---- Group operations (Phase 5) -------------------------------
+    //
+    // Default impls return `ApiError::Validation("not supported")` so
+    // a transport that doesn't support groups (email, voice, sms in
+    // the future) can stay on three methods. Signal overrides every
+    // method below with real signal-cli-rest-api calls.
+    //
+    // The contract is generic across bridges that have a group
+    // concept: each method takes a `channel` so a future
+    // multi-transport registry can route by channel internally.
+
+    /// List the controller's groups on this channel. Returns one
+    /// [`TransportGroupSummary`] per group the bridge sees the
+    /// controller as a member of, in bridge-defined order. Empty
+    /// vec when the controller is in no groups; never `Err` for the
+    /// "no groups" case.
+    async fn list_groups(&self, channel: &str) -> Result<Vec<TransportGroupSummary>, ApiError> {
+        let _ = channel;
+        Err(ApiError::Validation(
+            "list_groups not supported by this transport".into(),
+        ))
+    }
+
+    /// Create a fresh group on this channel with `members` (each a
+    /// canonical foreign id — the caller is responsible for
+    /// resolving display-name / phone-number args via
+    /// `resolve_recipient` first). `title` is optional; bridges
+    /// without titled groups ignore it. Returns the bridge's
+    /// canonical group id (Signal: base64 — same value the binding
+    /// store uses as `foreign_id`).
+    async fn create_group(
         &self,
         channel: &str,
-    ) -> Result<Option<String>, ApiError>;
+        title: Option<&str>,
+        members: &[String],
+    ) -> Result<String, ApiError> {
+        let _ = (channel, title, members);
+        Err(ApiError::Validation(
+            "create_group not supported by this transport".into(),
+        ))
+    }
+
+    /// Add `members` (canonical foreign ids) to an existing group.
+    /// `group_id` is the bridge's canonical group id (Signal:
+    /// base64). No return value; errors surface bridge-side
+    /// permission failures (e.g. controller isn't an admin).
+    async fn add_group_members(
+        &self,
+        channel: &str,
+        group_id: &str,
+        members: &[String],
+    ) -> Result<(), ApiError> {
+        let _ = (channel, group_id, members);
+        Err(ApiError::Validation(
+            "add_group_members not supported by this transport".into(),
+        ))
+    }
+
+    /// Leave the named group on this channel. The controller's
+    /// member row in the bridge's group is removed; the binding row
+    /// in `state_transport_bindings` is purged by the caller (the
+    /// tool body does it after the bridge call succeeds).
+    async fn leave_group(&self, channel: &str, group_id: &str) -> Result<(), ApiError> {
+        let _ = (channel, group_id);
+        Err(ApiError::Validation(
+            "leave_group not supported by this transport".into(),
+        ))
+    }
+
+    /// Phase 6 — fetch an inbound attachment blob from the bridge
+    /// by its bridge-side attachment id (which the inbound envelope
+    /// surfaced on `dataMessage.attachments[].id` for signal-cli).
+    ///
+    /// `attachment_id` is opaque to the host — every bridge owns its
+    /// own id space. Implementations stream the response into memory
+    /// and return the full bytes; per-attachment size limits are
+    /// enforced by the caller (the inbound consumer rejects blobs
+    /// over `MAX_INBOUND_ATTACHMENT_BYTES` to keep a malicious
+    /// contact from exhausting disk).
+    ///
+    /// Default impl errors so a non-attachment-aware bridge can
+    /// stay on the slimmer trait surface.
+    async fn fetch_attachment(
+        &self,
+        channel: &str,
+        attachment_id: &str,
+    ) -> Result<FetchedAttachment, ApiError> {
+        let _ = (channel, attachment_id);
+        Err(ApiError::Validation(
+            "fetch_attachment not supported by this transport".into(),
+        ))
+    }
+
+    /// Phase 7 — outbound dispatch with attachments. `recipient` is
+    /// a canonical foreign id (Signal: phone number or
+    /// base64-shaped group id); `attachments` is the list of
+    /// `state_attachments` ids the message should carry.
+    ///
+    /// Implementations are responsible for **conversation-scope
+    /// validation**: each `attachment_id` must belong to a row
+    /// whose `conversation_id` matches the calling turn's
+    /// conversation. A miss returns `ApiError::NotFound` (not
+    /// `NotAuthorized`) so cross-conversation id probing leaks no
+    /// info — same defense pattern as `AttachmentApi::send`.
+    ///
+    /// Returns the bridge's message id, same shape as
+    /// [`Self::send`]. Default impl errors with `Validation` so a
+    /// non-attachment-aware bridge stays on the simpler send path.
+    async fn send_with_attachments(
+        &self,
+        channel: &str,
+        recipient: &str,
+        text: &str,
+        attachments: &[String],
+    ) -> Result<String, ApiError> {
+        let _ = (channel, recipient, text, attachments);
+        Err(ApiError::Validation(
+            "send_with_attachments not supported by this transport".into(),
+        ))
+    }
+}
+
+/// Result of [`TransportApi::fetch_attachment`]. Carries the raw
+/// blob bytes plus the metadata the persistence layer needs to
+/// build an `AttachmentRow` + emit the corresponding card.
+#[derive(Debug, Clone)]
+pub struct FetchedAttachment {
+    /// Full attachment body. Already bounded by the consumer's
+    /// per-attachment size cap.
+    pub bytes: Vec<u8>,
+    /// IANA media type the bridge reported (e.g. `image/jpeg`,
+    /// `audio/aac`). Surfaces in the SPA's attachment chip + the
+    /// `Content-Type` header on `/api/attachments/{id}`. Empty
+    /// string acceptable when the bridge doesn't surface one;
+    /// the persistence layer falls back to `application/octet-stream`.
+    pub mime_type: String,
+    /// Operator-visible filename. May come from the bridge's
+    /// envelope or be synthesized from the attachment id when the
+    /// bridge omitted it. Sanitized by the persistence layer
+    /// before disk write.
+    pub filename: Option<String>,
+}
+
+/// Compact summary of a transport-group surfaced by
+/// [`TransportApi::list_groups`]. Mirrors the agent-facing tool
+/// result shape so the host doesn't have to translate at the chat
+/// surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportGroupSummary {
+    /// Bridge's canonical group id — `foreign_id` for the binding
+    /// store, opaque to callers above the transport tier.
+    pub id: String,
+    /// Operator-visible name. `None` for bridges that don't
+    /// surface titled groups (chat platforms like Slack always do;
+    /// signal-cli omits the title for "Note to Self"-style internal
+    /// groups).
+    pub name: Option<String>,
+    /// Member count. Useful for the agent's "did the right people
+    /// land in this group" check after a `create_group` /
+    /// `add_group_members` call.
+    pub member_count: u32,
 }
 
 /// Memory API. Reads cascade from the caller's trust class downward

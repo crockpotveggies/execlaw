@@ -256,10 +256,7 @@ impl<'db> AlertStore<'db> {
     /// the extra row probe themselves. The reverse semantic of
     /// `insert_firing` (which silently bumps the occurrence count
     /// instead of telling you whether it deduped).
-    pub fn firing_id_for_fingerprint(
-        &self,
-        fingerprint: &str,
-    ) -> Result<Option<String>, DbError> {
+    pub fn firing_id_for_fingerprint(&self, fingerprint: &str) -> Result<Option<String>, DbError> {
         self.db.with_conn(|c| {
             let got: Option<String> = c
                 .query_row(
@@ -410,15 +407,11 @@ mod tests {
         store.insert_firing(&acked_src).unwrap();
         store.ack(&acked_src.id, "ctrl", 150).unwrap();
 
-        let firing_only = store
-            .list(Some(&[AlertStatus::Firing]), None)
-            .unwrap();
+        let firing_only = store.list(Some(&[AlertStatus::Firing]), None).unwrap();
         assert_eq!(firing_only.len(), 1);
         assert_eq!(firing_only[0].fingerprint, "alert-1");
 
-        let acked_only = store
-            .list(Some(&[AlertStatus::Acked]), None)
-            .unwrap();
+        let acked_only = store.list(Some(&[AlertStatus::Acked]), None).unwrap();
         assert_eq!(acked_only.len(), 1);
         assert_eq!(acked_only[0].fingerprint, "alert-2");
 

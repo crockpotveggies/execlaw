@@ -11,7 +11,7 @@
 //! | qwen3_process_response_with_preamble  |   < 50 µs       | String search + slice.                     |
 //! | gemma_merge_system_into_user          |   < 10 µs       | Per call when family is Gemma.             |
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use execlaw_inference_api::{ChatMessage, ChatRequest, ChatResponse, Choice, ModelId, Role};
 use execlaw_model_adapter::{
     adapter::{AdaptedResponse, ModelAdapter, OutputHint},
@@ -82,11 +82,19 @@ fn bench_qwen3_process(c: &mut Criterion) {
     let adapter = Qwen3Adapter;
     let mut group = c.benchmark_group("qwen3_process_response");
 
-    let clean = resp("{\"thesis\": \"a clean structured reply with no preamble\", \"steps\": [{\"query\": \"x\"}]}");
-    let with_think = resp("<think>I should think about this carefully and weigh the options. Step 1: identify the goal. Step 2: outline the approach. Step 3: write the JSON.</think>{\"thesis\":\"t\",\"steps\":[{\"query\":\"x\"}]}");
-    let with_preamble = resp("Thinking Process:\n1. Analyze the request.\n2. Format as JSON.\n\n{\"thesis\":\"t\",\"steps\":[{\"query\":\"x\"}]}");
+    let clean = resp(
+        "{\"thesis\": \"a clean structured reply with no preamble\", \"steps\": [{\"query\": \"x\"}]}",
+    );
+    let with_think = resp(
+        "<think>I should think about this carefully and weigh the options. Step 1: identify the goal. Step 2: outline the approach. Step 3: write the JSON.</think>{\"thesis\":\"t\",\"steps\":[{\"query\":\"x\"}]}",
+    );
+    let with_preamble = resp(
+        "Thinking Process:\n1. Analyze the request.\n2. Format as JSON.\n\n{\"thesis\":\"t\",\"steps\":[{\"query\":\"x\"}]}",
+    );
 
-    group.throughput(Throughput::Bytes(clean.choices[0].message.content.as_ref().unwrap().len() as u64));
+    group.throughput(Throughput::Bytes(
+        clean.choices[0].message.content.as_ref().unwrap().len() as u64,
+    ));
     group.bench_function("clean", |b| {
         b.iter(|| {
             let r: AdaptedResponse =
@@ -103,10 +111,8 @@ fn bench_qwen3_process(c: &mut Criterion) {
     });
     group.bench_function("with_preamble", |b| {
         b.iter(|| {
-            let r: AdaptedResponse = adapter.process_response(
-                black_box(with_preamble.clone()),
-                OutputHint::StructuredJson,
-            );
+            let r: AdaptedResponse = adapter
+                .process_response(black_box(with_preamble.clone()), OutputHint::StructuredJson);
             black_box(r);
         })
     });

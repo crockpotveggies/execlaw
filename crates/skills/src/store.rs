@@ -19,10 +19,10 @@
 //! tool surface.
 
 use crate::model::{
-    NewProposal, NewSkill, NewSkillVersion, ProposalId, ProposalKind, ProposalState,
-    RegistrationKind, ResourceBlob, ResourceBody, Skill, SkillError, SkillId, SkillIndexEntry,
-    SkillMatch, SkillProposal, SkillResource, SkillState, SkillVersion, SkillView, VersionId,
-    MAX_BODY_BYTES, MAX_RESOURCE_BYTES, MAX_SKILL_TOTAL_BYTES, validate_skill_name,
+    MAX_BODY_BYTES, MAX_RESOURCE_BYTES, MAX_SKILL_TOTAL_BYTES, NewProposal, NewSkill,
+    NewSkillVersion, ProposalId, ProposalKind, ProposalState, RegistrationKind, ResourceBlob,
+    ResourceBody, Skill, SkillError, SkillId, SkillIndexEntry, SkillMatch, SkillProposal,
+    SkillResource, SkillState, SkillVersion, SkillView, VersionId, validate_skill_name,
 };
 use crate::scanner::{ScanInput, ScanVerdict, Strictness, scan};
 use execlaw_core::db::{Database, DbError};
@@ -77,8 +77,9 @@ impl SkillStore {
             })?
             .into_iter()
             .map(|(name, description, state_s, version)| {
-                let state = SkillState::parse(&state_s)
-                    .ok_or_else(|| SkillError::Db(DbError::Invariant(format!("unknown state: {state_s}"))))?;
+                let state = SkillState::parse(&state_s).ok_or_else(|| {
+                    SkillError::Db(DbError::Invariant(format!("unknown state: {state_s}")))
+                })?;
                 Ok(SkillIndexEntry {
                     name,
                     description,
@@ -117,7 +118,8 @@ impl SkillStore {
                 .optional()?)
             })?;
 
-        let Some((name, description, state_s, version, body_md, frontmatter_json, version_id)) = row
+        let Some((name, description, state_s, version, body_md, frontmatter_json, version_id)) =
+            row
         else {
             return Ok(None);
         };
@@ -252,7 +254,16 @@ impl SkillStore {
     /// Full row + current version metadata. Used by the admin UI.
     pub fn get(&self, name: &str) -> Result<Option<Skill>, SkillError> {
         let row: Option<(
-            i64, String, String, String, String, Option<String>, i64, i64, Option<i64>, i64,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            i64,
+            i64,
+            Option<i64>,
+            i64,
         )> = self.db.with_conn(|c| {
             Ok(c.query_row(
                 "SELECT id, name, state, source, registration_kind, owning_plugin_id,
@@ -291,8 +302,9 @@ impl SkillStore {
         else {
             return Ok(None);
         };
-        let state = SkillState::parse(&state_s)
-            .ok_or_else(|| SkillError::Db(DbError::Invariant(format!("unknown state: {state_s}"))))?;
+        let state = SkillState::parse(&state_s).ok_or_else(|| {
+            SkillError::Db(DbError::Invariant(format!("unknown state: {state_s}")))
+        })?;
         let registration_kind = RegistrationKind::parse(&kind_s).ok_or_else(|| {
             SkillError::Db(DbError::Invariant(format!("unknown reg kind: {kind_s}")))
         })?;
@@ -313,7 +325,17 @@ impl SkillStore {
 
     fn read_version_by_id(&self, id: VersionId) -> Result<SkillVersion, SkillError> {
         let row: (
-            i64, i64, i64, String, String, String, String, String, i64, Option<String>, Option<i64>,
+            i64,
+            i64,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            Option<String>,
+            Option<i64>,
         ) = self.db.with_conn(|c| {
             Ok(c.query_row(
                 "SELECT id, skill_id, version, description, body_md, frontmatter_json,
@@ -545,7 +567,12 @@ impl SkillStore {
 
     /// Promote a skill from `trial` → `stable`. Idempotent: promoting
     /// an already-stable skill is a no-op that returns Ok.
-    pub fn promote(&self, name: &str, notes: Option<String>, now_ms: i64) -> Result<(), SkillError> {
+    pub fn promote(
+        &self,
+        name: &str,
+        notes: Option<String>,
+        now_ms: i64,
+    ) -> Result<(), SkillError> {
         let promoted = self.db.transaction(|tx| {
             let state: Option<String> = tx
                 .query_row(
@@ -632,11 +659,7 @@ impl SkillStore {
     ///
     /// Always uses `Strict` scanner mode — plugin-shipped content
     /// must not introduce credentials.
-    pub fn import_shipped(
-        &self,
-        new: NewSkill,
-        now_ms: i64,
-    ) -> Result<SkillId, SkillError> {
+    pub fn import_shipped(&self, new: NewSkill, now_ms: i64) -> Result<SkillId, SkillError> {
         validate_skill_name(&new.name)?;
         validate_frontmatter(&new.initial_version.frontmatter_json)?;
         validate_sizes(&new.initial_version.body_md, &new.resources)?;
@@ -670,15 +693,7 @@ impl SkillStore {
                     "SELECT id, current_version_id, state, registration_kind, owning_plugin_id
                      FROM state_skills WHERE name = ?1",
                     params![new.name],
-                    |r| {
-                        Ok((
-                            r.get(0)?,
-                            r.get(1)?,
-                            r.get(2)?,
-                            r.get(3)?,
-                            r.get(4)?,
-                        ))
-                    },
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
                 .optional()?;
 
@@ -887,7 +902,16 @@ impl SkillStore {
     /// ascending. Used by the admin UI's diff view.
     pub fn list_versions(&self, name: &str) -> Result<Vec<SkillVersion>, SkillError> {
         let rows: Vec<(
-            i64, i64, i64, String, String, String, String, String, i64, Option<String>,
+            i64,
+            i64,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            Option<String>,
             Option<i64>,
         )> = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
@@ -902,8 +926,17 @@ impl SkillStore {
             let rows = stmt
                 .query_map(params![name], |r| {
                     Ok((
-                        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?,
-                        r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?,
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -929,11 +962,7 @@ impl SkillStore {
 
     /// Persist an agent-generated proposal for operator review.
     /// Returns the new proposal id.
-    pub fn submit_proposal(
-        &self,
-        new: NewProposal,
-        now_ms: i64,
-    ) -> Result<ProposalId, SkillError> {
+    pub fn submit_proposal(&self, new: NewProposal, now_ms: i64) -> Result<ProposalId, SkillError> {
         // Validate the name eagerly so a bad name doesn't sit in the
         // proposal table unreachable.
         validate_skill_name(&new.proposed_name)?;
@@ -1129,11 +1158,11 @@ impl SkillStore {
                 self.create(new, crate::scanner::Strictness::Strict, now_ms)?
             }
             ProposalKind::VersionFork => {
-                let target = p
-                    .target_skill_id
-                    .ok_or_else(|| SkillError::Db(execlaw_core::db::DbError::Invariant(
+                let target = p.target_skill_id.ok_or_else(|| {
+                    SkillError::Db(execlaw_core::db::DbError::Invariant(
                         "version_fork proposal missing target_skill_id".into(),
-                    )))?;
+                    ))
+                })?;
                 let target_skill = self.db.with_conn(|c| {
                     let name: String = c.query_row(
                         "SELECT name FROM state_skills WHERE id = ?1",
@@ -1482,8 +1511,7 @@ fn base64_encode(bytes: &[u8]) -> String {
     // Tiny implementation — avoids pulling base64 as a direct dep
     // (still in workspace deps but core/skills doesn't need to grow
     // its dep set for this one path).
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
     let mut i = 0;
     while i + 3 <= bytes.len() {
@@ -1551,8 +1579,12 @@ mod tests {
     #[test]
     fn create_and_view_roundtrip() {
         let s = fresh_store();
-        s.create(sample_new("test/foo", "hello world"), Strictness::Strict, 1000)
-            .unwrap();
+        s.create(
+            sample_new("test/foo", "hello world"),
+            Strictness::Strict,
+            1000,
+        )
+        .unwrap();
         let v = s.view("test/foo").unwrap().unwrap();
         assert_eq!(v.name, "test/foo");
         assert_eq!(v.body_md, "hello world");
@@ -1563,8 +1595,10 @@ mod tests {
     #[test]
     fn list_index_omits_archived() {
         let s = fresh_store();
-        s.create(sample_new("a/one", "x"), Strictness::Strict, 1).unwrap();
-        s.create(sample_new("a/two", "y"), Strictness::Strict, 2).unwrap();
+        s.create(sample_new("a/one", "x"), Strictness::Strict, 1)
+            .unwrap();
+        s.create(sample_new("a/two", "y"), Strictness::Strict, 2)
+            .unwrap();
         s.archive("a/one", 3).unwrap();
         let idx = s.list_index().unwrap();
         assert_eq!(idx.len(), 1);
@@ -1584,8 +1618,11 @@ mod tests {
     #[test]
     fn create_rejects_duplicate_name() {
         let s = fresh_store();
-        s.create(sample_new("a/dup", "x"), Strictness::Strict, 1).unwrap();
-        let err = s.create(sample_new("a/dup", "y"), Strictness::Strict, 2).unwrap_err();
+        s.create(sample_new("a/dup", "x"), Strictness::Strict, 1)
+            .unwrap();
+        let err = s
+            .create(sample_new("a/dup", "y"), Strictness::Strict, 2)
+            .unwrap_err();
         match err {
             SkillError::Db(DbError::Invariant(msg)) => assert!(msg.contains("already exists")),
             other => panic!("unexpected: {other:?}"),
@@ -1597,7 +1634,8 @@ mod tests {
     #[test]
     fn add_version_advances_current_pointer_and_records_parent() {
         let s = fresh_store();
-        s.create(sample_new("a/v", "v1"), Strictness::Strict, 1).unwrap();
+        s.create(sample_new("a/v", "v1"), Strictness::Strict, 1)
+            .unwrap();
         s.add_version(
             "a/v",
             NewSkillVersion {
@@ -1623,7 +1661,8 @@ mod tests {
     #[test]
     fn version_numbers_are_monotonic_per_skill() {
         let s = fresh_store();
-        s.create(sample_new("a/m", "1"), Strictness::Strict, 1).unwrap();
+        s.create(sample_new("a/m", "1"), Strictness::Strict, 1)
+            .unwrap();
         for i in 2..=5 {
             s.add_version(
                 "a/m",
@@ -1648,7 +1687,8 @@ mod tests {
     #[test]
     fn promote_trial_to_stable_then_idempotent() {
         let s = fresh_store();
-        s.create(sample_new("a/p", "x"), Strictness::Strict, 1).unwrap();
+        s.create(sample_new("a/p", "x"), Strictness::Strict, 1)
+            .unwrap();
         s.promote("a/p", Some("looks good".into()), 2).unwrap();
         let g = s.get("a/p").unwrap().unwrap();
         assert_eq!(g.state, SkillState::Stable);
@@ -1660,7 +1700,8 @@ mod tests {
     #[test]
     fn cannot_promote_archived() {
         let s = fresh_store();
-        s.create(sample_new("a/a", "x"), Strictness::Strict, 1).unwrap();
+        s.create(sample_new("a/a", "x"), Strictness::Strict, 1)
+            .unwrap();
         s.archive("a/a", 2).unwrap();
         let err = s.promote("a/a", None, 3).unwrap_err();
         assert!(matches!(err, SkillError::Db(DbError::Invariant(_))));
@@ -1669,7 +1710,8 @@ mod tests {
     #[test]
     fn archived_skills_invisible_to_view_and_list_and_search() {
         let s = fresh_store();
-        s.create(sample_new("a/inv", "x"), Strictness::Strict, 1).unwrap();
+        s.create(sample_new("a/inv", "x"), Strictness::Strict, 1)
+            .unwrap();
         s.archive("a/inv", 2).unwrap();
         assert!(s.view("a/inv").unwrap().is_none());
         assert!(s.list_index().unwrap().iter().all(|e| e.name != "a/inv"));
@@ -1680,7 +1722,10 @@ mod tests {
     #[test]
     fn scanner_blocks_create_with_credential_in_body() {
         let s = fresh_store();
-        let bad = sample_new("a/bad", "use sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz to call");
+        let bad = sample_new(
+            "a/bad",
+            "use sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz to call",
+        );
         let err = s.create(bad, Strictness::Strict, 1).unwrap_err();
         match err {
             SkillError::Blocked { findings, .. } => assert!(findings >= 1),
@@ -1861,7 +1906,8 @@ mod tests {
     #[test]
     fn record_invocation_writes_a_row() {
         let s = fresh_store();
-        s.create(sample_new("a/inv", "x"), Strictness::Strict, 1).unwrap();
+        s.create(sample_new("a/inv", "x"), Strictness::Strict, 1)
+            .unwrap();
         let id = s.record_invocation("a/inv", "conv-1", 100).unwrap();
         assert!(id > 0);
         let count: i64 = s
@@ -1911,7 +1957,8 @@ mod tests {
     #[test]
     fn search_empty_or_pure_punctuation_returns_no_rows() {
         let s = fresh_store();
-        s.create(sample_new("a/x", "x"), Strictness::Strict, 1).unwrap();
+        s.create(sample_new("a/x", "x"), Strictness::Strict, 1)
+            .unwrap();
         assert!(s.search("", 5).unwrap().is_empty());
         assert!(s.search("    ", 5).unwrap().is_empty());
         assert!(s.search("!@#$%^&*()", 5).unwrap().is_empty());
@@ -1929,7 +1976,8 @@ mod tests {
     #[test]
     fn record_invocation_for_archived_skill_errors() {
         let s = fresh_store();
-        s.create(sample_new("a/g", "x"), Strictness::Strict, 1).unwrap();
+        s.create(sample_new("a/g", "x"), Strictness::Strict, 1)
+            .unwrap();
         s.archive("a/g", 2).unwrap();
         assert!(s.record_invocation("a/g", "conv-1", 3).is_err());
     }
@@ -1972,7 +2020,8 @@ mod tests {
     #[test]
     fn list_versions_returns_versions_in_order() {
         let s = fresh_store();
-        s.create(sample_new("a/v", "v1"), Strictness::Strict, 1).unwrap();
+        s.create(sample_new("a/v", "v1"), Strictness::Strict, 1)
+            .unwrap();
         for i in 2..=4 {
             s.add_version(
                 "a/v",
@@ -2024,7 +2073,9 @@ mod tests {
     #[test]
     fn submit_proposal_persists_pending_row() {
         let s = fresh_store();
-        let id = s.submit_proposal(sample_proposal("agent/draft"), 100).unwrap();
+        let id = s
+            .submit_proposal(sample_proposal("agent/draft"), 100)
+            .unwrap();
         let p = s.get_proposal(id).unwrap().unwrap();
         assert_eq!(p.proposed_name, "agent/draft");
         assert_eq!(p.state, ProposalState::Pending);
@@ -2058,7 +2109,9 @@ mod tests {
     fn approve_new_skill_proposal_creates_skill_and_links_promoted_ids() {
         let s = fresh_store();
         let id = s.submit_proposal(sample_proposal("agent/new"), 1).unwrap();
-        let skill_id = s.approve_proposal(id, "admin", Some("looks good".into()), 100).unwrap();
+        let skill_id = s
+            .approve_proposal(id, "admin", Some("looks good".into()), 100)
+            .unwrap();
         // Skill exists.
         let g = s.get("agent/new").unwrap().unwrap();
         assert_eq!(g.id, skill_id);
@@ -2075,7 +2128,11 @@ mod tests {
         let s = fresh_store();
         // Pre-existing skill.
         let target_id = s
-            .create(sample_new("research/sources", "v1 body"), Strictness::Strict, 1)
+            .create(
+                sample_new("research/sources", "v1 body"),
+                Strictness::Strict,
+                1,
+            )
             .unwrap();
         // Fork proposal with new body.
         let mut p = sample_proposal("research/sources");
@@ -2084,9 +2141,7 @@ mod tests {
         p.body_md = "improved v2 body".into();
         let pid = s.submit_proposal(p, 2).unwrap();
 
-        let returned_id = s
-            .approve_proposal(pid, "admin", None, 3)
-            .unwrap();
+        let returned_id = s.approve_proposal(pid, "admin", None, 3).unwrap();
         assert_eq!(returned_id, target_id);
         // Skill now has v2 with the proposal's body.
         let g = s.get("research/sources").unwrap().unwrap();

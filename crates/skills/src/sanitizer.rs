@@ -125,9 +125,8 @@ fn is_suspicious_key(k: &str) -> bool {
     false
 }
 
-static OPENAI_KEY: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\bsk-(?:ant-|proj-|or-|live-|test-)?[A-Za-z0-9_-]{20,}\b").unwrap()
-});
+static OPENAI_KEY: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\bsk-(?:ant-|proj-|or-|live-|test-)?[A-Za-z0-9_-]{20,}\b").unwrap());
 static GITHUB_TOKEN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b").unwrap());
 static AWS_ACCESS_KEY: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bAKIA[0-9A-Z]{16}\b").unwrap());
@@ -141,9 +140,8 @@ static PEM_PRIVATE_KEY: Lazy<Regex> = Lazy::new(|| {
 static JWT_TOKEN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b").unwrap()
 });
-static URL_WITH_CREDS: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:[^/\s@]+@[^\s]+").unwrap()
-});
+static URL_WITH_CREDS: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:[^/\s@]+@[^\s]+").unwrap());
 
 static SHA256_HEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[a-fA-F0-9]{64}$").unwrap());
 static UUID: Lazy<Regex> = Lazy::new(|| {
@@ -341,7 +339,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn sanitize_one(args: JsonValue, result: Result<JsonValue, String>) -> (SanitizedStep, SanitizationReport) {
+    fn sanitize_one(
+        args: JsonValue,
+        result: Result<JsonValue, String>,
+    ) -> (SanitizedStep, SanitizationReport) {
         let mut r = SanitizationReport::default();
         let s = sanitize_step(1, "test_tool", &args, &result, &mut r);
         (s, r)
@@ -480,7 +481,10 @@ mod tests {
             }),
             Ok(json!({})),
         );
-        assert_eq!(s.args_json["sha"], "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(
+            s.args_json["sha"],
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
         assert_eq!(s.args_json["id"], "550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(r.entropy_redacted, 0);
     }

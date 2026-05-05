@@ -34,9 +34,9 @@
 use crate::auth::{JwtSigner, RefreshStore};
 use crate::routes::ApiError;
 use crate::state::{AppState, ServerConfig};
+use axum::Router;
 use axum::http::StatusCode;
 use axum::response::Json;
-use axum::Router;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -186,14 +186,15 @@ pub fn issue_login_tokens(
     let _ = users.touch_login(user_id, Utc::now().timestamp());
 
     let session_id = Uuid::new_v4().to_string();
-    let access = state
-        .signer
-        .issue_access_token(user_id, &session_id, state.config.access_token_ttl_secs)?;
-    let refresh = state.refresh_store.issue(
+    let access = state.signer.issue_access_token(
         user_id,
         &session_id,
-        state.config.refresh_token_ttl_secs,
+        state.config.access_token_ttl_secs,
     )?;
+    let refresh =
+        state
+            .refresh_store
+            .issue(user_id, &session_id, state.config.refresh_token_ttl_secs)?;
     Ok(Json(crate::routes::LoginResponse {
         access_token: access,
         refresh_token: refresh,
@@ -215,9 +216,9 @@ fn _config_marker(_: &ServerConfig) {}
 #[cfg(feature = "webauthn")]
 mod imp {
     use super::*;
+    use crate::auth_extract::AuthedUser;
     use axum::extract::{Path as AxumPath, State};
     use axum::routing::{delete, get, post};
-    use crate::auth_extract::AuthedUser;
     use dashmap::DashMap;
     use execlaw_core::webauthn::{WebauthnCredentialRow, WebauthnStore};
     use webauthn_rs::prelude::{
@@ -265,8 +266,7 @@ mod imp {
 
     impl WebauthnSvc {
         pub fn new(rp_id: &str, rp_origin: &str, rp_name: &str) -> Result<Self, WebauthnSvcError> {
-            let url =
-                Url::parse(rp_origin).map_err(|e| WebauthnSvcError::Build(e.to_string()))?;
+            let url = Url::parse(rp_origin).map_err(|e| WebauthnSvcError::Build(e.to_string()))?;
             let rp = WebauthnBuilder::new(rp_id, &url)
                 .map_err(|e| WebauthnSvcError::Build(e.to_string()))?
                 .rp_name(rp_name)
@@ -296,7 +296,11 @@ mod imp {
                     handle,
                     username,
                     display_name,
-                    if exclude.is_empty() { None } else { Some(exclude) },
+                    if exclude.is_empty() {
+                        None
+                    } else {
+                        Some(exclude)
+                    },
                 )
                 .map_err(|e| WebauthnSvcError::Ceremony(e.to_string()))?;
             let ceremony_id = Uuid::new_v4().to_string();
@@ -626,8 +630,8 @@ mod imp {
     }
 
     pub fn base64_url_encode(bytes: &[u8]) -> String {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         URL_SAFE_NO_PAD.encode(bytes)
     }
 
@@ -737,22 +741,16 @@ mod imp {
                 "/api/admin/webauthn/register/finish",
                 post(unconfigured_handler),
             )
-            .route(
-                "/api/admin/webauthn/credentials",
-                get(unconfigured_handler),
-            )
+            .route("/api/admin/webauthn/credentials", get(unconfigured_handler))
             .route(
                 "/api/admin/webauthn/credentials/{credential_id}",
                 delete(unconfigured_handler),
             )
-            .route(
-                "/api/login/webauthn/finish",
-                post(unconfigured_handler),
-            )
+            .route("/api/login/webauthn/finish", post(unconfigured_handler))
     }
 }
 
-pub use imp::{begin_login_assertion, webauthn_router, WebauthnSvc};
+pub use imp::{WebauthnSvc, begin_login_assertion, webauthn_router};
 
 // ---------------------------------------------------------------------------
 // Tests — only the feature-on path has unit tests; the stub path is
@@ -773,16 +771,14 @@ mod tests {
 
     #[test]
     fn build_accepts_localhost_http() {
-        let svc =
-            WebauthnSvc::new("localhost", "http://localhost:3030", "execlaw").unwrap();
+        let svc = WebauthnSvc::new("localhost", "http://localhost:3030", "execlaw").unwrap();
         let (r, a) = svc.pending_count();
         assert_eq!((r, a), (0, 0));
     }
 
     #[test]
     fn finish_with_unknown_ceremony_id_rejected() {
-        let svc =
-            WebauthnSvc::new("localhost", "http://localhost:3030", "execlaw").unwrap();
+        let svc = WebauthnSvc::new("localhost", "http://localhost:3030", "execlaw").unwrap();
         // Construct any well-formed RegisterPublicKeyCredential; the
         // unknown-id branch fires before the credential is parsed.
         let cred: RegisterPublicKeyCredential = serde_json::from_value(serde_json::json!({
@@ -802,8 +798,7 @@ mod tests {
 
     #[test]
     fn prune_expired_clears_old_pending() {
-        let svc =
-            WebauthnSvc::new("localhost", "http://localhost:3030", "execlaw").unwrap();
+        let svc = WebauthnSvc::new("localhost", "http://localhost:3030", "execlaw").unwrap();
         let (ceremony_id, _) = svc
             .begin_registration("u1", "alice", "Alice", "k".into(), vec![])
             .unwrap();

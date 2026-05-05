@@ -159,7 +159,10 @@ mod tests {
         }
         stop.notify_one();
         let _ = tokio::time::timeout(Duration::from_secs(1), h).await;
-        assert!(saw, "reaper loop must invoke reap_stale and publish VoiceSessionEnded");
+        assert!(
+            saw,
+            "reaper loop must invoke reap_stale and publish VoiceSessionEnded"
+        );
     }
 
     #[tokio::test]

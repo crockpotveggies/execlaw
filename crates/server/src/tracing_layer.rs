@@ -87,19 +87,24 @@ struct FieldVisitor {
 
 impl Visit for FieldVisitor {
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.fields.insert(field.name().to_owned(), value.to_owned());
+        self.fields
+            .insert(field.name().to_owned(), value.to_owned());
     }
     fn record_bool(&mut self, field: &Field, value: bool) {
-        self.fields.insert(field.name().to_owned(), value.to_string());
+        self.fields
+            .insert(field.name().to_owned(), value.to_string());
     }
     fn record_i64(&mut self, field: &Field, value: i64) {
-        self.fields.insert(field.name().to_owned(), value.to_string());
+        self.fields
+            .insert(field.name().to_owned(), value.to_string());
     }
     fn record_u64(&mut self, field: &Field, value: u64) {
-        self.fields.insert(field.name().to_owned(), value.to_string());
+        self.fields
+            .insert(field.name().to_owned(), value.to_string());
     }
     fn record_f64(&mut self, field: &Field, value: f64) {
-        self.fields.insert(field.name().to_owned(), value.to_string());
+        self.fields
+            .insert(field.name().to_owned(), value.to_string());
     }
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         self.fields
@@ -139,7 +144,9 @@ mod tests {
         });
 
         let store = LogStore::new(&db);
-        let rows = store.query(Some(LogLevel::Warn), None, None, None, 100).unwrap();
+        let rows = store
+            .query(Some(LogLevel::Warn), None, None, None, 100)
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].message, "something broke");
         assert_eq!(rows[0].conversation_id.as_deref(), Some("conv-trace"));
@@ -164,10 +171,14 @@ mod tests {
         });
 
         let store = LogStore::new(&db);
-        let warns = store.query(Some(LogLevel::Warn), None, None, None, 100).unwrap();
+        let warns = store
+            .query(Some(LogLevel::Warn), None, None, None, 100)
+            .unwrap();
         assert_eq!(warns.len(), 1);
         assert_eq!(warns[0].message, "warn one");
-        let errors = store.query(Some(LogLevel::Error), None, None, None, 100).unwrap();
+        let errors = store
+            .query(Some(LogLevel::Error), None, None, None, 100)
+            .unwrap();
         assert_eq!(errors.len(), 1);
     }
 

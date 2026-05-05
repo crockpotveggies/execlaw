@@ -115,7 +115,9 @@ impl FromRequestParts<AppState> for AuthedUser {
         let row = users
             .get_by_id(&claims.sub)
             .map_err(|_| AuthRejection("user lookup failed"))?
-            .ok_or(AuthRejection("token references a user that no longer exists"))?;
+            .ok_or(AuthRejection(
+                "token references a user that no longer exists",
+            ))?;
         Ok(AuthedUser::from(row))
     }
 }

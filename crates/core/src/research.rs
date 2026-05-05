@@ -19,7 +19,7 @@
 
 use crate::db::{Database, DbError};
 use crate::ids::{ConversationId, ResearchJobId};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -783,7 +783,8 @@ impl<'db> ResearchJobStore<'db> {
             if original.is_empty() {
                 return Ok(0); // not awaiting, or row missing
             }
-            let merged = format!("{original}\n\nClarification from operator: {clarification_owned}");
+            let merged =
+                format!("{original}\n\nClarification from operator: {clarification_owned}");
             let n = c.execute(
                 "UPDATE state_research_jobs \
                  SET status = 'pending', \
@@ -1344,14 +1345,7 @@ mod tests {
             (&cancelled, "cancelled"),
         ] {
             store
-                .insert_pending(
-                    id,
-                    &ConversationId::from("c"),
-                    "q",
-                    "Controller",
-                    None,
-                    100,
-                )
+                .insert_pending(id, &ConversationId::from("c"), "q", "Controller", None, 100)
                 .unwrap();
             // Force the desired state via raw UPDATE since
             // insert_pending always writes 'pending'.
@@ -1387,7 +1381,13 @@ mod tests {
             (&cancelled, ResearchJobStatus::Cancelled),
         ] {
             let row = store.get(id).unwrap().unwrap();
-            assert_eq!(&row.status, expected, "{} should be {:?}", id.as_str(), expected);
+            assert_eq!(
+                &row.status,
+                expected,
+                "{} should be {:?}",
+                id.as_str(),
+                expected
+            );
         }
         // Confirm the converts have the recovery error stamped.
         for id in [&planning, &gathering, &synthesizing] {
@@ -1442,14 +1442,7 @@ mod tests {
             (&without_card, None::<&str>),
         ] {
             store
-                .insert_pending(
-                    id,
-                    &ConversationId::from("c"),
-                    "q",
-                    "Controller",
-                    None,
-                    100,
-                )
+                .insert_pending(id, &ConversationId::from("c"), "q", "Controller", None, 100)
                 .unwrap();
             db.with_conn(|c| {
                 c.execute(
@@ -1522,20 +1515,24 @@ mod tests {
             .unwrap();
 
         // First claim — fresh card_id assigned.
-        let first = store.claim_next_pending("card-original", 200).unwrap().unwrap();
+        let first = store
+            .claim_next_pending("card-original", 200)
+            .unwrap()
+            .unwrap();
         assert_eq!(first.card_id.as_deref(), Some("card-original"));
 
         // Simulate the planner returning clarification + the user
         // answering: AwaitingInput → resume → Pending.
         store.set_awaiting_input(&id, "Which zone?", 250).unwrap();
-        store
-            .resume_with_clarification(&id, "Zone 6", 300)
-            .unwrap();
+        store.resume_with_clarification(&id, "Zone 6", 300).unwrap();
 
         // Second claim — supervisor's next tick. Must NOT
         // overwrite the original card_id even though we passed
         // a fresh placeholder. This is the regression.
-        let resumed = store.claim_next_pending("card-fresh-uuid", 400).unwrap().unwrap();
+        let resumed = store
+            .claim_next_pending("card-fresh-uuid", 400)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             resumed.card_id.as_deref(),
             Some("card-original"),
@@ -1776,7 +1773,14 @@ mod tests {
         let store = ResearchJobStore::new(&db);
         let id = ResearchJobId::new();
         store
-            .insert_pending(&id, &ConversationId::from("c"), "q", "Controller", None, 100)
+            .insert_pending(
+                &id,
+                &ConversationId::from("c"),
+                "q",
+                "Controller",
+                None,
+                100,
+            )
             .unwrap();
         store.claim_next_pending("c", 110).unwrap();
         // Cancel BEFORE the planner returns.
@@ -1810,7 +1814,14 @@ mod tests {
         let store = ResearchJobStore::new(&db);
         let id = ResearchJobId::new();
         store
-            .insert_pending(&id, &ConversationId::from("c"), "q", "Controller", None, 100)
+            .insert_pending(
+                &id,
+                &ConversationId::from("c"),
+                "q",
+                "Controller",
+                None,
+                100,
+            )
             .unwrap();
         store.claim_next_pending("c", 110).unwrap();
         store.cancel_active(&id, Some("operator"), 200).unwrap();
@@ -1852,7 +1863,14 @@ mod tests {
         let store = ResearchJobStore::new(&db);
         let id = ResearchJobId::new();
         store
-            .insert_pending(&id, &ConversationId::from("c"), "q", "Controller", None, 100)
+            .insert_pending(
+                &id,
+                &ConversationId::from("c"),
+                "q",
+                "Controller",
+                None,
+                100,
+            )
             .unwrap();
         store.claim_next_pending("c", 110).unwrap();
         store.cancel_active(&id, Some("operator"), 200).unwrap();
@@ -1903,7 +1921,13 @@ mod tests {
             .ok();
         store.claim_next_pending("c2", 140).unwrap();
         store
-            .finish(&active_id, ResearchJobStatus::Complete, None, Some("a"), 150)
+            .finish(
+                &active_id,
+                ResearchJobStatus::Complete,
+                None,
+                Some("a"),
+                150,
+            )
             .ok();
         store.claim_next_pending("c3", 160).unwrap();
         store
@@ -2393,14 +2417,7 @@ mod tests {
         let store = ResearchJobStore::new(db);
         let id = ResearchJobId::new();
         store
-            .insert_pending(
-                &id,
-                &ConversationId::from("c-clar"),
-                q,
-                "Owner",
-                None,
-                100,
-            )
+            .insert_pending(&id, &ConversationId::from("c-clar"), q, "Owner", None, 100)
             .unwrap();
         id
     }
@@ -2423,15 +2440,16 @@ mod tests {
         let db = fresh_db();
         let id = seed_pending_job(&db, "vague query");
         let store = ResearchJobStore::new(&db);
-        let landed = store
-            .set_awaiting_input(&id, "Which region?", 200)
-            .unwrap();
+        let landed = store.set_awaiting_input(&id, "Which region?", 200).unwrap();
         assert!(landed, "first set must land");
         let row = store.get(&id).unwrap().unwrap();
         assert_eq!(row.status, ResearchJobStatus::AwaitingInput);
         assert_eq!(row.error.as_deref(), Some("Which region?"));
         // Non-terminal: finished_at stays NULL.
-        assert!(row.finished_at.is_none(), "awaiting_input must not stamp finished_at");
+        assert!(
+            row.finished_at.is_none(),
+            "awaiting_input must not stamp finished_at"
+        );
         assert_eq!(row.updated_at, 200);
     }
 
@@ -2443,7 +2461,9 @@ mod tests {
         let db = fresh_db();
         let id = seed_pending_job(&db, "q");
         let store = ResearchJobStore::new(&db);
-        store.cancel_active(&id, Some("operator killed"), 150).unwrap();
+        store
+            .cancel_active(&id, Some("operator killed"), 150)
+            .unwrap();
         let landed = store
             .set_awaiting_input(&id, "Should never apply", 200)
             .unwrap();
@@ -2470,7 +2490,10 @@ mod tests {
 
         let row = store.get(&id).unwrap().unwrap();
         assert_eq!(row.status, ResearchJobStatus::Pending);
-        assert!(row.query.contains("evergreen ground covers"), "original query preserved");
+        assert!(
+            row.query.contains("evergreen ground covers"),
+            "original query preserved"
+        );
         assert!(row.query.contains("Zone 6"), "clarification appended");
         assert!(row.error.is_none(), "outstanding question cleared");
         assert!(row.plan_json.is_none(), "stale plan cleared");
@@ -2487,17 +2510,13 @@ mod tests {
         let id = seed_pending_job(&db, "q");
         let store = ResearchJobStore::new(&db);
         // No set_awaiting_input → row is still Pending.
-        let landed = store
-            .resume_with_clarification(&id, "answer", 300)
-            .unwrap();
+        let landed = store.resume_with_clarification(&id, "answer", 300).unwrap();
         assert!(!landed);
 
         // Cancelled rows must not be resurrectable either.
         store.set_awaiting_input(&id, "q?", 200).unwrap();
         store.cancel_active(&id, Some("op killed"), 250).unwrap();
-        let landed = store
-            .resume_with_clarification(&id, "answer", 300)
-            .unwrap();
+        let landed = store.resume_with_clarification(&id, "answer", 300).unwrap();
         assert!(!landed, "cannot resume a cancelled row");
         let row = store.get(&id).unwrap().unwrap();
         assert_eq!(row.status, ResearchJobStatus::Cancelled);

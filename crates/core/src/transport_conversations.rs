@@ -105,9 +105,7 @@ impl<'db> TransportConversationStore<'db> {
     }
 }
 
-fn row_to_transport_conv(
-    r: &rusqlite::Row<'_>,
-) -> rusqlite::Result<TransportConversationRow> {
+fn row_to_transport_conv(r: &rusqlite::Row<'_>) -> rusqlite::Result<TransportConversationRow> {
     let is_current: i64 = r.get(4)?;
     Ok(TransportConversationRow {
         plugin_id: r.get(0)?,
@@ -178,10 +176,7 @@ impl<'db> ConversationResolver<'db> {
     /// table; the entire decision lands in a single SQLite transaction
     /// so a crash mid-resolve can never leave the principal pointing at
     /// two `is_current = 1` rows.
-    pub fn resolve_or_mint(
-        &self,
-        input: &ResolveInput<'_>,
-    ) -> Result<ResolveOutcome, DbError> {
+    pub fn resolve_or_mint(&self, input: &ResolveInput<'_>) -> Result<ResolveOutcome, DbError> {
         // Controller short-circuit. No transaction needed — we don't
         // touch transport_conversations on the controller path.
         if input.is_controller {
@@ -204,11 +199,7 @@ impl<'db> ConversationResolver<'db> {
                      WHERE plugin_id = ?1 AND transport_handle = ?2 \
                        AND principal_id = ?3 AND is_current = 1 \
                      LIMIT 1",
-                    params![
-                        input.plugin_id,
-                        input.transport_handle,
-                        input.principal_id
-                    ],
+                    params![input.plugin_id, input.transport_handle, input.principal_id],
                     |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
                 )
                 .ok();
@@ -229,9 +220,7 @@ impl<'db> ConversationResolver<'db> {
                             cid,
                         ],
                     )?;
-                    return Ok(ResolveOutcome::Continued(ConversationId::from(
-                        cid.clone(),
-                    )));
+                    return Ok(ResolveOutcome::Continued(ConversationId::from(cid.clone())));
                 }
             }
 
@@ -243,11 +232,7 @@ impl<'db> ConversationResolver<'db> {
                      SET is_current = 0 \
                      WHERE plugin_id = ?1 AND transport_handle = ?2 \
                        AND principal_id = ?3 AND is_current = 1",
-                    params![
-                        input.plugin_id,
-                        input.transport_handle,
-                        input.principal_id
-                    ],
+                    params![input.plugin_id, input.transport_handle, input.principal_id],
                 )?;
             }
 
@@ -497,8 +482,10 @@ mod tests {
             controller_thread_id("ctrl-1"),
             controller_thread_id("ctrl-2")
         );
-        assert!(controller_thread_id("ctrl-1")
-            .as_str()
-            .starts_with("controller-thread:"));
+        assert!(
+            controller_thread_id("ctrl-1")
+                .as_str()
+                .starts_with("controller-thread:")
+        );
     }
 }

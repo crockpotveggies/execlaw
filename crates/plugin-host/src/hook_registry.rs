@@ -252,7 +252,18 @@ impl HookRegistry {
         }
 
         // Validate conflicts first, then insert.
+        //
+        // `host_implemented` tools are deliberately exempt from BOTH
+        // checks: a builtin under the same name is the *intended*
+        // implementation (the manifest declaration is just metadata
+        // for catalog/attribution), and a second plugin attempting to
+        // host-implement the same name is a tooling-author error
+        // caught here only if the duplicate is itself host-implemented
+        // — let the builtin layer surface that conflict.
         for t in &manifest.tools {
+            if t.host_implemented {
+                continue;
+            }
             if let Some(existing) = w.tools_by_name.get(&t.name) {
                 return Err(format!(
                     "tool '{}' is already registered by plugin '{}'",
@@ -302,6 +313,16 @@ impl HookRegistry {
 
         // Insert.
         for t in &manifest.tools {
+            if t.host_implemented {
+                // Manifest-declared but host-implemented: skip
+                // tools_by_name. The host's builtin (registered via
+                // `register_builtin`) is the dispatch target. Catalog
+                // surfaces should still attribute the tool to this
+                // plugin — that's wired by listing both the builtin
+                // descriptor and the plugin's manifest tools, then
+                // joining on name.
+                continue;
+            }
             let latency = match t.latency {
                 execlaw_plugin_sdk::manifest::ToolLatency::Low => "low",
                 execlaw_plugin_sdk::manifest::ToolLatency::Medium => "medium",
@@ -500,12 +521,9 @@ impl HookRegistry {
             ));
         }
         if w.builtins_by_name.contains_key(&name) {
-            return Err(format!(
-                "built-in tool '{name}' is already registered"
-            ));
+            return Err(format!("built-in tool '{name}' is already registered"));
         }
-        w.builtins_by_name
-            .insert(name, RegisteredBuiltin { tool });
+        w.builtins_by_name.insert(name, RegisteredBuiltin { tool });
         Ok(())
     }
 
@@ -548,6 +566,22 @@ impl HookRegistry {
 
     pub fn transport(&self, id: &str) -> Option<RegisteredTransport> {
         self.inner.read().unwrap().transports_by_id.get(id).cloned()
+    }
+
+    /// Snapshot every plugin-registered `[transport]` declaration.
+    /// Used by the Settings → User "My identities" surface to
+    /// populate the transport dropdown dynamically — the SPA
+    /// shouldn't be guessing what channels are valid before a
+    /// plugin lands. Order is stable (`BTreeMap`) so the dropdown
+    /// presents transports in a consistent order across reloads.
+    pub fn all_transports(&self) -> Vec<RegisteredTransport> {
+        self.inner
+            .read()
+            .unwrap()
+            .transports_by_id
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Look up the sidecar registered with `name`, if any. Returns
@@ -743,7 +777,10 @@ latency = "low"
         let t = reg.tool("x").expect("tool still registered");
         assert!(t.schema_json.is_none(), "missing file → schema_json None");
         // schema_path is preserved for diagnostics.
-        assert_eq!(t.schema_path.as_deref(), Some("schemas/does_not_exist.json"));
+        assert_eq!(
+            t.schema_path.as_deref(),
+            Some("schemas/does_not_exist.json")
+        );
     }
 
     #[test]
@@ -894,11 +931,7 @@ rpc_port = {port}
             .unwrap();
         reg.enable(&manifest_with_sidecar("p-a", "a-sidecar", 9001))
             .unwrap();
-        let names: Vec<String> = reg
-            .all_sidecars()
-            .into_iter()
-            .map(|b| b.name)
-            .collect();
+        let names: Vec<String> = reg.all_sidecars().into_iter().map(|b| b.name).collect();
         assert_eq!(names, vec!["a-sidecar", "z-sidecar"]);
     }
 
@@ -989,9 +1022,7 @@ supports_groups = false
 "#;
         let reg = HookRegistry::new();
         reg.enable(&PluginManifest::parse(m1).unwrap()).unwrap();
-        let err = reg
-            .enable(&PluginManifest::parse(m2).unwrap())
-            .unwrap_err();
+        let err = reg.enable(&PluginManifest::parse(m2).unwrap()).unwrap_err();
         assert!(err.contains("transport id 'signal'"));
         assert!(
             !reg.is_enabled("p2"),
@@ -1025,9 +1056,7 @@ entry = "other.js"
 "#;
         let reg = HookRegistry::new();
         reg.enable(&PluginManifest::parse(m1).unwrap()).unwrap();
-        let err = reg
-            .enable(&PluginManifest::parse(m2).unwrap())
-            .unwrap_err();
+        let err = reg.enable(&PluginManifest::parse(m2).unwrap()).unwrap_err();
         assert!(err.contains("ui_panel mount"));
         assert_eq!(reg.ui_panels().len(), 1);
     }
@@ -1184,13 +1213,77 @@ trust_hint_default = "Contact"
         assert!(!reg.is_enabled("rogue"));
     }
 
+    /// Phase 3: tools marked `host_implemented = true` in the
+    /// manifest are deliberately exempt from the
+    /// no-shadowing-a-builtin check — the builtin IS the intended
+    /// implementation, the manifest entry just attributes it to
+    /// the plugin in catalog UIs. Registering a builtin first then
+    /// enabling the plugin must succeed without conflict.
+    #[test]
+    fn host_implemented_tool_does_not_conflict_with_builtin() {
+        let reg = HookRegistry::new();
+        // Builtin landed first — happens at boot before plugin
+        // hydrate.
+        reg.register_builtin(arc_dummy("signal.send_message"))
+            .unwrap();
+        // Plugin manifest declares the same name as host-implemented.
+        let manifest = PluginManifest::parse(
+            r#"
+[plugin]
+id = "signal"
+name = "Signal"
+version = "0.1.0"
+
+[[tools]]
+name = "signal.send_message"
+host_implemented = true
+latency = "low"
+"#,
+        )
+        .unwrap();
+        reg.enable(&manifest)
+            .expect("host-implemented tool must not conflict with builtin");
+        // Builtin still wins on lookup; the host-implemented entry
+        // does NOT pollute tools_by_name.
+        assert!(reg.builtin("signal.send_message").is_some());
+        assert!(reg.tool("signal.send_message").is_none());
+        assert!(reg.is_enabled("signal"));
+    }
+
+    /// Reverse order: plugin enabled first (host_implemented=true),
+    /// then builtin registered. The builtin must still register
+    /// cleanly because the plugin entry never landed in tools_by_name.
+    #[test]
+    fn host_implemented_does_not_block_subsequent_builtin_registration() {
+        let reg = HookRegistry::new();
+        let manifest = PluginManifest::parse(
+            r#"
+[plugin]
+id = "signal"
+name = "Signal"
+version = "0.1.0"
+
+[[tools]]
+name = "signal.send_message"
+host_implemented = true
+latency = "low"
+"#,
+        )
+        .unwrap();
+        reg.enable(&manifest).unwrap();
+        // Now register the actual builtin — must succeed.
+        reg.register_builtin(arc_dummy("signal.send_message"))
+            .expect("builtin must land cleanly when plugin entry was host_implemented");
+    }
+
     /// Symmetric guard: registering a built-in whose name is already
     /// owned by an enabled plugin must fail rather than silently
     /// taking precedence at lookup time.
     #[test]
     fn builtin_cannot_shadow_existing_plugin_tool() {
         let reg = HookRegistry::new();
-        reg.enable(&manifest_with_tools("p1", &["overlap"])).unwrap();
+        reg.enable(&manifest_with_tools("p1", &["overlap"]))
+            .unwrap();
         let err = reg.register_builtin(arc_dummy("overlap")).unwrap_err();
         assert!(err.contains("would shadow plugin 'p1'"));
         assert!(reg.builtin("overlap").is_none());
@@ -1236,7 +1329,8 @@ trust_hint_default = "Contact"
     #[test]
     fn lookup_any_returns_plugin_for_plugin_name() {
         let reg = HookRegistry::new();
-        reg.enable(&manifest_with_tools("p1", &["plugin_tool"])).unwrap();
+        reg.enable(&manifest_with_tools("p1", &["plugin_tool"]))
+            .unwrap();
         let got = reg.lookup_any("plugin_tool").unwrap();
         assert!(!got.is_builtin());
         assert_eq!(got.name(), "plugin_tool");

@@ -23,7 +23,7 @@ pub mod service;
 pub use hf_downloader::{DownloadEvent, DownloadStream, HfDownloader, HfError, ResolvedModel};
 
 pub use hardware::{
-    detect, detect_sysfs, GpuDevice, GpuId, GpuVendor, HardwareProfile, SysfsSource,
+    GpuDevice, GpuId, GpuVendor, HardwareProfile, SysfsSource, detect, detect_sysfs,
 };
 pub use service::{
     BollardServiceController, HostMount, ServiceController, ServiceError, ServiceHandle,

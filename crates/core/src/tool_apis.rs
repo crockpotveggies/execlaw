@@ -28,8 +28,8 @@ use crate::tool::{
 };
 use async_trait::async_trait;
 use rusqlite::params;
-use std::sync::Arc;
 use serde::Deserialize;
+use std::sync::Arc;
 
 // -----------------------------------------------------------------
 // Trust ranking — local to this module so `core` stays free of

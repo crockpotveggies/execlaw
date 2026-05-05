@@ -194,7 +194,9 @@ mod tests {
         }
 
         // Filter by level → only the WARN.
-        let warns = store.query(Some(LogLevel::Warn), None, None, None, 100).unwrap();
+        let warns = store
+            .query(Some(LogLevel::Warn), None, None, None, 100)
+            .unwrap();
         assert_eq!(warns.len(), 1);
         assert_eq!(warns[0].ts_ms, 200);
 

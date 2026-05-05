@@ -139,10 +139,18 @@ mod tests {
         // insert-time picks one of the equal-TTL entries (which
         // one is non-deterministic — HashMap iteration), then
         // victim lands.
-        c.put("victim".into(), serde_json::json!("v"), Duration::from_secs(10));
+        c.put(
+            "victim".into(),
+            serde_json::json!("v"),
+            Duration::from_secs(10),
+        );
         // Insert one more — pushes over capacity. The min-expiry
         // is now `victim`, which gets evicted in favour of `fresh`.
-        c.put("fresh".into(), serde_json::json!("f"), Duration::from_secs(3600));
+        c.put(
+            "fresh".into(),
+            serde_json::json!("f"),
+            Duration::from_secs(3600),
+        );
         // Contract: victim is gone (it had the soonest expiry when
         // `fresh` arrived). `fresh` is present. The MAX_ENTRIES
         // long-TTL entries minus one (the original eviction at

@@ -93,10 +93,12 @@ fn load_plugin_files(mock_url: &str) -> (String, String) {
         .parent()
         .unwrap()
         .to_path_buf();
-    let manifest = std::fs::read_to_string(workspace_root.join("plugins/google-contacts/plugin.toml"))
-        .expect("plugins/google-contacts/plugin.toml must exist");
-    let original_script = std::fs::read_to_string(workspace_root.join("plugins/google-contacts/main.rhai"))
-        .expect("plugins/google-contacts/main.rhai must exist");
+    let manifest =
+        std::fs::read_to_string(workspace_root.join("plugins/google-contacts/plugin.toml"))
+            .expect("plugins/google-contacts/plugin.toml must exist");
+    let original_script =
+        std::fs::read_to_string(workspace_root.join("plugins/google-contacts/main.rhai"))
+            .expect("plugins/google-contacts/main.rhai must exist");
     let rewritten = original_script.replace(
         r#""https://people.googleapis.com/v1/people/me/connections""#,
         &format!(r#""{mock_url}/v1/people/me/connections""#),
@@ -129,7 +131,9 @@ fn build_app(stage_root: PathBuf) -> (axum::Router, AppState) {
         refresh_store: Arc::new(RefreshStore::new(db.clone())),
         events: events.clone(),
         event_log_hmac_key: Some(Arc::new(b"execlaw-test-hmac-key-32-bytes!!".to_vec())),
-        inference: Arc::new(execlaw_server::inference_resolver::InferenceResolver::new(None)),
+        inference: Arc::new(execlaw_server::inference_resolver::InferenceResolver::new(
+            None,
+        )),
         plugin_host: PluginHost::with_script_engine(
             db.clone(),
             HookRegistry::new(),
@@ -292,11 +296,7 @@ async fn google_contacts_plugin_full_install_and_dispatch_roundtrip() {
     // ---- 5. call_tool contacts.list with token -------------------
     let res = state
         .plugin_host
-        .call_tool(
-            "contacts.list",
-            serde_json::json!({"limit": 5}),
-            &["*"],
-        )
+        .call_tool("contacts.list", serde_json::json!({"limit": 5}), &["*"])
         .await
         .expect("contacts.list dispatch should succeed with valid token + caps");
     let contacts = res["contacts"]

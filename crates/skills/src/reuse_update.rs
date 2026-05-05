@@ -35,14 +35,12 @@
 
 use crate::capture::CaptureOutcome;
 use crate::model::{NewProposal, ProposalKind, SkillError, SkillId};
-use crate::sanitizer::{sanitize_step, SanitizationReport};
+use crate::sanitizer::{SanitizationReport, sanitize_step};
 use crate::store::SkillStore;
 use crate::summarizer::{
-    build_improvement_prompt, SkillSummarizer, SummarizerOutput, SummarizerPrompt,
+    SkillSummarizer, SummarizerOutput, SummarizerPrompt, build_improvement_prompt,
 };
-use execlaw_core::events::{
-    EventKind, EventLog, EventRecord, ToolResultPayload, ToolUsePayload,
-};
+use execlaw_core::events::{EventKind, EventLog, EventRecord, ToolResultPayload, ToolUsePayload};
 use execlaw_core::ids::{ConversationId, EventSeq};
 use execlaw_core::skills_config::SkillsConfigStore;
 use serde_json::Value as JsonValue;
@@ -132,7 +130,11 @@ impl ReuseUpdateWorker {
         // 1. Config gate.
         let cfg = match SkillsConfigStore::new(&self.db).get() {
             Ok(c) => c,
-            Err(e) => return CaptureOutcome::Error { message: e.to_string() },
+            Err(e) => {
+                return CaptureOutcome::Error {
+                    message: e.to_string(),
+                };
+            }
         };
         if !cfg.reuse_update_enabled {
             return CaptureOutcome::Disabled;
@@ -146,22 +148,36 @@ impl ReuseUpdateWorker {
         // 3. Look up the target skill (must exist + not be archived).
         let skill_name = match self.lookup_skill_name(req.skill_id) {
             Ok(Some(n)) => n,
-            Ok(None) => return CaptureOutcome::Error {
-                message: format!("skill {} not found", req.skill_id.0),
-            },
-            Err(e) => return CaptureOutcome::Error { message: e.to_string() },
+            Ok(None) => {
+                return CaptureOutcome::Error {
+                    message: format!("skill {} not found", req.skill_id.0),
+                };
+            }
+            Err(e) => {
+                return CaptureOutcome::Error {
+                    message: e.to_string(),
+                };
+            }
         };
         let view = match self.skill_store.view(&skill_name) {
             Ok(Some(v)) => v,
             Ok(None) => return CaptureOutcome::Disabled, // archived; nothing to fork
-            Err(e) => return CaptureOutcome::Error { message: e.to_string() },
+            Err(e) => {
+                return CaptureOutcome::Error {
+                    message: e.to_string(),
+                };
+            }
         };
 
         // 4. Replay and slice trajectory (same logic as auto-capture).
         let log = EventLog::new(&self.db);
         let events = match log.replay_since(&req.conversation_id, EventSeq(0)) {
             Ok(v) => v,
-            Err(e) => return CaptureOutcome::Error { message: e.to_string() },
+            Err(e) => {
+                return CaptureOutcome::Error {
+                    message: e.to_string(),
+                };
+            }
         };
         let trajectory = extract_latest_trajectory(&events, req.until_seq);
 
@@ -255,14 +271,14 @@ impl ReuseUpdateWorker {
             tool_calls_observed: tool_call_count as u32,
         };
         match self.skill_store.submit_proposal(new_p, now_ms) {
-            Ok(_) => CaptureOutcome::DryRun {
-                proposal: raw,
-            },
+            Ok(_) => CaptureOutcome::DryRun { proposal: raw },
             Err(SkillError::Blocked { findings, fields }) => CaptureOutcome::Blocked {
                 name: raw.name,
                 reason: format!("scanner blocked: {findings} finding(s) in {fields:?}"),
             },
-            Err(e) => CaptureOutcome::Error { message: e.to_string() },
+            Err(e) => CaptureOutcome::Error {
+                message: e.to_string(),
+            },
         }
     }
 
@@ -285,8 +301,15 @@ impl ReuseUpdateWorker {
 
 #[derive(Debug, Clone)]
 enum TrajectoryEntry {
-    ToolUse { ordinal: u32, name: String, args: JsonValue },
-    ToolResult { ordinal: u32, outcome: Result<JsonValue, String> },
+    ToolUse {
+        ordinal: u32,
+        name: String,
+        args: JsonValue,
+    },
+    ToolResult {
+        ordinal: u32,
+        outcome: Result<JsonValue, String>,
+    },
 }
 
 impl TrajectoryEntry {
@@ -369,7 +392,12 @@ fn pair_and_sanitize(
     let mut had_failure = false;
     let mut steps = Vec::new();
     for t in trajectory {
-        if let TrajectoryEntry::ToolUse { ordinal, name, args } = t {
+        if let TrajectoryEntry::ToolUse {
+            ordinal,
+            name,
+            args,
+        } = t
+        {
             let result = results
                 .get(ordinal)
                 .cloned()
@@ -390,7 +418,10 @@ fn log_outcome(req: &ReuseUpdateRequest, outcome: &CaptureOutcome) {
             invocation_id = req.invocation_id,
             "reuse-update disabled or skill archived; skipping"
         ),
-        BelowThreshold { tool_calls, threshold } => tracing::debug!(
+        BelowThreshold {
+            tool_calls,
+            threshold,
+        } => tracing::debug!(
             invocation_id = req.invocation_id,
             tool_calls,
             threshold,
@@ -441,11 +472,11 @@ mod tests {
     use crate::model::{NewSkill, NewSkillVersion, RegistrationKind};
     use crate::summarizer::{DraftSkillProposal, SummarizerOutput};
     use async_trait::async_trait;
+    use execlaw_core::Database;
     use execlaw_core::db::DbConfig;
     use execlaw_core::events::{EventLog, EventRecord};
     use execlaw_core::migrations::MigrationRunner;
     use execlaw_core::skills_config::{SkillsConfigStore, SkillsConfigUpdate};
-    use execlaw_core::Database;
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -461,7 +492,10 @@ mod tests {
     }
     impl MockSummarizer {
         fn new(reply: SummarizerOutput) -> Self {
-            Self { reply, calls: Mutex::new(0) }
+            Self {
+                reply,
+                calls: Mutex::new(0),
+            }
         }
         fn calls(&self) -> usize {
             *self.calls.lock().unwrap()
@@ -487,11 +521,15 @@ mod tests {
             .unwrap();
     }
 
-    fn append(log: &EventLog, cid: &ConversationId, seq: i64, kind: EventKind, payload: &impl serde::Serialize) {
-        log.append(
-            &EventRecord::new(cid.clone(), EventSeq(seq), kind, payload, None).unwrap(),
-        )
-        .unwrap();
+    fn append(
+        log: &EventLog,
+        cid: &ConversationId,
+        seq: i64,
+        kind: EventKind,
+        payload: &impl serde::Serialize,
+    ) {
+        log.append(&EventRecord::new(cid.clone(), EventSeq(seq), kind, payload, None).unwrap())
+            .unwrap();
     }
 
     fn seed_skill(store: &Arc<SkillStore>, name: &str, body: &str) -> SkillId {
@@ -542,7 +580,9 @@ mod tests {
     async fn skips_non_success_outcomes() {
         let (db, store) = fresh();
         enable_reuse_update(&db);
-        let summ = Arc::new(MockSummarizer::new(SummarizerOutput::Skip { reason: "n/a".into() }));
+        let summ = Arc::new(MockSummarizer::new(SummarizerOutput::Skip {
+            reason: "n/a".into(),
+        }));
         let w = ReuseUpdateWorker::new(db, store.clone(), summ.clone());
         let outcome = w
             .process_request(ReuseUpdateRequest {
@@ -565,16 +605,34 @@ mod tests {
         let id = seed_skill(&store, "research/sources", "v1: vague");
         let cid = ConversationId::from("c1");
         let log = EventLog::new(&db);
-        append(&log, &cid, 1, EventKind::UserMsg, &json!({"text": "find me sources"}));
-        append(&log, &cid, 2, EventKind::ToolUse, &ToolUsePayload {
-            ordinal: 0,
-            tool_name: "search".into(),
-            args_json: json!({"q": "rust"}),
-        });
-        append(&log, &cid, 3, EventKind::ToolResult, &ToolResultPayload {
-            ordinal: 0,
-            outcome: Ok(json!([])),
-        });
+        append(
+            &log,
+            &cid,
+            1,
+            EventKind::UserMsg,
+            &json!({"text": "find me sources"}),
+        );
+        append(
+            &log,
+            &cid,
+            2,
+            EventKind::ToolUse,
+            &ToolUsePayload {
+                ordinal: 0,
+                tool_name: "search".into(),
+                args_json: json!({"q": "rust"}),
+            },
+        );
+        append(
+            &log,
+            &cid,
+            3,
+            EventKind::ToolResult,
+            &ToolResultPayload {
+                ordinal: 0,
+                outcome: Ok(json!([])),
+            },
+        );
 
         let summ = Arc::new(MockSummarizer::new(SummarizerOutput::Draft(
             DraftSkillProposal {
@@ -595,10 +653,15 @@ mod tests {
                 outcome: "success".into(),
             })
             .await;
-        assert!(matches!(outcome, CaptureOutcome::DryRun { .. }), "{outcome:?}");
+        assert!(
+            matches!(outcome, CaptureOutcome::DryRun { .. }),
+            "{outcome:?}"
+        );
 
         // Proposal landed.
-        let pending = store.list_proposals(Some(crate::model::ProposalState::Pending)).unwrap();
+        let pending = store
+            .list_proposals(Some(crate::model::ProposalState::Pending))
+            .unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].kind, ProposalKind::VersionFork);
         assert_eq!(pending[0].target_skill_id, Some(id));
@@ -613,12 +676,27 @@ mod tests {
         let cid = ConversationId::from("c1");
         let log = EventLog::new(&db);
         append(&log, &cid, 1, EventKind::UserMsg, &json!({"text": "find"}));
-        append(&log, &cid, 2, EventKind::ToolUse, &ToolUsePayload {
-            ordinal: 0, tool_name: "t".into(), args_json: json!({}),
-        });
-        append(&log, &cid, 3, EventKind::ToolResult, &ToolResultPayload {
-            ordinal: 0, outcome: Ok(json!({})),
-        });
+        append(
+            &log,
+            &cid,
+            2,
+            EventKind::ToolUse,
+            &ToolUsePayload {
+                ordinal: 0,
+                tool_name: "t".into(),
+                args_json: json!({}),
+            },
+        );
+        append(
+            &log,
+            &cid,
+            3,
+            EventKind::ToolResult,
+            &ToolResultPayload {
+                ordinal: 0,
+                outcome: Ok(json!({})),
+            },
+        );
         let summ = Arc::new(MockSummarizer::new(SummarizerOutput::Skip {
             reason: "no improvement found".into(),
         }));
@@ -645,12 +723,27 @@ mod tests {
         let cid = ConversationId::from("c1");
         let log = EventLog::new(&db);
         append(&log, &cid, 1, EventKind::UserMsg, &json!({"text": "x"}));
-        append(&log, &cid, 2, EventKind::ToolUse, &ToolUsePayload {
-            ordinal: 0, tool_name: "t".into(), args_json: json!({}),
-        });
-        append(&log, &cid, 3, EventKind::ToolResult, &ToolResultPayload {
-            ordinal: 0, outcome: Ok(json!({})),
-        });
+        append(
+            &log,
+            &cid,
+            2,
+            EventKind::ToolUse,
+            &ToolUsePayload {
+                ordinal: 0,
+                tool_name: "t".into(),
+                args_json: json!({}),
+            },
+        );
+        append(
+            &log,
+            &cid,
+            3,
+            EventKind::ToolResult,
+            &ToolResultPayload {
+                ordinal: 0,
+                outcome: Ok(json!({})),
+            },
+        );
         let summ = Arc::new(MockSummarizer::new(SummarizerOutput::Draft(
             DraftSkillProposal {
                 name: "wrong/name".into(),
@@ -695,7 +788,11 @@ mod tests {
             })
             .await;
         assert_eq!(outcome, CaptureOutcome::Disabled);
-        assert_eq!(summ.calls(), 0, "summarizer must not be called for archived target");
+        assert_eq!(
+            summ.calls(),
+            0,
+            "summarizer must not be called for archived target"
+        );
     }
 
     #[test]

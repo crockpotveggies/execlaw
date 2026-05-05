@@ -49,9 +49,9 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
         refresh_store: Arc::new(RefreshStore::new(db.clone())),
         events: events.clone(),
         event_log_hmac_key: Some(Arc::new(b"execlaw-test-hmac-key-32-bytes!!".to_vec())),
-        inference: Arc::new(
-            execlaw_server::inference_resolver::InferenceResolver::new(None),
-        ),
+        inference: Arc::new(execlaw_server::inference_resolver::InferenceResolver::new(
+            None,
+        )),
         plugin_host: PluginHost::new(db.clone(), HookRegistry::new(), stage_root),
         webauthn: None,
         mcp_host: execlaw_server::mcp_host::McpHost::new(db),
@@ -79,10 +79,7 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
         skill_capture: execlaw_skills::AutoCaptureSink::noop(),
         reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
     };
-    (
-        execlaw_server::routes::build_router(state.clone()),
-        state,
-    )
+    (execlaw_server::routes::build_router(state.clone()), state)
 }
 
 async fn post_zip(app: axum::Router, bytes: Vec<u8>) -> (StatusCode, serde_json::Value) {
@@ -427,10 +424,7 @@ required_capabilities = ["admin"]
         .call_tool("dangerous", serde_json::json!({}), &["tools.safe"])
         .await
         .unwrap_err();
-    assert!(
-        err.contains("requires capability 'admin'"),
-        "err: {err}"
-    );
+    assert!(err.contains("requires capability 'admin'"), "err: {err}");
 }
 
 /// Wildcard capability "*" satisfies any requirement — used by

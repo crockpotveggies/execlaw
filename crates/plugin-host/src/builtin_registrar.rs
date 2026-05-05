@@ -24,10 +24,10 @@
 //! 2026-04-29.
 
 use crate::HookRegistry;
+use execlaw_core::Database;
 use execlaw_core::builtin_tools::core_builtin_tools;
 use execlaw_core::tool::{ToolImpl, ToolSource};
 use execlaw_core::tool_access::{ToolAccessSeed, ToolAccessStore, ToolSource as RowToolSource};
-use execlaw_core::Database;
 use std::sync::Arc;
 
 /// Errors a registrar pass can return. Distinguishes registration
@@ -75,12 +75,12 @@ pub fn register_builtins(
     let mut landed = Vec::with_capacity(tools.len());
     for tool in tools {
         let name = tool.descriptor().name.clone();
-        registry.register_builtin(tool.clone()).map_err(|e| {
-            RegisterBuiltinsError::Registry {
+        registry
+            .register_builtin(tool.clone())
+            .map_err(|e| RegisterBuiltinsError::Registry {
                 name: name.clone(),
                 message: e,
-            }
-        })?;
+            })?;
         let descriptor = tool.descriptor();
         // Translate the in-memory descriptor source into the
         // tool_access table's enum. Built-ins always map to the

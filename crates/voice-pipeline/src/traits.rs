@@ -392,9 +392,6 @@ mod tests {
         let mut t = MockTts::default();
         t.cancel().await;
         t.cancel().await;
-        assert_eq!(
-            t.canceled.load(std::sync::atomic::Ordering::Relaxed),
-            2
-        );
+        assert_eq!(t.canceled.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 }

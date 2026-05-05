@@ -12,7 +12,7 @@
 //! let adapted = adapter.chat(&client, req, OutputHint::StructuredJson).await?;
 //! ```
 
-use crate::adapter::{first_choice, standard_normalize, AdaptedResponse, ModelAdapter, OutputHint};
+use crate::adapter::{AdaptedResponse, ModelAdapter, OutputHint, first_choice, standard_normalize};
 use crate::extract;
 use crate::family::ModelFamily;
 use async_trait::async_trait;
@@ -310,7 +310,7 @@ impl ModelAdapter for OpenAiGenericAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use execlaw_inference_api::{ChatMessage, Choice, ChatResponse, ModelId, Role};
+    use execlaw_inference_api::{ChatMessage, ChatResponse, Choice, ModelId, Role};
 
     fn resp_with_content(text: &str) -> ChatResponse {
         ChatResponse {
@@ -334,10 +334,7 @@ mod tests {
     fn req() -> ChatRequest {
         ChatRequest {
             model: ModelId("test".into()),
-            messages: vec![
-                ChatMessage::system("sys"),
-                ChatMessage::user("hi"),
-            ],
+            messages: vec![ChatMessage::system("sys"), ChatMessage::user("hi")],
             tools: None,
             stream: false,
             temperature: None,

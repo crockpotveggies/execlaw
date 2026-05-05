@@ -9,17 +9,14 @@
 
 use async_trait::async_trait;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use execlaw_core::tool::{
-    ToolCtx, ToolDescriptor, ToolImpl, ToolLatency, ToolOutcome, ToolSource,
-};
+use execlaw_core::tool::{ToolCtx, ToolDescriptor, ToolImpl, ToolLatency, ToolOutcome, ToolSource};
 use execlaw_plugin_host::HookRegistry;
 use execlaw_plugin_sdk::PluginManifest;
 use std::sync::Arc;
 
 fn build_registry_with_n_tools(n: usize) -> HookRegistry {
-    let mut body = String::from(
-        "[plugin]\nid = \"bench-p\"\nname = \"bench\"\nversion = \"1.0.0\"\n",
-    );
+    let mut body =
+        String::from("[plugin]\nid = \"bench-p\"\nname = \"bench\"\nversion = \"1.0.0\"\n");
     for i in 0..n {
         body.push_str(&format!(
             "\n[[tools]]\nname = \"tool_{i}\"\nschema = \"schemas/tool_{i}.json\"\nlatency = \"low\"\nrequired_capabilities = [\"tools.safe\"]\n"
@@ -201,9 +198,8 @@ fn bench_lookup_any(c: &mut Criterion) {
         reg.register_builtin(build_noop_tool(&format!("builtin_{i}")))
             .unwrap();
     }
-    let mut body = String::from(
-        "[plugin]\nid = \"bench-mixed\"\nname = \"bench\"\nversion = \"1.0.0\"\n",
-    );
+    let mut body =
+        String::from("[plugin]\nid = \"bench-mixed\"\nname = \"bench\"\nversion = \"1.0.0\"\n");
     for i in 0..16 {
         body.push_str(&format!(
             "\n[[tools]]\nname = \"plugin_{i}\"\nschema = \"schemas/p_{i}.json\"\nlatency = \"low\"\nrequired_capabilities = []\n"
@@ -231,9 +227,8 @@ fn bench_lookup_any(c: &mut Criterion) {
 /// with multiple accounts.
 fn bench_oauth_accounts_lookup(c: &mut Criterion) {
     fn build_with_oauth(n_accounts: usize) -> HookRegistry {
-        let mut body = String::from(
-            "[plugin]\nid = \"bench-oauth\"\nname = \"bench\"\nversion = \"1.0.0\"\n",
-        );
+        let mut body =
+            String::from("[plugin]\nid = \"bench-oauth\"\nname = \"bench\"\nversion = \"1.0.0\"\n");
         for i in 0..n_accounts {
             body.push_str(&format!(
                 "\n[[oauth_accounts]]\nname = \"acc_{i}\"\nprovider = \"google\"\nscopes = [\"x\"]\n"
@@ -270,19 +265,14 @@ fn bench_per_turn_catalogue_clone(c: &mut Criterion) {
     fn build_with_loaded_schemas(n: usize) -> HookRegistry {
         let stage = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(stage.path().join("schemas")).unwrap();
-        let mut body = String::from(
-            "[plugin]\nid = \"bench-cat\"\nname = \"bench\"\nversion = \"1.0.0\"\n",
-        );
+        let mut body =
+            String::from("[plugin]\nid = \"bench-cat\"\nname = \"bench\"\nversion = \"1.0.0\"\n");
         // Realistic schema shape: a small object with two typed
         // properties and a required field. Mirrors the calendar /
         // contacts plugin schemas.
         let schema = r#"{"type":"object","properties":{"q":{"type":"string","description":"search terms"},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["q"]}"#;
         for i in 0..n {
-            std::fs::write(
-                stage.path().join(format!("schemas/tool_{i}.json")),
-                schema,
-            )
-            .unwrap();
+            std::fs::write(stage.path().join(format!("schemas/tool_{i}.json")), schema).unwrap();
             body.push_str(&format!(
                 "\n[[tools]]\nname = \"tool_{i}\"\ndescription = \"Tool number {i}. Use when the operator asks about topic {i}; returns up to 10 matching items.\"\nschema = \"schemas/tool_{i}.json\"\nlatency = \"low\"\nrequired_capabilities = []\n"
             ));
@@ -310,10 +300,7 @@ fn bench_per_turn_catalogue_clone(c: &mut Criterion) {
                 let cat: Vec<(String, String, serde_json::Value)> = tools
                     .iter()
                     .map(|t| {
-                        let desc = t
-                            .description
-                            .clone()
-                            .unwrap_or_else(|| t.tool_name.clone());
+                        let desc = t.description.clone().unwrap_or_else(|| t.tool_name.clone());
                         let schema = t
                             .schema_json
                             .clone()

@@ -26,9 +26,9 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
         refresh_store: Arc::new(RefreshStore::new(db.clone())),
         events: events.clone(),
         event_log_hmac_key: Some(Arc::new(b"execlaw-test-hmac-key-32-bytes!!".to_vec())),
-        inference: Arc::new(
-            execlaw_server::inference_resolver::InferenceResolver::new(None),
-        ),
+        inference: Arc::new(execlaw_server::inference_resolver::InferenceResolver::new(
+            None,
+        )),
         plugin_host: PluginHost::new(db.clone(), HookRegistry::new(), stage_root),
         webauthn: None,
         mcp_host: execlaw_server::mcp_host::McpHost::new(db),
@@ -56,10 +56,7 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
         skill_capture: execlaw_skills::AutoCaptureSink::noop(),
         reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
     };
-    (
-        execlaw_server::routes::build_router(state.clone()),
-        state,
-    )
+    (execlaw_server::routes::build_router(state.clone()), state)
 }
 
 async fn send_cold_contact(
@@ -85,7 +82,11 @@ async fn send_cold_contact(
     serde_json::from_slice(&bytes).unwrap()
 }
 
-async fn respond(app: axum::Router, approval_id: &str, verb: &str) -> (StatusCode, serde_json::Value) {
+async fn respond(
+    app: axum::Router,
+    approval_id: &str,
+    verb: &str,
+) -> (StatusCode, serde_json::Value) {
     let body = serde_json::to_vec(&serde_json::json!({ "verb": verb })).unwrap();
     let req = Request::builder()
         .method(Method::POST)
@@ -120,10 +121,7 @@ async fn trust_verb_upgrades_principal_and_resumes_conversation() {
 
     // Principal now has KnownTrusted in the store.
     let store = PrincipalStore::new(&state.db);
-    let p = store
-        .get(&PrincipalId::from("newcomer"))
-        .unwrap()
-        .unwrap();
+    let p = store.get(&PrincipalId::from("newcomer")).unwrap().unwrap();
     assert!(matches!(p.trust_level, CoreTrustLevel::KnownTrusted { .. }));
 
     // TrustChanged event committed to the conversation log.
@@ -144,7 +142,10 @@ async fn trust_verb_upgrades_principal_and_resumes_conversation() {
             break;
         }
     }
-    assert!(saw_replay, "original text must be replayed after Trust verb");
+    assert!(
+        saw_replay,
+        "original text must be replayed after Trust verb"
+    );
 }
 
 /// `TrustLimited` verb with allowed_topics upgrades to KnownLimited.
@@ -236,7 +237,10 @@ async fn ignore_once_clears_parked_state_without_trust_change() {
         .get(&PrincipalId::from("maybe-user"))
         .unwrap()
         .unwrap();
-    assert!(matches!(p.trust_level, CoreTrustLevel::UnknownPending { .. }));
+    assert!(matches!(
+        p.trust_level,
+        CoreTrustLevel::UnknownPending { .. }
+    ));
 
     // Second cold message from same sender re-parks the conversation.
     let init2 = send_cold_contact(app.clone(), "flow-4", "maybe-user", "hello again").await;

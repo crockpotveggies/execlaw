@@ -198,7 +198,9 @@ static SUSPICIOUS_KEY: Lazy<Regex> = Lazy::new(|| {
 // Tokens are the unit of high-entropy scanning. Split on whitespace
 // and a small set of common punctuation that wouldn't appear in a
 // secret string itself.
-static TOKEN_SPLIT: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\s,;<>{}()\[\]\u{2018}\u{2019}\u{201C}\u{201D}'\u{0022}]+").unwrap());
+static TOKEN_SPLIT: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"[\s,;<>{}()\[\]\u{2018}\u{2019}\u{201C}\u{201D}'\u{0022}]+").unwrap()
+});
 
 const ENTROPY_MIN_LEN: usize = 32;
 const ENTROPY_THRESHOLD: f64 = 4.5;
@@ -251,14 +253,70 @@ fn strip_vault_refs(s: &str) -> String {
 }
 
 fn scan_text(field: &str, text: &str, out: &mut Vec<Finding>) {
-    push_matches(field, text, &OPENAI_KEY, FindingKind::KnownPattern, Severity::Block, out);
-    push_matches(field, text, &GITHUB_TOKEN, FindingKind::KnownPattern, Severity::Block, out);
-    push_matches(field, text, &AWS_ACCESS_KEY, FindingKind::KnownPattern, Severity::Block, out);
-    push_matches(field, text, &SLACK_TOKEN, FindingKind::KnownPattern, Severity::Block, out);
-    push_matches(field, text, &GOOGLE_API_KEY, FindingKind::KnownPattern, Severity::Block, out);
-    push_matches(field, text, &PEM_PRIVATE_KEY, FindingKind::KnownPattern, Severity::Block, out);
-    push_matches(field, text, &JWT_TOKEN, FindingKind::KnownPattern, Severity::Block, out);
-    push_matches(field, text, &URL_WITH_CREDS, FindingKind::InlineCredential, Severity::Block, out);
+    push_matches(
+        field,
+        text,
+        &OPENAI_KEY,
+        FindingKind::KnownPattern,
+        Severity::Block,
+        out,
+    );
+    push_matches(
+        field,
+        text,
+        &GITHUB_TOKEN,
+        FindingKind::KnownPattern,
+        Severity::Block,
+        out,
+    );
+    push_matches(
+        field,
+        text,
+        &AWS_ACCESS_KEY,
+        FindingKind::KnownPattern,
+        Severity::Block,
+        out,
+    );
+    push_matches(
+        field,
+        text,
+        &SLACK_TOKEN,
+        FindingKind::KnownPattern,
+        Severity::Block,
+        out,
+    );
+    push_matches(
+        field,
+        text,
+        &GOOGLE_API_KEY,
+        FindingKind::KnownPattern,
+        Severity::Block,
+        out,
+    );
+    push_matches(
+        field,
+        text,
+        &PEM_PRIVATE_KEY,
+        FindingKind::KnownPattern,
+        Severity::Block,
+        out,
+    );
+    push_matches(
+        field,
+        text,
+        &JWT_TOKEN,
+        FindingKind::KnownPattern,
+        Severity::Block,
+        out,
+    );
+    push_matches(
+        field,
+        text,
+        &URL_WITH_CREDS,
+        FindingKind::InlineCredential,
+        Severity::Block,
+        out,
+    );
 
     scan_entropy(field, text, out);
 }
@@ -300,7 +358,13 @@ fn scan_entropy(field: &str, text: &str, out: &mut Vec<Finding>) {
     }
 }
 
-fn check_token_entropy(field: &str, _text: &str, start: usize, token: &str, out: &mut Vec<Finding>) {
+fn check_token_entropy(
+    field: &str,
+    _text: &str,
+    start: usize,
+    token: &str,
+    out: &mut Vec<Finding>,
+) {
     if token.len() < ENTROPY_MIN_LEN {
         return;
     }
@@ -435,7 +499,11 @@ mod tests {
             Strictness::Strict,
         );
         assert!(matches!(v, ScanVerdict::Suspicious { .. }));
-        assert!(v.findings().iter().any(|f| f.kind == FindingKind::KnownPattern));
+        assert!(
+            v.findings()
+                .iter()
+                .any(|f| f.kind == FindingKind::KnownPattern)
+        );
     }
 
     #[test]
@@ -458,7 +526,10 @@ mod tests {
 
     #[test]
     fn aws_access_key_is_blocked() {
-        let v = scan(&body("aws_access_key_id = AKIAIOSFODNN7EXAMPLE"), Strictness::Strict);
+        let v = scan(
+            &body("aws_access_key_id = AKIAIOSFODNN7EXAMPLE"),
+            Strictness::Strict,
+        );
         assert!(!v.is_clean());
     }
 
@@ -494,7 +565,9 @@ mod tests {
     #[test]
     fn jwt_is_blocked() {
         let v = scan(
-            &body("Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"),
+            &body(
+                "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+            ),
             Strictness::Strict,
         );
         assert!(!v.is_clean());
@@ -506,7 +579,11 @@ mod tests {
             &body("connect to postgres://admin:hunter2@db.internal:5432/app"),
             Strictness::Strict,
         );
-        assert!(v.findings().iter().any(|f| f.kind == FindingKind::InlineCredential));
+        assert!(
+            v.findings()
+                .iter()
+                .any(|f| f.kind == FindingKind::InlineCredential)
+        );
     }
 
     // --- entropy ---
@@ -519,7 +596,11 @@ mod tests {
             Strictness::Strict,
         );
         assert!(!v.is_clean());
-        assert!(v.findings().iter().any(|f| f.kind == FindingKind::HighEntropy));
+        assert!(
+            v.findings()
+                .iter()
+                .any(|f| f.kind == FindingKind::HighEntropy)
+        );
     }
 
     #[test]
@@ -543,7 +624,9 @@ mod tests {
     #[test]
     fn ordinary_prose_does_not_trip_entropy() {
         let v = scan(
-            &body("This is a perfectly ordinary skill body describing how to scaffold a new Rust crate using cargo new and conventional layout choices the team has standardized on."),
+            &body(
+                "This is a perfectly ordinary skill body describing how to scaffold a new Rust crate using cargo new and conventional layout choices the team has standardized on.",
+            ),
             Strictness::Strict,
         );
         assert!(v.is_clean(), "prose must be clean: {v:?}");
@@ -561,7 +644,10 @@ mod tests {
         };
         let strict = scan(&input, Strictness::Strict);
         let warn = scan(&input, Strictness::Warn);
-        assert!(!strict.is_clean(), "Strict mode must block on warn findings");
+        assert!(
+            !strict.is_clean(),
+            "Strict mode must block on warn findings"
+        );
         assert!(warn.is_clean(), "Warn mode lets warn-only findings through");
     }
 
@@ -574,7 +660,10 @@ mod tests {
             resources: &[],
         };
         let v = scan(&input, Strictness::Strict);
-        assert!(v.is_clean(), "vault-ref in frontmatter must be allowed: {v:?}");
+        assert!(
+            v.is_clean(),
+            "vault-ref in frontmatter must be allowed: {v:?}"
+        );
     }
 
     // --- strictness modes ---
@@ -709,6 +798,10 @@ mod tests {
         };
         let v = scan(&input, Strictness::Strict);
         assert!(!v.is_clean(), "credential in resource must trigger");
-        assert!(v.findings().iter().any(|f| f.field.starts_with("resources/config.env")));
+        assert!(
+            v.findings()
+                .iter()
+                .any(|f| f.field.starts_with("resources/config.env"))
+        );
     }
 }

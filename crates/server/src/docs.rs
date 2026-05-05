@@ -28,7 +28,10 @@ use crate::backends::{
     UpsertBackendRequest,
 };
 use crate::mcp_admin::{McpServerListResponse, McpServerView, McpServerWriteRequest};
-use crate::my_identities::{AddIdentifierRequest, IdentifierView, MyIdentitiesResponse};
+use crate::my_identities::{
+    AddIdentifierRequest, AvailableTransportView, AvailableTransportsResponse, IdentifierView,
+    MyIdentitiesResponse,
+};
 use crate::personality::{
     PersonalityListResponse, PersonalityPreviewResponse, PersonalityView, UpsertPersonalityRequest,
 };
@@ -176,6 +179,7 @@ impl Modify for SecurityAddon {
         crate::my_identities::list_handler,
         crate::my_identities::add_handler,
         crate::my_identities::delete_handler,
+        crate::my_identities::list_transports_handler,
         // routines (Phase 10 — cron-shaped agent automations, §5.6)
         crate::routines::list_handler,
         crate::routines::create_handler,
@@ -258,6 +262,8 @@ impl Modify for SecurityAddon {
         IdentifierView,
         MyIdentitiesResponse,
         AddIdentifierRequest,
+        AvailableTransportView,
+        AvailableTransportsResponse,
         RoutineView,
         RoutineListResponse,
         RoutineRunView,

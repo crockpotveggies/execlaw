@@ -25,9 +25,7 @@
 //! a `Heartbeat` arriving mid-tool-call doesn't get dropped.
 
 use anyhow::{Context, Result, anyhow, bail};
-use execlaw_runner_protocol::{
-    PROTOCOL_VERSION, RegistrationAck, RunnerToServer, ServerToRunner,
-};
+use execlaw_runner_protocol::{PROTOCOL_VERSION, RegistrationAck, RunnerToServer, ServerToRunner};
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use std::env;
 use tokio::net::TcpStream;
@@ -70,15 +68,15 @@ impl std::fmt::Debug for RunnerConfig {
 
 impl RunnerConfig {
     pub fn from_env() -> Result<Self> {
-        let rpc_url = env::var("EXECLAW_RPC_URL")
-            .context("EXECLAW_RPC_URL must be set")?;
-        let group_id = env::var("EXECLAW_GROUP_ID")
-            .context("EXECLAW_GROUP_ID must be set")?;
-        let spawn_secret = env::var("EXECLAW_SPAWN_SECRET")
-            .context("EXECLAW_SPAWN_SECRET must be set")?;
+        let rpc_url = env::var("EXECLAW_RPC_URL").context("EXECLAW_RPC_URL must be set")?;
+        let group_id = env::var("EXECLAW_GROUP_ID").context("EXECLAW_GROUP_ID must be set")?;
+        let spawn_secret =
+            env::var("EXECLAW_SPAWN_SECRET").context("EXECLAW_SPAWN_SECRET must be set")?;
         let inference_url = env::var("EXECLAW_INFERENCE_URL").ok();
         if rpc_url.is_empty() || group_id.is_empty() || spawn_secret.is_empty() {
-            bail!("EXECLAW_RPC_URL / EXECLAW_GROUP_ID / EXECLAW_SPAWN_SECRET must all be non-empty");
+            bail!(
+                "EXECLAW_RPC_URL / EXECLAW_GROUP_ID / EXECLAW_SPAWN_SECRET must all be non-empty"
+            );
         }
         Ok(Self {
             rpc_url,
@@ -156,9 +154,7 @@ impl ConnectionDriver {
         // First frame must be a RegistrationAck.
         let ack: RegistrationAck = match socket.next().await {
             Some(Ok(Message::Text(txt))) => serde_json::from_str(&txt)
-                .with_context(|| {
-                    format!("decoding registration ack: {}", trim(&txt, 200))
-                })?,
+                .with_context(|| format!("decoding registration ack: {}", trim(&txt, 200)))?,
             Some(Ok(Message::Binary(bytes))) => {
                 serde_json::from_slice(&bytes).context("decoding binary ack")?
             }
@@ -233,22 +229,20 @@ impl ConnectionDriver {
                     }
                 };
                 match msg {
-                    Message::Text(txt) => {
-                        match serde_json::from_str::<ServerToRunner>(&txt) {
-                            Ok(frame) => {
-                                if in_tx.send(frame).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    payload = %trim(&txt, 200),
-                                    "dropping undecodable ServerToRunner frame"
-                                );
+                    Message::Text(txt) => match serde_json::from_str::<ServerToRunner>(&txt) {
+                        Ok(frame) => {
+                            if in_tx.send(frame).is_err() {
+                                break;
                             }
                         }
-                    }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                payload = %trim(&txt, 200),
+                                "dropping undecodable ServerToRunner frame"
+                            );
+                        }
+                    },
                     Message::Binary(bytes) => {
                         match serde_json::from_slice::<ServerToRunner>(&bytes) {
                             Ok(frame) => {

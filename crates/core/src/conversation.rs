@@ -375,10 +375,7 @@ impl<'db> ConversationStore<'db> {
     /// the dev-thread-cleanup ergonomics the operator asks for; if
     /// stronger retention is needed later we can add a soft-delete
     /// flag column instead of removing rows.
-    pub fn delete(
-        &self,
-        conversation_id: &ConversationId,
-    ) -> Result<(), DbError> {
+    pub fn delete(&self, conversation_id: &ConversationId) -> Result<(), DbError> {
         self.db.with_conn(|c| {
             // Delete dependents first to avoid FK fallout if we
             // ever turn FKs back on. The order is conservative —
@@ -421,15 +418,12 @@ impl<'db> ConversationStore<'db> {
                     let is_pinned: i64 = r.get(6)?;
                     let is_ephemeral: i64 = r.get(7)?;
                     Ok(ThreadSummary {
-                        conversation_id: ConversationId::from(
-                            r.get::<_, String>(0)?,
-                        ),
+                        conversation_id: ConversationId::from(r.get::<_, String>(0)?),
                         kind: ConversationKind::parse(&kind_str)
                             .unwrap_or(ConversationKind::ControllerDM),
                         phase: Phase::parse(&phase_str).unwrap_or(Phase::Idle),
                         trust_class: r.get(3)?,
-                        modality: Modality::parse(&modality_str)
-                            .unwrap_or(Modality::Text),
+                        modality: Modality::parse(&modality_str).unwrap_or(Modality::Text),
                         display_name: r.get(5)?,
                         is_pinned: is_pinned != 0,
                         is_ephemeral: is_ephemeral != 0,
@@ -445,10 +439,7 @@ impl<'db> ConversationStore<'db> {
 
     /// IDs of every ephemeral conversation whose `ephemeral_expires_at <= now`.
     /// Used by `EphemeralSweeper` to discover what to purge.
-    pub fn list_expired_ephemeral(
-        &self,
-        now: i64,
-    ) -> Result<Vec<ConversationId>, DbError> {
+    pub fn list_expired_ephemeral(&self, now: i64) -> Result<Vec<ConversationId>, DbError> {
         self.db.with_conn(|c| {
             let mut stmt = c.prepare_cached(
                 "SELECT conversation_id FROM state_conversations \
@@ -860,8 +851,7 @@ mod tests {
             .unwrap();
 
         let expired = store.list_expired_ephemeral(100).unwrap();
-        let mut ids: Vec<String> =
-            expired.into_iter().map(|c| c.as_str().to_owned()).collect();
+        let mut ids: Vec<String> = expired.into_iter().map(|c| c.as_str().to_owned()).collect();
         ids.sort();
         assert_eq!(ids, vec!["edge", "past"]);
     }

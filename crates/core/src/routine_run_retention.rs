@@ -75,11 +75,7 @@ impl RoutineRunRetentionSweeper {
     }
 
     /// Pin a static retention duration (tests + fixtures).
-    pub fn with_config(
-        db: Database,
-        interval: Duration,
-        retention: Duration,
-    ) -> Self {
+    pub fn with_config(db: Database, interval: Duration, retention: Duration) -> Self {
         Self {
             db,
             interval,
@@ -188,9 +184,7 @@ mod tests {
         let id = store.insert_run_pending(routine_id, fired_at).unwrap();
         // Move out of Pending so retention picks it up.
         if status != RoutineRunStatus::Pending {
-            store
-                .finish_run(&id, status, fired_at, None, None)
-                .unwrap();
+            store.finish_run(&id, status, fired_at, None, None).unwrap();
         }
         id
     }
@@ -212,9 +206,9 @@ mod tests {
         let store = RoutineStore::new(&db);
         let rid = seed_routine(&store, "r", now);
 
-        seed_run(&store, &rid, 100, RoutineRunStatus::Success);   // very old, terminal
-        seed_run(&store, &rid, 200, RoutineRunStatus::Failed);    // very old, terminal
-        seed_run(&store, &rid, 300, RoutineRunStatus::Pending);   // very old but PENDING — keep
+        seed_run(&store, &rid, 100, RoutineRunStatus::Success); // very old, terminal
+        seed_run(&store, &rid, 200, RoutineRunStatus::Failed); // very old, terminal
+        seed_run(&store, &rid, 300, RoutineRunStatus::Pending); // very old but PENDING — keep
         seed_run(&store, &rid, 999_999, RoutineRunStatus::Success); // recent, keep
 
         // retention=500 → cutoff = 999_500. Strictly older than that

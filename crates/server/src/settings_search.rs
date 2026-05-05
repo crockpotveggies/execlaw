@@ -4,8 +4,8 @@
 
 use crate::auth_extract::AuthedUser;
 use crate::routes::ApiError;
-use crate::state::AppState;
 use crate::search_resolver::construct_from_row;
+use crate::state::AppState;
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -234,7 +234,10 @@ pub async fn set_default_handler(
         return Err(ApiError {
             status: StatusCode::NOT_FOUND,
             code: "search_provider_not_found",
-            message: format!("no provider row for kind {}; upsert it first", kind.as_str()),
+            message: format!(
+                "no provider row for kind {}; upsert it first",
+                kind.as_str()
+            ),
         });
     }
     let stored = store
@@ -266,14 +269,11 @@ pub async fn test_search_handler(
         })?;
     let provider = construct_from_row(&row);
     let started = std::time::Instant::now();
-    let results = provider
-        .search(&req.query, 5)
-        .await
-        .map_err(|e| ApiError {
-            status: StatusCode::BAD_GATEWAY,
-            code: "search_failed",
-            message: e.to_string(),
-        })?;
+    let results = provider.search(&req.query, 5).await.map_err(|e| ApiError {
+        status: StatusCode::BAD_GATEWAY,
+        code: "search_failed",
+        message: e.to_string(),
+    })?;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     Ok(Json(TestSearchResponse {
         provider_id: provider.provider_id().to_owned(),
@@ -291,10 +291,22 @@ pub async fn test_search_handler(
 
 pub fn settings_search_router() -> Router<AppState> {
     Router::new()
-        .route("/api/admin/search/providers", get(list_providers_handler).post(upsert_provider_handler))
-        .route("/api/admin/search/providers/{kind}", delete(delete_provider_handler))
-        .route("/api/admin/search/providers/default", post(set_default_handler))
-        .route("/api/admin/search/providers/{kind}/test", post(test_search_handler))
+        .route(
+            "/api/admin/search/providers",
+            get(list_providers_handler).post(upsert_provider_handler),
+        )
+        .route(
+            "/api/admin/search/providers/{kind}",
+            delete(delete_provider_handler),
+        )
+        .route(
+            "/api/admin/search/providers/default",
+            post(set_default_handler),
+        )
+        .route(
+            "/api/admin/search/providers/{kind}/test",
+            post(test_search_handler),
+        )
 }
 
 #[cfg(test)]
@@ -414,8 +426,7 @@ mod tests {
             .unwrap();
 
         // Promote it.
-        let promote_body =
-            serde_json::to_vec(&serde_json::json!({"kind": "searxng"})).unwrap();
+        let promote_body = serde_json::to_vec(&serde_json::json!({"kind": "searxng"})).unwrap();
         let resp = app
             .clone()
             .oneshot(

@@ -8,10 +8,10 @@
 //! real stack (Silero / Whisper / Qwen / Kokoro) plugs in through
 //! the same trait surface in Phase 8 without touching this file.
 
+use crate::DataFrame;
 use crate::bargein::{BargeInConfig, BargeInDecision, decide as decide_bargein};
 use crate::endpointer::{EndpointerConfig, classify_and_window};
 use crate::graph::Pipeline;
-use crate::DataFrame;
 use crate::traits::{AudioOut, SttClient, SttEvent, TtsClient, Vad, VadDecision};
 use execlaw_core::db::Database;
 use execlaw_core::events::{EventKind, EventLog, EventRecord};
@@ -183,10 +183,7 @@ impl<'db> VoiceSession<'db> {
     ///
     /// Returns the final [`BargeInDecision`] once the rescind window
     /// closes; returns `None` while still inside the window.
-    pub async fn resolve_bargein(
-        &mut self,
-        user_still_speaking: bool,
-    ) -> Option<BargeInDecision> {
+    pub async fn resolve_bargein(&mut self, user_still_speaking: bool) -> Option<BargeInDecision> {
         let started = self.bargein_started_at?;
         let elapsed = self.t_ms.saturating_sub(started) as u32;
         let decision = decide_bargein(
@@ -266,11 +263,7 @@ impl<'db> VoiceSession<'db> {
     /// synthesizes the text chunk-by-chunk, and plays each through
     /// the supplied `AudioOut`. Barge-in is checked between chunks
     /// via `audio_in.next_chunk().await` integrations in the caller.
-    pub async fn speak(
-        &mut self,
-        text: &str,
-        audio_out: &mut dyn AudioOut,
-    ) -> Result<(), String> {
+    pub async fn speak(&mut self, text: &str, audio_out: &mut dyn AudioOut) -> Result<(), String> {
         self.state = SessionState::AgentSpeaking;
         self.emit(
             EventKind::LlmResponseFinal,
@@ -284,7 +277,8 @@ impl<'db> VoiceSession<'db> {
             }
             let tts_out = self.tts.synthesize(&sentence).await?;
             if first_audio {
-                self.emit(EventKind::TtsFirstAudio, serde_json::json!({})).await;
+                self.emit(EventKind::TtsFirstAudio, serde_json::json!({}))
+                    .await;
                 first_audio = false;
             }
             self.emit(
@@ -703,10 +697,7 @@ mod tests {
         let err = keyed
             .replay_since(&cid, execlaw_core::ids::EventSeq(0))
             .unwrap_err();
-        assert!(matches!(
-            err,
-            execlaw_core::db::DbError::TamperDetected(_)
-        ));
+        assert!(matches!(err, execlaw_core::db::DbError::TamperDetected(_)));
     }
 
     /// Acceptance from §11 Phase 4: spotlighting strips smuggled
@@ -742,10 +733,7 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl TtsClient for CrashAfterFirst {
-            async fn synthesize(
-                &mut self,
-                text: &str,
-            ) -> Result<crate::traits::TtsAudio, String> {
+            async fn synthesize(&mut self, text: &str) -> Result<crate::traits::TtsAudio, String> {
                 let n = self
                     .calls
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -779,14 +767,19 @@ mod tests {
 
         let mut audio_out = MockAudioOut::default();
         // First sentence synthesizes; second crashes.
-        let result = s.speak("Hello there. World goes here.", &mut audio_out).await;
+        let result = s
+            .speak("Hello there. World goes here.", &mut audio_out)
+            .await;
         assert!(result.is_err(), "speak should propagate the crash");
 
         // The events committed BEFORE the crash must still verify
         // under the HMAC key. No half-signed rows.
         let keyed = execlaw_core::events::EventLog::new(&db).with_hmac_key(key);
         let events = keyed
-            .replay_since(&ConversationId::from("voice-crash"), execlaw_core::ids::EventSeq(0))
+            .replay_since(
+                &ConversationId::from("voice-crash"),
+                execlaw_core::ids::EventSeq(0),
+            )
             .expect("replay must succeed after a mid-speak crash");
         // We should see at least LlmResponseFinal + TtsFirstAudio +
         // one TtsAudioChunk (the first sentence that did synthesize).
@@ -822,8 +815,8 @@ mod tests {
             Box::new(MockTts::default()),
         );
         // Deep runner needs 100ms to "think".
-        let mut deep = MockDeepRunner::new("here is the deep answer")
-            .with_delay(Duration::from_millis(100));
+        let mut deep =
+            MockDeepRunner::new("here is the deep answer").with_delay(Duration::from_millis(100));
         let mut audio_out = MockAudioOut::default();
 
         let start = std::time::Instant::now();
@@ -911,11 +904,7 @@ mod tests {
             .ok()
             .map(|h| {
                 h.block_on(async {
-                    tokio::time::timeout(
-                        std::time::Duration::from_millis(50),
-                        rx2.recv(),
-                    )
-                    .await
+                    tokio::time::timeout(std::time::Duration::from_millis(50), rx2.recv()).await
                 })
             })
             .unwrap_or_else(|| {

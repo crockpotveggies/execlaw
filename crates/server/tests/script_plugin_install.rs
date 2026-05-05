@@ -88,9 +88,9 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
         refresh_store: Arc::new(RefreshStore::new(db.clone())),
         events: events.clone(),
         event_log_hmac_key: Some(Arc::new(b"execlaw-test-hmac-key-32-bytes!!".to_vec())),
-        inference: Arc::new(
-            execlaw_server::inference_resolver::InferenceResolver::new(None),
-        ),
+        inference: Arc::new(execlaw_server::inference_resolver::InferenceResolver::new(
+            None,
+        )),
         plugin_host: PluginHost::with_script_engine(
             db.clone(),
             HookRegistry::new(),
@@ -123,10 +123,7 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
         skill_capture: execlaw_skills::AutoCaptureSink::noop(),
         reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
     };
-    (
-        execlaw_server::routes::build_router(state.clone()),
-        state,
-    )
+    (execlaw_server::routes::build_router(state.clone()), state)
 }
 
 async fn post_zip(app: axum::Router, bytes: Vec<u8>) -> (StatusCode, serde_json::Value) {
@@ -587,8 +584,7 @@ source = "main.rhai"
         ("plugin.toml", MANIFEST_V2_THREE_TOOLS.as_bytes()),
         ("main.rhai", TINY_SCRIPT.as_bytes()),
     ]);
-    let (status, body) =
-        post_zip_with_query(app, v2_zip, "if_existing=upgrade").await;
+    let (status, body) = post_zip_with_query(app, v2_zip, "if_existing=upgrade").await;
     assert_eq!(status, StatusCode::OK, "upgrade body: {body}");
 
     // tut.alpha must be marked removed — it's gone from the new

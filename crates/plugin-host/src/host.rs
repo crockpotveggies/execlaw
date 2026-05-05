@@ -260,7 +260,12 @@ impl PluginHost {
                         args: runtime.args.clone(),
                         cwd: Some(stage_path.to_path_buf()),
                     };
-                    let plugin = match SubprocessPlugin::spawn(spec, self.inner.notification_tx.get().cloned()).await {
+                    let plugin = match SubprocessPlugin::spawn(
+                        spec,
+                        self.inner.notification_tx.get().cloned(),
+                    )
+                    .await
+                    {
                         Ok(p) => p,
                         Err(e) => {
                             self.inner.registry.disable(&plugin_id);
@@ -286,9 +291,7 @@ impl PluginHost {
                         Ok(s) => s,
                         Err(e) => {
                             self.inner.registry.disable(&plugin_id);
-                            return Err(PluginHostError::Spawn(format!(
-                                "script load: {e}"
-                            )));
+                            return Err(PluginHostError::Spawn(format!("script load: {e}")));
                         }
                     };
                     self.inner
@@ -445,21 +448,10 @@ impl PluginHost {
 
         self.inner.registry.disable(plugin_id);
 
-        if let Some(plugin) = self
-            .inner
-            .subprocesses
-            .write()
-            .await
-            .remove(plugin_id)
-        {
+        if let Some(plugin) = self.inner.subprocesses.write().await.remove(plugin_id) {
             plugin.shutdown().await;
         }
-        let _ = self
-            .inner
-            .script_plugins
-            .write()
-            .await
-            .remove(plugin_id);
+        let _ = self.inner.script_plugins.write().await.remove(plugin_id);
 
         // Phase B (2026-05-03) — archive skills owned by this
         // plugin BEFORE deleting the install row so the
@@ -506,23 +498,12 @@ impl PluginHost {
             return Ok(()); // idempotent
         }
         self.inner.registry.disable(plugin_id);
-        if let Some(plugin) = self
-            .inner
-            .subprocesses
-            .write()
-            .await
-            .remove(plugin_id)
-        {
+        if let Some(plugin) = self.inner.subprocesses.write().await.remove(plugin_id) {
             plugin.shutdown().await;
         }
         // Drop the script plugin (if any). No subprocess to kill —
         // the rhai::Engine is just memory.
-        let _ = self
-            .inner
-            .script_plugins
-            .write()
-            .await
-            .remove(plugin_id);
+        let _ = self.inner.script_plugins.write().await.remove(plugin_id);
         row.enabled = false;
         row.updated_at = chrono::Utc::now().timestamp();
         self.update_row(&row)?;
@@ -563,19 +544,14 @@ impl PluginHost {
                 execlaw_plugin_sdk::manifest::RuntimeTier::Subprocess => {
                     let spec = SubprocessSpec {
                         plugin_id: plugin_id.to_owned(),
-                        executable: resolve_executable(
-                            &stage,
-                            runtime_executable_or_err(runtime)?,
-                        ),
+                        executable: resolve_executable(&stage, runtime_executable_or_err(runtime)?),
                         args: runtime.args.clone(),
                         cwd: Some(stage),
                     };
-                    let plugin = SubprocessPlugin::spawn(
-                        spec,
-                        self.inner.notification_tx.get().cloned(),
-                    )
-                    .await
-                    .map_err(PluginHostError::Spawn)?;
+                    let plugin =
+                        SubprocessPlugin::spawn(spec, self.inner.notification_tx.get().cloned())
+                            .await
+                            .map_err(PluginHostError::Spawn)?;
                     self.inner
                         .subprocesses
                         .write()
@@ -628,8 +604,8 @@ impl PluginHost {
                 continue;
             }
             let needs_runtime = !manifest.tools.is_empty()
-            || manifest.transport.is_some()
-            || manifest.identity_provider.is_some();
+                || manifest.transport.is_some()
+                || manifest.identity_provider.is_some();
             if needs_runtime {
                 if let Some(runtime) = &manifest.runtime {
                     let stage = PathBuf::from(&row.stage_path);
@@ -645,7 +621,12 @@ impl PluginHost {
                                 args: runtime.args.clone(),
                                 cwd: Some(stage),
                             };
-                            match SubprocessPlugin::spawn(spec, self.inner.notification_tx.get().cloned()).await {
+                            match SubprocessPlugin::spawn(
+                                spec,
+                                self.inner.notification_tx.get().cloned(),
+                            )
+                            .await
+                            {
                                 Ok(p) => {
                                     self.inner
                                         .subprocesses
@@ -708,11 +689,7 @@ impl PluginHost {
     ///
     /// Returns every match; the caller decides how to rank (typically
     /// highest-confidence wins, with tie-break on registration order).
-    pub async fn resolve_identity(
-        &self,
-        transport: &str,
-        handle: &str,
-    ) -> Vec<serde_json::Value> {
+    pub async fn resolve_identity(&self, transport: &str, handle: &str) -> Vec<serde_json::Value> {
         let providers = self.inner.registry.identity_providers();
         if providers.is_empty() {
             return Vec::new();
@@ -900,38 +877,16 @@ impl PluginHost {
     // ---- DB row helpers (pure SQLite plumbing) --------------------
 
     pub fn list_rows(&self) -> Result<Vec<PluginRow>, PluginHostError> {
-        self.inner.db.with_conn(|c| {
-            let mut stmt = c.prepare_cached(
-                "SELECT plugin_id, version, manifest_toml, stage_path, enabled, \
+        self.inner
+            .db
+            .with_conn(|c| {
+                let mut stmt = c.prepare_cached(
+                    "SELECT plugin_id, version, manifest_toml, stage_path, enabled, \
                         installed_at, updated_at \
                  FROM state_plugins ORDER BY plugin_id",
-            )?;
-            let rows = stmt
-                .query_map([], |r| {
-                    Ok(PluginRow {
-                        plugin_id: r.get(0)?,
-                        version: r.get(1)?,
-                        manifest_toml: r.get(2)?,
-                        stage_path: r.get(3)?,
-                        enabled: r.get::<_, i64>(4)? != 0,
-                        installed_at: r.get(5)?,
-                        updated_at: r.get(6)?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok::<_, DbError>(rows)
-        }).map_err(PluginHostError::Db)
-    }
-
-    pub fn get_row(&self, plugin_id: &str) -> Result<Option<PluginRow>, PluginHostError> {
-        self.inner.db.with_conn(|c| {
-            let got = c
-                .query_row(
-                    "SELECT plugin_id, version, manifest_toml, stage_path, enabled, \
-                            installed_at, updated_at \
-                     FROM state_plugins WHERE plugin_id = ?1",
-                    params![plugin_id],
-                    |r| {
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
                         Ok(PluginRow {
                             plugin_id: r.get(0)?,
                             version: r.get(1)?,
@@ -941,11 +896,39 @@ impl PluginHost {
                             installed_at: r.get(5)?,
                             updated_at: r.get(6)?,
                         })
-                    },
-                )
-                .ok();
-            Ok(got)
-        }).map_err(PluginHostError::Db)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok::<_, DbError>(rows)
+            })
+            .map_err(PluginHostError::Db)
+    }
+
+    pub fn get_row(&self, plugin_id: &str) -> Result<Option<PluginRow>, PluginHostError> {
+        self.inner
+            .db
+            .with_conn(|c| {
+                let got = c
+                    .query_row(
+                        "SELECT plugin_id, version, manifest_toml, stage_path, enabled, \
+                            installed_at, updated_at \
+                     FROM state_plugins WHERE plugin_id = ?1",
+                        params![plugin_id],
+                        |r| {
+                            Ok(PluginRow {
+                                plugin_id: r.get(0)?,
+                                version: r.get(1)?,
+                                manifest_toml: r.get(2)?,
+                                stage_path: r.get(3)?,
+                                enabled: r.get::<_, i64>(4)? != 0,
+                                installed_at: r.get(5)?,
+                                updated_at: r.get(6)?,
+                            })
+                        },
+                    )
+                    .ok();
+                Ok(got)
+            })
+            .map_err(PluginHostError::Db)
     }
 
     fn insert_row(&self, row: &PluginRow) -> Result<(), PluginHostError> {
@@ -969,23 +952,29 @@ impl PluginHost {
     }
 
     fn update_row(&self, row: &PluginRow) -> Result<(), PluginHostError> {
-        self.inner.db.with_conn(|c| {
-            c.execute(
-                "UPDATE state_plugins SET enabled = ?1, updated_at = ?2 WHERE plugin_id = ?3",
-                params![row.enabled as i64, row.updated_at, row.plugin_id],
-            )?;
-            Ok(())
-        }).map_err(PluginHostError::Db)
+        self.inner
+            .db
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE state_plugins SET enabled = ?1, updated_at = ?2 WHERE plugin_id = ?3",
+                    params![row.enabled as i64, row.updated_at, row.plugin_id],
+                )?;
+                Ok(())
+            })
+            .map_err(PluginHostError::Db)
     }
 
     fn delete_row(&self, plugin_id: &str) -> Result<(), PluginHostError> {
-        self.inner.db.with_conn(|c| {
-            c.execute(
-                "DELETE FROM state_plugins WHERE plugin_id = ?1",
-                params![plugin_id],
-            )?;
-            Ok(())
-        }).map_err(PluginHostError::Db)
+        self.inner
+            .db
+            .with_conn(|c| {
+                c.execute(
+                    "DELETE FROM state_plugins WHERE plugin_id = ?1",
+                    params![plugin_id],
+                )?;
+                Ok(())
+            })
+            .map_err(PluginHostError::Db)
     }
 }
 
@@ -1061,9 +1050,7 @@ fn trust_rank(s: &str) -> u8 {
     }
 }
 
-fn oauth_map_from_params(
-    params: &serde_json::Value,
-) -> serde_json::Map<String, serde_json::Value> {
+fn oauth_map_from_params(params: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
     params
         .get("_oauth")
         .and_then(|v| v.as_object())
@@ -1126,8 +1113,7 @@ async fn handle_plugin_notification(
                 #[serde(default)]
                 tags: Vec<String>,
             }
-            let parsed: Result<RegisterParams, _> =
-                serde_json::from_value(n.params.clone());
+            let parsed: Result<RegisterParams, _> = serde_json::from_value(n.params.clone());
             let p = match parsed {
                 Ok(p) => p,
                 Err(e) => {
@@ -1186,8 +1172,7 @@ async fn handle_plugin_notification(
             struct UnregisterParams {
                 name: String,
             }
-            let parsed: Result<UnregisterParams, _> =
-                serde_json::from_value(n.params.clone());
+            let parsed: Result<UnregisterParams, _> = serde_json::from_value(n.params.clone());
             let p = match parsed {
                 Ok(p) => p,
                 Err(e) => {
@@ -1390,10 +1375,7 @@ executable = "./bin"
             map.get("controller").and_then(|v| v.as_str()),
             Some("ya29.controller"),
         );
-        assert_eq!(
-            map.get("team").and_then(|v| v.as_str()),
-            Some("ya29.team"),
-        );
+        assert_eq!(map.get("team").and_then(|v| v.as_str()), Some("ya29.team"),);
     }
 
     #[test]
@@ -1585,9 +1567,11 @@ source = "main.rhai"
             .unwrap()
             .unwrap();
         assert!(view.body_md.contains("SELECT carefully"));
-        assert_eq!(view.description, "Use to construct SQL queries against Postgres.");
-        let fm: serde_json::Value =
-            serde_json::from_str(&view.frontmatter_json).unwrap();
+        assert_eq!(
+            view.description,
+            "Use to construct SQL queries against Postgres."
+        );
+        let fm: serde_json::Value = serde_json::from_str(&view.frontmatter_json).unwrap();
         assert_eq!(fm["tags"][0], "db");
     }
 
@@ -1666,7 +1650,10 @@ source = "main.rhai"
         .await;
         let names = store.list_for_plugin("postgres-toolkit").unwrap();
         assert_eq!(names, vec!["postgres-toolkit/query-builder"]);
-        let g = store.get("postgres-toolkit/query-builder").unwrap().unwrap();
+        let g = store
+            .get("postgres-toolkit/query-builder")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             g.registration_kind,
             execlaw_skills::RegistrationKind::Registered
@@ -1835,11 +1822,7 @@ source = "main.rhai"
         let db = fresh_db();
         let registry = HookRegistry::new();
         let stage_root = tempfile::tempdir().unwrap();
-        let host = PluginHost::new(
-            db.clone(),
-            registry,
-            stage_root.path().to_path_buf(),
-        );
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
 
         let (_v1_keep, v1_stage) = stage_script_plugin(
             "test-google",
@@ -1920,11 +1903,8 @@ source = "main.rhai"
         let stage_root = tempfile::tempdir().unwrap();
         let host = PluginHost::new(db, registry, stage_root.path().to_path_buf());
 
-        let (_keep, stage) = stage_script_plugin(
-            "ghost",
-            "0.1.0",
-            "https://www.googleapis.com/auth/x",
-        );
+        let (_keep, stage) =
+            stage_script_plugin("ghost", "0.1.0", "https://www.googleapis.com/auth/x");
         let err = host.upgrade(&stage).await.unwrap_err();
         assert!(
             matches!(err, PluginHostError::NotInstalled(ref id) if id == "ghost"),
@@ -1937,23 +1917,13 @@ source = "main.rhai"
         let db = fresh_db();
         let registry = HookRegistry::new();
         let stage_root = tempfile::tempdir().unwrap();
-        let host = PluginHost::new(
-            db.clone(),
-            registry,
-            stage_root.path().to_path_buf(),
-        );
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
 
-        let (_v1, v1_stage) = stage_script_plugin(
-            "v-test",
-            "0.1.0",
-            "https://www.googleapis.com/auth/x",
-        );
+        let (_v1, v1_stage) =
+            stage_script_plugin("v-test", "0.1.0", "https://www.googleapis.com/auth/x");
         host.install(&v1_stage).await.unwrap();
-        let (_v2, v2_stage) = stage_script_plugin(
-            "v-test",
-            "1.4.7",
-            "https://www.googleapis.com/auth/x",
-        );
+        let (_v2, v2_stage) =
+            stage_script_plugin("v-test", "1.4.7", "https://www.googleapis.com/auth/x");
         host.upgrade(&v2_stage).await.unwrap();
 
         let row = host
@@ -2142,12 +2112,7 @@ executable = "./bin"
         let host = PluginHost::new(db, registry, PathBuf::from("/tmp"));
 
         let err = host
-            .call_tool(
-                "signal.send_message",
-                serde_json::json!({}),
-                &["*"],
-                None,
-            )
+            .call_tool("signal.send_message", serde_json::json!({}), &["*"], None)
             .await
             .expect_err("no caller_trust => below any floor");
         assert!(

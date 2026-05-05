@@ -18,16 +18,16 @@
 use crate::auth_extract::AuthedUser;
 use crate::routes::ApiError;
 use crate::state::AppState;
+use axum::Router;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, post};
-use axum::Router;
 use chrono::{TimeZone, Utc};
 use execlaw_core::audit::AuditStore;
 use execlaw_core::routines::{
-    next_n_fires, parse_cron, parse_timezone, RoutineError, RoutineRow, RoutineRunRow,
-    RoutineRunStatus, RoutineStore, RoutineUpsert,
+    RoutineError, RoutineRow, RoutineRunRow, RoutineRunStatus, RoutineStore, RoutineUpsert,
+    next_n_fires, parse_cron, parse_timezone,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -258,14 +258,11 @@ pub async fn get_handler(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<RoutineView>, ApiError> {
     let store = RoutineStore::new(&state.db);
-    let row = store
-        .get(&id)
-        .map_err(ApiError::from)?
-        .ok_or(ApiError {
-            status: StatusCode::NOT_FOUND,
-            code: "routine_not_found",
-            message: format!("routine '{id}' does not exist"),
-        })?;
+    let row = store.get(&id).map_err(ApiError::from)?.ok_or(ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "routine_not_found",
+        message: format!("routine '{id}' does not exist"),
+    })?;
     Ok(Json((&row).into()))
 }
 
@@ -291,14 +288,11 @@ pub async fn update_handler(
 ) -> Result<Json<RoutineView>, ApiError> {
     require_controller(&state, &user)?;
     let store = RoutineStore::new(&state.db);
-    let prior = store
-        .get(&id)
-        .map_err(ApiError::from)?
-        .ok_or(ApiError {
-            status: StatusCode::NOT_FOUND,
-            code: "routine_not_found",
-            message: format!("routine '{id}' does not exist"),
-        })?;
+    let prior = store.get(&id).map_err(ApiError::from)?.ok_or(ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "routine_not_found",
+        message: format!("routine '{id}' does not exist"),
+    })?;
     let now = chrono::Utc::now().timestamp();
     let row = store
         .upsert(
@@ -391,21 +385,22 @@ pub async fn run_now_handler(
 ) -> Result<Json<RoutineRunView>, ApiError> {
     require_controller(&state, &user)?;
     let store = RoutineStore::new(&state.db);
-    let row = store
-        .get(&id)
-        .map_err(ApiError::from)?
-        .ok_or(ApiError {
-            status: StatusCode::NOT_FOUND,
-            code: "routine_not_found",
-            message: format!("routine '{id}' does not exist"),
-        })?;
+    let row = store.get(&id).map_err(ApiError::from)?.ok_or(ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "routine_not_found",
+        message: format!("routine '{id}' does not exist"),
+    })?;
     let now = chrono::Utc::now().timestamp();
-    let run_id = store.insert_run_pending(&row.id, now).map_err(ApiError::from)?;
-    state.events.publish(crate::events::UiEvent::RoutineRunChanged {
-        routine_id: row.id.clone(),
-        run_id: run_id.clone(),
-        status: RoutineRunStatus::Pending.as_str().to_owned(),
-    });
+    let run_id = store
+        .insert_run_pending(&row.id, now)
+        .map_err(ApiError::from)?;
+    state
+        .events
+        .publish(crate::events::UiEvent::RoutineRunChanged {
+            routine_id: row.id.clone(),
+            run_id: run_id.clone(),
+            status: RoutineRunStatus::Pending.as_str().to_owned(),
+        });
 
     // Phase 11 closure — actually dispatch instead of marking
     // Skipped. The manual-fire button now behaves identically to a
@@ -421,11 +416,7 @@ pub async fn run_now_handler(
     )
     .await;
     let (status, error, conversation_id) = match dispatch_outcome {
-        Ok(o) => (
-            RoutineRunStatus::Success,
-            None,
-            Some(o.conversation_id),
-        ),
+        Ok(o) => (RoutineRunStatus::Success, None, Some(o.conversation_id)),
         Err(e) => (
             RoutineRunStatus::Failed,
             Some(e),
@@ -441,11 +432,13 @@ pub async fn run_now_handler(
             conversation_id.as_deref(),
         )
         .map_err(ApiError::from)?;
-    state.events.publish(crate::events::UiEvent::RoutineRunChanged {
-        routine_id: row.id.clone(),
-        run_id: run_id.clone(),
-        status: status.as_str().to_owned(),
-    });
+    state
+        .events
+        .publish(crate::events::UiEvent::RoutineRunChanged {
+            routine_id: row.id.clone(),
+            run_id: run_id.clone(),
+            status: status.as_str().to_owned(),
+        });
     let runs = store.list_runs(&row.id, 1).map_err(ApiError::from)?;
     let run = runs.first().ok_or(ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -560,7 +553,7 @@ mod tests {
     use super::*;
     use crate::routes::{build_router, test_app_state};
     use axum::body::{self, Body};
-    use axum::http::{header, Method, Request};
+    use axum::http::{Method, Request, header};
     use tower::ServiceExt;
 
     async fn setup_controller_token(app: &axum::Router) -> String {

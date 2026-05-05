@@ -131,11 +131,7 @@ pub fn parse_timezone(tz: &str) -> Result<Tz, RoutineError> {
 /// schedule, evaluated in `tz`. Returns `None` if the schedule has
 /// no upcoming occurrence in the next ~10 years (catches typos like
 /// `0 0 30 2 *` that would never fire).
-pub fn next_fire_after(
-    schedule: &Schedule,
-    tz: Tz,
-    after: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+pub fn next_fire_after(schedule: &Schedule, tz: Tz, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let after_local = after.with_timezone(&tz);
     schedule
         .after(&after_local)
@@ -173,21 +169,16 @@ impl<'db> RoutineStore<'db> {
     /// schedule + tz; failure to compute it is NOT a hard error
     /// (a routine with no upcoming run is still saveable, just
     /// dormant).
-    pub fn upsert(
-        &self,
-        payload: &RoutineUpsert,
-        now: i64,
-    ) -> Result<RoutineRow, RoutineError> {
+    pub fn upsert(&self, payload: &RoutineUpsert, now: i64) -> Result<RoutineRow, RoutineError> {
         if payload.name.trim().is_empty() {
-            return Err(RoutineError::Invalid(
-                "routine name is required".into(),
-            ));
+            return Err(RoutineError::Invalid("routine name is required".into()));
         }
         let schedule = parse_cron(&payload.schedule_cron)?;
         let tz = parse_timezone(&payload.timezone)?;
-        let after_dt = Utc.timestamp_opt(now, 0).single().ok_or_else(|| {
-            RoutineError::Invalid(format!("invalid `now` timestamp: {now}"))
-        })?;
+        let after_dt = Utc
+            .timestamp_opt(now, 0)
+            .single()
+            .ok_or_else(|| RoutineError::Invalid(format!("invalid `now` timestamp: {now}")))?;
         let next_run_at = next_fire_after(&schedule, tz, after_dt).map(|t| t.timestamp());
 
         // Reject schedules whose next fire is more than ~1 year out
@@ -246,26 +237,26 @@ impl<'db> RoutineStore<'db> {
             Ok(())
         })?;
 
-        self.get(&id)?
-            .ok_or(RoutineError::NotFound(id))
+        self.get(&id)?.ok_or(RoutineError::NotFound(id))
     }
 
     pub fn get(&self, id: &str) -> Result<Option<RoutineRow>, RoutineError> {
         let id_owned = id.to_owned();
-        self.db.with_conn(|c| {
-            let got = c
-                .query_row(
-                    "SELECT id, name, schedule_cron, timezone, prompt, \
+        self.db
+            .with_conn(|c| {
+                let got = c
+                    .query_row(
+                        "SELECT id, name, schedule_cron, timezone, prompt, \
                             target_conversation_id, enabled, last_run_at, \
                             last_run_status, next_run_at, created_at, updated_at \
                      FROM config_routines WHERE id = ?1",
-                    params![id_owned],
-                    row_to_routine,
-                )
-                .ok();
-            Ok(got)
-        })
-        .map_err(RoutineError::from)
+                        params![id_owned],
+                        row_to_routine,
+                    )
+                    .ok();
+                Ok(got)
+            })
+            .map_err(RoutineError::from)
     }
 
     /// List every routine, ordered by enabled-first then by next fire
@@ -333,17 +324,18 @@ impl<'db> RoutineStore<'db> {
         next_run_at: Option<i64>,
     ) -> Result<(), RoutineError> {
         let id_owned = id.to_owned();
-        self.db.with_conn(|c| {
-            c.execute(
-                "UPDATE config_routines \
+        self.db
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE config_routines \
                  SET last_run_at = ?1, last_run_status = ?2, \
                      next_run_at = ?3, updated_at = ?1 \
                  WHERE id = ?4",
-                params![last_run_at, status.as_str(), next_run_at, id_owned],
-            )?;
-            Ok(())
-        })
-        .map_err(RoutineError::from)
+                    params![last_run_at, status.as_str(), next_run_at, id_owned],
+                )?;
+                Ok(())
+            })
+            .map_err(RoutineError::from)
     }
 
     /// Insert a new run-history row in `Pending` status. Returns the
@@ -382,16 +374,17 @@ impl<'db> RoutineStore<'db> {
         let id_owned = run_id.to_owned();
         let err_owned = error.map(|s| s.to_owned());
         let cid_owned = conversation_id.map(|s| s.to_owned());
-        self.db.with_conn(|c| {
-            c.execute(
-                "UPDATE state_routine_runs \
+        self.db
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE state_routine_runs \
                  SET status = ?1, finished_at = ?2, error = ?3, conversation_id = ?4 \
                  WHERE id = ?5",
-                params![status.as_str(), finished_at, err_owned, cid_owned, id_owned],
-            )?;
-            Ok(())
-        })
-        .map_err(RoutineError::from)
+                    params![status.as_str(), finished_at, err_owned, cid_owned, id_owned],
+                )?;
+                Ok(())
+            })
+            .map_err(RoutineError::from)
     }
 
     /// Purge run-history rows older than `cutoff_unix`. Returns the
@@ -400,10 +393,7 @@ impl<'db> RoutineStore<'db> {
     /// is preserved so the operator can still see it (and so a
     /// crash-mid-fire row doesn't silently disappear). The retention
     /// sweeper at boot calls this on the configured cadence.
-    pub fn purge_runs_older_than(
-        &self,
-        cutoff_unix: i64,
-    ) -> Result<usize, RoutineError> {
+    pub fn purge_runs_older_than(&self, cutoff_unix: i64) -> Result<usize, RoutineError> {
         let n = self.db.with_conn(|c| {
             let n = c.execute(
                 "DELETE FROM state_routine_runs \
@@ -543,7 +533,10 @@ mod tests {
     fn upsert_creates_then_updates_with_next_run_at() {
         let db = fresh_db();
         let store = RoutineStore::new(&db);
-        let now = Utc.with_ymd_and_hms(2026, 4, 25, 3, 0, 0).unwrap().timestamp();
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 25, 3, 0, 0)
+            .unwrap()
+            .timestamp();
         let r1 = store.upsert(&upsert("morning", "0 8 * * *"), now).unwrap();
         assert!(!r1.id.is_empty());
         assert!(r1.next_run_at.is_some());
@@ -566,7 +559,10 @@ mod tests {
         // That's the typo-catching case: legitimate "every leap-day"
         // schedules are vanishingly rare, so the guardrail prefers
         // rejecting on the assumption it's a fat-fingered cron.
-        let now = Utc.with_ymd_and_hms(2026, 4, 25, 3, 0, 0).unwrap().timestamp();
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 25, 3, 0, 0)
+            .unwrap()
+            .timestamp();
         let err = store
             .upsert(&upsert("leap-only", "0 0 29 2 *"), now)
             .unwrap_err();
@@ -578,7 +574,10 @@ mod tests {
         let db = fresh_db();
         let store = RoutineStore::new(&db);
         // Dec 1 2026 → next Jan 1 = Jan 1 2027 = ~31 days out → fine.
-        let now = Utc.with_ymd_and_hms(2026, 12, 1, 3, 0, 0).unwrap().timestamp();
+        let now = Utc
+            .with_ymd_and_hms(2026, 12, 1, 3, 0, 0)
+            .unwrap()
+            .timestamp();
         let r = store
             .upsert(&upsert("yearly-but-soon", "0 0 1 1 *"), now)
             .unwrap();
@@ -605,7 +604,10 @@ mod tests {
     fn list_due_returns_only_enabled_with_elapsed_next_run_at() {
         let db = fresh_db();
         let store = RoutineStore::new(&db);
-        let now = Utc.with_ymd_and_hms(2026, 4, 25, 3, 0, 0).unwrap().timestamp();
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 25, 3, 0, 0)
+            .unwrap()
+            .timestamp();
 
         let due = store.upsert(&upsert("due", "0 8 * * *"), now).unwrap();
         // Force its next_run_at into the past.
@@ -635,7 +637,10 @@ mod tests {
     fn run_history_round_trip() {
         let db = fresh_db();
         let store = RoutineStore::new(&db);
-        let now = Utc.with_ymd_and_hms(2026, 4, 25, 3, 0, 0).unwrap().timestamp();
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 25, 3, 0, 0)
+            .unwrap()
+            .timestamp();
         let r = store.upsert(&upsert("test", "0 8 * * *"), now).unwrap();
 
         let run_id = store.insert_run_pending(&r.id, now).unwrap();
@@ -660,7 +665,10 @@ mod tests {
     fn delete_then_list_runs_is_empty_via_fk_cascade() {
         let db = fresh_db();
         let store = RoutineStore::new(&db);
-        let now = Utc.with_ymd_and_hms(2026, 4, 25, 3, 0, 0).unwrap().timestamp();
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 25, 3, 0, 0)
+            .unwrap()
+            .timestamp();
         let r = store.upsert(&upsert("test", "0 8 * * *"), now).unwrap();
         store.insert_run_pending(&r.id, now).unwrap();
 

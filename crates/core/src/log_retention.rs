@@ -74,11 +74,7 @@ impl LogRetentionSweeper {
 
     /// Pin a static retention duration (tests + fixtures that want
     /// deterministic behaviour without consulting the DB row).
-    pub fn with_config(
-        db: Database,
-        interval: Duration,
-        retention: Duration,
-    ) -> Self {
+    pub fn with_config(db: Database, interval: Duration, retention: Duration) -> Self {
         Self {
             db,
             interval,

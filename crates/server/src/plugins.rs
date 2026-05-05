@@ -18,8 +18,8 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::{Json, Router};
 use axum::routing::{delete, get, post};
+use axum::{Json, Router};
 use execlaw_plugin_host::PluginHostError;
 use execlaw_plugin_sdk::zip_stage::{StageError, stage_zip};
 use serde::{Deserialize, Serialize};
@@ -247,21 +247,16 @@ pub async fn install_handler(
 /// server boot, which always runs the same sync).
 fn sync_after_lifecycle_change(state: &AppState, plugin_id: &str) {
     let now = chrono::Utc::now().timestamp();
-    if let Err(e) = crate::tool_sync::mark_plugin_tools_removed(
-        &state.db,
-        plugin_id,
-        &state.plugin_host,
-        now,
-    ) {
+    if let Err(e) =
+        crate::tool_sync::mark_plugin_tools_removed(&state.db, plugin_id, &state.plugin_host, now)
+    {
         tracing::warn!(
             plugin_id = %plugin_id,
             error = %e,
             "mark_plugin_tools_removed failed during lifecycle sync",
         );
     }
-    if let Err(e) =
-        crate::tool_sync::sync_tool_access(&state.db, &state.plugin_host, now)
-    {
+    if let Err(e) = crate::tool_sync::sync_tool_access(&state.db, &state.plugin_host, now) {
         tracing::warn!(
             plugin_id = %plugin_id,
             error = %e,
@@ -454,11 +449,7 @@ pub async fn list_tools_handler(State(state): State<AppState>) -> impl IntoRespo
             required_capabilities: t.required_capabilities.clone(),
         })
         .collect();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"tools": tools})),
-    )
-        .into_response()
+    (StatusCode::OK, Json(serde_json::json!({"tools": tools}))).into_response()
 }
 
 /// One sidebar-nav entry the SPA renders under `⋯ More`.

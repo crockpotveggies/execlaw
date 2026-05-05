@@ -49,7 +49,7 @@ pub mod family;
 
 pub use adapter::{AdaptedResponse, ModelAdapter, OutputHint};
 pub use families::{
-    adapter_for, DeepSeekR1Adapter, DeepSeekV3Adapter, GemmaAdapter, Llama3Adapter,
-    MistralAdapter, OpenAiGenericAdapter, Qwen3Adapter,
+    DeepSeekR1Adapter, DeepSeekV3Adapter, GemmaAdapter, Llama3Adapter, MistralAdapter,
+    OpenAiGenericAdapter, Qwen3Adapter, adapter_for,
 };
 pub use family::ModelFamily;

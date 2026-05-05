@@ -402,8 +402,17 @@ pub fn merge(base: &PersonalityRow, over: Option<&PersonalityRow>) -> ResolvedPe
         }
     };
 
-    let (over_display, over_role, over_tone, over_style, over_init, over_about_a, over_about_c,
-         over_custom, over_voice) = match over {
+    let (
+        over_display,
+        over_role,
+        over_tone,
+        over_style,
+        over_init,
+        over_about_a,
+        over_about_c,
+        over_custom,
+        over_voice,
+    ) = match over {
         Some(o) => (
             o.display_name.as_str(),
             o.role.as_str(),
@@ -419,7 +428,11 @@ pub fn merge(base: &PersonalityRow, over: Option<&PersonalityRow>) -> ResolvedPe
     };
 
     ResolvedPersonality {
-        display_name: take(PersonalityField::DisplayName, &base.display_name, over_display),
+        display_name: take(
+            PersonalityField::DisplayName,
+            &base.display_name,
+            over_display,
+        ),
         role: take(PersonalityField::Role, &base.role, over_role),
         tone: take(PersonalityField::Tone, &base.tone, over_tone),
         communication_style: take(
@@ -428,7 +441,11 @@ pub fn merge(base: &PersonalityRow, over: Option<&PersonalityRow>) -> ResolvedPe
             over_style,
         ),
         initiative: take(PersonalityField::Initiative, &base.initiative, over_init),
-        about_agent: take(PersonalityField::AboutAgent, &base.about_agent, over_about_a),
+        about_agent: take(
+            PersonalityField::AboutAgent,
+            &base.about_agent,
+            over_about_a,
+        ),
         about_controller: take(
             PersonalityField::AboutController,
             &base.about_controller,
@@ -831,12 +848,16 @@ mod tests {
                 100,
             )
             .unwrap();
-        assert!(store
-            .delete(PersonalityScopeKind::Conversation, "conv-x")
-            .unwrap());
-        assert!(!store
-            .delete(PersonalityScopeKind::Conversation, "conv-x")
-            .unwrap());
+        assert!(
+            store
+                .delete(PersonalityScopeKind::Conversation, "conv-x")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .delete(PersonalityScopeKind::Conversation, "conv-x")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -869,9 +890,10 @@ mod tests {
         }
         let rows = store.list_overrides().unwrap();
         assert_eq!(rows.len(), 3);
-        assert!(rows
-            .iter()
-            .all(|r| r.scope_kind == PersonalityScopeKind::Conversation));
+        assert!(
+            rows.iter()
+                .all(|r| r.scope_kind == PersonalityScopeKind::Conversation)
+        );
     }
 
     #[test]

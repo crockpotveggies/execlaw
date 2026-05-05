@@ -209,6 +209,30 @@ impl SidecarSupervisor {
         }
     }
 
+    /// Look up the published host port for a single supervised
+    /// sidecar by name. Returns `Some(port)` only when the sidecar
+    /// has been spawned at least once (the supervisor mints its
+    /// host port on first spawn, then reuses it on every respawn —
+    /// see `host_port: Option<u16>` on `SidecarSlot`). Returns
+    /// `None` when no slot exists, when the slot has never spawned,
+    /// or when the slot is parked `CrashLooping` with no live
+    /// handle.
+    ///
+    /// This is the single accessor consumer plugins (signal-cli
+    /// transport, future bridge consumers) call to dial the
+    /// sidecar's local RPC. We deliberately surface a port number
+    /// rather than a fully-qualified URL so callers can append
+    /// arbitrary RPC paths without parsing/joining: every supported
+    /// sidecar publishes on `127.0.0.1:<port>`, no exceptions.
+    pub async fn host_port_for(&self, name: &str) -> Option<u16> {
+        self.slots
+            .lock()
+            .await
+            .get(name)
+            .and_then(|s| s.handle.as_ref())
+            .map(|h| h.host_port)
+    }
+
     /// Snapshot every sidecar's current state. Returns one entry
     /// per sidecar **registered in the hook registry** — sidecars
     /// the supervisor has never reconciled yet still show up as
@@ -292,9 +316,7 @@ impl SidecarSupervisor {
                 // actually running — orphaning a stopped slot
                 // shouldn't spam the bus. (Mirrors the
                 // `transition_status` dedup on the live-slot path.)
-                if was_running
-                    && let Some(bus) = &self.bus
-                {
+                if was_running && let Some(bus) = &self.bus {
                     bus.publish(UiEvent::SidecarStatusChanged {
                         name: c.clone(),
                         status: format!("{:?}", ServiceStatus::Stopped),
@@ -409,11 +431,7 @@ impl SidecarSupervisor {
                         "sidecar container spawned",
                     );
                     slot.handle = Some(handle);
-                    self.transition_status(
-                        &sidecar.name,
-                        slot,
-                        ServiceStatus::Starting,
-                    );
+                    self.transition_status(&sidecar.name, slot, ServiceStatus::Starting);
                     return;
                 }
                 Err(e) => {
@@ -478,11 +496,7 @@ impl SidecarSupervisor {
                     "sidecar container vanished; will respawn",
                 );
                 slot.handle = None;
-                self.transition_status(
-                    &sidecar.name,
-                    slot,
-                    ServiceStatus::Stopped,
-                );
+                self.transition_status(&sidecar.name, slot, ServiceStatus::Stopped);
             }
             ServiceStatus::CrashLooping { restart_count } => {
                 // Adopt the controller's count verbatim — pre-fix
@@ -509,21 +523,13 @@ impl SidecarSupervisor {
                     "http://127.0.0.1:{}{}",
                     handle.host_port, sidecar.rpc_health_path
                 );
-                let healthy = self
-                    .controller
-                    .health_check(&url)
-                    .await
-                    .unwrap_or(false);
+                let healthy = self.controller.health_check(&url).await.unwrap_or(false);
                 if healthy {
                     if !matches!(slot.status, ServiceStatus::Healthy) {
                         info!(sidecar = %sidecar.name, "sidecar healthy");
                     }
                     slot.restart_attempts = 0;
-                    self.transition_status(
-                        &sidecar.name,
-                        slot,
-                        ServiceStatus::Healthy,
-                    );
+                    self.transition_status(&sidecar.name, slot, ServiceStatus::Healthy);
                 } else {
                     // Container says it's up but RPC health failed —
                     // restart. Could be a slow-starting sidecar; the
@@ -539,14 +545,13 @@ impl SidecarSupervisor {
                     }
                     slot.handle = None;
                     slot.restart_attempts = slot.restart_attempts.saturating_add(1);
-                    let new_status =
-                        if slot.restart_attempts >= MAX_RESTART_ATTEMPTS {
-                            ServiceStatus::CrashLooping {
-                                restart_count: slot.restart_attempts,
-                            }
-                        } else {
-                            ServiceStatus::Stopped
-                        };
+                    let new_status = if slot.restart_attempts >= MAX_RESTART_ATTEMPTS {
+                        ServiceStatus::CrashLooping {
+                            restart_count: slot.restart_attempts,
+                        }
+                    } else {
+                        ServiceStatus::Stopped
+                    };
                     self.transition_status(&sidecar.name, slot, new_status);
                 }
             }
@@ -578,12 +583,7 @@ impl SidecarSupervisor {
     /// the same, which spammed the event bus + the SPA's sidecars
     /// page. Centralising the publish here means every transition
     /// site naturally dedups.
-    fn transition_status(
-        &self,
-        name: &str,
-        slot: &mut SidecarSlot,
-        new_status: ServiceStatus,
-    ) {
+    fn transition_status(&self, name: &str, slot: &mut SidecarSlot, new_status: ServiceStatus) {
         if slot.status == new_status {
             return;
         }
@@ -630,6 +630,54 @@ rpc_port = {port}
         let reg = HookRegistry::new();
         reg.enable(&m).unwrap();
         reg
+    }
+
+    /// Phase 3: `host_port_for` is the accessor consumer plugins
+    /// (signal-cli transport, future bridges) call to resolve the
+    /// sidecar's loopback RPC URL. Returns `None` until the first
+    /// successful spawn, then `Some(port)` thereafter — even after
+    /// drift respawn / RPC-fail restart, because the supervisor
+    /// reuses the originally-minted port.
+    #[tokio::test]
+    async fn host_port_for_returns_none_before_first_spawn_then_stable_port() {
+        let mock = Arc::new(MockServiceController::new());
+        let reg = registry_with_sidecar("p-signal", "signal", 8080);
+        let sup = SidecarSupervisor::new(mock.clone(), reg);
+
+        // Pre-reconcile: nothing spawned, accessor returns None
+        // (the manifest is registered but no slot exists yet).
+        assert_eq!(sup.host_port_for("signal").await, None);
+        assert_eq!(sup.host_port_for("nonexistent").await, None);
+
+        // First reconcile spawns and assigns a stable host port
+        // from SIDECAR_PORT_POOL_START.
+        sup.reconcile_once().await;
+        let port = sup
+            .host_port_for("signal")
+            .await
+            .expect("port must be set after first spawn");
+        assert_eq!(port, SIDECAR_PORT_POOL_START);
+
+        // RPC-fail restart cycle — the slot's host_port is reused
+        // (the supervisor's "stable URL" guarantee).
+        mock.pin_status(ServiceStatus::Healthy).await;
+        mock.pin_health(false).await;
+        sup.reconcile_once().await; // detect bad RPC, stop+drop handle
+        // Slot stops → handle is None → accessor returns None
+        // (because there's no live container to dial right now).
+        // This is the correct semantic: callers must wait for the
+        // next respawn before sending RPC.
+        assert_eq!(sup.host_port_for("signal").await, None);
+
+        // Next reconcile respawns. Bring health back so the cycle
+        // settles and the port surfaces again.
+        mock.pin_health(true).await;
+        sup.reconcile_once().await; // respawn with reused port
+        assert_eq!(
+            sup.host_port_for("signal").await,
+            Some(SIDECAR_PORT_POOL_START),
+            "respawn must reuse the originally-minted port",
+        );
     }
 
     #[tokio::test]
@@ -1036,9 +1084,9 @@ rpc_port = {p}
         let ports: Vec<u16> = snap
             .iter()
             .filter_map(|s| {
-                s.rpc_url.as_ref().and_then(|u| {
-                    u.strip_prefix("http://127.0.0.1:")?.parse::<u16>().ok()
-                })
+                s.rpc_url
+                    .as_ref()
+                    .and_then(|u| u.strip_prefix("http://127.0.0.1:")?.parse::<u16>().ok())
             })
             .collect();
         assert_eq!(ports.len(), 2);
@@ -1046,6 +1094,9 @@ rpc_port = {p}
         // name), so just check the set.
         let mut sorted = ports.clone();
         sorted.sort();
-        assert_eq!(sorted, vec![SIDECAR_PORT_POOL_START, SIDECAR_PORT_POOL_START + 1]);
+        assert_eq!(
+            sorted,
+            vec![SIDECAR_PORT_POOL_START, SIDECAR_PORT_POOL_START + 1]
+        );
     }
 }

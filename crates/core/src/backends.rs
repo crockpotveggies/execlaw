@@ -168,8 +168,7 @@ impl<'db> BackendStore<'db> {
     pub fn upsert(&self, payload: &BackendUpsert, now: i64) -> Result<BackendRow, BackendError> {
         let model_blob = serde_json::to_vec(&payload.model_spec_json)
             .map_err(|e| BackendError::Invalid(format!("model_spec_json: {e}")))?;
-        let reasoning = payload.reasoning_enabled
-            && payload.purpose.supports_reasoning_toggle();
+        let reasoning = payload.reasoning_enabled && payload.purpose.supports_reasoning_toggle();
         self.db.with_conn(|c| {
             c.execute(
                 "INSERT INTO config_backends \
@@ -249,16 +248,17 @@ impl<'db> BackendStore<'db> {
         now: i64,
     ) -> Result<(), BackendError> {
         let endpoint_owned = endpoint.map(|s| s.to_owned());
-        self.db.with_conn(|c| {
-            c.execute(
-                "UPDATE config_backends \
+        self.db
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE config_backends \
                  SET endpoint = ?1, updated_at = ?2 \
                  WHERE purpose = ?3",
-                params![endpoint_owned, now, purpose.as_str()],
-            )?;
-            Ok(())
-        })
-        .map_err(BackendError::from)
+                    params![endpoint_owned, now, purpose.as_str()],
+                )?;
+                Ok(())
+            })
+            .map_err(BackendError::from)
     }
 
     /// Operator can clear a configured backend without inserting a
@@ -340,7 +340,9 @@ mod tests {
     fn upsert_inserts_then_updates_in_place() {
         let db = fresh_db();
         let store = BackendStore::new(&db);
-        let r1 = store.upsert(&upsert_payload(BackendPurpose::Standard), 100).unwrap();
+        let r1 = store
+            .upsert(&upsert_payload(BackendPurpose::Standard), 100)
+            .unwrap();
         assert_eq!(r1.created_at, 100);
         assert_eq!(r1.updated_at, 100);
         let mut p2 = upsert_payload(BackendPurpose::Standard);
@@ -378,8 +380,12 @@ mod tests {
     fn clear_removes_one_purpose_only() {
         let db = fresh_db();
         let store = BackendStore::new(&db);
-        store.upsert(&upsert_payload(BackendPurpose::Standard), 0).unwrap();
-        store.upsert(&upsert_payload(BackendPurpose::Small), 0).unwrap();
+        store
+            .upsert(&upsert_payload(BackendPurpose::Standard), 0)
+            .unwrap();
+        store
+            .upsert(&upsert_payload(BackendPurpose::Small), 0)
+            .unwrap();
         assert!(store.clear(BackendPurpose::Standard).unwrap());
         assert!(store.get(BackendPurpose::Standard).unwrap().is_none());
         assert!(store.get(BackendPurpose::Small).unwrap().is_some());
@@ -428,7 +434,11 @@ mod tests {
             BackendPurpose::VoiceStt,
             BackendPurpose::VoiceTts,
         ] {
-            assert!(!p.supports_reasoning_toggle(), "{} must NOT toggle", p.as_str());
+            assert!(
+                !p.supports_reasoning_toggle(),
+                "{} must NOT toggle",
+                p.as_str()
+            );
         }
     }
 

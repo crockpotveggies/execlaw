@@ -23,12 +23,12 @@ use crate::auth_extract::AuthedUser;
 use crate::backend_presets::{self, PresetsResponse};
 use crate::routes::ApiError;
 use crate::state::AppState;
+use axum::Router;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, put};
-use axum::Router;
-use execlaw_container_manager::{detect, GpuVendor};
+use execlaw_container_manager::{GpuVendor, detect};
 use execlaw_core::audit::AuditStore;
 use execlaw_core::backends::{
     BackendError, BackendMode, BackendPurpose, BackendRow, BackendStore, BackendUpsert,
@@ -272,13 +272,16 @@ pub async fn upsert_handler(
         &user.user_id,
         "config_backends",
         purpose.as_str(),
-        prior.as_ref().map(|r| {
-            serde_json::json!({
-                "inference_backend": r.inference_backend,
-                "endpoint": r.endpoint,
-                "gpu_id": r.gpu_id,
+        prior
+            .as_ref()
+            .map(|r| {
+                serde_json::json!({
+                    "inference_backend": r.inference_backend,
+                    "endpoint": r.endpoint,
+                    "gpu_id": r.gpu_id,
+                })
             })
-        }).as_ref(),
+            .as_ref(),
         Some(&serde_json::json!({
             "inference_backend": row.inference_backend,
             "endpoint": row.endpoint,
@@ -320,10 +323,7 @@ pub async fn clear_handler(
         return Err(ApiError {
             status: StatusCode::NOT_FOUND,
             code: "backend_not_configured",
-            message: format!(
-                "purpose '{}' has no backend to clear",
-                purpose.as_str()
-            ),
+            message: format!("purpose '{}' has no backend to clear", purpose.as_str()),
         });
     }
     if let Some(prior) = prior {
@@ -541,9 +541,14 @@ pub async fn logs_handler(
             let snap = sup.snapshot_status().await;
             snap.iter()
                 .find(|s| s.purpose == purpose)
-                .map(|s| !matches!(s.status, execlaw_container_manager::ServiceStatus::Healthy
-                    | execlaw_container_manager::ServiceStatus::Starting
-                    | execlaw_container_manager::ServiceStatus::Pulling))
+                .map(|s| {
+                    !matches!(
+                        s.status,
+                        execlaw_container_manager::ServiceStatus::Healthy
+                            | execlaw_container_manager::ServiceStatus::Starting
+                            | execlaw_container_manager::ServiceStatus::Pulling
+                    )
+                })
                 .unwrap_or(true)
         }
         None => true,
@@ -585,14 +590,11 @@ pub async fn restart_handler(
         code: "unknown_purpose",
         message: format!("'{purpose}' is not a recognised backend purpose"),
     })?;
-    let sup = state
-        .backend_supervisor
-        .as_ref()
-        .ok_or_else(|| ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "supervisor_unavailable",
-            message: "backend supervisor is not running (Docker unreachable?)".into(),
-        })?;
+    let sup = state.backend_supervisor.as_ref().ok_or_else(|| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "supervisor_unavailable",
+        message: "backend supervisor is not running (Docker unreachable?)".into(),
+    })?;
     sup.restart(purpose).await.map_err(|e| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         code: "supervisor_error",
@@ -706,7 +708,10 @@ pub fn backends_router() -> Router<AppState> {
         )
         .route("/api/admin/backends/{purpose}/status", get(status_handler))
         .route("/api/admin/backends/{purpose}/logs", get(logs_handler))
-        .route("/api/admin/backends/{purpose}/restart", post(restart_handler))
+        .route(
+            "/api/admin/backends/{purpose}/restart",
+            post(restart_handler),
+        )
 }
 
 #[cfg(test)]
@@ -974,10 +979,8 @@ mod tests {
 
         // Simulate supervisor writing the endpoint back.
         execlaw_core::backends::BackendStore::new(
-            &execlaw_core::Database::open(
-                &execlaw_core::db::DbConfig::in_memory_unencrypted(),
-            )
-            .unwrap(),
+            &execlaw_core::Database::open(&execlaw_core::db::DbConfig::in_memory_unencrypted())
+                .unwrap(),
         );
         // Manually patch via the actual app's DB by reissuing as
         // an upsert with explicit endpoint — the cleanest test
@@ -1045,8 +1048,7 @@ mod tests {
         // URL.
         let mut body2 = upsert_body();
         body2["mode"] = serde_json::Value::String("external".into());
-        body2["endpoint"] =
-            serde_json::Value::String("http://192.168.1.50:8000/v1".into());
+        body2["endpoint"] = serde_json::Value::String("http://192.168.1.50:8000/v1".into());
         let req = Request::builder()
             .method(Method::PUT)
             .uri("/api/admin/backends/Standard")
@@ -1110,10 +1112,7 @@ mod tests {
         use execlaw_core::backends::BackendUpsert;
         let mut state = test_app_state();
         let mock = std::sync::Arc::new(MockServiceController::new());
-        let sup = crate::backend_supervisor::BackendSupervisor::new(
-            state.db.clone(),
-            mock.clone(),
-        );
+        let sup = crate::backend_supervisor::BackendSupervisor::new(state.db.clone(), mock.clone());
         state.backend_supervisor = Some(sup.clone());
 
         // Seed a managed Standard row.
@@ -1154,7 +1153,12 @@ mod tests {
         assert_eq!(v["mode"], "managed");
         assert_eq!(v["status"], "Healthy");
         assert_eq!(v["supervisor_available"], true);
-        assert!(v["endpoint"].as_str().unwrap().starts_with("http://127.0.0.1:"));
+        assert!(
+            v["endpoint"]
+                .as_str()
+                .unwrap()
+                .starts_with("http://127.0.0.1:")
+        );
     }
 
     #[tokio::test]
@@ -1274,10 +1278,7 @@ mod tests {
 
     #[test]
     fn build_presets_response_recommends_intel_on_arc_host() {
-        let resp = build_presets_response(
-            BackendPurpose::VoiceStt,
-            &[GpuVendor::Intel],
-        );
+        let resp = build_presets_response(BackendPurpose::VoiceStt, &[GpuVendor::Intel]);
         assert_eq!(resp.detected_vendors, vec!["intel"]);
         let intel = resp
             .presets
@@ -1311,10 +1312,7 @@ mod tests {
         // signal, but it shouldn't appear in the detected_vendors
         // string list either since the SPA's vendor-label table
         // can't render it.
-        let resp = build_presets_response(
-            BackendPurpose::VoiceStt,
-            &[GpuVendor::Unknown],
-        );
+        let resp = build_presets_response(BackendPurpose::VoiceStt, &[GpuVendor::Unknown]);
         assert!(resp.detected_vendors.is_empty());
     }
 
@@ -1323,10 +1321,7 @@ mod tests {
         // Audit fix: SPA used to guess inference_backend from the
         // preset id prefix. Server is now the single source of
         // truth. Spot-check a few.
-        let resp = build_presets_response(
-            BackendPurpose::Standard,
-            &[GpuVendor::Nvidia],
-        );
+        let resp = build_presets_response(BackendPurpose::Standard, &[GpuVendor::Nvidia]);
         let vllm = resp
             .presets
             .iter()
@@ -1399,10 +1394,7 @@ mod tests {
             if p["recommended"].as_bool().unwrap_or(false) {
                 let vendor = p["vendor"].as_str().unwrap();
                 if detected.is_empty() {
-                    assert_eq!(
-                        vendor, "cpu",
-                        "no-GPU host must only recommend CPU presets"
-                    );
+                    assert_eq!(vendor, "cpu", "no-GPU host must only recommend CPU presets");
                 } else {
                     assert!(
                         detected.iter().any(|d| d.as_str() == Some(vendor))
@@ -1439,8 +1431,7 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert!(
-            resp.status() == StatusCode::UNAUTHORIZED
-                || resp.status() == StatusCode::FORBIDDEN,
+            resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN,
             "expected auth rejection, got {}",
             resp.status()
         );
