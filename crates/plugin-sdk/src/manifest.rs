@@ -1090,7 +1090,7 @@ mod tests {
         let m = PluginManifest::parse(SIGNAL_MANIFEST)
             .expect("plugins/signal/plugin.toml must parse cleanly");
         assert_eq!(m.plugin.id, "signal");
-        assert_eq!(m.plugin.version, "0.3.6");
+        assert_eq!(m.plugin.version, "0.4.0");
         // The transport icon must propagate from manifest → SDK so
         // the SPA's sidebar can render a Signal-shaped marker on
         // bridged threads. Pin the literal so a typo in the manifest
@@ -1123,17 +1123,17 @@ mod tests {
             reply.trust_floor.is_none(),
             "signal.reply must NOT pin a trust floor"
         );
-        // Phase 5: every Signal tool is host-implemented. They
-        // need the TransportApi capability that rhai scripts
-        // can't access. The rhai stub on disk is a defensive
-        // guard, not a dispatch target.
+        // Phase B (v0.4.0): every Signal tool is now SCRIPT-tier.
+        // host_implemented=false (the default) means tool dispatch
+        // hits main.rhai's `tool_call`. The rhai script reaches the
+        // sidecar via the `sidecar_http_*` host bindings.
         assert!(
-            send.host_implemented,
-            "signal.send_message must be host-implemented (Phase 3)"
+            !send.host_implemented,
+            "signal.send_message must be script-tier in v0.4.0+"
         );
         assert!(
-            reply.host_implemented,
-            "signal.reply must be host-implemented (Phase 3)"
+            !reply.host_implemented,
+            "signal.reply must be script-tier in v0.4.0+"
         );
         for name in [
             "signal.list_groups",
@@ -1147,10 +1147,12 @@ mod tests {
                 .find(|t| t.name == name)
                 .unwrap_or_else(|| panic!("{name} must be declared"));
             assert!(
-                t.host_implemented,
-                "{name} must be host-implemented (Phase 5)"
+                !t.host_implemented,
+                "{name} must be script-tier in v0.4.0+"
             );
         }
+        // Two admin routes — pairing flow is now plugin-served.
+        assert_eq!(m.admin_routes.len(), 2);
         // Sidecar declaration: signal-cli supervised on /v1/about.
         let signal_cli = m
             .services

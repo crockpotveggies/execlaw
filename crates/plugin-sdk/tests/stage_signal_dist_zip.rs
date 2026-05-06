@@ -17,13 +17,13 @@ fn dist_signal_zip_stages_cleanly() {
         .unwrap()
         .parent()
         .unwrap();
-    let zip_path = workspace_root.join("dist").join("signal-0.3.6.zip");
+    let zip_path = workspace_root.join("dist").join("signal-0.4.0.zip");
     if !zip_path.exists() {
         // Allow CI / fresh clones to skip — the zip is rebuilt
         // by `scripts/package-plugins.ps1` (Phase 7) and not
         // checked in until the operator opts to ship it.
         eprintln!(
-            "dist/signal-0.3.6.zip not present at {}; skipping",
+            "dist/signal-0.4.0.zip not present at {}; skipping",
             zip_path.display()
         );
         return;
@@ -31,14 +31,18 @@ fn dist_signal_zip_stages_cleanly() {
     let f = File::open(&zip_path).expect("open dist zip");
     let staged = stage_zip(BufReader::new(f)).expect("stage_zip must accept the dist zip");
     assert_eq!(staged.manifest.plugin.id, "signal");
-    assert_eq!(staged.manifest.plugin.version, "0.3.6");
-    // All six tools are host-implemented — pin so a packaging step
-    // that accidentally bundled an old manifest gets caught.
+    assert_eq!(staged.manifest.plugin.version, "0.4.0");
+    // Phase B: all six tools are now SCRIPT-tier (main.rhai owns
+    // them via sidecar_http_* bindings). Pin so a regression that
+    // re-introduces host_implemented gets caught.
     assert_eq!(staged.manifest.tools.len(), 6);
     assert!(
-        staged.manifest.tools.iter().all(|t| t.host_implemented),
-        "every signal tool must be host_implemented in the dist zip"
+        staged.manifest.tools.iter().all(|t| !t.host_implemented),
+        "every signal tool must be script-tier in v0.4.0+ (host_implemented = false)"
     );
+    // Two admin routes (status + qrcodelink) — the plugin now owns
+    // its own pairing flow.
+    assert_eq!(staged.manifest.admin_routes.len(), 2);
     // Sidecar declaration must be present so the supervisor
     // spawns signal-cli on enable.
     let signal_cli = staged

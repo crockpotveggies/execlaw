@@ -218,6 +218,32 @@ pub trait HostCapabilities: Send + Sync {
         &self,
         msg: InboundMessage,
     ) -> Result<RouteOutcome, HostCapError>;
+
+    /// Read an attachment's bytes from the host's attachment
+    /// store, returned as a base64-encoded data URL the plugin
+    /// can ship verbatim through whatever wire format its
+    /// transport speaks (Signal's `base64_attachments` field, for
+    /// instance). The plugin doesn't need to know the on-disk path
+    /// — just the attachment_id the host minted on inbound.
+    ///
+    /// The host enforces trust scope: the attachment_id must be
+    /// associated with the calling plugin's conversation context.
+    /// Returns Err for missing rows, oversize payloads, etc.
+    async fn get_attachment_bytes_b64(
+        &self,
+        attachment_id: &str,
+    ) -> Result<AttachmentBytes, HostCapError>;
+}
+
+/// Output of [`HostCapabilities::get_attachment_bytes_b64`].
+#[derive(Debug, Clone)]
+pub struct AttachmentBytes {
+    /// `data:<mime>;base64,<payload>` — formatted to be dropped
+    /// directly into a JSON request body field. signal-cli's
+    /// bridge accepts this exact shape.
+    pub data_url: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
 }
 
 /// Capability set the script engine carries when host-capabilities

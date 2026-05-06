@@ -114,6 +114,48 @@ impl HostCapabilities for AppStateHostCapabilities {
     ) -> Result<RouteOutcome, HostCapError> {
         crate::generic_inbound::route_inbound(&self.state, msg).await
     }
+
+    async fn get_attachment_bytes_b64(
+        &self,
+        attachment_id: &str,
+    ) -> Result<execlaw_script::AttachmentBytes, HostCapError> {
+        use base64::Engine as _;
+        use execlaw_core::attachments::AttachmentStore;
+        use execlaw_core::ids::AttachmentId;
+        let store = AttachmentStore::new(&self.state.db);
+        let aid = AttachmentId::from(attachment_id);
+        let row = store
+            .get(&aid)
+            .map_err(|e| HostCapError::new(format!("attachment lookup: {e}")))?
+            .ok_or_else(|| HostCapError::new(format!("no attachment '{attachment_id}'")))?;
+        // 25 MiB cap mirrors the inbound + outbound caps in the
+        // retired signal_transport.rs.
+        const MAX_BYTES: u64 = 25 * 1024 * 1024;
+        let on_disk = std::fs::metadata(&row.path)
+            .map_err(|e| HostCapError::new(format!("attachment stat: {e}")))?
+            .len();
+        if on_disk > MAX_BYTES {
+            return Err(HostCapError::new(format!(
+                "attachment '{attachment_id}' is {on_disk} bytes; max is {MAX_BYTES}"
+            )));
+        }
+        let path = row.path.clone();
+        let bytes = tokio::task::spawn_blocking(move || std::fs::read(path))
+            .await
+            .map_err(|e| HostCapError::new(format!("attachment read join: {e}")))?
+            .map_err(|e| HostCapError::new(format!("attachment read: {e}")))?;
+        let mime = if row.mime_type.is_empty() {
+            "application/octet-stream"
+        } else {
+            row.mime_type.as_str()
+        };
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Ok(execlaw_script::AttachmentBytes {
+            data_url: format!("data:{mime};base64,{encoded}"),
+            mime_type: mime.to_owned(),
+            size_bytes: bytes.len() as u64,
+        })
+    }
 }
 
 /// Long-lived WebSocket consumer task. Reconnects on disconnect

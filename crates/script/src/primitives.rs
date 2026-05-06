@@ -543,7 +543,96 @@ fn register_host_cap_bindings(
     // as Rhai runtime errors with the plugin id tagged.
     register_sidecar_http_get(engine, plugin_id, host_caps.clone());
     register_sidecar_http_post(engine, plugin_id, host_caps.clone());
-    register_sidecar_http_delete(engine, plugin_id, host_caps);
+    register_sidecar_http_delete(engine, plugin_id, host_caps.clone());
+    register_host_get_attachment_bytes(engine, plugin_id, host_caps.clone());
+    register_sidecar_http_get_bytes(engine, plugin_id, host_caps);
+}
+
+fn register_host_get_attachment_bytes(
+    engine: &mut Engine,
+    plugin_id: &str,
+    host_caps: HostCapsHandle,
+) {
+    let pid = plugin_id.to_owned();
+    engine.register_fn(
+        "host_get_attachment_bytes",
+        move |attachment_id: ImmutableString| -> Result<Dynamic, Box<EvalAltResult>> {
+            let caps = match host_caps.get() {
+                Some(c) => c.clone(),
+                None => return Err(host_cap_unavailable_err(&pid, "host_get_attachment_bytes")),
+            };
+            let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_get_attachment_bytes: no tokio runtime: {e}").into(),
+                    rhai::Position::NONE,
+                ))
+            })?;
+            let res = tokio::task::block_in_place(|| {
+                runtime.block_on(caps.get_attachment_bytes_b64(&attachment_id))
+            });
+            match res {
+                Ok(a) => {
+                    let mut m = rhai::Map::new();
+                    m.insert("data_url".into(), Dynamic::from(ImmutableString::from(a.data_url)));
+                    m.insert("mime_type".into(), Dynamic::from(ImmutableString::from(a.mime_type)));
+                    m.insert("size_bytes".into(), Dynamic::from(a.size_bytes as i64));
+                    Ok(Dynamic::from(m))
+                }
+                Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_get_attachment_bytes: {}", e.0).into(),
+                    rhai::Position::NONE,
+                ))),
+            }
+        },
+    );
+}
+
+fn register_sidecar_http_get_bytes(
+    engine: &mut Engine,
+    plugin_id: &str,
+    host_caps: HostCapsHandle,
+) {
+    let pid = plugin_id.to_owned();
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(60))
+        .user_agent("execlaw/script-runtime/sidecar-bytes/0.1")
+        .build();
+    engine.register_fn(
+        "sidecar_http_get_bytes",
+        move |url: ImmutableString, query: Map| -> Result<Dynamic, Box<EvalAltResult>> {
+            use base64::Engine as _;
+            let caps = match host_caps.get() {
+                Some(c) => c.clone(),
+                None => return Err(host_cap_unavailable_err(&pid, "sidecar_http_get_bytes")),
+            };
+            sidecar_url_check(&pid, "sidecar_http_get_bytes", &url, &caps)?;
+            let mut req = agent.get(&url);
+            for (k, v) in map_to_query_iter(&query) {
+                req = req.query(&k, &v);
+            }
+            let resp = req
+                .call()
+                .map_err(|e| ureq_to_eval_err(&pid, "sidecar_http_get_bytes", &url, e))?;
+            let mime = resp
+                .header("Content-Type")
+                .map(|s| s.split(';').next().unwrap_or(s).trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "application/octet-stream".to_owned());
+            let mut buf = Vec::new();
+            resp.into_reader().read_to_end(&mut buf).map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] sidecar_http_get_bytes read: {e}").into(),
+                    rhai::Position::NONE,
+                ))
+            })?;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
+            let mut m = rhai::Map::new();
+            m.insert("data_url".into(), Dynamic::from(ImmutableString::from(format!("data:{mime};base64,{encoded}"))));
+            m.insert("mime_type".into(), Dynamic::from(ImmutableString::from(mime)));
+            m.insert("size_bytes".into(), Dynamic::from(buf.len() as i64));
+            Ok(Dynamic::from(m))
+        },
+    );
 }
 
 fn register_sidecar_http_get(

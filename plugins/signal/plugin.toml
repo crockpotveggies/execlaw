@@ -1,46 +1,14 @@
 [plugin]
 id = "signal"
 name = "Signal"
-version = "0.3.6"
-description = "Signal Messenger transport — send/reply/group operations via a host-managed signal-cli sidecar container."
+version = "0.4.0"
+description = "Signal Messenger transport — fully script-tier (Phase B). All host-side signal_*.rs code retired; this plugin's main.rhai owns inbound consumer, outbound, group ops, and admin pairing."
 author = "execlaw"
 license = "AGPL-3.0-or-later"
 
-# Phase 3 (2026-05-04): the supervised signal-cli sidecar is now
-# declared. The sidecar supervisor (Phase 2b) takes responsibility for
-# spawning, healthchecking, and restarting this container. The host
-# allocates a port in the 8501..=8600 pool and publishes
-# `127.0.0.1:<host_port>/v1/about` as the healthcheck URL.
-#
-# 2026-05-05 (v0.3.0):
-#   * Pinned to `:latest` (BUILD_VERSION 0.98). The `:0.92` tag ships
-#     signal-cli 0.13.13, whose link command can no longer reach
-#     Signal's current bootstrap servers ("Link request error:
-#     Connection closed!"). The newer image bundles a compatible
-#     signal-cli build.
-#   * `MODE=json-rpc` is the only mode that produces a real QR PNG
-#     for `/v1/qrcodelink`; default `normal` mode returns a JSON 400
-#     ("Couldn't create QR code: no data to encode") which the SPA
-#     renders as a blank white square.
-#   * `JSON_RPC_TRUST_NEW_IDENTITIES=on-first-use` matches Signal
-#     Desktop's TOFU default for new contacts; required for the
-#     daemon to start cleanly.
-#   * `state://data` mounts a per-sidecar host directory for the
-#     account keystore so pairing survives container restarts. The
-#     supervisor materialises this under
-#     `~/.execlaw/sidecars/signal/signal-cli/data/`.
-#   * `stage://enable-read-receipts.sh` mounts a shipped wrapper
-#     script that patches supervisord's signal-cli daemon line to
-#     add `--send-read-receipts` after bbernhard's jsonrpc2-helper
-#     generates the config. Without this, signal-cli silently drops
-#     read receipts even though the bbernhard /v1/configuration
-#     endpoint claims they're on.
-#   * `entrypoint` overrides bbernhard's image entrypoint with the
-#     wrapper, which `exec`s the original entrypoint in the
-#     background then runs the read-receipts reconciler.
-#
-# Phase 4+ will source the account keystore from the encrypted
-# vault (`secret://signal/account.tar.gz`) instead of the bind mount.
+# The supervised signal-cli sidecar. The sidecar supervisor owns
+# spawning, healthchecking, restarting; the plugin's main.rhai
+# uses `sidecar_url("signal-cli")` to dial it.
 [[services]]
 name = "signal-cli"
 image = "bbernhard/signal-cli-rest-api:latest"
@@ -65,21 +33,17 @@ read_only = true
 rpc_port = 8080
 rpc_health_path = "/v1/about"
 
-# Outbound transport on this plugin. Declared so the routing layer
-# knows `signal:` group bindings dispatch through this plugin's
-# tools; inbound consumer wiring (Phase 4) reads the same record.
+# Channel declaration. The icon flows into the SPA sidebar's
+# bridged-thread row marker; the host still uses
+# `HostTransportRegistry` for that lookup.
 [transport]
 transport_id = "signal"
 supports_attachments = true
 supports_groups = true
-# Bootstrap Icons name (sans `bi-` prefix). Renders next to Signal-
-# bridged thread titles in the sidebar so the operator can distinguish
-# Signal threads from Web / future-WhatsApp / future-email at a glance.
-# `chat-quote` reads as a messaging app and matches Signal's bubble
-# motif; the host falls back to `phone` if a transport plugin omits
-# this field.
 icon = "chat-quote"
 
+# Tools. host_implemented is gone — every tool dispatches into
+# main.rhai's `tool_call(name, args, oauth)`.
 [[tools]]
 name = "signal.send_message"
 description = """Send a Signal message to a person or group. \
@@ -90,12 +54,6 @@ Args: { to: string (name, phone, or `signal:user:<uuid>` JID), \
 text: string }."""
 trust_floor = "Controller"
 latency = "low"
-# Phase 3: implementation lives in the host crate as an
-# `Arc<dyn ToolImpl>` builtin so it can reach the host-side
-# `TransportApi` capability that rhai scripts can't access. The
-# manifest declaration stays for catalog/attribution; dispatch goes
-# through the builtin.
-host_implemented = true
 
 [[tools]]
 name = "signal.reply"
@@ -103,16 +61,9 @@ description = """Reply in the current Signal conversation. \
 This tool IS the user-visible reply — do NOT also produce a text \
 response summarising what you replied. After calling this tool, \
 return an empty text response to end your turn. \
-Only available when the current turn was triggered by an inbound \
-Signal message; the sidecar derives the recipient from the \
-conversation's principal_group.  Args: { text: string }."""
-# NOTE: reply intentionally has NO trust_floor — by definition the
-# inbound principal is the one being replied to, so a KnownLimited
-# Signal contact can ask the agent to reply on their own thread.
-# (send_message is the dangerous one — that's the tool that lets you
-# message OTHER people, hence Controller-only.)
+Args: { to: string (recipient — host fills from the conversation's binding), \
+text: string }."""
 latency = "low"
-host_implemented = true
 
 [[tools]]
 name = "signal.list_groups"
@@ -120,7 +71,6 @@ description = """List Signal groups the controller is a member of. \
 Returns: { groups: [{ id, name, member_count }] }."""
 trust_floor = "Controller"
 latency = "medium"
-host_implemented = true
 
 [[tools]]
 name = "signal.create_group"
@@ -131,18 +81,16 @@ and no rephrasing. Args: { title?: string, members: string[] (names \
 or phone numbers), message?: string (initial post) }."""
 trust_floor = "Controller"
 latency = "medium"
-host_implemented = true
 
 [[tools]]
 name = "signal.add_group_members"
 description = """Add members to an existing Signal group, looking up \
 the group by exact name match. The tool result includes an `ack_text` \
-field — your final reply to the user MUST be exactly that ack_text \
-with no additions, no emoji, and no rephrasing. Args: \
+field — your final reply to the user MUST be exactly that ack_text with \
+no additions, no emoji, and no rephrasing. Args: \
 { groupName: string, members: string[] (names or phone numbers) }."""
 trust_floor = "Controller"
 latency = "medium"
-host_implemented = true
 
 [[tools]]
 name = "signal.leave_group"
@@ -152,21 +100,27 @@ your final reply to the user MUST be exactly that ack_text with no \
 additions, no emoji, and no rephrasing. Args: { groupName: string }."""
 trust_floor = "Controller"
 latency = "medium"
-host_implemented = true
 
-# Settings → Plugin → Signal config page (Phase 8). The mount path
-# is the SPA route the PluginConfigRouter dispatches against; the
-# entry path is reserved for the future runtime-loaded panel
-# bundle (today the SPA's PluginConfigRouter has a hardcoded
-# KNOWN_CONFIGS map and the entry path is metadata only).
+# Plugin-served admin endpoints. Each maps to a Rhai handler in
+# main.rhai. Mounted by the host under
+# `/api/admin/plugins/signal{path}`.
+[[admin_routes]]
+method = "GET"
+path = "/status"
+handler = "admin_status"
+description = "Pairing + sidecar status snapshot."
+
+[[admin_routes]]
+method = "GET"
+path = "/qrcodelink"
+handler = "admin_qrcodelink"
+description = "QR code data URL the operator scans to pair signal-cli with their phone."
+
+# SPA settings page mount.
 [[ui_panels]]
 mount = "admin/plugins/signal"
 entry = "ui/panel.js"
 
-# As of Phase 5, every Signal tool is host-implemented. The rhai
-# stub file (main.rhai) is kept on disk as a defensive guard that
-# fails loudly if the dispatcher ever forwards a host-implemented
-# tool to the rhai layer — see `plugins/signal/main.rhai`.
 [runtime]
 tier = "script"
 source = "main.rhai"
