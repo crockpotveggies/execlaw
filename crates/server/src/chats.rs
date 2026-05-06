@@ -1762,6 +1762,14 @@ async fn handle_cold_contact(
             principal.id.as_str()
         ),
     });
+    // Real-time approvals badge — the SPA's ApprovalWatcher listens
+    // for this and re-syncs `/api/admin/approvals` so the sidebar
+    // count flips the moment a cold contact arrives, without waiting
+    // on a Sidebar remount or a poll.
+    state.events.publish(UiEvent::ApprovalCreated {
+        approval_id: approval_id.clone(),
+        conversation_id: cid.as_str().to_owned(),
+    });
 
     (
         StatusCode::ACCEPTED,
@@ -2118,13 +2126,17 @@ pub async fn handle_cold_contact_for_inbound(
     }
 
     state.events.publish(UiEvent::AlertFired {
-        alert_id: approval_id,
+        alert_id: approval_id.clone(),
         severity: "Warning".into(),
         source: "core.cold_contact".into(),
         title: format!(
             "New Signal contact wants to talk — approve?: {}",
             principal.id.as_str()
         ),
+    });
+    state.events.publish(UiEvent::ApprovalCreated {
+        approval_id,
+        conversation_id: cid.as_str().to_owned(),
     });
     Ok(())
 }

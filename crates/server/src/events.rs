@@ -121,6 +121,27 @@ pub enum UiEvent {
         alert_id: String,
     },
 
+    /// A new pending approval landed on the controller's queue. Today
+    /// the only producer is the cold-contact path (a non-trusted
+    /// principal sent the agent a message and we parked the
+    /// conversation in `AwaitingTrustDecision`); future producers
+    /// (Rule-of-Two breach, sensitive-tool-call) follow the same
+    /// shape. The SPA's `ApprovalWatcher` listens for this and
+    /// re-fetches `/api/admin/approvals` to refresh the sidebar
+    /// badge in real-time — the same shape `AlertFired` has for the
+    /// brand-status indicator.
+    ApprovalCreated {
+        approval_id: String,
+        conversation_id: String,
+    },
+    /// A pending approval was acted on (Trust / TrustLimited / Block /
+    /// IgnoreOnce / ClaimAsMe — any verb that flips the approval out
+    /// of `UnknownPending`). Triggers the same SPA refresh.
+    ApprovalResolved {
+        approval_id: String,
+        conversation_id: String,
+    },
+
     /// A routine run-history row's status changed (queued, picked up,
     /// finished). Drives live updates in the Settings → Routines
     /// run-history drawer so the operator doesn't have to refresh

@@ -218,6 +218,10 @@ pub async fn respond_handler(
                 row.phase = Phase::Idle;
                 let _ = store.upsert(&row);
             }
+            state.events.publish(UiEvent::ApprovalResolved {
+                approval_id: approval_id.clone(),
+                conversation_id: cid.as_str().to_owned(),
+            });
             return (
                 StatusCode::OK,
                 Json(serde_json::json!(ApprovalResponse {
@@ -345,6 +349,11 @@ pub async fn respond_handler(
             );
         }
     }
+
+    state.events.publish(UiEvent::ApprovalResolved {
+        approval_id: approval_id.clone(),
+        conversation_id: cid.as_str().to_owned(),
+    });
 
     (
         StatusCode::OK,
@@ -510,6 +519,11 @@ async fn claim_as_me(
              trust transition stands but no turn ran",
         );
     }
+
+    state.events.publish(UiEvent::ApprovalResolved {
+        approval_id: approval_id.clone(),
+        conversation_id: cid.as_str().to_owned(),
+    });
 
     (
         StatusCode::OK,

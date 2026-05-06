@@ -1,6 +1,7 @@
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { AuthProvider } from "./auth/AuthContext";
 import { AlertWatcher } from "./routes/AlertWatcher";
+import { ApprovalWatcher } from "./routes/ApprovalWatcher";
 import { AppBoot } from "./routes/AppBoot";
 import { Approvals } from "./routes/Approvals";
 import { Chat } from "./routes/Chat";
@@ -29,6 +30,17 @@ export function App() {
                   routes/AlertWatcher.tsx for the rationale.
                 */}
                 <AlertWatcher />
+                {/*
+                  Same shape as AlertWatcher, for the sidebar's
+                  pending-approvals badge. A cold contact landing
+                  while the operator is on Settings / Research /
+                  Routines used to stay invisible until the next
+                  navigation or hard refresh — the badge only
+                  refreshed on Sidebar mount. ApprovalWatcher's WS
+                  subscription re-syncs the canonical list on
+                  `approval_created` / `approval_resolved`.
+                */}
+                <ApprovalWatcher />
                 <Routes>
                     <Route path="/" element={<AppBoot />} />
                     <Route path="/setup" element={<SetupWizard />} />
