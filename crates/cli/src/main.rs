@@ -1636,6 +1636,26 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         reuse_update: reuse_update_sink,
     };
 
+    // Phase B (channel-plugin surface): wire the host-capabilities
+    // arc into the script engine NOW that AppState exists. The
+    // four Rhai bindings (`sidecar_url`, `ws_subscribe`,
+    // `host_route_inbound`, plus the helper plumbing) start
+    // returning real results from this call onward; before this
+    // they error cleanly with "host capabilities not wired."
+    {
+        let caps = execlaw_server::host_caps_impl::AppStateHostCapabilities::new(
+            state.clone(),
+        )
+        .into_arc();
+        if state.plugin_host.attach_host_capabilities(caps).is_err() {
+            tracing::warn!(
+                "host_caps already attached — second wiring call ignored"
+            );
+        } else {
+            tracing::info!("script-tier host capabilities attached");
+        }
+    }
+
     // Phase-7 background workers — run for the lifetime of the
     // process. The sweepers carry their own intervals; the server
     // owns the stop signal so a SIGTERM can drain everything.

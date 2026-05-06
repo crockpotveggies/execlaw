@@ -10,7 +10,7 @@
 use crate::cache::HttpCache;
 use crate::host_caps::HostCapabilitiesArc;
 use crate::primitives::{self, OwningPluginSlot};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// Sandbox limits — wide enough for normal HTTP-API-wrapper
@@ -33,14 +33,20 @@ pub struct ScriptEngine {
     /// false. Mirrors the same flag in tool_apis_http's
     /// `HttpWebFetchApi::with_loopback_allowed`.
     allow_loopback: bool,
-    /// Optional host-capabilities surface the script tier reaches
-    /// when scripts call `sidecar_url` / `ws_subscribe` /
-    /// `host_route_inbound`. `None` for unit-test fixtures + dev
-    /// runs without an `AppState`; production passes the host
-    /// crate's concrete impl in via [`with_host_capabilities`].
-    /// Bindings remain registered either way; absent caps surface
-    /// at call time as a clean Rhai runtime error.
-    host_caps: Option<HostCapabilitiesArc>,
+    /// Host-capabilities surface the script tier reaches when
+    /// scripts call `sidecar_url` / `ws_subscribe` /
+    /// `host_route_inbound`. Wrapped in `Arc<OnceLock<...>>` so
+    /// the engine factory can be constructed BEFORE the host
+    /// capabilities exist (chicken-and-egg with `AppState`, which
+    /// holds the script engine via `PluginHost` but is itself
+    /// what `AppStateHostCapabilities` needs to construct).
+    /// [`set_host_capabilities`] installs the value once at boot;
+    /// subsequent calls are silent no-ops (OnceLock semantics).
+    /// Bindings registered against the engine clone this Arc and
+    /// read at call time — when the lock is empty (test fixtures,
+    /// pre-boot construction), each binding returns a clean Rhai
+    /// runtime error.
+    host_caps: Arc<OnceLock<HostCapabilitiesArc>>,
 }
 
 impl ScriptEngine {
@@ -54,7 +60,7 @@ impl ScriptEngine {
                 .user_agent("execlaw/script-runtime/0.1")
                 .build(),
             allow_loopback: false,
-            host_caps: None,
+            host_caps: Arc::new(OnceLock::new()),
         }
     }
 
@@ -62,15 +68,24 @@ impl ScriptEngine {
         Self {
             http_agent,
             allow_loopback: false,
-            host_caps: None,
+            host_caps: Arc::new(OnceLock::new()),
         }
     }
 
-    /// Plug the host-capabilities surface in. Production callers
-    /// (the cli boot path) use this; tests typically don't.
-    pub fn with_host_capabilities(mut self, caps: HostCapabilitiesArc) -> Self {
-        self.host_caps = Some(caps);
-        self
+    /// Plug the host-capabilities surface in AFTER engine
+    /// construction. Returns `Ok(())` on the first set; subsequent
+    /// calls return `Err(_)` (the original value sticks). Used by
+    /// the cli boot path: AppState is built first; once it exists,
+    /// `AppStateHostCapabilities::new(state.clone())` becomes
+    /// available and the engine's caps slot can be filled.
+    pub fn set_host_capabilities(&self, caps: HostCapabilitiesArc) -> Result<(), HostCapabilitiesArc> {
+        self.host_caps.set(caps)
+    }
+
+    /// Return the current host-capabilities arc (or `None` if not
+    /// yet set). Surfaced for tests + the admin-routes dispatcher.
+    pub fn host_capabilities(&self) -> Option<HostCapabilitiesArc> {
+        self.host_caps.get().cloned()
     }
 
     /// Test-only: skip the SSRF guard so the engine can talk to
@@ -106,6 +121,10 @@ impl ScriptEngine {
         // `import` / file I/O, but explicit deny is cheap.
         engine.disable_symbol("eval");
         let cache = Arc::new(HttpCache::new());
+        // Pass an Arc<OnceLock<...>> so each binding closure reads
+        // host_caps lazily at call time — caps installed AFTER
+        // engine build (the `cli/main.rs` boot order) still flow
+        // through.
         let slot = primitives::register(
             &mut engine,
             plugin_id,

@@ -32,8 +32,14 @@ use rhai::{Dynamic, Engine, EvalAltResult, ImmutableString, Map};
 use sha2::{Digest, Sha256};
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+
+/// Shared lock the engine factory passes in. Each Rhai binding
+/// captures a clone; calls read at dispatch time so caps installed
+/// AFTER engine construction (the cli/main.rs boot order) still
+/// flow through.
+pub(crate) type HostCapsHandle = Arc<OnceLock<HostCapabilitiesArc>>;
 
 /// Per-engine box for the script's plugin handle. The
 /// `ws_subscribe` binding fishes the `ScriptPlugin` out of this
@@ -76,7 +82,7 @@ pub(crate) fn register(
     http_agent: ureq::Agent,
     cache: Arc<HttpCache>,
     allow_loopback: bool,
-    host_caps: Option<HostCapabilitiesArc>,
+    host_caps: HostCapsHandle,
 ) -> OwningPluginSlot {
     let pid_for_logs = plugin_id.to_owned();
     let owning_plugin: OwningPluginSlot = Arc::new(Mutex::new(None));
@@ -310,7 +316,7 @@ pub(crate) fn register(
 fn register_host_cap_bindings(
     engine: &mut Engine,
     plugin_id: &str,
-    host_caps: Option<HostCapabilitiesArc>,
+    host_caps: HostCapsHandle,
     owning_plugin: OwningPluginSlot,
 ) {
     // base64_encode(s) -> base64 (standard alphabet, padded).
@@ -355,7 +361,7 @@ fn register_host_cap_bindings(
         engine.register_fn(
             "sidecar_url",
             move |name: ImmutableString| -> Result<Dynamic, Box<EvalAltResult>> {
-                let caps = match caps.as_ref() {
+                let caps = match caps.get() {
                     Some(c) => c.clone(),
                     None => {
                         return Err(host_cap_unavailable_err(&pid, "sidecar_url"));
@@ -400,7 +406,7 @@ fn register_host_cap_bindings(
             move |url: ImmutableString,
                   callback: ImmutableString|
                   -> Result<Dynamic, Box<EvalAltResult>> {
-                let caps = match caps.as_ref() {
+                let caps = match caps.get() {
                     Some(c) => c.clone(),
                     None => return Err(host_cap_unavailable_err(&pid, "ws_subscribe")),
                 };
@@ -492,7 +498,7 @@ fn register_host_cap_bindings(
         engine.register_fn(
             "host_route_inbound",
             move |msg: Map| -> Result<Dynamic, Box<EvalAltResult>> {
-                let caps = match caps.as_ref() {
+                let caps = match caps.get() {
                     Some(c) => c.clone(),
                     None => return Err(host_cap_unavailable_err(&pid, "host_route_inbound")),
                 };

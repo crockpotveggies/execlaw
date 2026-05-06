@@ -180,6 +180,25 @@ impl PluginHost {
         self.inner.skill_store.get()
     }
 
+    /// Plug a host-capabilities surface into the script engine so
+    /// `sidecar_url` / `ws_subscribe` / `host_route_inbound`
+    /// bindings reach the host's concrete services. Call this once
+    /// at boot AFTER `AppState` exists (which is what the caps
+    /// implementation needs).
+    ///
+    /// Idempotent on the same caps; subsequent calls with a
+    /// different caps are silent no-ops (OnceLock semantics inside
+    /// the engine). Surfaced separately from `new()` because the
+    /// engine factory has to be constructible BEFORE `AppState`
+    /// exists — the chicken-and-egg between `AppState.plugin_host`
+    /// and `AppStateHostCapabilities::new(state)`.
+    pub fn attach_host_capabilities(
+        &self,
+        caps: execlaw_script::HostCapabilitiesArc,
+    ) -> Result<(), execlaw_script::HostCapabilitiesArc> {
+        self.inner.script_engine.set_host_capabilities(caps)
+    }
+
     pub fn registry(&self) -> &HookRegistry {
         &self.inner.registry
     }
