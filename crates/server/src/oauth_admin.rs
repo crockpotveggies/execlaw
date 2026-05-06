@@ -857,6 +857,7 @@ mod tests {
             alert_sources: vec![],
             health_checks: vec![],
             skills: vec![],
+            admin_routes: vec![],
             runtime: None,
         };
         state
