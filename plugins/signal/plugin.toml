@@ -1,7 +1,7 @@
 [plugin]
 id = "signal"
 name = "Signal"
-version = "0.4.1"
+version = "0.4.2"
 description = "Signal Messenger transport — fully script-tier (Phase B). All host-side signal_*.rs code retired; this plugin's main.rhai owns inbound consumer, outbound, group ops, and admin pairing."
 author = "execlaw"
 license = "AGPL-3.0-or-later"
@@ -115,6 +115,12 @@ method = "GET"
 path = "/qrcodelink"
 handler = "admin_qrcodelink"
 description = "QR code data URL the operator scans to pair signal-cli with their phone."
+
+[[admin_routes]]
+method = "DELETE"
+path = "/unregister-account"
+handler = "admin_unregister_account"
+description = "Unlink this execlaw install from a paired Signal account. Number passed as ?number=<E.164>."
 
 # SPA settings page mount.
 [[ui_panels]]

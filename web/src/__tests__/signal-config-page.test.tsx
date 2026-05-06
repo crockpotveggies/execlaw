@@ -1,16 +1,18 @@
-// Tests for the Settings → Plugin → Signal config page (Phase 8).
+// Tests for the Settings → Plugin → Signal config page.
 //
 // Covers:
-//   * Loading state until /api/admin/signal/status resolves.
-//   * Not-paired branch fetches the QR PNG and renders it via a
-//     blob URL once the upstream sidecar returns 200.
+//   * Loading state until /api/admin/plugins/signal/status resolves.
+//   * Not-paired branch fetches the QR PNG (as a JSON {data_url}
+//     response from the plugin admin handler) and renders it via
+//     <img src=data:image/png;base64,...>.
 //   * Not-paired branch surfaces the upstream error (e.g. signal-cli
 //     can't reach Signal because of TLS interception) instead of
 //     showing a blank <img>.
 //   * Paired branch renders the registered number + Unlink button
-//     and confirms before firing DELETE.
+//     and confirms before firing DELETE /unregister-account?number=...
 //   * Sidecar-not-running state surfaces the "waiting for sidecar"
 //     hint and skips the QR fetch.
+//   * Status fetch_error renders verbatim.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -18,13 +20,6 @@ import { SignalConfigPage } from "../settings/SignalConfigPage";
 import { AuthProvider } from "../auth/AuthContext";
 
 let fetchMock: ReturnType<typeof vi.fn>;
-
-// jsdom doesn't ship URL.createObjectURL — stub it so the
-// component's blob-URL handoff resolves to a stable string we can
-// assert on.
-const blobUrl = "blob:mock://qr";
-const createObjectURL = vi.fn(() => blobUrl);
-const revokeObjectURL = vi.fn();
 
 const meResponse = () =>
     new Response(
@@ -52,6 +47,20 @@ function statusResponse(s: StatusFixture) {
     return new Response(JSON.stringify(body), { status: 200 });
 }
 
+function qrJsonResponse(dataUrl: string) {
+    return new Response(
+        JSON.stringify({ data_url: dataUrl, mime_type: "image/png" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+    );
+}
+
+function qrErrorJsonResponse(message: string) {
+    return new Response(JSON.stringify({ error: message }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+    });
+}
+
 function mountPage() {
     return render(
         <AuthProvider>
@@ -68,38 +77,20 @@ beforeEach(() => {
     localStorage.setItem("execlaw.refresh_token", "tok");
     fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
-    createObjectURL.mockClear();
-    revokeObjectURL.mockClear();
-    // jsdom 24 doesn't define these — stub so the component can
-    // hand the fetched blob to <img src>.
-    (globalThis.URL as unknown as { createObjectURL: typeof createObjectURL }).createObjectURL =
-        createObjectURL;
-    (globalThis.URL as unknown as { revokeObjectURL: typeof revokeObjectURL }).revokeObjectURL =
-        revokeObjectURL;
 });
 
 afterEach(() => {
     vi.unstubAllGlobals();
 });
 
-function pngResponse() {
-    // 1x1 transparent PNG bytes — body content is irrelevant since
-    // we only assert the blob handoff happened.
-    const bytes = new Uint8Array([
-        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-    ]);
-    return new Response(bytes, {
-        status: 200,
-        headers: { "content-type": "image/png" },
-    });
-}
-
 describe("SignalConfigPage", () => {
     it("renders the QR pairing block when no accounts are registered", async () => {
         const qrCalls: string[] = [];
+        const fakeDataUrl =
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB";
         fetchMock.mockImplementation(async (url: string) => {
             if (url === "/api/admin/me") return meResponse();
-            if (url === "/api/admin/signal/status") {
+            if (url === "/api/admin/plugins/signal/status") {
                 return statusResponse({
                     sidecar_status: "healthy",
                     sidecar_rpc_url: "http://127.0.0.1:8501",
@@ -107,9 +98,9 @@ describe("SignalConfigPage", () => {
                     fetch_error: null,
                 });
             }
-            if (url.startsWith("/api/admin/signal/qrcodelink")) {
+            if (url.startsWith("/api/admin/plugins/signal/qrcodelink")) {
                 qrCalls.push(url);
-                return pngResponse();
+                return qrJsonResponse(fakeDataUrl);
             }
             return new Response("{}", { status: 200 });
         });
@@ -119,42 +110,26 @@ describe("SignalConfigPage", () => {
                 screen.getByTestId("signal-pairing-block"),
             ).toBeInTheDocument();
         });
-        // QR is fetched (not <img src>) so the auth-bearing query-
-        // string URL still flows through fetch and an upstream
-        // failure can be surfaced as a real error message rather
-        // than a blank image. The fetched URL must still carry the
-        // bearer-token fallback for the access-token-aware proxy.
         await waitFor(() => {
             expect(qrCalls.length).toBeGreaterThan(0);
         });
-        const qrUrl = qrCalls[0];
-        expect(qrUrl).toContain("/api/admin/signal/qrcodelink");
-        expect(qrUrl).toContain("device_name=execlaw");
-        expect(qrUrl).toContain("access_token=tok");
-        // PNG body → <img> renders the blob URL once the fetch
-        // resolves.
+        expect(qrCalls[0]).toContain("/api/admin/plugins/signal/qrcodelink");
+        expect(qrCalls[0]).toContain("device_name=execlaw");
+        // The plugin returns JSON {data_url}; the SPA pipes that
+        // straight into <img src> — no blob URL involved.
         await waitFor(() => {
             const qr = screen.getByTestId(
                 "signal-pairing-qr",
             ) as HTMLImageElement;
-            expect(qr.src).toBe(blobUrl);
+            expect(qr.src).toBe(fakeDataUrl);
         });
-        // Paired block does NOT render in this state.
         expect(screen.queryByTestId("signal-paired-block")).toBeNull();
     });
 
     it("surfaces the upstream sidecar error when QR generation fails", async () => {
-        // Real failure mode: bbernhard's signal-cli was returning
-        // `{"error":"Couldn't create QR code: no data to encode"}`
-        // (signal-cli's link command couldn't reach Signal's
-        // bootstrap servers — old image version, network outage,
-        // etc.). Pre-fix, the SPA loaded this 400 response into a
-        // bare <img src> which silently fell back to a blank
-        // placeholder. The fix routes the QR through fetch and
-        // shows the actual error.
         fetchMock.mockImplementation(async (url: string) => {
             if (url === "/api/admin/me") return meResponse();
-            if (url === "/api/admin/signal/status") {
+            if (url === "/api/admin/plugins/signal/status") {
                 return statusResponse({
                     sidecar_status: "healthy",
                     sidecar_rpc_url: "http://127.0.0.1:8501",
@@ -162,17 +137,9 @@ describe("SignalConfigPage", () => {
                     fetch_error: null,
                 });
             }
-            if (url.startsWith("/api/admin/signal/qrcodelink")) {
-                return new Response(
-                    JSON.stringify({
-                        code: "sidecar_qr_failed",
-                        message:
-                            "signal-cli /v1/qrcodelink returned HTTP 400: Couldn't create QR code: no data to encode",
-                    }),
-                    {
-                        status: 502,
-                        headers: { "content-type": "application/json" },
-                    },
+            if (url.startsWith("/api/admin/plugins/signal/qrcodelink")) {
+                return qrErrorJsonResponse(
+                    "signal-cli /v1/qrcodelink returned HTTP 400: Couldn't create QR code: no data to encode",
                 );
             }
             return new Response("{}", { status: 200 });
@@ -185,14 +152,13 @@ describe("SignalConfigPage", () => {
         });
         const errBlock = screen.getByTestId("signal-pairing-qr-error");
         expect(errBlock.textContent).toContain("no data to encode");
-        // QR <img> doesn't render when the upstream failed.
         expect(screen.queryByTestId("signal-pairing-qr")).toBeNull();
     });
 
     it("renders the paired block + unlink button when an account is registered", async () => {
         fetchMock.mockImplementation(async (url: string) => {
             if (url === "/api/admin/me") return meResponse();
-            if (url === "/api/admin/signal/status") {
+            if (url === "/api/admin/plugins/signal/status") {
                 return statusResponse({
                     sidecar_status: "healthy",
                     sidecar_rpc_url: "http://127.0.0.1:8501",
@@ -209,7 +175,6 @@ describe("SignalConfigPage", () => {
             ).toBeInTheDocument();
         });
         expect(screen.getByText("+15551234567")).toBeInTheDocument();
-        // QR pairing block does NOT render.
         expect(screen.queryByTestId("signal-pairing-block")).toBeNull();
     });
 
@@ -222,12 +187,14 @@ describe("SignalConfigPage", () => {
             calls.push({ url, init });
             if (url === "/api/admin/me") return meResponse();
             if (
-                url === "/api/admin/signal/accounts/%2B15551234567" &&
+                url.startsWith(
+                    "/api/admin/plugins/signal/unregister-account",
+                ) &&
                 init?.method === "DELETE"
             ) {
                 return new Response("", { status: 204 });
             }
-            if (url === "/api/admin/signal/status") {
+            if (url === "/api/admin/plugins/signal/status") {
                 return statusResponse({
                     sidecar_status: "healthy",
                     sidecar_rpc_url: "http://127.0.0.1:8501",
@@ -242,15 +209,18 @@ describe("SignalConfigPage", () => {
             expect(screen.getByText("+15551234567")).toBeInTheDocument();
         });
         fireEvent.click(screen.getByTestId("signal-paired-unlink"));
-        // Confirm fires; DELETE flushes.
         await waitFor(() => {
             const del = calls.find(
                 (c) =>
-                    c.url ===
-                        "/api/admin/signal/accounts/%2B15551234567" &&
-                    c.init?.method === "DELETE",
+                    c.url.startsWith(
+                        "/api/admin/plugins/signal/unregister-account",
+                    ) && c.init?.method === "DELETE",
             );
             expect(del).toBeDefined();
+            // Number is passed as a query param now (the plugin
+            // admin dispatcher matches paths literally and doesn't
+            // support `/accounts/{number}`-style path params).
+            expect(del!.url).toContain("number=%2B15551234567");
         });
         expect(confirmSpy).toHaveBeenCalledTimes(1);
         confirmSpy.mockRestore();
@@ -259,9 +229,9 @@ describe("SignalConfigPage", () => {
     it("shows the waiting hint when the sidecar isn't running yet", async () => {
         fetchMock.mockImplementation(async (url: string) => {
             if (url === "/api/admin/me") return meResponse();
-            if (url === "/api/admin/signal/status") {
+            if (url === "/api/admin/plugins/signal/status") {
                 return statusResponse({
-                    sidecar_status: "starting",
+                    sidecar_status: "down",
                     sidecar_rpc_url: null,
                     registered_accounts: [],
                     fetch_error: null,
@@ -275,85 +245,18 @@ describe("SignalConfigPage", () => {
                 screen.getByTestId("signal-pairing-waiting"),
             ).toBeInTheDocument();
         });
-        // QR <img> doesn't render until the sidecar publishes a
-        // host port.
         expect(screen.queryByTestId("signal-pairing-qr")).toBeNull();
-        // Status chip reflects the supervisor's state.
         expect(
             screen.getByTestId("signal-sidecar-status").textContent,
-        ).toBe("starting");
-    });
-
-    it("auto-finalizes pairing when accounts.json drifts from /v1/accounts", async () => {
-        // Real failure mode: signal-cli's link command writes the
-        // new account to accounts.json on disk, but the running
-        // daemon throws UnsupportedOperationException trying to
-        // mutate its in-memory account map (signal-cli upstream
-        // bug). The SPA detects the drift via accounts_on_disk vs
-        // registered_accounts and POSTs /finalize-pairing to
-        // restart the daemon.
-        const calls: Array<{ url: string; init?: RequestInit }> = [];
-        fetchMock.mockImplementation(
-            async (url: string, init?: RequestInit) => {
-                calls.push({ url, init });
-                if (url === "/api/admin/me") return meResponse();
-                if (url === "/api/admin/signal/status") {
-                    return statusResponse({
-                        sidecar_status: "healthy",
-                        sidecar_rpc_url: "http://127.0.0.1:8501",
-                        registered_accounts: [],
-                        accounts_on_disk: ["+12369995414"],
-                        fetch_error: null,
-                    });
-                }
-                if (
-                    url === "/api/admin/signal/finalize-pairing" &&
-                    init?.method === "POST"
-                ) {
-                    return new Response("", { status: 202 });
-                }
-                if (url.startsWith("/api/admin/signal/qrcodelink")) {
-                    return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), {
-                        status: 200,
-                        headers: { "content-type": "image/png" },
-                    });
-                }
-                return new Response("{}", { status: 200 });
-            },
-        );
-        mountPage();
-        await waitFor(() => {
-            const finalize = calls.find(
-                (c) =>
-                    c.url === "/api/admin/signal/finalize-pairing" &&
-                    c.init?.method === "POST",
-            );
-            expect(finalize).toBeDefined();
-        });
-        // The "finalising" banner shows up while the restart is in
-        // flight so the operator sees something is happening.
-        await waitFor(() => {
-            expect(
-                screen.getByTestId("signal-finalizing-banner"),
-            ).toBeInTheDocument();
-        });
-        // We must NOT spam /finalize-pairing on every poll tick —
-        // the ref-guard ensures exactly one POST per drift episode.
-        await new Promise((r) => setTimeout(r, 50));
-        const finalizeCalls = calls.filter(
-            (c) =>
-                c.url === "/api/admin/signal/finalize-pairing" &&
-                c.init?.method === "POST",
-        );
-        expect(finalizeCalls.length).toBe(1);
+        ).toBe("down");
     });
 
     it("surfaces a /v1/accounts fetch error verbatim", async () => {
         fetchMock.mockImplementation(async (url: string) => {
             if (url === "/api/admin/me") return meResponse();
-            if (url === "/api/admin/signal/status") {
+            if (url === "/api/admin/plugins/signal/status") {
                 return statusResponse({
-                    sidecar_status: "healthy",
+                    sidecar_status: "unhealthy",
                     sidecar_rpc_url: "http://127.0.0.1:8501",
                     registered_accounts: [],
                     fetch_error: "signal-cli /v1/accounts returned HTTP 500",

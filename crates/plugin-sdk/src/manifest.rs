@@ -1090,7 +1090,7 @@ mod tests {
         let m = PluginManifest::parse(SIGNAL_MANIFEST)
             .expect("plugins/signal/plugin.toml must parse cleanly");
         assert_eq!(m.plugin.id, "signal");
-        assert_eq!(m.plugin.version, "0.4.1");
+        assert_eq!(m.plugin.version, "0.4.2");
         // The transport icon must propagate from manifest → SDK so
         // the SPA's sidebar can render a Signal-shaped marker on
         // bridged threads. Pin the literal so a typo in the manifest
@@ -1151,8 +1151,9 @@ mod tests {
                 "{name} must be script-tier in v0.4.0+"
             );
         }
-        // Two admin routes — pairing flow is now plugin-served.
-        assert_eq!(m.admin_routes.len(), 2);
+        // Three admin routes — pairing flow + unregister are
+        // plugin-served now.
+        assert_eq!(m.admin_routes.len(), 3);
         // Sidecar declaration: signal-cli supervised on /v1/about.
         let signal_cli = m
             .services

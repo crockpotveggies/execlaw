@@ -2086,7 +2086,12 @@ export async function listAvailableTransports(
     );
 }
 
-// ---- /api/admin/signal/* (Phase 8 — operator pairing UI) ------------
+// ---- /api/admin/plugins/signal/* (Phase 8 — operator pairing UI) ----
+//
+// Every endpoint here is a thin wrapper over an admin_route declared
+// in plugins/signal/plugin.toml. They route through the generic
+// /api/admin/plugins/{plugin_id}/{*tail} dispatcher, which gates on
+// Controller trust + invokes the matching Rhai handler in main.rhai.
 
 /// Live pairing/registration status for the supervised signal-cli
 /// sidecar. The Settings → Plugin → Signal page polls this every
@@ -2122,55 +2127,50 @@ export async function getSignalStatus(
     tokenAccessor: () => string | null,
 ): Promise<SignalStatusResponse> {
     return apiFetch<SignalStatusResponse>(
-        "/api/admin/signal/status",
+        "/api/admin/plugins/signal/status",
         {},
         tokenAccessor,
     );
 }
 
-/// Build a query-stringed URL for `/api/admin/signal/qrcodelink`
-/// the SPA can shove directly into an `<img src>`. The endpoint
-/// streams PNG bytes from the supervised sidecar's
-/// `/v1/qrcodelink`. Bearer-token auth via the `?access_token=`
-/// query-string fallback (the SPA can't stamp `Authorization`
-/// headers on raw image src loads).
-export function signalQrCodeLinkUrl(
-    accessToken: string | null,
-    deviceName?: string,
-): string {
+/// Response shape from the qrcodelink admin endpoint. Either
+/// `data_url` (PNG base64) is set OR `error` is set; never both.
+export interface SignalQrCodeLinkResponse {
+    data_url?: string;
+    mime_type?: string;
+    error?: string;
+}
+
+/// Fetch the device-link QR code from the plugin. The handler
+/// proxies the supervised sidecar's `/v1/qrcodelink` and returns
+/// the PNG as a base64 data URL the SPA puts directly into
+/// `<img src>`. The previous "raw bytes via `<img src>` direct
+/// load" path retired with v0.4.0+ because the plugin admin
+/// dispatcher returns JSON.
+export async function fetchSignalQrCodeLink(
+    deviceName: string,
+    tokenAccessor: () => string | null,
+): Promise<SignalQrCodeLinkResponse> {
     const params = new URLSearchParams();
     if (deviceName && deviceName.trim().length > 0) {
         params.set("device_name", deviceName.trim());
     }
-    if (accessToken) {
-        params.set("access_token", accessToken);
-    }
     const qs = params.toString();
-    return `/api/admin/signal/qrcodelink${qs ? `?${qs}` : ""}`;
+    return apiFetch<SignalQrCodeLinkResponse>(
+        `/api/admin/plugins/signal/qrcodelink${qs ? `?${qs}` : ""}`,
+        {},
+        tokenAccessor,
+    );
 }
 
 export async function unregisterSignalAccount(
     number: string,
     tokenAccessor: () => string | null,
 ): Promise<void> {
+    const qs = new URLSearchParams({ number }).toString();
     await apiFetch<unknown>(
-        `/api/admin/signal/accounts/${encodeURIComponent(number)}`,
+        `/api/admin/plugins/signal/unregister-account?${qs}`,
         { method: "DELETE", rawText: true },
-        tokenAccessor,
-    );
-}
-
-/// Trigger the supervisor to restart the signal-cli sidecar so the
-/// daemon re-reads accounts from disk. Workaround for an upstream
-/// signal-cli bug that leaves the running daemon out of sync after
-/// a successful device-link. The SPA auto-fires this when it sees
-/// `accounts_on_disk` outpace `registered_accounts`.
-export async function finalizeSignalPairing(
-    tokenAccessor: () => string | null,
-): Promise<void> {
-    await apiFetch<unknown>(
-        "/api/admin/signal/finalize-pairing",
-        { method: "POST", rawText: true },
         tokenAccessor,
     );
 }

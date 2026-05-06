@@ -370,31 +370,79 @@ fn summarise_send_response(resp) {
 // ADMIN ROUTES (declared in plugin.toml's [[admin_routes]])
 // =====================================================================
 
-// GET /api/admin/plugins/signal/status
+// GET /api/admin/plugins/signal/status — pairing + sidecar snapshot
+// the SPA polls every few seconds while the Settings → Plugins →
+// Signal page is open. Shape matches `SignalStatusResponse` in
+// web/src/api/endpoints.ts.
 fn admin_status(req) {
-    let accounts = ();
-    try {
-        accounts = sidecar_http_get(sidecar_url("signal-cli") + "/v1/accounts", #{});
-    } catch (e) {
-        return #{ "paired": false, "error": e.to_string() };
+    let base = sidecar_url("signal-cli");
+    if base == () {
+        return #{
+            "sidecar_status": "down",
+            "sidecar_rpc_url": (),
+            "registered_accounts": [],
+            "accounts_on_disk": [],
+            "fetch_error": "signal-cli sidecar not running",
+        };
     }
-    let paired = accounts != () && type_of(accounts) == "array" && !accounts.is_empty();
+    let accounts = [];
+    let fetch_error = ();
+    try {
+        let raw = sidecar_http_get(base + "/v1/accounts", #{});
+        if raw != () && type_of(raw) == "array" {
+            accounts = raw;
+        }
+    } catch (e) {
+        fetch_error = e.to_string();
+    }
+    // We don't have a host filesystem binding so we can't see the
+    // accounts.json drift the upstream signal-cli `addManager` bug
+    // produces. Report disk == in-memory; the operator restarts the
+    // sidecar manually from Settings → Sidecars when they hit it.
     #{
-        "paired": paired,
-        "accounts": if paired { accounts } else { [] },
+        "sidecar_status": if fetch_error == () { "healthy" } else { "unhealthy" },
+        "sidecar_rpc_url": base,
+        "registered_accounts": accounts,
+        "accounts_on_disk": accounts,
+        "fetch_error": fetch_error,
     }
 }
 
 // GET /api/admin/plugins/signal/qrcodelink — returns the QR code
-// PNG as a base64 data URL the SPA renders inline. The operator
-// scans the QR with their phone's Signal app to pair this sidecar
-// instance.
+// PNG as a base64 data URL the SPA puts directly into <img src>.
+// The operator scans the QR with their phone's Signal app to pair
+// this sidecar instance as a secondary device.
 fn admin_qrcodelink(req) {
-    // bbernhard accepts any phone-number-shaped string here; this
-    // endpoint is the bootstrap, so /v1/accounts won't have an
-    // entry yet. Use a placeholder that works against bbernhard's
-    // unauthenticated qrcodelink path.
-    let url = sidecar_url("signal-cli") + "/v1/qrcodelink";
-    let r = sidecar_http_get_bytes(url, #{ "device_name": "execlaw" });
-    #{ "data_url": r.data_url, "mime_type": r.mime_type }
+    let device_name = "execlaw";
+    if req.query != () && req.query.device_name != () {
+        let q = trim(req.query.device_name);
+        if q != "" { device_name = q; }
+    }
+    let base = sidecar_url("signal-cli");
+    if base == () {
+        return #{ "error": "signal-cli sidecar not running" };
+    }
+    try {
+        let r = sidecar_http_get_bytes(base + "/v1/qrcodelink", #{ "device_name": device_name });
+        return #{ "data_url": r.data_url, "mime_type": r.mime_type };
+    } catch (e) {
+        return #{ "error": e.to_string() };
+    }
+}
+
+// DELETE /api/admin/plugins/signal/unregister-account?number=<E.164>
+// Unlinks this execlaw install from the Signal account. The SPA
+// fires this from the "Unlink" button on the paired-state view.
+fn admin_unregister_account(req) {
+    let number = ();
+    if req.query != () && req.query.number != () {
+        number = trim(req.query.number);
+    }
+    if number == () || number == "" {
+        throw "missing required query param 'number'";
+    }
+    let base = sidecar_url("signal-cli");
+    if base == () { throw "signal-cli sidecar not running"; }
+    sidecar_http_delete(base + "/v1/accounts/" + url_encode(number), #{});
+    #{ "ok": true }
 }

@@ -23,12 +23,11 @@
 // "starting" sidecar surfaces here instead of leaving the operator
 // confused why the QR endpoint 503s.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Button from "react-bootstrap/Button";
 import {
-    finalizeSignalPairing,
+    fetchSignalQrCodeLink,
     getSignalStatus,
-    signalQrCodeLinkUrl,
     unregisterSignalAccount,
     type SignalStatusResponse,
 } from "../api/endpoints";
@@ -47,12 +46,6 @@ export function SignalConfigPage(_props: PluginConfigProps): JSX.Element {
     const [status, setStatus] = useState<SignalStatusResponse | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [busy, setBusy] = useState(false);
-    const [finalizing, setFinalizing] = useState(false);
-    // Guard against firing /finalize-pairing on every poll tick
-    // while the daemon is restarting. We allow exactly one
-    // auto-finalize per drift episode; if it happens again later
-    // (e.g. a second device link) the ref resets when drift clears.
-    const finalizeFiredRef = useRef(false);
 
     const refresh = useCallback(async () => {
         try {
@@ -72,40 +65,13 @@ export function SignalConfigPage(_props: PluginConfigProps): JSX.Element {
         return () => window.clearInterval(id);
     }, [refresh]);
 
-    // Auto-finalize when accounts.json on disk has paired numbers
-    // the running daemon's /v1/accounts hasn't surfaced. Workaround
-    // for the upstream signal-cli `addManager` immutable-collection
-    // bug: the link succeeds, the keystore writes to disk, but the
-    // daemon's in-memory map can't accept the new account. A clean
-    // restart re-reads disk and the pairing materialises.
-    useEffect(() => {
-        if (status === null) return;
-        const onDisk = status.accounts_on_disk ?? [];
-        const reported = status.registered_accounts ?? [];
-        const drift = onDisk.length > reported.length;
-        if (!drift) {
-            finalizeFiredRef.current = false;
-            return;
-        }
-        if (finalizeFiredRef.current) return;
-        finalizeFiredRef.current = true;
-        setFinalizing(true);
-        void finalizeSignalPairing(getAccessToken)
-            .catch((e) => {
-                // Restart already in flight is fine; surface other
-                // errors so the operator sees them.
-                setError(e instanceof Error ? e.message : String(e));
-                finalizeFiredRef.current = false;
-            })
-            .finally(() => {
-                // The supervisor needs ~5–15s for the container to
-                // come back up. Keep the "finalising" banner up
-                // until the next poll observes the daemon reporting
-                // the new account, which clears `drift` above and
-                // resets `finalizeFiredRef`.
-                window.setTimeout(() => setFinalizing(false), 8_000);
-            });
-    }, [status, getAccessToken]);
+    // The auto-finalize-pairing path retired with the host-side
+    // signal_admin module. If the operator hits the upstream
+    // signal-cli `addManager` bug (account on disk but daemon
+    // hasn't loaded it), they restart the sidecar from
+    // Settings → Sidecars. The plugin doesn't have a binding to
+    // restart its own sidecar, and the drift detection that fed
+    // this needs host-filesystem access we no longer expose.
 
     const onUnregister = useCallback(
         async (number: string) => {
@@ -143,16 +109,6 @@ export function SignalConfigPage(_props: PluginConfigProps): JSX.Element {
             ) : (
                 <>
                     <SidecarStatusBlock status={status} />
-                    {finalizing && (
-                        <div
-                            className="alert alert-info small mb-3"
-                            data-testid="signal-finalizing-banner"
-                        >
-                            <strong>Finalising pairing…</strong> Restarting
-                            the signal-cli daemon so it picks up your newly
-                            linked device. This usually takes 5–15 seconds.
-                        </div>
-                    )}
                     {status.registered_accounts.length === 0 ? (
                         <PairingBlock
                             sidecarRunning={status.sidecar_rpc_url !== null}
@@ -225,58 +181,49 @@ function PairingBlock({
 }): JSX.Element {
     const auth = useAuth();
     const [generation, setGeneration] = useState(0);
-    const [qrBlobUrl, setQrBlobUrl] = useState<string | null>(null);
+    const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
     const [qrError, setQrError] = useState<string | null>(null);
     const [qrLoading, setQrLoading] = useState(false);
 
-    // Fetch the QR via fetch() rather than letting <img src> load
-    // it directly: the upstream sidecar can return a non-2xx JSON
-    // error (e.g. signal-cli failed to reach Signal's bootstrap
-    // service because of a TLS-intercepting proxy on the host
-    // network), and a bare <img> swallows that as a broken image,
-    // surfacing as a confusing white square. Going through fetch
-    // lets us show the actual error.
+    // The plugin admin handler returns JSON `{data_url, mime_type}`
+    // on success or `{error: "..."}` on failure (e.g. signal-cli
+    // bootstrap unreachable because of a TLS-intercepting proxy on
+    // the host network). The `data_url` is a `data:image/png;base64,…`
+    // URL we put directly into <img src>.
     useEffect(() => {
         if (!sidecarRunning) return;
         let cancelled = false;
-        let createdBlobUrl: string | null = null;
         setQrLoading(true);
         setQrError(null);
-        const tok = auth.getAccessToken();
-        const url = `${signalQrCodeLinkUrl(tok, "execlaw")}&_g=${generation}`;
-        void fetch(url)
-            .then(async (resp) => {
+        // Generation suffix is unused by the handler but threaded
+        // through so we get a fresh request when it bumps.
+        void generation;
+        void fetchSignalQrCodeLink("execlaw", auth.getAccessToken)
+            .then((r) => {
                 if (cancelled) return;
-                if (!resp.ok) {
-                    const text = await resp.text();
-                    let message = text;
-                    try {
-                        const j = JSON.parse(text) as { message?: string };
-                        if (j.message) message = j.message;
-                    } catch {
-                        // not JSON — keep raw text
-                    }
-                    setQrError(message || `HTTP ${resp.status}`);
-                    setQrBlobUrl(null);
+                if (r.error) {
+                    setQrError(r.error);
+                    setQrDataUrl(null);
                     return;
                 }
-                const blob = await resp.blob();
-                if (cancelled) return;
-                createdBlobUrl = URL.createObjectURL(blob);
-                setQrBlobUrl(createdBlobUrl);
-                setQrError(null);
+                if (r.data_url) {
+                    setQrDataUrl(r.data_url);
+                    setQrError(null);
+                } else {
+                    setQrError("plugin returned neither data_url nor error");
+                    setQrDataUrl(null);
+                }
             })
             .catch((e) => {
                 if (cancelled) return;
                 setQrError(e instanceof Error ? e.message : String(e));
-                setQrBlobUrl(null);
+                setQrDataUrl(null);
             })
             .finally(() => {
                 if (!cancelled) setQrLoading(false);
             });
         return () => {
             cancelled = true;
-            if (createdBlobUrl) URL.revokeObjectURL(createdBlobUrl);
         };
     }, [auth, generation, sidecarRunning]);
 
@@ -376,16 +323,16 @@ function PairingBlock({
                 </div>
             ) : (
                 <div className="d-flex flex-column align-items-center gap-2">
-                    {qrLoading && qrBlobUrl === null ? (
+                    {qrLoading && qrDataUrl === null ? (
                         <div
                             className="execlaw-muted small py-4"
                             data-testid="signal-pairing-qr-loading"
                         >
                             Generating QR…
                         </div>
-                    ) : qrBlobUrl !== null ? (
+                    ) : qrDataUrl !== null ? (
                         <img
-                            src={qrBlobUrl}
+                            src={qrDataUrl}
                             alt="Signal device-link QR code"
                             width={256}
                             height={256}
