@@ -325,10 +325,12 @@ fn set_typing_impl(args) {
     let active = args.active == true;
     if to == () || to == "" { throw "signal.set_typing requires `to`"; }
     let recipient = wire_recipient(to);
+    // bbernhard's typing-indicator wants PUT (start) / DELETE (stop)
+    // on /v1/typing-indicator/{number}; POST returns 404 silently.
     let url = sidecar_url("signal-cli") + "/v1/typing-indicator/" + url_encode(self_number());
     let body = #{ "recipient": recipient };
     if active {
-        sidecar_http_post(url, body);
+        sidecar_http_put(url, body);
     } else {
         sidecar_http_delete(url, #{});
     }

@@ -605,6 +605,7 @@ fn register_host_cap_bindings(
     // as Rhai runtime errors with the plugin id tagged.
     register_sidecar_http_get(engine, plugin_id, host_caps.clone());
     register_sidecar_http_post(engine, plugin_id, host_caps.clone());
+    register_sidecar_http_put(engine, plugin_id, host_caps.clone());
     register_sidecar_http_delete(engine, plugin_id, host_caps.clone());
     register_host_get_attachment_bytes(engine, plugin_id, host_caps.clone());
     register_sidecar_http_get_bytes(engine, plugin_id, host_caps);
@@ -754,6 +755,38 @@ fn register_sidecar_http_post(
                 .post(&url)
                 .send_json(body_value)
                 .map_err(|e| ureq_to_eval_err(&pid, "sidecar_http_post", &url, e))?;
+            decode_response(&pid, &url, resp)
+        },
+    );
+}
+
+fn register_sidecar_http_put(
+    engine: &mut Engine,
+    plugin_id: &str,
+    host_caps: HostCapsHandle,
+) {
+    let pid = plugin_id.to_owned();
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .user_agent("execlaw/script-runtime/sidecar/0.1")
+        .build();
+    engine.register_fn(
+        "sidecar_http_put",
+        move |url: ImmutableString, body: Dynamic| -> Result<Dynamic, Box<EvalAltResult>> {
+            let caps = match host_caps.get() {
+                Some(c) => c.clone(),
+                None => return Err(host_cap_unavailable_err(&pid, "sidecar_http_put")),
+            };
+            sidecar_url_check(&pid, "sidecar_http_put", &url, &caps)?;
+            let body_value = rhai_to_json(body)
+                .map_err(|e| Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] sidecar_http_put: encode body: {e}").into(),
+                    rhai::Position::NONE,
+                )))?;
+            let resp = agent
+                .put(&url)
+                .send_json(body_value)
+                .map_err(|e| ureq_to_eval_err(&pid, "sidecar_http_put", &url, e))?;
             decode_response(&pid, &url, resp)
         },
     );
