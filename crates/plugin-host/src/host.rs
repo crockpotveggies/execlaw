@@ -219,6 +219,50 @@ impl PluginHost {
             .cloned()
     }
 
+    /// Fire the optional `on_enable()` Rhai lifecycle hook for
+    /// every loaded script plugin. The cli boot path calls this
+    /// AFTER the sidecar supervisor has been started — so a
+    /// transport plugin's `on_enable` (typically `ws_subscribe`
+    /// against the sidecar's WS endpoint) sees a live supervisor
+    /// when it looks up `sidecar_url`.
+    ///
+    /// `wait_for_sidecars` should resolve once the supervisor has
+    /// at least attempted to start every plugin's declared
+    /// sidecars. The host doesn't wait for "all healthy" because a
+    /// single broken sidecar would block every other plugin's
+    /// lifecycle — instead, plugins whose sidecars are still
+    /// crash-looping handle the `sidecar_url == None` case in
+    /// their on_enable (typically: log + retry on next reload).
+    ///
+    /// Best-effort: a panicking or erroring on_enable logs at
+    /// `warn` and the loop moves on to the next plugin.
+    pub async fn fire_on_enable_for_all(&self) {
+        let plugins: Vec<(String, execlaw_script::ScriptPlugin)> = self
+            .inner
+            .script_plugins
+            .read()
+            .await
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (plugin_id, plugin) in plugins {
+            if let Err(e) = plugin.call_on_enable().await {
+                tracing::warn!(
+                    target: "plugin_host::lifecycle",
+                    plugin_id = %plugin_id,
+                    error = %e,
+                    "on_enable hook returned an error",
+                );
+            } else {
+                tracing::debug!(
+                    target: "plugin_host::lifecycle",
+                    plugin_id = %plugin_id,
+                    "on_enable fired",
+                );
+            }
+        }
+    }
+
     pub fn stage_root(&self) -> &Path {
         &self.inner.stage_root
     }
@@ -333,22 +377,16 @@ impl PluginHost {
                         .script_plugins
                         .write()
                         .await
-                        .insert(plugin_id.clone(), script.clone());
-                    // Lifecycle hook — script plugins that declare
-                    // an `on_enable()` function get one call after
-                    // they're loaded so they can spawn background
-                    // tasks (transport WS consumers, etc.).
-                    // Best-effort: a misbehaving on_enable doesn't
-                    // unwind the install — the operator can still
-                    // hit tools that don't depend on the consumer.
-                    if let Err(e) = script.call_on_enable().await {
-                        tracing::warn!(
-                            target: "plugin_host::install",
-                            plugin_id = %plugin_id,
-                            error = %e,
-                            "on_enable hook returned an error; plugin is loaded but lifecycle initialisation may be incomplete",
-                        );
-                    }
+                        .insert(plugin_id.clone(), script);
+                    // NOTE — on_enable is NOT fired here. Channel
+                    // plugins that declare `[[services]]` need
+                    // their sidecars healthy before on_enable runs
+                    // (a `ws_subscribe` against a not-yet-started
+                    // sidecar fails). The cli boot path fires
+                    // on_enable via `fire_on_enable_for_all` once
+                    // the sidecar supervisor reports the plugin's
+                    // sidecars healthy. Plugins without sidecars
+                    // get on_enable fired immediately by that pass.
                 }
             }
         }
@@ -707,15 +745,12 @@ impl PluginHost {
                                         .script_plugins
                                         .write()
                                         .await
-                                        .insert(row.plugin_id.clone(), s.clone());
+                                        .insert(row.plugin_id.clone(), s);
                                     debug!(plugin_id = %row.plugin_id, "hydrated script plugin");
-                                    if let Err(e) = s.call_on_enable().await {
-                                        warn!(
-                                            plugin_id = %row.plugin_id,
-                                            error = %e,
-                                            "on_enable hook returned an error during hydrate",
-                                        );
-                                    }
+                                    // on_enable is fired by the boot
+                                    // path's `fire_on_enable_for_all`
+                                    // after the supervisor reports
+                                    // sidecars healthy.
                                 }
                                 Err(e) => {
                                     warn!(plugin_id = %row.plugin_id, error = %e, "failed to load script on hydrate");

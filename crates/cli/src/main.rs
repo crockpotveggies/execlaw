@@ -1755,6 +1755,28 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         tokio::spawn(async move { sup.run(stop).await });
     }
 
+    // Phase B lifecycle: fire each script plugin's optional
+    // `on_enable()` Rhai hook. The sidecar supervisor was just
+    // spawned above, so a transport plugin's WS-subscribe call
+    // sees a live supervisor when it looks up `sidecar_url`.
+    // Plugins whose sidecars are still spinning up handle the
+    // None case gracefully (sidecar_url returns None → on_enable
+    // logs + bails; the WS subscription ends up missing for that
+    // boot — operator restart fixes it). A future tightening
+    // would wait for sidecar healthy before firing, but that
+    // adds blocking I/O to the boot path.
+    {
+        let plugin_host = state.plugin_host.clone();
+        tokio::spawn(async move {
+            // Small delay so the supervisor's first reconcile
+            // pass has a chance to publish ports. Capped — if
+            // sidecars aren't up by then we still fire on_enable
+            // and let the plugin handle the None.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            plugin_host.fire_on_enable_for_all().await;
+        });
+    }
+
     // Boot reconcile pass — merges any stale UnknownPending
     // principals shadowing a "My identities" mapping that was
     // added after the first cold-contact for that handle. Cheap
