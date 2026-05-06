@@ -1277,17 +1277,10 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     // host-implemented Signal tools as builtins so they can reach
     // `ctx.transport`. The plugin manifest declares them with
     // `host_implemented = true` so the rhai tier doesn't try to
-    // dispatch them; this register call binds the actual
-    // implementations. Group ops (list/create/add/leave) stay in
-    // the rhai stub until Phase 5.
-    {
-        let now = chrono::Utc::now().timestamp();
-        let tools = execlaw_server::signal_tools::signal_builtin_tools();
-        match execlaw_plugin_host::register_builtins(plugin_host.registry(), &db, now, tools) {
-            Ok(landed) => tracing::info!(count = landed.len(), "signal tools registered"),
-            Err(e) => return Err(anyhow::anyhow!("register signal tools failed: {e}")),
-        }
-    }
+    // (Phase B removed: signal_tools host registration. The signal
+    // plugin v0.4.0+ ships every tool in main.rhai — dispatch hits
+    // the script tier through the standard plugin-tool path. No
+    // host-side wiring needed here anymore.)
 
     // 2026-05-03 — Phase A: register the skill subsystem's tool
     // surface (skills.list/view/resource/search + admin-gated
@@ -1545,39 +1538,35 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     let research_workspace = execlaw_server::research::ResearchWorkspace::new(
         execlaw_server::research::ResearchWorkspace::default_root(),
     );
-    // Channel-keyed transport registry. Each plugin that needs
-    // host-side dispatch (signal-cli, future bridges) registers a
-    // factory here. Built once and shared with both AppState and
-    // ResearchSupervisor so the research runner can fan completed
-    // PDFs out without naming Signal.
+    // Channel-keyed transport registry. Phase B: every channel
+    // plugin gets a `RhaiBackedTransportFactory` that delegates
+    // TransportApi methods to the plugin's tool dispatch. The
+    // factory is keyed on the plugin's `[transport].transport_id`
+    // declared in the manifest; today only signal is registered
+    // here at boot, but adding WhatsApp/etc. is a one-line clone
+    // pointing at the new plugin's id.
     let host_transports = {
         let mut reg = execlaw_server::transport_registry::HostTransportRegistry::new();
-        if let Some(sup) = sidecar_supervisor.clone() {
-            let resolver: std::sync::Arc<
-                dyn execlaw_server::signal_transport::RpcEndpointResolver,
-            > = std::sync::Arc::new(sup);
-            // Source the SPA-sidebar icon from the bundled signal
-            // plugin manifest so a packaging bump (operator overrides
-            // `[transport].icon = "telephone"` for their fork) doesn't
-            // require a host rebuild. Falls back to the
-            // `default_signal_icon()` constant if the manifest can't
-            // be parsed (manifest gone missing in a stripped build,
-            // dev-time edit broke the file, etc.) — a benign visual
-            // default beats a boot crash.
-            const SIGNAL_MANIFEST: &str =
-                include_str!("../../../plugins/signal/plugin.toml");
-            let icon = execlaw_plugin_sdk::manifest::PluginManifest::parse(SIGNAL_MANIFEST)
-                .ok()
-                .and_then(|m| m.transport.and_then(|t| t.icon))
-                .unwrap_or_else(|| {
-                    execlaw_server::signal_transport::default_signal_icon().to_owned()
-                });
-            reg.register(std::sync::Arc::new(
-                execlaw_server::signal_transport::SignalCliTransportFactory::with_icon(
-                    resolver, icon,
-                ),
-            ));
-        }
+        // Signal — script-tier as of plugin v0.4.0. The plugin's
+        // own main.rhai owns inbound, outbound, and admin paths;
+        // the host's only role here is to plug a generic
+        // RhaiBackedTransportFactory into the auto-bridge so
+        // `bridge_text_reply_to_originating_transport` etc. find
+        // it via the registry.
+        const SIGNAL_MANIFEST: &str =
+            include_str!("../../../plugins/signal/plugin.toml");
+        let icon = execlaw_plugin_sdk::manifest::PluginManifest::parse(SIGNAL_MANIFEST)
+            .ok()
+            .and_then(|m| m.transport.and_then(|t| t.icon))
+            .unwrap_or_else(|| "phone".to_owned());
+        reg.register(std::sync::Arc::new(
+            execlaw_server::rhai_transport::RhaiBackedTransportFactory::new(
+                plugin_host.clone(),
+                "signal",
+                "signal",
+                icon,
+            ),
+        ));
         tracing::info!(channels = reg.len(), "host-transport registry populated");
         reg
     };
@@ -1786,28 +1775,11 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         }
     }
 
-    // Phase 4 — Signal inbound consumer. Subscribes to the
-    // supervised signal-cli sidecar's `/v1/receive/<self_number>`
-    // WebSocket and routes each inbound `dataMessage` through the
-    // existing trust pipeline. Returns `None` (and logs a warning)
-    // when EXECLAW_SIGNAL_CONTROLLER_NUMBER is unset OR the sidecar
-    // supervisor isn't wired — both are operator-config gaps, not
-    // crash conditions.
-    if execlaw_server::signal_inbound::spawn_signal_inbound_consumer(
-        state.clone(),
-        sweep_stop.clone(),
-    )
-    .is_some()
-    {
-        tracing::info!("signal inbound consumer spawned");
-    } else {
-        // Configuration gap, not normal operation — surface at
-        // `warn` so it shows up in the operator's log scan even
-        // if they haven't filtered for the signal_inbound target.
-        tracing::warn!(
-            "signal inbound consumer disabled (EXECLAW_SIGNAL_CONTROLLER_NUMBER unset or sidecar supervisor unavailable)"
-        );
-    }
+    // Phase B (signal v0.4.0+): the inbound consumer is now
+    // plugin-owned. The signal plugin's `on_enable()` Rhai hook
+    // fires from `PluginHost::hydrate` and calls `ws_subscribe`
+    // against the supervised sidecar's `/v1/receive/<number>`
+    // endpoint. The host gets out of the way — no spawn here.
 
     // Phase 13.D — voice-session reaper. Drops idle voice sessions
     // (operator closed the tab mid-mic) every REAP_INTERVAL so the

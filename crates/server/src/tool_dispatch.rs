@@ -92,7 +92,12 @@ pub struct ChainedToolDispatch<B: BuiltinTools> {
     /// `Denied("transport capability not granted")`. Wraps in
     /// `Arc<dyn>` rather than the concrete supervisor so non-signal
     /// transports can land here later without churn.
-    pub signal_transport_resolver: Option<Arc<dyn crate::signal_transport::RpcEndpointResolver>>,
+    /// Phase B: vestigial. Kept as a `()` placeholder so existing
+    /// builder methods + tests compile until they're cleaned up
+    /// in a follow-up. The plugin tier reaches the sidecar via
+    /// `sidecar_http_*` bindings directly — no host-side transport
+    /// resolver needed anymore.
+    pub signal_transport_resolver: Option<()>,
     /// Phase 3 — controller's registered Signal phone number,
     /// e.g. `+15551234567`. Read once at boot from
     /// `EXECLAW_SIGNAL_CONTROLLER_NUMBER`; flowed through the
@@ -217,35 +222,24 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
         self
     }
 
-    /// Phase 3 — wire the Signal transport. `resolver` is the
-    /// supervised sidecar's host-port lookup (production passes the
-    /// `SidecarSupervisor`); `self_number` is the controller's
-    /// registered Signal number, read at dispatcher construction
-    /// time from `EXECLAW_SIGNAL_CONTROLLER_NUMBER`. Either `None`
-    /// keeps the transport capability dormant — calls return
-    /// `Denied`.
-    pub fn with_signal_transport(
-        mut self,
-        resolver: Arc<dyn crate::signal_transport::RpcEndpointResolver>,
-        self_number: Option<String>,
+    /// Phase B: signal transport wiring is gone — the plugin tier
+    /// reaches the sidecar through Rhai's `sidecar_http_*`
+    /// bindings. These shims kept for API compat with call sites
+    /// still passing `None` (e.g. tests, dispatch_routine_turn);
+    /// remove in a follow-up cleanup.
+    pub fn with_signal_transport<T>(
+        self,
+        _resolver: T,
+        _self_number: Option<String>,
     ) -> Self {
-        self.signal_transport_resolver = Some(resolver);
-        self.signal_self_number = self_number;
         self
     }
 
-    /// Convenience: pass `Option<Arc<dyn ...>>` directly so the
-    /// production call site can avoid an `if-let` ladder. The
-    /// supervisor lives behind `AppState::sidecar_supervisor:
-    /// Option<...>`, so the caller is already holding an
-    /// `Option`-wrapped value; this lets it flow through unchanged.
-    pub fn with_signal_transport_opt(
-        mut self,
-        resolver: Option<Arc<dyn crate::signal_transport::RpcEndpointResolver>>,
-        self_number: Option<String>,
+    pub fn with_signal_transport_opt<T>(
+        self,
+        _resolver: Option<T>,
+        _self_number: Option<String>,
     ) -> Self {
-        self.signal_transport_resolver = resolver;
-        self.signal_self_number = self_number;
         self
     }
 
@@ -388,46 +382,15 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
                 now,
             )));
         }
-        let needs_transport = caps.iter().any(|c| matches!(c, Capability::Transport));
-        if needs_transport {
-            if let Some(resolver) = self.signal_transport_resolver.as_ref() {
-                // Phase 4 — resolve `current_chat_id` from the
-                // conversation's `principal_group_id`. The chain:
-                //   1. conversation_id → state_conversations.principal_group_id
-                //   2. principal_group_id + "signal" → state_transport_bindings.foreign_id
-                // A miss at either step (controller-initiated chat,
-                // group with no Signal binding, etc.) leaves
-                // `current_chat_id = None` and `signal.reply` returns
-                // `no_inbound_context` — the tool's own precondition
-                // surface, not a silent dispatch against the wrong
-                // recipient.
-                let pg_store =
-                    execlaw_core::principal_groups::PrincipalGroupStore::new(self.host.db());
-                let binding_store =
-                    execlaw_core::transport_bindings::TransportBindingStore::new(self.host.db());
-                let current_chat_id = pg_store
-                    .principal_group_id_for(ctx.conversation_id.as_str())
-                    .ok()
-                    .flatten()
-                    .and_then(|pg_id| {
-                        binding_store
-                            .bindings_for_group(&pg_id, crate::signal_transport::SIGNAL_CHANNEL)
-                            .ok()
-                            .and_then(|mut v| v.pop().map(|b| b.foreign_id))
-                    });
-                let transport = crate::signal_transport::SignalCliTransport::new(
-                    resolver.clone(),
-                    self.host.db().clone(),
-                    self.signal_self_number.clone(),
-                    current_chat_id,
-                )
-                .with_caller_conversation_id(ctx.conversation_id.clone());
-                ctx.transport = Some(Arc::new(transport));
-            }
-            // No resolver wired (test fixture / boot order race) →
-            // ctx.transport stays None and the tool body's own
-            // capability-not-granted denial fires.
-        }
+        // Phase B: the host no longer injects a TransportApi for
+        // Capability::Transport — channel plugins are script-tier
+        // and reach their sidecar via `sidecar_http_*` Rhai
+        // bindings directly. The capability is still recognised
+        // here as a dormant gate; tool descriptors that declare it
+        // surface "transport capability not granted" if any path
+        // tries to reach `ctx.transport` (which is always None
+        // post-Phase-B).
+        let _needs_transport = caps.iter().any(|c| matches!(c, Capability::Transport));
         let needs_attachment_send = caps.iter().any(|c| matches!(c, Capability::AttachmentSend));
         if needs_attachment_send {
             if let Some(events) = self.events.as_ref() {

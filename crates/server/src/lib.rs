@@ -64,10 +64,11 @@ pub mod settings_search;
 pub mod setup_preflight;
 pub mod sidecar_supervisor;
 pub mod sidecars_admin;
-pub mod signal_admin;
-pub mod signal_inbound;
-pub mod signal_tools;
-pub mod signal_transport;
+// Phase B: signal_admin / signal_inbound / signal_tools /
+// signal_transport retired. Every Signal capability lives in
+// plugins/signal/main.rhai (v0.4.0+) and reaches the sidecar via
+// `sidecar_http_*` Rhai bindings; transport methods flow through
+// `rhai_transport::RhaiBackedTransport`.
 pub mod skill_capture_runtime;
 pub mod skills_admin;
 pub mod state;

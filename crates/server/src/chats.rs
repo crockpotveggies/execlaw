@@ -1209,13 +1209,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         .with_research_supervisor_wake_opt(
             state.research_supervisor.as_ref().map(|s| s.wake.clone()),
         )
-        .with_signal_transport_opt(
-            state.sidecar_supervisor.as_ref().map(|s| {
-                std::sync::Arc::new(s.clone())
-                    as std::sync::Arc<dyn crate::signal_transport::RpcEndpointResolver>
-            }),
-            crate::signal_transport::SignalCliTransport::read_self_number_from_env(),
-        )
+        .with_signal_transport_opt::<()>(None, None)
         .with_host_transports(state.host_transports.clone()),
     );
 
@@ -1533,13 +1527,7 @@ async fn run_tool_capable_turn(
         .with_research_supervisor_wake_opt(
             state.research_supervisor.as_ref().map(|s| s.wake.clone()),
         )
-        .with_signal_transport_opt(
-            state.sidecar_supervisor.as_ref().map(|s| {
-                std::sync::Arc::new(s.clone())
-                    as std::sync::Arc<dyn crate::signal_transport::RpcEndpointResolver>
-            }),
-            crate::signal_transport::SignalCliTransport::read_self_number_from_env(),
-        )
+        .with_signal_transport_opt::<()>(None, None)
         .with_host_transports(state.host_transports.clone()),
     );
     let exec = TurnExecutor::new((*inference).clone(), dispatch);

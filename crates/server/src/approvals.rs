@@ -335,7 +335,7 @@ pub async fn respond_handler(
             // we add other channels' cold-contact paths the approval
             // payload will need to carry the originating channel
             // explicitly; for now hardcoding signal matches reality.
-            Some(crate::signal_transport::SIGNAL_CHANNEL),
+            Some("signal"),
         )
         .await
         {
@@ -507,7 +507,7 @@ async fn claim_as_me(
         &controller_now,
         trust_flat,
         &original_text,
-        Some(crate::signal_transport::SIGNAL_CHANNEL),
+        Some("signal"),
     )
     .await
     {
