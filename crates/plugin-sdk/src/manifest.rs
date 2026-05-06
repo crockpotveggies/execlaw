@@ -1090,7 +1090,7 @@ mod tests {
         let m = PluginManifest::parse(SIGNAL_MANIFEST)
             .expect("plugins/signal/plugin.toml must parse cleanly");
         assert_eq!(m.plugin.id, "signal");
-        assert_eq!(m.plugin.version, "0.4.0");
+        assert_eq!(m.plugin.version, "0.4.1");
         // The transport icon must propagate from manifest → SDK so
         // the SPA's sidebar can render a Signal-shaped marker on
         // bridged threads. Pin the literal so a typo in the manifest
