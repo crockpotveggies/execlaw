@@ -667,6 +667,33 @@ impl PluginHost {
         row.updated_at = chrono::Utc::now().timestamp();
         self.update_row(&row)?;
         info!(plugin_id, "plugin enabled");
+
+        // Fire on_enable for script plugins so a fresh enable / a
+        // post-install upgrade gets the same lifecycle treatment as
+        // a boot-time hydrate. on_enable handlers are expected to be
+        // robust to "sidecar not yet up" (use `sidecar_url_blocking`
+        // or equivalent polling) so this is safe to call regardless
+        // of supervisor state. Best-effort — a panicking or erroring
+        // hook is logged but doesn't fail enable().
+        let plugin = self
+            .inner
+            .script_plugins
+            .read()
+            .await
+            .get(plugin_id)
+            .cloned();
+        if let Some(plugin) = plugin {
+            // Spawn so the HTTP request returns immediately;
+            // on_enable can poll for up to a few minutes.
+            let pid = plugin_id.to_owned();
+            tokio::spawn(async move {
+                if let Err(e) = plugin.call_on_enable().await {
+                    warn!(plugin_id = %pid, error = %e, "on_enable hook returned an error");
+                } else {
+                    debug!(plugin_id = %pid, "on_enable fired (post-enable)");
+                }
+            });
+        }
         Ok(())
     }
 

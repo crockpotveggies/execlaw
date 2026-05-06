@@ -242,6 +242,27 @@ pub(crate) fn register(
 
     engine.register_fn("now", || -> i64 { chrono::Utc::now().timestamp() });
 
+    // sleep_ms(millis) — cooperative sleep. Plugins call this from
+    // boot-time polling loops (e.g. waiting for a sidecar's HTTP
+    // daemon to surface). Capped at 5 minutes so a runaway script
+    // can't hang the engine indefinitely.
+    engine.register_fn("sleep_ms", |ms: i64| {
+        if ms <= 0 {
+            return;
+        }
+        let ms = std::cmp::min(ms as u64, 300_000);
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                return;
+            }
+        };
+        tokio::task::block_in_place(|| {
+            runtime.block_on(tokio::time::sleep(std::time::Duration::from_millis(ms)));
+        });
+    });
+
     // unix_to_rfc3339(unix_secs: i64) -> "YYYY-MM-DDTHH:MM:SSZ"
     // — formatted UTC. Date math is gnarly to do in Rhai; lean
     // on chrono so plugins don't have to ship a Hinnant
@@ -382,6 +403,47 @@ fn register_host_cap_bindings(
                 };
                 let url = tokio::task::block_in_place(|| {
                     runtime.block_on(caps.sidecar_url(&name))
+                });
+                Ok(match url {
+                    Some(u) => Dynamic::from(ImmutableString::from(u)),
+                    None => Dynamic::UNIT,
+                })
+            },
+        );
+    }
+
+    // sidecar_url_blocking(name, timeout_ms) -> Option<String>
+    //
+    // Same as `sidecar_url` but waits up to `timeout_ms` for the
+    // supervisor to publish a port. Use from `on_enable` so the
+    // plugin's WS subscription survives the cold-boot race where
+    // the lifecycle hook fires before the supervisor's first
+    // reconcile pass has spawned the container.
+    {
+        let pid = plugin_id.to_owned();
+        let caps = host_caps.clone();
+        engine.register_fn(
+            "sidecar_url_blocking",
+            move |name: ImmutableString, timeout_ms: i64| -> Result<Dynamic, Box<EvalAltResult>> {
+                let caps = match caps.get() {
+                    Some(c) => c.clone(),
+                    None => {
+                        return Err(host_cap_unavailable_err(&pid, "sidecar_url_blocking"));
+                    }
+                };
+                let runtime = match tokio::runtime::Handle::try_current() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        return Err(Box::new(EvalAltResult::ErrorRuntime(
+                            format!("[{pid}] sidecar_url_blocking: no tokio runtime: {e}")
+                                .into(),
+                            rhai::Position::NONE,
+                        )));
+                    }
+                };
+                let timeout = if timeout_ms < 0 { 0u64 } else { timeout_ms as u64 };
+                let url = tokio::task::block_in_place(|| {
+                    runtime.block_on(caps.sidecar_url_blocking(&name, timeout))
                 });
                 Ok(match url {
                     Some(u) => Dynamic::from(ImmutableString::from(u)),

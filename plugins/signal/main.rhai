@@ -26,13 +26,43 @@ fn on_enable() {
     // Spawn the WS inbound consumer. The host's ws_subscribe owns
     // the reconnect + backoff loop; we just hand it the URL + the
     // name of the per-frame Rhai function.
-    let url = ws_url();
-    if url == () {
-        log_warn("signal: sidecar not yet running; on_enable will retry on next plugin reload");
+    //
+    // Cold-boot race: on_enable fires shortly after process boot,
+    // but the sidecar supervisor's first reconcile pass takes a
+    // few seconds to publish a port for signal-cli's container.
+    // Use the blocking sidecar_url variant (60s budget) so the
+    // subscription survives the race instead of bailing silently.
+    let base = sidecar_url_blocking("signal-cli", 60000);
+    if base == () {
+        log_warn("signal: sidecar didn't come up within 60s — restart the plugin from Settings → Plugins to retry");
         return;
     }
-    log_info("signal: subscribing to inbound WebSocket at " + url);
-    ws_subscribe(url, "on_frame");
+    // Once the supervisor has published a port we still need to
+    // wait for signal-cli's HTTP daemon inside the container to
+    // start serving /v1/accounts (typically another 5-30s on
+    // first boot). Poll with a 90s budget.
+    let num = ();
+    let waited = 0;
+    let max_wait_ms = 90000;
+    let step_ms = 1000;
+    while num == () && waited < max_wait_ms {
+        try {
+            num = self_number();
+        } catch (e) {
+            num = ();
+        }
+        if num == () {
+            sleep_ms(step_ms);
+            waited += step_ms;
+        }
+    }
+    if num == () {
+        log_warn("signal: signal-cli didn't surface a paired account within 90s — pair via Settings → Plugins → Signal then restart the plugin");
+        return;
+    }
+    let ws = base.replace("http://", "ws://") + "/v1/receive/" + url_encode(num);
+    log_info("signal: subscribing to inbound WebSocket at " + ws);
+    ws_subscribe(ws, "on_frame");
 }
 
 // =====================================================================

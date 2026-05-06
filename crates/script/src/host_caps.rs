@@ -173,6 +173,33 @@ pub trait HostCapabilities: Send + Sync {
     /// — no trailing slash, no path; plugin appends its own.
     async fn sidecar_url(&self, sidecar_name: &str) -> Option<String>;
 
+    /// Like [`sidecar_url`] but waits up to `timeout_ms` for the
+    /// supervisor to publish a port. Plugins call this from
+    /// `on_enable` so the WS subscription survives the cold-boot
+    /// race where the lifecycle hook fires before the sidecar
+    /// supervisor's first reconcile pass has spawned the container.
+    ///
+    /// Returns the URL on success, `None` on timeout. The polling
+    /// cadence is implementation-defined; the default impl polls
+    /// every 500ms.
+    async fn sidecar_url_blocking(
+        &self,
+        sidecar_name: &str,
+        timeout_ms: u64,
+    ) -> Option<String> {
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            if let Some(url) = self.sidecar_url(sidecar_name).await {
+                return Some(url);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
     /// True iff `url` resolves to a registered supervised sidecar.
     /// The script tier's `sidecar_http_*` bindings consult this
     /// before bypassing the SSRF guard — only URLs whose

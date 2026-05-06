@@ -17,13 +17,13 @@ fn dist_signal_zip_stages_cleanly() {
         .unwrap()
         .parent()
         .unwrap();
-    let zip_path = workspace_root.join("dist").join("signal-0.4.2.zip");
+    let zip_path = workspace_root.join("dist").join("signal-0.4.3.zip");
     if !zip_path.exists() {
         // Allow CI / fresh clones to skip — the zip is rebuilt
         // by `scripts/package-plugins.ps1` (Phase 7) and not
         // checked in until the operator opts to ship it.
         eprintln!(
-            "dist/signal-0.4.2.zip not present at {}; skipping",
+            "dist/signal-0.4.3.zip not present at {}; skipping",
             zip_path.display()
         );
         return;
@@ -31,7 +31,7 @@ fn dist_signal_zip_stages_cleanly() {
     let f = File::open(&zip_path).expect("open dist zip");
     let staged = stage_zip(BufReader::new(f)).expect("stage_zip must accept the dist zip");
     assert_eq!(staged.manifest.plugin.id, "signal");
-    assert_eq!(staged.manifest.plugin.version, "0.4.2");
+    assert_eq!(staged.manifest.plugin.version, "0.4.3");
     // Phase B: all six tools are now SCRIPT-tier (main.rhai owns
     // them via sidecar_http_* bindings). Pin so a regression that
     // re-introduces host_implemented gets caught.
