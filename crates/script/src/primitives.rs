@@ -913,7 +913,7 @@ fn map_to_query_iter(m: &Map) -> impl Iterator<Item = (String, String)> + '_ {
 /// Convert a rhai `Dynamic` into a `serde_json::Value`. Supports
 /// the shapes the script-tier plugin SDK actually produces:
 /// nested maps + arrays of strings/ints/floats/bools/units.
-pub(crate) fn rhai_to_json(d: Dynamic) -> Result<serde_json::Value, String> {
+pub fn rhai_to_json(d: Dynamic) -> Result<serde_json::Value, String> {
     if d.is_unit() {
         return Ok(serde_json::Value::Null);
     }
@@ -953,7 +953,7 @@ pub(crate) fn rhai_to_json(d: Dynamic) -> Result<serde_json::Value, String> {
 
 /// Inverse of `rhai_to_json`. Numbers prefer i64 when they fit,
 /// f64 otherwise. Null lands as Rhai's UNIT (`()`).
-pub(crate) fn json_to_rhai(v: &serde_json::Value) -> Dynamic {
+pub fn json_to_rhai(v: &serde_json::Value) -> Dynamic {
     match v {
         serde_json::Value::Null => Dynamic::UNIT,
         serde_json::Value::Bool(b) => (*b).into(),

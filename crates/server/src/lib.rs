@@ -34,6 +34,7 @@ pub mod generic_inbound;
 pub mod group_addressing;
 pub mod host_caps_impl;
 pub mod inference_resolver;
+pub mod plugin_admin_routes;
 pub mod mcp_admin;
 pub mod mcp_host;
 pub mod my_identities;

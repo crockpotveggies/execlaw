@@ -195,6 +195,26 @@ pub struct RegisteredOauthAccount {
     pub scopes: Vec<String>,
 }
 
+/// One `[[admin_routes]]` declaration cached in the registry so
+/// the host's HTTP dispatcher (`/api/admin/plugins/{plugin_id}/...`)
+/// can look up the matching Rhai handler without re-parsing the
+/// manifest TOML on every request.
+#[derive(Debug, Clone)]
+pub struct RegisteredAdminRoute {
+    pub plugin_id: String,
+    /// Uppercased HTTP method — `"GET"`, `"POST"`, etc. The host
+    /// uppercases at registration time so dispatch can compare
+    /// without copying.
+    pub method: String,
+    /// Path under `/api/admin/plugins/{plugin_id}`. Always begins
+    /// with `/` post-normalisation; the registration step adds one
+    /// if the manifest omitted it.
+    pub path: String,
+    /// Rhai top-level function name to invoke per request.
+    pub handler: String,
+    pub description: Option<String>,
+}
+
 /// Result of [`HookRegistry::lookup_any`]. The dispatch layer pattern-
 /// matches on this so it can either invoke a built-in directly or
 /// drop into the plugin RPC path with the metadata.
@@ -251,6 +271,11 @@ struct HookRegistryInner {
     /// fetch tokens for; without the cache it would re-parse the
     /// manifest TOML on every call.
     oauth_accounts: BTreeMap<String, Vec<RegisteredOauthAccount>>,
+    /// Per-plugin admin routes (`[[admin_routes]]`). Mounted under
+    /// `/api/admin/plugins/{plugin_id}` by the host's dispatcher;
+    /// every entry resolves to a Rhai handler in the plugin's
+    /// script. Cleared on plugin disable/uninstall.
+    admin_routes: BTreeMap<String, Vec<RegisteredAdminRoute>>,
     enabled_plugins: BTreeSet<String>,
 }
 
@@ -495,6 +520,26 @@ impl HookRegistry {
                 .collect();
             w.oauth_accounts.insert(plugin_id.clone(), cached);
         }
+        if !manifest.admin_routes.is_empty() {
+            let cached: Vec<RegisteredAdminRoute> = manifest
+                .admin_routes
+                .iter()
+                .map(|r| {
+                    let mut path = r.path.clone();
+                    if !path.starts_with('/') {
+                        path.insert(0, '/');
+                    }
+                    RegisteredAdminRoute {
+                        plugin_id: plugin_id.clone(),
+                        method: r.method.to_uppercase(),
+                        path,
+                        handler: r.handler.clone(),
+                        description: r.description.clone(),
+                    }
+                })
+                .collect();
+            w.admin_routes.insert(plugin_id.clone(), cached);
+        }
         w.enabled_plugins.insert(plugin_id.clone());
         Ok(())
     }
@@ -513,6 +558,7 @@ impl HookRegistry {
         w.event_subs.retain(|_, v| !v.is_empty());
         w.alert_sources.retain(|s| s.plugin_id != plugin_id);
         w.oauth_accounts.remove(plugin_id);
+        w.admin_routes.remove(plugin_id);
         w.enabled_plugins.remove(plugin_id);
     }
 
@@ -672,6 +718,20 @@ impl HookRegistry {
             .read()
             .unwrap()
             .oauth_accounts
+            .get(plugin_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Admin routes (`[[admin_routes]]`) declared by `plugin_id`.
+    /// Returned by clone — caller walks once per HTTP request to
+    /// match (method, path) → handler. Empty when the plugin
+    /// declares none.
+    pub fn admin_routes_for(&self, plugin_id: &str) -> Vec<RegisteredAdminRoute> {
+        self.inner
+            .read()
+            .unwrap()
+            .admin_routes
             .get(plugin_id)
             .cloned()
             .unwrap_or_default()

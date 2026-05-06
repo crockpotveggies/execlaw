@@ -203,6 +203,22 @@ impl PluginHost {
         &self.inner.registry
     }
 
+    /// Look up the live `ScriptPlugin` by id. Returns `None` for
+    /// subprocess-tier plugins, plugins not yet loaded, or unknown
+    /// ids. Surfaced for the admin-route dispatcher (and future
+    /// plugin-introspection paths).
+    pub async fn script_plugin(
+        &self,
+        plugin_id: &str,
+    ) -> Option<execlaw_script::ScriptPlugin> {
+        self.inner
+            .script_plugins
+            .read()
+            .await
+            .get(plugin_id)
+            .cloned()
+    }
+
     pub fn stage_root(&self) -> &Path {
         &self.inner.stage_root
     }

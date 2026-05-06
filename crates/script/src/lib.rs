@@ -58,3 +58,11 @@ pub use host_caps::{
     RouteOutcome, WsFrameHandler, WsSubscriptionHandle,
 };
 pub use plugin::ScriptPlugin;
+
+/// Re-exports for callers outside the script crate that need to
+/// shuttle data into the engine — chiefly the admin-routes
+/// dispatcher in `execlaw-server` which builds a Rhai args map
+/// from an HTTP request.
+pub mod primitives_glue {
+    pub use crate::primitives::{json_to_rhai, rhai_to_json};
+}

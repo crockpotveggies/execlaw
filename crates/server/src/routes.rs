@@ -708,6 +708,7 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::runner_rpc::register_runner),
         )
         .merge(crate::plugins::plugins_router())
+        .merge(crate::plugin_admin_routes::admin_routes_router())
         .merge(crate::approvals::approvals_router())
         .merge(crate::attachments_admin::attachments_router())
         .merge(crate::observability::observability_router())

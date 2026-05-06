@@ -16,7 +16,7 @@ pub mod subprocess;
 
 pub use builtin_registrar::{RegisterBuiltinsError, register_builtins, register_core_builtins};
 pub use hook_registry::{
-    HookRegistry, RegisteredAlertSource, RegisteredAny, RegisteredBuiltin,
+    HookRegistry, RegisteredAdminRoute, RegisteredAlertSource, RegisteredAny, RegisteredBuiltin,
     RegisteredEventSubscription, RegisteredIdentityProvider, RegisteredTool, RegisteredTransport,
     RegisteredUiPanel,
 };
