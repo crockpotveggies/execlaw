@@ -700,167 +700,6 @@ fn signal_principal_id(source_number: &str) -> PrincipalId {
     PrincipalId::from(format!("pri_signal_{source_number}"))
 }
 
-/// LLM-based classifier: is this group inbound directed at the
-/// agent?
-///
-/// **Why not deterministic name-matching?** The earlier
-/// word-boundary matcher silenced the agent when it should have
-/// answered — multi-turn clarifications without re-naming the
-/// agent, agreement replies ("yes please"), and agent-only
-/// questions ("what's on the calendar?") all read as
-/// "not addressed" by a string-matcher and the operator had to
-/// prefix every message with the agent's name. That's worse UX
-/// than the original "agent answers everything" behaviour. A
-/// small/fast LLM picks up conversational context the matcher
-/// can't.
-///
-/// **Scope** — this is invoked from `route_group_inbound` ONLY.
-/// 1:1 DMs run through `route_inbound_message`, which never
-/// touches this classifier. Pin the DM-untouched invariant in
-/// the test suite.
-///
-/// **Fall-open semantics** — the function returns `true` (=
-/// dispatch the turn, preserve "agent answers" behaviour) on
-/// every uncertain path:
-///   * No inference backend resolved (operator hasn't wired one).
-///   * 5-second timeout (model is slow / unreachable).
-///   * HTTP error from inference.
-///   * Response body doesn't parse as JSON or doesn't contain
-///     a `directed` boolean.
-///
-/// The ONLY return-`false` path is a clean LLM verdict of
-/// `{"directed": false}`. So a misbehaving classifier degrades
-/// to "agent answers everything", not "agent silent on
-/// everything" — the safer of the two failure modes.
-async fn classify_addressed_to_agent_via_llm(
-    state: &AppState,
-    agent_name: &str,
-    agent_role: &str,
-    message_text: &str,
-) -> bool {
-    use execlaw_core::backends::BackendPurpose;
-    use execlaw_inference_api::{ChatMessage, ChatRequest, ModelId};
-
-    // Prefer the Small backend (Haiku-class, sub-second turnaround
-    // for a 32-token classification). Fall back to Standard if Small
-    // isn't wired — better to spend the standard model's latency
-    // budget here than to silently dispatch every group message.
-    // Final fallback to the bootstrap inference resolver (resolved
-    // through the same chain `dispatch_external_turn` uses).
-    let inference = state
-        .inference
-        .resolve(&state.db, BackendPurpose::Small)
-        .or_else(|| state.inference.resolve(&state.db, BackendPurpose::Standard));
-    let inference = match inference {
-        Some(c) => c,
-        None => {
-            tracing::debug!(
-                target: "signal_inbound::address_classifier",
-                "no inference backend resolved; falling open (will dispatch)"
-            );
-            return true;
-        }
-    };
-
-    let system_prompt = format!(
-        "You are a binary classifier for a chat-bot routing layer. \
-         The agent is named \"{agent_name}\" and acts as the operator's {role}. \
-         A new message arrived in a Signal group with the agent and other humans. \
-         Decide if THIS message is directed at the agent.\n\n\
-         DIRECTED (true):\n\
-         - Names the agent (\"{agent_name}, ...\", \"@{agent_name}\", \"hey {agent_name}\")\n\
-         - A question or instruction only the agent could reasonably answer\n\
-         - A clear reply or follow-up to something the agent just said\n\
-         - Mid-conversation clarifications inside an exchange the agent started\n\n\
-         NOT DIRECTED (false):\n\
-         - Addresses a different person by name (\"Alice, did you...\")\n\
-         - General group chatter, banter, or scheduling between other humans\n\
-         - Reactions or one-word replies tied to a non-agent participant's last turn\n\
-         - Messages where the agent has no obvious involvement\n\n\
-         Output STRICT JSON, nothing else: {{\"directed\": true}} or {{\"directed\": false}}.",
-        agent_name = agent_name,
-        role = if agent_role.trim().is_empty() {
-            "assistant"
-        } else {
-            agent_role
-        },
-    );
-
-    let req = ChatRequest {
-        model: ModelId(state.config.model_id.clone()),
-        messages: vec![
-            ChatMessage::system(system_prompt),
-            ChatMessage::user(format!("Message: \"{}\"", message_text.replace('"', "\\\""))),
-        ],
-        tools: None,
-        stream: false,
-        temperature: Some(0.0),
-        max_tokens: Some(32),
-        // Suppress Qwen's `<think>` block — the classifier needs
-        // the JSON token, not a chain-of-thought monologue. Other
-        // models silently ignore the field.
-        chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
-    };
-
-    let resp = match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        inference.chat_completions(&req),
-    )
-    .await
-    {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(e)) => {
-            tracing::warn!(
-                target: "signal_inbound::address_classifier",
-                error = %e,
-                "inference error during address classification; falling open"
-            );
-            return true;
-        }
-        Err(_) => {
-            tracing::warn!(
-                target: "signal_inbound::address_classifier",
-                "address classifier timed out after 5s; falling open"
-            );
-            return true;
-        }
-    };
-
-    let text = resp
-        .choices
-        .first()
-        .and_then(|c| c.message.content.as_deref())
-        .unwrap_or("");
-    parse_directed_verdict(text).unwrap_or_else(|| {
-        tracing::debug!(
-            target: "signal_inbound::address_classifier",
-            response_preview = %&text.chars().take(120).collect::<String>(),
-            "couldn't parse JSON `directed` from classifier response; falling open"
-        );
-        true
-    })
-}
-
-/// Parse `{"directed": true|false}` (possibly wrapped in a code
-/// fence or trailing prose) from a model response. Returns the
-/// boolean if found, `None` otherwise.
-///
-/// Greedy: scans for the first `{` to the last `}` and tries to
-/// parse that span as JSON. Works for most "I'm not sure but here's
-/// JSON" responses. A response that contains NO braces or no
-/// `directed` key returns `None` — the caller falls open.
-fn parse_directed_verdict(text: &str) -> Option<bool> {
-    let bytes = text.as_bytes();
-    let start = bytes.iter().position(|b| *b == b'{')?;
-    let end = bytes.iter().rposition(|b| *b == b'}')?;
-    if end <= start {
-        return None;
-    }
-    let span = &text[start..=end];
-    let v: serde_json::Value = serde_json::from_str(span).ok()?;
-    v.get("directed")?.as_bool()
-}
-
 /// Resolve the canonical principal for an inbound message landing on
 /// an existing transport binding. After reconcile rebinds a Signal
 /// handle from a stale UnknownPending principal to (e.g.) the
@@ -1390,50 +1229,25 @@ async fn route_group_inbound(
         .await;
     }
 
-    // 5. Group-only address filter. The agent shouldn't chime in
-    //    on conversations between other group members — operators
-    //    consistently report this as "the bot keeps replying to
-    //    messages that weren't directed at it." Soft prompt-level
-    //    instructions ("don't reply unless addressed") aren't
-    //    reliable; the model often pattern-matches its name onto
-    //    any inbound text. An earlier deterministic word-boundary
-    //    matcher silenced the agent too aggressively (operators had
-    //    to repeat the agent's name on every clarification). This
-    //    iteration consults a small/fast LLM with the operator's
-    //    configured agent name + role and lets it judge directedness
-    //    contextually.
+    // 5. Group-address filter. Channel-agnostic logic — every
+    //    transport that delivers messages into multi-participant
+    //    conversations needs the same "is this directed at the
+    //    agent?" gate. We delegate to the
+    //    [`crate::group_addressing`] module so future transports
+    //    (WhatsApp, email, SMS-MMS, Discord) get the same behaviour
+    //    by calling the same entry point — and so this Signal-
+    //    routing file doesn't host channel-agnostic logic that
+    //    would need to be duplicated elsewhere.
     //
-    //    SAFETY: this branch is in `route_group_inbound` only —
-    //    1:1 DMs (`route_inbound_message`) are never filtered;
-    //    every DM is by definition addressed to the agent. Any
-    //    error reading the personality, classifier timeout, or
-    //    parse failure → fall open and dispatch. The worst case
-    //    is the agent behaving exactly like it did pre-fix.
-    let (agent_name, agent_role): (Option<String>, String) = {
-        use execlaw_core::personality::PersonalityStore;
-        let store = PersonalityStore::new(&state.db);
-        match store.get_default() {
-            Ok(row) => (Some(row.display_name), row.role),
-            Err(e) => {
-                tracing::debug!(
-                    target: "signal_inbound",
-                    error = %e,
-                    "personality lookup failed in group address filter; falling open",
-                );
-                (None, "assistant".to_owned())
-            }
-        }
-    };
-    let addressed = match agent_name.as_deref() {
-        Some(name) if name.trim().chars().count() >= 2 => {
-            classify_addressed_to_agent_via_llm(state, name, &agent_role, &msg.text).await
-        }
-        // No personality row OR dangerously-short configured name →
-        // fall open. Skip-dispatch is destructive UX (silent agent)
-        // and the operator can still steer the model with the
-        // existing custom_instructions prompt.
-        _ => true,
-    };
+    //    SAFETY: 1:1 DMs (`route_inbound_message`, no group_id)
+    //    never reach this branch — they always dispatch.
+    //    Multi-participant groups whose only members are
+    //    Controllers also dispatch (no other humans to confuse).
+    //    Every uncertain path falls open inside
+    //    `should_dispatch_to_agent` — the worst case is the agent
+    //    behaving exactly like it did before this filter landed.
+    let addressed =
+        crate::group_addressing::should_dispatch_to_agent(state, &cid, &msg.text).await;
     if !addressed {
         // Persist the inbound so the agent's future history-replay
         // sees it (when a follow-up DOES address the agent it
@@ -1461,7 +1275,6 @@ async fn route_group_inbound(
             target: "signal_inbound",
             sender = %sender.id.as_str(),
             group_id = %group_id,
-            agent_name = ?agent_name,
             "group inbound did not address the agent; persisted but skipped dispatch",
         );
         return Ok(RouteOutcome::GroupNotAddressed {
@@ -2132,167 +1945,14 @@ mod tests {
         assert_eq!(p.trust_level.class_tag(), "UnknownPending");
     }
 
-    // ---- group address filter (LLM-based classifier) ------------------
-
-    #[test]
-    fn parse_directed_verdict_handles_clean_json() {
-        assert_eq!(parse_directed_verdict("{\"directed\": true}"), Some(true));
-        assert_eq!(parse_directed_verdict("{\"directed\": false}"), Some(false));
-    }
-
-    #[test]
-    fn parse_directed_verdict_strips_code_fences_and_prose() {
-        // Models often wrap JSON in code fences or trailing prose
-        // even when told not to. The greedy `{...}` extractor
-        // rescues the verdict in those cases.
-        assert_eq!(
-            parse_directed_verdict("```json\n{\"directed\": false}\n```"),
-            Some(false)
-        );
-        assert_eq!(
-            parse_directed_verdict(
-                "Here is the verdict:\n{\"directed\": true}\nThanks!"
-            ),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn parse_directed_verdict_returns_none_for_garbage() {
-        // Any unparseable / no-JSON / no-`directed`-key response →
-        // None. The caller falls open and dispatches the turn —
-        // safer than silencing every group message.
-        assert!(parse_directed_verdict("").is_none());
-        assert!(parse_directed_verdict("yes").is_none());
-        assert!(parse_directed_verdict("not json at all").is_none());
-        assert!(parse_directed_verdict("{\"unrelated\": 1}").is_none());
-        // Numeric `directed` doesn't satisfy `as_bool`.
-        assert!(parse_directed_verdict("{\"directed\": 1}").is_none());
-    }
-
-    #[test]
-    fn parse_directed_verdict_picks_outermost_braces() {
-        // Nested objects in the response — outer braces define the
-        // span. Should still surface the top-level `directed`.
-        assert_eq!(
-            parse_directed_verdict("{\"directed\": true, \"meta\": {\"x\": 1}}"),
-            Some(true)
-        );
-    }
-
-    #[tokio::test]
-    async fn route_group_inbound_falls_open_when_no_inference_backend() {
-        // Without an inference backend wired (the test fixture's
-        // default state), the LLM classifier short-circuits and
-        // returns "directed = true". This pins the safe failure
-        // mode: the agent stays chatty rather than silent when the
-        // classifier is unavailable. Any reversal of this guard
-        // would silently break group routing on hosts that haven't
-        // yet wired a Small backend.
-        use execlaw_core::personality::{PersonalityScopeKind, PersonalityStore, PersonalityUpsert};
-        let state = test_app_state();
-        let now = chrono::Utc::now().timestamp();
-        let store = PersonalityStore::new(&state.db);
-        let default_row = store.get_default().unwrap();
-        store
-            .upsert(
-                &PersonalityUpsert {
-                    scope_kind: PersonalityScopeKind::Default,
-                    scope_ref: "".into(),
-                    display_name: "Lena".into(),
-                    role: default_row.role,
-                    tone: default_row.tone,
-                    communication_style: default_row.communication_style,
-                    initiative: default_row.initiative,
-                    about_agent: default_row.about_agent,
-                    about_controller: default_row.about_controller,
-                    custom_instructions: default_row.custom_instructions,
-                    voice_id: default_row.voice_id,
-                    override_fields: std::collections::HashSet::new(),
-                },
-                now,
-            )
-            .unwrap();
-        let pid = signal_principal_id("+15554443333");
-        PrincipalStore::new(&state.db)
-            .upsert(&Principal {
-                id: pid.clone(),
-                identifiers: vec![Identifier {
-                    transport: SIGNAL_CHANNEL.into(),
-                    handle: "+15554443333".into(),
-                }],
-                trust_level: CoreTrustLevel::Controller,
-                resolved_by: vec![],
-                metadata: serde_json::json!({}),
-                first_seen: now,
-                last_seen: Some(now),
-                controller_notes: None,
-            })
-            .unwrap();
-        let mut msg = dm("+15554443333", "Elyssa did you have any more questions?");
-        msg.group_id = Some("g-fallopen".into());
-        let outcome = route_inbound_message(&state, &msg).await.unwrap();
-        assert!(
-            matches!(outcome, RouteOutcome::Dispatched { .. }),
-            "no-inference fall-open must dispatch (NOT GroupNotAddressed); got {outcome:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn route_group_inbound_falls_open_when_personality_display_name_too_short() {
-        // Defensive: a misconfigured personality with a 1-char
-        // display_name skips the LLM call entirely and falls open.
-        // Dangerously-short names are treated the same as missing
-        // ones — silencing the agent over a typo would be worse
-        // than the existing prompt-level instruction.
-        use execlaw_core::personality::{PersonalityScopeKind, PersonalityStore, PersonalityUpsert};
-        let state = test_app_state();
-        let now = chrono::Utc::now().timestamp();
-        let store = PersonalityStore::new(&state.db);
-        let default_row = store.get_default().unwrap();
-        store
-            .upsert(
-                &PersonalityUpsert {
-                    scope_kind: PersonalityScopeKind::Default,
-                    scope_ref: "".into(),
-                    display_name: "A".into(),
-                    role: default_row.role,
-                    tone: default_row.tone,
-                    communication_style: default_row.communication_style,
-                    initiative: default_row.initiative,
-                    about_agent: default_row.about_agent,
-                    about_controller: default_row.about_controller,
-                    custom_instructions: default_row.custom_instructions,
-                    voice_id: default_row.voice_id,
-                    override_fields: std::collections::HashSet::new(),
-                },
-                now,
-            )
-            .unwrap();
-        let pid = signal_principal_id("+15554443333");
-        PrincipalStore::new(&state.db)
-            .upsert(&Principal {
-                id: pid.clone(),
-                identifiers: vec![Identifier {
-                    transport: SIGNAL_CHANNEL.into(),
-                    handle: "+15554443333".into(),
-                }],
-                trust_level: CoreTrustLevel::Controller,
-                resolved_by: vec![],
-                metadata: serde_json::json!({}),
-                first_seen: now,
-                last_seen: Some(now),
-                controller_notes: None,
-            })
-            .unwrap();
-        let mut msg = dm("+15554443333", "anything at all");
-        msg.group_id = Some("g-shortname".into());
-        let outcome = route_inbound_message(&state, &msg).await.unwrap();
-        assert!(
-            matches!(outcome, RouteOutcome::Dispatched { .. }),
-            "short-name fall-open must dispatch; got {outcome:?}"
-        );
-    }
+    // ---- group address filter --------------------------------------
+    //
+    // Channel-agnostic classifier behaviour (LLM call, JSON parsing,
+    // fall-open semantics) is exercised by the test suite in
+    // `crate::group_addressing::tests`. Signal-side coverage here is
+    // intentionally minimal: just the "DM path bypasses the filter"
+    // invariant that's specific to how `route_inbound_message`
+    // forks group vs DM routing.
 
     #[tokio::test]
     async fn route_dm_path_is_unaffected_by_group_address_filter() {

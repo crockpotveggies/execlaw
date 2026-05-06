@@ -30,6 +30,7 @@ pub mod chats;
 pub mod docs;
 pub mod events;
 pub mod factory_reset;
+pub mod group_addressing;
 pub mod inference_resolver;
 pub mod mcp_admin;
 pub mod mcp_host;
