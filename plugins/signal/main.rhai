@@ -33,7 +33,7 @@ fn on_enable() {
     // Use the blocking sidecar_url variant (60s budget) so the
     // subscription survives the race instead of bailing silently.
     let base = sidecar_url_blocking("signal-cli", 60000);
-    if base == () {
+    if base == () || base == "" {
         log_warn("signal: sidecar didn't come up within 60s — restart the plugin from Settings → Plugins to retry");
         return;
     }
@@ -60,9 +60,20 @@ fn on_enable() {
         log_warn("signal: signal-cli didn't surface a paired account within 90s — pair via Settings → Plugins → Signal then restart the plugin");
         return;
     }
-    let ws = base.replace("http://", "ws://") + "/v1/receive/" + url_encode(num);
+    // Rhai's `string.replace(a, b)` MUTATES in place + returns unit
+    // (NOT a value), so `base.replace("http://", "ws://") + "/path"`
+    // evaluates to `() + "/path"` -> "/path" with no host. Strip the
+    // "http://" prefix via sub_string instead. sidecar_url contract:
+    // "http://<host>:<port>" — exactly 7 chars to skip.
+    let host_port = base.sub_string(7);
+    let ws = "ws://" + host_port + "/v1/receive/" + url_encode(num);
     log_info("signal: subscribing to inbound WebSocket at " + ws);
-    ws_subscribe(ws, "on_frame");
+    // Discard the returned WsSubscriptionHandle — call_on_enable
+    // serializes the Rhai return value to JSON and the handle isn't
+    // serializable. We don't need it (host owns the subscription's
+    // lifecycle until the plugin is disabled).
+    let _handle = ws_subscribe(ws, "on_frame");
+    ()
 }
 
 // =====================================================================
@@ -380,14 +391,15 @@ fn self_number() {
 
 fn ws_url() {
     let base = sidecar_url("signal-cli");
-    if base == () { return (); }
+    if base == () || base == "" { return (); }
     let num;
     try {
         num = self_number();
     } catch (e) {
         return ();
     }
-    base.replace("http://", "ws://") + "/v1/receive/" + url_encode(num)
+    // sub_string instead of replace — see comment in on_enable.
+    "ws://" + base.sub_string(7) + "/v1/receive/" + url_encode(num)
 }
 
 fn summarise_send_response(resp) {

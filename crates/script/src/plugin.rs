@@ -173,8 +173,38 @@ impl ScriptPlugin {
     /// `on_enable` or not — `MissingFunction` is converted to a
     /// silent success because the convention is opt-in.
     pub async fn call_on_enable(&self) -> ScriptResult<()> {
-        match self.invoke_async("on_enable", vec![]).await {
-            Ok(_) => Ok(()),
+        // Don't go through invoke_async — it forces a Rhai → JSON
+        // conversion of the return value, and on_enable hooks
+        // commonly end with `ws_subscribe(...)` whose return is a
+        // WsSubscriptionHandle that isn't serializable. We just
+        // care that it ran, not what it returned.
+        let inner = self.inner.clone();
+        let result = tokio::task::spawn_blocking(move || -> ScriptResult<()> {
+            let mut scope = rhai::Scope::new();
+            match inner.engine.call_fn::<rhai::Dynamic>(
+                &mut scope,
+                &inner.ast,
+                "on_enable",
+                Vec::<rhai::Dynamic>::new(),
+            ) {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("Function not found") {
+                        Err(ScriptError::MissingFunction("on_enable"))
+                    } else {
+                        Err(ScriptError::Runtime(format!(
+                            "[{}] on_enable: {e}",
+                            inner.plugin_id,
+                        )))
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|e| ScriptError::Runtime(format!("spawn_blocking: {e}")))?;
+        match result {
+            Ok(()) => Ok(()),
             Err(ScriptError::MissingFunction(_)) => Ok(()),
             Err(e) => Err(e),
         }

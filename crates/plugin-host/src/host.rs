@@ -442,6 +442,32 @@ impl PluginHost {
         }
 
         info!(plugin_id, version, "plugin installed");
+
+        // Fire on_enable for script plugins on the install/upgrade
+        // path too — same rationale as `enable()`. With the
+        // `sidecar_url_blocking` binding, on_enable handlers are
+        // expected to poll for sidecar readiness rather than bail
+        // on first-miss, so the historic "wait until boot's
+        // fire_on_enable_for_all" rationale no longer applies.
+        // Best-effort + spawned: install returns immediately even
+        // if the hook polls for minutes.
+        let plugin = self
+            .inner
+            .script_plugins
+            .read()
+            .await
+            .get(&plugin_id)
+            .cloned();
+        if let Some(plugin) = plugin {
+            let pid = plugin_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = plugin.call_on_enable().await {
+                    warn!(plugin_id = %pid, error = %e, "on_enable hook returned an error");
+                } else {
+                    debug!(plugin_id = %pid, "on_enable fired (post-install)");
+                }
+            });
+        }
         Ok(row)
     }
 
