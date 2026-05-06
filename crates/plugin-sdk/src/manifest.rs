@@ -1090,17 +1090,20 @@ mod tests {
         let m = PluginManifest::parse(SIGNAL_MANIFEST)
             .expect("plugins/signal/plugin.toml must parse cleanly");
         assert_eq!(m.plugin.id, "signal");
-        assert_eq!(m.plugin.version, "0.4.4");
+        assert_eq!(m.plugin.version, "0.4.5");
         // The transport icon must propagate from manifest → SDK so
         // the SPA's sidebar can render a Signal-shaped marker on
         // bridged threads. Pin the literal so a typo in the manifest
         // (or a renamed Bootstrap-icons class) gets caught here.
         let transport = m.transport.as_ref().expect("[transport] must be present");
         assert_eq!(transport.icon.as_deref(), Some("chat-quote"));
-        // Six tools mirror the selfhosted-claw integration. If we
+        // 6 agent-callable tools mirror the selfhosted-claw integration,
+        // plus 3 host-internal convention tools (v0.4.5+: set_typing,
+        // send_with_attachments, fetch_attachment) registered so the
+        // host's auto-bridge code can dial in via call_tool. If we
         // add or remove one, this assertion forces a deliberate
         // update — the audit doc should stay in sync.
-        assert_eq!(m.tools.len(), 6);
+        assert_eq!(m.tools.len(), 9);
         // signal.send_message and the group ops MUST carry a
         // Controller floor — that's the security invariant from the
         // audit. Letting a Signal contact use these tools would let
@@ -1140,6 +1143,12 @@ mod tests {
             "signal.create_group",
             "signal.add_group_members",
             "signal.leave_group",
+            // Host-internal convention tools (v0.4.5+) — declared
+            // so plugin_host.call_tool() can find them when the
+            // host's auto-bridge code dials in.
+            "signal.set_typing",
+            "signal.send_with_attachments",
+            "signal.fetch_attachment",
         ] {
             let t = m
                 .tools
