@@ -8,7 +8,8 @@
 //! single-digit plugin counts.
 
 use crate::cache::HttpCache;
-use crate::primitives;
+use crate::host_caps::HostCapabilitiesArc;
+use crate::primitives::{self, OwningPluginSlot};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +33,14 @@ pub struct ScriptEngine {
     /// false. Mirrors the same flag in tool_apis_http's
     /// `HttpWebFetchApi::with_loopback_allowed`.
     allow_loopback: bool,
+    /// Optional host-capabilities surface the script tier reaches
+    /// when scripts call `sidecar_url` / `ws_subscribe` /
+    /// `host_route_inbound`. `None` for unit-test fixtures + dev
+    /// runs without an `AppState`; production passes the host
+    /// crate's concrete impl in via [`with_host_capabilities`].
+    /// Bindings remain registered either way; absent caps surface
+    /// at call time as a clean Rhai runtime error.
+    host_caps: Option<HostCapabilitiesArc>,
 }
 
 impl ScriptEngine {
@@ -45,6 +54,7 @@ impl ScriptEngine {
                 .user_agent("execlaw/script-runtime/0.1")
                 .build(),
             allow_loopback: false,
+            host_caps: None,
         }
     }
 
@@ -52,7 +62,15 @@ impl ScriptEngine {
         Self {
             http_agent,
             allow_loopback: false,
+            host_caps: None,
         }
+    }
+
+    /// Plug the host-capabilities surface in. Production callers
+    /// (the cli boot path) use this; tests typically don't.
+    pub fn with_host_capabilities(mut self, caps: HostCapabilitiesArc) -> Self {
+        self.host_caps = Some(caps);
+        self
     }
 
     /// Test-only: skip the SSRF guard so the engine can talk to
@@ -71,7 +89,12 @@ impl ScriptEngine {
     /// limits + every primitive registered. The returned engine
     /// captures `plugin_id` + a fresh per-plugin cache; reusing
     /// it across plugins would cross the cache.
-    pub fn build_for_plugin(&self, plugin_id: &str) -> rhai::Engine {
+    ///
+    /// Returns `(engine, owning_plugin_slot)` — the slot lets the
+    /// caller plant the live `ScriptPlugin` so `ws_subscribe`'s
+    /// per-frame callback can invoke handlers on the same engine
+    /// without reaching back into the factory.
+    pub fn build_for_plugin(&self, plugin_id: &str) -> (rhai::Engine, OwningPluginSlot) {
         let mut engine = rhai::Engine::new();
         engine.set_max_operations(MAX_OPS_PER_CALL);
         engine.set_max_call_levels(MAX_CALL_DEPTH);
@@ -83,14 +106,15 @@ impl ScriptEngine {
         // `import` / file I/O, but explicit deny is cheap.
         engine.disable_symbol("eval");
         let cache = Arc::new(HttpCache::new());
-        primitives::register(
+        let slot = primitives::register(
             &mut engine,
             plugin_id,
             self.http_agent.clone(),
             cache,
             self.allow_loopback,
+            self.host_caps.clone(),
         );
-        engine
+        (engine, slot)
     }
 }
 
@@ -118,7 +142,7 @@ mod tests {
     #[test]
     fn engine_rejects_runaway_loop_via_operations_limit() {
         let factory = ScriptEngine::new();
-        let engine = factory.build_for_plugin("loop");
+        let (engine, _slot) = factory.build_for_plugin("loop");
         let runaway = "let n = 0; loop { n += 1; }";
         let err = engine.eval::<rhai::Dynamic>(runaway).unwrap_err();
         let s = err.to_string();

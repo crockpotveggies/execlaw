@@ -22,7 +22,7 @@
 
 use crate::engine::ScriptEngine;
 use crate::errors::{ScriptError, ScriptResult};
-use crate::primitives::{json_to_rhai, rhai_to_json};
+use crate::primitives::{json_to_rhai, rhai_to_json, set_owning_plugin};
 use rhai::{AST, Dynamic, Engine, Scope};
 use std::path::Path;
 use std::sync::Arc;
@@ -58,17 +58,24 @@ impl ScriptPlugin {
         source: &str,
         engine_factory: &ScriptEngine,
     ) -> ScriptResult<Self> {
-        let engine = engine_factory.build_for_plugin(plugin_id);
+        let (engine, owning_slot) = engine_factory.build_for_plugin(plugin_id);
         let ast = engine
             .compile(source)
             .map_err(|e| ScriptError::ParseError(format!("[{plugin_id}] compile: {e}")))?;
-        Ok(Self {
+        let plugin = Self {
             inner: Arc::new(ScriptPluginInner {
                 plugin_id: plugin_id.to_owned(),
                 engine,
                 ast,
             }),
-        })
+        };
+        // Plant the live plugin handle so the engine's
+        // `ws_subscribe` binding can invoke per-frame Rhai
+        // handlers via `invoke_async_owned`. Done after the AST
+        // compiles so the slot only holds a fully-constructed
+        // plugin.
+        set_owning_plugin(&owning_slot, plugin.clone());
+        Ok(plugin)
     }
 
     /// Load + parse a script from disk. Convenience wrapper for
@@ -150,6 +157,41 @@ impl ScriptPlugin {
                     } else {
                         ScriptError::Runtime(format!("[{}] {function}: {e}", inner.plugin_id,))
                     }
+                })
+        })
+        .await
+        .map_err(|e| ScriptError::Runtime(format!("spawn_blocking: {e}")))??;
+
+        rhai_to_json(result).map_err(ScriptError::BadShape)
+    }
+
+    /// Same as `invoke_async` but takes the function name as an
+    /// owned `String`. Used by the `ws_subscribe` binding which
+    /// captures the operator-supplied callback name dynamically;
+    /// `invoke_async` requires `&'static str` because Rhai's
+    /// `call_fn` does. The duplication is small and the static
+    /// path stays the canonical one for compile-time-known
+    /// dispatch points (`tool_call`, `identity_resolve`).
+    ///
+    /// `MissingFunction` carries `&'static str` so a missing
+    /// dynamic-name handler surfaces as a `Runtime` error
+    /// instead — the owned name is stamped in the message.
+    pub async fn invoke_async_owned(
+        &self,
+        function: String,
+        args: Vec<Dynamic>,
+    ) -> ScriptResult<serde_json::Value> {
+        let inner = self.inner.clone();
+        let result = tokio::task::spawn_blocking(move || -> ScriptResult<Dynamic> {
+            let mut scope = Scope::new();
+            inner
+                .engine
+                .call_fn::<Dynamic>(&mut scope, &inner.ast, &function, args)
+                .map_err(|e| {
+                    ScriptError::Runtime(format!(
+                        "[{}] {function}: {e}",
+                        inner.plugin_id,
+                    ))
                 })
         })
         .await

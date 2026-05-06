@@ -52,6 +52,15 @@ pub struct PluginManifest {
     #[serde(default)]
     pub skills: Vec<SkillDecl>,
 
+    /// Plugin-served admin endpoints (§ channel-plugin surface).
+    /// Each entry maps an HTTP method + path under
+    /// `/api/admin/plugins/{plugin_id}/...` to a Rhai handler
+    /// function the host invokes per request. Lets channel
+    /// plugins (Signal pairing flows, future WhatsApp QR, etc.)
+    /// expose admin UI without having to live in the host crate.
+    #[serde(default)]
+    pub admin_routes: Vec<AdminRouteDecl>,
+
     /// Runtime declaration — which isolation tier (§4.4) the plugin
     /// runs in and how to spawn it. Optional because tool-only
     /// plugins can sometimes be resolved in-process (Phase 3+
@@ -317,6 +326,46 @@ pub struct OauthAccountDecl {
 pub struct UiPanelDecl {
     pub mount: String,
     pub entry: String,
+}
+
+/// Plugin-served admin endpoint — declared in the plugin's
+/// manifest, routed by the host under
+/// `/api/admin/plugins/{plugin_id}{path}`, dispatched into the
+/// plugin's Rhai script via the named handler function.
+///
+/// Lets channel plugins surface admin operations (Signal pairing,
+/// future WhatsApp QR, future webhook secret rotation, etc.)
+/// without their handler code having to live in the host crate.
+///
+/// Example:
+/// ```toml
+/// [[admin_routes]]
+/// method = "POST"
+/// path = "/pair"
+/// handler = "on_pair_request"
+/// ```
+///
+/// The Rhai handler signature is
+/// `fn on_pair_request(args)` — `args` is a map containing
+/// `method`, `path`, `query` (params parsed from the URL),
+/// `body` (decoded JSON when the request was JSON; raw string
+/// otherwise), and `headers` (subset the host whitelisted).
+/// Return value is JSON the host serialises into the HTTP
+/// response. Plugins can throw a Rhai error to surface a 500.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdminRouteDecl {
+    /// HTTP method — `"GET"`, `"POST"`, `"DELETE"`, etc. The host
+    /// uppercases before matching, so `"post"` is fine too.
+    pub method: String,
+    /// Path under `/api/admin/plugins/{plugin_id}`. Leading slash
+    /// recommended for readability — the host normalises.
+    pub path: String,
+    /// Rhai top-level function name to invoke per request.
+    pub handler: String,
+    /// Optional human-readable description shown in plugin
+    /// catalog / docs UIs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
