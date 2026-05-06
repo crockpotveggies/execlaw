@@ -67,7 +67,7 @@ pub type ToolResultRoutes = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Tool
 /// bound (`config.max_tool_rounds`); this is the runner's
 /// belt-and-suspenders cap so a misconfigured server can't pin the
 /// runner in an infinite loop.
-pub const RUNNER_MAX_TOOL_ROUNDS: u32 = 16;
+pub const RUNNER_MAX_TOOL_ROUNDS: u32 = 24;
 
 pub async fn run_turn(
     tx: ConnectionTx,

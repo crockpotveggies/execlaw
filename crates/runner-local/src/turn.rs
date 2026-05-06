@@ -338,7 +338,31 @@ impl TurnExecutor {
                     Some("agent".into()),
                 )?);
 
+                tracing::info!(
+                    target: "executor::tool_dispatch",
+                    round = rounds,
+                    ordinal = tool_ordinal,
+                    tool = %tc.function.name,
+                    "agent dispatching tool",
+                );
                 let outcome = self.tool_dispatch.call(&tc.function.name, &args).await;
+                match &outcome {
+                    Ok(_) => tracing::info!(
+                        target: "executor::tool_dispatch",
+                        round = rounds,
+                        ordinal = tool_ordinal,
+                        tool = %tc.function.name,
+                        "tool ok",
+                    ),
+                    Err(e) => tracing::warn!(
+                        target: "executor::tool_dispatch",
+                        round = rounds,
+                        ordinal = tool_ordinal,
+                        tool = %tc.function.name,
+                        error = %e,
+                        "tool failed",
+                    ),
+                }
 
                 let result_payload = ToolResultPayload {
                     ordinal: tool_ordinal,

@@ -75,10 +75,12 @@ impl Default for ServerConfig {
             // "search → fetch → summarise" or
             // "list_calendars → list_events → check_availability →
             // create_event" need 4-6 rounds to complete cleanly.
-            // 8 leaves headroom for one retry per step. The runner
-            // hard ceiling stays at `RUNNER_MAX_TOOL_ROUNDS = 16`
-            // so an in-process bug here can never burn past that.
-            max_tool_rounds: 8,
+            // Routines that fan out across multiple sub-tasks
+            // (e.g. "weather + 4 news categories + Signal send"
+            // for a Daily Briefing) realistically hit 10-14 rounds.
+            // 16 keeps headroom for retries while staying inside
+            // the runner hard ceiling (`RUNNER_MAX_TOOL_ROUNDS`).
+            max_tool_rounds: 16,
         }
     }
 }
