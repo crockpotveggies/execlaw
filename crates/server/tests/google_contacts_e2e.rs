@@ -163,6 +163,8 @@ fn build_app(stage_root: PathBuf) -> (axum::Router, AppState) {
         turn_cancel: execlaw_server::turn_cancel::TurnCancellationRegistry::new(),
         runner_supervisor: None,
         research_supervisor: None,
+        sidecar_supervisor: None,
+        host_transports: execlaw_server::transport_registry::HostTransportRegistry::new(),
         skill_capture: execlaw_skills::AutoCaptureSink::noop(),
         reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
     };
@@ -296,7 +298,7 @@ async fn google_contacts_plugin_full_install_and_dispatch_roundtrip() {
     // ---- 5. call_tool contacts.list with token -------------------
     let res = state
         .plugin_host
-        .call_tool("contacts.list", serde_json::json!({"limit": 5}), &["*"])
+        .call_tool("contacts.list", serde_json::json!({"limit": 5}), &["*"], None)
         .await
         .expect("contacts.list dispatch should succeed with valid token + caps");
     let contacts = res["contacts"]

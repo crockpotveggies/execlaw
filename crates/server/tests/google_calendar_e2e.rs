@@ -196,6 +196,8 @@ fn build_app(stage_root: PathBuf) -> (axum::Router, AppState) {
         turn_cancel: execlaw_server::turn_cancel::TurnCancellationRegistry::new(),
         runner_supervisor: None,
         research_supervisor: None,
+        sidecar_supervisor: None,
+        host_transports: execlaw_server::transport_registry::HostTransportRegistry::new(),
         skill_capture: execlaw_skills::AutoCaptureSink::noop(),
         reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
     };
@@ -311,7 +313,7 @@ async fn google_calendar_plugin_full_install_and_dispatch_roundtrip() {
     // Returns Err since the plugin's tool_call throws on missing token.
     let err = state
         .plugin_host
-        .call_tool("calendar.list_calendars", serde_json::json!({}), &["*"])
+        .call_tool("calendar.list_calendars", serde_json::json!({}), &["*"], None)
         .await
         .unwrap_err();
     assert!(
@@ -323,7 +325,7 @@ async fn google_calendar_plugin_full_install_and_dispatch_roundtrip() {
     seed_oauth(&state.db, "ya29.fake");
     let res = state
         .plugin_host
-        .call_tool("calendar.list_calendars", serde_json::json!({}), &["*"])
+        .call_tool("calendar.list_calendars", serde_json::json!({}), &["*"], None)
         .await
         .expect("calendar.list_calendars should succeed with token + caps");
     let cals = res["calendars"].as_array().unwrap();
@@ -334,7 +336,7 @@ async fn google_calendar_plugin_full_install_and_dispatch_roundtrip() {
     // ---- 6. call_tool calendar.list_events default args ---------
     let res = state
         .plugin_host
-        .call_tool("calendar.list_events", serde_json::json!({}), &["*"])
+        .call_tool("calendar.list_events", serde_json::json!({}), &["*"], None)
         .await
         .expect("calendar.list_events should succeed");
     let events = res["events"].as_array().unwrap();

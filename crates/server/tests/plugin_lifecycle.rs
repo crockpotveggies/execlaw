@@ -76,6 +76,8 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
         turn_cancel: execlaw_server::turn_cancel::TurnCancellationRegistry::new(),
         runner_supervisor: None,
         research_supervisor: None,
+        sidecar_supervisor: None,
+        host_transports: execlaw_server::transport_registry::HostTransportRegistry::new(),
         skill_capture: execlaw_skills::AutoCaptureSink::noop(),
         reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
     };
@@ -421,7 +423,7 @@ required_capabilities = ["admin"]
 
     // Caller only has "tools.safe" — not "admin".
     let err = host
-        .call_tool("dangerous", serde_json::json!({}), &["tools.safe"])
+        .call_tool("dangerous", serde_json::json!({}), &["tools.safe"], None)
         .await
         .unwrap_err();
     assert!(err.contains("requires capability 'admin'"), "err: {err}");
@@ -456,7 +458,7 @@ required_capabilities = ["admin", "vault.write"]
     // actually loaded for this plugin, but for a DIFFERENT reason
     // than cap-missing.
     let err = host
-        .call_tool("needs-admin", serde_json::json!({}), &["*"])
+        .call_tool("needs-admin", serde_json::json!({}), &["*"], None)
         .await
         .unwrap_err();
     assert!(
@@ -604,6 +606,7 @@ async fn reference_hello_plugin_roundtrips_end_to_end() {
             "hello.echo",
             serde_json::json!({"message": "execlaw says hi"}),
             &["tools.safe"],
+            None,
         )
         .await
         .expect("tool call should succeed");
@@ -617,6 +620,7 @@ async fn reference_hello_plugin_roundtrips_end_to_end() {
             "hello.echo",
             serde_json::json!({"message": "nope"}),
             &["tools.medium"],
+            None,
         )
         .await
         .expect_err("should be rejected on capability check");
@@ -654,6 +658,7 @@ async fn subprocess_plugin_tool_roundtrips_via_host() {
             "echo-tool",
             serde_json::json!({"msg": "hello"}),
             &["tools.safe"],
+            None,
         )
         .await
         .unwrap();

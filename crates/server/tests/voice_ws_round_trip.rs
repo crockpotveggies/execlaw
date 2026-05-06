@@ -60,6 +60,8 @@ fn build_state(transcript: &'static str) -> AppState {
         turn_cancel: execlaw_server::turn_cancel::TurnCancellationRegistry::new(),
         runner_supervisor: None,
         research_supervisor: None,
+        sidecar_supervisor: None,
+        host_transports: execlaw_server::transport_registry::HostTransportRegistry::new(),
         skill_capture: execlaw_skills::AutoCaptureSink::noop(),
         reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
     }

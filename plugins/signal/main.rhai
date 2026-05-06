@@ -14,8 +14,8 @@
 //   * Outbound + typing + attachment-fetch the host calls via tools.
 //   * Pairing flow (admin_routes handlers).
 
-const SIDECAR_NAME = "signal-cli";
-const CHANNEL = "signal";
+// SIDECAR_NAME = "signal-cli", CHANNEL = "signal" — Rhai consts aren't
+// visible inside fn bodies, so the literals are inlined throughout.
 const SELF_NUMBER_TTL = 300; // 5-min cache for /v1/accounts.
 
 // =====================================================================
@@ -40,52 +40,78 @@ fn on_enable() {
 // =====================================================================
 
 fn on_frame(raw) {
-    // Decode the bbernhard frame shape and hand the result to the
-    // host's standard routing pipeline. Anything we don't act on
-    // (receipts, typing notifs, sync messages) gets dropped here.
-    let env;
-    try {
-        env = parse_json(raw).envelope;
-    } catch (e) {
-        log_warn("signal: undecodable frame: " + e);
-        return;
-    }
-    if env == () { return; }
-    let dm = env.dataMessage;
-    if dm == () { return; }
-    let text = dm.message;
-    let attachments = dm.attachments;
-    if text == () && (attachments == () || attachments.is_empty()) {
-        // Pure receipt / typing / sync — nothing to surface.
-        return;
-    }
-
-    let group_info = dm.groupInfo;
-    let group_id = ();
-    let group_name = ();
-    if group_info != () {
-        group_id = group_info.groupId;
-        let raw_name = group_info.groupName;
-        if raw_name != () && raw_name != "" {
-            group_name = raw_name;
-        }
-    }
-
-    let inbound = #{
-        "channel": CHANNEL,
-        "native_id": env.sourceNumber != () ? env.sourceNumber : env.source,
-        "display_name": env.sourceName,
-        "group_id": group_id,
-        "group_name": group_name,
-        "text": text != () ? text : "",
-        "timestamp_ms": env.timestamp,
-        "attachments": map_attachments(attachments),
-    };
-
+    // Decode + handoff. Decode is split out into a pure `decode_frame`
+    // function that the script-tier test suite calls directly with
+    // no host_caps wiring — keeps the JSON-shape contract under
+    // unit-test coverage without needing a live signal-cli sidecar.
+    let inbound = decode_frame(raw);
+    if inbound == () { return; }
     try {
         host_route_inbound(inbound);
     } catch (e) {
         log_warn("signal: host_route_inbound rejected: " + e);
+    }
+}
+
+// Pure helper: decode a raw bbernhard WS frame into the
+// channel-agnostic InboundMessage shape the host's routing
+// pipeline expects, OR `()` for non-content frames (receipts,
+// typing indicators, sync messages, account mismatches, etc.)
+// the consumer should drop.
+//
+// Pure = doesn't call any host_caps binding. Tested standalone
+// against fixture JSON in crates/script/tests/signal_plugin.rs.
+fn decode_frame(raw) {
+    // The whole decode lives inside one try/catch — any property
+    // access on a non-map (e.g. an integer envelope, or garbage)
+    // throws in Rhai and we want every shape error to drop the
+    // frame, not propagate.
+    try {
+        let env = parse_json(raw).envelope;
+        if env == () { return (); }
+        let dm = env.dataMessage;
+        if dm == () { return (); }
+        let text = dm.message;
+        let attachments = dm.attachments;
+        if text == () && (attachments == () || attachments.is_empty()) {
+            return ();
+        }
+        // Drop whitespace-only message bodies the same way the retired
+        // host-side decoder did — receipts can carry a dataMessage
+        // with `" "` text, which would otherwise route as a real
+        // user_msg.
+        let trimmed = if text != () { trim(text) } else { "" };
+        if trimmed == "" && (attachments == () || attachments.is_empty()) {
+            return ();
+        }
+
+        let group_info = dm.groupInfo;
+        let group_id = ();
+        let group_name = ();
+        if group_info != () {
+            group_id = group_info.groupId;
+            let raw_name = group_info.groupName;
+            if raw_name != () {
+                let name_trimmed = trim(raw_name);
+                if name_trimmed != "" {
+                    group_name = name_trimmed;
+                }
+            }
+        }
+
+        return #{
+            "channel": "signal",
+            "native_id": if env.sourceNumber != () { env.sourceNumber } else { env.source },
+            "display_name": env.sourceName,
+            "group_id": group_id,
+            "group_name": group_name,
+            "text": trimmed,
+            "timestamp_ms": env.timestamp,
+            "attachments": map_attachments(attachments),
+        };
+    } catch (e) {
+        log_warn("signal: undecodable frame: " + e);
+        return ();
     }
 }
 
@@ -136,7 +162,7 @@ fn send_message_impl(args) {
         "recipients": [recipient],
         "message": text,
     };
-    let resp = sidecar_http_post(sidecar_url(SIDECAR_NAME) + "/v2/send", body);
+    let resp = sidecar_http_post(sidecar_url("signal-cli") + "/v2/send", body);
     summarise_send_response(resp)
 }
 
@@ -155,7 +181,7 @@ fn reply_impl(args) {
 // ---- group ops ------------------------------------------------------
 
 fn list_groups_impl() {
-    let url = sidecar_url(SIDECAR_NAME) + "/v1/groups/" + url_encode(self_number());
+    let url = sidecar_url("signal-cli") + "/v1/groups/" + url_encode(self_number());
     let raw = sidecar_http_get(url, #{});
     if raw == () { return #{ "groups": [] }; }
     let out = [];
@@ -163,20 +189,20 @@ fn list_groups_impl() {
         if g.id == () { continue; }
         out.push(#{
             "id": g.id,
-            "name": (g.name != () && g.name != "") ? g.name : (),
-            "member_count": (g.members != () && type_of(g.members) == "array") ? g.members.len() : 0,
+            "name": if g.name != () && g.name != "" { g.name } else { () },
+            "member_count": if g.members != () && type_of(g.members) == "array" { g.members.len() } else { 0 },
         });
     }
     #{ "groups": out, "ack_text": "Listed " + out.len() + " group(s)." }
 }
 
 fn create_group_impl(args) {
-    let title = args.title != () ? args.title : "";
+    let title = if args.title != () { args.title } else { "" };
     let members = args.members;
     if members == () || type_of(members) != "array" || members.is_empty() {
         throw "signal.create_group requires `members` (non-empty array)";
     }
-    let url = sidecar_url(SIDECAR_NAME) + "/v1/groups/" + url_encode(self_number());
+    let url = sidecar_url("signal-cli") + "/v1/groups/" + url_encode(self_number());
     let body = #{ "name": title, "members": members };
     let resp = sidecar_http_post(url, body);
     let group_id = resp.id;
@@ -196,7 +222,7 @@ fn add_group_members_impl(args) {
         throw "signal.add_group_members requires `members` (non-empty array)";
     }
     let group_id = lookup_group_by_name(name);
-    let url = sidecar_url(SIDECAR_NAME) + "/v1/groups/" + url_encode(self_number())
+    let url = sidecar_url("signal-cli") + "/v1/groups/" + url_encode(self_number())
         + "/" + url_encode(group_id) + "/members";
     sidecar_http_post(url, #{ "members": members });
     #{ "ack_text": "Added " + members.len() + " member(s) to \"" + name + "\"." }
@@ -206,7 +232,7 @@ fn leave_group_impl(args) {
     let name = args.groupName;
     if name == () || name == "" { throw "signal.leave_group requires `groupName`"; }
     let group_id = lookup_group_by_name(name);
-    let url = sidecar_url(SIDECAR_NAME) + "/v1/groups/" + url_encode(self_number())
+    let url = sidecar_url("signal-cli") + "/v1/groups/" + url_encode(self_number())
         + "/" + url_encode(group_id) + "/quit";
     sidecar_http_post(url, #{});
     #{ "ack_text": "Left group \"" + name + "\"." }
@@ -224,7 +250,7 @@ fn lookup_group_by_name(name) {
 
 fn send_with_attachments_impl(args) {
     let to = args.to;
-    let text = args.text != () ? args.text : "";
+    let text = if args.text != () { args.text } else { "" };
     let attachments = args.attachments;
     if to == () || to == "" { throw "signal.send_with_attachments requires `to`"; }
     if attachments == () || type_of(attachments) != "array" || attachments.is_empty() {
@@ -249,7 +275,7 @@ fn send_with_attachments_impl(args) {
         "message": text,
         "base64_attachments": data_urls,
     };
-    let resp = sidecar_http_post(sidecar_url(SIDECAR_NAME) + "/v2/send", body);
+    let resp = sidecar_http_post(sidecar_url("signal-cli") + "/v2/send", body);
     summarise_send_response(resp)
 }
 
@@ -258,7 +284,7 @@ fn set_typing_impl(args) {
     let active = args.active == true;
     if to == () || to == "" { throw "signal.set_typing requires `to`"; }
     let recipient = wire_recipient(to);
-    let url = sidecar_url(SIDECAR_NAME) + "/v1/typing-indicator/" + url_encode(self_number());
+    let url = sidecar_url("signal-cli") + "/v1/typing-indicator/" + url_encode(self_number());
     let body = #{ "recipient": recipient };
     if active {
         sidecar_http_post(url, body);
@@ -279,7 +305,7 @@ fn fetch_attachment_impl(args) {
     if attachment_id.len() > 256 || attachment_id.contains("..") {
         throw "signal.fetch_attachment: bad attachment_id shape";
     }
-    let url = sidecar_url(SIDECAR_NAME) + "/v1/attachments/" + url_encode(attachment_id);
+    let url = sidecar_url("signal-cli") + "/v1/attachments/" + url_encode(attachment_id);
     let r = sidecar_http_get_bytes(url, #{});
     #{
         "data_url": r.data_url,
@@ -314,7 +340,7 @@ fn self_number() {
     // Cache /v1/accounts response for 5 min — signal-cli only ever
     // has one account paired in production; the round trip is
     // ~1ms but every outbound call would otherwise hit it.
-    let url = sidecar_url(SIDECAR_NAME) + "/v1/accounts";
+    let url = sidecar_url("signal-cli") + "/v1/accounts";
     let raw = sidecar_http_get(url, #{});
     if raw == () || type_of(raw) != "array" || raw.is_empty() {
         throw "signal: no account paired — visit Settings → Plugin → Signal and scan a QR code";
@@ -323,7 +349,7 @@ fn self_number() {
 }
 
 fn ws_url() {
-    let base = sidecar_url(SIDECAR_NAME);
+    let base = sidecar_url("signal-cli");
     if base == () { return (); }
     let num;
     try {
@@ -346,16 +372,16 @@ fn summarise_send_response(resp) {
 
 // GET /api/admin/plugins/signal/status
 fn admin_status(req) {
-    let mut accounts;
+    let accounts = ();
     try {
-        accounts = sidecar_http_get(sidecar_url(SIDECAR_NAME) + "/v1/accounts", #{});
+        accounts = sidecar_http_get(sidecar_url("signal-cli") + "/v1/accounts", #{});
     } catch (e) {
         return #{ "paired": false, "error": e.to_string() };
     }
     let paired = accounts != () && type_of(accounts) == "array" && !accounts.is_empty();
     #{
         "paired": paired,
-        "accounts": paired ? accounts : [],
+        "accounts": if paired { accounts } else { [] },
     }
 }
 
@@ -368,7 +394,7 @@ fn admin_qrcodelink(req) {
     // endpoint is the bootstrap, so /v1/accounts won't have an
     // entry yet. Use a placeholder that works against bbernhard's
     // unauthenticated qrcodelink path.
-    let url = sidecar_url(SIDECAR_NAME) + "/v1/qrcodelink";
+    let url = sidecar_url("signal-cli") + "/v1/qrcodelink";
     let r = sidecar_http_get_bytes(url, #{ "device_name": "execlaw" });
     #{ "data_url": r.data_url, "mime_type": r.mime_type }
 }

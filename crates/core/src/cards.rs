@@ -715,7 +715,9 @@ mod tests {
         }
         assert_eq!(card.state, CardState::Completed);
         assert_eq!(card.progress, Some(0.9));
-        assert_eq!(card.phase.as_deref(), Some("Synthesizing"));
+        // Closed clears the stale phase so the SPA doesn't render
+        // "Synthesizing" under a "Completed" badge (commit 1fe1407).
+        assert_eq!(card.phase, None);
         assert_eq!(card.updated_at, 400);
     }
 
