@@ -1,109 +1,68 @@
-//! Channel-keyed registry for host-side `TransportApi`
-//! implementations.
+//! Channel-keyed registry — channel → (plugin_id, icon) lookup.
 //!
-//! Why this exists: prior to 2026-05-05 (rev `e42ce4b`), the
-//! "bridge a message back through the originating transport"
-//! call sites in `chats.rs`, `attachment_api.rs`, and
-//! `research/runner.rs` each:
+//! Phase B simplification: pre-fix this registry returned an
+//! `Arc<dyn TransportApi>` per channel through a per-plugin
+//! `HostTransportFactory`. The factory's only job was to mint
+//! a `RhaiBackedTransport` (480 lines of method-mapping shim)
+//! that delegated each `TransportApi` call to a plugin tool name.
+//! Auto-bridge sites (text-reply bridge, attachment fan-out,
+//! research-PDF dispatch) consumed the trait.
 //!
-//!   * matched on the literal `SIGNAL_CHANNEL` string,
-//!   * constructed `SignalCliTransport` directly, and
-//!   * imported `crate::signal_transport` from a module that has
-//!     no business knowing about Signal specifically.
+//! Now the registry just answers two questions:
 //!
-//! Adding a second transport (WhatsApp, Telegram, email-bridged-
-//! agent, ...) would have meant editing every one of those sites —
-//! a Liskov-shaped leak the operator's "are we violating
-//! encapsulation" question correctly flagged.
+//!   1. What plugin handles channel X? (`lookup_first_supported_binding`)
+//!   2. What sidebar icon does channel X want? (`icon_for`)
 //!
-//! The registry inverts the dependency: each transport plugin
-//! ships a [`HostTransportFactory`] at boot, the registry stores
-//! them keyed on `channel`, and the bridge call sites just walk
-//! the conversation's bindings and ask the registry "got a
-//! transport for `binding.channel`?". No channel-string match
-//! outside the per-channel modules.
+//! Auto-bridge sites take the answer + call
+//! `plugin_host.call_tool("<channel>.send_message", ...)`
+//! directly. No adapter layer; the plugin's own tool body owns
+//! the wire-format transformation (e.g. signal-cli's
+//! `group.<base64>` recipient encoding lives in
+//! `plugins/signal/main.rhai::wire_recipient`).
 //!
 //! ### Cardinality
 //!
-//! Today exactly one factory is registered (`signal-cli`). Adding
-//! a second is one [`HostTransportRegistry::register`] call at
-//! boot — no edits to the generic bridge sites.
-//!
-//! ### What stays per-channel
-//!
-//! The host-side **implementation** of each transport (sidecar
-//! protocol, attachment encoding, WS frame parsing) lives in its
-//! own module — for Signal that's `signal_transport.rs`,
-//! `signal_inbound.rs`, `signal_admin.rs`. The plugin manifest
-//! declares the tools as `host_implemented = true` because Rhai
-//! can't reach `Capability::Transport`. That layering is correct
-//! and unchanged. What this module fixes is the *call sites*: they
-//! no longer name Signal.
+//! Today exactly one channel is registered (`signal`). Adding a
+//! second is one [`HostTransportRegistry::register`] call at boot
+//! — no edits to the generic bridge sites.
 
-use async_trait::async_trait;
-use execlaw_core::Database;
-use execlaw_core::ids::ConversationId;
-use execlaw_core::tool::TransportApi;
 use execlaw_core::transport_bindings::TransportBinding;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
-/// Per-channel constructor. Each transport plugin ships one of
-/// these at boot. Captures whatever long-lived dependencies the
-/// transport needs (signal-cli's RPC resolver, a future SMTP
-/// client config, a Telegram bot-token registry) so the per-call
-/// `build` is just a dependency-injection step on the binding's
-/// hot data.
-#[async_trait]
-pub trait HostTransportFactory: Send + Sync {
-    /// Channel name this factory handles. Same string the binding
-    /// store uses (`signal`, `email`, `whatsapp`, ...). Lookup is
-    /// case-sensitive — the upstream binding-insert path
-    /// normalises before write, so we don't here.
-    fn channel(&self) -> &str;
-
-    /// Bootstrap-icons name (without the `bi-` prefix) the SPA
-    /// renders next to thread titles bridged on this transport.
-    /// Sourced from the plugin manifest's `[transport].icon` field
-    /// at registration time. Default "phone" matches the manifest
-    /// fallback so a transport plugin that omits the field still
-    /// renders SOMETHING distinct from the (icon-less) web Control
-    /// thread.
-    fn icon(&self) -> &str {
-        "phone"
-    }
-
-    /// Build a [`TransportApi`] scoped to one conversation +
-    /// recipient. Returns `(transport, wire_recipient)` —
-    /// `wire_recipient` is the recipient string callers should pass
-    /// to `transport.send` / `transport.send_with_attachments` /
-    /// `transport.start_typing`. The factory transforms the binding's
-    /// `foreign_id` for the on-wire format if needed (e.g.
-    /// signal-cli's group recipient is the binding's `internal_id`
-    /// re-base64-encoded with a `group.` prefix; DM recipients pass
-    /// through unchanged).
-    ///
-    /// Failures are rare (resolver refused, transport disabled
-    /// mid-call) — the caller treats `None` as "no transport
-    /// available right now," skips the bridge, and continues. The
-    /// caller already committed any web-side surfaces (card pair /
-    /// model_turn) so a missed bridge degrades gracefully rather
-    /// than failing the user-visible flow.
-    fn build(
-        &self,
-        db: &Database,
-        conversation_id: &ConversationId,
-        foreign_id: &str,
-        is_group: bool,
-    ) -> Option<(Arc<dyn TransportApi>, String)>;
+/// Per-channel boot-time metadata. Cheap to clone.
+#[derive(Debug, Clone)]
+pub struct ChannelInfo {
+    /// Plugin id that owns this channel — auto-bridge dispatches
+    /// `<channel>.send_message` (and friends) into this plugin's
+    /// tool surface.
+    pub plugin_id: String,
+    /// Bootstrap-icons name (sans `bi-` prefix) the SPA renders
+    /// next to bridged thread titles in the sidebar. Sourced from
+    /// the plugin manifest's `[transport].icon` field at boot.
+    pub icon: String,
 }
 
-/// The registry. Cheap to clone (every entry is `Arc`). Plant on
-/// `AppState` once at boot; bridge sites read through it on every
-/// dispatch.
+/// One result from [`HostTransportRegistry::lookup_first_supported_binding`].
+/// The auto-bridge sites pass these fields straight into a
+/// `plugin_host.call_tool` invocation.
+#[derive(Debug, Clone)]
+pub struct ResolvedBinding {
+    pub plugin_id: String,
+    pub channel: String,
+    /// Foreign id from the binding row (`+15551234567` for DMs,
+    /// the raw `internal_id` base64 form for Signal groups).
+    /// Auto-bridge passes this verbatim as the tool's `to` arg —
+    /// the plugin's tool body handles any wire-format transform
+    /// (e.g. `group.<base64>` for Signal groups).
+    pub foreign_id: String,
+    pub is_group: bool,
+}
+
+/// The registry. Cheap to clone. Plant on `AppState` once at boot;
+/// auto-bridge call sites read through it on every dispatch.
 #[derive(Clone, Default)]
 pub struct HostTransportRegistry {
-    by_channel: BTreeMap<String, Arc<dyn HostTransportFactory>>,
+    by_channel: BTreeMap<String, ChannelInfo>,
 }
 
 impl HostTransportRegistry {
@@ -111,78 +70,56 @@ impl HostTransportRegistry {
         Self::default()
     }
 
-    /// Register a factory. Idempotent on the same channel name —
-    /// later registrations overwrite earlier ones (intentional:
-    /// lets a test fixture replace the Signal factory with a mock
-    /// without restructuring the boot path).
-    pub fn register(&mut self, factory: Arc<dyn HostTransportFactory>) {
-        self.by_channel.insert(factory.channel().to_owned(), factory);
+    /// Register a channel. Idempotent on the same channel name —
+    /// later registrations overwrite earlier ones (intentional;
+    /// lets a test fixture replace the canonical mapping with a
+    /// mock without restructuring the boot path).
+    pub fn register(&mut self, channel: impl Into<String>, info: ChannelInfo) {
+        self.by_channel.insert(channel.into(), info);
     }
 
-    /// Walk `bindings` in order and return a transport for the
-    /// first binding whose channel has a registered factory. The
-    /// per-binding `foreign_id` and `is_group` flag flow into
-    /// [`HostTransportFactory::build`] so transports that key on
-    /// recipient (signal-cli's per-message addressing) get them
-    /// without the bridge site having to thread them.
-    ///
-    /// Returns `(transport, channel, wire_recipient)` so the caller
-    /// can dispatch straight to
-    /// `transport.send(channel, wire_recipient, text)`. The factory
-    /// is responsible for transforming `foreign_id` to the on-wire
-    /// recipient format when required by the transport (e.g.
-    /// signal-cli expects the `group.<base64>` form for groups, not
-    /// the binding's `internal_id` form).
+    /// Walk `bindings` in order; return the first whose channel is
+    /// registered. Auto-bridge sites use the result to dispatch
+    /// `plugin_host.call_tool("<channel>.send_message", {to,
+    /// text, ...})`.
     ///
     /// `None` when none of the conversation's bindings have a
-    /// registered transport (web-only conversation, transport
-    /// plugin not installed).
-    pub fn build_for_first_supported_binding(
+    /// registered handler (web-only conversation, or the channel's
+    /// plugin isn't installed).
+    pub fn lookup_first_supported_binding(
         &self,
-        db: &Database,
-        conversation_id: &ConversationId,
         bindings: &[TransportBinding],
-    ) -> Option<(Arc<dyn TransportApi>, String, String)> {
+    ) -> Option<ResolvedBinding> {
         for binding in bindings {
-            let factory = match self.by_channel.get(&binding.channel) {
-                Some(f) => f,
-                None => continue,
-            };
-            if let Some((transport, wire_recipient)) =
-                factory.build(db, conversation_id, &binding.foreign_id, binding.is_group)
-            {
-                return Some((transport, binding.channel.clone(), wire_recipient));
+            if let Some(info) = self.by_channel.get(&binding.channel) {
+                return Some(ResolvedBinding {
+                    plugin_id: info.plugin_id.clone(),
+                    channel: binding.channel.clone(),
+                    foreign_id: binding.foreign_id.clone(),
+                    is_group: binding.is_group,
+                });
             }
         }
         None
     }
 
-    /// Bootstrap-icons name registered for `channel`, or `None` when
-    /// the channel has no factory. The SPA's sidebar uses this to
-    /// render a per-channel marker next to bridged thread titles —
-    /// returning the manifest-supplied icon (or the trait default
-    /// "phone") so the operator can distinguish Signal / WhatsApp /
-    /// future-email at a glance.
+    /// Bootstrap-icons name registered for `channel`, or `None`
+    /// when the channel has no entry. Used by the SPA's sidebar
+    /// per-row marker via the `/api/chats` thread-list endpoint.
     pub fn icon_for(&self, channel: &str) -> Option<&str> {
-        self.by_channel.get(channel).map(|f| f.icon())
+        self.by_channel.get(channel).map(|i| i.icon.as_str())
     }
 
-    /// Number of registered channels. Used by tests + an optional
-    /// boot-log line so the operator can see "1 transport registered:
-    /// signal" without grepping.
     pub fn len(&self) -> usize {
         self.by_channel.len()
     }
 
-    /// True when no factories are registered. Equivalent to
-    /// `len() == 0`.
     pub fn is_empty(&self) -> bool {
         self.by_channel.is_empty()
     }
 
-    /// Iterator over registered channel names. Useful for boot
-    /// logging + the `/api/admin/me/transports` endpoint that
-    /// drives the SPA's "My identities" dropdown.
+    /// Iterator over registered channel names. Used by boot
+    /// logging + future plugin-introspection paths.
     pub fn channels(&self) -> impl Iterator<Item = &str> {
         self.by_channel.keys().map(|s| s.as_str())
     }
@@ -191,96 +128,8 @@ impl HostTransportRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use execlaw_core::tool::ApiError;
-    use execlaw_core::transport_bindings::TransportBinding;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// Mock factory that records every `build` call so a test can
-    /// pin "the registry actually called us with the right channel
-    /// + recipient."
-    struct CountingFactory {
-        channel: String,
-        builds: Arc<AtomicU32>,
-        last_recipient: Arc<std::sync::Mutex<Option<String>>>,
-    }
-
-    impl CountingFactory {
-        fn new(channel: &str) -> (Self, Arc<AtomicU32>, Arc<std::sync::Mutex<Option<String>>>) {
-            let builds = Arc::new(AtomicU32::new(0));
-            let last = Arc::new(std::sync::Mutex::new(None));
-            (
-                Self {
-                    channel: channel.to_owned(),
-                    builds: builds.clone(),
-                    last_recipient: last.clone(),
-                },
-                builds,
-                last,
-            )
-        }
-    }
-
-    /// Stub transport that errors for every call. The registry
-    /// tests don't dispatch — they just verify the build path —
-    /// so a non-functional `TransportApi` is fine here.
-    struct StubTransport;
-
-    #[async_trait]
-    impl TransportApi for StubTransport {
-        async fn resolve_recipient(
-            &self,
-            _channel: &str,
-            _free_form: &str,
-        ) -> Result<String, ApiError> {
-            Err(ApiError::Validation("stub".into()))
-        }
-        async fn send(
-            &self,
-            _channel: &str,
-            _recipient: &str,
-            _text: &str,
-        ) -> Result<String, ApiError> {
-            Err(ApiError::Validation("stub".into()))
-        }
-        async fn current_chat_id(&self, _channel: &str) -> Result<Option<String>, ApiError> {
-            Ok(None)
-        }
-    }
-
-    #[async_trait]
-    impl HostTransportFactory for CountingFactory {
-        fn channel(&self) -> &str {
-            &self.channel
-        }
-        fn build(
-            &self,
-            _db: &Database,
-            _cid: &ConversationId,
-            foreign_id: &str,
-            is_group: bool,
-        ) -> Option<(Arc<dyn TransportApi>, String)> {
-            self.builds.fetch_add(1, Ordering::Relaxed);
-            *self.last_recipient.lock().unwrap() = Some(foreign_id.to_owned());
-            // Mock the signal-cli "encode group ids as group.<b64>"
-            // transformation so tests can pin both passthrough and
-            // transformed recipients.
-            let wire = if is_group {
-                format!("GROUP_OF:{foreign_id}")
-            } else {
-                foreign_id.to_owned()
-            };
-            Some((Arc::new(StubTransport), wire))
-        }
-    }
-
-    fn fresh_db() -> Database {
-        let db = execlaw_core::Database::open(&execlaw_core::DbConfig::in_memory_unencrypted())
-            .unwrap();
-        execlaw_core::MigrationRunner::new(&db).apply_all().unwrap();
-        db
-    }
-
-    fn b(channel: &str, foreign: &str) -> TransportBinding {
+    fn binding(channel: &str, foreign: &str) -> TransportBinding {
         TransportBinding {
             channel: channel.to_owned(),
             foreign_id: foreign.to_owned(),
@@ -296,116 +145,117 @@ mod tests {
         let r = HostTransportRegistry::new();
         assert!(r.is_empty());
         assert_eq!(r.len(), 0);
-        let db = fresh_db();
-        let cid = ConversationId::from("c-1");
-        let got = r.build_for_first_supported_binding(&db, &cid, &[b("signal", "+15551234567")]);
-        assert!(got.is_none());
+        assert!(
+            r.lookup_first_supported_binding(&[binding("signal", "+15551234567")])
+                .is_none()
+        );
+        assert!(r.icon_for("signal").is_none());
     }
 
     #[test]
-    fn registry_dispatches_to_matching_channel() {
+    fn registered_channel_round_trips() {
         let mut r = HostTransportRegistry::new();
-        let (sf, sb, sl) = CountingFactory::new("signal");
-        let (ef, eb, _el) = CountingFactory::new("email");
-        r.register(Arc::new(sf));
-        r.register(Arc::new(ef));
-        assert_eq!(r.len(), 2);
-        let db = fresh_db();
-        let cid = ConversationId::from("c-1");
-        let got = r.build_for_first_supported_binding(
-            &db,
-            &cid,
-            &[b("signal", "+15551234567")],
+        r.register(
+            "signal",
+            ChannelInfo {
+                plugin_id: "signal".into(),
+                icon: "chat-quote".into(),
+            },
         );
-        assert!(got.is_some());
-        let (_t, ch, fid) = got.unwrap();
-        assert_eq!(ch, "signal");
-        assert_eq!(fid, "+15551234567");
-        assert_eq!(sb.load(Ordering::Relaxed), 1, "signal factory must have been called");
-        assert_eq!(eb.load(Ordering::Relaxed), 0, "email factory must NOT have been called");
-        assert_eq!(sl.lock().unwrap().as_deref(), Some("+15551234567"));
+        assert_eq!(r.icon_for("signal"), Some("chat-quote"));
+        let resolved = r
+            .lookup_first_supported_binding(&[binding("signal", "+15551234567")])
+            .expect("signal binding must resolve");
+        assert_eq!(resolved.plugin_id, "signal");
+        assert_eq!(resolved.channel, "signal");
+        assert_eq!(resolved.foreign_id, "+15551234567");
+        assert!(!resolved.is_group);
     }
 
     #[test]
-    fn registry_skips_unregistered_channels_and_finds_first_match() {
-        // Walk order: skip channels with no factory, return the
-        // first that has one. Simulates a future "this conversation
-        // is bridged on whatsapp + signal; whatsapp plugin not
-        // installed, so signal wins" case.
+    fn lookup_skips_unregistered_channels_and_finds_first_match() {
         let mut r = HostTransportRegistry::new();
-        let (sf, sb, _) = CountingFactory::new("signal");
-        r.register(Arc::new(sf));
-        let db = fresh_db();
-        let cid = ConversationId::from("c-1");
-        let got = r.build_for_first_supported_binding(
-            &db,
-            &cid,
-            &[b("whatsapp", "+15550000001"), b("signal", "+15550000002")],
+        r.register(
+            "signal",
+            ChannelInfo {
+                plugin_id: "signal".into(),
+                icon: "chat-quote".into(),
+            },
         );
-        assert!(got.is_some());
-        let (_t, ch, fid) = got.unwrap();
-        assert_eq!(ch, "signal");
-        assert_eq!(fid, "+15550000002");
-        assert_eq!(sb.load(Ordering::Relaxed), 1);
+        let resolved = r
+            .lookup_first_supported_binding(&[
+                binding("whatsapp", "+15550000001"),
+                binding("signal", "+15550000002"),
+            ])
+            .unwrap();
+        assert_eq!(resolved.channel, "signal");
+        assert_eq!(resolved.foreign_id, "+15550000002");
+    }
+
+    #[test]
+    fn group_binding_propagates_is_group_flag() {
+        let mut r = HostTransportRegistry::new();
+        r.register(
+            "signal",
+            ChannelInfo {
+                plugin_id: "signal".into(),
+                icon: "chat-quote".into(),
+            },
+        );
+        let mut group = binding("signal", "BASE64_INTERNAL_ID");
+        group.is_group = true;
+        let resolved = r.lookup_first_supported_binding(&[group]).unwrap();
+        assert_eq!(resolved.foreign_id, "BASE64_INTERNAL_ID");
+        assert!(
+            resolved.is_group,
+            "group bindings must propagate is_group through to the auto-bridge caller"
+        );
     }
 
     #[test]
     fn channels_iterator_lists_every_registered_channel() {
         let mut r = HostTransportRegistry::new();
-        let (sf, _, _) = CountingFactory::new("signal");
-        let (ef, _, _) = CountingFactory::new("email");
-        r.register(Arc::new(sf));
-        r.register(Arc::new(ef));
+        r.register(
+            "signal",
+            ChannelInfo {
+                plugin_id: "signal".into(),
+                icon: "chat-quote".into(),
+            },
+        );
+        r.register(
+            "whatsapp",
+            ChannelInfo {
+                plugin_id: "whatsapp".into(),
+                icon: "phone".into(),
+            },
+        );
         let mut names: Vec<&str> = r.channels().collect();
         names.sort();
-        assert_eq!(names, vec!["email", "signal"]);
-    }
-
-    #[test]
-    fn registry_passes_is_group_flag_to_factory() {
-        // Group bindings and DM bindings both flow through the
-        // registry; the factory is responsible for transforming the
-        // foreign_id into the on-wire recipient format. Pin that
-        // (a) groups are not skipped, and (b) the factory's wire
-        // recipient propagates back through the registry.
-        let mut r = HostTransportRegistry::new();
-        let (sf, sb, _) = CountingFactory::new("signal");
-        r.register(Arc::new(sf));
-        let db = fresh_db();
-        let cid = ConversationId::from("c-1");
-
-        // DM binding → recipient passes through unchanged.
-        let dm = b("signal", "+15551234567");
-        let got = r.build_for_first_supported_binding(&db, &cid, &[dm]);
-        assert!(got.is_some());
-        let (_t, ch, wire) = got.unwrap();
-        assert_eq!(ch, "signal");
-        assert_eq!(wire, "+15551234567");
-
-        // Group binding → factory transforms foreign_id (mock uses
-        // a `GROUP_OF:` prefix; the real Signal factory base64-
-        // encodes the bytes and prefixes `group.`).
-        let mut group_binding = b("signal", "BASE64_INTERNAL_ID");
-        group_binding.is_group = true;
-        let got = r.build_for_first_supported_binding(&db, &cid, &[group_binding]);
-        assert!(got.is_some());
-        let (_t, _ch, wire) = got.unwrap();
-        assert_eq!(wire, "GROUP_OF:BASE64_INTERNAL_ID");
-        assert_eq!(sb.load(Ordering::Relaxed), 2);
+        assert_eq!(names, vec!["signal", "whatsapp"]);
     }
 
     #[test]
     fn re_registering_same_channel_overwrites() {
         let mut r = HostTransportRegistry::new();
-        let (a, ab, _) = CountingFactory::new("signal");
-        let (b_factory, bb, _) = CountingFactory::new("signal");
-        r.register(Arc::new(a));
-        r.register(Arc::new(b_factory));
-        assert_eq!(r.len(), 1, "second register must REPLACE, not stack");
-        let db = fresh_db();
-        let cid = ConversationId::from("c-1");
-        r.build_for_first_supported_binding(&db, &cid, &[b("signal", "+1")]);
-        assert_eq!(ab.load(Ordering::Relaxed), 0);
-        assert_eq!(bb.load(Ordering::Relaxed), 1);
+        r.register(
+            "signal",
+            ChannelInfo {
+                plugin_id: "signal-a".into(),
+                icon: "icon-a".into(),
+            },
+        );
+        r.register(
+            "signal",
+            ChannelInfo {
+                plugin_id: "signal-b".into(),
+                icon: "icon-b".into(),
+            },
+        );
+        assert_eq!(r.len(), 1);
+        let resolved = r
+            .lookup_first_supported_binding(&[binding("signal", "+1")])
+            .unwrap();
+        assert_eq!(resolved.plugin_id, "signal-b");
+        assert_eq!(r.icon_for("signal"), Some("icon-b"));
     }
 }

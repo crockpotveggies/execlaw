@@ -77,6 +77,11 @@ pub struct ResearchSupervisor {
     /// transport bound to the conversation. `None` skips the
     /// bridge step.
     pub host_transports: Option<crate::transport_registry::HostTransportRegistry>,
+    /// Plugin host. Paired with `host_transports` so the
+    /// synthesize-phase auto-bridge can dispatch
+    /// `<channel>.send_with_attachments` directly into the
+    /// channel's plugin tool surface.
+    pub plugin_host: Option<execlaw_plugin_host::PluginHost>,
 }
 
 impl ResearchSupervisor {
@@ -96,6 +101,7 @@ impl ResearchSupervisor {
             cancel_tokens: Arc::new(DashMap::new()),
             wake: Arc::new(Notify::new()),
             host_transports: None,
+            plugin_host: None,
         }
     }
 
@@ -108,6 +114,14 @@ impl ResearchSupervisor {
         registry: Option<crate::transport_registry::HostTransportRegistry>,
     ) -> Self {
         self.host_transports = registry;
+        self
+    }
+
+    pub fn with_plugin_host(
+        mut self,
+        plugin_host: Option<execlaw_plugin_host::PluginHost>,
+    ) -> Self {
+        self.plugin_host = plugin_host;
         self
     }
 
@@ -261,6 +275,7 @@ impl ResearchSupervisor {
         let inference_resolver = self.inference.clone();
         let events = self.events.clone();
         let host_transports = self.host_transports.clone();
+        let plugin_host = self.plugin_host.clone();
         // Mint + register a cancellation token so the cancel admin
         // endpoint can short-circuit the gather phase mid-flight.
         // The spawned task removes its entry on exit (any path —
@@ -282,6 +297,7 @@ impl ResearchSupervisor {
                 events,
                 cancel: cancel.clone(),
                 host_transports,
+                plugin_host,
             };
             let result = run_job(ctx).await;
             tokens.remove(&job_id_key);

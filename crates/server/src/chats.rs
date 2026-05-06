@@ -2382,7 +2382,6 @@ async fn bridge_text_reply_to_originating_transport(
 ) -> Result<(), String> {
     use execlaw_core::events::{EventKind, ToolUsePayload};
     use execlaw_core::principal_groups::PrincipalGroupStore;
-    use execlaw_core::tool::TransportApi;
     use execlaw_core::transport_bindings::TransportBindingStore;
 
     // Step 1: discover the conversation's transport bindings. No
@@ -2397,16 +2396,17 @@ async fn bridge_text_reply_to_originating_transport(
         .bindings_for_group_any_channel(&pg_id)
         .map_err(|e| format!("bindings_for_group: {e}"))?;
 
-    // Step 2: ask the host-transport registry for a matching
-    // factory. Channel-agnostic — `signal` happens to be the only
-    // registered transport today, but the bridge no longer hardcodes
-    // it. Empty registry / web-only conversation → exit.
-    let Some((transport, channel, recipient)) = state
+    // Step 2: registry lookup. Empty registry / web-only
+    // conversation / no installed plugin for any binding's
+    // channel → exit.
+    let Some(resolved) = state
         .host_transports
-        .build_for_first_supported_binding(&state.db, cid, &bindings)
+        .lookup_first_supported_binding(&bindings)
     else {
         return Ok(());
     };
+    let channel = &resolved.channel;
+    let foreign_id = &resolved.foreign_id;
 
     // Step 3: scan the conversation's events to find the most
     // recent turn. We need (a) the last model_turn's text and
@@ -2431,28 +2431,20 @@ async fn bridge_text_reply_to_originating_transport(
     let turn = &events[turn_start_idx..];
 
     // Step 4: bail if the agent already dispatched via a transport-
-    // send tool in this turn. The set of tool names that count as
-    // "already dispatched" is per-channel; today's only entry is
-    // signal.* but as transports register their own send tools the
-    // list grows. We resolve it from the channel name so the bridge
-    // call site stays channel-agnostic.
+    // send tool in this turn.
     let already_dispatched = turn.iter().any(|ev| {
         if !matches!(ev.kind, EventKind::ToolUse) {
             return false;
         }
         ev.decode_payload::<ToolUsePayload>()
-            .map(|p| is_send_tool_for_channel(&channel, &p.tool_name))
+            .map(|p| is_send_tool_for_channel(channel, &p.tool_name))
             .unwrap_or(false)
     });
     if already_dispatched {
         return Ok(());
     }
 
-    // Step 5: extract the model_turn text. Must be non-empty —
-    // tool-using turns legitimately commit empty model_turn text
-    // (the tool IS the reply). For our path (no transport tool
-    // used), empty text means the agent stayed silent and there's
-    // nothing to bridge.
+    // Step 5: extract the model_turn text.
     let model_text = turn
         .iter()
         .filter_map(|ev| {
@@ -2469,11 +2461,18 @@ async fn bridge_text_reply_to_originating_transport(
         return Ok(());
     }
 
-    // Step 6: dispatch via the registry-resolved transport.
-    transport
-        .send(&channel, &recipient, &model_text)
+    // Step 6: dispatch directly into the channel's plugin tool.
+    // The plugin's tool body owns wire-format transformation
+    // (e.g. signal-cli's `group.<base64>` recipient encoding
+    // lives in plugins/signal/main.rhai's `wire_recipient` fn).
+    let tool_name = format!("{channel}.send_message");
+    let args = serde_json::json!({"to": foreign_id, "text": model_text});
+    state
+        .plugin_host
+        .call_tool(&tool_name, args, &["*"], Some("Controller"))
         .await
-        .map_err(|e| format!("transport send: {e}"))?;
+        .map_err(|e| format!("plugin tool {tool_name}: {e}"))?;
+    let recipient = foreign_id;
     tracing::info!(
         target: "chats::dispatch_external_turn",
         conversation_id = %cid.as_str(),
@@ -2535,34 +2534,40 @@ impl TypingIndicatorGuard {
             Err(_) => return TypingIndicatorGuard { cancel: None },
         };
 
-        // 2. Ask the registry for a transport.
-        let Some((transport, channel, recipient)) = state
+        // 2. Ask the registry for a binding.
+        let Some(resolved) = state
             .host_transports
-            .build_for_first_supported_binding(&state.db, cid, &bindings)
+            .lookup_first_supported_binding(&bindings)
         else {
             return TypingIndicatorGuard { cancel: None };
         };
+        let channel = resolved.channel.clone();
+        let recipient = resolved.foreign_id.clone();
+        let plugin_host = state.plugin_host.clone();
 
-        // 3. Spawn the refresh loop.
+        // 3. Spawn the refresh loop. Each tick dispatches the
+        //    plugin's `<channel>.set_typing` tool with the
+        //    operator-supplied recipient. The plugin owns the
+        //    HTTP shape (signal-cli's PUT/DELETE typing-indicator
+        //    endpoint, etc.) — host stays channel-agnostic.
         let cancel = tokio_util::sync::CancellationToken::new();
         let task_cancel = cancel.clone();
         tokio::spawn(async move {
-            // 4-second cadence: under Signal's ~5s typing-
-            // indicator timeout so the contact never sees the
-            // indicator flicker off mid-turn.
             const REFRESH_INTERVAL: std::time::Duration =
                 std::time::Duration::from_secs(4);
+            let tool_name = format!("{channel}.set_typing");
             loop {
-                // Fire (refresh). Errors here are common during
-                // sidecar restarts; log at debug so a slow
-                // restart doesn't fill the operator's log.
-                if let Err(e) = transport.start_typing(&channel, &recipient).await {
+                let args = serde_json::json!({"to": recipient, "active": true});
+                if let Err(e) = plugin_host
+                    .call_tool(&tool_name, args, &["*"], Some("Controller"))
+                    .await
+                {
                     tracing::debug!(
                         target: "chats::typing_indicator",
                         channel = %channel,
                         recipient = %recipient,
                         error = %e,
-                        "start_typing failed; will retry on next refresh tick",
+                        "set_typing(active=true) failed; will retry on next refresh tick",
                     );
                 }
                 tokio::select! {
@@ -2572,7 +2577,10 @@ impl TypingIndicatorGuard {
             }
             // Explicit stop so the contact sees "stopped typing"
             // immediately. Best-effort.
-            let _ = transport.stop_typing(&channel, &recipient).await;
+            let stop_args = serde_json::json!({"to": recipient, "active": false});
+            let _ = plugin_host
+                .call_tool(&tool_name, stop_args, &["*"], Some("Controller"))
+                .await;
         });
         TypingIndicatorGuard {
             cancel: Some(cancel),

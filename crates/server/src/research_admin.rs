@@ -444,6 +444,7 @@ pub async fn advance_job_handler(
         model,
         cancel: cancel.clone(),
         host_transports: Some(state.host_transports.clone()),
+        plugin_host: Some(state.plugin_host.clone()),
     };
     let db_for_notes = state.db.clone();
     let id_for_task = id.clone();

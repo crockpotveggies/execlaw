@@ -90,6 +90,12 @@ pub struct JobRunCtx {
     /// synthesize phase can fan the report PDF out through every
     /// registered transport bound to the conversation.
     pub host_transports: Option<crate::transport_registry::HostTransportRegistry>,
+    /// Plugin host. Paired with `host_transports` so the
+    /// synthesize-phase auto-bridge can dispatch
+    /// `<channel>.send_with_attachments` directly into the
+    /// channel's plugin. None disables the auto-bridge (web-only
+    /// research run).
+    pub plugin_host: Option<execlaw_plugin_host::PluginHost>,
 }
 
 /// System prompt for the planner LLM call. Asks for a strict JSON
@@ -149,6 +155,7 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
         events,
         cancel,
         host_transports,
+        plugin_host,
     } = ctx;
 
     // Earliest pre-flight cancel check. The supervisor spawns this
@@ -440,6 +447,7 @@ pub async fn run_job(ctx: JobRunCtx) -> Result<ResearchJobRow, ResearchRunnerErr
         model: model.clone(),
         cancel: cancel.clone(),
         host_transports: host_transports.clone(),
+        plugin_host: plugin_host.clone(),
     };
     let notes = run_gather_phase(
         &phase_deps,
@@ -493,6 +501,11 @@ pub struct PhaseDeps {
     /// adds a new transport plugin by registering its factory at
     /// boot, no edits here. `None` skips the bridge step.
     pub host_transports: Option<crate::transport_registry::HostTransportRegistry>,
+    /// Plugin host. Required alongside `host_transports` for the
+    /// synthesize-phase auto-bridge to dispatch
+    /// `<channel>.send_with_attachments` into the channel's plugin.
+    /// `None` disables the bridge.
+    pub plugin_host: Option<execlaw_plugin_host::PluginHost>,
 }
 
 /// Run the gather phase end-to-end: mark_gathering → run_gather →
@@ -523,6 +536,7 @@ pub async fn run_gather_phase(
         model,
         cancel,
         host_transports: _,
+        plugin_host: _,
     } = deps;
     // 2026-05-04 — resolve the active provider from
     // config_search_providers instead of hard-coding DDG. The
@@ -627,6 +641,7 @@ pub async fn run_synthesize_phase(
         model,
         cancel,
         host_transports,
+        plugin_host,
     } = deps;
     // Pre-flight cancel check. If the operator cancelled during
     // gather (or between phases), the row is already Cancelled —
@@ -766,10 +781,13 @@ pub async fn run_synthesize_phase(
     // for. Channel-agnostic — the bridge no longer names Signal.
     // Best-effort: a failure logs but doesn't mark the job failed
     // (the SPA's download chip stays as a fallback).
-    if let Some(registry) = host_transports.as_ref() {
+    if let (Some(registry), Some(plugin_host_ref)) =
+        (host_transports.as_ref(), plugin_host.as_ref())
+    {
         bridge_research_pdf_to_originating_transport(
             db,
             registry,
+            plugin_host_ref,
             conv_id,
             outcome.attachment_id.as_str(),
             query,
@@ -812,12 +830,12 @@ pub async fn run_synthesize_phase(
 async fn bridge_research_pdf_to_originating_transport(
     db: &Database,
     registry: &crate::transport_registry::HostTransportRegistry,
+    plugin_host: &execlaw_plugin_host::PluginHost,
     conversation_id: &execlaw_core::ids::ConversationId,
     attachment_id: &str,
     query: &str,
 ) {
     use execlaw_core::principal_groups::PrincipalGroupStore;
-    use execlaw_core::tool::TransportApi;
     use execlaw_core::transport_bindings::TransportBindingStore;
 
     let pg_store = PrincipalGroupStore::new(db);
@@ -838,33 +856,30 @@ async fn bridge_research_pdf_to_originating_transport(
             return;
         }
     };
-    let Some((transport, channel, recipient)) =
-        registry.build_for_first_supported_binding(db, conversation_id, &bindings)
-    else {
-        return; // web-only conversation OR registry has no factory for any binding's channel
+    let Some(resolved) = registry.lookup_first_supported_binding(&bindings) else {
+        return;
     };
 
-    // Prose framing: a tight one-liner echoing the original query
-    // is enough — the PDF is the actual deliverable.
     let summary = format!(
         "Deep-research report ready for: {}",
         truncate_for_error(query, 240)
     );
-    match transport
-        .send_with_attachments(
-            &channel,
-            &recipient,
-            &summary,
-            &[attachment_id.to_owned()],
-        )
+    let tool_name = format!("{}.send_with_attachments", resolved.channel);
+    let args = serde_json::json!({
+        "to": resolved.foreign_id,
+        "text": summary,
+        "attachments": [attachment_id],
+    });
+    match plugin_host
+        .call_tool(&tool_name, args, &["*"], Some("Controller"))
         .await
     {
         Ok(_) => {
             tracing::info!(
                 target: "research::bridge",
                 conversation_id = %conversation_id.as_str(),
-                channel = %channel,
-                recipient = %recipient,
+                channel = %resolved.channel,
+                recipient = %resolved.foreign_id,
                 attachment_id = %attachment_id,
                 "auto-dispatched research PDF via originating transport",
             );
@@ -873,8 +888,8 @@ async fn bridge_research_pdf_to_originating_transport(
             tracing::warn!(
                 target: "research::bridge",
                 conversation_id = %conversation_id.as_str(),
-                channel = %channel,
-                recipient = %recipient,
+                channel = %resolved.channel,
+                recipient = %resolved.foreign_id,
                 error = %e,
                 "research PDF transport dispatch failed; SPA download chip remains the only deliverable",
             );
@@ -1579,6 +1594,7 @@ mod tests {
             model: "test-model".into(),
             cancel,
             host_transports: None,
+            plugin_host: None,
         };
 
         // Must return Ok(()) cleanly without making the LLM call,
@@ -1731,6 +1747,7 @@ mod tests {
             model: "test-model".into(),
             cancel,
             host_transports: None,
+            plugin_host: None,
         };
 
         let notes = vec![ResearchNote {
@@ -1960,6 +1977,7 @@ mod tests {
             events: EventBus::new(),
             cancel,
             host_transports: None,
+            plugin_host: None,
         };
 
         let row = run_job(ctx).await.expect("must short-circuit cleanly");

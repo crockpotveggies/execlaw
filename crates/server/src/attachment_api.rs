@@ -37,11 +37,14 @@ pub struct ServerAttachmentApi {
     /// Host-transport registry. When the caller's conversation is
     /// bound to a transport (state_transport_bindings hit on the
     /// conversation's principal_group) AND the registry has a
-    /// factory for that channel, `send` ALSO ships the attachment
-    /// through the transport — not just the web-UI download chip.
-    /// `None` keeps the legacy web-only behavior (test fixtures,
-    /// managed-mode boots without transport plugins).
+    /// channel mapping for that channel, `send` ALSO ships the
+    /// attachment through the channel's plugin — not just the
+    /// web-UI download chip.
     transports: Option<crate::transport_registry::HostTransportRegistry>,
+    /// Plugin host for dispatching `<channel>.send_with_attachments`
+    /// tool calls. Required alongside `transports` for the auto-
+    /// bridge fan-out.
+    plugin_host: Option<execlaw_plugin_host::PluginHost>,
 }
 
 impl ServerAttachmentApi {
@@ -51,19 +54,26 @@ impl ServerAttachmentApi {
             events,
             caller_conversation_id,
             transports: None,
+            plugin_host: None,
         }
     }
 
-    /// Builder-style attach the host-transport registry so `send`
-    /// fans out to the originating transport. The dispatcher
-    /// passes `state.host_transports.clone()`. Channel-agnostic —
-    /// a Telegram/email/etc. plugin that registers a factory at
-    /// boot is auto-included with no edits here.
+    /// Builder-style attach the host-transport registry + plugin
+    /// host so `send` fans out to the originating channel's
+    /// plugin tool.
     pub fn with_transports(
         mut self,
         registry: Option<crate::transport_registry::HostTransportRegistry>,
     ) -> Self {
         self.transports = registry;
+        self
+    }
+
+    pub fn with_plugin_host(
+        mut self,
+        plugin_host: execlaw_plugin_host::PluginHost,
+    ) -> Self {
+        self.plugin_host = Some(plugin_host);
         self
     }
 }
@@ -212,6 +222,9 @@ impl ServerAttachmentApi {
         let Some(registry) = self.transports.as_ref() else {
             return;
         };
+        let Some(plugin_host) = self.plugin_host.as_ref() else {
+            return;
+        };
 
         let pg_store = PrincipalGroupStore::new(&self.db);
         let pg_id = match pg_store.principal_group_id_for(self.caller_conversation_id.as_str()) {
@@ -231,31 +244,35 @@ impl ServerAttachmentApi {
                 return;
             }
         };
-        let Some((transport, channel, recipient)) = registry
-            .build_for_first_supported_binding(&self.db, &self.caller_conversation_id, &bindings)
-        else {
-            return; // web-only conversation OR registry has no factory for this channel
+        let Some(resolved) = registry.lookup_first_supported_binding(&bindings) else {
+            return;
         };
 
         let body = caption.unwrap_or(filename);
-        if let Err(e) = transport
-            .send_with_attachments(&channel, &recipient, body, &[attachment_id.to_owned()])
+        let tool_name = format!("{}.send_with_attachments", resolved.channel);
+        let args = serde_json::json!({
+            "to": resolved.foreign_id,
+            "text": body,
+            "attachments": [attachment_id],
+        });
+        if let Err(e) = plugin_host
+            .call_tool(&tool_name, args, &["*"], Some("Controller"))
             .await
         {
             tracing::warn!(
                 target: "attachment_api::bridge",
                 conversation_id = %self.caller_conversation_id.as_str(),
-                channel = %channel,
-                recipient = %recipient,
+                channel = %resolved.channel,
+                recipient = %resolved.foreign_id,
                 error = %e,
-                "transport fan-out failed; web-UI chip remains visible to the operator",
+                "plugin tool fan-out failed; web-UI chip remains visible to the operator",
             );
         } else {
             tracing::info!(
                 target: "attachment_api::bridge",
                 conversation_id = %self.caller_conversation_id.as_str(),
-                channel = %channel,
-                recipient = %recipient,
+                channel = %resolved.channel,
+                recipient = %resolved.foreign_id,
                 attachment_id = %attachment_id,
                 "fanned attachment out via originating transport",
             );

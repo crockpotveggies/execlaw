@@ -1538,35 +1538,27 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     let research_workspace = execlaw_server::research::ResearchWorkspace::new(
         execlaw_server::research::ResearchWorkspace::default_root(),
     );
-    // Channel-keyed transport registry. Phase B: every channel
-    // plugin gets a `RhaiBackedTransportFactory` that delegates
-    // TransportApi methods to the plugin's tool dispatch. The
-    // factory is keyed on the plugin's `[transport].transport_id`
-    // declared in the manifest; today only signal is registered
-    // here at boot, but adding WhatsApp/etc. is a one-line clone
-    // pointing at the new plugin's id.
+    // Channel-keyed transport registry. Phase B refactor: just a
+    // `channel → (plugin_id, icon)` lookup. Auto-bridge sites
+    // (text-reply bridge, attachment fan-out, research-PDF
+    // dispatch) consult it for the channel's owning plugin id +
+    // dispatch via `plugin_host.call_tool("<channel>.send_message",
+    // ...)` directly. No TransportApi adapter layer.
     let host_transports = {
         let mut reg = execlaw_server::transport_registry::HostTransportRegistry::new();
-        // Signal — script-tier as of plugin v0.4.0. The plugin's
-        // own main.rhai owns inbound, outbound, and admin paths;
-        // the host's only role here is to plug a generic
-        // RhaiBackedTransportFactory into the auto-bridge so
-        // `bridge_text_reply_to_originating_transport` etc. find
-        // it via the registry.
         const SIGNAL_MANIFEST: &str =
             include_str!("../../../plugins/signal/plugin.toml");
         let icon = execlaw_plugin_sdk::manifest::PluginManifest::parse(SIGNAL_MANIFEST)
             .ok()
             .and_then(|m| m.transport.and_then(|t| t.icon))
             .unwrap_or_else(|| "phone".to_owned());
-        reg.register(std::sync::Arc::new(
-            execlaw_server::rhai_transport::RhaiBackedTransportFactory::new(
-                plugin_host.clone(),
-                "signal",
-                "signal",
+        reg.register(
+            "signal",
+            execlaw_server::transport_registry::ChannelInfo {
+                plugin_id: "signal".into(),
                 icon,
-            ),
-        ));
+            },
+        );
         tracing::info!(channels = reg.len(), "host-transport registry populated");
         reg
     };
@@ -1578,7 +1570,8 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         config.model_id.clone(),
         events.clone(),
     )
-    .with_host_transports(Some(host_transports.clone()));
+    .with_host_transports(Some(host_transports.clone()))
+    .with_plugin_host(Some(plugin_host.clone()));
 
     // Phase C (2026-05-03) — auto-capture worker. The summarizer
     // talks to `BackendPurpose::Small` so the standard turn isn't
