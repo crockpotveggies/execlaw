@@ -165,6 +165,21 @@ impl ScriptPlugin {
         rhai_to_json(result).map_err(ScriptError::BadShape)
     }
 
+    /// Optional lifecycle hook — host calls this once after the
+    /// plugin is enabled/hydrated. Plugins use it to spawn long-
+    /// lived background tasks (a transport plugin's WS inbound
+    /// consumer, a webhook poller, etc.) via `ws_subscribe`.
+    /// Best-effort: returns `Ok(())` whether the script defines
+    /// `on_enable` or not — `MissingFunction` is converted to a
+    /// silent success because the convention is opt-in.
+    pub async fn call_on_enable(&self) -> ScriptResult<()> {
+        match self.invoke_async("on_enable", vec![]).await {
+            Ok(_) => Ok(()),
+            Err(ScriptError::MissingFunction(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Same as `invoke_async` but takes the function name as an
     /// owned `String`. Used by the `ws_subscribe` binding which
     /// captures the operator-supplied callback name dynamically;

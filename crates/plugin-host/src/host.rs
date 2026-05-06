@@ -333,7 +333,22 @@ impl PluginHost {
                         .script_plugins
                         .write()
                         .await
-                        .insert(plugin_id.clone(), script);
+                        .insert(plugin_id.clone(), script.clone());
+                    // Lifecycle hook — script plugins that declare
+                    // an `on_enable()` function get one call after
+                    // they're loaded so they can spawn background
+                    // tasks (transport WS consumers, etc.).
+                    // Best-effort: a misbehaving on_enable doesn't
+                    // unwind the install — the operator can still
+                    // hit tools that don't depend on the consumer.
+                    if let Err(e) = script.call_on_enable().await {
+                        tracing::warn!(
+                            target: "plugin_host::install",
+                            plugin_id = %plugin_id,
+                            error = %e,
+                            "on_enable hook returned an error; plugin is loaded but lifecycle initialisation may be incomplete",
+                        );
+                    }
                 }
             }
         }
@@ -692,8 +707,15 @@ impl PluginHost {
                                         .script_plugins
                                         .write()
                                         .await
-                                        .insert(row.plugin_id.clone(), s);
+                                        .insert(row.plugin_id.clone(), s.clone());
                                     debug!(plugin_id = %row.plugin_id, "hydrated script plugin");
+                                    if let Err(e) = s.call_on_enable().await {
+                                        warn!(
+                                            plugin_id = %row.plugin_id,
+                                            error = %e,
+                                            "on_enable hook returned an error during hydrate",
+                                        );
+                                    }
                                 }
                                 Err(e) => {
                                     warn!(plugin_id = %row.plugin_id, error = %e, "failed to load script on hydrate");
