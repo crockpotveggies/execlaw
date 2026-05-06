@@ -203,6 +203,13 @@ pub struct ConversationRow {
     // (`set_display_name`, `set_pinned`, `mark_ephemeral`) so the FSM
     // upsert path doesn't clobber UX state on every turn.
     pub display_name: Option<String>,
+    /// Provenance of `display_name` (migration 0034). `"auto"` means
+    /// the field was last set by a transport (Signal `groupName`,
+    /// future WhatsApp/email subject lines) and is free to be
+    /// overwritten by a later inbound. `"manual"` means the operator
+    /// renamed via `PATCH /api/chats/{id}` and the value is locked —
+    /// transports MUST NOT clobber. New rows default to `"auto"`.
+    pub display_name_source: String,
     pub is_pinned: bool,
     pub is_ephemeral: bool,
     pub ephemeral_expires_at: Option<i64>,
@@ -225,6 +232,11 @@ pub struct ThreadSummary {
     pub trust_class: String,
     pub modality: Modality,
     pub display_name: Option<String>,
+    /// Mirror of `ConversationRow.display_name_source` — `"auto"` |
+    /// `"manual"`. Surfaced so the SPA's settings UI can render a
+    /// hint ("auto-tracking Signal group name") next to the rename
+    /// affordance, but not strictly required for sidebar rendering.
+    pub display_name_source: String,
     pub is_pinned: bool,
     pub is_ephemeral: bool,
     pub ephemeral_expires_at: Option<i64>,
@@ -258,9 +270,9 @@ impl<'db> ConversationStore<'db> {
                 "INSERT INTO state_conversations \
                  (conversation_id, kind, last_seq, phase, controller_id, trust_class, \
                   snapshot_blob, snapshot_seq, lease_owner, lease_expires, modality, \
-                  display_name, is_pinned, is_ephemeral, ephemeral_expires_at, \
-                  last_activity_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+                  display_name, display_name_source, is_pinned, is_ephemeral, \
+                  ephemeral_expires_at, last_activity_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
                  ON CONFLICT(conversation_id) DO UPDATE SET \
                     kind = excluded.kind, \
                     last_seq = excluded.last_seq, \
@@ -285,6 +297,7 @@ impl<'db> ConversationStore<'db> {
                     row.lease_expires,
                     row.modality.as_str(),
                     row.display_name,
+                    row.display_name_source,
                     row.is_pinned as i64,
                     row.is_ephemeral as i64,
                     row.ephemeral_expires_at,
@@ -296,19 +309,67 @@ impl<'db> ConversationStore<'db> {
     }
 
     /// Update the user-facing thread title (the LLM-generated 3-word
-    /// name, or the transport-supplied group name, or a hard-coded value
-    /// like "Control thread").
+    /// name, or a hard-coded value like "Control thread"). Stamps
+    /// `display_name_source = 'manual'` — operator intent locks the
+    /// value against transport-driven renames. Pass `None` to clear
+    /// the name AND reset source to `'auto'` so the next transport
+    /// inbound can re-seed.
     pub fn set_display_name(
         &self,
         conversation_id: &ConversationId,
         name: Option<&str>,
     ) -> Result<(), DbError> {
         self.db.with_conn(|c| {
+            // Clearing the name resets source to 'auto' so transport
+            // inbounds can repopulate. A non-None rename locks to
+            // 'manual'.
+            let source = if name.is_some() { "manual" } else { "auto" };
             c.execute(
-                "UPDATE state_conversations SET display_name = ?1 WHERE conversation_id = ?2",
-                params![name, conversation_id.as_str()],
+                "UPDATE state_conversations \
+                 SET display_name = ?1, display_name_source = ?2 \
+                 WHERE conversation_id = ?3",
+                params![name, source, conversation_id.as_str()],
             )?;
             Ok(())
+        })
+    }
+
+    /// Transport-driven display_name update. Writes only when the
+    /// row's `display_name_source = 'auto'` (or the row has no name
+    /// yet). Operator-renamed threads (`source = 'manual'`) are left
+    /// alone — that's the whole reason this method exists separately
+    /// from `set_display_name`.
+    ///
+    /// Returns `Ok(true)` if the row was updated, `Ok(false)` if the
+    /// row was locked to manual (or didn't exist). Idempotent:
+    /// calling with the same name twice is a single update on the
+    /// first call, no-op on the second.
+    ///
+    /// Generic by design — takes a `name` string with no transport-
+    /// specific shape. Signal's `groupName` is the canonical caller
+    /// today; future WhatsApp / email callers feed their own names
+    /// in the same way.
+    pub fn apply_auto_display_name(
+        &self,
+        conversation_id: &ConversationId,
+        name: &str,
+    ) -> Result<bool, DbError> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Ok(false);
+        }
+        self.db.with_conn(|c| {
+            // UPDATE ... WHERE source = 'auto' — atomic guard
+            // against a race with a concurrent manual rename.
+            let n = c.execute(
+                "UPDATE state_conversations \
+                 SET display_name = ?1, display_name_source = 'auto' \
+                 WHERE conversation_id = ?2 \
+                   AND display_name_source = 'auto' \
+                   AND (display_name IS NULL OR display_name <> ?1)",
+                params![trimmed, conversation_id.as_str()],
+            )?;
+            Ok(n > 0)
         })
     }
 
@@ -405,8 +466,8 @@ impl<'db> ConversationStore<'db> {
         self.db.with_conn(|c| {
             let mut stmt = c.prepare_cached(
                 "SELECT conversation_id, kind, phase, trust_class, modality, \
-                        display_name, is_pinned, is_ephemeral, ephemeral_expires_at, \
-                        last_seq, last_activity_at \
+                        display_name, display_name_source, is_pinned, is_ephemeral, \
+                        ephemeral_expires_at, last_seq, last_activity_at \
                  FROM state_conversations \
                  ORDER BY is_pinned DESC, last_activity_at DESC, conversation_id ASC",
             )?;
@@ -415,8 +476,8 @@ impl<'db> ConversationStore<'db> {
                     let kind_str: String = r.get(1)?;
                     let phase_str: String = r.get(2)?;
                     let modality_str: String = r.get(4)?;
-                    let is_pinned: i64 = r.get(6)?;
-                    let is_ephemeral: i64 = r.get(7)?;
+                    let is_pinned: i64 = r.get(7)?;
+                    let is_ephemeral: i64 = r.get(8)?;
                     Ok(ThreadSummary {
                         conversation_id: ConversationId::from(r.get::<_, String>(0)?),
                         kind: ConversationKind::parse(&kind_str)
@@ -425,11 +486,12 @@ impl<'db> ConversationStore<'db> {
                         trust_class: r.get(3)?,
                         modality: Modality::parse(&modality_str).unwrap_or(Modality::Text),
                         display_name: r.get(5)?,
+                        display_name_source: r.get(6)?,
                         is_pinned: is_pinned != 0,
                         is_ephemeral: is_ephemeral != 0,
-                        ephemeral_expires_at: r.get(8)?,
-                        last_seq: EventSeq(r.get::<_, i64>(9)?),
-                        last_activity_at: r.get(10)?,
+                        ephemeral_expires_at: r.get(9)?,
+                        last_seq: EventSeq(r.get::<_, i64>(10)?),
+                        last_activity_at: r.get(11)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -463,8 +525,8 @@ impl<'db> ConversationStore<'db> {
                 .query_row(
                     "SELECT kind, last_seq, phase, controller_id, trust_class, \
                             snapshot_blob, snapshot_seq, lease_owner, lease_expires, modality, \
-                            display_name, is_pinned, is_ephemeral, ephemeral_expires_at, \
-                            last_activity_at \
+                            display_name, display_name_source, is_pinned, is_ephemeral, \
+                            ephemeral_expires_at, last_activity_at \
                      FROM state_conversations WHERE conversation_id = ?1",
                     params![conversation_id.as_str()],
                     row_to_conversation,
@@ -490,10 +552,11 @@ fn row_to_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation
     let lease_expires: Option<i64> = row.get(8)?;
     let modality_str: String = row.get(9)?;
     let display_name: Option<String> = row.get(10)?;
-    let is_pinned: i64 = row.get(11)?;
-    let is_ephemeral: i64 = row.get(12)?;
-    let ephemeral_expires_at: Option<i64> = row.get(13)?;
-    let last_activity_at: i64 = row.get(14)?;
+    let display_name_source: String = row.get(11)?;
+    let is_pinned: i64 = row.get(12)?;
+    let is_ephemeral: i64 = row.get(13)?;
+    let ephemeral_expires_at: Option<i64> = row.get(14)?;
+    let last_activity_at: i64 = row.get(15)?;
     Ok(ConversationRow {
         // Filled in by the caller — we don't have the typed id here.
         conversation_id: ConversationId::from(""),
@@ -508,6 +571,7 @@ fn row_to_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation
         lease_expires,
         modality: Modality::parse(&modality_str).unwrap_or(Modality::Text),
         display_name,
+        display_name_source,
         is_pinned: is_pinned != 0,
         is_ephemeral: is_ephemeral != 0,
         ephemeral_expires_at,
@@ -582,6 +646,7 @@ mod tests {
             lease_expires: None,
             modality: Modality::Text,
             display_name: None,
+            display_name_source: "auto".into(),
             is_pinned: false,
             is_ephemeral: false,
             ephemeral_expires_at: None,

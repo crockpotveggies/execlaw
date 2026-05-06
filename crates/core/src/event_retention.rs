@@ -222,6 +222,7 @@ mod tests {
                 lease_expires: None,
                 modality: Modality::Text,
                 display_name: None,
+                display_name_source: "auto".into(),
                 is_pinned,
                 is_ephemeral,
                 ephemeral_expires_at: None,

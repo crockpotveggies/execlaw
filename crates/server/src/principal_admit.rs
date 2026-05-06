@@ -773,6 +773,7 @@ mod tests {
             lease_expires: None,
             modality: execlaw_core::conversation::Modality::Text,
             display_name: None,
+            display_name_source: "auto".into(),
             is_pinned: false,
             is_ephemeral: false,
             ephemeral_expires_at: None,

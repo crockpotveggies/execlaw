@@ -2020,22 +2020,30 @@ pub fn ensure_conversation_for(db: &execlaw_core::Database, cid: &ConversationId
     ensure_conversation(&store, cid);
 }
 
-/// Seed `display_name` on the conversation row when (and only when)
-/// the column is currently NULL. Used by transport inbound paths
-/// (Signal DM = contact's `source_name`, Signal group = `groupName`)
-/// so a freshly-bridged thread shows "Alice" / "Family chat" in the
-/// sidebar instead of the generic "New chat · 7596ad" fallback.
+/// Apply a transport-supplied display_name to the conversation row.
+/// Used by every transport inbound (Signal `groupName`, Signal DM
+/// `source_name`, future WhatsApp / email / etc.) so the SPA's
+/// sidebar mirrors whatever the source-of-truth system calls the
+/// thread.
 ///
-/// Skips silently in three cases that all mean "leave the row alone":
-///   * No conversation row yet (first-mint hasn't landed).
-///   * Row already has a display_name — the controller may have
-///     renamed it via `PATCH /api/chats/{id}`; respect that.
-///   * `name` itself is empty / whitespace-only — pointless write.
+/// Tracking semantics (migration 0034):
+///   * If the row's `display_name_source = 'manual'` (operator
+///     renamed via `PATCH /api/chats/{id}`), leave it alone — the
+///     operator's intent locks the value.
+///   * If the row's source is `'auto'` (or unset, i.e. fresh row),
+///     write the new name and tag it `'auto'`. Re-runs of the
+///     same name are no-ops at the SQL layer (the `UPDATE ... WHERE
+///     display_name <> ?` guard).
 ///
-/// Best-effort: errors swallow with a debug log. Display name is a
-/// UX nicety, not a correctness step; failing the inbound route over
-/// a sidebar label would be the wrong trade-off.
-pub fn seed_conversation_display_name_if_unset(
+/// This is the path that picks up Signal group renames: signal-cli
+/// sends `groupName` on every inbound, and an unchanged source
+/// means a re-name from the original landed in our table the next
+/// time someone posts.
+///
+/// Best-effort: errors log at debug and the routing flow continues.
+/// Display name is a UX nicety, not correctness — failing the
+/// inbound over a sidebar label would be the wrong trade-off.
+pub fn apply_auto_display_name(
     db: &execlaw_core::Database,
     cid: &ConversationId,
     name: Option<&str>,
@@ -2048,30 +2056,14 @@ pub fn seed_conversation_display_name_if_unset(
         return;
     }
     let store = ConversationStore::new(db);
-    match store.get(cid) {
-        Ok(Some(row)) => {
-            if row.display_name.is_some() {
-                return;
-            }
-            if let Err(e) = store.set_display_name(cid, Some(trimmed)) {
-                tracing::debug!(
-                    target: "chats::seed_display_name",
-                    conversation_id = %cid.as_str(),
-                    error = %e,
-                    "failed to seed display_name; sidebar will show fallback",
-                );
-            }
-        }
-        Ok(None) => {
-            // Row not yet inserted — caller should have run
-            // `ensure_conversation_for` first. Leave silently.
-        }
+    match store.apply_auto_display_name(cid, trimmed) {
+        Ok(_changed) => {}
         Err(e) => {
             tracing::debug!(
-                target: "chats::seed_display_name",
+                target: "chats::apply_auto_display_name",
                 conversation_id = %cid.as_str(),
                 error = %e,
-                "conversation lookup failed during display_name seed",
+                "failed to apply transport-supplied display_name; sidebar will keep the old label",
             );
         }
     }
@@ -4176,6 +4168,7 @@ fn ensure_conversation(store: &ConversationStore<'_>, cid: &ConversationId) {
         lease_expires: None,
         modality: Modality::Text,
         display_name: None,
+        display_name_source: "auto".into(),
         is_pinned: false,
         is_ephemeral: false,
         ephemeral_expires_at: None,
@@ -4319,52 +4312,68 @@ mod tests {
     }
 
     #[test]
-    fn seed_display_name_writes_only_when_unset_and_trims() {
+    fn apply_auto_display_name_tracks_source_and_respects_manual_renames() {
         // Mint a conversation row, then exercise the four shapes the
         // seeder is supposed to handle:
         //   1. None / empty / whitespace input → no-op (column stays NULL).
         //   2. Real string on a row that's still NULL → writes the
-        //      trimmed value.
-        //   3. Same call again → no-op (column already set; the
-        //      transport inbound path runs this on every message and
-        //      must NOT clobber a controller rename).
-        //   4. Caller-supplied controller rename → preserved across
-        //      a follow-up seeder pass with a different inbound name.
+        //      trimmed value with `display_name_source = 'auto'`.
+        //   3. Subsequent transport inbound with a DIFFERENT name →
+        //      auto-tracked rename takes effect (Signal group rename UX).
+        //   4. Operator's `set_display_name` (PATCH path) flips source
+        //      to `'manual'` → next transport inbound is a no-op.
+        //   5. Operator clears the name (PATCH with None) → source
+        //      flips back to `'auto'` → next transport inbound re-seeds.
         let state = test_app_state();
         let cid = ConversationId::from("conv-seed-test");
         ensure_conversation_for(&state.db, &cid);
         let store = ConversationStore::new(&state.db);
 
         // 1a. None — silent.
-        seed_conversation_display_name_if_unset(&state.db, &cid, None);
+        apply_auto_display_name(&state.db, &cid, None);
         assert!(store.get(&cid).unwrap().unwrap().display_name.is_none());
         // 1b. Empty / whitespace.
-        seed_conversation_display_name_if_unset(&state.db, &cid, Some("   "));
+        apply_auto_display_name(&state.db, &cid, Some("   "));
         assert!(store.get(&cid).unwrap().unwrap().display_name.is_none());
 
-        // 2. First non-empty value lands.
-        seed_conversation_display_name_if_unset(&state.db, &cid, Some("  Alice  "));
-        assert_eq!(
-            store.get(&cid).unwrap().unwrap().display_name.as_deref(),
-            Some("Alice")
-        );
+        // 2. First non-empty value lands. Source must be 'auto'.
+        apply_auto_display_name(&state.db, &cid, Some("  Family chat  "));
+        let row = store.get(&cid).unwrap().unwrap();
+        assert_eq!(row.display_name.as_deref(), Some("Family chat"));
+        assert_eq!(row.display_name_source, "auto");
 
-        // 3. Idempotent — every subsequent inbound calls the seeder;
-        //    it must not overwrite.
-        seed_conversation_display_name_if_unset(&state.db, &cid, Some("Bob"));
-        assert_eq!(
-            store.get(&cid).unwrap().unwrap().display_name.as_deref(),
-            Some("Alice")
-        );
+        // 3. Group renamed on Signal — next inbound carries the new
+        //    name. Source still 'auto', display_name updates.
+        apply_auto_display_name(&state.db, &cid, Some("Saturday crew"));
+        let row = store.get(&cid).unwrap().unwrap();
+        assert_eq!(row.display_name.as_deref(), Some("Saturday crew"));
+        assert_eq!(row.display_name_source, "auto");
 
-        // 4. Controller renames via the existing PATCH path → the
-        //    seeder respects that rename on the next inbound.
-        store.set_display_name(&cid, Some("Family chat")).unwrap();
-        seed_conversation_display_name_if_unset(&state.db, &cid, Some("Some Other Name"));
+        // 4. Operator renames via PATCH → source flips to 'manual',
+        //    transport inbounds become no-ops.
+        store.set_display_name(&cid, Some("My weekend group")).unwrap();
+        let row = store.get(&cid).unwrap().unwrap();
+        assert_eq!(row.display_name_source, "manual");
+        apply_auto_display_name(&state.db, &cid, Some("Signal renamed it again"));
+        let row = store.get(&cid).unwrap().unwrap();
         assert_eq!(
-            store.get(&cid).unwrap().unwrap().display_name.as_deref(),
-            Some("Family chat")
+            row.display_name.as_deref(),
+            Some("My weekend group"),
+            "transport inbound must NOT clobber a manual rename",
         );
+        assert_eq!(row.display_name_source, "manual");
+
+        // 5. Operator clears the manual name → source resets to 'auto'
+        //    → next transport inbound re-seeds. This is the "let
+        //    Signal's name show through again" path.
+        store.set_display_name(&cid, None).unwrap();
+        let row = store.get(&cid).unwrap().unwrap();
+        assert!(row.display_name.is_none());
+        assert_eq!(row.display_name_source, "auto");
+        apply_auto_display_name(&state.db, &cid, Some("Fresh from Signal"));
+        let row = store.get(&cid).unwrap().unwrap();
+        assert_eq!(row.display_name.as_deref(), Some("Fresh from Signal"));
+        assert_eq!(row.display_name_source, "auto");
     }
 
     #[tokio::test]
