@@ -734,21 +734,39 @@ impl<'db> EventLog<'db> {
         base_seq: EventSeq,
         events: Vec<PendingEvent>,
     ) -> Result<Vec<EventRecord>, DbError> {
-        let materialized = enforce_tool_pairing(conversation_id, base_seq, events)?;
+        let mut materialized = enforce_tool_pairing(conversation_id, base_seq, events)?;
 
-        // Sign before the transaction so any HMAC-key absence fails fast.
-        // We capture both the tag bytes AND the key_id used so each row's
-        // `state_events.key_id` column reflects the key we actually signed under.
-        let signed: Vec<(Option<Vec<u8>>, i64)> = materialized
-            .iter()
-            .map(|ev| match self.sign(ev) {
-                Some((t, id)) => (Some(t.to_vec()), id),
-                None => (None, 0),
-            })
-            .collect();
-
+        // Acquire the connection lock + open the write transaction
+        // BEFORE re-validating the base_seq against actual state.
+        // Two concurrent appenders to the same conversation used to
+        // race here: caller A reads last_seq=N and computes seqs
+        // N+1..N+k; caller B does the same; both then INSERT and B
+        // hits "UNIQUE constraint failed: state_events.(conversation_id,
+        // seq)". Re-checking inside the transaction collapses the
+        // window — the connection mutex serializes commits, so the
+        // second commit picks up the first's writes here, shifts its
+        // seqs, re-signs, and lands cleanly.
         self.db.transaction(|tx| {
-            for (ev, (tag, key_id)) in materialized.iter().zip(signed.iter()) {
+            let actual_max: i64 = tx
+                .query_row(
+                    "SELECT COALESCE(MAX(seq), 0) FROM state_events WHERE conversation_id = ?1",
+                    params![conversation_id.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let delta = actual_max - base_seq.0;
+            if delta > 0 {
+                for ev in materialized.iter_mut() {
+                    ev.seq = EventSeq(ev.seq.0 + delta);
+                }
+            }
+            // Sign INSIDE the transaction — the canonical bytes
+            // include `seq`, so a delta-shift requires re-signing.
+            for ev in materialized.iter() {
+                let (tag, key_id) = match self.sign(ev) {
+                    Some((t, id)) => (Some(t.to_vec()), id),
+                    None => (None, 0),
+                };
                 tx.execute(
                     "INSERT INTO state_events \
                      (conversation_id, seq, kind, payload, committed_at, actor, tag, key_id) \
@@ -1239,18 +1257,21 @@ mod tests {
         assert_eq!(format!("{}", EventKind::ToolResult), "tool_result");
     }
 
-    /// `commit_turn` must be atomic: if one of the pending events
-    /// collides with an already-written seq, NONE of the batch should
-    /// land in the event log (all-or-nothing).
+    /// `commit_turn` shifts the batch's seqs onto the actual tail of
+    /// the conversation if the caller's `base_seq` was stale. The
+    /// pre-2026-05 implementation FAILED on `UNIQUE constraint`
+    /// instead of shifting; that was the bug that took down Signal
+    /// inbound when two frames raced into the same conversation.
+    /// The new contract: a stale base_seq is silently corrected
+    /// inside the transaction so the batch lands at MAX(seq) + 1.
     #[test]
-    fn commit_turn_is_atomic_on_seq_collision() {
+    fn commit_turn_shifts_seqs_when_base_is_stale() {
         let db = fresh_db();
         let log = EventLog::new(&db);
-        let cid = ConversationId::from("conv-atomic");
+        let cid = ConversationId::from("conv-shift");
 
-        // Pre-write an event at seq=2 so that the incoming batch,
-        // starting at base_seq=0 and containing 3 pendings, will
-        // collide on its 2nd insert.
+        // Pre-write an event at seq=2 simulating a concurrent
+        // committer that landed first.
         let preexisting = EventRecord::new(
             cid.clone(),
             EventSeq(2),
@@ -1282,14 +1303,19 @@ mod tests {
             .unwrap(),
         ];
 
-        let err = log.commit_turn(&cid, EventSeq(0), pending).unwrap_err();
-        assert!(matches!(err, DbError::Sqlite(_)));
+        // Caller passed base_seq=0 (stale — they didn't see the
+        // pre-existing seq=2 row). commit_turn must shift the batch
+        // to start at seq=3, not fail.
+        let written = log.commit_turn(&cid, EventSeq(0), pending).unwrap();
+        assert_eq!(written.len(), 3);
+        assert_eq!(written[0].seq, EventSeq(3));
+        assert_eq!(written[1].seq, EventSeq(4));
+        assert_eq!(written[2].seq, EventSeq(5));
 
-        // The only event visible must be the pre-existing one — no
-        // partial batch leaked through.
         let events = log.replay_since(&cid, EventSeq(0)).unwrap();
-        assert_eq!(events.len(), 1, "turn was not atomic");
-        assert_eq!(events[0].seq, EventSeq(2));
+        assert_eq!(events.len(), 4);
+        let seqs: Vec<i64> = events.iter().map(|e| e.seq.0).collect();
+        assert_eq!(seqs, vec![2, 3, 4, 5]);
     }
 
     /// When an HMAC key is attached, the `tag` column is populated on

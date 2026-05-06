@@ -137,6 +137,16 @@ pub struct ToolDecl {
     /// can't reach. Group ops stay rhai-implemented.
     #[serde(default, skip_serializing_if = "is_false")]
     pub host_implemented: bool,
+    /// When true, the tool registers with the host's `call_tool`
+    /// dispatch table (so auto-bridge code can dial in) but does
+    /// NOT surface in the agent's tool catalog. Used for "host
+    /// calls these on behalf of the agent" convention tools like
+    /// `signal.set_typing` and `signal.send_with_attachments`
+    /// where letting the planner see them causes tool-call loops
+    /// (the model decides "let me set typing!" repeatedly until
+    /// max_tool_rounds trips).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub host_internal: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -1090,7 +1100,7 @@ mod tests {
         let m = PluginManifest::parse(SIGNAL_MANIFEST)
             .expect("plugins/signal/plugin.toml must parse cleanly");
         assert_eq!(m.plugin.id, "signal");
-        assert_eq!(m.plugin.version, "0.4.5");
+        assert_eq!(m.plugin.version, "0.4.6");
         // The transport icon must propagate from manifest → SDK so
         // the SPA's sidebar can render a Signal-shaped marker on
         // bridged threads. Pin the literal so a typo in the manifest

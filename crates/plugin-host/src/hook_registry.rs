@@ -48,6 +48,15 @@ pub struct RegisteredTool {
     /// with no floor accept any caller that passes the existing
     /// capability gate.
     pub trust_floor: Option<String>,
+    /// Manifest's `[[tools]].host_internal`. When true, the tool is
+    /// registered with the host's `call_tool` dispatch table (so
+    /// auto-bridge code in chats.rs / research/runner.rs can dial
+    /// in) but EXCLUDED from the agent's tool catalog enumeration.
+    /// Used for "host calls these on behalf of the agent" tools
+    /// like `signal.set_typing` and `signal.send_with_attachments`
+    /// where surfacing them to the planner causes spurious
+    /// tool-call loops.
+    pub host_internal: bool,
 }
 
 /// A built-in tool registered via [`HookRegistry::register_builtin`].
@@ -435,6 +444,7 @@ impl HookRegistry {
                     description: t.description.clone(),
                     schema_json,
                     trust_floor: t.trust_floor.clone(),
+                    host_internal: t.host_internal,
                 }),
             );
         }
@@ -587,6 +597,23 @@ impl HookRegistry {
             .unwrap()
             .tools_by_name
             .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Like `all_tools` but excludes tools the plugin marked
+    /// `host_internal = true` in its manifest. Use this when
+    /// building the agent's tool catalog — those tools are
+    /// reachable via `call_tool` but should NOT be surfaced to
+    /// the planner (typing-indicator, attachment-bridge convention
+    /// tools, etc.).
+    pub fn agent_callable_tools(&self) -> Vec<Arc<RegisteredTool>> {
+        self.inner
+            .read()
+            .unwrap()
+            .tools_by_name
+            .values()
+            .filter(|t| !t.host_internal)
             .cloned()
             .collect()
     }

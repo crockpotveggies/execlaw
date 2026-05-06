@@ -1032,7 +1032,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
     let plugin_tool_names: Vec<String> = state
         .plugin_host
         .registry()
-        .all_tools()
+        .agent_callable_tools()
         .iter()
         .map(|t| t.tool_name.clone())
         .collect();
@@ -1121,7 +1121,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
             ToolDeclaration::function(d.name.clone(), d.description.clone(), d.schema.clone())
         })
         .collect();
-    tool_decls.extend(state.plugin_host.registry().all_tools().iter().map(|t| {
+    tool_decls.extend(state.plugin_host.registry().agent_callable_tools().iter().map(|t| {
         // Pre-fix this advertised every plugin tool as
         // `Plugin tool 'X' (latency: Y)` with an empty
         // `{"type":"object"}` schema — the model couldn't
@@ -1484,7 +1484,7 @@ async fn run_tool_capable_turn(
             ToolDeclaration::function(d.name.clone(), d.description.clone(), d.schema.clone())
         })
         .collect();
-    tool_decls.extend(state.plugin_host.registry().all_tools().iter().map(|t| {
+    tool_decls.extend(state.plugin_host.registry().agent_callable_tools().iter().map(|t| {
         let description = t.description.clone().unwrap_or_else(|| {
             format!(
                 "Plugin tool '{}' from '{}' (latency: {}). The plugin manifest did not \
@@ -1560,7 +1560,7 @@ async fn run_tool_capable_turn(
     let routing_plugins: Vec<String> = state
         .plugin_host
         .registry()
-        .all_tools()
+        .agent_callable_tools()
         .iter()
         .map(|t| t.tool_name.clone())
         .collect();

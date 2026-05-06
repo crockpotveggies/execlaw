@@ -1,7 +1,7 @@
 [plugin]
 id = "signal"
 name = "Signal"
-version = "0.4.5"
+version = "0.4.6"
 description = "Signal Messenger transport — fully script-tier (Phase B). All host-side signal_*.rs code retired; this plugin's main.rhai owns inbound consumer, outbound, group ops, and admin pairing."
 author = "execlaw"
 license = "AGPL-3.0-or-later"
@@ -117,6 +117,7 @@ the agent composes a reply; agents do not need to call it directly. \
 Args: { to: string, active: bool }."""
 trust_floor = "Controller"
 latency = "low"
+host_internal = true
 
 [[tools]]
 name = "signal.send_with_attachments"
@@ -129,6 +130,7 @@ Args: { to: string, text?: string, attachments: int[] (host \
 attachment ids) }."""
 trust_floor = "Controller"
 latency = "medium"
+host_internal = true
 
 [[tools]]
 name = "signal.fetch_attachment"
@@ -138,6 +140,7 @@ attachment ingest pipeline; agents do not call this directly. \
 Args: { attachment_id: string }."""
 trust_floor = "Controller"
 latency = "low"
+host_internal = true
 
 # Plugin-served admin endpoints. Each maps to a Rhai handler in
 # main.rhai. Mounted by the host under
