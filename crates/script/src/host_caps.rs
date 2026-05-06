@@ -173,6 +173,19 @@ pub trait HostCapabilities: Send + Sync {
     /// — no trailing slash, no path; plugin appends its own.
     async fn sidecar_url(&self, sidecar_name: &str) -> Option<String>;
 
+    /// True iff `url` resolves to a registered supervised sidecar.
+    /// The script tier's `sidecar_http_*` bindings consult this
+    /// before bypassing the SSRF guard — only URLs whose
+    /// host:port match a sidecar known to the supervisor get
+    /// loopback access.
+    async fn is_known_sidecar_url(&self, url: &str) -> bool {
+        // Default impl: walk every supervised sidecar and check.
+        // Concrete impls can override with a faster path if the
+        // supervisor exposes a direct lookup.
+        let _ = url;
+        false
+    }
+
     /// Subscribe to a long-lived WebSocket. The host owns the
     /// reconnect loop, exponential backoff, and cooperative
     /// shutdown. Per-frame the host invokes `on_frame` on a

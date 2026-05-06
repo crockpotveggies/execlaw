@@ -494,7 +494,7 @@ fn register_host_cap_bindings(
     // it to the host. The host's pipeline takes over from there.
     {
         let pid = plugin_id.to_owned();
-        let caps = host_caps;
+        let caps = host_caps.clone();
         engine.register_fn(
             "host_route_inbound",
             move |msg: Map| -> Result<Dynamic, Box<EvalAltResult>> {
@@ -525,6 +525,150 @@ fn register_host_cap_bindings(
             },
         );
     }
+
+    // sidecar_http_get / sidecar_http_post / sidecar_http_delete
+    //
+    // SSRF-aware HTTP for plugin → sidecar communication. The
+    // standard `http_*` bindings reject loopback in production,
+    // which would otherwise lock plugins out of their own
+    // supervised sidecars (signal-cli, future bbernhard-style
+    // bridges). These bindings validate the URL via
+    // `host_caps.is_known_sidecar_url()` — only URLs that resolve
+    // to a registered supervised sidecar's host:port are
+    // permitted to reach loopback.
+    //
+    // Same shape as `http_get` / `http_post` / `http_delete`
+    // (Map-of-strings query params, Dynamic body, no bearer —
+    // plugins use the sidecar's own auth model). Errors surface
+    // as Rhai runtime errors with the plugin id tagged.
+    register_sidecar_http_get(engine, plugin_id, host_caps.clone());
+    register_sidecar_http_post(engine, plugin_id, host_caps.clone());
+    register_sidecar_http_delete(engine, plugin_id, host_caps);
+}
+
+fn register_sidecar_http_get(
+    engine: &mut Engine,
+    plugin_id: &str,
+    host_caps: HostCapsHandle,
+) {
+    let pid = plugin_id.to_owned();
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .user_agent("execlaw/script-runtime/sidecar/0.1")
+        .build();
+    engine.register_fn(
+        "sidecar_http_get",
+        move |url: ImmutableString, query: Map| -> Result<Dynamic, Box<EvalAltResult>> {
+            let caps = match host_caps.get() {
+                Some(c) => c.clone(),
+                None => return Err(host_cap_unavailable_err(&pid, "sidecar_http_get")),
+            };
+            sidecar_url_check(&pid, "sidecar_http_get", &url, &caps)?;
+            let mut req = agent.get(&url);
+            for (k, v) in map_to_query_iter(&query) {
+                req = req.query(&k, &v);
+            }
+            let resp = req
+                .call()
+                .map_err(|e| ureq_to_eval_err(&pid, "sidecar_http_get", &url, e))?;
+            decode_response(&pid, &url, resp)
+        },
+    );
+}
+
+fn register_sidecar_http_post(
+    engine: &mut Engine,
+    plugin_id: &str,
+    host_caps: HostCapsHandle,
+) {
+    let pid = plugin_id.to_owned();
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .user_agent("execlaw/script-runtime/sidecar/0.1")
+        .build();
+    engine.register_fn(
+        "sidecar_http_post",
+        move |url: ImmutableString, body: Dynamic| -> Result<Dynamic, Box<EvalAltResult>> {
+            let caps = match host_caps.get() {
+                Some(c) => c.clone(),
+                None => return Err(host_cap_unavailable_err(&pid, "sidecar_http_post")),
+            };
+            sidecar_url_check(&pid, "sidecar_http_post", &url, &caps)?;
+            let body_value = rhai_to_json(body)
+                .map_err(|e| Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] sidecar_http_post: encode body: {e}").into(),
+                    rhai::Position::NONE,
+                )))?;
+            let resp = agent
+                .post(&url)
+                .send_json(body_value)
+                .map_err(|e| ureq_to_eval_err(&pid, "sidecar_http_post", &url, e))?;
+            decode_response(&pid, &url, resp)
+        },
+    );
+}
+
+fn register_sidecar_http_delete(
+    engine: &mut Engine,
+    plugin_id: &str,
+    host_caps: HostCapsHandle,
+) {
+    let pid = plugin_id.to_owned();
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .user_agent("execlaw/script-runtime/sidecar/0.1")
+        .build();
+    engine.register_fn(
+        "sidecar_http_delete",
+        move |url: ImmutableString, query: Map| -> Result<Dynamic, Box<EvalAltResult>> {
+            let caps = match host_caps.get() {
+                Some(c) => c.clone(),
+                None => return Err(host_cap_unavailable_err(&pid, "sidecar_http_delete")),
+            };
+            sidecar_url_check(&pid, "sidecar_http_delete", &url, &caps)?;
+            let mut req = agent.request("DELETE", &url);
+            for (k, v) in map_to_query_iter(&query) {
+                req = req.query(&k, &v);
+            }
+            let resp = req
+                .call()
+                .map_err(|e| ureq_to_eval_err(&pid, "sidecar_http_delete", &url, e))?;
+            decode_response(&pid, &url, resp)
+        },
+    );
+}
+
+/// Reject the URL if it's not a registered supervised sidecar.
+/// Blocks at call time so a misconfigured plugin sees a clean
+/// error instead of a network failure pointing at an arbitrary
+/// loopback service.
+fn sidecar_url_check(
+    plugin_id: &str,
+    fn_name: &str,
+    url: &str,
+    caps: &HostCapabilitiesArc,
+) -> Result<(), Box<EvalAltResult>> {
+    let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
+        Box::new(EvalAltResult::ErrorRuntime(
+            format!("[{plugin_id}] {fn_name}: no tokio runtime: {e}").into(),
+            rhai::Position::NONE,
+        ))
+    })?;
+    let known = tokio::task::block_in_place(|| {
+        runtime.block_on(caps.is_known_sidecar_url(url))
+    });
+    if !known {
+        return Err(Box::new(EvalAltResult::ErrorRuntime(
+            format!(
+                "[{plugin_id}] {fn_name}: URL {url} is not a registered sidecar — \
+                 the SSRF-bypass `sidecar_http_*` family only accepts URLs whose \
+                 host:port matches a supervised sidecar"
+            )
+            .into(),
+            rhai::Position::NONE,
+        )));
+    }
+    Ok(())
 }
 
 /// Pull the documented [`InboundMessage`] fields out of a Rhai

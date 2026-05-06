@@ -274,6 +274,20 @@ impl SidecarSupervisor {
             .map(|h| h.host_port)
     }
 
+    /// True iff `port` is currently published by ANY supervised
+    /// sidecar. Used by the script tier's `sidecar_http_*` path
+    /// to validate that the URL a plugin author hands in actually
+    /// resolves to a known sidecar before bypassing the SSRF
+    /// guard. O(n) over running sidecars — fine at single-digit
+    /// counts; if that grows we add a port→name index.
+    pub async fn has_published_port(&self, port: u16) -> bool {
+        self.slots
+            .lock()
+            .await
+            .values()
+            .any(|s| s.handle.as_ref().map(|h| h.host_port) == Some(port))
+    }
+
     /// Snapshot every sidecar's current state. Returns one entry
     /// per sidecar **registered in the hook registry** — sidecars
     /// the supervisor has never reconciled yet still show up as

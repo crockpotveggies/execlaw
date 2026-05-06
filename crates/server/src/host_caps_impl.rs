@@ -65,6 +65,33 @@ impl HostCapabilities for AppStateHostCapabilities {
         Some(format!("http://127.0.0.1:{port}"))
     }
 
+    async fn is_known_sidecar_url(&self, url: &str) -> bool {
+        // Parse host:port out of the URL and compare against every
+        // supervised sidecar's published port. Only `http://127.0.0.1:*`
+        // qualifies — defends against a plugin smuggling a
+        // non-loopback URL through the sidecar_http_* path.
+        let parsed = match url::Url::parse(url) {
+            Ok(u) => u,
+            Err(_) => return false,
+        };
+        if parsed.scheme() != "http" && parsed.scheme() != "ws" {
+            return false;
+        }
+        if parsed.host_str() != Some("127.0.0.1") {
+            return false;
+        }
+        let port = match parsed.port() {
+            Some(p) => p,
+            None => return false,
+        };
+        let supervisor = match self.state.sidecar_supervisor.as_ref() {
+            Some(s) => s,
+            None => return false,
+        };
+        // Walk every running sidecar; match on port.
+        supervisor.has_published_port(port).await
+    }
+
     async fn ws_subscribe(
         &self,
         url: String,
