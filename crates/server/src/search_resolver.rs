@@ -1,18 +1,29 @@
-//! Dispatch-time resolver for the active web-search provider.
+//! Dispatch-time resolver for the active web-search provider(s).
 //!
 //! Reads the `config_search_providers` table at every call site
 //! that needs a `WebSearchApi`, constructs the right adapter from
-//! the row's per-kind config_json, and returns it boxed. Falling
-//! back to DDG with empty config when no provider is active or
-//! the active row's config is malformed — better to attempt a
-//! search than to return None and break the caller.
+//! each enabled row's per-kind config_json, and returns either
+//!
+//!   * the lone enabled adapter (when only one is enabled), OR
+//!   * a [`crate::search_rotating::RotatingWebSearchApi`] wrapper
+//!     covering every enabled provider (when 2+ are enabled).
+//!
+//! The rotating wrapper round-robins per call, parks providers
+//! on rate-limit / quota errors for 60s, and enforces a global
+//! 250ms pacing gate across all web_search dispatches. State
+//! (cursor, cooldowns) lives in a process-global so resolver
+//! constructions can stay per-call without losing rotation context.
+//!
+//! Falls back to DuckDuckGo (always available, no config) when
+//! the store lookup fails or no row is enabled — better to attempt
+//! a search than break the caller.
 //!
 //! Why per-call rather than cached: provider config can change
 //! mid-process (operator updates the SearxNG URL, swaps to Brave,
-//! etc.) and a cached provider would serve stale config until the
-//! next restart. The lookup is a single SQL query against an
-//! indexed table — micro-optimisation of zero practical value.
+//! etc.) and a cached resolver would serve stale config until the
+//! next restart.
 
+use crate::search_rotating::RotatingWebSearchApi;
 use crate::tool_apis_search::DuckDuckGoSearchApi;
 use crate::tool_apis_search_brave::BraveSearchApi;
 use crate::tool_apis_search_exa::ExaSearchApi;
@@ -24,29 +35,59 @@ use execlaw_core::tool::WebSearchApi;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Construct the active provider for `db`. Always returns
-/// something so the caller can dispatch unconditionally; on any
-/// failure path it falls back to DuckDuckGo (the seed default,
-/// always works without config).
+/// Construct the active web-search dispatcher for `db`. Returns
+/// the rotating wrapper when 2+ providers are enabled; a single
+/// adapter otherwise. Always returns something so the caller can
+/// dispatch unconditionally — on a store-lookup failure it falls
+/// back to DuckDuckGo (the seed default, no config required).
 pub fn resolve_active_provider(db: &Database) -> Arc<dyn WebSearchApi> {
-    let row = match SearchProviderStore::new(db).active() {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            tracing::warn!(
-                "search_resolver: no active provider in config_search_providers; \
-                 falling back to DuckDuckGo"
-            );
-            return Arc::new(DuckDuckGoSearchApi::new());
-        }
+    let store = SearchProviderStore::new(db);
+    let rows = match store.list_all() {
+        Ok(rs) => rs,
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "search_resolver: store lookup failed; falling back to DuckDuckGo"
+                "search_resolver: store list_all failed; falling back to DuckDuckGo"
             );
             return Arc::new(DuckDuckGoSearchApi::new());
         }
     };
-    construct_from_row(&row)
+
+    // Sort: is_default first, then alphabetical for stability so
+    // the operator's "default" pick is the rotation's seed
+    // position. Rotation cursor cycles from there.
+    let mut enabled: Vec<SearchProviderRow> = rows.into_iter().filter(|r| r.enabled).collect();
+    enabled.sort_by(|a, b| {
+        b.is_default
+            .cmp(&a.is_default) // default first (true > false)
+            .then_with(|| a.kind.as_str().cmp(b.kind.as_str()))
+    });
+
+    if enabled.is_empty() {
+        tracing::warn!(
+            "search_resolver: no enabled providers in config_search_providers; \
+             falling back to DuckDuckGo"
+        );
+        return Arc::new(DuckDuckGoSearchApi::new());
+    }
+
+    if enabled.len() == 1 {
+        // Single-provider passthrough — no rotation overhead +
+        // skips the global pacing gate (the per-adapter gate is
+        // sufficient for one provider).
+        return construct_from_row(&enabled[0]);
+    }
+
+    let providers: Vec<(SearchProviderKind, Arc<dyn WebSearchApi>)> = enabled
+        .iter()
+        .map(|r| (r.kind, construct_from_row(r)))
+        .collect();
+    tracing::debug!(
+        target: "search_resolver",
+        providers = ?providers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        "rotating web_search across enabled providers",
+    );
+    Arc::new(RotatingWebSearchApi::new(providers))
 }
 
 /// Pure builder: row → boxed adapter. Public for tests + future
@@ -110,10 +151,23 @@ mod tests {
         assert_eq!(provider.provider_id(), "duckduckgo");
     }
 
+    /// Disable the seed DDG row so a single-other-provider test
+    /// gets the single-passthrough path (vs the rotating wrapper).
+    fn disable_ddg(store: &SearchProviderStore) {
+        let mut row = store
+            .get(SearchProviderKind::DuckDuckGo)
+            .unwrap()
+            .unwrap();
+        row.enabled = false;
+        row.is_default = false;
+        store.upsert(&row).unwrap();
+    }
+
     #[test]
-    fn resolves_to_searxng_when_promoted_with_base_url() {
+    fn single_enabled_provider_returns_passthrough_searxng() {
         let db = fresh_db();
         let store = SearchProviderStore::new(&db);
+        disable_ddg(&store);
         store
             .upsert(&SearchProviderRow {
                 kind: SearchProviderKind::SearxNG,
@@ -129,9 +183,10 @@ mod tests {
     }
 
     #[test]
-    fn resolves_to_brave_when_promoted_with_api_key() {
+    fn single_enabled_provider_returns_passthrough_brave() {
         let db = fresh_db();
         let store = SearchProviderStore::new(&db);
+        disable_ddg(&store);
         store
             .upsert(&SearchProviderRow {
                 kind: SearchProviderKind::Brave,
@@ -147,9 +202,10 @@ mod tests {
     }
 
     #[test]
-    fn resolves_to_exa_when_promoted_with_api_key() {
+    fn single_enabled_provider_returns_passthrough_exa() {
         let db = fresh_db();
         let store = SearchProviderStore::new(&db);
+        disable_ddg(&store);
         store
             .upsert(&SearchProviderRow {
                 kind: SearchProviderKind::Exa,
@@ -165,9 +221,10 @@ mod tests {
     }
 
     #[test]
-    fn resolves_to_tavily_when_promoted_with_api_key() {
+    fn single_enabled_provider_returns_passthrough_tavily() {
         let db = fresh_db();
         let store = SearchProviderStore::new(&db);
+        disable_ddg(&store);
         store
             .upsert(&SearchProviderRow {
                 kind: SearchProviderKind::Tavily,
@@ -180,6 +237,50 @@ mod tests {
             .unwrap();
         let provider = resolve_active_provider(&db);
         assert_eq!(provider.provider_id(), "tavily");
+    }
+
+    #[test]
+    fn two_enabled_providers_return_rotating_wrapper() {
+        let db = fresh_db();
+        let store = SearchProviderStore::new(&db);
+        // DDG remains enabled (the seed default) — add Brave as a
+        // second enabled provider. resolve should wrap them.
+        store
+            .upsert(&SearchProviderRow {
+                kind: SearchProviderKind::Brave,
+                enabled: true,
+                is_default: false,
+                config_json: r#"{"api_key":"sk-test"}"#.into(),
+                created_at: 100,
+                updated_at: 100,
+            })
+            .unwrap();
+        let provider = resolve_active_provider(&db);
+        assert_eq!(
+            provider.provider_id(),
+            "rotating",
+            "2+ enabled providers must return the rotating wrapper",
+        );
+    }
+
+    #[test]
+    fn disabled_providers_excluded_from_rotation() {
+        // Brave is enabled but disabled — only DDG remains enabled,
+        // so resolve takes the single-passthrough path.
+        let db = fresh_db();
+        let store = SearchProviderStore::new(&db);
+        store
+            .upsert(&SearchProviderRow {
+                kind: SearchProviderKind::Brave,
+                enabled: false,
+                is_default: false,
+                config_json: r#"{"api_key":"sk-test"}"#.into(),
+                created_at: 100,
+                updated_at: 100,
+            })
+            .unwrap();
+        let provider = resolve_active_provider(&db);
+        assert_eq!(provider.provider_id(), "duckduckgo");
     }
 
     #[test]

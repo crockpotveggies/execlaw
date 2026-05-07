@@ -57,6 +57,7 @@ pub mod runner_supervisor;
 pub mod runners_admin;
 pub mod search_rate_limit;
 pub mod search_resolver;
+pub mod search_rotating;
 pub mod settings_general;
 pub mod settings_research;
 pub mod settings_search;
