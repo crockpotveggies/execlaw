@@ -1,12 +1,15 @@
 // Settings → Search. Operator manages the search-provider registry
-// here: which providers are configured, which is the default for
-// the deep-research gather phase + the agent's web_search tool, and
-// per-provider config (SearxNG base URL, Brave API key).
+// here: which providers are configured + enabled, which is the
+// rotation seed (default), and per-provider config (SearxNG base
+// URL, Brave/Exa/Tavily API keys).
 //
-// Built 2026-05-04 to give the operator a way out of DDG's bot-
-// detection bouncing — the previous design had a free-text
-// "default_search_provider" field on the Research page that pointed
-// at a "Settings → Search" page that didn't yet exist.
+// 2026-05-04: built to give the operator a way out of DDG's bot-
+// detection bouncing.
+// 2026-05-06: rotation refactor — the resolver now wraps every
+// enabled provider in a round-robin pool with per-provider 60s
+// cooldown on 429s. The "default" still drives the rotation seed
+// position; the per-row toggle decides whether a provider
+// participates at all.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Alert, Badge, Button, Card, Form, Spinner } from "react-bootstrap";
@@ -26,6 +29,11 @@ import {
 /// here (instead of fetching from the server) is fine because
 /// adding a new provider requires both code AND UI changes — the
 /// list literally can't drift.
+///
+/// Descriptions are kept to a single short line — the card
+/// truncates with ellipsis on overflow, so any prose past ~70
+/// chars gets clipped on narrow viewports. The full README-style
+/// blurb lives on the provider's own docs site.
 const KNOWN_KINDS: ReadonlyArray<{
     kind: string;
     display: string;
@@ -43,15 +51,13 @@ const KNOWN_KINDS: ReadonlyArray<{
     {
         kind: "duckduckgo",
         display: "DuckDuckGo",
-        description:
-            "HTML scrape of html.duckduckgo.com. No config. Free, no API key, but rate-limits aggressively on busy sessions and serves a bot-detection page when flagged. Default on first boot.",
+        description: "Free HTML scrape. No key. Bot-detection on busy days.",
         fields: [],
     },
     {
         kind: "searxng",
         display: "SearxNG (self-hosted)",
-        description:
-            "Self-hosted meta-search. Run a SearxNG container alongside execlaw, point this at it. Aggregates results from Google, Bing, DDG, Wikipedia. No shared rate-limit ceiling, no API key. Aligns with execlaw's no-mandatory-external-services rule.",
+        description: "Self-hosted meta-search aggregator. No key, no quota.",
         fields: [
             {
                 key: "base_url",
@@ -66,8 +72,7 @@ const KNOWN_KINDS: ReadonlyArray<{
     {
         kind: "brave",
         display: "Brave Search API",
-        description:
-            "Paid (~$5/1k queries; free tier of 2k/month). Purpose-built for AI/agent use. Fast, no scraping, no rate-limit roulette. Get a key at search.brave.com.",
+        description: "Paid AI-tuned search. ~$5/1k; 2k/month free tier.",
         fields: [
             {
                 key: "api_key",
@@ -82,8 +87,7 @@ const KNOWN_KINDS: ReadonlyArray<{
     {
         kind: "exa",
         display: "Exa (neural search)",
-        description:
-            "Neural / semantic web search built for AI agents. Returns higher-signal results than keyword engines for natural-language queries. Includes extracted page text + highlights so the gather worker doesn't have to re-fetch every URL. Paid by query + content fee. Get a key at exa.ai.",
+        description: "Neural/semantic search for AI agents. Paid.",
         fields: [
             {
                 key: "api_key",
@@ -98,8 +102,7 @@ const KNOWN_KINDS: ReadonlyArray<{
     {
         kind: "tavily",
         display: "Tavily (RAG-optimised)",
-        description:
-            "Search API purpose-built for LLM/RAG pipelines. Free tier (1k credits/month) is enough for personal research workloads. Returns clean per-result snippets; we skip the optional answer summary since gather has its own synthesizer. Get a key at tavily.com.",
+        description: "RAG-tuned search. 1k free credits/month.",
         fields: [
             {
                 key: "api_key",
@@ -122,14 +125,32 @@ interface EditingState {
     config: Record<string, string>;
 }
 
+/// One-line truncation style: the description lives in a `<div>`
+/// that occupies whatever width the title bar gives it. Bootstrap
+/// has `.text-truncate` utility but it requires a width-bounded
+/// parent; we set min-width:0 on the flex item so the truncate
+/// works inside `d-flex`.
+const TRUNCATE_STYLE: React.CSSProperties = {
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+};
+
 export function SearchPage() {
     const { getAccessToken } = useAuth();
     const [providers, setProviders] = useState<SearchProviderView[] | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [busy, setBusy] = useState(false);
+    /// `kind` whose enabled-toggle is mid-flight. Stops a double-
+    /// click from firing two upserts; keeps the switch from looking
+    /// frozen while the request lands.
+    const [togglingKind, setTogglingKind] = useState<string | null>(null);
     const [editing, setEditing] = useState<EditingState | null>(null);
-    const [testFor, setTestFor] = useState<string | null>(null);
+    /// `kind` whose Test panel is currently expanded. Click "Test"
+    /// to open / collapse. Only one panel open at a time so the
+    /// page stays compact.
+    const [testOpenFor, setTestOpenFor] = useState<string | null>(null);
     const [testQuery, setTestQuery] = useState("");
     const [testResult, setTestResult] = useState<SearchTestResponse | null>(null);
     const [testError, setTestError] = useState<string | null>(null);
@@ -208,6 +229,34 @@ export function SearchPage() {
         }
     }, [editing, getAccessToken, providers, reload]);
 
+    /// Quick on/off toggle from the card header. Preserves the
+    /// existing config + is_default — only flips `enabled`.
+    const toggleEnabled = useCallback(
+        async (kind: string, next: boolean) => {
+            const existing = providers?.find((p) => p.kind === kind);
+            if (!existing) return;
+            setTogglingKind(kind);
+            setError(null);
+            try {
+                await upsertSearchProvider(
+                    {
+                        kind,
+                        enabled: next,
+                        is_default: existing.is_default,
+                        config: existing.config ?? {},
+                    },
+                    getAccessToken,
+                );
+                await reload();
+            } catch (e) {
+                setError(e instanceof Error ? e.message : "toggle failed");
+            } finally {
+                setTogglingKind(null);
+            }
+        },
+        [getAccessToken, providers, reload],
+    );
+
     const promote = useCallback(
         async (kind: string) => {
             setBusy(true);
@@ -250,6 +299,24 @@ export function SearchPage() {
         },
         [getAccessToken, providers, reload],
     );
+
+    /// Toggle the Test panel for `kind`. Closing clears any prior
+    /// result/error so reopening starts clean.
+    const toggleTestPanel = useCallback((kind: string) => {
+        setTestOpenFor((prev) => {
+            if (prev === kind) {
+                setTestQuery("");
+                setTestResult(null);
+                setTestError(null);
+                return null;
+            }
+            // Switching to a different provider — reset state.
+            setTestQuery("");
+            setTestResult(null);
+            setTestError(null);
+            return kind;
+        });
+    }, []);
 
     const runTest = useCallback(
         async (kind: string) => {
@@ -311,10 +378,9 @@ export function SearchPage() {
                     Search providers
                 </h3>
                 <div className="execlaw-muted small">
-                    Pick the search provider the deep-research gather phase
-                    and the agent's <code>web_search</code> tool use. Switch
-                    away from DuckDuckGo if you're hitting bot-detection
-                    bounces.
+                    Enable any combination of providers — the agent rotates
+                    across them, parking any that hit a 429 / quota limit for
+                    60s. The default sets the rotation's seed position.
                 </div>
             </header>
 
@@ -336,39 +402,63 @@ export function SearchPage() {
                         const row = providers?.find((p) => p.kind === meta.kind);
                         const configured = configuredKinds.has(meta.kind);
                         const isDefault = row?.is_default ?? false;
+                        const enabled = row?.enabled ?? false;
+                        const isToggling = togglingKind === meta.kind;
+                        const isTestOpen = testOpenFor === meta.kind;
                         return (
                             <Card
                                 key={meta.kind}
                                 data-testid={`provider-card-${meta.kind}`}
                             >
                                 <Card.Body>
-                                    <div className="d-flex justify-content-between align-items-start mb-2">
-                                        <div>
-                                            <h5 className="h6 mb-1">
-                                                {meta.display}
+                                    <div className="d-flex justify-content-between align-items-center mb-2 gap-3">
+                                        <div className="flex-grow-1" style={{ minWidth: 0 }}>
+                                            <h5 className="h6 mb-1 d-flex align-items-center gap-2">
+                                                <span>{meta.display}</span>
                                                 {isDefault && (
                                                     <Badge
                                                         bg="success"
-                                                        className="ms-2"
                                                         data-testid={`provider-default-${meta.kind}`}
                                                     >
-                                                        Active
+                                                        Default
                                                     </Badge>
                                                 )}
-                                                {configured && !isDefault && (
-                                                    <Badge
-                                                        bg="secondary"
-                                                        className="ms-2"
-                                                    >
-                                                        Configured
+                                                {configured && !isDefault && enabled && (
+                                                    <Badge bg="secondary">
+                                                        Enabled
+                                                    </Badge>
+                                                )}
+                                                {configured && !enabled && (
+                                                    <Badge bg="light" text="dark">
+                                                        Disabled
                                                     </Badge>
                                                 )}
                                             </h5>
-                                            <div className="execlaw-muted small">
+                                            <div
+                                                className="execlaw-muted small"
+                                                style={TRUNCATE_STYLE}
+                                                title={meta.description}
+                                            >
                                                 {meta.description}
                                             </div>
                                         </div>
-                                        <div className="d-flex gap-2">
+                                        <div className="d-flex gap-2 align-items-center flex-shrink-0">
+                                            {configured && (
+                                                <Form.Check
+                                                    type="switch"
+                                                    id={`provider-switch-${meta.kind}`}
+                                                    checked={enabled}
+                                                    disabled={isToggling || busy}
+                                                    onChange={(e) =>
+                                                        void toggleEnabled(
+                                                            meta.kind,
+                                                            e.target.checked,
+                                                        )
+                                                    }
+                                                    aria-label={`${enabled ? "Disable" : "Enable"} ${meta.display}`}
+                                                    data-testid={`provider-toggle-${meta.kind}`}
+                                                />
+                                            )}
                                             {!configured && (
                                                 <Button
                                                     size="sm"
@@ -393,6 +483,24 @@ export function SearchPage() {
                                                         data-testid={`provider-edit-${meta.kind}`}
                                                     >
                                                         Edit
+                                                    </Button>
+                                                    <Button
+                                                        size="sm"
+                                                        variant={
+                                                            isTestOpen
+                                                                ? "primary"
+                                                                : "outline-primary"
+                                                        }
+                                                        onClick={() =>
+                                                            toggleTestPanel(
+                                                                meta.kind,
+                                                            )
+                                                        }
+                                                        disabled={busy}
+                                                        aria-expanded={isTestOpen}
+                                                        data-testid={`provider-test-toggle-${meta.kind}`}
+                                                    >
+                                                        Test
                                                     </Button>
                                                     {!isDefault && (
                                                         <Button
@@ -518,10 +626,10 @@ export function SearchPage() {
                                         </div>
                                     )}
 
-                                    {configured && (
+                                    {isTestOpen && (
                                         <div
                                             className="border-top pt-3 mt-2"
-                                            data-testid={`provider-test-${meta.kind}`}
+                                            data-testid={`provider-test-panel-${meta.kind}`}
                                         >
                                             <div className="d-flex gap-2 align-items-end mb-2">
                                                 <Form.Group className="flex-grow-1">
@@ -531,103 +639,81 @@ export function SearchPage() {
                                                     <Form.Control
                                                         type="text"
                                                         placeholder="rust async patterns"
-                                                        value={
-                                                            testFor === meta.kind
-                                                                ? testQuery
-                                                                : ""
-                                                        }
-                                                        onChange={(e) => {
-                                                            setTestFor(meta.kind);
+                                                        value={testQuery}
+                                                        onChange={(e) =>
                                                             setTestQuery(
                                                                 e.target.value,
-                                                            );
-                                                        }}
-                                                        onFocus={() => {
+                                                            )
+                                                        }
+                                                        onKeyDown={(e) => {
                                                             if (
-                                                                testFor !==
-                                                                meta.kind
+                                                                e.key === "Enter"
                                                             ) {
-                                                                setTestFor(
+                                                                e.preventDefault();
+                                                                void runTest(
                                                                     meta.kind,
-                                                                );
-                                                                setTestResult(
-                                                                    null,
-                                                                );
-                                                                setTestError(
-                                                                    null,
                                                                 );
                                                             }
                                                         }}
+                                                        autoFocus
+                                                        data-testid={`provider-test-input-${meta.kind}`}
                                                     />
                                                 </Form.Group>
                                                 <Button
                                                     size="sm"
-                                                    variant="outline-primary"
+                                                    variant="primary"
                                                     onClick={() =>
                                                         runTest(meta.kind)
                                                     }
                                                     disabled={busy}
                                                     data-testid={`provider-run-test-${meta.kind}`}
                                                 >
-                                                    Run test
+                                                    Run
                                                 </Button>
                                             </div>
-                                            {testFor === meta.kind &&
-                                                testError && (
-                                                    <Alert
-                                                        variant="danger"
-                                                        data-testid={`provider-test-error-${meta.kind}`}
-                                                    >
-                                                        {testError}
-                                                    </Alert>
-                                                )}
-                                            {testFor === meta.kind &&
-                                                testResult && (
-                                                    <div
-                                                        data-testid={`provider-test-results-${meta.kind}`}
-                                                    >
-                                                        <div className="execlaw-muted small mb-2">
-                                                            {
-                                                                testResult.results
-                                                                    .length
-                                                            }{" "}
-                                                            results in{" "}
-                                                            {
-                                                                testResult.elapsed_ms
-                                                            }
-                                                            ms
-                                                        </div>
-                                                        <ul className="list-unstyled small mb-0">
-                                                            {testResult.results
-                                                                .slice(0, 5)
-                                                                .map((h, i) => (
-                                                                    <li
-                                                                        key={`${h.url}-${i}`}
-                                                                        className="mb-2"
-                                                                    >
-                                                                        <a
-                                                                            href={
-                                                                                h.url
-                                                                            }
-                                                                            target="_blank"
-                                                                            rel="noopener noreferrer"
-                                                                        >
-                                                                            {
-                                                                                h.title
-                                                                            }
-                                                                        </a>
-                                                                        {h.snippet && (
-                                                                            <div className="execlaw-muted">
-                                                                                {
-                                                                                    h.snippet
-                                                                                }
-                                                                            </div>
-                                                                        )}
-                                                                    </li>
-                                                                ))}
-                                                        </ul>
+                                            {testError && (
+                                                <Alert
+                                                    variant="danger"
+                                                    data-testid={`provider-test-error-${meta.kind}`}
+                                                >
+                                                    {testError}
+                                                </Alert>
+                                            )}
+                                            {testResult && (
+                                                <div
+                                                    data-testid={`provider-test-results-${meta.kind}`}
+                                                >
+                                                    <div className="execlaw-muted small mb-2">
+                                                        {testResult.results.length}{" "}
+                                                        results in{" "}
+                                                        {testResult.elapsed_ms}
+                                                        ms
                                                     </div>
-                                                )}
+                                                    <ul className="list-unstyled small mb-0">
+                                                        {testResult.results
+                                                            .slice(0, 5)
+                                                            .map((h, i) => (
+                                                                <li
+                                                                    key={`${h.url}-${i}`}
+                                                                    className="mb-2"
+                                                                >
+                                                                    <a
+                                                                        href={h.url}
+                                                                        target="_blank"
+                                                                        rel="noopener noreferrer"
+                                                                    >
+                                                                        {h.title}
+                                                                    </a>
+                                                                    {h.snippet && (
+                                                                        <div className="execlaw-muted">
+                                                                            {h.snippet}
+                                                                        </div>
+                                                                    )}
+                                                                </li>
+                                                            ))}
+                                                    </ul>
+                                                </div>
+                                            )}
                                         </div>
                                     )}
                                 </Card.Body>
