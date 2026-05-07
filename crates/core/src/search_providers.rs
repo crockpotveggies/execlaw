@@ -10,7 +10,11 @@
 //!   * `duckduckgo` — `{}` (no config)
 //!   * `searxng` — `{"base_url": "https://searx.example.com"}`
 //!   * `brave` — `{"api_key": "..."}`
+//!   * `exa` — `{"api_key": "..."}`
 //!   * `tavily` — `{"api_key": "..."}`
+//!   * `serpapi` — `{"api_key": "..."}`
+//!   * `perplexity` — `{"api_key": "..."}`
+//!   * `searchapi` — `{"api_key": "..."}`
 //!
 //! The store doesn't validate per-kind config shapes — that's the
 //! adapter's job at construction time. This keeps `core` provider-
@@ -53,6 +57,23 @@ pub enum SearchProviderKind {
     /// Free tier (currently 1k credits/month) is enough for
     /// personal research workloads.
     Tavily,
+    /// SerpAPI. Paid wrapper around Google / Bing / Yahoo /
+    /// DuckDuckGo / etc. Free tier 100/month. Pays off when
+    /// Brave / Exa / Tavily quotas are exhausted and the
+    /// operator wants Google-quality SERPs without scraping.
+    /// Requires an API key from serpapi.com.
+    SerpApi,
+    /// Perplexity Search API. Returns ranked URLs + snippets
+    /// curated for LLM use, separate from the Sonar chat
+    /// completions API. Requires an API key from
+    /// perplexity.ai/api-platform.
+    Perplexity,
+    /// SearchAPI.io. Another paid SERP wrapper, similar shape
+    /// to SerpAPI. Free tier 100/month. Adding it to the
+    /// rotation pool effectively doubles the free-tier search
+    /// budget vs running SerpAPI alone. Requires an API key
+    /// from searchapi.io.
+    SearchApi,
 }
 
 impl SearchProviderKind {
@@ -63,6 +84,9 @@ impl SearchProviderKind {
             Self::Brave => "brave",
             Self::Exa => "exa",
             Self::Tavily => "tavily",
+            Self::SerpApi => "serpapi",
+            Self::Perplexity => "perplexity",
+            Self::SearchApi => "searchapi",
         }
     }
 
@@ -73,6 +97,9 @@ impl SearchProviderKind {
             "brave" => Some(Self::Brave),
             "exa" => Some(Self::Exa),
             "tavily" => Some(Self::Tavily),
+            "serpapi" => Some(Self::SerpApi),
+            "perplexity" => Some(Self::Perplexity),
+            "searchapi" => Some(Self::SearchApi),
             _ => None,
         }
     }
@@ -88,6 +115,9 @@ impl SearchProviderKind {
             Self::Brave => "Brave Search API",
             Self::Exa => "Exa (neural search)",
             Self::Tavily => "Tavily (RAG-optimised)",
+            Self::SerpApi => "SerpAPI",
+            Self::Perplexity => "Perplexity Search",
+            Self::SearchApi => "SearchAPI",
         }
     }
 }
@@ -419,6 +449,9 @@ mod tests {
             SearchProviderKind::Brave,
             SearchProviderKind::Exa,
             SearchProviderKind::Tavily,
+            SearchProviderKind::SerpApi,
+            SearchProviderKind::Perplexity,
+            SearchProviderKind::SearchApi,
         ] {
             assert_eq!(SearchProviderKind::parse(k.as_str()), Some(k));
             assert!(!k.display_name().is_empty());

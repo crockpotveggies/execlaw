@@ -114,6 +114,51 @@ const KNOWN_KINDS: ReadonlyArray<{
             },
         ],
     },
+    {
+        kind: "serpapi",
+        display: "SerpAPI",
+        description: "Paid Google SERP wrapper. 100/month free.",
+        fields: [
+            {
+                key: "api_key",
+                label: "API key",
+                type: "password",
+                placeholder: "your-serpapi-key",
+                helpText:
+                    "Your SerpAPI key from serpapi.com/manage-api-key. Sent as the api_key query param.",
+            },
+        ],
+    },
+    {
+        kind: "perplexity",
+        display: "Perplexity Search",
+        description: "Curated for LLM use. Bearer auth.",
+        fields: [
+            {
+                key: "api_key",
+                label: "API key",
+                type: "password",
+                placeholder: "pplx-...",
+                helpText:
+                    "Your Perplexity API key (starts with 'pplx-') from perplexity.ai/api-platform. Sent as a Bearer token.",
+            },
+        ],
+    },
+    {
+        kind: "searchapi",
+        display: "SearchAPI",
+        description: "Paid SERP wrapper. 100/month free tier.",
+        fields: [
+            {
+                key: "api_key",
+                label: "API key",
+                type: "password",
+                placeholder: "your-searchapi-key",
+                helpText:
+                    "Your SearchAPI key from searchapi.io/dashboard. Sent as a Bearer token.",
+            },
+        ],
+    },
 ];
 
 interface EditingState {

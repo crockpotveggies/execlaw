@@ -27,7 +27,10 @@ use crate::search_rotating::RotatingWebSearchApi;
 use crate::tool_apis_search::DuckDuckGoSearchApi;
 use crate::tool_apis_search_brave::BraveSearchApi;
 use crate::tool_apis_search_exa::ExaSearchApi;
+use crate::tool_apis_search_perplexity::PerplexitySearchApi;
+use crate::tool_apis_search_searchapi::SearchApiSearchApi;
 use crate::tool_apis_search_searxng::SearxNGSearchApi;
+use crate::tool_apis_search_serpapi::SerpApiSearchApi;
 use crate::tool_apis_search_tavily::TavilySearchApi;
 use execlaw_core::Database;
 use execlaw_core::search_providers::{SearchProviderKind, SearchProviderRow, SearchProviderStore};
@@ -128,6 +131,30 @@ pub fn construct_from_row(row: &SearchProviderRow) -> Arc<dyn WebSearchApi> {
                 .unwrap_or("")
                 .to_owned();
             Arc::new(TavilySearchApi::new(api_key))
+        }
+        SearchProviderKind::SerpApi => {
+            let api_key = cfg
+                .get("api_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            Arc::new(SerpApiSearchApi::new(api_key))
+        }
+        SearchProviderKind::Perplexity => {
+            let api_key = cfg
+                .get("api_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            Arc::new(PerplexitySearchApi::new(api_key))
+        }
+        SearchProviderKind::SearchApi => {
+            let api_key = cfg
+                .get("api_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            Arc::new(SearchApiSearchApi::new(api_key))
         }
     }
 }
