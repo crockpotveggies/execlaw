@@ -82,6 +82,7 @@ pub mod tool_apis_search_searchapi;
 pub mod tool_apis_search_searxng;
 pub mod tool_apis_search_serpapi;
 pub mod tool_apis_search_tavily;
+pub mod tool_apis_search_websurfx;
 pub mod tool_apis_subagent;
 pub mod tool_dispatch;
 pub mod tool_sync;

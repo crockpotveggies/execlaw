@@ -159,6 +159,21 @@ const KNOWN_KINDS: ReadonlyArray<{
             },
         ],
     },
+    {
+        kind: "websurfx",
+        display: "Websurfx (self-hosted)",
+        description: "Self-hosted Rust meta-search. No key, no quota.",
+        fields: [
+            {
+                key: "base_url",
+                label: "Base URL",
+                type: "url",
+                placeholder: "http://websurfx.local:8080",
+                helpText:
+                    "Root URL of your Websurfx instance — the adapter appends /search?format=json. Requires Websurfx 1.x for the JSON endpoint.",
+            },
+        ],
+    },
 ];
 
 interface EditingState {

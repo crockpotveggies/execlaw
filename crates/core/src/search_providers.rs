@@ -15,6 +15,7 @@
 //!   * `serpapi` — `{"api_key": "..."}`
 //!   * `perplexity` — `{"api_key": "..."}`
 //!   * `searchapi` — `{"api_key": "..."}`
+//!   * `websurfx` — `{"base_url": "http://websurfx.local:8080"}`
 //!
 //! The store doesn't validate per-kind config shapes — that's the
 //! adapter's job at construction time. This keeps `core` provider-
@@ -74,6 +75,12 @@ pub enum SearchProviderKind {
     /// budget vs running SerpAPI alone. Requires an API key
     /// from searchapi.io.
     SearchApi,
+    /// Websurfx. Self-hosted Rust meta-search engine — same
+    /// "no API key, no shared rate limit" shape as SearxNG,
+    /// different codebase. Useful when an operator wants a
+    /// second self-hosted backend in the rotation pool, or
+    /// when SearxNG's settings.yml is too fiddly.
+    Websurfx,
 }
 
 impl SearchProviderKind {
@@ -87,6 +94,7 @@ impl SearchProviderKind {
             Self::SerpApi => "serpapi",
             Self::Perplexity => "perplexity",
             Self::SearchApi => "searchapi",
+            Self::Websurfx => "websurfx",
         }
     }
 
@@ -100,6 +108,7 @@ impl SearchProviderKind {
             "serpapi" => Some(Self::SerpApi),
             "perplexity" => Some(Self::Perplexity),
             "searchapi" => Some(Self::SearchApi),
+            "websurfx" => Some(Self::Websurfx),
             _ => None,
         }
     }
@@ -118,6 +127,7 @@ impl SearchProviderKind {
             Self::SerpApi => "SerpAPI",
             Self::Perplexity => "Perplexity Search",
             Self::SearchApi => "SearchAPI",
+            Self::Websurfx => "Websurfx (self-hosted)",
         }
     }
 }
@@ -452,6 +462,7 @@ mod tests {
             SearchProviderKind::SerpApi,
             SearchProviderKind::Perplexity,
             SearchProviderKind::SearchApi,
+            SearchProviderKind::Websurfx,
         ] {
             assert_eq!(SearchProviderKind::parse(k.as_str()), Some(k));
             assert!(!k.display_name().is_empty());

@@ -32,6 +32,7 @@ use crate::tool_apis_search_searchapi::SearchApiSearchApi;
 use crate::tool_apis_search_searxng::SearxNGSearchApi;
 use crate::tool_apis_search_serpapi::SerpApiSearchApi;
 use crate::tool_apis_search_tavily::TavilySearchApi;
+use crate::tool_apis_search_websurfx::WebsurfxSearchApi;
 use execlaw_core::Database;
 use execlaw_core::search_providers::{SearchProviderKind, SearchProviderRow, SearchProviderStore};
 use execlaw_core::tool::WebSearchApi;
@@ -155,6 +156,14 @@ pub fn construct_from_row(row: &SearchProviderRow) -> Arc<dyn WebSearchApi> {
                 .unwrap_or("")
                 .to_owned();
             Arc::new(SearchApiSearchApi::new(api_key))
+        }
+        SearchProviderKind::Websurfx => {
+            let base_url = cfg
+                .get("base_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            Arc::new(WebsurfxSearchApi::new(base_url))
         }
     }
 }
