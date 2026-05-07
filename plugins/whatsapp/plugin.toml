@@ -1,7 +1,7 @@
 [plugin]
 id = "whatsapp"
 name = "WhatsApp"
-version = "0.1.0"
+version = "0.1.1"
 description = "WhatsApp Multi-Device transport via wuzapi (whatsmeow-backed). Mirrors the Signal plugin shape: 6 agent-callable tools (send_message, reply, list_groups, create_group, add_group_members, leave_group) + 3 host-internal convention tools (set_typing, send_with_attachments, fetch_attachment), inbound WS consumer, QR-pairing admin flow."
 author = "execlaw"
 license = "AGPL-3.0-or-later"
@@ -35,7 +35,9 @@ read_only = false
 
 [services.sidecar]
 rpc_port = 8080
-rpc_health_path = "/api/version"
+# wuzapi serves a 200 on `GET /` (the root webroot). It does not
+# expose a /api/version or /health route, so use the root.
+rpc_health_path = "/"
 
 # Channel declaration. The icon flows into the SPA sidebar's
 # bridged-thread row marker.

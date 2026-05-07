@@ -1,104 +1,134 @@
 // whatsapp — WhatsApp Multi-Device transport via wuzapi.
 //
-// Same shape as the Signal plugin (post-v0.4.7): the host owns
+// Same shape as the Signal plugin (post-v0.4.7). The host owns
 // trust admit + conversation routing + agent reply auto-bridge;
 // this plugin owns the inbound WS consumer, frame decoder, all
 // `whatsapp.*` tools, and the QR pairing flow.
 //
-// wuzapi quirks vs bbernhard:
-//   * Multi-tenant: every HTTP call needs a `Token: <user_token>`
-//     header. The token is provisioned via /admin/users at
-//     on_enable (admin token comes from the manifest's services.env)
-//     and then cached in the per-plugin vault.
-//   * WS endpoint: ws://host:port/ws?token=<user_token>.
-//   * Recipient JID format: `<digits>@s.whatsapp.net` for 1:1,
-//     `<id>@g.us` for groups. wire_recipient() massages plain
-//     phone numbers into the @s.whatsapp.net form.
+// wuzapi contract (probed live against asternic/wuzapi:latest,
+// 2026-05-08):
+//
+//   * Health probe: `GET /` returns 200 (no /health, no /api/version).
+//   * Admin auth: `Authorization: <admin_token>` header. Admin
+//     token comes from the manifest's WUZAPI_ADMIN_TOKEN env var.
+//   * User auth: `Token: <user_token>` header. The user token
+//     is set explicitly when we POST /admin/users so we know it
+//     ahead of time without parsing the response.
+//   * POST /admin/users  body  {name, token, webhook, events}
+//                        resp  {code, data: {...full user...}, success}
+//                        409 / 500 on duplicate name (which is fine —
+//                        we treat it as "already provisioned" and
+//                        continue with the known token).
+//   * GET  /admin/users  resp  {code, data: [...], success}
+//   * POST /session/connect  body  {Subscribe: ["Message"], Immediate: true}
+//                            MUST be called once before /session/qr
+//                            stops returning "no session".
+//   * GET  /session/status  resp  {data: {connected, loggedIn, jid, qrcode, ...}}
+//   * GET  /session/qr      resp  {data: {QRCode: "data:image/png;base64,..."}}
+//                            (NOT raw PNG bytes — JSON-wrapped data URL)
+//   * POST /chat/send/text  body  {Phone, Body}
+//   * Group ops: /group/list, /group/create, /group/updateparticipants,
+//     /group/leave  — same Token header, varies by version.
+//
+// Deferred: end-to-end test of group + attachment paths against
+// a real paired account. The endpoints + body shapes match
+// wuzapi's documented API but field-casing drift is possible.
+
+const USER_TOKEN_NAME = "execlaw-user";
 
 // =====================================================================
 // LIFECYCLE
 // =====================================================================
 
 fn on_enable() {
-    // Wait for the wuzapi container to publish a port.
     let base = sidecar_url_blocking("wuzapi", 60000);
     if base == () || base == "" {
         log_warn("whatsapp: sidecar didn't come up within 60s — restart the plugin from Settings → Plugins to retry");
         return;
     }
-
-    // Provision (or look up) the per-execlaw user, cache its
-    // token in the vault. The token doesn't change across reboots
-    // unless wuzapi's database is wiped, so vault hits 99% of the
-    // time after first install.
-    let user_token = ();
+    // Provision (or look up) the per-execlaw user. The token is
+    // pinned ("execlaw-user") so we don't have to round-trip the
+    // /admin/users response. Vault caches the same value to keep
+    // user_headers() honest if wuzapi's env / db gets reset.
     try {
-        user_token = ensure_user_token(base);
+        ensure_user_token(base);
     } catch (e) {
-        log_warn("whatsapp: couldn't provision wuzapi user: " + e + " — pair via Settings → Plugins → WhatsApp once the sidecar is healthy");
+        log_warn("whatsapp: ensure_user_token failed: " + e + " — Settings → Plugins → WhatsApp will surface the error and the operator can retry once wuzapi is healthy");
         return;
     }
-    if user_token == () || user_token == "" {
-        log_warn("whatsapp: ensure_user_token returned empty; bailing");
-        return;
+    // Connect the session so /session/qr starts returning the
+    // QR code instead of 500-ing with "no session". Idempotent —
+    // wuzapi treats a second /session/connect on a connected
+    // session as a no-op.
+    try {
+        ensure_session_connected(base);
+    } catch (e) {
+        log_warn("whatsapp: /session/connect failed: " + e + " — pairing UI will retry on each poll");
     }
-
-    // Subscribe to the per-user WS event stream. wuzapi accepts
-    // the token via the `?token=` query param OR the Token: header
-    // — we use the query param since ws_subscribe doesn't support
-    // headers yet.
     let host_port = base.sub_string(7); // strip "http://"
-    let ws = "ws://" + host_port + "/ws?token=" + url_encode(user_token);
+    let ws = "ws://" + host_port + "/ws?token=" + url_encode("execlaw-user");
     log_info("whatsapp: subscribing to inbound WebSocket at ws://" + host_port + "/ws");
     let _handle = ws_subscribe(ws, "on_frame");
     ()
 }
 
-// Provision-or-lookup the "execlaw" wuzapi user. The endpoint
-// shape is wuzapi-specific: POST /admin/users with the admin
-// token returns either the new user OR an "already exists" hint.
-// We then GET /admin/users to find by name + extract the token.
+// Idempotent provision of the "execlaw" user. Token is pinned so
+// we always know what value to send in user_headers(). Already-
+// existing user surfaces as a 4xx/500 from POST; we ignore that
+// and verify via GET /admin/users.
 fn ensure_user_token(base) {
-    // Cache hit?
+    // Cache hit fast-path.
     let cached = vault_get("user_token");
     if cached != () && cached != "" { return cached; }
 
-    let admin = #{ "Authorization": "execlaw-wuzapi-admin", "Token": "execlaw-wuzapi-admin" };
+    let admin_h = #{ "Authorization": "execlaw-wuzapi-admin" };
+    let token = "execlaw-user";
 
-    // Try to create the user. Idempotent on wuzapi >= 1.x — a
-    // duplicate name returns 409 / 400 with an "already exists"
-    // body, which we treat as success and fall through to lookup.
+    // Best-effort create. Treat any failure as "user probably
+    // already exists" and fall through to the listing check.
     try {
         sidecar_http_post(base + "/admin/users", #{
             "name": "execlaw",
-            "token": "",
-        }, admin);
+            "token": token,
+            "webhook": "",
+            "events": "All",
+        }, admin_h);
+        log_info("whatsapp: provisioned wuzapi user 'execlaw'");
     } catch (e) {
-        // Best-effort: log, then try to look up by name anyway.
-        log_info("whatsapp: /admin/users create returned: " + e);
+        log_info("whatsapp: /admin/users create returned " + e + " (proceeding to verify)");
     }
 
-    // List + find. wuzapi's /admin/users response shape varies
-    // by version — handle both `[{...}]` and `{users:[{...}]}`.
-    let raw = sidecar_http_get(base + "/admin/users", #{}, admin);
-    let users = raw;
-    if type_of(raw) == "map" && raw.users != () {
-        users = raw.users;
+    // Verify by listing. wuzapi wraps the array in `data`.
+    let raw = sidecar_http_get(base + "/admin/users", #{}, admin_h);
+    let users = ();
+    if type_of(raw) == "map" && raw.data != () {
+        users = raw.data;
+    } else if type_of(raw) == "array" {
+        users = raw;
     }
     if users == () || type_of(users) != "array" {
-        throw "wuzapi /admin/users returned unexpected shape: " + raw;
+        throw "wuzapi /admin/users returned unexpected shape";
     }
+    let found = false;
     for u in users {
         let name = if u.name != () { u.name } else { u.Name };
-        if name == "execlaw" {
-            let token = if u.token != () { u.token } else { u.Token };
-            if token != () && token != "" {
-                vault_put("user_token", token);
-                return token;
-            }
-        }
+        if name == "execlaw" { found = true; break; }
     }
-    throw "wuzapi: no user named 'execlaw' after create + list";
+    if !found {
+        throw "wuzapi: 'execlaw' user not present after create + list";
+    }
+    vault_put("user_token", token);
+    token
+}
+
+// POST /session/connect. Idempotent — wuzapi reports "Connected"
+// on already-connected sessions. Required before /session/qr
+// will return a QR; otherwise that endpoint 500s with "no session".
+fn ensure_session_connected(base) {
+    sidecar_http_post(base + "/session/connect", #{
+        "Subscribe": ["Message"],
+        "Immediate": true,
+    }, user_headers());
 }
 
 // =====================================================================
@@ -116,27 +146,7 @@ fn on_frame(raw) {
 }
 
 // Pure helper: decode a wuzapi WS event into the channel-agnostic
-// InboundMessage shape OR `()` for non-content events (status
-// updates, presence, receipts) the consumer should drop.
-//
-// wuzapi event envelope (best-effort against the documented API
-// — the actual shape may vary by version + needs iteration when
-// the operator first pairs):
-//   {
-//     "type": "Message",
-//     "event": {
-//       "Info": {
-//         "Chat": "<jid>@s.whatsapp.net" | "<id>@g.us",
-//         "Sender": "<jid>@s.whatsapp.net",
-//         "PushName": "Justin",
-//         "Timestamp": 1234567890,
-//         "IsGroup": false
-//       },
-//       "Message": {
-//         "conversation": "Hello"
-//       }
-//     }
-//   }
+// InboundMessage shape OR `()` for non-content events.
 fn decode_frame(raw) {
     try {
         let env = parse_json(raw);
@@ -149,10 +159,6 @@ fn decode_frame(raw) {
         let msg = event.Message;
         if info == () || msg == () { return (); }
 
-        // Pull the text out of the various message variants. The
-        // most common is `conversation` for plain text; richer
-        // types (extendedTextMessage, imageMessage with caption,
-        // etc.) live under nested keys.
         let text = ();
         if msg.conversation != () { text = msg.conversation; }
         if text == () && msg.extendedTextMessage != () && msg.extendedTextMessage.text != () {
@@ -166,22 +172,34 @@ fn decode_frame(raw) {
         }
         let trimmed = if text != () { trim(text) } else { "" };
 
-        // Attachments: image / video / audio / document. Each
-        // returns a media_id we'd POST back to wuzapi to
-        // download. Capture the media_id as bridge_id; the host
-        // will call whatsapp.fetch_attachment with it later.
         let attachments = [];
-        for kind in ["imageMessage", "videoMessage", "audioMessage", "documentMessage"] {
-            let m = msg[kind];
-            if m == () { continue; }
+        if msg.imageMessage != () {
+            let m = msg.imageMessage;
             let bridge_id = if m.url != () { m.url } else if m.directPath != () { m.directPath } else { () };
-            if bridge_id == () { continue; }
-            attachments.push(#{
-                "bridge_id": bridge_id,
-                "content_type": m.mimetype,
-                "filename": if m.fileName != () { m.fileName } else { () },
-                "size_bytes": m.fileLength,
-            });
+            if bridge_id != () {
+                attachments.push(#{ "bridge_id": bridge_id, "content_type": m.mimetype, "filename": m.fileName, "size_bytes": m.fileLength });
+            }
+        }
+        if msg.documentMessage != () {
+            let m = msg.documentMessage;
+            let bridge_id = if m.url != () { m.url } else if m.directPath != () { m.directPath } else { () };
+            if bridge_id != () {
+                attachments.push(#{ "bridge_id": bridge_id, "content_type": m.mimetype, "filename": m.fileName, "size_bytes": m.fileLength });
+            }
+        }
+        if msg.videoMessage != () {
+            let m = msg.videoMessage;
+            let bridge_id = if m.url != () { m.url } else if m.directPath != () { m.directPath } else { () };
+            if bridge_id != () {
+                attachments.push(#{ "bridge_id": bridge_id, "content_type": m.mimetype, "filename": m.fileName, "size_bytes": m.fileLength });
+            }
+        }
+        if msg.audioMessage != () {
+            let m = msg.audioMessage;
+            let bridge_id = if m.url != () { m.url } else if m.directPath != () { m.directPath } else { () };
+            if bridge_id != () {
+                attachments.push(#{ "bridge_id": bridge_id, "content_type": m.mimetype, "filename": (), "size_bytes": m.fileLength });
+            }
         }
 
         if trimmed == "" && attachments.is_empty() { return (); }
@@ -190,9 +208,6 @@ fn decode_frame(raw) {
         let sender = info.Sender;
         let is_group = info.IsGroup == true || (chat != () && chat.contains("@g.us"));
 
-        // Foreign id: for 1:1, the sender's JID (or chat, same thing).
-        // For groups, the sender's JID — the chat is the group's JID
-        // and goes into group_id.
         let native_id = if sender != () { strip_jid(sender) } else { strip_jid(chat) };
         let group_id = if is_group { chat } else { () };
 
@@ -201,7 +216,7 @@ fn decode_frame(raw) {
             "native_id": native_id,
             "display_name": info.PushName,
             "group_id": group_id,
-            "group_name": (), // wuzapi doesn't include group name on every event
+            "group_name": (),
             "text": trimmed,
             "timestamp_ms": if info.Timestamp != () { info.Timestamp * 1000 } else { () },
             "attachments": attachments,
@@ -212,10 +227,6 @@ fn decode_frame(raw) {
     }
 }
 
-// Strip `@s.whatsapp.net` / `@g.us` suffix to recover the bare
-// digits or id. Used for the InboundMessage.native_id field —
-// the host's principal admit pipeline keys on plain phone, not
-// wuzapi-formatted JID.
 fn strip_jid(s) {
     if s == () || s == "" { return s; }
     let at = s.index_of("@");
@@ -240,19 +251,15 @@ fn tool_call(name, args, oauth) {
     throw "unknown tool '" + name + "'";
 }
 
-// ---- send_message / reply ------------------------------------------
-
 fn send_message_impl(args) {
     let to = args.to;
     let text = args.text;
     if to == () || to == "" { throw "whatsapp.send_message requires `to`"; }
     if text == () || text == "" { throw "whatsapp.send_message requires `text`"; }
-    let phone_jid = wire_recipient(to);
-    let body = #{
-        "Phone": phone_jid,
+    let resp = sidecar_http_post(sidecar_url("wuzapi") + "/chat/send/text", #{
+        "Phone": wire_recipient(to),
         "Body": text,
-    };
-    let resp = sidecar_http_post(sidecar_url("wuzapi") + "/chat/send/text", body, user_headers());
+    }, user_headers());
     summarise_send_response(resp)
 }
 
@@ -263,22 +270,20 @@ fn reply_impl(args) {
     send_message_impl(args)
 }
 
-// ---- group ops ------------------------------------------------------
-
 fn list_groups_impl() {
-    let url = sidecar_url("wuzapi") + "/group/list";
-    let raw = sidecar_http_get(url, #{}, user_headers());
-    if raw == () { return #{ "groups": [] }; }
-    // wuzapi returns either {data: {groups: [...]}} or [...] — handle both.
-    let groups = raw;
+    let raw = sidecar_http_get(sidecar_url("wuzapi") + "/group/list", #{}, user_headers());
+    let groups = ();
     if type_of(raw) == "map" {
-        if raw.data != () && raw.data.groups != () {
-            groups = raw.data.groups;
-        } else if raw.groups != () {
-            groups = raw.groups;
+        if raw.data != () {
+            // wuzapi often nests further: {data: {Groups: [...]}}.
+            if type_of(raw.data) == "array" { groups = raw.data; }
+            else if raw.data.Groups != () { groups = raw.data.Groups; }
+            else if raw.data.groups != () { groups = raw.data.groups; }
         }
+    } else if type_of(raw) == "array" {
+        groups = raw;
     }
-    if type_of(groups) != "array" { return #{ "groups": [] }; }
+    if groups == () || type_of(groups) != "array" { return #{ "groups": [] }; }
     let out = [];
     for g in groups {
         let id = if g.JID != () { g.JID } else if g.id != () { g.id } else { () };
@@ -300,14 +305,17 @@ fn create_group_impl(args) {
         throw "whatsapp.create_group requires `members` (non-empty array)";
     }
     let participants = [];
-    for m in members {
-        participants.push(wire_recipient(m));
+    for m in members { participants.push(wire_recipient(m)); }
+    let resp = sidecar_http_post(sidecar_url("wuzapi") + "/group/create", #{
+        "Name": title,
+        "Participants": participants,
+    }, user_headers());
+    let group_id = ();
+    if type_of(resp) == "map" {
+        if resp.data != () && resp.data.JID != () { group_id = resp.data.JID; }
+        else if resp.JID != () { group_id = resp.JID; }
     }
-    let url = sidecar_url("wuzapi") + "/group/create";
-    let body = #{ "Name": title, "Participants": participants };
-    let resp = sidecar_http_post(url, body, user_headers());
-    let group_id = if resp.JID != () { resp.JID } else if resp.id != () { resp.id } else if resp.data != () && resp.data.JID != () { resp.data.JID } else { () };
-    if group_id == () { throw "whatsapp.create_group: bridge returned no `JID`: " + resp; }
+    if group_id == () { throw "whatsapp.create_group: bridge returned no JID"; }
     let ack_text = "Group \"" + title + "\" created with " + members.len() + " member(s).";
     if args.message != () && args.message != "" {
         send_message_impl(#{ "to": group_id, "text": args.message });
@@ -324,11 +332,8 @@ fn add_group_members_impl(args) {
     }
     let group_id = lookup_group_by_name(name);
     let participants = [];
-    for m in members {
-        participants.push(wire_recipient(m));
-    }
-    let url = sidecar_url("wuzapi") + "/group/updateparticipants";
-    sidecar_http_post(url, #{
+    for m in members { participants.push(wire_recipient(m)); }
+    sidecar_http_post(sidecar_url("wuzapi") + "/group/updateparticipants", #{
         "GroupJID": group_id,
         "Phone": participants,
         "Action": "add",
@@ -340,8 +345,9 @@ fn leave_group_impl(args) {
     let name = args.groupName;
     if name == () || name == "" { throw "whatsapp.leave_group requires `groupName`"; }
     let group_id = lookup_group_by_name(name);
-    let url = sidecar_url("wuzapi") + "/group/leave";
-    sidecar_http_post(url, #{ "GroupJID": group_id }, user_headers());
+    sidecar_http_post(sidecar_url("wuzapi") + "/group/leave", #{
+        "GroupJID": group_id,
+    }, user_headers());
     #{ "ack_text": "Left group \"" + name + "\"." }
 }
 
@@ -352,8 +358,6 @@ fn lookup_group_by_name(name) {
     }
     throw "whatsapp: no group named '" + name + "'";
 }
-
-// ---- auto-bridge (host-called) -------------------------------------
 
 fn send_with_attachments_impl(args) {
     let to = args.to;
@@ -367,30 +371,27 @@ fn send_with_attachments_impl(args) {
         throw "whatsapp.send_with_attachments: max 8 attachments per send; got " + attachments.len();
     }
     let phone_jid = wire_recipient(to);
-    // wuzapi takes one media at a time on /chat/send/{image,document,etc}.
-    // For multi-attachment batches, send each in series; the text
-    // rides on the first.
     let last_resp = ();
     let i = 0;
     for aid in attachments {
         let a = host_get_attachment_bytes(aid);
-        // Pick the right wuzapi endpoint by mime type.
         let path = "/chat/send/document";
+        let media_field = "Document";
         if a.mime_type != () && a.mime_type.starts_with("image/") {
             path = "/chat/send/image";
+            media_field = "Image";
         } else if a.mime_type != () && a.mime_type.starts_with("video/") {
             path = "/chat/send/video";
+            media_field = "Video";
         } else if a.mime_type != () && a.mime_type.starts_with("audio/") {
             path = "/chat/send/audio";
+            media_field = "Audio";
         }
         let body = #{
             "Phone": phone_jid,
-            "Image": a.data_url, // wuzapi accepts base64 data URLs in the media field
-            "Document": a.data_url,
-            "Video": a.data_url,
-            "Audio": a.data_url,
             "Caption": if i == 0 { text } else { "" },
         };
+        body[media_field] = a.data_url;
         last_resp = sidecar_http_post(sidecar_url("wuzapi") + path, body, user_headers());
         i += 1;
     }
@@ -401,13 +402,10 @@ fn set_typing_impl(args) {
     let to = args.to;
     let active = args.active == true;
     if to == () || to == "" { throw "whatsapp.set_typing requires `to`"; }
-    let phone_jid = wire_recipient(to);
-    let url = sidecar_url("wuzapi") + "/chat/presence";
-    let body = #{
-        "Phone": phone_jid,
+    sidecar_http_post(sidecar_url("wuzapi") + "/chat/presence", #{
+        "Phone": wire_recipient(to),
         "State": if active { "composing" } else { "paused" },
-    };
-    sidecar_http_post(url, body, user_headers());
+    }, user_headers());
     #{ "ok": true }
 }
 
@@ -416,28 +414,21 @@ fn fetch_attachment_impl(args) {
     if attachment_id == () || attachment_id == "" {
         throw "whatsapp.fetch_attachment requires `attachment_id`";
     }
-    // wuzapi exposes /chat/downloadimage etc. Multiple endpoints
-    // by media kind, but the simplest is to use the generic
-    // download with the media URL/path.
-    let url = sidecar_url("wuzapi") + "/chat/downloadimage";
-    let r = sidecar_http_get_bytes(url, #{ "url": attachment_id }, user_headers());
-    #{
-        "data_url": r.data_url,
-        "mime_type": r.mime_type,
-        "size_bytes": r.size_bytes,
-    }
+    let r = sidecar_http_get_bytes(
+        sidecar_url("wuzapi") + "/chat/downloadimage",
+        #{ "url": attachment_id },
+        user_headers(),
+    );
+    #{ "data_url": r.data_url, "mime_type": r.mime_type, "size_bytes": r.size_bytes }
 }
 
 // =====================================================================
 // HELPERS
 // =====================================================================
 
-// Convert a plain phone (E.164 or digits-only) into wuzapi's JID
-// shape. Group ids (`<id>@g.us`) and already-formed JIDs pass
-// through unchanged.
 fn wire_recipient(s) {
     if s == () || s == "" { return s; }
-    if s.contains("@") { return s; } // already a JID
+    if s.contains("@") { return s; }
     let digits = s;
     if digits.starts_with("+") {
         digits = digits.sub_string(1);
@@ -445,32 +436,45 @@ fn wire_recipient(s) {
     digits + "@s.whatsapp.net"
 }
 
-// Build the per-request headers map. wuzapi accepts `Token: <user_token>`;
-// we send it on every call so the sidecar associates the request
-// with our provisioned user.
 fn user_headers() {
     let token = vault_get("user_token");
     if token == () || token == "" {
         throw "whatsapp: no user_token in vault — on_enable hasn't completed yet, or the wuzapi sidecar is down";
     }
-    #{ "Token": token, "Authorization": token }
+    #{ "Token": token }
 }
 
 fn summarise_send_response(resp) {
     if resp == () { return "ok"; }
-    if resp.Details != () { return resp.Details; }
-    if resp.id != () { return resp.id; }
+    if type_of(resp) == "map" {
+        if resp.data != () && type_of(resp.data) == "map" && resp.data.Details != () {
+            return resp.data.Details;
+        }
+        if resp.Details != () { return resp.Details; }
+    }
     "ok"
 }
 
 // =====================================================================
-// ADMIN ROUTES (declared in plugin.toml's [[admin_routes]])
+// ADMIN ROUTES
 // =====================================================================
 
-// GET /api/admin/plugins/whatsapp/status — pairing + sidecar
-// snapshot the SPA polls. Same shape as Signal's admin_status so
-// the SPA's WhatsApp page can reuse the SignalStatusResponse
-// shape (sidecar_status + registered_accounts + fetch_error).
+// GET /api/admin/plugins/whatsapp/status
+//
+// Reports three distinct states the SPA can present cleanly:
+//   * sidecar_status = "down"     -> wuzapi container not running.
+//   * sidecar_status = "awaiting_pairing" -> wuzapi up but no
+//     user_token in vault (on_enable hasn't finished provisioning,
+//     or just after install before the first pairing). The SPA
+//     renders the pairing card.
+//   * sidecar_status = "healthy"  -> wuzapi up + user provisioned;
+//     /session/status fetched cleanly.
+//   * sidecar_status = "unhealthy" -> wuzapi up + user provisioned
+//     but /session/status threw.
+//
+// This separation is the fix for the reported bug where a
+// "vault empty" condition (a normal first-run state) was being
+// reported as "sidecar unhealthy".
 fn admin_status(req) {
     let base = sidecar_url("wuzapi");
     if base == () {
@@ -482,22 +486,35 @@ fn admin_status(req) {
             "fetch_error": "wuzapi sidecar not running",
         };
     }
+
+    // No user provisioned yet → not actually unhealthy. on_enable
+    // either hasn't fired (cold-boot race) or its provisioning
+    // step failed (admin token mismatch, wuzapi rejecting create).
+    // Either way the SPA's pairing card is the right thing to
+    // render — it'll keep polling until a token shows up.
+    let token = vault_get("user_token");
+    if token == () || token == "" {
+        return #{
+            "sidecar_status": "awaiting_pairing",
+            "sidecar_rpc_url": base,
+            "registered_accounts": [],
+            "accounts_on_disk": [],
+            "fetch_error": (),
+        };
+    }
+
     let accounts = [];
     let fetch_error = ();
     try {
-        // /session/info reflects the per-user session state.
-        let info = sidecar_http_get(base + "/session/info", #{}, user_headers());
-        if info != () {
-            // wuzapi's connected/loggedin booleans tell us if a phone
-            // is paired. Surface the connected JID as a one-element
-            // accounts list so the SPA's "registered_accounts" badge
-            // works the same way as Signal.
-            let logged = info.LoggedIn == true || info.loggedIn == true ||
-                (info.data != () && info.data.LoggedIn == true);
+        let info = sidecar_http_get(base + "/session/status", #{}, #{ "Token": token });
+        let data = ();
+        if type_of(info) == "map" {
+            data = if info.data != () { info.data } else { info };
+        }
+        if data != () {
+            let logged = data.loggedIn == true || data.LoggedIn == true;
             if logged {
-                let jid = ();
-                if info.JID != () { jid = info.JID; }
-                else if info.data != () && info.data.JID != () { jid = info.data.JID; }
+                let jid = if data.jid != () { data.jid } else if data.JID != () { data.JID } else { () };
                 if jid != () && jid != "" {
                     accounts.push(strip_jid(jid));
                 }
@@ -506,6 +523,7 @@ fn admin_status(req) {
     } catch (e) {
         fetch_error = e.to_string();
     }
+
     #{
         "sidecar_status": if fetch_error == () { "healthy" } else { "unhealthy" },
         "sidecar_rpc_url": base,
@@ -515,26 +533,47 @@ fn admin_status(req) {
     }
 }
 
-// GET /api/admin/plugins/whatsapp/qrcodelink — returns the QR
-// code data URL the SPA <img>-renders. Operator scans it from
-// WhatsApp on their phone (Settings → Linked devices → Link a
-// device) to pair this wuzapi instance.
+// GET /api/admin/plugins/whatsapp/qrcodelink
+//
+// wuzapi returns the QR as a JSON envelope `{"data": {"QRCode":
+// "data:image/png;base64,..."}}` — NOT raw PNG bytes. We extract
+// the data_url and pass it through; the SPA puts it directly
+// into <img src>.
+//
+// /session/qr 500s with "no session" if /session/connect was
+// never called. Best-effort connect-then-qr in case the boot
+// path's connect call failed silently.
 fn admin_qrcodelink(req) {
     let base = sidecar_url("wuzapi");
     if base == () {
         return #{ "error": "wuzapi sidecar not running" };
     }
+    let token = vault_get("user_token");
+    if token == () || token == "" {
+        return #{ "error": "wuzapi user not provisioned yet — wait a few seconds and refresh, or check the server log for 'whatsapp: ensure_user_token failed'" };
+    }
+    // Best-effort connect — idempotent.
     try {
-        let r = sidecar_http_get_bytes(base + "/session/qr", #{}, user_headers());
-        return #{ "data_url": r.data_url, "mime_type": r.mime_type };
+        ensure_session_connected(base);
+    } catch (e) {
+        return #{ "error": "wuzapi /session/connect failed: " + e };
+    }
+    try {
+        let resp = sidecar_http_get(base + "/session/qr", #{}, #{ "Token": token });
+        let data = ();
+        if type_of(resp) == "map" {
+            data = if resp.data != () { resp.data } else { resp };
+        }
+        if data == () || data.QRCode == () || data.QRCode == "" {
+            return #{ "error": "wuzapi /session/qr returned no QRCode field — payload: " + resp };
+        }
+        return #{ "data_url": data.QRCode, "mime_type": "image/png" };
     } catch (e) {
         return #{ "error": e.to_string() };
     }
 }
 
-// DELETE /api/admin/plugins/whatsapp/unregister-account — logs
-// the wuzapi user out of WhatsApp + clears the cached user_token.
-// Forces a fresh QR scan on next pairing.
+// DELETE /api/admin/plugins/whatsapp/unregister-account
 fn admin_unregister_account(req) {
     let base = sidecar_url("wuzapi");
     if base == () { throw "wuzapi sidecar not running"; }

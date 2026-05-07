@@ -129,14 +129,22 @@ function SidecarStatusBlock({
                     Account fetch failed: {status.fetch_error}
                 </div>
             )}
-            {status.sidecar_status !== "healthy" && (
+            {status.sidecar_status === "awaiting_pairing" && (
                 <div className="execlaw-muted small">
-                    Sidecar isn&apos;t healthy yet. Pairing waits until the
-                    supervisor brings it up — see{" "}
-                    <strong>Settings → Sidecars</strong> for restart attempts
-                    and recent errors.
+                    Sidecar is up; waiting for the wuzapi user to be
+                    provisioned. The plugin auto-creates one on the
+                    first poll — usually a few seconds.
                 </div>
             )}
+            {status.sidecar_status !== "healthy" &&
+                status.sidecar_status !== "awaiting_pairing" && (
+                    <div className="execlaw-muted small">
+                        Sidecar isn&apos;t healthy yet. Pairing waits
+                        until the supervisor brings it up — see{" "}
+                        <strong>Settings → Sidecars</strong> for restart
+                        attempts and recent errors.
+                    </div>
+                )}
         </div>
     );
 }
@@ -345,11 +353,14 @@ function badgeClassForStatus(status: string): string {
             return "bg-success";
         case "starting":
         case "pulling":
+        case "awaiting_pairing":
             return "bg-info";
         case "crashlooping":
+        case "unhealthy":
             return "bg-danger";
         case "stopped":
         case "unwired":
+        case "down":
             return "bg-secondary";
         default:
             return "bg-secondary";
