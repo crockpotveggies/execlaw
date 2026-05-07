@@ -34,6 +34,7 @@ import { GoogleContactsPage } from "./GoogleContactsPage";
 import type { PluginConfigComponent } from "./PluginConfigBase";
 import { PushoverConfigPage } from "./PushoverConfigPage";
 import { SignalConfigPage } from "./SignalConfigPage";
+import { WhatsAppConfigPage } from "./WhatsAppConfigPage";
 
 const KNOWN_CONFIGS: Record<string, PluginConfigComponent> = {
     // Each new plugin with a custom config UI registers here.
@@ -43,6 +44,7 @@ const KNOWN_CONFIGS: Record<string, PluginConfigComponent> = {
     "google-calendar": GoogleCalendarPage,
     pushover: PushoverConfigPage,
     signal: SignalConfigPage,
+    whatsapp: WhatsAppConfigPage,
 };
 
 export function PluginConfigRouter() {

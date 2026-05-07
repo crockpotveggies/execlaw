@@ -2175,6 +2175,46 @@ export async function unregisterSignalAccount(
     );
 }
 
+// ---- /api/admin/plugins/whatsapp/* ---------------------------------
+//
+// WhatsApp plugin admin endpoints. Mirrors the Signal shape: same
+// SignalStatusResponse-style status payload, same QR-bytes
+// fetcher, same unregister DELETE. The plugin owns its own per-
+// plugin vault for the wuzapi user_token.
+
+export type WhatsAppStatusResponse = SignalStatusResponse;
+export type WhatsAppQrCodeLinkResponse = SignalQrCodeLinkResponse;
+
+export async function getWhatsAppStatus(
+    tokenAccessor: () => string | null,
+): Promise<WhatsAppStatusResponse> {
+    return apiFetch<WhatsAppStatusResponse>(
+        "/api/admin/plugins/whatsapp/status",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function fetchWhatsAppQrCodeLink(
+    tokenAccessor: () => string | null,
+): Promise<WhatsAppQrCodeLinkResponse> {
+    return apiFetch<WhatsAppQrCodeLinkResponse>(
+        "/api/admin/plugins/whatsapp/qrcodelink",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function unregisterWhatsAppAccount(
+    tokenAccessor: () => string | null,
+): Promise<void> {
+    await apiFetch<unknown>(
+        "/api/admin/plugins/whatsapp/unregister-account",
+        { method: "DELETE", rawText: true },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/plugins/pushover/* ---------------------------------
 //
 // Pushover plugin admin endpoints. The plugin persists user_key +

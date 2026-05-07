@@ -1,0 +1,169 @@
+[plugin]
+id = "whatsapp"
+name = "WhatsApp"
+version = "0.1.0"
+description = "WhatsApp Multi-Device transport via wuzapi (whatsmeow-backed). Mirrors the Signal plugin shape: 6 agent-callable tools (send_message, reply, list_groups, create_group, add_group_members, leave_group) + 3 host-internal convention tools (set_typing, send_with_attachments, fetch_attachment), inbound WS consumer, QR-pairing admin flow."
+author = "execlaw"
+license = "AGPL-3.0-or-later"
+
+# Supervised wuzapi sidecar. wuzapi is a Go HTTP/WebSocket wrapper
+# around whatsmeow — same role as bbernhard/signal-cli-rest-api
+# plays for Signal. Single Docker container, REST for outbound,
+# WebSocket for inbound, QR endpoint for pairing.
+[[services]]
+name = "wuzapi"
+image = "asternic/wuzapi:latest"
+ports = []
+
+# wuzapi multi-tenant mode: the admin token authenticates the
+# /admin/users endpoint we use at on_enable to provision (or
+# look up) a single execlaw user. The user-token (returned by
+# that endpoint) is what the plugin then uses for all subsequent
+# REST + WS calls. Sidecar is loopback-only so the admin token's
+# blast radius is tight even at this fixed value; operators
+# rotating to higher security can override via docker-compose.
+[services.env]
+WUZAPI_ADMIN_TOKEN = "execlaw-wuzapi-admin"
+
+# Persistent state: wuzapi stores its sqlite db (paired accounts,
+# session keys) under /app/dbdata. Mount a volume so the pairing
+# survives sidecar restarts.
+[[services.mounts]]
+source = "state://data"
+target = "/app/dbdata"
+read_only = false
+
+[services.sidecar]
+rpc_port = 8080
+rpc_health_path = "/api/version"
+
+# Channel declaration. The icon flows into the SPA sidebar's
+# bridged-thread row marker.
+[transport]
+transport_id = "whatsapp"
+supports_attachments = true
+supports_groups = true
+icon = "whatsapp"
+
+# ===== Agent-callable tools =====================================
+[[tools]]
+name = "whatsapp.send_message"
+description = """Send a WhatsApp message to a person or group. \
+This tool IS the user-visible message — do NOT also produce a text \
+reply summarising what you sent. After calling this tool, return an \
+empty text response to end your turn. \
+Args: { to: string (E.164 phone, or `<id>@g.us` group jid), \
+text: string }."""
+schema = "schemas/whatsapp.send_message.json"
+trust_floor = "Controller"
+latency = "low"
+
+[[tools]]
+name = "whatsapp.reply"
+description = """Reply in the current WhatsApp conversation. \
+This tool IS the user-visible reply — do NOT also produce a text \
+response summarising what you replied. After calling this tool, \
+return an empty text response to end your turn. \
+Args: { to: string (recipient — host fills from the conversation's binding), \
+text: string }."""
+schema = "schemas/whatsapp.send_message.json"
+latency = "low"
+
+[[tools]]
+name = "whatsapp.list_groups"
+description = """List WhatsApp groups the controller is a member of. \
+Returns: { groups: [{ id, name, member_count }] }."""
+trust_floor = "Controller"
+latency = "medium"
+
+[[tools]]
+name = "whatsapp.create_group"
+description = """Create a new WhatsApp group with the specified members. \
+The tool result includes an `ack_text` field — your final reply to \
+the user MUST be exactly that ack_text with no additions, no emoji, \
+and no rephrasing. Args: { title: string, members: string[] (E.164 \
+phones), message?: string (initial post) }."""
+trust_floor = "Controller"
+latency = "medium"
+
+[[tools]]
+name = "whatsapp.add_group_members"
+description = """Add members to an existing WhatsApp group, looking up \
+the group by exact name match. The tool result includes an `ack_text` \
+field — your final reply to the user MUST be exactly that ack_text with \
+no additions, no emoji, and no rephrasing. Args: \
+{ groupName: string, members: string[] (E.164 phones) }."""
+trust_floor = "Controller"
+latency = "medium"
+
+[[tools]]
+name = "whatsapp.leave_group"
+description = """Leave an existing WhatsApp group, looking up the group \
+by exact name match. The tool result includes an `ack_text` field — \
+your final reply to the user MUST be exactly that ack_text with no \
+additions, no emoji, and no rephrasing. Args: { groupName: string }."""
+trust_floor = "Controller"
+latency = "medium"
+
+# ===== Host-internal convention tools ============================
+[[tools]]
+name = "whatsapp.set_typing"
+description = """Host-internal: drive WhatsApp's typing-presence \
+indicator for the active recipient. The host fires this automatically \
+while the agent composes a reply; agents do not need to call it \
+directly. Args: { to: string, active: bool }."""
+trust_floor = "Controller"
+latency = "low"
+host_internal = true
+
+[[tools]]
+name = "whatsapp.send_with_attachments"
+description = """Send a WhatsApp message with one or more attachments \
+referenced by host-side attachment ids. Used by the deep-research \
+auto-bridge to deliver a finished PDF report through the originating \
+WhatsApp thread. Agents normally rely on send_message + the attachment \
+chip flow; this is the host-internal equivalent. \
+Args: { to: string, text?: string, attachments: int[] (host \
+attachment ids) }."""
+trust_floor = "Controller"
+latency = "medium"
+host_internal = true
+
+[[tools]]
+name = "whatsapp.fetch_attachment"
+description = """Host-internal: fetch the raw bytes of a WhatsApp \
+inbound attachment by its sidecar-side bridge id. Used by the host's \
+attachment ingest pipeline; agents do not call this directly. \
+Args: { attachment_id: string }."""
+trust_floor = "Controller"
+latency = "low"
+host_internal = true
+
+# ===== Admin routes ==============================================
+# Mounted by the host under /api/admin/plugins/whatsapp{path}.
+[[admin_routes]]
+method = "GET"
+path = "/status"
+handler = "admin_status"
+description = "Pairing + sidecar status snapshot."
+
+[[admin_routes]]
+method = "GET"
+path = "/qrcodelink"
+handler = "admin_qrcodelink"
+description = "QR code data URL the operator scans to pair wuzapi with their phone."
+
+[[admin_routes]]
+method = "DELETE"
+path = "/unregister-account"
+handler = "admin_unregister_account"
+description = "Unlink this execlaw install from the paired WhatsApp account."
+
+# SPA settings page mount.
+[[ui_panels]]
+mount = "admin/plugins/whatsapp"
+entry = "ui/panel.js"
+
+[runtime]
+tier = "script"
+source = "main.rhai"

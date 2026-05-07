@@ -779,42 +779,74 @@ fn register_sidecar_http_get_bytes(
         .timeout(Duration::from_secs(60))
         .user_agent("execlaw/script-runtime/sidecar-bytes/0.1")
         .build();
+    {
+        let agent = agent.clone();
+        let pid = pid.clone();
+        let host_caps = host_caps.clone();
+        engine.register_fn(
+            "sidecar_http_get_bytes",
+            move |url: ImmutableString, query: Map| -> Result<Dynamic, Box<EvalAltResult>> {
+                http_get_bytes_impl(&agent, &pid, &host_caps, &url, &query, None)
+            },
+        );
+    }
+    // 3-arg overload: sidecar_http_get_bytes(url, query, headers)
     engine.register_fn(
         "sidecar_http_get_bytes",
-        move |url: ImmutableString, query: Map| -> Result<Dynamic, Box<EvalAltResult>> {
-            use base64::Engine as _;
-            let caps = match host_caps.get() {
-                Some(c) => c.clone(),
-                None => return Err(host_cap_unavailable_err(&pid, "sidecar_http_get_bytes")),
-            };
-            sidecar_url_check(&pid, "sidecar_http_get_bytes", &url, &caps)?;
-            let mut req = agent.get(&url);
-            for (k, v) in map_to_query_iter(&query) {
-                req = req.query(&k, &v);
-            }
-            let resp = req
-                .call()
-                .map_err(|e| ureq_to_eval_err(&pid, "sidecar_http_get_bytes", &url, e))?;
-            let mime = resp
-                .header("Content-Type")
-                .map(|s| s.split(';').next().unwrap_or(s).trim().to_owned())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "application/octet-stream".to_owned());
-            let mut buf = Vec::new();
-            resp.into_reader().read_to_end(&mut buf).map_err(|e| {
-                Box::new(EvalAltResult::ErrorRuntime(
-                    format!("[{pid}] sidecar_http_get_bytes read: {e}").into(),
-                    rhai::Position::NONE,
-                ))
-            })?;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
-            let mut m = rhai::Map::new();
-            m.insert("data_url".into(), Dynamic::from(ImmutableString::from(format!("data:{mime};base64,{encoded}"))));
-            m.insert("mime_type".into(), Dynamic::from(ImmutableString::from(mime)));
-            m.insert("size_bytes".into(), Dynamic::from(buf.len() as i64));
-            Ok(Dynamic::from(m))
+        move |url: ImmutableString,
+              query: Map,
+              headers: Map|
+              -> Result<Dynamic, Box<EvalAltResult>> {
+            http_get_bytes_impl(&agent, &pid, &host_caps, &url, &query, Some(&headers))
         },
     );
+}
+
+fn http_get_bytes_impl(
+    agent: &ureq::Agent,
+    pid: &str,
+    host_caps: &HostCapsHandle,
+    url: &ImmutableString,
+    query: &Map,
+    headers: Option<&Map>,
+) -> Result<Dynamic, Box<EvalAltResult>> {
+    use base64::Engine as _;
+    let caps = match host_caps.get() {
+        Some(c) => c.clone(),
+        None => return Err(host_cap_unavailable_err(pid, "sidecar_http_get_bytes")),
+    };
+    sidecar_url_check(pid, "sidecar_http_get_bytes", url, &caps)?;
+    let mut req = agent.get(url);
+    for (k, v) in map_to_query_iter(query) {
+        req = req.query(&k, &v);
+    }
+    if let Some(h) = headers {
+        req = apply_headers(req, h);
+    }
+    let resp = req
+        .call()
+        .map_err(|e| ureq_to_eval_err(pid, "sidecar_http_get_bytes", url, e))?;
+    let mime = resp
+        .header("Content-Type")
+        .map(|s| s.split(';').next().unwrap_or(s).trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "application/octet-stream".to_owned());
+    let mut buf = Vec::new();
+    resp.into_reader().read_to_end(&mut buf).map_err(|e| {
+        Box::new(EvalAltResult::ErrorRuntime(
+            format!("[{pid}] sidecar_http_get_bytes read: {e}").into(),
+            rhai::Position::NONE,
+        ))
+    })?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
+    let mut m = rhai::Map::new();
+    m.insert(
+        "data_url".into(),
+        Dynamic::from(ImmutableString::from(format!("data:{mime};base64,{encoded}"))),
+    );
+    m.insert("mime_type".into(), Dynamic::from(ImmutableString::from(mime)));
+    m.insert("size_bytes".into(), Dynamic::from(buf.len() as i64));
+    Ok(Dynamic::from(m))
 }
 
 fn register_sidecar_http_get(
@@ -827,9 +859,36 @@ fn register_sidecar_http_get(
         .timeout(Duration::from_secs(30))
         .user_agent("execlaw/script-runtime/sidecar/0.1")
         .build();
+    {
+        let agent = agent.clone();
+        let pid = pid.clone();
+        let host_caps = host_caps.clone();
+        engine.register_fn(
+            "sidecar_http_get",
+            move |url: ImmutableString, query: Map| -> Result<Dynamic, Box<EvalAltResult>> {
+                let caps = match host_caps.get() {
+                    Some(c) => c.clone(),
+                    None => return Err(host_cap_unavailable_err(&pid, "sidecar_http_get")),
+                };
+                sidecar_url_check(&pid, "sidecar_http_get", &url, &caps)?;
+                let mut req = agent.get(&url);
+                for (k, v) in map_to_query_iter(&query) {
+                    req = req.query(&k, &v);
+                }
+                let resp = req
+                    .call()
+                    .map_err(|e| ureq_to_eval_err(&pid, "sidecar_http_get", &url, e))?;
+                decode_response(&pid, &url, resp)
+            },
+        );
+    }
+    // 3-arg overload: sidecar_http_get(url, query, headers)
     engine.register_fn(
         "sidecar_http_get",
-        move |url: ImmutableString, query: Map| -> Result<Dynamic, Box<EvalAltResult>> {
+        move |url: ImmutableString,
+              query: Map,
+              headers: Map|
+              -> Result<Dynamic, Box<EvalAltResult>> {
             let caps = match host_caps.get() {
                 Some(c) => c.clone(),
                 None => return Err(host_cap_unavailable_err(&pid, "sidecar_http_get")),
@@ -839,6 +898,7 @@ fn register_sidecar_http_get(
             for (k, v) in map_to_query_iter(&query) {
                 req = req.query(&k, &v);
             }
+            req = apply_headers(req, &headers);
             let resp = req
                 .call()
                 .map_err(|e| ureq_to_eval_err(&pid, "sidecar_http_get", &url, e))?;
@@ -857,26 +917,70 @@ fn register_sidecar_http_post(
         .timeout(Duration::from_secs(30))
         .user_agent("execlaw/script-runtime/sidecar/0.1")
         .build();
+    {
+        let agent = agent.clone();
+        let pid = pid.clone();
+        let host_caps = host_caps.clone();
+        engine.register_fn(
+            "sidecar_http_post",
+            move |url: ImmutableString, body: Dynamic| -> Result<Dynamic, Box<EvalAltResult>> {
+                let caps = match host_caps.get() {
+                    Some(c) => c.clone(),
+                    None => return Err(host_cap_unavailable_err(&pid, "sidecar_http_post")),
+                };
+                sidecar_url_check(&pid, "sidecar_http_post", &url, &caps)?;
+                let body_value = rhai_to_json(body).map_err(|e| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        format!("[{pid}] sidecar_http_post: encode body: {e}").into(),
+                        rhai::Position::NONE,
+                    ))
+                })?;
+                let resp = agent
+                    .post(&url)
+                    .send_json(body_value)
+                    .map_err(|e| ureq_to_eval_err(&pid, "sidecar_http_post", &url, e))?;
+                decode_response(&pid, &url, resp)
+            },
+        );
+    }
+    // 3-arg overload: sidecar_http_post(url, body, headers)
     engine.register_fn(
         "sidecar_http_post",
-        move |url: ImmutableString, body: Dynamic| -> Result<Dynamic, Box<EvalAltResult>> {
+        move |url: ImmutableString,
+              body: Dynamic,
+              headers: Map|
+              -> Result<Dynamic, Box<EvalAltResult>> {
             let caps = match host_caps.get() {
                 Some(c) => c.clone(),
                 None => return Err(host_cap_unavailable_err(&pid, "sidecar_http_post")),
             };
             sidecar_url_check(&pid, "sidecar_http_post", &url, &caps)?;
-            let body_value = rhai_to_json(body)
-                .map_err(|e| Box::new(EvalAltResult::ErrorRuntime(
+            let body_value = rhai_to_json(body).map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(
                     format!("[{pid}] sidecar_http_post: encode body: {e}").into(),
                     rhai::Position::NONE,
-                )))?;
-            let resp = agent
-                .post(&url)
+                ))
+            })?;
+            let req = apply_headers(agent.post(&url), &headers);
+            let resp = req
                 .send_json(body_value)
                 .map_err(|e| ureq_to_eval_err(&pid, "sidecar_http_post", &url, e))?;
             decode_response(&pid, &url, resp)
         },
     );
+}
+
+/// Apply every key from `headers` as a request header. Values
+/// are stringified via Rhai's standard conversion.
+fn apply_headers(mut req: ureq::Request, headers: &Map) -> ureq::Request {
+    for (k, v) in headers.iter() {
+        let value = match v.clone().into_string() {
+            Ok(s) => s,
+            Err(_) => format!("{v}"),
+        };
+        req = req.set(k.as_str(), &value);
+    }
+    req
 }
 
 fn register_sidecar_http_put(
@@ -889,21 +993,52 @@ fn register_sidecar_http_put(
         .timeout(Duration::from_secs(30))
         .user_agent("execlaw/script-runtime/sidecar/0.1")
         .build();
+    {
+        let agent = agent.clone();
+        let pid = pid.clone();
+        let host_caps = host_caps.clone();
+        engine.register_fn(
+            "sidecar_http_put",
+            move |url: ImmutableString, body: Dynamic| -> Result<Dynamic, Box<EvalAltResult>> {
+                let caps = match host_caps.get() {
+                    Some(c) => c.clone(),
+                    None => return Err(host_cap_unavailable_err(&pid, "sidecar_http_put")),
+                };
+                sidecar_url_check(&pid, "sidecar_http_put", &url, &caps)?;
+                let body_value = rhai_to_json(body).map_err(|e| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        format!("[{pid}] sidecar_http_put: encode body: {e}").into(),
+                        rhai::Position::NONE,
+                    ))
+                })?;
+                let resp = agent
+                    .put(&url)
+                    .send_json(body_value)
+                    .map_err(|e| ureq_to_eval_err(&pid, "sidecar_http_put", &url, e))?;
+                decode_response(&pid, &url, resp)
+            },
+        );
+    }
+    // 3-arg overload: sidecar_http_put(url, body, headers)
     engine.register_fn(
         "sidecar_http_put",
-        move |url: ImmutableString, body: Dynamic| -> Result<Dynamic, Box<EvalAltResult>> {
+        move |url: ImmutableString,
+              body: Dynamic,
+              headers: Map|
+              -> Result<Dynamic, Box<EvalAltResult>> {
             let caps = match host_caps.get() {
                 Some(c) => c.clone(),
                 None => return Err(host_cap_unavailable_err(&pid, "sidecar_http_put")),
             };
             sidecar_url_check(&pid, "sidecar_http_put", &url, &caps)?;
-            let body_value = rhai_to_json(body)
-                .map_err(|e| Box::new(EvalAltResult::ErrorRuntime(
+            let body_value = rhai_to_json(body).map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(
                     format!("[{pid}] sidecar_http_put: encode body: {e}").into(),
                     rhai::Position::NONE,
-                )))?;
-            let resp = agent
-                .put(&url)
+                ))
+            })?;
+            let req = apply_headers(agent.put(&url), &headers);
+            let resp = req
                 .send_json(body_value)
                 .map_err(|e| ureq_to_eval_err(&pid, "sidecar_http_put", &url, e))?;
             decode_response(&pid, &url, resp)
@@ -921,9 +1056,36 @@ fn register_sidecar_http_delete(
         .timeout(Duration::from_secs(30))
         .user_agent("execlaw/script-runtime/sidecar/0.1")
         .build();
+    {
+        let agent = agent.clone();
+        let pid = pid.clone();
+        let host_caps = host_caps.clone();
+        engine.register_fn(
+            "sidecar_http_delete",
+            move |url: ImmutableString, query: Map| -> Result<Dynamic, Box<EvalAltResult>> {
+                let caps = match host_caps.get() {
+                    Some(c) => c.clone(),
+                    None => return Err(host_cap_unavailable_err(&pid, "sidecar_http_delete")),
+                };
+                sidecar_url_check(&pid, "sidecar_http_delete", &url, &caps)?;
+                let mut req = agent.request("DELETE", &url);
+                for (k, v) in map_to_query_iter(&query) {
+                    req = req.query(&k, &v);
+                }
+                let resp = req
+                    .call()
+                    .map_err(|e| ureq_to_eval_err(&pid, "sidecar_http_delete", &url, e))?;
+                decode_response(&pid, &url, resp)
+            },
+        );
+    }
+    // 3-arg overload: sidecar_http_delete(url, query, headers)
     engine.register_fn(
         "sidecar_http_delete",
-        move |url: ImmutableString, query: Map| -> Result<Dynamic, Box<EvalAltResult>> {
+        move |url: ImmutableString,
+              query: Map,
+              headers: Map|
+              -> Result<Dynamic, Box<EvalAltResult>> {
             let caps = match host_caps.get() {
                 Some(c) => c.clone(),
                 None => return Err(host_cap_unavailable_err(&pid, "sidecar_http_delete")),
@@ -933,6 +1095,7 @@ fn register_sidecar_http_delete(
             for (k, v) in map_to_query_iter(&query) {
                 req = req.query(&k, &v);
             }
+            req = apply_headers(req, &headers);
             let resp = req
                 .call()
                 .map_err(|e| ureq_to_eval_err(&pid, "sidecar_http_delete", &url, e))?;

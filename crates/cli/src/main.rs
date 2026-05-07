@@ -1548,7 +1548,7 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         let mut reg = execlaw_server::transport_registry::HostTransportRegistry::new();
         const SIGNAL_MANIFEST: &str =
             include_str!("../../../plugins/signal/plugin.toml");
-        let icon = execlaw_plugin_sdk::manifest::PluginManifest::parse(SIGNAL_MANIFEST)
+        let signal_icon = execlaw_plugin_sdk::manifest::PluginManifest::parse(SIGNAL_MANIFEST)
             .ok()
             .and_then(|m| m.transport.and_then(|t| t.icon))
             .unwrap_or_else(|| "phone".to_owned());
@@ -1556,7 +1556,21 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
             "signal",
             execlaw_server::transport_registry::ChannelInfo {
                 plugin_id: "signal".into(),
-                icon,
+                icon: signal_icon,
+            },
+        );
+        const WHATSAPP_MANIFEST: &str =
+            include_str!("../../../plugins/whatsapp/plugin.toml");
+        let whatsapp_icon =
+            execlaw_plugin_sdk::manifest::PluginManifest::parse(WHATSAPP_MANIFEST)
+                .ok()
+                .and_then(|m| m.transport.and_then(|t| t.icon))
+                .unwrap_or_else(|| "whatsapp".to_owned());
+        reg.register(
+            "whatsapp",
+            execlaw_server::transport_registry::ChannelInfo {
+                plugin_id: "whatsapp".into(),
+                icon: whatsapp_icon,
             },
         );
         tracing::info!(channels = reg.len(), "host-transport registry populated");
