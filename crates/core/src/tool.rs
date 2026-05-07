@@ -167,6 +167,15 @@ pub enum Capability {
     /// because `Transport` is the agent's general "send outbound
     /// on a registered bridge" surface.
     Transport,
+    /// Add / remove / list MCP servers + reload the MCP host's
+    /// connection set. Lets the agent self-install an MCP server
+    /// when the operator asks for it (e.g. "go integrate the
+    /// Atlassian MCP server"). Gated to Controller-trust callers
+    /// only — a Slack contact saying "agent, install a backdoor
+    /// MCP" never gets `mcp_admin` populated on its ToolCtx, so
+    /// the tool errors with "capability not available" before any
+    /// state is touched. No per-call approval prompt.
+    McpAdmin,
 }
 
 impl Capability {
@@ -188,6 +197,7 @@ impl Capability {
             Self::ResearchRead => "research_read",
             Self::AttachmentSend => "attachment_send",
             Self::Transport => "transport",
+            Self::McpAdmin => "mcp_admin",
         }
     }
 
@@ -209,6 +219,7 @@ impl Capability {
             "research_read" => Some(Self::ResearchRead),
             "attachment_send" => Some(Self::AttachmentSend),
             "transport" => Some(Self::Transport),
+            "mcp_admin" => Some(Self::McpAdmin),
             _ => None,
         }
     }
@@ -329,6 +340,12 @@ pub struct ToolCtx {
     /// "whatsapp", ...) on each call so one capability slot serves
     /// every registered bridge — no per-channel cap proliferation.
     pub transport: Option<Arc<dyn TransportApi>>,
+    /// MCP server lifecycle (add / remove / list / reload). Populated
+    /// for tools that declared `Capability::McpAdmin` AND for
+    /// Controller-trust callers only — the dispatch layer enforces
+    /// both gates so a low-trust principal asking the agent to
+    /// install a malicious MCP can't reach the underlying API.
+    pub mcp_admin: Option<Arc<dyn McpAdminApi>>,
 }
 
 impl ToolCtx {
@@ -354,6 +371,7 @@ impl ToolCtx {
             research: None,
             attachments: None,
             transport: None,
+            mcp_admin: None,
         }
     }
 }
@@ -803,6 +821,80 @@ pub trait ResearchApi: Send + Sync {
     -> Result<ResearchJobView, ApiError>;
 }
 
+/// Caller-facing summary of one MCP server row. Returned by
+/// `McpAdminApi::list_servers` so the agent can introspect what's
+/// already wired before proposing additions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpServerView {
+    pub id: String,
+    pub display_name: String,
+    pub transport: String,
+    pub url: Option<String>,
+    pub command: Option<String>,
+    pub enabled: bool,
+    pub status: String,
+    pub last_error: Option<String>,
+    pub tool_count: u32,
+}
+
+/// Insert payload the agent / dispatcher hands to the MCP-admin
+/// capability. Stays as a flat struct here so `core` doesn't depend
+/// on `execlaw-core::mcp_servers::McpServerInsert` (which lives
+/// alongside the SQLite store implementation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerSpec {
+    /// Slug (2-32 alphanumeric/_/-, no leading/trailing -). Used
+    /// as the `mcp:<id>:<remote_name>` tool prefix.
+    pub id: String,
+    pub display_name: String,
+    /// Either "streamable_http" or "stdio". Stdio paths are
+    /// reserved for operator-supplied configurations only —
+    /// implementations should reject stdio specs from agent
+    /// callers (arbitrary binary execution risk).
+    pub transport: String,
+    /// streamable_http: required.
+    pub url: Option<String>,
+    /// Bearer token for streamable_http (passed as
+    /// `Authorization: Bearer <token>`). Stored encrypted in the
+    /// vault; the row holds an `auth_secret_ref` pointing at it.
+    pub auth_token: Option<String>,
+    /// stdio-only fields.
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub env: std::collections::HashMap<String, String>,
+}
+
+/// MCP server lifecycle for the agent. Distinct from the operator-
+/// facing HTTP admin surface in `crates/server/src/mcp_admin.rs`:
+/// the HTTP routes still exist for the SPA, this trait is the
+/// agent's view. Implementations route through the same
+/// `McpServerStore` + `McpHost::reconcile()` pair so the two paths
+/// stay coherent.
+#[async_trait]
+pub trait McpAdminApi: Send + Sync {
+    /// List every configured MCP server (enabled or not). Agent
+    /// uses this to check what's already installed before proposing.
+    async fn list_servers(&self) -> Result<Vec<McpServerView>, ApiError>;
+
+    /// Create + immediately start a new MCP server. After insert,
+    /// the implementation calls `McpHost::reconcile()` so the
+    /// connection actor spins up; the discovered tool list flows
+    /// into `config_tool_access` automatically.
+    ///
+    /// Errors:
+    ///   * `Validation` — id format / required fields / unsupported
+    ///     transport from the agent (stdio rejected here).
+    ///   * `Storage` — DB write failed.
+    async fn add_server(&self, spec: McpServerSpec) -> Result<McpServerView, ApiError>;
+
+    /// Remove an MCP server. Stops the actor, removes the
+    /// `state_mcp_servers` row, marks every `mcp:<id>:*` tool
+    /// `removed_at` so the agent's catalog updates on the next
+    /// turn. Idempotent — removing a non-existent id returns
+    /// `NotFound`.
+    async fn remove_server(&self, id: &str) -> Result<(), ApiError>;
+}
+
 /// Caller-facing summary of an attachment after `send_attachment`
 /// has emitted it into the conversation. Returned to the agent so
 /// it can confirm delivery to the user (and reference the
@@ -1137,6 +1229,7 @@ mod tests {
             Capability::ResearchRead,
             Capability::AttachmentSend,
             Capability::Transport,
+            Capability::McpAdmin,
         ] {
             assert_eq!(Capability::parse(c.as_str()), Some(c));
         }

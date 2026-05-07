@@ -391,7 +391,27 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
         // tries to reach `ctx.transport` (which is always None
         // post-Phase-B).
         let _needs_transport = caps.iter().any(|c| matches!(c, Capability::Transport));
+        let needs_mcp_admin = caps.iter().any(|c| matches!(c, Capability::McpAdmin));
         let needs_attachment_send = caps.iter().any(|c| matches!(c, Capability::AttachmentSend));
+        if needs_mcp_admin {
+            // Belt-and-suspenders trust gate. The tool descriptor
+            // already pins `default_allowed_classes = ["Controller"]`
+            // and the dispatch policy check rejects below-Controller
+            // callers BEFORE this point — but populating mcp_admin
+            // for non-Controller trust would let a future policy
+            // edit accidentally widen the surface. Hard-code the
+            // gate here too.
+            if self.caller_trust.as_str().eq_ignore_ascii_case("Controller") {
+                if let Some(host) = &self.mcp_host {
+                    ctx.mcp_admin = Some(Arc::new(crate::tool_apis_mcp::DbMcpAdminApi::new(
+                        self.host.db().clone(),
+                        host.clone(),
+                    )));
+                }
+                // No mcp_host wired (test fixture / boot order bug):
+                // leave None and the tool surfaces a clean denial.
+            }
+        }
         if needs_attachment_send {
             if let Some(events) = self.events.as_ref() {
                 // Hand the attachment API the host-transport

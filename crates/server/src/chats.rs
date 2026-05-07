@@ -3189,6 +3189,21 @@ pub(crate) fn build_tool_routing_prose(
              in the background. Use sparingly: it costs a fresh inference round and an isolated \
              context.",
         ),
+        (
+            "mcp",
+            "* `mcp_list_servers` / `mcp_add_server` / `mcp_remove_server` — install MCP \
+             (Model Context Protocol) servers so their tools flow into your catalog. Use when \
+             the operator says \"integrate / install / wire up the X MCP server\" (e.g. \
+             Atlassian, Linear, GitHub). Workflow: (1) `mcp_list_servers` to check what's \
+             already wired so you don't double-add; (2) `web_search` + `web_fetch` if you \
+             don't know the server's URL or auth shape; (3) ASK the user for any required API \
+             token / bearer in plain text — do NOT make one up; (4) call `mcp_add_server` with \
+             `transport: \"streamable_http\"`, the URL, and `auth_token` if needed. After the \
+             call returns, the server's tools auto-flow into your catalog as `mcp:<id>:<name>` \
+             — you can call them on the next turn. For Atlassian Rovo specifically: URL is \
+             `https://mcp.atlassian.com/v1/mcp/authv2`, auth via API token from \
+             id.atlassian.com.",
+        ),
     ];
 
     // Bucket every tool by its family prefix.
@@ -3229,6 +3244,9 @@ pub(crate) fn build_tool_routing_prose(
             }
             "delegate" => {
                 present.insert("delegate");
+            }
+            "mcp" => {
+                present.insert("mcp");
             }
             _ => {}
         }

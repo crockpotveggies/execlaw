@@ -2148,6 +2148,276 @@ impl ToolImpl for ResearchGetReportTool {
 }
 
 // ---------------------------------------------------------------
+// MCP server lifecycle (Controller-trust only)
+// ---------------------------------------------------------------
+
+fn default_allowed_for_mcp_admin() -> Vec<String> {
+    // MCP admin is sensitive — adding a server pulls in a new tool
+    // surface that the agent then has unrestricted access to. Pin
+    // to Controller-class only. Operators can NOT broaden this in
+    // Settings → Tools without an explicit security review.
+    vec!["Controller".into()]
+}
+
+#[derive(Debug, Deserialize)]
+struct McpAddServerArgs {
+    id: String,
+    display_name: String,
+    /// Currently only "streamable_http" is accepted from the agent.
+    /// Stdio specs are rejected here (arbitrary-binary risk);
+    /// operators add stdio servers via the SPA.
+    transport: String,
+    url: Option<String>,
+    /// Bearer token sent as `Authorization: Bearer <token>`.
+    /// Stored encrypted in the vault under a generated key.
+    auth_token: Option<String>,
+}
+
+pub struct McpListServersTool {
+    descriptor: ToolDescriptor,
+}
+
+impl Default for McpListServersTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl McpListServersTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "mcp_list_servers".into(),
+                description:
+                    "List every configured MCP server. Use BEFORE proposing a new \
+                     `mcp_add_server` call so you don't double-add a server the \
+                     operator already wired up. Returns a list of {id, display_name, \
+                     transport, url, command, enabled, status, last_error, tool_count} \
+                     per server."
+                        .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Low,
+                capabilities: vec![Capability::McpAdmin],
+                default_allowed_classes: default_allowed_for_mcp_admin(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for McpListServersTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, _args: Value) -> ToolOutcome {
+        let api = match ctx.mcp_admin.as_ref() {
+            Some(a) => a,
+            None => {
+                return ToolOutcome::denied(
+                    "mcp_admin capability not granted to this caller (Controller-trust required)",
+                );
+            }
+        };
+        match api.list_servers().await {
+            Ok(servers) => match serde_json::to_value(json!({ "servers": servers })) {
+                Ok(v) => ToolOutcome::Ok(v),
+                Err(e) => ToolOutcome::err("encode", e.to_string()),
+            },
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+pub struct McpAddServerTool {
+    descriptor: ToolDescriptor,
+}
+
+impl Default for McpAddServerTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl McpAddServerTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "mcp_add_server".into(),
+                description:
+                    "Add and immediately connect a new MCP server. Use this when the \
+                     user asks the agent to integrate / install / wire up an MCP \
+                     server (e.g. \"agent, integrate the Atlassian MCP server\").\n\n\
+                     CONNECT MODEL: only `streamable_http` is supported here — agent \
+                     cannot install stdio servers (those run arbitrary local \
+                     binaries; operators add them manually via Settings → MCP).\n\n\
+                     CLARIFICATION FLOW: most servers need a bearer token / API key. \
+                     If you don't have one, do NOT make one up — ASK the user for \
+                     it in plain text in your reply. Same pattern as the research \
+                     clarification flow: stop and ask, the user replies with the \
+                     token, you call `mcp_add_server` with `auth_token` populated. \
+                     For Atlassian Rovo specifically: use \
+                     `https://mcp.atlassian.com/v1/mcp/authv2` and ask the user to \
+                     generate an API token from id.atlassian.com → Security → API \
+                     tokens.\n\n\
+                     ID is a slug 2-32 chars, alphanumeric + `-` + `_`, no leading/ \
+                     trailing hyphen. After the call returns, the server's tools \
+                     auto-flow into your tool catalog as `mcp:<id>:<name>` — you \
+                     can call them on the next turn without further setup."
+                        .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Slug used as the `mcp:<id>:<tool>` prefix. 2-32 chars, alphanumeric + '-' + '_', no leading/trailing '-'."
+                        },
+                        "display_name": {
+                            "type": "string",
+                            "description": "Human-readable label shown in Settings → MCP."
+                        },
+                        "transport": {
+                            "type": "string",
+                            "enum": ["streamable_http"],
+                            "description": "Only streamable_http is accepted from the agent. stdio is operator-only."
+                        },
+                        "url": {
+                            "type": "string",
+                            "description": "Required for streamable_http. Full URL the MCP client POSTs JSON-RPC envelopes to."
+                        },
+                        "auth_token": {
+                            "type": ["string", "null"],
+                            "description": "Bearer token for the Authorization header. Omit if the server is unauthenticated. Ask the user for this if the server's docs require authentication."
+                        }
+                    },
+                    "required": ["id", "display_name", "transport"],
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Medium,
+                capabilities: vec![Capability::McpAdmin],
+                default_allowed_classes: default_allowed_for_mcp_admin(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for McpAddServerTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, args: Value) -> ToolOutcome {
+        let parsed: McpAddServerArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolOutcome::err("invalid_argument", e.to_string()),
+        };
+        let api = match ctx.mcp_admin.as_ref() {
+            Some(a) => a,
+            None => {
+                return ToolOutcome::denied(
+                    "mcp_admin capability not granted to this caller (Controller-trust required)",
+                );
+            }
+        };
+        let spec = crate::tool::McpServerSpec {
+            id: parsed.id,
+            display_name: parsed.display_name,
+            transport: parsed.transport,
+            url: parsed.url,
+            auth_token: parsed.auth_token,
+            command: None,
+            args: vec![],
+            env: std::collections::HashMap::new(),
+        };
+        match api.add_server(spec).await {
+            Ok(view) => match serde_json::to_value(view) {
+                Ok(v) => ToolOutcome::Ok(v),
+                Err(e) => ToolOutcome::err("encode", e.to_string()),
+            },
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct McpRemoveServerArgs {
+    id: String,
+}
+
+pub struct McpRemoveServerTool {
+    descriptor: ToolDescriptor,
+}
+
+impl Default for McpRemoveServerTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl McpRemoveServerTool {
+    pub fn new() -> Self {
+        Self {
+            descriptor: ToolDescriptor {
+                name: "mcp_remove_server".into(),
+                description:
+                    "Remove a configured MCP server. Stops the connection actor, \
+                     drops the row from `state_mcp_servers`, marks every \
+                     `mcp:<id>:*` tool removed in your catalog. Idempotent — \
+                     removing a non-existent id returns NotFound. Ask the user \
+                     for confirmation before calling this; uninstalls are not \
+                     reversible (they have to re-add the server)."
+                        .into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "MCP server id (the slug, not the prefixed tool name)."
+                        }
+                    },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Low,
+                capabilities: vec![Capability::McpAdmin],
+                default_allowed_classes: default_allowed_for_mcp_admin(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for McpRemoveServerTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, args: Value) -> ToolOutcome {
+        let parsed: McpRemoveServerArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolOutcome::err("invalid_argument", e.to_string()),
+        };
+        let api = match ctx.mcp_admin.as_ref() {
+            Some(a) => a,
+            None => {
+                return ToolOutcome::denied(
+                    "mcp_admin capability not granted to this caller (Controller-trust required)",
+                );
+            }
+        };
+        match api.remove_server(&parsed.id).await {
+            Ok(()) => ToolOutcome::Ok(json!({ "ok": true, "id": parsed.id })),
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------
 // Registrar
 // ---------------------------------------------------------------
 
@@ -2181,6 +2451,9 @@ pub fn core_builtin_tools() -> Vec<Arc<dyn ToolImpl>> {
         Arc::new(ResearchListTool::new()),
         Arc::new(ResearchGetReportTool::new()),
         Arc::new(SendAttachmentTool::new()),
+        Arc::new(McpListServersTool::new()),
+        Arc::new(McpAddServerTool::new()),
+        Arc::new(McpRemoveServerTool::new()),
     ]
 }
 
@@ -2318,7 +2591,10 @@ mod tests {
         assert!(names.contains(&"research_list"));
         assert!(names.contains(&"research_get_report"));
         assert!(names.contains(&"send_attachment"));
-        assert_eq!(names.len(), 24);
+        assert!(names.contains(&"mcp_list_servers"));
+        assert!(names.contains(&"mcp_add_server"));
+        assert!(names.contains(&"mcp_remove_server"));
+        assert_eq!(names.len(), 27);
     }
 
     #[test]

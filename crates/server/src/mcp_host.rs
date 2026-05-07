@@ -21,17 +21,47 @@
 //!     starts/stops actors as the operator adds, edits, or
 //!     disables servers.
 
+use crate::mcp_http_client::HttpMcpClient;
 use crate::tool_sync::default_mcp_classes_for;
 use dashmap::DashMap;
 use execlaw_core::Database;
 use execlaw_core::mcp_servers::{McpServerRow, McpServerStatus, McpServerStore, McpTransport};
 use execlaw_core::tool_access::{ToolAccessSeed, ToolAccessStore, ToolSource};
+use execlaw_core::vault_row::VaultRowStore;
 use execlaw_mcp_client::{McpClient, McpError, McpNotification, McpResult, McpTool, StdioSpec};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
+
+/// Connected MCP client — branches by transport. Both arms expose
+/// the same `list_tools` / `call_tool` shape so `mcp_host` can
+/// dispatch uniformly.
+#[derive(Clone)]
+enum ConnectedClient {
+    Stdio(Arc<McpClient>),
+    Http(HttpMcpClient),
+}
+
+impl ConnectedClient {
+    async fn list_tools(&self) -> McpResult<Vec<McpTool>> {
+        match self {
+            Self::Stdio(c) => c.list_tools().await,
+            Self::Http(c) => c.list_tools().await,
+        }
+    }
+    async fn call_tool(
+        &self,
+        name: &str,
+        args: Value,
+    ) -> McpResult<execlaw_mcp_client::CallToolResult> {
+        match self {
+            Self::Stdio(c) => c.call_tool(name, args).await,
+            Self::Http(c) => c.call_tool(name, args).await,
+        }
+    }
+}
 
 /// Tool-name prefix all MCP-sourced tools use in the registry. Lets
 /// the dispatch chain route by string-prefix instead of looking up
@@ -44,7 +74,7 @@ const RECONNECT_MAX: Duration = Duration::from_secs(60);
 
 /// One running MCP server actor's handle.
 struct ServerHandle {
-    client: Mutex<Option<Arc<McpClient>>>,
+    client: Mutex<Option<ConnectedClient>>,
     shutdown: Arc<Notify>,
 }
 
@@ -86,18 +116,10 @@ impl McpHost {
             }
         };
 
-        // Start / restart actors for every enabled stdio row.
+        // Start / restart actors for every enabled row. Both
+        // stdio and streamable_http are now wired.
         for row in &rows {
             if !row.enabled {
-                self.stop_one(&row.id).await;
-                continue;
-            }
-            if row.transport != McpTransport::Stdio {
-                debug!(
-                    id = %row.id,
-                    transport = %row.transport.as_str(),
-                    "mcp reconcile: skipping non-stdio transport (HTTP support deferred)"
-                );
                 self.stop_one(&row.id).await;
                 continue;
             }
@@ -161,17 +183,16 @@ impl McpHost {
             .get(server_id)
             .map(|kv| kv.value().clone())
             .ok_or_else(|| format!("MCP server '{server_id}' not connected"))?;
-        let client =
-            handle.client.lock().await.clone().ok_or_else(|| {
-                format!("MCP server '{server_id}' has no live connection right now")
-            })?;
+        let client = handle
+            .client
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| format!("MCP server '{server_id}' has no live connection right now"))?;
         let r = client
             .call_tool(remote_name, args)
             .await
             .map_err(|e| format!("MCP call failed: {e}"))?;
-        // Return the full result so the runner can show is_error +
-        // structured content. Wrap in serde_json::to_value via a
-        // small struct so we keep the field names stable.
         Ok(serde_json::json!({
             "content": r.content,
             "isError": r.is_error,
@@ -189,15 +210,22 @@ impl McpHost {
         let db = self.inner.db.clone();
         let global_stop = self.inner.global_stop.clone();
         tokio::spawn(async move {
-            actor_loop(db, row, handle, shutdown, global_stop).await;
+            match row.transport {
+                McpTransport::Stdio => {
+                    stdio_actor_loop(db, row, handle, shutdown, global_stop).await
+                }
+                McpTransport::StreamableHttp => {
+                    http_actor_loop(db, row, handle, shutdown, global_stop).await
+                }
+            }
         });
     }
 }
 
-/// Per-server supervisor: spawns the stdio child, runs the sync,
+/// Per-server stdio supervisor: spawns the child, runs the sync,
 /// drives reconnects with exponential backoff. Exits when its
 /// `shutdown` notify fires.
-async fn actor_loop(
+async fn stdio_actor_loop(
     db: Database,
     row: McpServerRow,
     handle: Arc<ServerHandle>,
@@ -217,7 +245,7 @@ async fn actor_loop(
         match client_result {
             Ok(client) => {
                 let client = Arc::new(client);
-                *handle.client.lock().await = Some(client.clone());
+                *handle.client.lock().await = Some(ConnectedClient::Stdio(client.clone()));
                 let now = chrono::Utc::now().timestamp();
                 let _ = McpServerStore::new(&db).set_status(
                     &row.id,
@@ -226,7 +254,7 @@ async fn actor_loop(
                     now,
                 );
                 info!(server = %row.id, "MCP server connected");
-                if let Err(e) = sync_tools(&db, &row, &client).await {
+                if let Err(e) = sync_tools(&db, &row, &ConnectedClient::Stdio(client.clone())).await {
                     warn!(server = %row.id, error = %e, "initial tool sync failed");
                 }
 
@@ -255,7 +283,8 @@ async fn actor_loop(
                             recv = notif_rx.recv() => {
                                 match recv {
                                     Ok(McpNotification::ToolsListChanged) => {
-                                        if let Err(e) = sync_tools(&db_for_loop, &row_for_loop, &client_for_loop).await {
+                                        let cc = ConnectedClient::Stdio(client_for_loop.clone());
+                                        if let Err(e) = sync_tools(&db_for_loop, &row_for_loop, &cc).await {
                                             warn!(server = %row_for_loop.id, error = %e, "list_changed re-sync failed");
                                         }
                                     }
@@ -316,8 +345,126 @@ async fn actor_loop(
     }
 }
 
+/// Per-server HTTP supervisor. Connects via streamable HTTP, runs
+/// the initial tool sync, then sits idle until shutdown. HTTP MCP
+/// is connection-per-request under the hood (the reqwest client
+/// handles pooling) so there's no long-lived socket to babysit —
+/// failures surface on the next `call_tool` rather than out-of-band
+/// disconnect events.
+async fn http_actor_loop(
+    db: Database,
+    row: McpServerRow,
+    handle: Arc<ServerHandle>,
+    shutdown: Arc<Notify>,
+    global_stop: Arc<Notify>,
+) {
+    let mut backoff = RECONNECT_INITIAL;
+    loop {
+        let url = match row.url.as_deref() {
+            Some(u) if !u.is_empty() => u.to_owned(),
+            _ => {
+                let msg = "streamable_http server has no url configured";
+                warn!(server = %row.id, "{msg}");
+                let now = chrono::Utc::now().timestamp();
+                let _ = McpServerStore::new(&db).set_status(
+                    &row.id,
+                    McpServerStatus::Error,
+                    Some(msg),
+                    now,
+                );
+                return;
+            }
+        };
+        // auth_secret_ref points at a vault row with the bearer
+        // token. None / empty = unauthenticated server.
+        let bearer = if let Some(name) = row.auth_secret_ref.as_deref().filter(|s| !s.is_empty()) {
+            match VaultRowStore::new(&db).get(None, name) {
+                Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                    Ok(s) => Some(s),
+                    Err(_) => {
+                        warn!(server = %row.id, "auth_secret_ref vault row is not utf-8; treating as no auth");
+                        None
+                    }
+                },
+                Ok(None) => {
+                    warn!(server = %row.id, name, "auth_secret_ref points at a missing vault row; treating as no auth");
+                    None
+                }
+                Err(e) => {
+                    warn!(server = %row.id, error = %e, "vault read failed; treating as no auth");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        match HttpMcpClient::connect(&url, bearer.as_deref()).await {
+            Ok(client) => {
+                let cc = ConnectedClient::Http(client);
+                *handle.client.lock().await = Some(cc.clone());
+                let now = chrono::Utc::now().timestamp();
+                let _ = McpServerStore::new(&db).set_status(
+                    &row.id,
+                    McpServerStatus::Connected,
+                    None,
+                    now,
+                );
+                info!(server = %row.id, url = %url, "MCP server connected (http)");
+                if let Err(e) = sync_tools(&db, &row, &cc).await {
+                    warn!(server = %row.id, error = %e, "initial tool sync failed");
+                }
+                // No notification stream in v1 — just wait for
+                // shutdown. Re-syncs happen on `reconcile()`.
+                tokio::select! {
+                    _ = shutdown.notified() => {
+                        debug!(server = %row.id, "http actor: local stop");
+                    }
+                    _ = global_stop.notified() => {
+                        debug!(server = %row.id, "http actor: global stop");
+                    }
+                }
+                *handle.client.lock().await = None;
+                let now = chrono::Utc::now().timestamp();
+                let _ = McpServerStore::new(&db).set_status(
+                    &row.id,
+                    McpServerStatus::Disconnected,
+                    None,
+                    now,
+                );
+                info!(server = %row.id, "MCP server disconnected (http)");
+                return;
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                warn!(
+                    server = %row.id,
+                    error = %msg,
+                    backoff_ms = backoff.as_millis(),
+                    "MCP http connect failed; will retry"
+                );
+                let now = chrono::Utc::now().timestamp();
+                let _ = McpServerStore::new(&db).set_status(
+                    &row.id,
+                    McpServerStatus::Error,
+                    Some(&msg),
+                    now,
+                );
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = shutdown.notified() => return,
+            _ = global_stop.notified() => return,
+        }
+        backoff = (backoff * 2).min(RECONNECT_MAX);
+    }
+}
+
 /// Reflect a server's `tools/list` response into `config_tool_access`.
-async fn sync_tools(db: &Database, row: &McpServerRow, client: &McpClient) -> McpResult<usize> {
+/// Transport-agnostic — works for both stdio and streamable_http
+/// because both arms of `ConnectedClient` expose the same surface.
+async fn sync_tools(db: &Database, row: &McpServerRow, client: &ConnectedClient) -> McpResult<usize> {
     let tools: Vec<McpTool> = client.list_tools().await?;
     let store = ToolAccessStore::new(db);
     let now = chrono::Utc::now().timestamp();
