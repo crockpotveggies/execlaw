@@ -1573,6 +1573,19 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                 icon: whatsapp_icon,
             },
         );
+        const SLACK_MANIFEST: &str =
+            include_str!("../../../plugins/slack/plugin.toml");
+        let slack_icon = execlaw_plugin_sdk::manifest::PluginManifest::parse(SLACK_MANIFEST)
+            .ok()
+            .and_then(|m| m.transport.and_then(|t| t.icon))
+            .unwrap_or_else(|| "slack".to_owned());
+        reg.register(
+            "slack",
+            execlaw_server::transport_registry::ChannelInfo {
+                plugin_id: "slack".into(),
+                icon: slack_icon,
+            },
+        );
         tracing::info!(channels = reg.len(), "host-transport registry populated");
         reg
     };

@@ -102,8 +102,11 @@ impl HostCapabilities for AppStateHostCapabilities {
 
         // Spawn the long-lived consumer. Reconnect with capped
         // exponential backoff. Cancellation token wakes the loop
-        // out of any awaited future.
-        tokio::spawn(consumer_loop(url, on_frame, cancel));
+        // out of any awaited future. The handle's outbox slot is
+        // refreshed by the consumer on every successful connect so
+        // plugins can `ws_send` text frames back through the same
+        // socket (Slack Socket Mode envelope_id ACKs, etc.).
+        tokio::spawn(consumer_loop(url, on_frame, cancel, handle.clone()));
 
         Ok(handle)
     }
@@ -216,7 +219,9 @@ async fn consumer_loop(
     url: String,
     on_frame: WsFrameHandler,
     cancel: Arc<tokio_util::sync::CancellationToken>,
+    handle: WsSubscriptionHandle,
 ) {
+    use futures::sink::SinkExt;
     use futures::stream::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
 
@@ -254,31 +259,32 @@ async fn consumer_loop(
             }
         };
 
-        let (_write, mut read) = stream.split();
+        let (mut write, mut read) = stream.split();
+
+        // Outbox: per-connection mpsc the handle's send() drops
+        // text frames into. Refreshed on every reconnect. Plugins
+        // calling send() while disconnected get an Err — protocol
+        // redelivery handles the gap (e.g. Slack re-sends events
+        // whose envelope_id wasn't ACKed in time).
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        handle.set_outbox(Some(out_tx));
+
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
                     tracing::debug!(target: "host_caps::ws", %url, "cancellation requested; closing");
+                    handle.set_outbox(None);
                     return;
                 }
                 frame = read.next() => {
                     match frame {
                         Some(Ok(Message::Text(text))) => {
-                            // Spawn handler so the consumer keeps
-                            // pulling the next frame. A slow
-                            // Rhai handler can fall behind without
-                            // blocking the socket — at worst we
-                            // accumulate handler tasks; at best
-                            // they run concurrently.
                             let on_frame = on_frame.clone();
                             tokio::spawn(async move {
                                 on_frame(text.to_string()).await;
                             });
                         }
                         Some(Ok(Message::Binary(_))) => {
-                            // bbernhard / signal-cli emits text
-                            // only; future binary-framed protocols
-                            // can extend WsFrameHandler later.
                             tracing::debug!(target: "host_caps::ws", %url, "ignoring binary frame");
                         }
                         Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
@@ -293,8 +299,27 @@ async fn consumer_loop(
                         }
                     }
                 }
+                outbound = out_rx.recv() => {
+                    match outbound {
+                        Some(msg) => {
+                            if let Err(e) = write.send(Message::Text(msg.into())).await {
+                                tracing::warn!(target: "host_caps::ws", %url, error = %e, "ws send failed; closing connection");
+                                break;
+                            }
+                        }
+                        None => {
+                            // Sender dropped — should only happen if
+                            // handle is dropped (engine teardown).
+                            tracing::debug!(target: "host_caps::ws", %url, "outbox closed; closing connection");
+                            break;
+                        }
+                    }
+                }
             }
         }
+        // Disconnect: clear the outbox slot so plugin send() returns
+        // a clean error rather than queueing into a dead mpsc.
+        handle.set_outbox(None);
         if cancel.is_cancelled() {
             return;
         }

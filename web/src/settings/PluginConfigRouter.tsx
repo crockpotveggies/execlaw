@@ -34,6 +34,7 @@ import { GoogleContactsPage } from "./GoogleContactsPage";
 import type { PluginConfigComponent } from "./PluginConfigBase";
 import { PushoverConfigPage } from "./PushoverConfigPage";
 import { SignalConfigPage } from "./SignalConfigPage";
+import { SlackConfigPage } from "./SlackConfigPage";
 import { WhatsAppConfigPage } from "./WhatsAppConfigPage";
 
 const KNOWN_CONFIGS: Record<string, PluginConfigComponent> = {
@@ -44,6 +45,7 @@ const KNOWN_CONFIGS: Record<string, PluginConfigComponent> = {
     "google-calendar": GoogleCalendarPage,
     pushover: PushoverConfigPage,
     signal: SignalConfigPage,
+    slack: SlackConfigPage,
     whatsapp: WhatsAppConfigPage,
 };
 

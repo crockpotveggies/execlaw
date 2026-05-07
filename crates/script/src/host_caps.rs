@@ -118,15 +118,30 @@ pub enum RouteOutcome {
 /// Long-lived background-task handle for a Rhai-driven WebSocket
 /// consumer. The plugin gets one per `ws_subscribe` call; dropping
 /// (or explicit close) cancels the task and releases the
-/// connection. Cheap clone (Arc inside).
+/// connection.
+///
+/// Carries an outbound sender slot so plugins can write back over
+/// the same socket — required for protocols with bidirectional
+/// envelopes (Slack Socket Mode `envelope_id` ACKs, Discord
+/// gateway heartbeats, MCP-over-WS, etc.). The slot is `None` while
+/// disconnected; the consumer loop refreshes it on each successful
+/// connect. `send()` while disconnected returns Err — the protocol
+/// usually assumes the server will re-deliver, and silently
+/// queueing across reconnect would replay stale ACKs.
+///
+/// Cheap clone (Arc inside everything).
 #[derive(Clone)]
 pub struct WsSubscriptionHandle {
     cancel: Arc<tokio_util::sync::CancellationToken>,
+    outbox: Arc<std::sync::RwLock<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
 }
 
 impl WsSubscriptionHandle {
     pub fn new(cancel: Arc<tokio_util::sync::CancellationToken>) -> Self {
-        Self { cancel }
+        Self {
+            cancel,
+            outbox: Arc::new(std::sync::RwLock::new(None)),
+        }
     }
 
     /// Cooperative cancellation — the subscriber's reconnect loop
@@ -139,6 +154,34 @@ impl WsSubscriptionHandle {
     /// engine was dropped).
     pub fn is_closed(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    /// Set or clear the active sender. The consumer loop swaps
+    /// the slot on every successful connect (Some) and on
+    /// disconnect (None).
+    pub fn set_outbox(&self, tx: Option<tokio::sync::mpsc::UnboundedSender<String>>) {
+        if let Ok(mut slot) = self.outbox.write() {
+            *slot = tx;
+        }
+    }
+
+    /// Submit a text frame to be written on the active socket.
+    /// Returns Err when no active connection (plugin should let
+    /// the protocol's redelivery semantics handle the gap rather
+    /// than blind-retry).
+    pub fn send(&self, msg: String) -> Result<(), HostCapError> {
+        let slot = self
+            .outbox
+            .read()
+            .map_err(|_| HostCapError::new("ws send: outbox lock poisoned"))?;
+        match slot.as_ref() {
+            Some(tx) => tx
+                .send(msg)
+                .map_err(|_| HostCapError::new("ws send: writer task gone (likely just disconnected)")),
+            None => Err(HostCapError::new(
+                "ws send: not connected (plugin should rely on protocol-level redelivery)",
+            )),
+        }
     }
 }
 

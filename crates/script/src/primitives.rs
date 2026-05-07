@@ -370,6 +370,27 @@ fn register_host_cap_bindings(
         );
     }
 
+    // to_json_string(value) -> string
+    //
+    // Inverse of parse_json — round-trip a Rhai map / array / scalar
+    // into a compact JSON string. Plugins use this to persist
+    // structured state via vault_put (which only stores strings).
+    {
+        let pid = plugin_id.to_owned();
+        engine.register_fn(
+            "to_json_string",
+            move |value: Dynamic| -> Result<ImmutableString, Box<EvalAltResult>> {
+                let json = rhai_to_json(value).map_err(|e| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        format!("[{pid}] to_json_string: {e}").into(),
+                        rhai::Position::NONE,
+                    ))
+                })?;
+                Ok(ImmutableString::from(json.to_string()))
+            },
+        );
+    }
+
     // sidecar_url(name) -> "http://127.0.0.1:<port>" | unit
     //
     // The supervisor publishes the host port for each running
@@ -542,9 +563,151 @@ fn register_host_cap_bindings(
         );
     }
 
+    // ws_subscribe_bidi(url, callback_name) -> handle
+    //
+    // Bidirectional sibling of ws_subscribe. The Rhai callback is
+    // invoked with TWO args — `(handle, frame)` — so plugins can
+    // call `ws_send(handle, msg)` from within the per-frame
+    // handler. Required for Socket Mode-style protocols (Slack,
+    // Discord gateway, MCP-over-WS) where the server expects
+    // per-event ACKs back over the same socket.
+    //
+    // Existing 1-arg-callback `ws_subscribe` is unchanged so
+    // Signal / WhatsApp / future receive-only plugins keep
+    // working without modification.
+    {
+        let pid = plugin_id.to_owned();
+        let caps = host_caps.clone();
+        let owning = owning_plugin.clone();
+        engine.register_fn(
+            "ws_subscribe_bidi",
+            move |url: ImmutableString,
+                  callback: ImmutableString|
+                  -> Result<Dynamic, Box<EvalAltResult>> {
+                let caps = match caps.get() {
+                    Some(c) => c.clone(),
+                    None => return Err(host_cap_unavailable_err(&pid, "ws_subscribe_bidi")),
+                };
+                let plugin = owning
+                    .lock()
+                    .expect("OwningPluginSlot mutex poisoned")
+                    .clone();
+                let plugin = match plugin {
+                    Some(p) => p,
+                    None => {
+                        return Err(Box::new(EvalAltResult::ErrorRuntime(
+                            format!(
+                                "[{pid}] ws_subscribe_bidi: owning plugin not yet wired"
+                            )
+                            .into(),
+                            rhai::Position::NONE,
+                        )));
+                    }
+                };
+                // Shared cell — populated AFTER ws_subscribe returns
+                // the handle. The handler reads it on every frame.
+                let handle_cell: Arc<std::sync::RwLock<Option<WsSubscriptionHandle>>> =
+                    Arc::new(std::sync::RwLock::new(None));
+                let handle_cell_for_handler = handle_cell.clone();
+                let pid_for_handler = pid.clone();
+                let cb_name: String = callback.to_string();
+                let handler: WsFrameHandler = Arc::new(move |frame: String| {
+                    let plugin = plugin.clone();
+                    let pid = pid_for_handler.clone();
+                    let cb = cb_name.clone();
+                    let h_opt = handle_cell_for_handler
+                        .read()
+                        .ok()
+                        .and_then(|g| g.clone());
+                    Box::pin(async move {
+                        let mut args: Vec<Dynamic> = Vec::with_capacity(2);
+                        if let Some(h) = h_opt {
+                            args.push(Dynamic::from(h));
+                        } else {
+                            // Shouldn't happen — handle_cell is
+                            // populated before the consumer reads
+                            // frames. If it does, pass UNIT so the
+                            // Rhai handler signature still matches.
+                            args.push(Dynamic::UNIT);
+                        }
+                        args.push(Dynamic::from(ImmutableString::from(frame)));
+                        if let Err(e) = plugin.invoke_async_owned(cb, args).await {
+                            tracing::warn!(
+                                plugin_id = %pid,
+                                error = %e,
+                                "ws_subscribe_bidi frame handler returned an error",
+                            );
+                        }
+                    })
+                });
+                let runtime = match tokio::runtime::Handle::try_current() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        return Err(Box::new(EvalAltResult::ErrorRuntime(
+                            format!("[{pid}] ws_subscribe_bidi: no tokio runtime: {e}")
+                                .into(),
+                            rhai::Position::NONE,
+                        )));
+                    }
+                };
+                let url_owned = url.to_string();
+                let handle = tokio::task::block_in_place(|| {
+                    runtime.block_on(caps.ws_subscribe(url_owned, handler))
+                });
+                match handle {
+                    Ok(h) => {
+                        // Populate the cell so the handler can pass
+                        // the handle into the Rhai callback on
+                        // every frame.
+                        if let Ok(mut slot) = handle_cell.write() {
+                            *slot = Some(h.clone());
+                        }
+                        Ok(Dynamic::from(h))
+                    }
+                    Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
+                        format!("[{pid}] ws_subscribe_bidi: {}", e.0).into(),
+                        rhai::Position::NONE,
+                    ))),
+                }
+            },
+        );
+    }
+
     // Method on WsSubscriptionHandle — `handle.close()` from Rhai.
     engine.register_fn("close", |h: &mut WsSubscriptionHandle| h.close());
     engine.register_fn("is_closed", |h: &mut WsSubscriptionHandle| h.is_closed());
+
+    // ws_send(handle, text_msg) -> bool
+    //
+    // Generic bidirectional escape hatch on the existing
+    // ws_subscribe surface. Returns true on success, false when
+    // the socket is currently disconnected (the protocol's
+    // redelivery semantics handle the gap — re-queueing across a
+    // reconnect would replay stale ACKs).
+    //
+    // First user: Slack Socket Mode envelope_id ACKs. Future
+    // bidirectional-WS plugins (Discord gateway, MCP-over-WS,
+    // generic webhook receivers) get this for free.
+    {
+        let pid = plugin_id.to_owned();
+        engine.register_fn(
+            "ws_send",
+            move |h: &mut WsSubscriptionHandle, msg: ImmutableString| -> bool {
+                match h.send(msg.to_string()) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "execlaw_script::primitives",
+                            plugin_id = %pid,
+                            error = %e.0,
+                            "ws_send dropped — caller should rely on protocol-level redelivery",
+                        );
+                        false
+                    }
+                }
+            },
+        );
+    }
 
     // host_route_inbound(message_map) -> "Dispatched" |
     //                                    "GroupNotAddressed" |

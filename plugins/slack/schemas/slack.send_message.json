@@ -1,0 +1,15 @@
+{
+    "type": "object",
+    "properties": {
+        "to": {
+            "type": "string",
+            "description": "Recipient. Channel id (e.g. C0123456789), DM id (D…), or fully-qualified `slack:<id>` JID. The plugin resolves the workspace by looking up which workspace last saw a message on this channel."
+        },
+        "text": {
+            "type": "string",
+            "description": "Message body. Long messages are split at 3500-char paragraph/line/space boundaries — pass the full reply, the plugin handles chunking."
+        }
+    },
+    "required": ["to", "text"],
+    "additionalProperties": false
+}

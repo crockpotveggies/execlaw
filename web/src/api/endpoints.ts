@@ -2175,6 +2175,108 @@ export async function unregisterSignalAccount(
     );
 }
 
+// ---- /api/admin/plugins/slack/* ------------------------------------
+//
+// Slack plugin admin endpoints. Multi-workspace from day 1: list,
+// add, remove. Auth is two tokens per workspace (xoxb- bot token,
+// xapp- app-level token). The plugin auto-discovers team_id +
+// bot_user_id via auth.test on the bot token.
+
+export interface SlackWorkspaceView {
+    team_id: string;
+    team_name: string;
+    bot_user_id: string;
+    controller_user_id: string;
+    bot_token_masked: string;
+    app_token_masked: string;
+}
+
+export interface SlackWorkspacesResponse {
+    workspaces: SlackWorkspaceView[];
+}
+
+export interface SlackStatusResponse {
+    sidecar_status: string;
+    sidecar_rpc_url: string | null;
+    registered_accounts: string[];
+    accounts_on_disk: string[];
+    fetch_error: string | null;
+    workspaces_configured: number;
+}
+
+export interface SlackAddWorkspaceResponse {
+    team_id: string;
+    team_name: string;
+    bot_user_id: string;
+    controller_user_id: string;
+}
+
+export async function getSlackStatus(
+    tokenAccessor: () => string | null,
+): Promise<SlackStatusResponse> {
+    return apiFetch<SlackStatusResponse>(
+        "/api/admin/plugins/slack/status",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function listSlackWorkspaces(
+    tokenAccessor: () => string | null,
+): Promise<SlackWorkspacesResponse> {
+    return apiFetch<SlackWorkspacesResponse>(
+        "/api/admin/plugins/slack/workspaces",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function addSlackWorkspace(
+    bot_token: string,
+    app_token: string,
+    controller_user_id: string,
+    tokenAccessor: () => string | null,
+): Promise<SlackAddWorkspaceResponse> {
+    return apiFetch<SlackAddWorkspaceResponse>(
+        "/api/admin/plugins/slack/workspaces",
+        {
+            method: "POST",
+            body: { bot_token, app_token, controller_user_id },
+        },
+        tokenAccessor,
+    );
+}
+
+export async function removeSlackWorkspace(
+    team_id: string,
+    tokenAccessor: () => string | null,
+): Promise<void> {
+    const qs = new URLSearchParams({ team_id }).toString();
+    await apiFetch<unknown>(
+        `/api/admin/plugins/slack/workspaces?${qs}`,
+        { method: "DELETE", rawText: true },
+        tokenAccessor,
+    );
+}
+
+export interface SlackTestResponse {
+    ok?: boolean;
+    ts?: string;
+    error?: string;
+}
+
+export async function sendSlackTestMessage(
+    team_id: string,
+    channel: string,
+    tokenAccessor: () => string | null,
+): Promise<SlackTestResponse> {
+    return apiFetch<SlackTestResponse>(
+        "/api/admin/plugins/slack/test",
+        { method: "POST", body: { team_id, channel } },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/plugins/whatsapp/* ---------------------------------
 //
 // WhatsApp plugin admin endpoints. Mirrors the Signal shape: same

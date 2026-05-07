@@ -1,0 +1,128 @@
+[plugin]
+id = "slack"
+name = "Slack"
+version = "0.1.0"
+description = "Slack transport via Socket Mode (no public URL needed). Multi-workspace from day 1: each workspace contributes its own bot+app token pair and runs its own Socket Mode connection. Mirrors the Signal/WhatsApp tool surface but is sidecar-free — pure-Rhai over the host's http_post + ws_subscribe + ws_send bindings."
+author = "execlaw"
+license = "AGPL-3.0-or-later"
+
+# No sidecar — Slack is public REST + Socket Mode WS. The plugin
+# reaches it via the existing `http_post` (SSRF guard accepts
+# external HTTPS, rejects loopback) and `ws_subscribe` /
+# `ws_send` (bidirectional WS, used for envelope_id ACKs).
+
+[transport]
+transport_id = "slack"
+supports_attachments = true
+supports_groups = true
+icon = "slack"
+
+# ===== Agent-callable tools =====================================
+[[tools]]
+name = "slack.send_message"
+description = """Send a Slack message to a channel or DM. \
+This tool IS the user-visible message — do NOT also produce a text \
+reply summarising what you sent. After calling this tool, return an \
+empty text response to end your turn. \
+The plugin auto-applies `thread_ts` when replying inside a thread \
+the bot just received an inbound from. Long messages are split at \
+3500-char paragraph/line/space boundaries. \
+Args: { to: string (channel id `C…`, DM id `D…`, or `slack:<id>` JID), \
+text: string }."""
+schema = "schemas/slack.send_message.json"
+trust_floor = "Controller"
+latency = "low"
+
+[[tools]]
+name = "slack.reply"
+description = """Reply in the current Slack conversation. \
+This tool IS the user-visible reply — do NOT also produce a text \
+response summarising what you replied. After calling this tool, \
+return an empty text response to end your turn. \
+Args: { to: string (recipient — host fills from the conversation's binding), \
+text: string }."""
+schema = "schemas/slack.send_message.json"
+latency = "low"
+
+[[tools]]
+name = "slack.list_channels"
+description = """List Slack channels and DMs the bot is a member of, \
+across every configured workspace. \
+Returns: { channels: [{ id, name, workspace, is_dm }] }."""
+trust_floor = "Controller"
+latency = "medium"
+
+# ===== Host-internal convention tools ============================
+[[tools]]
+name = "slack.set_typing"
+description = """Host-internal NO-OP. Slack's API does not expose a \
+typing-indicator endpoint (Bot users have no typing event). The host's \
+typing-guard fires `slack.set_typing` per turn anyway for cross-channel \
+consistency; this returns ok silently so the guard call doesn't error. \
+Args: { to: string, active: bool }."""
+trust_floor = "Controller"
+latency = "low"
+host_internal = true
+
+[[tools]]
+name = "slack.send_with_attachments"
+description = """Send a Slack message with one or more attachments \
+referenced by host-side attachment ids. Used by the deep-research \
+auto-bridge. Uses Slack's 3-step v2 file upload: \
+files.getUploadURLExternal → direct PUT → files.completeUploadExternal. \
+Caption rides on the first attachment; thread_ts auto-applied if \
+known. \
+Args: { to: string, text?: string, attachments: int[] (host attachment ids) }."""
+trust_floor = "Controller"
+latency = "medium"
+host_internal = true
+
+[[tools]]
+name = "slack.fetch_attachment"
+description = """Host-internal: fetch the raw bytes of a Slack \
+inbound attachment by its bridge id (Slack's `url_private`). The \
+plugin sends Authorization: Bearer <bot_token> for the workspace \
+that owns the channel. Args: { attachment_id: string }."""
+trust_floor = "Controller"
+latency = "low"
+host_internal = true
+
+# ===== Admin routes ==============================================
+[[admin_routes]]
+method = "GET"
+path = "/status"
+handler = "admin_status"
+description = "List configured workspaces + connection state."
+
+[[admin_routes]]
+method = "GET"
+path = "/workspaces"
+handler = "admin_list_workspaces"
+description = "List configured workspaces (masked tokens)."
+
+[[admin_routes]]
+method = "POST"
+path = "/workspaces"
+handler = "admin_add_workspace"
+description = "Add a workspace. Body: {bot_token, app_token, controller_user_id?}. Calls auth.test to discover team_id + bot_user_id."
+
+[[admin_routes]]
+method = "DELETE"
+path = "/workspaces"
+handler = "admin_remove_workspace"
+description = "Remove a workspace by team_id. Query: ?team_id=T123."
+
+[[admin_routes]]
+method = "POST"
+path = "/test"
+handler = "admin_test_message"
+description = "Send a test message. Body: {team_id, channel}."
+
+# SPA settings page mount.
+[[ui_panels]]
+mount = "admin/plugins/slack"
+entry = "ui/panel.js"
+
+[runtime]
+tier = "script"
+source = "main.rhai"
