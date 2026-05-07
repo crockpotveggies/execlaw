@@ -14,7 +14,9 @@
 //   Response on success: {"status": 1, "request": "..."}
 //   Response on error:   {"status": 0, "errors": [...]}
 
-const PUSHOVER_ENDPOINT = "https://api.pushover.net/1/messages.json";
+// Rhai gotcha: module-level `const` isn't visible inside fn
+// bodies. Inline the endpoint literal at every use site.
+// PUSHOVER_ENDPOINT = "https://api.pushover.net/1/messages.json"
 
 // =====================================================================
 // AGENT TOOL DISPATCH
@@ -57,7 +59,7 @@ fn notify_impl(args) {
         body.url_title = args.url_title;
     }
 
-    let resp = http_post(PUSHOVER_ENDPOINT, body, "");
+    let resp = http_post("https://api.pushover.net/1/messages.json", body, "");
     // Pushover returns 200 with status=0 + errors[] on input
     // failures (bad token, message too long, etc.) — surface the
     // error array verbatim instead of a silent "ok".
