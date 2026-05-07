@@ -443,22 +443,6 @@ export function SearchPage() {
                                             </div>
                                         </div>
                                         <div className="d-flex gap-2 align-items-center flex-shrink-0">
-                                            {configured && (
-                                                <Form.Check
-                                                    type="switch"
-                                                    id={`provider-switch-${meta.kind}`}
-                                                    checked={enabled}
-                                                    disabled={isToggling || busy}
-                                                    onChange={(e) =>
-                                                        void toggleEnabled(
-                                                            meta.kind,
-                                                            e.target.checked,
-                                                        )
-                                                    }
-                                                    aria-label={`${enabled ? "Disable" : "Enable"} ${meta.display}`}
-                                                    data-testid={`provider-toggle-${meta.kind}`}
-                                                />
-                                            )}
                                             {!configured && (
                                                 <Button
                                                     size="sm"
@@ -473,6 +457,19 @@ export function SearchPage() {
                                             )}
                                             {configured && (
                                                 <>
+                                                    {!isDefault && (
+                                                        <Button
+                                                            size="sm"
+                                                            variant="outline-secondary"
+                                                            onClick={() =>
+                                                                promote(meta.kind)
+                                                            }
+                                                            disabled={busy}
+                                                            data-testid={`provider-promote-${meta.kind}`}
+                                                        >
+                                                            Make default
+                                                        </Button>
+                                                    )}
                                                     <Button
                                                         size="sm"
                                                         variant="outline-secondary"
@@ -489,7 +486,7 @@ export function SearchPage() {
                                                         variant={
                                                             isTestOpen
                                                                 ? "primary"
-                                                                : "outline-primary"
+                                                                : "outline-secondary"
                                                         }
                                                         onClick={() =>
                                                             toggleTestPanel(
@@ -505,19 +502,6 @@ export function SearchPage() {
                                                     {!isDefault && (
                                                         <Button
                                                             size="sm"
-                                                            variant="success"
-                                                            onClick={() =>
-                                                                promote(meta.kind)
-                                                            }
-                                                            disabled={busy}
-                                                            data-testid={`provider-promote-${meta.kind}`}
-                                                        >
-                                                            Set as default
-                                                        </Button>
-                                                    )}
-                                                    {!isDefault && (
-                                                        <Button
-                                                            size="sm"
                                                             variant="outline-danger"
                                                             onClick={() =>
                                                                 remove(meta.kind)
@@ -528,6 +512,21 @@ export function SearchPage() {
                                                             Delete
                                                         </Button>
                                                     )}
+                                                    <Form.Check
+                                                        type="switch"
+                                                        id={`provider-switch-${meta.kind}`}
+                                                        checked={enabled}
+                                                        disabled={isToggling || busy}
+                                                        onChange={(e) =>
+                                                            void toggleEnabled(
+                                                                meta.kind,
+                                                                e.target.checked,
+                                                            )
+                                                        }
+                                                        aria-label={`${enabled ? "Disable" : "Enable"} ${meta.display}`}
+                                                        data-testid={`provider-toggle-${meta.kind}`}
+                                                        className="ms-1"
+                                                    />
                                                 </>
                                             )}
                                         </div>
