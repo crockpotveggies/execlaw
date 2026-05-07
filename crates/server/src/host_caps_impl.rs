@@ -156,6 +156,54 @@ impl HostCapabilities for AppStateHostCapabilities {
             size_bytes: bytes.len() as u64,
         })
     }
+
+    async fn vault_get(
+        &self,
+        plugin_id: &str,
+        name: &str,
+    ) -> Result<Option<String>, HostCapError> {
+        use execlaw_core::vault_row::VaultRowStore;
+        let store = VaultRowStore::new(&self.state.db);
+        let raw = store
+            .get(Some(plugin_id), name)
+            .map_err(|e| HostCapError::new(format!("vault_get: {e}")))?;
+        match raw {
+            Some(bytes) => match String::from_utf8(bytes) {
+                Ok(s) => Ok(Some(s)),
+                Err(_) => Err(HostCapError::new(format!(
+                    "vault row '{name}' for plugin '{plugin_id}' is not valid UTF-8"
+                ))),
+            },
+            None => Ok(None),
+        }
+    }
+
+    async fn vault_put(
+        &self,
+        plugin_id: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<(), HostCapError> {
+        use execlaw_core::vault_row::VaultRowStore;
+        let store = VaultRowStore::new(&self.state.db);
+        let now = chrono::Utc::now().timestamp();
+        store
+            .put(Some(plugin_id), name, value.as_bytes(), now)
+            .map_err(|e| HostCapError::new(format!("vault_put: {e}")))?;
+        Ok(())
+    }
+
+    async fn vault_delete(
+        &self,
+        plugin_id: &str,
+        name: &str,
+    ) -> Result<bool, HostCapError> {
+        use execlaw_core::vault_row::VaultRowStore;
+        let store = VaultRowStore::new(&self.state.db);
+        store
+            .delete(Some(plugin_id), name)
+            .map_err(|e| HostCapError::new(format!("vault_delete: {e}")))
+    }
 }
 
 /// Long-lived WebSocket consumer task. Reconnects on disconnect

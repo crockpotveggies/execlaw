@@ -260,6 +260,41 @@ pub trait HostCapabilities: Send + Sync {
         &self,
         attachment_id: &str,
     ) -> Result<AttachmentBytes, HostCapError>;
+
+    /// Read a per-plugin secret from `vault_secrets`. Returns the
+    /// value as a String when a row exists for `(self.plugin_id,
+    /// name)`, or `None` when nothing's been written.
+    ///
+    /// Plugins use this to read operator-configured secrets they
+    /// persist via [`vault_put`] — Pushover's user_key + app_token,
+    /// future plugins' API tokens, anything an admin route writes
+    /// through a config form. Stored bytes are interpreted as
+    /// UTF-8; non-UTF-8 blobs surface an error rather than silently
+    /// returning garbage.
+    async fn vault_get(
+        &self,
+        plugin_id: &str,
+        name: &str,
+    ) -> Result<Option<String>, HostCapError>;
+
+    /// Write a per-plugin secret to `vault_secrets`. Idempotent on
+    /// `(plugin_id, name)` — the row's `value_blob` is replaced
+    /// and `updated_at` is bumped. Plugins call this from admin-
+    /// route handlers when the operator submits a config form.
+    async fn vault_put(
+        &self,
+        plugin_id: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<(), HostCapError>;
+
+    /// Delete a per-plugin secret. Returns `true` when a row was
+    /// removed, `false` when no such row existed. Idempotent.
+    async fn vault_delete(
+        &self,
+        plugin_id: &str,
+        name: &str,
+    ) -> Result<bool, HostCapError>;
 }
 
 /// Output of [`HostCapabilities::get_attachment_bytes_b64`].

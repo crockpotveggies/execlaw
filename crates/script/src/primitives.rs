@@ -608,7 +608,126 @@ fn register_host_cap_bindings(
     register_sidecar_http_put(engine, plugin_id, host_caps.clone());
     register_sidecar_http_delete(engine, plugin_id, host_caps.clone());
     register_host_get_attachment_bytes(engine, plugin_id, host_caps.clone());
-    register_sidecar_http_get_bytes(engine, plugin_id, host_caps);
+    register_sidecar_http_get_bytes(engine, plugin_id, host_caps.clone());
+    register_vault_bindings(engine, plugin_id, host_caps);
+}
+
+/// Per-plugin secret store, scoped to the calling plugin's id.
+/// `vault_get(name)` returns the stored value or `()` when missing.
+/// `vault_put(name, value)` upserts. `vault_delete(name)` removes
+/// and returns true/false. Used by admin-route handlers that
+/// persist operator-supplied API keys (Pushover user/token,
+/// future plugins' bearer tokens, etc.) and by tool-call handlers
+/// that read those keys at dispatch time.
+fn register_vault_bindings(
+    engine: &mut Engine,
+    plugin_id: &str,
+    host_caps: HostCapsHandle,
+) {
+    {
+        let pid = plugin_id.to_owned();
+        let caps = host_caps.clone();
+        engine.register_fn(
+            "vault_get",
+            move |name: ImmutableString| -> Result<Dynamic, Box<EvalAltResult>> {
+                let caps = match caps.get() {
+                    Some(c) => c.clone(),
+                    None => return Err(host_cap_unavailable_err(&pid, "vault_get")),
+                };
+                let runtime = match tokio::runtime::Handle::try_current() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        return Err(Box::new(EvalAltResult::ErrorRuntime(
+                            format!("[{pid}] vault_get: no tokio runtime: {e}").into(),
+                            rhai::Position::NONE,
+                        )));
+                    }
+                };
+                let pid_for_call = pid.clone();
+                let result = tokio::task::block_in_place(|| {
+                    runtime.block_on(caps.vault_get(&pid_for_call, &name))
+                });
+                match result {
+                    Ok(Some(v)) => Ok(Dynamic::from(ImmutableString::from(v))),
+                    Ok(None) => Ok(Dynamic::UNIT),
+                    Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
+                        format!("[{pid}] vault_get: {}", e.0).into(),
+                        rhai::Position::NONE,
+                    ))),
+                }
+            },
+        );
+    }
+
+    {
+        let pid = plugin_id.to_owned();
+        let caps = host_caps.clone();
+        engine.register_fn(
+            "vault_put",
+            move |name: ImmutableString,
+                  value: ImmutableString|
+                  -> Result<(), Box<EvalAltResult>> {
+                let caps = match caps.get() {
+                    Some(c) => c.clone(),
+                    None => return Err(host_cap_unavailable_err(&pid, "vault_put")),
+                };
+                let runtime = match tokio::runtime::Handle::try_current() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        return Err(Box::new(EvalAltResult::ErrorRuntime(
+                            format!("[{pid}] vault_put: no tokio runtime: {e}").into(),
+                            rhai::Position::NONE,
+                        )));
+                    }
+                };
+                let pid_for_call = pid.clone();
+                let result = tokio::task::block_in_place(|| {
+                    runtime.block_on(caps.vault_put(&pid_for_call, &name, &value))
+                });
+                match result {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
+                        format!("[{pid}] vault_put: {}", e.0).into(),
+                        rhai::Position::NONE,
+                    ))),
+                }
+            },
+        );
+    }
+
+    {
+        let pid = plugin_id.to_owned();
+        let caps = host_caps;
+        engine.register_fn(
+            "vault_delete",
+            move |name: ImmutableString| -> Result<bool, Box<EvalAltResult>> {
+                let caps = match caps.get() {
+                    Some(c) => c.clone(),
+                    None => return Err(host_cap_unavailable_err(&pid, "vault_delete")),
+                };
+                let runtime = match tokio::runtime::Handle::try_current() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        return Err(Box::new(EvalAltResult::ErrorRuntime(
+                            format!("[{pid}] vault_delete: no tokio runtime: {e}").into(),
+                            rhai::Position::NONE,
+                        )));
+                    }
+                };
+                let pid_for_call = pid.clone();
+                let result = tokio::task::block_in_place(|| {
+                    runtime.block_on(caps.vault_delete(&pid_for_call, &name))
+                });
+                match result {
+                    Ok(deleted) => Ok(deleted),
+                    Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
+                        format!("[{pid}] vault_delete: {}", e.0).into(),
+                        rhai::Position::NONE,
+                    ))),
+                }
+            },
+        );
+    }
 }
 
 fn register_host_get_attachment_bytes(

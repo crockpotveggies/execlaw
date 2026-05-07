@@ -1,0 +1,29 @@
+{
+    "type": "object",
+    "properties": {
+        "message": {
+            "type": "string",
+            "description": "Notification body (max 1024 chars). Required."
+        },
+        "title": {
+            "type": "string",
+            "description": "Optional notification title (max 250 chars). Defaults to the application's Pushover label."
+        },
+        "priority": {
+            "type": "integer",
+            "minimum": -2,
+            "maximum": 2,
+            "description": "Pushover priority: -2 (lowest, no notification), -1 (low / quiet), 0 (normal, default), 1 (high, bypass quiet hours), 2 (emergency — requires user acknowledgement)."
+        },
+        "url": {
+            "type": "string",
+            "description": "Optional URL the notification's tap-action navigates to."
+        },
+        "url_title": {
+            "type": "string",
+            "description": "Anchor text shown for `url` (max 100 chars). Ignored when `url` is omitted."
+        }
+    },
+    "required": ["message"],
+    "additionalProperties": false
+}

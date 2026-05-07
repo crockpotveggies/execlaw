@@ -2175,6 +2175,61 @@ export async function unregisterSignalAccount(
     );
 }
 
+// ---- /api/admin/plugins/pushover/* ---------------------------------
+//
+// Pushover plugin admin endpoints. The plugin persists user_key +
+// app_token via its own per-plugin vault scope; the SPA's config
+// page reads + writes through these wrappers.
+
+export interface PushoverConfigResponse {
+    user_key_set: boolean;
+    user_key_masked: string;
+    app_token_set: boolean;
+    app_token_masked: string;
+}
+
+export async function getPushoverConfig(
+    tokenAccessor: () => string | null,
+): Promise<PushoverConfigResponse> {
+    return apiFetch<PushoverConfigResponse>(
+        "/api/admin/plugins/pushover/config",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function setPushoverConfig(
+    user_key: string,
+    app_token: string,
+    tokenAccessor: () => string | null,
+): Promise<void> {
+    await apiFetch<unknown>(
+        "/api/admin/plugins/pushover/config",
+        {
+            method: "POST",
+            body: { user_key, app_token },
+            rawText: true,
+        },
+        tokenAccessor,
+    );
+}
+
+export interface PushoverTestResponse {
+    ok?: boolean;
+    request_id?: string;
+    error?: string;
+}
+
+export async function testPushoverNotification(
+    tokenAccessor: () => string | null,
+): Promise<PushoverTestResponse> {
+    return apiFetch<PushoverTestResponse>(
+        "/api/admin/plugins/pushover/test",
+        { method: "POST" },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/routines (Phase 10 — §5.6) -------------------------
 
 export type RoutineRunStatus = "Pending" | "Success" | "Failed" | "Skipped";

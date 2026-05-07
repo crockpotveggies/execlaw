@@ -36,6 +36,26 @@ impl<'db> VaultRowStore<'db> {
         })
     }
 
+    /// Delete a single secret by `(plugin_id, name)`. Returns
+    /// `true` when a row was removed, `false` when no such row
+    /// existed. Idempotent — operators / plugins can call this
+    /// without checking presence first.
+    pub fn delete(&self, plugin_id: Option<&str>, name: &str) -> Result<bool, DbError> {
+        self.db.with_conn(|c| {
+            let n = match plugin_id {
+                Some(pid) => c.execute(
+                    "DELETE FROM vault_secrets WHERE plugin_id = ?1 AND name = ?2",
+                    params![pid, name],
+                )?,
+                None => c.execute(
+                    "DELETE FROM vault_secrets WHERE plugin_id IS NULL AND name = ?1",
+                    params![name],
+                )?,
+            };
+            Ok(n > 0)
+        })
+    }
+
     pub fn get(&self, plugin_id: Option<&str>, name: &str) -> Result<Option<Vec<u8>>, DbError> {
         self.db.with_conn(|c| {
             let got = match plugin_id {
