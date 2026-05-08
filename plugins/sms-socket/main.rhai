@@ -70,9 +70,7 @@ fn on_enable() {
 
     // Handshake the gateway expects on every connect. Without
     // these, the gateway treats us as a passive listener and never
-    // delivers `gateway.state` pings or live `sms.received`
-    // events — which in turn destabilises the gateway when an
-    // SMS arrives because nothing is registered to consume it.
+    // delivers `gateway.state` pings or live `sms.received` events.
     // Mirrors selfhosted-claw's onopen sequence
     // (sms-socket.ts:430-457).
     //
@@ -80,12 +78,33 @@ fn on_enable() {
     //      active subscriber and prompts the gateway to start
     //      pushing live events to us.
     //   2. rehydrate       — replays history we missed while
-    //      disconnected. v1 uses since=0 and a generous limit;
-    //      the host's inbound dedup catches duplicates.
+    //      disconnected. The `since` cursor is critical: with
+    //      since=0 the gateway returns every buffered event going
+    //      back potentially weeks, and we'd flood the agent with
+    //      historical messages, which in turn would fire 40+
+    //      outbound auto-replies. Track the most-recent received
+    //      event timestamp in vault and pass that as `since`.
     //
-    // The host replays these on every (re)connect. requestIds are
-    // intentionally fixed strings — fire-and-forget; we don't
-    // correlate the responses to anything.
+    // First-install case: no `last_seen_ms` in the vault yet.
+    // Default to NOW so we don't dump pre-install history through
+    // the agent. The trade-off is that any SMS that came in during
+    // the few seconds between install and on_enable would be
+    // missed on the very first connect — acceptable; live delivery
+    // takes over from this point.
+    let last_seen_ms = vault_get("last_seen_ms");
+    let since;
+    if last_seen_ms != () && last_seen_ms != "" {
+        try {
+            since = last_seen_ms.to_int();
+        } catch (e) {
+            since = now() * 1000;
+        }
+    } else {
+        since = now() * 1000;
+        vault_put("last_seen_ms", since.to_string());
+        log_info("sms-socket: first connect — anchoring rehydrate cursor at " + since + "ms");
+    }
+
     let init_state = #{
         "type": "getGatewayState",
         "requestId": "sms-handshake-state",
@@ -95,7 +114,7 @@ fn on_enable() {
         "type": "rehydrate",
         "requestId": "sms-handshake-rehydrate",
         "payload": #{
-            "since": 0,
+            "since": since,
             "limit": 200,
         },
     };
@@ -137,17 +156,36 @@ fn on_frame(handle, raw) {
             return;
         }
         // Rehydrate response carries a history of events in
-        // payload.events[]. Each is a full envelope (type, payload)
-        // — replay through the same routing path as live events.
-        // Host-side dedup on (channel, native_id, timestamp_ms,
-        // text) catches any overlap with what we received live.
+        // payload.events[]. Each is a full envelope (type, payload).
+        //
+        // Defense-in-depth cursor filter: even though we asked
+        // rehydrate `since: last_seen_ms`, defend against gateway
+        // bugs that ignore the cursor and dump full history. We
+        // skip any event with a timestamp <= the cursor we PASSED
+        // IN. The cursor was captured at on_enable time, BEFORE
+        // any new events arrived in this connection, so:
+        //
+        //   * Events older than the cursor → already processed in
+        //     a past session, drop them (no agent dispatch).
+        //   * Events newer than the cursor → genuinely missed
+        //     while disconnected; route them.
+        //
+        // Without this filter, a fresh install or a gateway that
+        // returns the full buffer floods the agent with backlog
+        // and triggers 40+ outbound auto-replies.
         if env.requestId == "sms-handshake-rehydrate"
             && env.payload != ()
             && env.payload.events != ()
             && type_of(env.payload.events) == "array"
         {
             let count = env.payload.events.len();
-            log_info("sms-socket: rehydrate returned " + count + " event(s); replaying");
+            // Re-read the cursor at replay time. Using the same
+            // value we passed as `since` keeps the replay window
+            // closed under the rehydrate semantics.
+            let cursor = read_last_seen_ms();
+            log_info("sms-socket: rehydrate returned " + count + " event(s); cursor=" + cursor + "ms");
+            let routed = 0;
+            let skipped = 0;
             for nested in env.payload.events {
                 if type_of(nested) != "map" { continue; }
                 let nested_type = nested.type;
@@ -155,14 +193,21 @@ fn on_frame(handle, raw) {
                 if nested_type != "sms.received" && nested_type != "mms.received" {
                     continue;
                 }
-                let inbound = decode_event(nested_type, nested);
-                if inbound == () { continue; }
-                try {
-                    host_route_inbound(inbound);
-                } catch (e) {
-                    log_warn("sms-socket: rehydrate dispatch rejected: " + e);
+                let nested_ts = ();
+                if nested.payload != () && nested.payload.receivedAt != () {
+                    nested_ts = nested.payload.receivedAt;
+                } else if nested.timestamp != () {
+                    nested_ts = nested.timestamp;
+                }
+                if nested_ts != () && nested_ts <= cursor {
+                    skipped += 1;
+                    continue;
+                }
+                if route_inbound_event(nested_type, nested) {
+                    routed += 1;
                 }
             }
+            log_info("sms-socket: rehydrate replay done; routed=" + routed + " skipped=" + skipped);
         }
         return;
     }
@@ -186,12 +231,43 @@ fn on_frame(handle, raw) {
         return;
     }
 
+    route_inbound_event(env_type, env);
+}
+
+// Single dispatch path used by both live frames + rehydrate replay.
+// Updates last_seen_ms in vault on every routed event so the next
+// rehydrate's `since` cursor reflects what we've actually consumed.
+// Returns true on successful dispatch, false on decode/skip.
+fn route_inbound_event(env_type, env) {
     let inbound = decode_event(env_type, env);
-    if inbound == () { return; }
+    if inbound == () { return false; }
+    // Persist the cursor BEFORE dispatching, not after. If the
+    // host dispatch throws (e.g. UNIQUE constraint on duplicate
+    // ingest), we still want the cursor moved past this event so
+    // the NEXT rehydrate doesn't re-fetch it. The host's own dedup
+    // is a safety net; the cursor is the primary correctness lever.
+    let ts = inbound.timestamp_ms;
+    if ts != () {
+        let prev = read_last_seen_ms();
+        if ts > prev {
+            vault_put("last_seen_ms", ts.to_string());
+        }
+    }
     try {
         host_route_inbound(inbound);
     } catch (e) {
         log_warn("sms-socket: host_route_inbound rejected: " + e);
+    }
+    true
+}
+
+fn read_last_seen_ms() {
+    let raw = vault_get("last_seen_ms");
+    if raw == () || raw == "" { return 0; }
+    try {
+        return raw.to_int();
+    } catch (e) {
+        return 0;
     }
 }
 
