@@ -10,22 +10,61 @@ driven by a Rust control plane, a WordPress-style plugin framework, a
 unified container manager, a chat-first UI, and a participant-aware
 agent model.
 
-## Source of truth
+<p align="center">
+  <img src="docs/screenshots/skills-screenshot.png" alt="execlaw — Skills page in the SPA" width="820">
+</p>
 
-- **[`MIGRATION_PLAN.md`](MIGRATION_PLAN.md)** — the target architecture
-  and phased plan. Every design decision in the codebase cites a section
-  there. §0 "Grounding Principles" is the non-negotiable list: axiom #1
-  (no cloud LLMs), axiom #11 (container deployment), and axiom #12
-  (minimal container images) are absolute.
-- **[`STATUS.md`](STATUS.md)** — live progress log. Read this first if
-  you want to see what works today.
+<p align="center">
+  <img src="docs/screenshots/deep-research-screenshot.png" alt="execlaw — Deep research session" width="820">
+</p>
 
-## Quick start
+## Documentation
+
+| Doc | What it covers |
+|---|---|
+| [`docs/architecture.md`](docs/architecture.md) | System topology, design principles, FSM, data model, recovery, observability — the **what**. |
+| [`docs/agent-model.md`](docs/agent-model.md) | TurnExecutor, memory layers, reflection loop, planner/executor split — the **how** of one turn. |
+| [`docs/plugins.md`](docs/plugins.md) | Plugin manifest schema, runtime tiers, sidecar model, Rhai primitives, and a step-by-step guide for writing a custom plugin. |
+| [`docs/sidecar-supervisor-design.md`](docs/sidecar-supervisor-design.md) | Supervised-container layer plugins compose against. |
+| [`docs/runner-design.md`](docs/runner-design.md) | Per-conversation runner container model. |
+| [`docs/voice-followups.md`](docs/voice-followups.md) | Voice modality design notes. |
+| [`MIGRATION_PLAN.md`](MIGRATION_PLAN.md) | Section-by-section design rationale + research citations — the **why**. §0 "Grounding Principles" is the non-negotiable list (no cloud LLMs, container deployment, minimal images). |
+| [`AGENTS.md`](AGENTS.md) | Onboarding for AI coding agents working on this repo. |
+
+## What ships today
+
+- **Control plane** (Rust binary): event log + scheduler + plugin host + container manager + outbox relay + axum server + SQLCipher vault.
+- **Per-conversation runner containers**: stateless against the log, stateless OpenAI-compatible client to local inference (vLLM / OpenArc / Whisper / Kokoro).
+- **Trust ladder + Rule of Two**: `Controller / Delegated / KnownTrusted / KnownLimited / UnknownPending / Blocked` with cold-contact escalation, signed approval-token JWTs, sideband HITL.
+- **HMAC-chained event log**: every committed row is tamper-evident; replay rebuilds state deterministically.
+- **Outbox + idempotency**: framework-minted `(conversation_id, turn_seq, tool_call_ordinal)` keys, retries with backoff, dead-letter queue.
+- **Plugin framework** (10 in-tree plugins): script-tier (Rhai) + subprocess-tier (JSON-RPC), full manifest schema (tools / transports / identity providers / OAuth / sidecars / admin routes / webhook routes / UI panels / skills).
+- **Shipped transports**: Signal (signal-cli sidecar), WhatsApp (wuzapi sidecar), Slack (multi-workspace OAuth), SMS (Android-gateway WebSocket).
+- **Shipped HTTP integrations**: Google Calendar, Google Contacts (also identity provider), Google Places, Pushover.
+- **Research subsystem**: deep-research plan/gather/synthesize pipeline with retention and per-phase event flow.
+- **SPA**: chat-first sidebar, pinned Control thread (every controller-channel message collapses here), token streaming, approval queue, per-plugin admin panels, settings.
+
+See [`docs/architecture.md` §18](docs/architecture.md) for the full milestone breakdown.
+
+## Screenshots
+
+Drop UI screenshots into [`docs/screenshots/`](docs/screenshots/) and reference them inline below as the SPA evolves.
+
+```markdown
+![Control thread](docs/screenshots/control-thread.png)
+![Plugin install flow](docs/screenshots/plugin-install.png)
+```
+
+`docs/screenshots/.gitkeep` keeps the directory tracked even when empty. PNG / SVG / WebP all work; keep them under ~500 KB each. The doc's existing inline examples cite `docs/screenshots/*` paths, so new shots only need to drop in.
+
+---
+
+## Quick start (production)
 
 execlaw runs as a host service on bare metal — systemd on Linux,
 launchd on macOS, the Service Control Manager on Windows. Docker is
-optional and only needed for managed-mode inference backends (Phase
-12); the control plane itself is a single Rust binary.
+optional and only needed for managed-mode inference backends; the
+control plane itself is a single Rust binary.
 
 ### One-shot install
 
@@ -33,7 +72,7 @@ optional and only needed for managed-mode inference backends (Phase
 cargo install --path crates/cli   # or `cargo build --release` and copy the binary
 execlaw install                   # migrate DB → register service → start it
 curl http://127.0.0.1:3030/api/health    # → {"status":"ok"}
-open http://127.0.0.1:3030/api/docs      # Swagger + AsyncAPI
+open  http://127.0.0.1:3030/api/docs     # Swagger + AsyncAPI
 ```
 
 `execlaw install` registers a per-user service by default. Add
@@ -82,29 +121,71 @@ curl -X POST http://127.0.0.1:3030/api/setup \
 The SPA at `http://127.0.0.1:3030/` will guide you through the rest
 (backend wizard, plugin install, personality, etc.).
 
-## Workspace layout
+---
 
-See [`MIGRATION_PLAN.md` §3.1](MIGRATION_PLAN.md) for the full rationale.
+## Dev mode (hot-reload, full stack)
 
-| Crate | Purpose |
+Two long-running processes give you a restart-free edit cycle for both
+the Rust server and the SPA.
+
+### One-time setup
+
+```bash
+# Rust file-watcher.
+cargo install cargo-watch --locked
+
+# SPA dependencies.
+cd web && npm install
+```
+
+### Run both terminals
+
+```bash
+# Terminal 1 — Rust hot-reload. cargo-watch rebuilds + restarts the
+# binary on every .rs save. Wraps `cargo run -p execlaw -- serve`.
+bash scripts/dev-server.sh         # POSIX / WSL / Git Bash on Windows
+# or:
+pwsh scripts/dev-server.ps1        # Windows PowerShell
+# or, from inside web/:
+cd web && npm run dev:server        # alias for the bash script
+
+# Terminal 2 — SPA hot-reload. Vite HMR; proxies /api → :3031.
+cd web && npm run dev               # standard Vite dev server
+# (use `npm run dev:3031` if you need the explicit VITE_API_TARGET wiring)
+```
+
+Open <http://127.0.0.1:5173/> — the SPA hits the Vite dev server, which
+proxies API calls to the cargo-watch'd Rust binary on `:3031`. Editing
+a `.tsx` file triggers a Vite HMR push; editing a `.rs` file triggers
+a `cargo build` + binary restart and the next API call hits the new
+code (typically <5s for incremental edits).
+
+### Why port 3031, not 3030
+
+Docker Desktop's vpnkit squats `:3030` on Windows hosts, so the dev
+server steers off it to avoid `EADDRINUSE`. The Vite proxy reads
+`VITE_API_TARGET` to match. Override on hosts where Docker isn't a
+problem:
+
+```bash
+EXECLAW_DEV_BIND=127.0.0.1:3030 bash scripts/dev-server.sh
+# ... and adjust web/vite.config.ts proxy target accordingly.
+```
+
+### Useful npm scripts (in `web/`)
+
+| Script | What it does |
 |---|---|
-| `crates/core` | Event log, FSM, migrations, SQLCipher-encrypted storage |
-| `crates/session` | Per-conversation pipeline composition (text vs voice) |
-| `crates/inference-api` | OpenAI-compatible LLM client. **No cloud SDKs.** |
-| `crates/runner-local` | The one runner; Phase 1 fills in the agent loop |
-| `crates/voice-pipeline` | STT → LLM → TTS two-lane Tokio graph |
-| `crates/plugin-sdk` | `plugin.toml` manifest parser + ZIP staging |
-| `crates/plugin-host` | Plugin registry + lifecycle |
-| `crates/container-manager` | bollard client + tiered hardware detection |
-| `crates/policy` | Rule of Two, capability tokens, input guards |
-| `crates/vault` | OS-keyring master key + Argon2id admin password |
-| `crates/transport-api` | Trait a transport plugin implements |
-| `crates/identity-api` | Trait an identity-provider plugin implements |
-| `crates/outbox` | Outbox relay primitives |
-| `crates/server` | Axum HTTP + WebSocket surface |
-| `crates/cli` | `execlaw` binary (install, service install/start/stop, doctor, serve, ...) |
+| `npm run dev` | Vite dev server with HMR (default port 5173). |
+| `npm run dev:3031` | Same as `dev` but pins `VITE_API_TARGET=http://127.0.0.1:3031`. |
+| `npm run dev:server` | Forwards to `bash ../scripts/dev-server.sh` so you can launch the Rust server from inside `web/`. |
+| `npm run build` | Production SPA bundle (`web/dist/`). |
+| `npm run preview` | Serve the built bundle locally. |
+| `npm test` / `npm run test:watch` | Vitest. |
+| `npm run lint` | `tsc --noEmit`. |
+| `npm run size` | Print bundle-size budget snapshot. |
 
-## Building from source (developer)
+### Rust dev cheatsheet
 
 ```bash
 # Plaintext SQLite path (fast; skips OpenSSL vendoring).
@@ -113,6 +194,10 @@ cargo run -p execlaw -- doctor
 
 # Full SQLCipher path (production build).
 cargo test --workspace --no-default-features -F execlaw-core/sqlcipher
+
+# Replay a turn — reconstructs the exact prompt, capability set,
+# policy decision, and committed events for one conversation/seq.
+cargo run -p execlaw -- replay <conversation_id> --at <seq>
 ```
 
 Requires Rust 1.85+ (edition 2024). Bare-metal targets:
@@ -121,43 +206,44 @@ Requires Rust 1.85+ (edition 2024). Bare-metal targets:
 on each is handled by the
 [`service-manager`](https://crates.io/crates/service-manager) crate.
 
-## Hot-reload dev workflow
-
-Two long-running processes give you a restart-free edit cycle for
-both the Rust server and the SPA:
-
-```bash
-# One-time install of the Rust file-watcher:
-cargo install cargo-watch --locked
-
-# Terminal 1 — Rust hot-reload. cargo-watch rebuilds + restarts the
-# binary on every .rs save. Wraps `cargo run -p execlaw -- serve`.
-cd web && npm run dev:server
-#   POSIX direct:   bash scripts/dev-server.sh
-#   PowerShell:     pwsh scripts/dev-server.ps1
-
-# Terminal 2 — SPA hot-reload (Vite HMR). Proxies /api → :3031.
-cd web && npm run dev:3031
-```
-
-Open http://127.0.0.1:5173/ — the SPA hits the Vite dev server, which
-proxies API calls to the cargo-watch'd Rust binary on :3031. Editing
-a `.tsx` file triggers a Vite HMR push; editing a `.rs` file triggers
-a `cargo build` + binary restart and the next API call hits the new
-code (typically <5s for incremental edits).
-
-Why :3031 instead of the production :3030 — Docker Desktop's vpnkit
-squats :3030 on Windows hosts, so the dev server steers off it to
-avoid `EADDRINUSE`. The Vite proxy reads `VITE_API_TARGET` to match;
-`npm run dev:3031` sets it for you. Override with
-`EXECLAW_DEV_BIND=127.0.0.1:3030` on hosts where Docker isn't a
-problem (and adjust the Vite target to match).
-
 ### Disk-space note
 
 The Rust workspace's `target/` directory grows quickly (40+ GB on a
 warm dev box). If `cargo-watch` rebuilds start failing with
 `No space left on device`, run `cargo clean` to reclaim.
+
+---
+
+## Workspace layout
+
+See [`MIGRATION_PLAN.md` §3.1](MIGRATION_PLAN.md) for the full rationale.
+
+| Path | Purpose |
+|---|---|
+| `crates/core/` | Event log, FSM, migrations (35+ incremental), SQLCipher-encrypted storage, principal store, memory lifecycle. |
+| `crates/session/` | Per-conversation pipeline composition (text vs voice). |
+| `crates/inference-api/` | OpenAI-compatible LLM client. **No cloud SDKs.** |
+| `crates/runner-local/` | TurnExecutor — full tool-loop turn path. |
+| `crates/voice-pipeline/` | STT → LLM → TTS two-lane Tokio graph. |
+| `crates/plugin-sdk/` | `plugin.toml` manifest parser + ZIP staging. |
+| `crates/plugin-host/` | Plugin registry + lifecycle (install / enable / disable / hydrate). |
+| `crates/script/` | Embedded Rhai engine + primitive bindings (HTTP, sidecar, vault, OAuth, WS, routing, JSON, time). |
+| `crates/container-manager/` | bollard client + tiered hardware detection. |
+| `crates/policy/` | Rule of Two, capability tokens, input guards, spotlighting. |
+| `crates/vault/` | OS-keyring master key + Argon2id admin password. |
+| `crates/transport-api/` | Trait a transport plugin implements. |
+| `crates/identity-api/` | Trait an identity-provider plugin implements. |
+| `crates/outbox/` | Outbox relay primitives (idempotency, retry, dead-letter). |
+| `crates/server/` | Axum HTTP + WebSocket surface, sidecar supervisor, admin/webhook routers, chat path. |
+| `crates/mcp-client/` | MCP server registration + tool dispatch (alternative to plugin tools). |
+| `crates/cli/` | `execlaw` binary (install, service, doctor, serve, replay, eval, …). |
+| `crates/eval-harness/` | LLM-judge harness against local Qwen. |
+| `plugins/` | In-tree reference + first-party plugins (signal, whatsapp, slack, sms-socket, google-*, pushover, hello, identity-local-address-book). |
+| `web/` | React + react-bootstrap SPA. Vite + Vitest. |
+| `scripts/` | `dev-server.sh` / `dev-server.ps1` — cargo-watch wrappers. |
+| `docs/` | Architecture + agent-model + plugins + screenshots. |
+| `evals/` | Rubric TOML files for the LLM-judge harness. |
+| `spec/` | OpenAPI + AsyncAPI specs. |
 
 ## License
 
