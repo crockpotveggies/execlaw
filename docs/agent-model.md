@@ -1,6 +1,6 @@
 # execlaw — Agent Model
 
-How a conversation in execlaw turns into model calls, tool calls, and durable state. This is the *how* doc — read [`architecture.md`](architecture.md) first for the system topology.
+How a conversation in execlaw turns into model calls, tool calls, and durable state. This is the *how* doc — read [`architecture.md`](architecture.md) first for the system topology, and [`plugins.md`](plugins.md) for the plugin-author reference.
 
 > **Status legend.** Each section is tagged with what's actually built today vs. designed but not yet wired:
 > - `[shipped]` — code is in `main` and exercised by tests.
@@ -517,6 +517,8 @@ The primary agent can spawn a background subagent (`delegate_task`, `research_*`
 
 **Capability shrinking:** the subagent's tool catalog is the parent's catalog *minus* `delegate_task` and any other tool the parent's policy says cannot be re-delegated. Subagents cannot fan out unboundedly.
 
+**Auto-bridge of agent text replies.** When a turn was triggered by an inbound transport message (Signal, WhatsApp, SMS, Slack, …) and the agent produced a `model_turn` text response without explicitly calling that channel's `send_message` tool, `bridge_text_reply_to_originating_transport` in `crates/server/src/chats.rs` looks up the conversation's transport bindings and dispatches the text through the originating transport's `<channel>.send_message` host tool. Idempotent against a double-call: if the agent already invoked the explicit transport tool in the same turn, the bridge backs off. This is the path that keeps inbound contacts on Signal / WhatsApp / SMS replied-to even when the model forgets to call the transport tool. `[shipped]`
+
 ---
 
 ## 11. Self-improvement in execlaw
@@ -544,7 +546,7 @@ Mapping the patterns from §6 of the project memory (proactive-agent / self-impr
 
 ---
 
-## 12. What's actually wired today (2026-05-07)
+## 12. What's actually wired today (2026-05-08)
 
 A precise read of the codebase, not a status report:
 
@@ -556,10 +558,14 @@ A precise read of the codebase, not a status report:
 - `read_memory` bumps `hits` and stamps `last_used_at` on the row that matched in the read-down cascade
 - `PromotionStore` with idempotent propose, approve flips target tier, reject leaves tier alone
 - `ReflectionStore` append + per-conversation list
-- Wakeup, routines, subagents (DeepResearchExecutor)
+- Wakeup, routines, subagents (DeepResearchExecutor) — the deep-research plan/gather/synthesize pipeline (C3–C6) plus retention and per-phase event flow
 - Outbox with idempotency keys, dedup, retry, dead-letter, alerts
 - Capability tokens, `config_tool_access` per trust class
 - Per-conversation runner containers, supervisor respawn
+- Auto-bridge of agent text replies via the originating transport when the agent forgets to call `<channel>.send_message` (`bridge_text_reply_to_originating_transport`, §10)
+- Group-awareness in agent classifier — the chat route detects when the conversation has multiple human participants and biases the should-dispatch decision toward silence unless the agent is explicitly addressed
+- Plugin transport surface mature: signal, whatsapp, slack, sms-socket all ship as full-loop transports with inbound (WS or webhook) and outbound (send/reply/typing/markread) wired through the auto-bridge
+- Webhook handlers for HTTP-third-party integrations (e.g. WhatsApp via wuzapi) use `host_route_inbound_spawn` so the HTTP ack returns in single-digit milliseconds — without this, third-party retry loops (wuzapi's 30 s default) cause the agent to run 3–5× per inbound and the user receives duplicate replies. The plugin layer also dedupes by upstream message ID as defense in depth.
 
 **Schema-ready, runner-side glue not yet in main:**
 - HOT slot injection in `assemble_system_prompt` — needs a call to `MemoryStore::list_hot` with byte cap

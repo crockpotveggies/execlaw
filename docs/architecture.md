@@ -6,7 +6,9 @@ Relationship to other docs:
 
 - [`MIGRATION_PLAN.md`](../MIGRATION_PLAN.md) is the design rationale, section-by-section, with research citations and trade-off discussion. Read it when you need to understand *why*.
 - This document is the *what*: the structure, the invariants, the flows. Read it when you need to understand *how things fit together*.
-- [`STATUS.md`](../STATUS.md) is the live progress log: what works today vs. what's scaffolded.
+- [`agent-model.md`](agent-model.md) is the *how* of one turn — TurnExecutor, memory layers, reflection loop, planner/executor split.
+- [`plugins.md`](plugins.md) is the plugin-author reference — manifest schema, runtime tiers, sidecar model, primitives, and a step-by-step guide for writing a custom plugin.
+- [`sidecar-supervisor-design.md`](sidecar-supervisor-design.md) deep-dives the supervised-container layer plugins compose against.
 
 ---
 
@@ -65,12 +67,14 @@ The rest of this document is these principles made concrete.
 │                    ┌───────────────────┼────────────────────┼──────────────┐ │
 │                    │                   ▼                    ▼              │ │
 │                    │  ┌────────────────────────┐  ┌───────────────────┐    │ │
-│                    │  │  runner-local (per     │  │ transport plugins │    │ │
-│                    │  │  active conversation)  │  │                   │    │ │
-│                    │  │                        │  │  plugin-signal    │    │ │
-│                    │  │  stateless, Ed25519    │  │  plugin-voice     │    │ │
-│                    │  │  capability token      │  │  plugin-webchat   │    │ │
-│                    │  └───────────┬────────────┘  │  plugin-email     │    │ │
+│                    │  │  runner-local (per     │  │ plugins (ZIP-     │    │ │
+│                    │  │  active conversation)  │  │ installed)        │    │ │
+│                    │  │                        │  │                   │    │ │
+│                    │  │  stateless, Ed25519    │  │  signal, whatsapp │    │ │
+│                    │  │  capability token      │  │  slack, sms-socket│    │ │
+│                    │  └───────────┬────────────┘  │  google-* trio    │    │ │
+│                    │              │               │  pushover, hello, │    │ │
+│                    │              │               │  identity-local…  │    │ │
 │                    │              │               └────────┬──────────┘    │ │
 │                    │              │ OpenAI API             │               │ │
 │                    │              ▼                        │               │ │
@@ -125,9 +129,9 @@ Thin Rust binary (`runner-local`). Speaks OpenAI-compatible API to whichever loc
 
 `service-vllm` (nvidia), `service-openarc` (Intel), `service-whisper`, `service-kokoro`, etc. Each serves an OpenAI-compatible or protocol-matched endpoint. Control plane calls them via `inference-api` client. These are the containers that carry the heavy vendor runtimes — keeping the control plane minimal (axiom #12).
 
-### 4.4 Transport plugins
+### 4.4 Plugins (ZIP-installed extensions)
 
-Signal, web chat, phone voice, email, Matrix. Each implements the `Transport` trait: receive inbound events and push them to the control plane's event log with stable `(plugin_id, source_event_id)` identifiers; drain outbox rows and deliver to the external surface.
+Plugins are how every non-core capability lights up — transports, third-party integrations, identity providers, OAuth-using HTTP bridges, sidecar-backed services. Operator uploads a ZIP via the SPA; the host parses `plugin.toml`, registers all declared hooks atomically, and from that moment the plugin's tools appear in the agent's catalog (subject to capability + trust gating). Two runtime tiers: **script** (Rhai source loaded into an embedded interpreter — the dominant tier; used by signal, whatsapp, slack, sms-socket, google-calendar, google-contacts, google-places, pushover) and **subprocess** (native binary, JSON-RPC over stdio — used by hello reference plugin and identity-local-address-book). Transport-class plugins additionally implement the conversation-routing contract: receive inbound events, push them to the event log with stable `(plugin_id, source_event_id)` identifiers, drain outbox rows, deliver to the external surface. Full reference in [`plugins.md`](plugins.md).
 
 ### 4.5 Outbox relay
 
@@ -137,7 +141,7 @@ A separate async task in the control plane, explicitly *not* invoked by the runn
 
 ## 5. Data model
 
-Full schema is in [`crates/core/migrations/0001_initial_schema.sql`](../crates/core/migrations/0001_initial_schema.sql) (22 tables). The load-bearing ones:
+Full schema is the union of every file in [`crates/core/migrations/`](../crates/core/migrations/) — initial schema in `0001_initial_schema.sql` plus 30+ incremental migrations as the system has grown (HMAC-tag column, plugin install table, eval flags, users + WebAuthn, principal groups, OAuth accounts, skills, transport bindings, search providers, memory lifecycle, …). The load-bearing tables:
 
 ### 5.1 `state_events` — the source of truth
 
@@ -261,14 +265,23 @@ CREATE TABLE memory_entries (
 - `state_alerts`, `state_incidents`, `state_alert_silences` — operational alerting (§10 of plan).
 - `state_attachments`, `state_artifacts` — blob references for inbound images and research PDFs.
 - `config_runner_deployments` — GPU + model + backend mapping per `RunnerPurpose`.
-- `config_trust_policy`, `config_alert_routing`, `config_research_quota`, `config_runtime_settings` — operator-editable settings.
-- `research_jobs` — background research sessions (§2.9.1 of plan).
+- `config_trust_policy`, `config_alert_routing`, `config_research_quota`, `config_runtime_settings`, `config_general` — operator-editable settings.
+- `config_tool_access` (migration 0009) — per-trust-class capability grants for tool dispatch.
+- `config_mcp_servers` (migration 0010) — operator-supplied MCP server registrations; tools surface dynamically alongside plugin tools.
+- `config_routines` — cron-shaped recurring tasks fired through the wakeup channel.
+- `research_jobs` (migration 0027) — background research sessions (§2.9.1 of plan).
 - `vault_secrets` — SQLCipher-encrypted secret store; references are opaque to plugins.
 - `log_entries` — SQLite half of the JSONL+SQLite dual log sink.
 - `transport_cursors` — per-transport resume point (what `source_event_id` was last processed).
-- `transport_conversations` (Phase 6 / migration 0005) — `(plugin_id, transport_handle, principal_id) → conversation_id` mapping that the `ConversationResolver` uses on inbound to decide whether a new message continues an existing thread or rotates to a new one. The Controller principal short-circuits: every controller message — across web, voice, Signal, email — collapses into one fixed `controller-thread` ConversationId so the SPA can render a single pinned **Control thread**.
-- `eval_flagged` — operator-tagged regression-target event ranges (Phase 5).
-- `state_plugins` — persisted plugin installs (Phase 2 migration 0003).
+- `transport_conversations` (migration 0006) — `(plugin_id, transport_handle, principal_id) → conversation_id` mapping that the `ConversationResolver` uses on inbound to decide whether a new message continues an existing thread or rotates to a new one. The Controller principal short-circuits: every controller message — across web, voice, Signal, WhatsApp, SMS, Slack, email — collapses into one fixed `controller-thread` ConversationId so the SPA can render a single pinned **Control thread**.
+- `transport_bindings` (migration 0032) — `(transport, foreign_id) → principal_id` map that drives auto-bridge transport selection (`bridge_text_reply_to_originating_transport`).
+- `principal_groups` (migration 0024) — `principal_group_id ↔ conversation_id` mapping; lets multi-channel principals share one conversation thread.
+- `eval_flagged` (migration 0004) — operator-tagged regression-target event ranges.
+- `state_plugins` (migration 0003) — persisted plugin installs; re-hydrated on every server boot.
+- `state_oauth_clients`, `state_oauth_tokens` (migration 0028) — OAuth client metadata + access/refresh tokens for plugins that declare `[[oauth_accounts]]`. Plugins never see refresh tokens or client secrets.
+- `users`, `state_webauthn_credentials`, `state_refresh_tokens` (migrations 0005/0007/0008) — operator account + auth state for the SPA.
+- `state_skills`, `state_skill_proposals`, `config_skills` (migrations 0029–0031) — operator-authored skill markdown registry; plugins ship skills via `[[skills]]` manifest entries.
+- `search_providers` (migration 0033) — pluggable search backend registrations for the research subsystem.
 
 ### 5.7 Threads, controller-thread merge, and incognito
 
@@ -776,10 +789,14 @@ For the reader who wants to jump into code:
 | [`crates/policy/src/spotlighting.rs`](../crates/policy/src/spotlighting.rs) | Per-conversation random delimiters |
 | [`crates/policy/src/sideband.rs`](../crates/policy/src/sideband.rs) | Sideband transport picker + `ApprovalVerb` |
 | [`crates/policy/src/input_guard.rs`](../crates/policy/src/input_guard.rs) | Zero-width / bidi / homoglyph strip |
-| [`crates/plugin-sdk/src/manifest.rs`](../crates/plugin-sdk/src/manifest.rs) | Hook-based manifest parser + `[runtime]` |
-| [`crates/plugin-host/src/host.rs`](../crates/plugin-host/src/host.rs) | `PluginHost` lifecycle (Phase 2) |
-| [`crates/plugin-host/src/hook_registry.rs`](../crates/plugin-host/src/hook_registry.rs) | Tool/transport/identity-provider lookup maps |
+| [`crates/plugin-sdk/src/manifest.rs`](../crates/plugin-sdk/src/manifest.rs) | Hook-based manifest parser. Source of truth for every section: `[plugin]`, `[runtime]`, `[[tools]]`, `[transport]`, `[identity_provider]`, `[[services]]` + `[services.sidecar]`, `[[admin_routes]]`, `[[webhook_routes]]`, `[[oauth_accounts]]`, `[[ui_panels]]`, `[[skills]]`, `[[health_checks]]`, `[[event_subscriptions]]`, `[[alert_sources]]`. |
+| [`crates/plugin-host/src/host.rs`](../crates/plugin-host/src/host.rs) | `PluginHost` install/upgrade/enable/disable/hydrate lifecycle |
+| [`crates/plugin-host/src/hook_registry.rs`](../crates/plugin-host/src/hook_registry.rs) | Tool / transport / identity-provider / admin-route / webhook-route lookup maps |
 | [`crates/plugin-host/src/subprocess.rs`](../crates/plugin-host/src/subprocess.rs) | Subprocess plugin tier (JSON-RPC over stdio) |
+| [`crates/script/src/primitives.rs`](../crates/script/src/primitives.rs) | Rhai script-tier primitive registration: HTTP, sidecar, vault, OAuth, WS, `host_route_inbound` / `host_route_inbound_spawn`, JSON, time, logging |
+| [`crates/server/src/sidecar_supervisor.rs`](../crates/server/src/sidecar_supervisor.rs) | Supervised-container reconcile loop, health probe, crash-loop guard. See [`docs/sidecar-supervisor-design.md`](sidecar-supervisor-design.md). |
+| [`crates/server/src/plugin_admin_routes.rs`](../crates/server/src/plugin_admin_routes.rs) | Authenticated dispatcher at `/api/admin/plugins/{plugin_id}{path}` |
+| [`crates/server/src/plugin_webhook_routes.rs`](../crates/server/src/plugin_webhook_routes.rs) | Unauthenticated dispatcher at `/api/webhooks/{plugin_id}{path}`; supports both `application/json` and `application/x-www-form-urlencoded` bodies |
 | [`crates/container-manager/src/hardware.rs`](../crates/container-manager/src/hardware.rs) | Tier-1 sysfs GPU detection |
 | [`crates/server/src/routes.rs`](../crates/server/src/routes.rs) | REST surface (auth, OpenAPI) |
 | [`crates/server/src/chats.rs`](../crates/server/src/chats.rs) | Chat surface — policy + capability + cold-contact + streaming |
@@ -788,7 +805,9 @@ For the reader who wants to jump into code:
 | [`crates/server/src/tool_dispatch.rs`](../crates/server/src/tool_dispatch.rs) | `ChainedToolDispatch` — built-ins → plugins with capability check |
 | [`crates/server/src/capability.rs`](../crates/server/src/capability.rs) | Per-turn capability token issue + verify |
 | [`crates/runner-local/src/turn.rs`](../crates/runner-local/src/turn.rs) | TurnExecutor — full tool-loop turn path |
-| [`crates/runner-local/src/memory_tool.rs`](../crates/runner-local/src/memory_tool.rs) | `read_memory` / `write_memory` with trust-class scoping |
+| [`crates/core/src/builtin_tools.rs`](../crates/core/src/builtin_tools.rs) | Built-in tool implementations including `read_memory` / `write_memory` / `list_memory` |
+| [`crates/core/src/tool_apis.rs`](../crates/core/src/tool_apis.rs) | `DbMemoryApi` — trust-class read-down cascade enforced at the storage shim |
+| [`crates/core/src/memory_lifecycle.rs`](../crates/core/src/memory_lifecycle.rs) | `PromotionStore` + `ReflectionStore` (memory hot/warm/cold lifecycle) |
 | [`crates/inference-api/src/lib.rs`](../crates/inference-api/src/lib.rs) | OpenAI-compatible client + streaming SSE |
 | [`crates/voice-pipeline/src/graph.rs`](../crates/voice-pipeline/src/graph.rs) | Two-lane Tokio graph (system lane preempts data lane) |
 | [`crates/voice-pipeline/src/traits.rs`](../crates/voice-pipeline/src/traits.rs) | `AudioIn`/`AudioOut`/`Vad`/`SttClient`/`TtsClient` + mocks |
@@ -797,7 +816,9 @@ For the reader who wants to jump into code:
 | [`crates/voice-pipeline/src/bargein.rs`](../crates/voice-pipeline/src/bargein.rs) | Barge-in / backchannel-rescind decision |
 | [`spec/asyncapi.yaml`](../spec/asyncapi.yaml) | WebSocket event vocabulary |
 | [`plugins/hello/`](../plugins/hello/) | In-tree reference subprocess plugin |
-| [`docs/plugin-inventory.md`](./plugin-inventory.md) | Phase 8 port queue |
+| [`plugins/signal/`, `plugins/whatsapp/`, `plugins/slack/`, `plugins/sms-socket/`](../plugins/) | Transport plugins — sidecar / webhook / WS variants |
+| [`plugins/google-calendar/`, `plugins/google-contacts/`, `plugins/google-places/`](../plugins/) | OAuth + API-key reference HTTP plugins |
+| [`docs/plugins.md`](plugins.md) | Plugin-author reference: when to use plugins vs MCP, manifest schema, sidecar model, primitives, walkthroughs |
 | [`crates/core/src/eval.rs`](../crates/core/src/eval.rs) | `EvalFlaggedStore` for regression-target event ranges (Phase 5) |
 | [`crates/server/src/observability.rs`](../crates/server/src/observability.rs) | `GET /api/admin/logs` + `GET /api/admin/eval/flags` (Phase 5) |
 | [`crates/server/src/tracing_layer.rs`](../crates/server/src/tracing_layer.rs) | `SqliteLogLayer` — mirrors tracing events into `log_entries` (Phase 5) |
@@ -823,7 +844,7 @@ These are *not* oversights — they are chosen constraints:
 
 ## 18. What's built vs. what's next
 
-Per [`STATUS.md`](../STATUS.md) as of 2026-04-24.
+Last refreshed: 2026-05-08. The phase tags below reflect implementation milestones; for the live-progress feed, look at `git log` on `foundation` and the per-plugin manifests under `plugins/`.
 
 **Phase 0 — Foundation + local inference + GPU-aware deployment.** Complete.
 
@@ -835,13 +856,17 @@ Per [`STATUS.md`](../STATUS.md) as of 2026-04-24.
 - Streaming SSE (`chat_completions_stream`) + `ChatTokenDelta` on the WS bus
 - Crash-safety tests (kill mid-turn, replay-after-restart, post-commit tamper)
 
-**Phase 2 — Plugin framework.** Complete (ports moved to Phase 8).
+**Phase 2 — Plugin framework.** Complete and exercised in production by 10 in-tree plugins.
 - `PluginHost` lifecycle (install/enable/disable/uninstall/hydrate) with SQLite persistence via migration 0003
 - `POST /api/admin/plugins/install` + list / enable / disable / uninstall / tools routes
-- Manifest `[runtime]` table for subprocess-tier entrypoint declaration
-- Capability-enforced `ChainedToolDispatch` — built-ins → plugins → error
-- In-tree reference plugin at `plugins/hello/`
-- Tool-capable chat path that lights up when tools are registered
+- Manifest schema: `[plugin]`, `[runtime]` (script + subprocess tiers), `[[tools]]` (with `host_internal`, `trust_floor`, `latency`), `[transport]`, `[identity_provider]`, `[[services]]` + `[services.sidecar]`, `[[admin_routes]]`, `[[webhook_routes]]` (unauthenticated, plugin validates), `[[oauth_accounts]]`, `[[ui_panels]]`, `[[skills]]`, `[[health_checks]]`, `[[event_subscriptions]]`, `[[alert_sources]]`
+- Capability-enforced `ChainedToolDispatch` — built-ins → plugins → MCP → error
+- Script-tier engine (`crates/script/src/`) — embedded Rhai with primitives for HTTP, sidecar HTTP (SSRF-aware), WebSocket subscribe / bidi, vault, OAuth-token injection, JSON, time (incl. `parse_rfc3339_ms`), routing (`host_route_inbound` synchronous + `host_route_inbound_spawn` fire-and-forget for HTTP-webhook handlers)
+- Subprocess-tier engine — JSON-RPC over stdio; reference at `plugins/hello/`
+- Authenticated admin router at `/api/admin/plugins/{id}/...`; unauthenticated webhook router at `/api/webhooks/{id}/...` accepting both `application/json` and `application/x-www-form-urlencoded` bodies
+- Sidecar supervisor (`crates/server/src/sidecar_supervisor.rs`) with 5 s reconcile, health probes, crash-loop guard, stable per-`(plugin_id, sidecar_name)` host port allocation
+- Shipped plugins: `signal` (Signal-Messenger transport, supervised `signal-cli` sidecar), `whatsapp` (WhatsApp transport, supervised `wuzapi` sidecar, webhook inbound, `markread` read receipts), `slack` (multi-workspace OAuth transport), `sms-socket` (Android-gateway WS transport), `google-calendar` / `google-contacts` / `google-places` (OAuth or API-key HTTP integrations; `google-contacts` is also an identity provider), `pushover` (one-way notifier), `hello` (subprocess reference), `identity-local-address-book` (subprocess identity provider)
+- Plugin-author reference: [`docs/plugins.md`](plugins.md)
 
 **Phase 3 — Participants, trust, policy engine, Rule of Two.** Complete.
 - `PrincipalStore` persists the full rich `TrustLevel` variant via JSON
@@ -859,10 +884,11 @@ Per [`STATUS.md`](../STATUS.md) as of 2026-04-24.
 - **Planner/executor containment** — when `policy.planner_executor` is true (effective_trust < KnownTrusted), the tool-capable chat path is disabled. A prompt-injected executor can't exfiltrate via tool_use args because there are no tool_use slots. Full placeholder-passing choreography lands as a later refinement.
 - Trust-class-scoped memory reads (from Phase 1)
 
-**Phase 3 deferrals** (land in Phase 6 / Phase 8):
+**Phase 3 deferrals**:
 - `config_trust_policy` UI-editable defaults: SQLite table exists; UI surfacing lands with Phase 6.
-- Cross-transport sideband delivery (controller approves via Signal): waits on `plugin-signal` in Phase 8.
+- Cross-transport sideband delivery is wired now that signal/whatsapp/slack/sms-socket transports ship; remaining work is the controller-pick-transport policy table.
 - Rule-of-Two breach approval flow for non-cold-contact (currently 202 awaiting_approval; the ApprovalVerb::Approve / Edit / Reject path lands when there's a sensitive-tool-call to gate).
+- Group-awareness in agent classifier: shipped — agent now knows when it's in a group and is biased toward silence.
 
 **Phase 4 — Voice pipeline primitives.** Complete (internal, with mocks).
 - `traits.rs`: `AudioIn` / `AudioOut` / `Vad` / `SttClient` / `TtsClient` — the full contract between the pipeline and stage backends, plus `MockAudioIn` / `MockAudioOut` / `MockVad` / `MockStt` / `MockTts` for deterministic testing.
@@ -897,7 +923,12 @@ Per [`STATUS.md`](../STATUS.md) as of 2026-04-24.
 - Eval-flag dashboard
 - Trace viewer embedded in the chat UI
 
-**Phase 6 — UI port (chat-first SPA + Tauri Desktop).** Pending.
+**Phase 6 — UI port (chat-first SPA + Tauri Desktop).** In progress (sub-phases 6a–6c partially landed; 6d Tauri pending).
+- Chat-first SPA scaffolding under `web/` is live: pinned Control thread, thread list, inbound messages from external transports collapse into the controller thread per the `ConversationResolver` rule, OpenAI-style streaming token render.
+- Settings → Plugins page drives install / enable / disable / uninstall + per-plugin admin panels (each plugin's `[[ui_panels]]` mounts a SPA route).
+- Research subsystem (C3–C6) shipped: deep-research plan/gather/synthesize pipeline, retention policy, `/research` page, every-phase event flow.
+- Approval queue infrastructure: cold-contact alerts, sensitive-tool approvals, OAuth-grant proposals all flow through one SPA dropdown.
+- Pending: Tauri Desktop wrapper (6d), full incognito-thread UI polish, voice UI (lands with Phase 8 audio plugins).
 
 Stack (locked in 2026-04-25):
 - **React Native** + **react-native-web** as the cross-platform component layer.
