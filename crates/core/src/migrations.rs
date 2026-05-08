@@ -298,6 +298,46 @@ impl<'a> MigrationRunner<'a> {
         Ok(applied)
     }
 
+    /// Recompute and overwrite the stored checksum for an
+    /// already-applied migration to match the current SQL on disk.
+    ///
+    /// Use case: `core.autocrlf` (or any other byte-level edit that
+    /// doesn't change the SQL semantics — whitespace touch-ups, a
+    /// trailing newline added) flips the file's checksum and the
+    /// runner refuses to continue with `ChecksumMismatch`. This
+    /// command lets the operator confirm "yes, the SQL is the same
+    /// to me" and patch the row, without forcing a destructive DB
+    /// reset.
+    ///
+    /// Returns:
+    ///   * `Ok(true)`  if the row was patched (or already matched).
+    ///   * `Ok(false)` if no row for `id` exists in `schema_version`
+    ///     yet — caller should run `apply_all` first.
+    ///   * `Err(...)`  if `id` isn't in the embedded migration list.
+    ///
+    /// This does NOT re-run the SQL. The columns/tables the
+    /// migration created stay as they are; only the checksum row
+    /// changes. If the SQL has actually diverged in semantically
+    /// meaningful ways (a column was renamed, a table dropped),
+    /// this is the wrong tool — write a follow-up migration instead.
+    pub fn repair_checksum(&self, id: u32) -> Result<bool, MigrationError> {
+        let migration = MIGRATIONS
+            .iter()
+            .find(|m| m.id == id)
+            .ok_or_else(|| MigrationError::Db(DbError::Migration(format!(
+                "no embedded migration with id {id}"
+            ))))?;
+        let new_checksum = simple_checksum(migration.sql);
+        let updated: usize = self.db.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE schema_version SET checksum = ?1 WHERE id = ?2",
+                params![new_checksum, id],
+            )?;
+            Ok(n)
+        })?;
+        Ok(updated > 0)
+    }
+
     /// How many migrations have been applied.
     pub fn applied_count(&self) -> Result<u32, MigrationError> {
         let n: i64 = self.db.with_conn(|c| {
@@ -316,10 +356,20 @@ impl<'a> MigrationRunner<'a> {
 
 /// Very-not-cryptographic checksum used only to detect in-place edits of an
 /// already-applied migration file. sha256 would be overkill; we want `std`-only.
+///
+/// Line endings are normalized to `\n` before hashing. Without this, a
+/// migration authored on Windows with CRLF endings produces a different
+/// checksum than the same file after `core.autocrlf` round-trips through
+/// git — and the runner refuses to continue with a "checksum mismatch"
+/// at the next boot, even though the SQL is byte-equivalent semantically.
+/// Every other migration in this repo is committed as LF; normalising
+/// here makes the runner tolerant of contributors whose checkouts ended
+/// up CRLF anyway.
 fn simple_checksum(sql: &str) -> String {
     use std::hash::{Hash, Hasher};
+    let normalized: String = sql.replace("\r\n", "\n").replace('\r', "\n");
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    sql.hash(&mut h);
+    normalized.hash(&mut h);
     format!("{:016x}", h.finish())
 }
 
@@ -737,6 +787,93 @@ mod tests {
         assert_eq!(lookup["VoiceSTT"].as_deref(), Some("GPU-abc-12345"));
         // Already-clean ordinal is left untouched.
         assert_eq!(lookup["VoiceTTS"].as_deref(), Some("0"));
+    }
+
+    /// Regression: a migration file edited from LF to CRLF (e.g. by
+    /// `core.autocrlf=true` on a Windows checkout) must hash to the
+    /// same checksum as the LF version — otherwise every Windows
+    /// contributor whose git config flips line endings would trip
+    /// the "already applied with a different checksum" guard on the
+    /// next boot, even though the SQL is byte-equivalent.
+    /// Operator escape hatch for the CRLF-vs-LF saga: after a file's
+    /// checksum drifts (semantic SQL unchanged), `repair_checksum`
+    /// writes the recomputed value over the stored row without
+    /// re-running the migration body. The columns/tables the
+    /// migration created stay put.
+    #[test]
+    fn repair_checksum_overwrites_stored_value_without_reapplying() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        let runner = MigrationRunner::new(&db);
+        runner.apply_all().unwrap();
+        // Corrupt the stored checksum for migration 35.
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE schema_version SET checksum = 'deadbeef' WHERE id = 35",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        // A second apply_all must now refuse to continue.
+        match runner.apply_all() {
+            Err(MigrationError::ChecksumMismatch(35)) => {}
+            other => panic!("expected ChecksumMismatch(35), got {other:?}"),
+        }
+        // Repair fixes it; subsequent apply_all is a no-op.
+        let patched = runner.repair_checksum(35).unwrap();
+        assert!(patched, "row for id 35 must exist post-apply_all");
+        let next = runner.apply_all().unwrap();
+        assert!(next.is_empty(), "no migrations should re-apply after repair");
+    }
+
+    #[test]
+    fn repair_checksum_returns_false_when_id_not_yet_applied() {
+        // Calling repair on a migration that's never been applied
+        // is a no-op — there's nothing in schema_version to patch.
+        // Return false rather than error so a generic "repair all"
+        // script can iterate without special-casing fresh DBs.
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        let runner = MigrationRunner::new(&db);
+        // Don't apply migrations — schema_version doesn't even exist
+        // yet. Create just the table so the UPDATE has something to
+        // run against.
+        db.with_conn(|c| {
+            c.execute_batch(
+                "CREATE TABLE schema_version (\
+                    id INTEGER PRIMARY KEY, name TEXT NOT NULL, \
+                    checksum TEXT NOT NULL, applied_at INTEGER NOT NULL\
+                 );",
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let patched = runner.repair_checksum(35).unwrap();
+        assert!(!patched);
+    }
+
+    #[test]
+    fn repair_checksum_unknown_id_errors() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        let runner = MigrationRunner::new(&db);
+        runner.apply_all().unwrap();
+        let err = runner.repair_checksum(9999).unwrap_err();
+        match err {
+            MigrationError::Db(DbError::Migration(msg)) => {
+                assert!(msg.contains("9999"), "msg: {msg}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn checksum_is_line_ending_tolerant() {
+        let lf = "ALTER TABLE foo ADD COLUMN bar TEXT;\nUPDATE foo SET bar = 'x';\n";
+        let crlf = "ALTER TABLE foo ADD COLUMN bar TEXT;\r\nUPDATE foo SET bar = 'x';\r\n";
+        let cr_only = "ALTER TABLE foo ADD COLUMN bar TEXT;\rUPDATE foo SET bar = 'x';\r";
+        assert_eq!(simple_checksum(lf), simple_checksum(crlf));
+        assert_eq!(simple_checksum(lf), simple_checksum(cr_only));
     }
 
     #[test]

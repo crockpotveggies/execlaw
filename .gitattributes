@@ -1,0 +1,20 @@
+# Force LF for files whose contents go through `include_str!` or are
+# otherwise checksummed. Without this, a Windows checkout with
+# `core.autocrlf=true` produces CRLF on disk, which changes the
+# embedded bytes — and for migrations that's caught by the runner's
+# checksum guard at boot:
+#
+#   error: migration id N already applied but with a different checksum
+#
+# Migration files are the canonical case; we also pin Rust + SQL +
+# Markdown + JSON because they're the file types most likely to be
+# loaded as bytes for hashing or signature verification.
+*.sql      text eol=lf
+*.rs       text eol=lf
+*.md       text eol=lf
+*.json     text eol=lf
+*.toml     text eol=lf
+*.yaml     text eol=lf
+*.yml      text eol=lf
+*.sh       text eol=lf
+Dockerfile* text eol=lf

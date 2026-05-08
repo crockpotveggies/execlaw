@@ -244,6 +244,21 @@ enum DbOp {
         #[arg(long, default_value_t = false)]
         no_encrypt: bool,
     },
+    /// Re-stamp the stored checksum for an already-applied migration
+    /// to match the embedded SQL. Use ONLY when the runner refuses
+    /// with "migration id N already applied but with a different
+    /// checksum" because of a benign byte-level edit (line endings,
+    /// whitespace). Does not re-run the migration body — columns and
+    /// tables stay put.
+    RepairChecksum {
+        /// Migration id to repair (e.g. `35`).
+        #[arg(long)]
+        id: u32,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        no_encrypt: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -724,6 +739,24 @@ fn cmd_db_status(db_path: PathBuf, no_encrypt: bool) -> anyhow::Result<()> {
     let db = open_db(&db_path, no_encrypt)?;
     let count = execlaw_core::MigrationRunner::new(&db).applied_count()?;
     println!("applied migrations: {count}");
+    Ok(())
+}
+
+fn cmd_db_repair_checksum(id: u32, db_path: PathBuf, no_encrypt: bool) -> anyhow::Result<()> {
+    let db = open_db(&db_path, no_encrypt)?;
+    let runner = execlaw_core::MigrationRunner::new(&db);
+    let patched = runner.repair_checksum(id)?;
+    if patched {
+        println!(
+            "repaired stored checksum for migration id {id} \
+             to match embedded SQL on disk"
+        );
+    } else {
+        println!(
+            "no schema_version row for migration id {id}; nothing to repair \
+             (run `execlaw db migrate` first if this is a fresh DB)"
+        );
+    }
     Ok(())
 }
 
@@ -2039,6 +2072,9 @@ fn main() -> ExitCode {
             }
             DbOp::Status { db, no_encrypt } => {
                 cmd_db_status(db.unwrap_or_else(default_db_path), no_encrypt)
+            }
+            DbOp::RepairChecksum { id, db, no_encrypt } => {
+                cmd_db_repair_checksum(id, db.unwrap_or_else(default_db_path), no_encrypt)
             }
         },
         Command::Hw { op } => match op {
