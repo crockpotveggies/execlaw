@@ -763,11 +763,27 @@ fn register_host_cap_bindings(
                         if let Ok(mut slot) = handle_cell.write() {
                             *slot = Some(h.clone());
                         }
-                        // Also publish to the per-plugin "active
-                        // handle" slot so tool calls can reach this
-                        // socket via ws_send_to_active without
-                        // touching the per-call engine scope.
+                        // Publish to the per-plugin "active handle"
+                        // slot so tool calls can reach this socket
+                        // via ws_send_to_active. CRITICAL: close the
+                        // previous active handle first — otherwise a
+                        // re-subscribe (e.g. credential rotation,
+                        // disable→enable cycle) leaks the old
+                        // consumer task, which keeps reconnecting
+                        // and routing inbound frames in parallel
+                        // with the new subscription. That manifests
+                        // as duplicate inbound dispatches +
+                        // UNIQUE-constraint violations on
+                        // state_events.(conversation_id, seq).
                         if let Ok(mut slot) = active_slot.write() {
+                            if let Some(prev) = slot.take() {
+                                tracing::debug!(
+                                    target: "execlaw_script::primitives",
+                                    plugin_id = %pid,
+                                    "ws_subscribe_bidi: closing previous active subscription"
+                                );
+                                prev.close();
+                            }
                             *slot = Some(h.clone());
                         }
                         Ok(Dynamic::from(h))
@@ -859,7 +875,19 @@ fn register_host_cap_bindings(
                         if let Ok(mut slot) = handle_cell.write() {
                             *slot = Some(h.clone());
                         }
+                        // Same close-previous-on-replace contract
+                        // as the 2-arg overload above. See that
+                        // block's comment for the leak/duplicate-
+                        // dispatch rationale.
                         if let Ok(mut slot) = active_slot.write() {
+                            if let Some(prev) = slot.take() {
+                                tracing::debug!(
+                                    target: "execlaw_script::primitives",
+                                    plugin_id = %pid,
+                                    "ws_subscribe_bidi: closing previous active subscription"
+                                );
+                                prev.close();
+                            }
                             *slot = Some(h.clone());
                         }
                         Ok(Dynamic::from(h))
