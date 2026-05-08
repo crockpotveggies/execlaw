@@ -31,6 +31,7 @@ import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
 import { GoogleCalendarPage } from "./GoogleCalendarPage";
 import { GoogleContactsPage } from "./GoogleContactsPage";
+import { GooglePlacesConfigPage } from "./GooglePlacesConfigPage";
 import type { PluginConfigComponent } from "./PluginConfigBase";
 import { PushoverConfigPage } from "./PushoverConfigPage";
 import { SignalConfigPage } from "./SignalConfigPage";
@@ -44,6 +45,7 @@ const KNOWN_CONFIGS: Record<string, PluginConfigComponent> = {
     // remove the danger zone or back button.
     "google-contacts": GoogleContactsPage,
     "google-calendar": GoogleCalendarPage,
+    "google-places": GooglePlacesConfigPage,
     pushover: PushoverConfigPage,
     signal: SignalConfigPage,
     slack: SlackConfigPage,

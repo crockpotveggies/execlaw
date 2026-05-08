@@ -156,6 +156,30 @@ pub(crate) fn register(
         );
     }
 
+    // 4-arg overload: http_get(url, query, bearer, headers_map)
+    //
+    // Custom headers applied after the Bearer line, so plugins can
+    // either supplement (X-Goog-FieldMask alongside Authorization)
+    // or override (pass bearer="" and a custom Authorization header
+    // in the map for non-Bearer auth schemes — Google Maps APIs use
+    // `X-Goog-Api-Key`).
+    {
+        let agent = http_agent.clone();
+        let pid = plugin_id.to_owned();
+        engine.register_fn(
+            "http_get",
+            move |url: ImmutableString,
+                  query: Map,
+                  bearer: ImmutableString,
+                  headers: Map|
+                  -> Result<Dynamic, Box<EvalAltResult>> {
+                http_get_impl_with_headers(
+                    &agent, &pid, &url, &query, &bearer, Some(&headers), allow_loopback,
+                )
+            },
+        );
+    }
+
     // http_post(url, body_map_or_value, bearer) -> map | array | null
     {
         let agent = http_agent.clone();
@@ -167,6 +191,24 @@ pub(crate) fn register(
                   bearer: ImmutableString|
                   -> Result<Dynamic, Box<EvalAltResult>> {
                 http_post_impl(&agent, &pid, &url, body, &bearer, allow_loopback)
+            },
+        );
+    }
+
+    // 4-arg overload: http_post(url, body, bearer, headers_map)
+    {
+        let agent = http_agent.clone();
+        let pid = plugin_id.to_owned();
+        engine.register_fn(
+            "http_post",
+            move |url: ImmutableString,
+                  body: Dynamic,
+                  bearer: ImmutableString,
+                  headers: Map|
+                  -> Result<Dynamic, Box<EvalAltResult>> {
+                http_post_impl_with_headers(
+                    &agent, &pid, &url, body, &bearer, Some(&headers), allow_loopback,
+                )
             },
         );
     }
@@ -313,6 +355,19 @@ pub(crate) fn register(
         match s.parse::<i64>() {
             Ok(n) => Dynamic::from(n),
             Err(_) => Dynamic::UNIT,
+        }
+    });
+    // Companion to `host_parse_int` for decimal values — agents
+    // typically pass lat/lng / ratings / radius as either a JSON
+    // number (already an f64) or a JSON string (the LLM serialiser
+    // sometimes does this for "safety"). Rhai's stdlib doesn't
+    // register a string-to-float either, so we expose our own.
+    //
+    // Returns `f64` on success, `()` (Unit) on parse failure.
+    engine.register_fn("host_parse_float", |s: ImmutableString| -> Dynamic {
+        match s.parse::<f64>() {
+            Ok(n) if n.is_finite() => Dynamic::from(n),
+            _ => Dynamic::UNIT,
         }
     });
 
@@ -1962,6 +2017,25 @@ fn http_get_impl(
     bearer: &str,
     allow_loopback: bool,
 ) -> Result<Dynamic, Box<EvalAltResult>> {
+    http_get_impl_with_headers(agent, plugin_id, url, query, bearer, None, allow_loopback)
+}
+
+/// Full-surface http_get used by the 4-arg `http_get(url, query,
+/// bearer, headers)` Rhai binding. Headers are applied AFTER the
+/// Authorization line, so a plugin can override the Bearer header
+/// (or omit it entirely by passing `bearer=""` and providing its
+/// own Authorization in `headers`). This is required for APIs that
+/// authenticate via a non-Bearer header — Google Maps APIs use
+/// `X-Goog-Api-Key`, for instance.
+fn http_get_impl_with_headers(
+    agent: &ureq::Agent,
+    plugin_id: &str,
+    url: &str,
+    query: &Map,
+    bearer: &str,
+    headers: Option<&Map>,
+    allow_loopback: bool,
+) -> Result<Dynamic, Box<EvalAltResult>> {
     validate_url(plugin_id, "http_get", url, allow_loopback)?;
     let mut req = agent.get(url);
     for (k, v) in map_to_query_iter(query) {
@@ -1969,6 +2043,9 @@ fn http_get_impl(
     }
     if !bearer.is_empty() {
         req = req.set("Authorization", &format!("Bearer {bearer}"));
+    }
+    if let Some(h) = headers {
+        req = apply_headers(req, h);
     }
     let resp = req
         .call()
@@ -1984,12 +2061,30 @@ fn http_post_impl(
     bearer: &str,
     allow_loopback: bool,
 ) -> Result<Dynamic, Box<EvalAltResult>> {
+    http_post_impl_with_headers(agent, plugin_id, url, body, bearer, None, allow_loopback)
+}
+
+/// Full-surface http_post used by the 4-arg `http_post(url, body,
+/// bearer, headers)` Rhai binding. See `http_get_impl_with_headers`
+/// for the headers/Bearer interaction rationale.
+fn http_post_impl_with_headers(
+    agent: &ureq::Agent,
+    plugin_id: &str,
+    url: &str,
+    body: Dynamic,
+    bearer: &str,
+    headers: Option<&Map>,
+    allow_loopback: bool,
+) -> Result<Dynamic, Box<EvalAltResult>> {
     validate_url(plugin_id, "http_post", url, allow_loopback)?;
     let body_json = rhai_to_json(body)
         .map_err(|e| EvalAltResult::ErrorRuntime(e.into(), rhai::Position::NONE))?;
     let mut req = agent.post(url);
     if !bearer.is_empty() {
         req = req.set("Authorization", &format!("Bearer {bearer}"));
+    }
+    if let Some(h) = headers {
+        req = apply_headers(req, h);
     }
     let resp = req
         .send_json(body_json)

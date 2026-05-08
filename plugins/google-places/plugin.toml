@@ -1,0 +1,86 @@
+[plugin]
+id = "google-places"
+name = "Google Places"
+version = "0.1.0"
+description = "Google Places (New) API tools. Exposes text search, nearby search, and place details so the agent can find restaurants, businesses, points of interest, and addresses. API-key only — no OAuth. The plugin calls https://places.googleapis.com via the host's `http_post` / `http_get` bindings using `X-Goog-Api-Key` header auth."
+author = "execlaw"
+license = "AGPL-3.0-or-later"
+
+# No sidecar. Plain REST against the public Google Places API.
+# The 4-arg http_get / http_post Rhai overloads supply the
+# `X-Goog-Api-Key` and `X-Goog-FieldMask` headers Google requires.
+
+# ===== Agent-callable tools =====================================
+[[tools]]
+name = "google_places.search"
+description = """Search for restaurants, businesses, addresses, and \
+points of interest using Google Places text search. Best for \
+natural-language queries like "coffee near Gastown" or "good ramen \
+in Vancouver". Returns a list of place summaries including name, \
+address, rating, price level, types, hours (pro tier), website, \
+and phone (pro tier). Args: { query: string (required, natural \
+language), max_results?: int (1-20, default 5), min_rating?: \
+number (0-5, client-side filter), open_now?: bool (only places \
+open right now), type?: string (Google place type like \
+"restaurant" / "cafe" / "lodging") }."""
+schema = "schemas/google_places.search.json"
+trust_floor = "Controller"
+latency = "medium"
+
+[[tools]]
+name = "google_places.nearby"
+description = """Find places near a specific lat/lng within a \
+radius using Google Places nearby search. Best for "what's around \
+me" queries when the agent has a known coordinate (e.g. from a \
+controller's check-in or a place-details call). Args: { latitude: \
+number (required), longitude: number (required), radius: number \
+(required, meters, max 50000), type?: string (Google place type), \
+max_results?: int (1-20, default 10), min_rating?: number (0-5) \
+}."""
+schema = "schemas/google_places.nearby.json"
+trust_floor = "Controller"
+latency = "medium"
+
+[[tools]]
+name = "google_places.details"
+description = """Fetch full details for a Google Place by place_id, \
+including current open/closed status, full hours, editorial \
+summary, and recent reviews. Use this AFTER a search/nearby call \
+to drill into a specific result. Args: { place_id: string \
+(required, returned in search/nearby results as `place_id`) }."""
+schema = "schemas/google_places.details.json"
+trust_floor = "Controller"
+latency = "medium"
+
+# ===== Admin routes =============================================
+[[admin_routes]]
+method = "GET"
+path = "/status"
+handler = "admin_status"
+description = "Return whether the API key is configured + last validation result."
+
+[[admin_routes]]
+method = "GET"
+path = "/config"
+handler = "admin_get_config"
+description = "Return the masked api_key + cost_tier + default_max_results."
+
+[[admin_routes]]
+method = "POST"
+path = "/config"
+handler = "admin_set_config"
+description = "Persist the operator-supplied api_key + cost_tier + default_max_results. Validates the key by issuing a 1-result `coffee` search before saving."
+
+[[admin_routes]]
+method = "POST"
+path = "/test"
+handler = "admin_test"
+description = "Issue a sample text search so the operator can confirm wiring end-to-end."
+
+[[ui_panels]]
+mount = "admin/plugins/google-places"
+entry = "ui/panel.js"
+
+[runtime]
+tier = "script"
+source = "main.rhai"

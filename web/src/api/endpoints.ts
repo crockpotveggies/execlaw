@@ -2372,6 +2372,91 @@ export async function testPushoverNotification(
     );
 }
 
+// ---- /api/admin/plugins/google-places/* ---------------------------
+//
+// Google Places plugin admin endpoints. The plugin holds an
+// api_key + cost_tier ("essentials" | "pro") + default_max_results
+// (1-20). No OAuth, no sidecar — the plugin hits Google's REST
+// API directly with `X-Goog-Api-Key` header auth via the host's
+// 4-arg http_post / http_get bindings.
+
+export interface GooglePlacesConfigResponse {
+    api_key_set: boolean;
+    api_key_masked: string;
+    cost_tier: string;
+    default_max_results: number;
+    validated_at: string;
+    validation_error: string;
+}
+
+export interface GooglePlacesStatusResponse {
+    state: string;
+    configured: boolean;
+    cost_tier: string;
+    default_max_results: number;
+    validated_at: string;
+    validation_error: string;
+}
+
+export async function getGooglePlacesConfig(
+    tokenAccessor: () => string | null,
+): Promise<GooglePlacesConfigResponse> {
+    return apiFetch<GooglePlacesConfigResponse>(
+        "/api/admin/plugins/google-places/config",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function setGooglePlacesConfig(
+    api_key: string,
+    cost_tier: string,
+    default_max_results: number | null,
+    tokenAccessor: () => string | null,
+): Promise<{ ok: boolean }> {
+    return apiFetch<{ ok: boolean }>(
+        "/api/admin/plugins/google-places/config",
+        {
+            method: "POST",
+            body: {
+                api_key,
+                cost_tier,
+                default_max_results: default_max_results ?? "",
+            },
+        },
+        tokenAccessor,
+    );
+}
+
+export async function getGooglePlacesStatus(
+    tokenAccessor: () => string | null,
+): Promise<GooglePlacesStatusResponse> {
+    return apiFetch<GooglePlacesStatusResponse>(
+        "/api/admin/plugins/google-places/status",
+        {},
+        tokenAccessor,
+    );
+}
+
+export interface GooglePlacesTestResponse {
+    ok?: boolean;
+    query?: string;
+    returned_count?: number;
+    first_result_name?: string;
+    error?: string;
+}
+
+export async function testGooglePlaces(
+    query: string,
+    tokenAccessor: () => string | null,
+): Promise<GooglePlacesTestResponse> {
+    return apiFetch<GooglePlacesTestResponse>(
+        "/api/admin/plugins/google-places/test",
+        { method: "POST", body: { query } },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/plugins/sms-socket/* ------------------------------
 //
 // SMS Socket plugin admin endpoints. The plugin holds an api_key +
