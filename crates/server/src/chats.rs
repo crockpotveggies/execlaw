@@ -2602,26 +2602,42 @@ impl Drop for TypingIndicatorGuard {
 /// plugins extend this map (today only signal ships host-side
 /// send tools); the bridge is forward-compatible because an
 /// unknown channel falls through to "no overlap, dispatch."
+/// True iff `tool_name` is the agent-visible "send a text reply"
+/// tool for `channel`, by convention.
+///
+/// **The convention** every transport plugin in the workspace
+/// follows: agent-callable text-send tools are named
+/// `{channel}.send_message` (free-form recipient) and
+/// `{channel}.reply` (current-conversation reply). Both ship in
+/// every transport plugin's manifest as non-`host_internal` tools;
+/// host-internal tools (typing indicators, attachment uploads,
+/// receipts) get other names.
+///
+/// We match on the convention rather than maintaining a hardcoded
+/// list of channel→tool-names. The previous version of this
+/// function had separate arms per channel, and missing arms for
+/// `sms` / `whatsapp` / `slack` caused the auto-bridge to
+/// double-send every agent reply on those channels — the tool
+/// body sent once, then the bridge fired a second copy because
+/// the channel's tool name wasn't in the lookup. Plugins are
+/// dynamic; the auto-bridge needs to handle channels the host
+/// learned about at install time, not just compile time.
+///
+/// If a future transport plugin chooses different tool names (say
+/// `discord.publish` instead of `discord.send_message`), it should
+/// either:
+///   * Conform to the convention so this and the host's
+///     transport-bridge code work without further changes, OR
+///   * Extend this with a manifest-declared `is_send_tool`
+///     boolean and read it from the plugin registry instead of
+///     using string-name conventions.
 fn is_send_tool_for_channel(channel: &str, tool_name: &str) -> bool {
-    match channel {
-        "signal" => matches!(tool_name, "signal.reply" | "signal.send_message"),
-        "sms" => matches!(tool_name, "sms.reply" | "sms.send_message"),
-        "whatsapp" => matches!(tool_name, "whatsapp.reply" | "whatsapp.send_message"),
-        "slack" => matches!(tool_name, "slack.reply" | "slack.send_message"),
-        // Lives here (not on the registry) because the registry's
-        // job is "give me a TransportApi"; this map is the inverse —
-        // "did the agent already use a tool that sends via this
-        // transport." Two different concerns; keeping them apart
-        // avoids forcing every transport to ship a name list it
-        // doesn't actually need.
-        //
-        // CRITICAL when adding a new transport: forgetting to add
-        // its send-tool names here means the auto-bridge will
-        // double-send every agent reply on that channel — the
-        // tool body sends once, then the bridge fires a second
-        // copy because it doesn't recognise the tool that just ran.
-        _ => false,
+    let prefix_len = channel.len();
+    if !tool_name.starts_with(channel) {
+        return false;
     }
+    let rest = &tool_name[prefix_len..];
+    matches!(rest, ".send_message" | ".reply")
 }
 
 /// Sender-id sentinel marking a UserMsg event the server-side
@@ -4343,6 +4359,80 @@ mod tests {
     async fn json_body<T: for<'de> serde::Deserialize<'de>>(body: Body) -> T {
         let bytes = body::to_bytes(body, usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // ---- is_send_tool_for_channel ----------------------------------
+    //
+    // Pin the convention: every transport plugin's agent-callable
+    // text-send tools are `{channel}.send_message` and
+    // `{channel}.reply`. The auto-bridge depends on this — a miss
+    // here causes double-sends on the affected channel (one from
+    // the agent's tool call, one from the bridge that didn't realise
+    // the agent already dispatched).
+    //
+    // These tests run against every transport plugin shipped in
+    // the repo, so a new plugin that breaks the convention without
+    // updating `is_send_tool_for_channel` (or shipping its tool
+    // names through the convention) trips here.
+
+    #[test]
+    fn is_send_tool_recognises_signal_send_tools() {
+        assert!(is_send_tool_for_channel("signal", "signal.send_message"));
+        assert!(is_send_tool_for_channel("signal", "signal.reply"));
+    }
+
+    #[test]
+    fn is_send_tool_recognises_sms_send_tools() {
+        assert!(is_send_tool_for_channel("sms", "sms.send_message"));
+        assert!(is_send_tool_for_channel("sms", "sms.reply"));
+    }
+
+    #[test]
+    fn is_send_tool_recognises_whatsapp_send_tools() {
+        assert!(is_send_tool_for_channel("whatsapp", "whatsapp.send_message"));
+        assert!(is_send_tool_for_channel("whatsapp", "whatsapp.reply"));
+    }
+
+    #[test]
+    fn is_send_tool_recognises_slack_send_tools() {
+        assert!(is_send_tool_for_channel("slack", "slack.send_message"));
+        assert!(is_send_tool_for_channel("slack", "slack.reply"));
+    }
+
+    #[test]
+    fn is_send_tool_recognises_arbitrary_future_channel() {
+        // The convention is the contract — a hypothetical
+        // `discord` plugin that ships discord.send_message /
+        // discord.reply works without changes here.
+        assert!(is_send_tool_for_channel("discord", "discord.send_message"));
+        assert!(is_send_tool_for_channel("discord", "discord.reply"));
+        assert!(is_send_tool_for_channel("xmpp", "xmpp.send_message"));
+    }
+
+    #[test]
+    fn is_send_tool_rejects_host_internal_and_unrelated_tools() {
+        // Host-internal tools (typing, attachments, receipts) and
+        // tools from OTHER channels must not match — otherwise the
+        // bridge would suppress legitimate dispatches.
+        assert!(!is_send_tool_for_channel("sms", "sms.set_typing"));
+        assert!(!is_send_tool_for_channel("sms", "sms.send_with_attachments"));
+        assert!(!is_send_tool_for_channel("sms", "sms.fetch_attachment"));
+        assert!(!is_send_tool_for_channel("signal", "sms.send_message"));
+        assert!(!is_send_tool_for_channel("sms", "signal.send_message"));
+        assert!(!is_send_tool_for_channel("sms", "google_calendar.create_event"));
+        assert!(!is_send_tool_for_channel("sms", ""));
+    }
+
+    #[test]
+    fn is_send_tool_does_not_match_prefix_collisions() {
+        // `smsfoo.send_message` must NOT match channel="sms"
+        // because the convention is `{channel}.tool_name` with a
+        // literal dot separator, not a substring match.
+        assert!(!is_send_tool_for_channel("sms", "smsfoo.send_message"));
+        // And `sms.send_message_extended` (or any other suffix
+        // variant) is not a known send tool.
+        assert!(!is_send_tool_for_channel("sms", "sms.send_message_extended"));
+        assert!(!is_send_tool_for_channel("sms", "sms.replyall"));
     }
 
     #[test]
