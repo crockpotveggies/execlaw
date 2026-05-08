@@ -272,9 +272,10 @@ pub trait HostCapabilities: Send + Sync {
         url: String,
         on_frame: WsFrameHandler,
     ) -> Result<WsSubscriptionHandle, HostCapError> {
-        // Default delegates to ws_subscribe_with_headers with no
-        // headers, so existing impls only need to implement one.
-        self.ws_subscribe_with_headers(url, vec![], on_frame).await
+        // Default delegates with no headers and no init frames so
+        // existing impls only need to implement the full method.
+        self.ws_subscribe_with_init(url, vec![], vec![], on_frame)
+            .await
     }
 
     /// Same as [`ws_subscribe`] but adds custom HTTP headers on the
@@ -290,6 +291,37 @@ pub trait HostCapabilities: Send + Sync {
         &self,
         url: String,
         headers: Vec<(String, String)>,
+        on_frame: WsFrameHandler,
+    ) -> Result<WsSubscriptionHandle, HostCapError> {
+        // Default delegates to the full ws_subscribe_with_init.
+        self.ws_subscribe_with_init(url, headers, vec![], on_frame)
+            .await
+    }
+
+    /// Full subscribe surface: connect-time HTTP headers PLUS init
+    /// frames the host writes on every successful (re)connect
+    /// before the per-frame callback starts firing.
+    ///
+    /// Required for protocols where the server expects a
+    /// client-initiated handshake to register the connection as an
+    /// active subscriber. The sms-socket-app gateway is one such:
+    /// without an initial `getGatewayState` envelope (and a
+    /// `rehydrate` to catch missed events) the gateway never
+    /// delivers live `sms.received` frames to this connection. The
+    /// resulting "connected but no traffic" state crashes the
+    /// gateway when an SMS arrives, because nothing has registered
+    /// to consume the inbound event.
+    ///
+    /// `init_frames` is an ordered list of UTF-8 text frames. The
+    /// host writes them in order, before reading any inbound, on
+    /// every successful connect — including reconnects after a
+    /// disconnect. An empty vec is equivalent to
+    /// [`ws_subscribe_with_headers`].
+    async fn ws_subscribe_with_init(
+        &self,
+        url: String,
+        headers: Vec<(String, String)>,
+        init_frames: Vec<String>,
         on_frame: WsFrameHandler,
     ) -> Result<WsSubscriptionHandle, HostCapError>;
 

@@ -92,10 +92,11 @@ impl HostCapabilities for AppStateHostCapabilities {
         supervisor.has_published_port(port).await
     }
 
-    async fn ws_subscribe_with_headers(
+    async fn ws_subscribe_with_init(
         &self,
         url: String,
         headers: Vec<(String, String)>,
+        init_frames: Vec<String>,
         on_frame: WsFrameHandler,
     ) -> Result<WsSubscriptionHandle, HostCapError> {
         let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
@@ -107,7 +108,20 @@ impl HostCapabilities for AppStateHostCapabilities {
         // refreshed by the consumer on every successful connect so
         // plugins can `ws_send` text frames back through the same
         // socket (Slack Socket Mode envelope_id ACKs, etc.).
-        tokio::spawn(consumer_loop(url, headers, on_frame, cancel, handle.clone()));
+        //
+        // `init_frames` is replayed on every successful (re)connect
+        // before any inbound is read — required by handshake-driven
+        // protocols like the sms-socket-app gateway, which only
+        // delivers events to subscribers that have introduced
+        // themselves.
+        tokio::spawn(consumer_loop(
+            url,
+            headers,
+            init_frames,
+            on_frame,
+            cancel,
+            handle.clone(),
+        ));
 
         Ok(handle)
     }
@@ -219,6 +233,7 @@ impl HostCapabilities for AppStateHostCapabilities {
 async fn consumer_loop(
     url: String,
     headers: Vec<(String, String)>,
+    init_frames: Vec<String>,
     on_frame: WsFrameHandler,
     cancel: Arc<tokio_util::sync::CancellationToken>,
     handle: WsSubscriptionHandle,
@@ -324,7 +339,25 @@ async fn consumer_loop(
         // redelivery handles the gap (e.g. Slack re-sends events
         // whose envelope_id wasn't ACKed in time).
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        handle.set_outbox(Some(out_tx));
+        handle.set_outbox(Some(out_tx.clone()));
+
+        // Replay any handshake / init frames declared at subscribe
+        // time. Goes through the same outbox so the writer half of
+        // the select! below picks it up — keeps the write contract
+        // single-source. Failure to enqueue means the receiver was
+        // already dropped (impossible at this point), so we ignore
+        // the SendError.
+        if !init_frames.is_empty() {
+            tracing::debug!(
+                target: "host_caps::ws",
+                %url,
+                count = init_frames.len(),
+                "replaying init frames"
+            );
+            for frame in &init_frames {
+                let _ = out_tx.send(frame.clone());
+            }
+        }
 
         loop {
             tokio::select! {
@@ -472,7 +505,7 @@ mod ws_headers_tests {
         // captured the upgrade headers.
         let cancel_for_task = cancel.clone();
         let task = tokio::spawn(async move {
-            consumer_loop(url, headers, on_frame, cancel_for_task, handle).await;
+            consumer_loop(url, headers, vec![], on_frame, cancel_for_task, handle).await;
         });
         let captured = tokio::time::timeout(Duration::from_secs(3), captured_rx)
             .await
@@ -511,7 +544,7 @@ mod ws_headers_tests {
         ];
         let cancel_for_task = cancel.clone();
         let task = tokio::spawn(async move {
-            consumer_loop(url, headers, on_frame, cancel_for_task, handle).await;
+            consumer_loop(url, headers, vec![], on_frame, cancel_for_task, handle).await;
         });
         let captured = tokio::time::timeout(Duration::from_secs(3), captured_rx)
             .await
@@ -550,7 +583,7 @@ mod ws_headers_tests {
         let on_frame: WsFrameHandler = Arc::new(|_| Box::pin(async move {}));
         let cancel_for_task = cancel.clone();
         let task = tokio::spawn(async move {
-            consumer_loop(url, vec![], on_frame, cancel_for_task, handle).await;
+            consumer_loop(url, vec![], vec![], on_frame, cancel_for_task, handle).await;
         });
         let captured = tokio::time::timeout(Duration::from_secs(3), captured_rx)
             .await

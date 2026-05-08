@@ -67,7 +67,43 @@ fn on_enable() {
     }
     log_info("sms-socket: subscribing to gateway at " + url);
     let headers = #{ "Authorization": "Bearer " + api_key };
-    let _handle = ws_subscribe_bidi(url, "on_frame", headers);
+
+    // Handshake the gateway expects on every connect. Without
+    // these, the gateway treats us as a passive listener and never
+    // delivers `gateway.state` pings or live `sms.received`
+    // events — which in turn destabilises the gateway when an
+    // SMS arrives because nothing is registered to consume it.
+    // Mirrors selfhosted-claw's onopen sequence
+    // (sms-socket.ts:430-457).
+    //
+    //   1. getGatewayState — registers this connection as an
+    //      active subscriber and prompts the gateway to start
+    //      pushing live events to us.
+    //   2. rehydrate       — replays history we missed while
+    //      disconnected. v1 uses since=0 and a generous limit;
+    //      the host's inbound dedup catches duplicates.
+    //
+    // The host replays these on every (re)connect. requestIds are
+    // intentionally fixed strings — fire-and-forget; we don't
+    // correlate the responses to anything.
+    let init_state = #{
+        "type": "getGatewayState",
+        "requestId": "sms-handshake-state",
+        "payload": #{},
+    };
+    let init_rehydrate = #{
+        "type": "rehydrate",
+        "requestId": "sms-handshake-rehydrate",
+        "payload": #{
+            "since": 0,
+            "limit": 200,
+        },
+    };
+    let init_frames = [
+        to_json_string(init_state),
+        to_json_string(init_rehydrate),
+    ];
+    let _handle = ws_subscribe_bidi(url, "on_frame", headers, init_frames);
     ()
 }
 
@@ -98,6 +134,35 @@ fn on_frame(handle, raw) {
                 detail = env.payload.error;
             }
             log_warn("sms-socket: gateway rejected requestId=" + env.requestId + ": " + detail);
+            return;
+        }
+        // Rehydrate response carries a history of events in
+        // payload.events[]. Each is a full envelope (type, payload)
+        // — replay through the same routing path as live events.
+        // Host-side dedup on (channel, native_id, timestamp_ms,
+        // text) catches any overlap with what we received live.
+        if env.requestId == "sms-handshake-rehydrate"
+            && env.payload != ()
+            && env.payload.events != ()
+            && type_of(env.payload.events) == "array"
+        {
+            let count = env.payload.events.len();
+            log_info("sms-socket: rehydrate returned " + count + " event(s); replaying");
+            for nested in env.payload.events {
+                if type_of(nested) != "map" { continue; }
+                let nested_type = nested.type;
+                if nested_type == () || nested_type == "" { continue; }
+                if nested_type != "sms.received" && nested_type != "mms.received" {
+                    continue;
+                }
+                let inbound = decode_event(nested_type, nested);
+                if inbound == () { continue; }
+                try {
+                    host_route_inbound(inbound);
+                } catch (e) {
+                    log_warn("sms-socket: rehydrate dispatch rejected: " + e);
+                }
+            }
         }
         return;
     }

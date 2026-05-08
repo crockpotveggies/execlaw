@@ -901,6 +901,135 @@ fn register_host_cap_bindings(
         );
     }
 
+    // 4-arg overload:
+    //   ws_subscribe_bidi(url, callback, headers_map, init_frames_array)
+    //
+    // Same as the 3-arg headers overload, plus an ordered list of
+    // text frames the host writes on every successful (re)connect
+    // before the per-frame callback starts firing. Required for
+    // protocols where the server expects a client-initiated
+    // handshake to register the connection as an active subscriber
+    // — e.g. the sms-socket-app gateway, which never delivers
+    // events to a connection that hasn't first sent
+    // `getGatewayState`.
+    //
+    // `init_frames` is a Rhai Array; each element must coerce to a
+    // string. The host replays them on the consumer's outbox in
+    // order, so they go out before any inbound is read.
+    {
+        let pid = plugin_id.to_owned();
+        let caps = host_caps.clone();
+        let owning = owning_plugin.clone();
+        let active_slot = active_bidi_handle.clone();
+        engine.register_fn(
+            "ws_subscribe_bidi",
+            move |url: ImmutableString,
+                  callback: ImmutableString,
+                  headers: Map,
+                  init_frames: rhai::Array|
+                  -> Result<Dynamic, Box<EvalAltResult>> {
+                let caps = match caps.get() {
+                    Some(c) => c.clone(),
+                    None => return Err(host_cap_unavailable_err(&pid, "ws_subscribe_bidi")),
+                };
+                let plugin = owning
+                    .lock()
+                    .expect("OwningPluginSlot mutex poisoned")
+                    .clone();
+                let plugin = match plugin {
+                    Some(p) => p,
+                    None => {
+                        return Err(Box::new(EvalAltResult::ErrorRuntime(
+                            format!("[{pid}] ws_subscribe_bidi: owning plugin not yet wired").into(),
+                            rhai::Position::NONE,
+                        )));
+                    }
+                };
+                let handle_cell: Arc<std::sync::RwLock<Option<WsSubscriptionHandle>>> =
+                    Arc::new(std::sync::RwLock::new(None));
+                let handle_cell_for_handler = handle_cell.clone();
+                let pid_for_handler = pid.clone();
+                let cb_name: String = callback.to_string();
+                let handler: WsFrameHandler = Arc::new(move |frame: String| {
+                    let plugin = plugin.clone();
+                    let pid = pid_for_handler.clone();
+                    let cb = cb_name.clone();
+                    let h_opt = handle_cell_for_handler.read().ok().and_then(|g| g.clone());
+                    Box::pin(async move {
+                        let mut args: Vec<Dynamic> = Vec::with_capacity(2);
+                        args.push(match h_opt {
+                            Some(h) => Dynamic::from(h),
+                            None => Dynamic::UNIT,
+                        });
+                        args.push(Dynamic::from(ImmutableString::from(frame)));
+                        if let Err(e) = plugin.invoke_async_owned(cb, args).await {
+                            tracing::warn!(
+                                plugin_id = %pid,
+                                error = %e,
+                                "ws_subscribe_bidi frame handler returned an error",
+                            );
+                        }
+                    })
+                });
+                let runtime = match tokio::runtime::Handle::try_current() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        return Err(Box::new(EvalAltResult::ErrorRuntime(
+                            format!("[{pid}] ws_subscribe_bidi: no tokio runtime: {e}").into(),
+                            rhai::Position::NONE,
+                        )));
+                    }
+                };
+                let url_owned = url.to_string();
+                let header_pairs = headers_map_to_pairs(&headers);
+                // Coerce Array<Dynamic> → Vec<String>. Non-string
+                // entries are stringified via .to_string() so a
+                // map / array passed in still serialises sensibly,
+                // though plugins should usually pass JSON strings
+                // straight through to_json_string.
+                let init_frames_owned: Vec<String> = init_frames
+                    .into_iter()
+                    .map(|d| {
+                        d.into_immutable_string()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|other| other.to_string())
+                    })
+                    .collect();
+                let handle = tokio::task::block_in_place(|| {
+                    runtime.block_on(caps.ws_subscribe_with_init(
+                        url_owned,
+                        header_pairs,
+                        init_frames_owned,
+                        handler,
+                    ))
+                });
+                match handle {
+                    Ok(h) => {
+                        if let Ok(mut slot) = handle_cell.write() {
+                            *slot = Some(h.clone());
+                        }
+                        if let Ok(mut slot) = active_slot.write() {
+                            if let Some(prev) = slot.take() {
+                                tracing::debug!(
+                                    target: "execlaw_script::primitives",
+                                    plugin_id = %pid,
+                                    "ws_subscribe_bidi: closing previous active subscription"
+                                );
+                                prev.close();
+                            }
+                            *slot = Some(h.clone());
+                        }
+                        Ok(Dynamic::from(h))
+                    }
+                    Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
+                        format!("[{pid}] ws_subscribe_bidi: {}", e.0).into(),
+                        rhai::Position::NONE,
+                    ))),
+                }
+            },
+        );
+    }
+
     // ws_close_active() -> bool
     //
     // Cancel the plugin's most recently subscribed bidi WebSocket
