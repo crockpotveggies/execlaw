@@ -3143,38 +3143,51 @@ pub fn build_turn_context_prose(
     //      invitation; a fall-open dispatch is "you might NOT
     //      have been addressed, behave accordingly."
     if let Some(g) = group {
-        out.push_str("\n## Group conversation context\n\n");
+        // Short, directive group block. Earlier wording was a
+        // multi-line "posture" paragraph that the agent ignored —
+        // operators saw the model reply "I don't have that
+        // information either, should I ask Elyssa?" to a message
+        // clearly addressed at Elyssa. The fix is to make the
+        // group rules concrete and absolute, frame the router's
+        // verdict as a fallible guess (not authoritative
+        // permission), and be terse — small models lose nuance
+        // under verbose instructions.
+        out.push_str("\n## Group conversation\n\n");
         let group_label = match &g.group_name {
             Some(n) => format!("\"{}\"", n.replace('"', "\\\"")),
-            None => "this group".to_owned(),
+            None => "an unnamed group".to_owned(),
         };
         out.push_str(&format!(
-            "* You are answering in {group_label}, a group conversation with \
-             {n} participants (including the operator).\n",
+            "You are in {group_label} ({n} participants). Every other participant \
+             can read every message — you are not a relay.\n\n",
             n = g.member_count,
         ));
+        // The "Hard rules" framing matters: small/cheap models
+        // ignore wishy-washy "should" wording but follow numbered
+        // hard rules. Rule #1 is the one that actually fires for
+        // the failure mode the user reported (a message addressing
+        // someone else by name).
+        out.push_str(
+            "Hard rules:\n\
+             1. If this message addresses ANY person by name and that name is NOT yours, \
+             reply with NOTHING. The named person will answer. Do not offer to ask them — \
+             they are in this group and have already seen the message.\n\
+             2. If this message is one word, an emoji, a reaction, or generic chatter \
+             between humans, reply with NOTHING.\n\
+             3. Default is silence. Only speak when directly named, @-mentioned, or \
+             continuing a thread you started.\n\
+             4. When you do reply, one line. No \"happy to help,\" no offers to do things \
+             you weren't asked to do.\n\n",
+        );
+        // Reframe the verdict so the agent doesn't read it as
+        // authoritative permission to answer. The classifier is
+        // upstream; its guess can be wrong; the agent is the
+        // last line of defense.
         out.push_str(&format!(
-            "* Why this turn was routed to you: {desc}.\n",
+            "Router's guess about why you woke up (often wrong — apply the hard rules \
+             regardless): {desc}.\n",
             desc = g.addressed_reason.description(),
         ));
-        // Default-to-silence posture nudge. The classifier upstream
-        // can already drop unaddressed messages (returning Skip),
-        // but its verdict is fallible — and many group messages
-        // that DO reach the agent are still ambiguous. The right
-        // posture is "answer concisely when clearly addressed,
-        // otherwise stay quiet." The wording here is deliberate:
-        // operators consistently report "barging in" as the most
-        // annoying agent failure mode in groups, so the prompt
-        // says it explicitly.
-        out.push_str(
-            "* Group posture: in a group, the DEFAULT is to stay silent unless you were \
-             clearly addressed. If this message reads more like banter between other \
-             humans than a request to you, reply with a short acknowledgement only when \
-             genuinely useful — or stay silent. NEVER barge into general group chatter, \
-             multi-human scheduling, or messages aimed at someone else by name. Brevity \
-             beats verbosity in groups: a one-line answer is almost always better than a \
-             paragraph.\n",
-        );
     }
     out
 }
@@ -5411,8 +5424,8 @@ mod tests {
     #[test]
     fn build_turn_context_prose_omits_group_block_when_none() {
         // Default for DM / web / single-actor turns: no group
-        // section, no "default to silence" nudge — that prose is
-        // wrong outside groups.
+        // section, no hard rules — that prose is wrong outside
+        // groups.
         let now = chrono::Utc::now();
         let prose = super::build_turn_context_prose(
             now,
@@ -5423,18 +5436,18 @@ mod tests {
             None,
             None,
         );
-        assert!(!prose.contains("Group conversation context"));
-        assert!(!prose.to_lowercase().contains("default is to stay silent"));
+        assert!(!prose.contains("Group conversation"));
+        assert!(!prose.to_lowercase().contains("hard rules"));
     }
 
     #[test]
     fn build_turn_context_prose_renders_group_block_with_strong_signal() {
-        // Pin the wording the agent reads when it was clearly
-        // addressed: TransportMention is the strongest verdict, the
-        // block names the group + member count + reason in plain
-        // English, AND the "default to silence" posture nudge is
-        // present so even on a strong signal the agent is reminded
-        // of group etiquette.
+        // Pin the wording the agent reads in a group: the block
+        // names the group + member count, includes the "hard rules"
+        // section that the model reliably follows (the verbose
+        // posture-paragraph version was being ignored), and frames
+        // the router's verdict as a fallible guess rather than
+        // authoritative permission.
         let now = chrono::Utc::now();
         let g = super::GroupTurnContext {
             group_name: Some("Project Loon".into()),
@@ -5450,27 +5463,34 @@ mod tests {
             None,
             Some(&g),
         );
-        assert!(prose.contains("Group conversation context"));
+        assert!(prose.contains("Group conversation"));
         assert!(prose.contains("\"Project Loon\""));
         assert!(prose.contains("4 participants"));
-        // The reason wording must appear so the model understands
-        // the strength of the upstream signal. TransportMention
-        // language is the "explicit @-mention" line.
+        // The hard-rules block is the load-bearing piece — without
+        // these the model defaults to "be helpful" and barges in.
+        assert!(prose.to_lowercase().contains("hard rules"));
+        // Rule #1 is specifically what catches "Elyssa are you
+        // taking the Tesla?" — the failure mode operators reported.
         assert!(
-            prose.to_lowercase().contains("explicit @-mention")
-                || prose.to_lowercase().contains("@-mention"),
-            "transport-mention reason text should be in the prose; got: {prose}",
+            prose.to_lowercase().contains("addresses any person by name"),
+            "rule against addressing-someone-else must be present; got: {prose}",
         );
-        // Posture nudge — present regardless of signal strength.
-        assert!(prose.to_lowercase().contains("default is to stay silent"));
+        // The router's verdict must be present AND framed as a
+        // guess, not as permission. The "often wrong" framing is
+        // what stops the model from reading the verdict as
+        // authoritative.
+        assert!(
+            prose.to_lowercase().contains("router's guess")
+                && prose.to_lowercase().contains("often wrong"),
+            "router verdict must be framed as a fallible guess; got: {prose}",
+        );
     }
 
     #[test]
     fn build_turn_context_prose_group_block_warns_on_fall_open() {
-        // FallOpen variants are weak signals — the agent should
-        // know it might NOT have been addressed. Pin the "may NOT
-        // have been addressed" wording so a future prompt rewrite
-        // doesn't quietly delete the warning.
+        // FallOpen variants are weak signals — the description
+        // string must steer the agent toward silence rather than
+        // toward answering on uncertain routing.
         let now = chrono::Utc::now();
         let g = super::GroupTurnContext {
             group_name: None,
@@ -5486,12 +5506,13 @@ mod tests {
             None,
             Some(&g),
         );
-        // No group name → falls back to "this group".
-        assert!(prose.contains("this group"));
-        // Fall-open warning text must appear.
+        // No group name → falls back to "an unnamed group".
+        assert!(prose.contains("an unnamed group"));
+        // Fall-open description must steer toward silence.
         assert!(
-            prose.to_lowercase().contains("may not have been addressed"),
-            "fall-open reason must surface the 'may NOT have been addressed' warning; got: {prose}",
+            prose.to_lowercase().contains("not addressed")
+                && prose.to_lowercase().contains("staying silent"),
+            "fall-open reason must steer the agent toward silence; got: {prose}",
         );
     }
 

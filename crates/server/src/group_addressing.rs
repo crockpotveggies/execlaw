@@ -112,26 +112,31 @@ pub enum AddressedReason {
 }
 
 impl AddressedReason {
-    /// Short human-readable phrase suitable for the agent's system
-    /// prompt. Stable strings — change with care, the model has
-    /// been primed on this wording.
+    /// Short human-readable phrase rendered into the agent's system
+    /// prompt. Wording is deliberately *non-authoritative* — every
+    /// variant frames the router's choice as a guess, not as
+    /// permission to answer. The agent's hard-rules block decides
+    /// whether to actually reply; this string just tells it which
+    /// signal triggered routing so it can calibrate.
     pub fn description(&self) -> &'static str {
         match self {
             AddressedReason::TransportMention => {
-                "the message contains an explicit @-mention of you in the transport's wire format"
+                "the transport flagged an explicit @-mention of you (still apply the hard rules — verify the message body actually addresses you)"
             }
-            AddressedReason::NameInText => "your name appears in the message text",
+            AddressedReason::NameInText => {
+                "your name appears somewhere in the message text (could be addressing you, or could be talking ABOUT you to someone else — apply the hard rules)"
+            }
             AddressedReason::ClassifierDirected => {
-                "a fast classifier judged the message to be directed at you (your name was NOT in the text — the verdict came from semantics, so be careful)"
+                "a small classifier guessed this was for you, with no name match — weak signal, treat as likely-not-for-you unless the message body clearly says otherwise"
             }
             AddressedReason::EligibilityBypass => {
-                "this conversation has no other non-Controller humans, so the addressing question doesn't apply"
+                "this conversation isn't a multi-human group from the addressing layer's perspective — the hard rules still apply, but ambient chatter is unlikely"
             }
             AddressedReason::FallOpenClassifierUnavailable => {
-                "the addressing classifier was unavailable, so the router defaulted to dispatching the turn — you may NOT have been addressed; default to staying brief or asking who the message was for"
+                "the classifier was unavailable, so the router dispatched by default — you very likely were NOT addressed, lean toward staying silent"
             }
             AddressedReason::FallOpenClassifierError => {
-                "the addressing classifier errored, so the router defaulted to dispatching the turn — you may NOT have been addressed; default to staying brief or asking who the message was for"
+                "the classifier errored, so the router dispatched by default — you very likely were NOT addressed, lean toward staying silent"
             }
         }
     }
@@ -352,50 +357,45 @@ async fn classify_via_llm(
     } else {
         agent_role
     };
-    // The classifier prompt is biased toward `false` (silence) on
-    // ambiguous group chatter. Past tuning was permissive — anything
-    // the agent *could* answer was treated as directed, which made
-    // the agent barge into general group conversation. The new bias:
+    // Few-shot prompt — small classifier models (Haiku-class) do
+    // much better with concrete examples than with rule lists.
+    // The earlier rule-based version was getting "Elyssa are you
+    // taking the Tesla?" wrong (returning directed=true) because
+    // the model saw "could answer this" and overrode the rules.
     //
-    //   * "directed" requires a STRONG signal (named, mentioned,
-    //     replying to the agent, or a request only the agent can
-    //     fulfil because it references agent-specific tools).
-    //   * Generic questions, casual banter, scheduling,
-    //     opinion-asking with no addressee — all "false". The
-    //     correct posture for the agent in a group is to listen
-    //     unless invited.
+    // Examples are chosen to cover the failure modes operators
+    // reported, anchored to two key patterns the model needs to
+    // distinguish:
+    //   * direct address to the agent → true
+    //   * direct address to another human (by name OR pronoun) → false
     //
-    // Cost of a false positive (= barging in): high — operators
-    // consistently report this as the most annoying agent failure
-    // mode.
-    // Cost of a false negative (= missed address): low — the operator
-    // can name the agent or @-mention to retry; barging happens at
-    // every silent group event, missed addresses happen once.
+    // Wording is deliberately blunt: small models lose nuance under
+    // long instructions. The single classifier rule is the example
+    // set + "match the closest example."
     let system_prompt = format!(
-        "You are a binary classifier for a chat-bot routing layer. \
-         The agent is named \"{agent_name}\" and acts as the operator's {role_phrase}. \
-         A new message arrived in a GROUP conversation that includes the agent, the operator, \
-         and other humans. Decide if THIS specific message is directed at the agent.\n\n\
-         IMPORTANT BIAS: in a group, the DEFAULT is that messages are between humans and the \
-         agent should stay silent. Only return `true` when the message is clearly aimed at \
-         the agent. When unsure, return `false`. Barging into casual group conversation is \
-         worse than missing one address — the operator can re-prompt by naming the agent.\n\n\
-         Return `true` ONLY when at least one of these holds:\n\
-         - The agent is named or @-mentioned in this message (e.g. \"{agent_name}, ...\", \
-           \"@{agent_name}\", \"hey {agent_name}\")\n\
-         - The message is a direct reply or follow-up to something the agent ITSELF just said \
-           (continuing an exchange the agent started)\n\
-         - The message asks for output that ONLY the agent can produce (a draft the agent was \
-           writing, a tool call only it has, a research task already in progress)\n\n\
-         Return `false` for everything else, including:\n\
-         - General questions to the room (\"anyone know a good restaurant?\", \"what time \
-           tomorrow?\") with no clear addressee — even if the agent COULD answer\n\
-         - Casual chatter, banter, reactions, emoji, one-word replies\n\
-         - Messages addressing another human by name (\"Alice, did you ...\")\n\
-         - Scheduling, planning, or coordination between other humans\n\
-         - Opinions or commentary not directed at anyone in particular\n\
-         - Forwarded content, links shared without a question to the agent\n\n\
-         Output STRICT JSON, nothing else: {{\"directed\": true}} or {{\"directed\": false}}."
+        "Classify whether a group-chat message is directed at the agent named \"{agent_name}\" \
+         (role: {role_phrase}).\n\n\
+         Examples (match the closest pattern):\n\
+         \"{agent_name}, can you check the calendar?\" → {{\"directed\": true}}\n\
+         \"hey {agent_name}\" → {{\"directed\": true}}\n\
+         \"@{agent_name} what time tomorrow?\" → {{\"directed\": true}}\n\
+         \"{agent_name} please draft a reply\" → {{\"directed\": true}}\n\
+         \"thanks {agent_name}\" → {{\"directed\": true}}\n\
+         \"Alice, did you book the venue?\" → {{\"directed\": false}}\n\
+         \"Bob are you taking the car?\" → {{\"directed\": false}}\n\
+         \"Elyssa are you taking the Tesla?\" → {{\"directed\": false}}\n\
+         \"anyone know a good Thai place?\" → {{\"directed\": false}}\n\
+         \"what time are we meeting tomorrow?\" → {{\"directed\": false}}\n\
+         \"now\" → {{\"directed\": false}}\n\
+         \"lol\" → {{\"directed\": false}}\n\
+         \"ok cool\" → {{\"directed\": false}}\n\
+         \"👍\" → {{\"directed\": false}}\n\
+         \"on my way\" → {{\"directed\": false}}\n\n\
+         Rules:\n\
+         - If the message addresses ANY person by name and that name is NOT \"{agent_name}\", \
+         output false. Always. The named person will answer.\n\
+         - If unsure, output false. The default in a group is silence.\n\n\
+         Now classify. Output ONLY one JSON object: {{\"directed\": true}} or {{\"directed\": false}}."
     );
 
     let req = ChatRequest {
