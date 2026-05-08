@@ -369,13 +369,35 @@ async fn consumer_loop(
                 frame = read.next() => {
                     match frame {
                         Some(Ok(Message::Text(text))) => {
+                            // INFO-level frame trace. Truncated to
+                            // 400 chars so a chatty stream doesn't
+                            // overwhelm the log. Plenty for
+                            // diagnosing handshake / event-shape
+                            // bugs against an unfamiliar gateway.
+                            let preview = if text.len() > 400 {
+                                format!("{}…[+{} bytes]", &text[..400], text.len() - 400)
+                            } else {
+                                text.to_string()
+                            };
+                            tracing::info!(
+                                target: "host_caps::ws",
+                                %url,
+                                len = text.len(),
+                                preview = %preview,
+                                "<<< text frame"
+                            );
                             let on_frame = on_frame.clone();
                             tokio::spawn(async move {
                                 on_frame(text.to_string()).await;
                             });
                         }
-                        Some(Ok(Message::Binary(_))) => {
-                            tracing::debug!(target: "host_caps::ws", %url, "ignoring binary frame");
+                        Some(Ok(Message::Binary(b))) => {
+                            tracing::info!(
+                                target: "host_caps::ws",
+                                %url,
+                                len = b.len(),
+                                "<<< binary frame (ignored)"
+                            );
                         }
                         Some(Ok(Message::Ping(payload))) => {
                             // CRITICAL: once a WebSocketStream is
@@ -394,22 +416,52 @@ async fn consumer_loop(
                             // by the consumer task and only ONE arm
                             // of this `select!` runs per iteration,
                             // so we never race the outbox writer.
-                            tracing::debug!(target: "host_caps::ws", %url, len = payload.len(), "pong");
+                            tracing::info!(
+                                target: "host_caps::ws",
+                                %url,
+                                len = payload.len(),
+                                "<<< ping; >>> pong"
+                            );
                             if let Err(e) = write.send(Message::Pong(payload)).await {
                                 tracing::warn!(target: "host_caps::ws", %url, error = %e, "pong send failed; closing connection");
                                 break;
                             }
                         }
                         Some(Ok(Message::Pong(_))) => {
-                            // Server-initiated pongs (e.g. response
-                            // to a ping we sent in the future) —
-                            // currently we send no client-side
-                            // pings, so this branch is a no-op.
-                            // Don't break; tungstenite's stream
-                            // already handles protocol bookkeeping.
+                            tracing::debug!(target: "host_caps::ws", %url, "<<< pong (ignored)");
                         }
-                        Some(Ok(Message::Close(_))) | None => {
-                            tracing::info!(target: "host_caps::ws", %url, "stream ended; reconnecting");
+                        Some(Ok(Message::Close(frame))) => {
+                            // Surface the close code + reason from
+                            // the peer; the previous `stream ended`
+                            // log gave us nothing to act on. RFC
+                            // 6455 close codes:
+                            //   1000 normal, 1001 going away,
+                            //   1002 protocol error, 1003 unsupported
+                            //   data, 1006 abnormal close (no frame),
+                            //   1008 policy violation, 1009 too big,
+                            //   1011 internal error.
+                            let (code, reason) = match frame {
+                                Some(f) => (
+                                    u16::from(f.code),
+                                    f.reason.to_string(),
+                                ),
+                                None => (0, String::new()),
+                            };
+                            tracing::warn!(
+                                target: "host_caps::ws",
+                                %url,
+                                close_code = code,
+                                close_reason = %reason,
+                                "<<< close frame; reconnecting"
+                            );
+                            break;
+                        }
+                        None => {
+                            tracing::warn!(
+                                target: "host_caps::ws",
+                                %url,
+                                "stream ended without close frame (peer dropped TCP); reconnecting"
+                            );
                             break;
                         }
                         Some(Ok(Message::Frame(_))) => {}
@@ -422,6 +474,18 @@ async fn consumer_loop(
                 outbound = out_rx.recv() => {
                     match outbound {
                         Some(msg) => {
+                            let preview = if msg.len() > 400 {
+                                format!("{}…[+{} bytes]", &msg[..400], msg.len() - 400)
+                            } else {
+                                msg.clone()
+                            };
+                            tracing::info!(
+                                target: "host_caps::ws",
+                                %url,
+                                len = msg.len(),
+                                preview = %preview,
+                                ">>> text frame"
+                            );
                             if let Err(e) = write.send(Message::Text(msg.into())).await {
                                 tracing::warn!(target: "host_caps::ws", %url, error = %e, "ws send failed; closing connection");
                                 break;
