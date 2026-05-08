@@ -142,24 +142,50 @@ pub async fn admit_external_principal(
 /// identity-provider plugins declare in their `[identity_provider]
 /// .resolves` field.
 ///
-/// The mapping reflects the data type, not the transport name —
-/// google-contacts resolves `phone` and `email`, not `signal` /
-/// `whatsapp` / `telegram`. A Signal handle that's an E.164 number
-/// gets presented as `phone`; a future Signal-username handle would
-/// stay as `signal_username`. Web stays as `web` (its own stable
-/// identifier kind).
+/// The mapping is driven by the **handle's shape**, not the
+/// transport name — google-contacts resolves `phone` and `email`,
+/// not `signal` / `whatsapp` / `telegram` / `imessage` / etc.
+/// Looking at the handle keeps this open to any future
+/// E.164-shaped transport without code changes.
+///
+///   * Handle starts with `+` and is otherwise digits/spaces/dashes
+///     → `phone` (E.164 by convention).
+///   * Handle contains an `@` and has a `.`-separated TLD on the
+///     right-hand side → `email`.
+///   * Otherwise → transport verbatim. This still fires for
+///     transports like `signal` whose handle is a Signal-username
+///     (no `+`), letting plugins that resolve `signal` directly
+///     match.
 pub fn resolver_kind_for(transport: &str, handle: &str) -> String {
-    match transport {
-        // E.164-style transport handles → present as `phone` so
-        // contact plugins (Google Contacts, local address book)
-        // match against their stored phone numbers.
-        "signal" | "whatsapp" | "sms" | "telegram" if handle.starts_with('+') => "phone".to_owned(),
-        // Email-shaped transport handles → `email`.
-        "email" => "email".to_owned(),
-        // Everything else: surface the transport name verbatim and
-        // let plugins decide whether they handle it.
-        other => other.to_owned(),
+    if looks_like_e164(handle) {
+        return "phone".to_owned();
     }
+    if looks_like_email(handle) {
+        return "email".to_owned();
+    }
+    transport.to_owned()
+}
+
+/// E.164: leading `+`, then 7-15 digits. Per ITU-T E.164 the
+/// total digit count is at most 15. Spaces/dashes inside aren't
+/// canonical E.164 but we accept them for the resolver-kind check
+/// since operators paste freely.
+fn looks_like_e164(handle: &str) -> bool {
+    if !handle.starts_with('+') {
+        return false;
+    }
+    let digit_count = handle.chars().filter(|c| c.is_ascii_digit()).count();
+    (7..=15).contains(&digit_count)
+}
+
+/// Loose email check: one `@`, at least one char on each side, and
+/// the right-hand side contains a `.`. Doesn't claim RFC 5322
+/// conformance — we just want to disambiguate from phone / handle.
+fn looks_like_email(handle: &str) -> bool {
+    let Some((local, domain)) = handle.split_once('@') else {
+        return false;
+    };
+    !local.is_empty() && domain.contains('.') && !domain.starts_with('.')
 }
 
 /// Pure: distill plugin matches into a `TrustLevel`, applying the
@@ -395,18 +421,37 @@ pub fn reconcile_against_my_identities(
             let stale_groups = list_groups_for_member(db, &stale.id)?;
 
             for stale_group_id in &stale_groups {
-                // Resolve / mint the canonical target group. For
-                // Controller the membership includes_controller=true
-                // so the conversation lands as ControllerDM; for
-                // any other higher-trust principal we route through
-                // a singleton group keyed on that principal.
+                // Resolve / mint the canonical target group. The
+                // group key MUST carry the SAME channel the stale
+                // group was minted on — otherwise we mint a fresh
+                // group under a different channel and leave the
+                // original orphaned, breaking inbound routing for
+                // that principal on the original transport.
+                //
+                // Read the channel from the stale group itself
+                // rather than hardcoding (which previously baked
+                // "signal" in and silently broke whatsapp / sms /
+                // slack reconciliation as soon as those transports
+                // shipped).
+                let stale_channel = pg_store
+                    .get(stale_group_id)?
+                    .map(|g| g.channel)
+                    .unwrap_or_else(|| {
+                        // Defensive: stale group somehow gone from
+                        // the store between list and resolve. Default
+                        // to the resolver_kind we picked for the
+                        // identifier — not perfect, but better than
+                        // hardcoded "signal".
+                        stale.identifiers
+                            .first()
+                            .map(|i| i.transport.clone())
+                            .unwrap_or_default()
+                    });
                 let is_controller = matches!(target.trust_level, CoreTrustLevel::Controller);
                 let target_group = pg_store
                     .resolve(
                         &execlaw_core::principal_groups::GroupKey {
-                            channel: "signal", // identifier transport drives membership; signal is the only
-                                                // first-contact-minting transport today. Future transports
-                                                // should call reconcile per their own channel.
+                            channel: &stale_channel,
                             native_group_id: None,
                             principals: &[target.id.clone()],
                             includes_controller: is_controller,
@@ -631,6 +676,43 @@ mod tests {
         assert_eq!(resolver_kind_for("signal", "alice"), "signal");
         assert_eq!(resolver_kind_for("email", "a@b.c"), "email");
         assert_eq!(resolver_kind_for("web", "user-1"), "web");
+    }
+
+    #[test]
+    fn resolver_kind_works_for_runtime_installed_phone_transports() {
+        // Critical: the function shouldn't be hardcoded against a
+        // small list of channels. Any future phone-shape transport
+        // (imessage, voice, telnyx_sms, …) must auto-resolve to
+        // "phone" purely from the handle's E.164 shape.
+        assert_eq!(resolver_kind_for("imessage", "+14165550100"), "phone");
+        assert_eq!(resolver_kind_for("voice", "+442071234567"), "phone");
+        assert_eq!(resolver_kind_for("telnyx_sms", "+12345678"), "phone");
+        // And non-phone transports still pass through.
+        assert_eq!(resolver_kind_for("matrix", "@alice:example.com"), "matrix");
+        assert_eq!(resolver_kind_for("xmpp", "alice@chat.example"), "email");
+    }
+
+    #[test]
+    fn looks_like_e164_basic_cases() {
+        assert!(looks_like_e164("+14165550100"));
+        assert!(looks_like_e164("+442071234567"));
+        assert!(looks_like_e164("+1 416-555-0100")); // pasted-with-formatting
+        assert!(!looks_like_e164("14165550100")); // missing leading +
+        assert!(!looks_like_e164("+12345")); // too short (5 < 7)
+        assert!(!looks_like_e164(&format!("+{}", "1".repeat(16)))); // too long (16 > 15)
+        assert!(!looks_like_e164(""));
+        assert!(!looks_like_e164("+abc"));
+    }
+
+    #[test]
+    fn looks_like_email_basic_cases() {
+        assert!(looks_like_email("alice@example.com"));
+        assert!(looks_like_email("a@b.c"));
+        assert!(!looks_like_email("alice")); // no @
+        assert!(!looks_like_email("@example.com")); // empty local
+        assert!(!looks_like_email("alice@")); // empty domain
+        assert!(!looks_like_email("alice@local")); // no TLD
+        assert!(!looks_like_email("alice@.com")); // domain starts with dot
     }
 
     #[tokio::test]

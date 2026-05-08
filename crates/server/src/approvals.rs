@@ -33,6 +33,42 @@ use crate::auth::JwtSigner;
 use crate::events::UiEvent;
 use crate::state::AppState;
 
+/// Look up the conversation's originating-transport channel by
+/// asking the host's transport-binding store + transport registry.
+/// Used by the cold-contact and claim_as_me approval replays so
+/// they don't hardcode which channel the inbound came in on
+/// (previously this was always "signal", which broke the moment
+/// other transports started seeing cold-contact flows).
+///
+/// Returns `None` when:
+///   * The conversation isn't tied to a principal_group (web-only
+///     chat with no transport);
+///   * No bindings exist yet for that group;
+///   * No installed plugin handles any of the bindings' channels
+///     (e.g. operator uninstalled the transport between the cold-
+///     contact arriving and the approval being processed).
+///
+/// Callers thread the result into `dispatch_external_turn`'s
+/// `origin_channel` so the auto-bridge / typing indicator / system
+/// prose all surface the right transport.
+fn origin_channel_for_conversation(
+    state: &AppState,
+    cid: &ConversationId,
+) -> Option<String> {
+    use execlaw_core::principal_groups::PrincipalGroupStore;
+    use execlaw_core::transport_bindings::TransportBindingStore;
+    let pg_store = PrincipalGroupStore::new(&state.db);
+    let pg_id = pg_store.principal_group_id_for(cid.as_str()).ok().flatten()?;
+    let binding_store = TransportBindingStore::new(&state.db);
+    let bindings = binding_store
+        .bindings_for_group_any_channel(&pg_id)
+        .ok()?;
+    state
+        .host_transports
+        .lookup_first_supported_binding(&bindings)
+        .map(|r| r.channel)
+}
+
 /// Mint a signed approval-token JWT (§2.11). The token's `jti` is
 /// the approval_id; verifying the token before honoring an approval
 /// response prevents an attacker from forging an `/approvals/X/respond`
@@ -324,18 +360,20 @@ pub async fn respond_handler(
         };
         let trust_flat = execlaw_policy::trust::TrustLevel::parse(promoted.trust_level.class_tag())
             .unwrap_or(execlaw_policy::trust::TrustLevel::UnknownPending);
+        // Look up the actual originating channel from the
+        // conversation's first transport binding. Previously this
+        // was hardcoded to "signal" because Signal was the only
+        // shipped transport with a cold-contact UX; now any
+        // installed transport (sms, whatsapp, slack, ...) gets the
+        // right origin channel without code changes here.
+        let origin_channel = origin_channel_for_conversation(&state, &cid);
         if let Err(e) = crate::chats::dispatch_external_turn(
             &state,
             &cid,
             &promoted,
             trust_flat,
             &original_text,
-            // Cold-contact approvals come from the Signal flow today
-            // (it's the only transport with cold-contact UX). When
-            // we add other channels' cold-contact paths the approval
-            // payload will need to carry the originating channel
-            // explicitly; for now hardcoding signal matches reality.
-            Some("signal"),
+            origin_channel.as_deref(),
         )
         .await
         {
@@ -501,13 +539,16 @@ async fn claim_as_me(
         _ => return internal_error("controller principal vanished mid-claim"),
     };
     let trust_flat = execlaw_policy::trust::TrustLevel::Controller;
+    // Look up the actual origin channel; see
+    // origin_channel_for_conversation for rationale.
+    let origin_channel = origin_channel_for_conversation(&state, cid);
     if let Err(e) = crate::chats::dispatch_external_turn(
         &state,
         cid,
         &controller_now,
         trust_flat,
         &original_text,
-        Some("signal"),
+        origin_channel.as_deref(),
     )
     .await
     {

@@ -141,14 +141,36 @@ fn pretty_label_for(transport_id: &str) -> String {
 }
 
 /// Best-effort handle hint — the operator sees this as the form
-/// field's placeholder. Phone-number transports default to E.164;
-/// everything else falls back to a generic "handle" prompt.
+/// field's placeholder. Heuristic: name-shape match the transport
+/// id against a few known categories. Cosmetic only; mistyping
+/// here just shows a slightly odd default in the form.
+///
+/// **Proper fix when this needs to grow**: add an
+/// `identifier_kind: Option<String>` field to the manifest's
+/// `[transport]` decl (TransportDecl in plugin-sdk) and have the
+/// host's transport registry surface it. Then this becomes a
+/// registry lookup, plugins self-declare, and the host stops
+/// guessing. Until then: a name-prefix heuristic catches the
+/// common cases without a hardcoded table to maintain.
 fn handle_placeholder_for(transport_id: &str) -> String {
-    match transport_id {
-        "signal" | "whatsapp" | "sms" => "+15551234".into(),
-        "email" => "you@example.com".into(),
-        _ => "handle".into(),
+    let id = transport_id.to_ascii_lowercase();
+    // Email-shaped transports.
+    if id == "email" || id.contains("mail") {
+        return "you@example.com".into();
     }
+    // Phone-shaped transports: any of the well-known messenger /
+    // SMS / dialer prefixes. New phone-based transports installed
+    // at runtime (e.g. `imessage`, `voice`, `telnyx_sms`) usually
+    // contain one of these substrings; the heuristic catches them
+    // without code changes.
+    let phone_hints = [
+        "sms", "mms", "phone", "voice", "call", "signal", "whatsapp",
+        "telegram", "imessage", "messenger",
+    ];
+    if phone_hints.iter().any(|h| id.contains(h)) {
+        return "+15551234".into();
+    }
+    "handle".into()
 }
 
 #[utoipa::path(

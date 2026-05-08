@@ -3052,31 +3052,21 @@ pub(crate) fn humanise_tool_call(tool_name: &str, args: &serde_json::Value) -> S
                     .unwrap_or_else(|| pretty.into())
             )
         }
-        // === Signal plugin ===
-        // These need bespoke phrasings because the generic
-        // dotted-namespace fallback below would render
-        // `signal.send_message` → "send message via signal", which
-        // is awkward and doesn't surface the recipient. Once the
-        // Signal plugin lands these are the labels operators see in
-        // the loader pill.
-        "signal.send_message" => match (s("to"), s("text")) {
-            (Some(to), _) => format!("Sending Signal message to {to}"),
-            _ => "Sending a Signal message".into(),
-        },
-        "signal.reply" => "Replying on Signal".into(),
-        "signal.create_group" => match s("title") {
-            Some(t) => format!("Creating Signal group “{t}”"),
-            None => "Creating a Signal group".into(),
-        },
-        "signal.add_group_members" => match s("groupName") {
-            Some(g) => format!("Adding members to “{g}”"),
-            None => "Adding members to a Signal group".into(),
-        },
-        "signal.list_groups" => "Listing Signal groups".into(),
-        "signal.leave_group" => match s("groupName") {
-            Some(g) => format!("Leaving Signal group “{g}”"),
-            None => "Leaving a Signal group".into(),
-        },
+        // === Transport-plugin tools (any channel) ===
+        //
+        // The convention is `{channel}.{verb}` — `signal.send_message`,
+        // `sms.send_message`, `whatsapp.create_group`, etc. We
+        // recognise the verb and surface a transport-aware label,
+        // formatting the channel name human-readable. Previously
+        // these arms were hardcoded per-Signal; that broke the
+        // moment plugins for sms / whatsapp / slack landed because
+        // their tools fell through to the generic dotted-namespace
+        // fallback below ("send message via whatsapp"), which is
+        // awkward and doesn't surface the recipient.
+        n if n.contains('.') && is_transport_tool_verb(n) => {
+            let (channel, verb) = n.split_once('.').unwrap();
+            humanise_transport_tool(channel, verb, &s)
+        }
         // Plugin-namespaced tools (`google.calendar.list_events`
         // etc) get a "<verb> via <namespace>" rendering. Operators
         // have plugin descriptions in the catalogue; the loader
@@ -3095,6 +3085,84 @@ pub(crate) fn humanise_tool_call(tool_name: &str, args: &serde_json::Value) -> S
             match chars.next() {
                 Some(c) => c.to_uppercase().chain(chars).collect(),
                 None => "Working".into(),
+            }
+        }
+    }
+}
+
+/// True iff the part after the first `.` in a dotted tool name is
+/// one of the known transport-plugin verbs. Keeps `humanise_tool_call`'s
+/// transport-aware branch from claiming non-transport namespaced
+/// tools (e.g. `google_calendar.create_event` would otherwise look
+/// like a "create_event" verb on a `google_calendar` channel).
+fn is_transport_tool_verb(tool_name: &str) -> bool {
+    match tool_name.split_once('.') {
+        Some((_, verb)) => matches!(
+            verb,
+            "send_message"
+                | "reply"
+                | "create_group"
+                | "add_group_members"
+                | "remove_group_members"
+                | "list_groups"
+                | "leave_group"
+        ),
+        None => false,
+    }
+}
+
+/// Format a transport-plugin tool call into human prose, given the
+/// channel and the verb. Recipient / title args come through `s`
+/// (a getter built from the JSON args earlier in `humanise_tool_call`).
+fn humanise_transport_tool(
+    channel: &str,
+    verb: &str,
+    s: &impl Fn(&str) -> Option<String>,
+) -> String {
+    let label = display_label_for_channel(channel);
+    match verb {
+        "send_message" => match s("to") {
+            Some(to) => format!("Sending {label} message to {to}"),
+            None => format!("Sending a {label} message"),
+        },
+        "reply" => format!("Replying on {label}"),
+        "create_group" => match s("title").or_else(|| s("name")) {
+            Some(t) => format!("Creating {label} group “{t}”"),
+            None => format!("Creating a {label} group"),
+        },
+        "add_group_members" => match s("groupName").or_else(|| s("group_name")) {
+            Some(g) => format!("Adding members to “{g}”"),
+            None => format!("Adding members to a {label} group"),
+        },
+        "remove_group_members" => match s("groupName").or_else(|| s("group_name")) {
+            Some(g) => format!("Removing members from “{g}”"),
+            None => format!("Removing members from a {label} group"),
+        },
+        "list_groups" => format!("Listing {label} groups"),
+        "leave_group" => match s("groupName").or_else(|| s("group_name")) {
+            Some(g) => format!("Leaving {label} group “{g}”"),
+            None => format!("Leaving a {label} group"),
+        },
+        _ => format!("{verb} via {channel}").replace('_', " "),
+    }
+}
+
+/// Convert a channel id (`signal`, `sms`, `whatsapp`, `slack`) into
+/// the prose form operators expect to read in the loader pill. We
+/// special-case channels with non-Title-case canonical spellings
+/// (`SMS`, `MMS`-future) and Title-case the rest.
+///
+/// For unknown channels installed at runtime we fall back to
+/// Title-Case-ing the id; future improvement: read the channel's
+/// human name from the plugin manifest's `[transport].label` field.
+fn display_label_for_channel(channel: &str) -> String {
+    match channel {
+        "sms" | "mms" => channel.to_uppercase(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(c) => c.to_uppercase().chain(chars).collect(),
+                None => other.to_string(),
             }
         }
     }
