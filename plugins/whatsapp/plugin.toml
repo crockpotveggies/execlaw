@@ -1,7 +1,7 @@
 [plugin]
 id = "whatsapp"
 name = "WhatsApp"
-version = "0.1.5"
+version = "0.1.6"
 description = "WhatsApp Multi-Device transport via wuzapi (whatsmeow-backed). Mirrors the Signal plugin shape: 6 agent-callable tools (send_message, reply, list_groups, create_group, add_group_members, leave_group) + 3 host-internal convention tools (set_typing, send_with_attachments, fetch_attachment), inbound WS consumer, QR-pairing admin flow."
 author = "execlaw"
 license = "AGPL-3.0-or-later"
@@ -24,6 +24,20 @@ ports = []
 # rotating to higher security can override via docker-compose.
 [services.env]
 WUZAPI_ADMIN_TOKEN = "execlaw-wuzapi-admin"
+
+# Webhook retry envelope for the case where execlaw is briefly
+# down (during a deploy / cargo-watch rebuild / OS reboot) while
+# wuzapi keeps running. Wuzapi's defaults are 5×30s=15min total,
+# which is too short for a "left the laptop closed for an hour"
+# scenario. Bump count to 10 — exponential backoff (30, 60, 120,
+# 240, 480, 960, 1920, 3840, 7680, 15360s) gives ~8.5h of retries
+# total, which covers any realistic operator-triggered downtime.
+#
+# Per-attempt resty timeout (default 30s) still applies on each
+# request, so a hung execlaw won't stall the loop.
+WEBHOOK_RETRY_ENABLED = "true"
+WEBHOOK_RETRY_COUNT = "10"
+WEBHOOK_RETRY_DELAY_SECONDS = "30"
 
 # Persistent state: wuzapi stores its sqlite db (paired accounts,
 # session keys) under /app/dbdata. Mount a volume so the pairing
