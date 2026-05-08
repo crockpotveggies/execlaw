@@ -377,7 +377,37 @@ async fn consumer_loop(
                         Some(Ok(Message::Binary(_))) => {
                             tracing::debug!(target: "host_caps::ws", %url, "ignoring binary frame");
                         }
-                        Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+                        Some(Ok(Message::Ping(payload))) => {
+                            // CRITICAL: once a WebSocketStream is
+                            // split() the library STOPS auto-ponging.
+                            // The application is responsible for
+                            // mirroring every Ping back as a Pong
+                            // carrying the same payload, or the
+                            // peer's keepalive timer fires and
+                            // closes the connection (sms-socket-app
+                            // gateway: ~30s ping, drops after two
+                            // missed pongs ≈ 60-90s of silence on
+                            // the wire).
+                            //
+                            // Writing directly from the read arm
+                            // is safe — `write` is held exclusively
+                            // by the consumer task and only ONE arm
+                            // of this `select!` runs per iteration,
+                            // so we never race the outbox writer.
+                            tracing::debug!(target: "host_caps::ws", %url, len = payload.len(), "pong");
+                            if let Err(e) = write.send(Message::Pong(payload)).await {
+                                tracing::warn!(target: "host_caps::ws", %url, error = %e, "pong send failed; closing connection");
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Pong(_))) => {
+                            // Server-initiated pongs (e.g. response
+                            // to a ping we sent in the future) —
+                            // currently we send no client-side
+                            // pings, so this branch is a no-op.
+                            // Don't break; tungstenite's stream
+                            // already handles protocol bookkeeping.
+                        }
                         Some(Ok(Message::Close(_))) | None => {
                             tracing::info!(target: "host_caps::ws", %url, "stream ended; reconnecting");
                             break;
@@ -608,6 +638,122 @@ mod ws_headers_tests {
         assert!(
             auth.is_none(),
             "no headers requested but Authorization arrived: {captured:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ws_keepalive_tests {
+    //! Regression coverage for WebSocket-level keepalive (Ping →
+    //! Pong). The sms-socket-app gateway sends a Ping every ~30s
+    //! and drops the connection after two missed pongs (~60-90s
+    //! of silence). Tokio-tungstenite STOPS auto-ponging once the
+    //! stream is split — the application is responsible for
+    //! mirroring every Ping back as a Pong with the same payload.
+    //!
+    //! Symptom of regression: a connection that's idle for ~90s
+    //! gets cleanly closed by the server (`stream ended` log),
+    //! and on a busy server, the close happens around the moment
+    //! of the next inbound event because that's when the server
+    //! tries to deliver to a connection it's already marked dead.
+    //!
+    //! These tests spin up a real WS server, send a Ping with a
+    //! known payload, and assert the consumer_loop returns a
+    //! Pong with the same payload within a generous timeout.
+    use super::*;
+    use futures::sink::SinkExt;
+    use futures::stream::StreamExt;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio_tungstenite::tungstenite::Message;
+
+    /// Ping-pong fixture: spawn a server that accepts a single
+    /// connection, sends a Ping with a known payload after a
+    /// brief settle, then waits for the matching Pong (or any
+    /// frame), forwarding what it received via the oneshot.
+    async fn ping_then_capture_pong(
+        ping_payload: Vec<u8>,
+    ) -> (String, oneshot::Receiver<Option<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let ws = match tokio_tungstenite::accept_async(stream).await {
+                Ok(ws) => ws,
+                Err(_) => {
+                    let _ = tx.send(None);
+                    return;
+                }
+            };
+            let (mut server_write, mut server_read) = ws.split();
+
+            // Brief settle — the client (consumer_loop) needs to
+            // get into its select! loop. Without this, the Ping
+            // can race the read.next() registration.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            if server_write
+                .send(Message::Ping(ping_payload.into()))
+                .await
+                .is_err()
+            {
+                let _ = tx.send(None);
+                return;
+            }
+
+            // Wait for the response. We expect Message::Pong with
+            // the same payload. Bounded — if the consumer never
+            // pongs, the test fails on the outer timeout.
+            let frame = tokio::time::timeout(
+                Duration::from_secs(5),
+                server_read.next(),
+            )
+            .await
+            .ok()
+            .flatten();
+            let payload = match frame {
+                Some(Ok(Message::Pong(p))) => Some(p.to_vec()),
+                _ => None,
+            };
+            let _ = tx.send(payload);
+        });
+        (format!("ws://127.0.0.1:{port}/"), rx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consumer_responds_to_ping_with_matching_pong() {
+        let ping_payload = b"keepalive-12345".to_vec();
+        let expected = ping_payload.clone();
+        let (url, captured_rx) = ping_then_capture_pong(ping_payload).await;
+
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let handle = WsSubscriptionHandle::new(cancel.clone());
+        let on_frame: WsFrameHandler =
+            Arc::new(|_| Box::pin(async move { /* drop */ }));
+        let cancel_for_task = cancel.clone();
+        let task = tokio::spawn(async move {
+            consumer_loop(url, vec![], vec![], on_frame, cancel_for_task, handle).await;
+        });
+
+        let captured = tokio::time::timeout(Duration::from_secs(8), captured_rx)
+            .await
+            .expect("test timed out waiting for pong")
+            .expect("oneshot received");
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+
+        let payload = captured.expect(
+            "consumer_loop did not respond to Ping with a Pong — \
+             tokio-tungstenite stops auto-ponging after split(); \
+             see the Message::Ping arm in consumer_loop",
+        );
+        assert_eq!(
+            payload, expected,
+            "Pong payload must mirror the Ping payload bit-for-bit \
+             per RFC 6455 §5.5.3"
         );
     }
 }
