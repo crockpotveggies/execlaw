@@ -224,6 +224,21 @@ pub struct RegisteredAdminRoute {
     pub description: Option<String>,
 }
 
+/// Same shape as `RegisteredAdminRoute` but for unauthenticated
+/// `[[webhook_routes]]` mounted at `/api/webhooks/{plugin_id}{path}`.
+/// Held in its own map so the public-webhook dispatcher can't
+/// accidentally pick up an admin route, and vice-versa — keeping
+/// the two surfaces strictly disjoint avoids accidental auth
+/// bypass.
+#[derive(Debug, Clone)]
+pub struct RegisteredWebhookRoute {
+    pub plugin_id: String,
+    pub method: String,
+    pub path: String,
+    pub handler: String,
+    pub description: Option<String>,
+}
+
 /// Result of [`HookRegistry::lookup_any`]. The dispatch layer pattern-
 /// matches on this so it can either invoke a built-in directly or
 /// drop into the plugin RPC path with the metadata.
@@ -285,6 +300,12 @@ struct HookRegistryInner {
     /// every entry resolves to a Rhai handler in the plugin's
     /// script. Cleared on plugin disable/uninstall.
     admin_routes: BTreeMap<String, Vec<RegisteredAdminRoute>>,
+    /// Per-plugin webhook routes (`[[webhook_routes]]`). Mounted
+    /// UNAUTHENTICATED under `/api/webhooks/{plugin_id}` by the
+    /// host's webhook dispatcher. Plugins are responsible for
+    /// validating the request inside the Rhai handler — typically
+    /// matching a secret query-token against a vault row.
+    webhook_routes: BTreeMap<String, Vec<RegisteredWebhookRoute>>,
     enabled_plugins: BTreeSet<String>,
 }
 
@@ -550,6 +571,26 @@ impl HookRegistry {
                 .collect();
             w.admin_routes.insert(plugin_id.clone(), cached);
         }
+        if !manifest.webhook_routes.is_empty() {
+            let cached: Vec<RegisteredWebhookRoute> = manifest
+                .webhook_routes
+                .iter()
+                .map(|r| {
+                    let mut path = r.path.clone();
+                    if !path.starts_with('/') {
+                        path.insert(0, '/');
+                    }
+                    RegisteredWebhookRoute {
+                        plugin_id: plugin_id.clone(),
+                        method: r.method.to_uppercase(),
+                        path,
+                        handler: r.handler.clone(),
+                        description: r.description.clone(),
+                    }
+                })
+                .collect();
+            w.webhook_routes.insert(plugin_id.clone(), cached);
+        }
         w.enabled_plugins.insert(plugin_id.clone());
         Ok(())
     }
@@ -569,6 +610,7 @@ impl HookRegistry {
         w.alert_sources.retain(|s| s.plugin_id != plugin_id);
         w.oauth_accounts.remove(plugin_id);
         w.admin_routes.remove(plugin_id);
+        w.webhook_routes.remove(plugin_id);
         w.enabled_plugins.remove(plugin_id);
     }
 
@@ -759,6 +801,19 @@ impl HookRegistry {
             .read()
             .unwrap()
             .admin_routes
+            .get(plugin_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Webhook routes (`[[webhook_routes]]`) declared by `plugin_id`.
+    /// Same shape as admin_routes_for but for the unauthenticated
+    /// public-callback surface. Empty when the plugin declares none.
+    pub fn webhook_routes_for(&self, plugin_id: &str) -> Vec<RegisteredWebhookRoute> {
+        self.inner
+            .read()
+            .unwrap()
+            .webhook_routes
             .get(plugin_id)
             .cloned()
             .unwrap_or_default()

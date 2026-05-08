@@ -34,7 +34,8 @@
 // a real paired account. The endpoints + body shapes match
 // wuzapi's documented API but field-casing drift is possible.
 
-const USER_TOKEN_NAME = "execlaw-user";
+// USER_TOKEN_NAME = "execlaw-user" — inlined at every call site
+// (Rhai's module-level `const` doesn't reach into fn bodies).
 
 // =====================================================================
 // LIFECYCLE
@@ -57,19 +58,67 @@ fn on_enable() {
         return;
     }
     // Connect the session so /session/qr starts returning the
-    // QR code instead of 500-ing with "no session". Idempotent —
-    // wuzapi treats a second /session/connect on a connected
-    // session as a no-op.
+    // QR code instead of 500-ing with "no session". The
+    // ensure_session_connected helper swallows wuzapi's HTTP 500
+    // "already connected" response since that's the desired state.
     try {
         ensure_session_connected(base);
     } catch (e) {
         log_warn("whatsapp: /session/connect failed: " + e + " — pairing UI will retry on each poll");
     }
-    let host_port = base.sub_string(7); // strip "http://"
-    let ws = "ws://" + host_port + "/ws?token=" + url_encode("execlaw-user");
-    log_info("whatsapp: subscribing to inbound WebSocket at ws://" + host_port + "/ws");
-    let _handle = ws_subscribe(ws, "on_frame");
+    // wuzapi has no WebSocket event surface (verified upstream:
+    // routes.go has /session/qr / /webhook / /chat/* but no /ws,
+    // and the surveyed alternatives — WAHA / WPPConnect /
+    // Evolution-API — all use Socket.IO which our raw-WS client
+    // can't speak). Event delivery flows through wuzapi's
+    // webhook: we POST a callback URL to wuzapi /webhook, then
+    // wuzapi POSTs every Message event to our
+    // /api/webhooks/whatsapp/event handler.
+    //
+    // The callback URL embeds a secret token validated inside
+    // the webhook handler. Without the token check the endpoint
+    // is reachable from anyone on the bind address and could be
+    // used to inject fake inbound messages. Generated once at
+    // first enable and persisted in vault.
+    try {
+        ensure_webhook_registered(base);
+    } catch (e) {
+        log_warn("whatsapp: webhook registration failed: " + e + " — inbound messages won't reach the agent until this resolves");
+    }
     ()
+}
+
+// Generate (or reuse) a webhook secret + register the callback
+// URL with wuzapi so it knows where to POST inbound events.
+//
+// Idempotent: on every plugin enable we re-POST so a wuzapi
+// container restart that lost its config gets re-armed. Wuzapi's
+// PUT/POST /webhook endpoints both accept the same payload shape
+// `{webhook, subscribe, ...}`; we use POST.
+fn ensure_webhook_registered(base) {
+    // Generate the secret once, persist for life of the install.
+    let secret = vault_get("webhook_secret");
+    if secret == () || secret == "" {
+        // hash() is deterministic but takes the timestamp as input,
+        // giving us a 64-char hex string per fresh install. Good
+        // enough for a path-only secret — if an attacker can guess
+        // a 256-bit hash they can also guess the api_key.
+        secret = hash(now_ms().to_string() + "-" + "execlaw-user");
+        vault_put("webhook_secret", secret);
+        log_info("whatsapp: minted webhook secret");
+    }
+    // Public callback URL. The host's bind address might not be
+    // 127.0.0.1:3031 in every install — but the wuzapi sidecar
+    // runs in Docker and reaches the host via host.docker.internal
+    // OR the container's gateway. For now hardcode the localhost
+    // bind; future improvement: read from config_general.bind_address.
+    let webhook_url = "http://host.docker.internal:3031/api/webhooks/whatsapp/event?token=" + secret;
+    let body = #{
+        "webhook": webhook_url,
+        "subscribe": ["Message"],
+    };
+    sidecar_http_post(base + "/webhook", body, user_headers());
+    log_info("whatsapp: webhook registered at " + webhook_url.sub_string(0, 50) + "...");
 }
 
 // Idempotent provision of the "execlaw" user. Token is pinned so
@@ -170,11 +219,86 @@ fn on_frame(raw) {
     }
 }
 
+// =====================================================================
+// WEBHOOK
+// =====================================================================
+//
+// Mounted at `POST /api/webhooks/whatsapp/event` per the
+// `[[webhook_routes]]` decl in plugin.toml. Wuzapi POSTs every
+// Message event here as JSON. The handler:
+//
+//   1. Validates `?token=<secret>` matches the vault-stored
+//      webhook_secret (rejects 401 on mismatch). Without this any
+//      caller on the bind address could inject fake messages.
+//   2. Decodes the wuzapi event payload into the channel-agnostic
+//      InboundMessage shape.
+//   3. Calls host_route_inbound to fan out through the standard
+//      pipeline (trust admit, conversation routing, agent dispatch,
+//      etc.).
+//
+// Returns `{ok: true}` on accepted events, `{ok: false, error: ...}`
+// on auth / decode failure. Wuzapi treats non-200 as a delivery
+// failure and may retry; we always respond 200 with an envelope so
+// retries don't compound.
+fn on_webhook_event(args) {
+    let supplied = ();
+    if args.query != () && args.query.token != () {
+        supplied = args.query.token;
+    }
+    let expected = vault_get("webhook_secret");
+    if expected == () || expected == "" {
+        log_warn("whatsapp: webhook hit but no secret in vault — refusing (re-enable the plugin to mint a fresh secret)");
+        return #{ "ok": false, "error": "webhook_secret_missing" };
+    }
+    if supplied == () || supplied != expected {
+        log_warn("whatsapp: webhook token mismatch from caller; rejecting");
+        return #{ "ok": false, "error": "invalid_token" };
+    }
+    let body = args.body;
+    if body == () || type_of(body) != "map" {
+        return #{ "ok": false, "error": "missing_body" };
+    }
+    let inbound = decode_event_map(body);
+    if inbound == () {
+        // Most events are non-content (read receipts, presence,
+        // history sync chunks). decode_event_map returns Unit for
+        // those — accept and ack so wuzapi doesn't retry.
+        return #{ "ok": true };
+    }
+    try {
+        host_route_inbound(inbound);
+    } catch (e) {
+        log_warn("whatsapp: host_route_inbound rejected: " + e);
+    }
+    #{ "ok": true }
+}
+
 // Pure helper: decode a wuzapi WS event into the channel-agnostic
 // InboundMessage shape OR `()` for non-content events.
+//
+// Kept against the raw-string path even though we no longer have
+// a WS event surface — the tests in
+// `crates/script/tests/whatsapp_plugin.rs` (when they exist) call
+// this with raw JSON strings. The webhook code path goes through
+// `decode_event_map` directly because the body is already a Map
+// by the time the host's webhook dispatcher calls our handler.
 fn decode_frame(raw) {
     try {
         let env = parse_json(raw);
+        if env == () { return (); }
+        return decode_event_map(env);
+    } catch (e) {
+        log_warn("whatsapp: undecodable frame: " + e);
+        return ();
+    }
+}
+
+// Pure helper: same logic as decode_frame but takes an
+// already-parsed Map. Webhook handler uses this directly because
+// the host's webhook dispatcher passes `body` as a Map (decoded
+// from the wuzapi POST's JSON body).
+fn decode_event_map(env) {
+    try {
         if env == () { return (); }
         if env.type != () && env.type != "Message" { return (); }
 
@@ -247,7 +371,7 @@ fn decode_frame(raw) {
             "attachments": attachments,
         };
     } catch (e) {
-        log_warn("whatsapp: undecodable frame: " + e);
+        log_warn("whatsapp: undecodable event: " + e);
         return ();
     }
 }
@@ -528,6 +652,18 @@ fn admin_status(req) {
         };
     }
 
+    // Opportunistically re-register the webhook on every status
+    // poll. on_enable's attempt may have failed (wuzapi was
+    // cycling) and the SPA polls /status every few seconds, so
+    // this gives us a natural retry rhythm without needing a
+    // dedicated background task.
+    try {
+        ensure_webhook_registered(base);
+    } catch (e) {
+        // Non-fatal — log and let the next poll retry.
+        log_warn("whatsapp: webhook re-register from status failed: " + e);
+    }
+
     let accounts = [];
     let fetch_error = ();
     try {
@@ -582,6 +718,16 @@ fn admin_qrcodelink(req) {
         ensure_session_connected(base);
     } catch (e) {
         return #{ "error": "wuzapi /session/connect failed: " + e };
+    }
+    // Retry webhook registration here too — on_enable's attempt
+    // may have hit a wuzapi-cycling Network Error and given up.
+    // Operator clicking the QR-pair button is a natural retry
+    // moment; if wuzapi is up enough to serve the QR, it's up
+    // enough to accept the webhook config.
+    try {
+        ensure_webhook_registered(base);
+    } catch (e) {
+        log_warn("whatsapp: webhook re-register from qrcodelink failed: " + e);
     }
     try {
         let resp = sidecar_http_get(base + "/session/qr", #{}, #{ "Token": token });

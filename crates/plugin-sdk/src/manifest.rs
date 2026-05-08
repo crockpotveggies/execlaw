@@ -61,6 +61,15 @@ pub struct PluginManifest {
     #[serde(default)]
     pub admin_routes: Vec<AdminRouteDecl>,
 
+    /// Public webhook routes the plugin exposes for receiving
+    /// callbacks from third-party services. Mounted UNAUTHENTICATED
+    /// at `/api/webhooks/{plugin_id}{path}` — see `WebhookRouteDecl`
+    /// for the security contract (handlers MUST validate a shared
+    /// secret in the URL or body). First user: WhatsApp / wuzapi
+    /// posting message events here.
+    #[serde(default)]
+    pub webhook_routes: Vec<WebhookRouteDecl>,
+
     /// Runtime declaration — which isolation tier (§4.4) the plugin
     /// runs in and how to spawn it. Optional because tool-only
     /// plugins can sometimes be resolved in-process (Phase 3+
@@ -374,6 +383,43 @@ pub struct AdminRouteDecl {
     pub handler: String,
     /// Optional human-readable description shown in plugin
     /// catalog / docs UIs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Public webhook route a plugin exposes for receiving callbacks
+/// from third-party services (e.g. wuzapi → execlaw event POSTs).
+/// Mounted by the host under
+/// `/api/webhooks/{plugin_id}{path}` — UNAUTHENTICATED at the HTTP
+/// layer because external callers can't hold execlaw JWTs. The
+/// plugin's handler is responsible for verifying the request's
+/// authenticity (typically a secret token in the URL query string
+/// matched against a vault-stored value).
+///
+/// ```toml
+/// [[webhook_routes]]
+/// method = "POST"
+/// path   = "/event"
+/// handler = "on_webhook_event"
+/// description = "wuzapi posts WhatsApp message events here."
+/// ```
+///
+/// The Rhai handler signature mirrors `[[admin_routes]]` —
+/// `fn on_webhook_event(args)` — `args` carries `method`, `path`,
+/// `query`, `body`. Return value becomes the HTTP response body
+/// (JSON-serialised). Throw to surface a 500.
+///
+/// **Security**: this surface is reachable from anyone who can
+/// hit the host's bind address. Plugin handlers MUST validate the
+/// caller's identity before doing anything stateful — the typical
+/// pattern is a `?token={secret}` query param compared against a
+/// `vault_get("webhook_secret")` value with a constant-time
+/// comparison.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WebhookRouteDecl {
+    pub method: String,
+    pub path: String,
+    pub handler: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }

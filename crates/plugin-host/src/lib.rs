@@ -18,7 +18,7 @@ pub use builtin_registrar::{RegisterBuiltinsError, register_builtins, register_c
 pub use hook_registry::{
     HookRegistry, RegisteredAdminRoute, RegisteredAlertSource, RegisteredAny, RegisteredBuiltin,
     RegisteredEventSubscription, RegisteredIdentityProvider, RegisteredTool, RegisteredTransport,
-    RegisteredUiPanel,
+    RegisteredUiPanel, RegisteredWebhookRoute,
 };
 pub use host::{BuiltinTools, PluginHost, PluginHostError, PluginRow};
 pub use subprocess::{RpcError, RpcRequest, RpcResponse, SubprocessPlugin, SubprocessSpec};
