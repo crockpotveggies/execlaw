@@ -309,7 +309,56 @@ fn on_webhook_event(args) {
     } catch (e) {
         log_warn("whatsapp: host_route_inbound rejected: " + e);
     }
+    // Fire-and-forget read receipt back to wuzapi so the sender's
+    // single-tick turns to double-tick-blue. Done after dispatch
+    // because the agent should appear to read THEN reply, mirroring
+    // how a human conversation looks. Failures are logged but do
+    // not affect the webhook response — read receipts are cosmetic
+    // and can be retried by the user re-opening the chat.
+    try {
+        mark_inbound_read(event_map);
+    } catch (e) {
+        log_warn("whatsapp: markread failed: " + e);
+    }
     #{ "ok": true }
+}
+
+// Best-effort POST /chat/markread for an inbound message event.
+//
+// Wuzapi's MarkRead accepts (per upstream `markReadStruct` in
+// handlers.go):
+//   { Id: [msgid, ...], Chat: <JID>, Sender: <JID> }
+// where Chat / Sender are the legacy whatsmeow JID strings (the
+// new ChatPhone / SenderPhone fields parse a phone number, but
+// the JID path is what we already have on hand from the webhook
+// payload — and crucially it works for `@lid` privacy-mode
+// senders where no phone is exposed in `Chat`).
+//
+// Skipped when:
+//   * IsFromMe is true — our own echoed outbound, nothing to read.
+//   * Info.ID is missing — can't address the message.
+fn mark_inbound_read(event_map) {
+    if event_map == () { return; }
+    let event = event_map.event;
+    if event == () { return; }
+    let info = event.Info;
+    if info == () { return; }
+    if info.IsFromMe == true { return; }
+    let id = info.ID;
+    if id == () || id == "" { return; }
+    let chat = info.Chat;
+    if chat == () || chat == "" { return; }
+    let body = #{
+        "Id": [id],
+        "Chat": chat,
+    };
+    let sender = info.Sender;
+    if sender != () && sender != "" {
+        body["Sender"] = sender;
+    }
+    let base = sidecar_url_blocking("wuzapi", 5000);
+    if base == () || base == "" { return; }
+    sidecar_http_post(base + "/chat/markread", body, user_headers());
 }
 
 // Resolve a WhatsApp group JID to its user-facing title, with a
