@@ -51,7 +51,7 @@ use crate::routes::ApiError;
 use crate::state::AppState;
 use axum::Router;
 use axum::extract::{Path, Query, State};
-use axum::http::{Method, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::any;
 use std::collections::BTreeMap;
@@ -67,6 +67,7 @@ async fn dispatch_handler(
     Path((plugin_id, tail)): Path<(String, String)>,
     method: Method,
     Query(query): Query<BTreeMap<String, String>>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let path_with_slash = format!("/{tail}");
@@ -103,17 +104,68 @@ async fn dispatch_handler(
             ),
         })?;
 
-    // Decode body — JSON when the third party sent JSON (the
-    // common case for webhooks), else raw string. Plugins that
-    // need raw bytes can set Content-Type: application/octet-stream
-    // and base64 in their handler; for now nothing in-tree needs
-    // that.
+    // Decode body to a JSON value the plugin can pattern-match on.
+    // Three encodings, by order of probable Content-Type:
+    //
+    //   * application/json — most webhooks (Slack, GitHub, Stripe).
+    //   * application/x-www-form-urlencoded — wuzapi (whatsmeow
+    //     wrapper) posts `instanceName=...&jsonData=<urlencoded
+    //     JSON>&userID=...`. We decode it into the same shape a
+    //     JSON post would produce, so plugin code stays uniform.
+    //   * Anything else — fall through to a UTF-8 String so the
+    //     plugin can decide.
+    //
+    // If Content-Type is missing/garbage we still try JSON first
+    // because Slack-style senders sometimes omit it.
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(';').next().unwrap_or("").trim().to_ascii_lowercase())
+        .unwrap_or_default();
     let body_value: serde_json::Value = if body.is_empty() {
         serde_json::Value::Null
+    } else if content_type == "application/x-www-form-urlencoded"
+        || (content_type.is_empty() && body.first() != Some(&b'{') && body.first() != Some(&b'['))
+    {
+        // serde_urlencoded::from_bytes -> Vec<(String, String)>.
+        // Build a JSON object so plugins see `body.fieldName`
+        // exactly as they would for a JSON post. wuzapi puts its
+        // payload inside `jsonData` as a (URL-decoded) JSON
+        // string — the plugin's handler is already expected to
+        // re-parse that with parse_json.
+        match serde_urlencoded::from_bytes::<Vec<(String, String)>>(&body) {
+            Ok(pairs) => {
+                let map: serde_json::Map<String, serde_json::Value> = pairs
+                    .into_iter()
+                    .map(|(k, v)| (k, serde_json::Value::String(v)))
+                    .collect();
+                serde_json::Value::Object(map)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    plugin_id = %plugin_id,
+                    body_len = body.len(),
+                    body_preview = %String::from_utf8_lossy(&body[..body.len().min(400)]),
+                    parse_err = %e,
+                    "webhook body not form-urlencoded; falling back to String"
+                );
+                serde_json::Value::String(String::from_utf8_lossy(&body).to_string())
+            }
+        }
     } else {
         match serde_json::from_slice(&body) {
             Ok(v) => v,
-            Err(_) => serde_json::Value::String(String::from_utf8_lossy(&body).to_string()),
+            Err(e) => {
+                tracing::warn!(
+                    plugin_id = %plugin_id,
+                    content_type = %content_type,
+                    body_len = body.len(),
+                    body_preview = %String::from_utf8_lossy(&body[..body.len().min(400)]),
+                    parse_err = %e,
+                    "webhook body not JSON; falling back to String"
+                );
+                serde_json::Value::String(String::from_utf8_lossy(&body).to_string())
+            }
         }
     };
     let query_value = serde_json::Value::Object(

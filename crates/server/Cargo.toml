@@ -37,6 +37,7 @@ tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_urlencoded = "0.7"
 jsonwebtoken.workspace = true
 ed25519-dalek = { workspace = true, features = ["rand_core", "pkcs8", "pem"] }
 rand.workspace = true
