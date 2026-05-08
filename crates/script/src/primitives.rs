@@ -873,6 +873,56 @@ fn register_host_cap_bindings(
         );
     }
 
+    // ws_close_active() -> bool
+    //
+    // Cancel the plugin's most recently subscribed bidi WebSocket
+    // and clear the active-handle slot. Returns true if a handle
+    // was present (and is now closing), false if there was no
+    // active subscription.
+    //
+    // Use case: admin handlers that mutate the credentials a
+    // subscription depends on (api_key, gateway_url, OAuth token
+    // refresh). Operator changes the credentials → handler writes
+    // to vault → handler calls ws_close_active() → handler calls
+    // on_enable() to re-subscribe with the new credentials. No
+    // manual disable/re-enable cycle needed.
+    //
+    // Cancellation is cooperative — the consumer loop checks the
+    // token between frames and on every reconnect tick, so a
+    // close() returns immediately while the actual socket teardown
+    // happens on the next loop iteration. Calling on_enable()
+    // synchronously after this is safe; the new subscription gets
+    // a fresh handle that wins the active slot.
+    {
+        let pid = plugin_id.to_owned();
+        let active_slot = active_bidi_handle.clone();
+        engine.register_fn("ws_close_active", move || -> bool {
+            let mut slot = match active_slot.write() {
+                Ok(s) => s,
+                Err(_) => {
+                    tracing::warn!(
+                        target: "execlaw_script::primitives",
+                        plugin_id = %pid,
+                        "ws_close_active: active-handle lock poisoned"
+                    );
+                    return false;
+                }
+            };
+            match slot.take() {
+                Some(h) => {
+                    h.close();
+                    tracing::debug!(
+                        target: "execlaw_script::primitives",
+                        plugin_id = %pid,
+                        "ws_close_active: cancelled active subscription"
+                    );
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+
     // ws_send_to_active(text_msg) -> bool
     //
     // Send a text frame on the plugin's most recently subscribed

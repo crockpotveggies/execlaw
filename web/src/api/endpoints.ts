@@ -2410,8 +2410,8 @@ export async function setSmsSocketConfig(
     gateway_url: string,
     default_subscription_id: string,
     tokenAccessor: () => string | null,
-): Promise<{ ok: boolean; restart_required?: string }> {
-    return apiFetch<{ ok: boolean; restart_required?: string }>(
+): Promise<{ ok: boolean; reconnected?: boolean }> {
+    return apiFetch<{ ok: boolean; reconnected?: boolean }>(
         "/api/admin/plugins/sms-socket/config",
         {
             method: "POST",

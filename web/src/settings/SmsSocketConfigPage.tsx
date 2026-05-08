@@ -92,15 +92,14 @@ export function SmsSocketConfigPage(_props: PluginConfigProps): JSX.Element {
         setSavedNotice(null);
         setTestStatus({ kind: "idle" });
         try {
-            const r = await setSmsSocketConfig(
+            await setSmsSocketConfig(
                 apiKey,
                 gatewayUrl.trim(),
                 subscriptionId.trim(),
                 getAccessToken,
             );
             setSavedNotice(
-                r.restart_required ??
-                    "Saved. Disable + re-enable the plugin so the WebSocket reconnects with the new credentials.",
+                "Saved. The plugin tore down its old WebSocket and reconnected with the new credentials — check the gateway-status panel below for the next ping.",
             );
             setApiKey("");
             await reload();

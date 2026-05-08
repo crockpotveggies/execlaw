@@ -412,6 +412,23 @@ fn admin_set_config(req) {
     let gateway_url = trim(raw_url);
     let sub = trim(raw_sub);
 
+    // Pre-validate before mutating anything in the vault — half-
+    // applied config (new url written, ws:// check throws) leaves
+    // the plugin in a confusing state. Validate first, then write.
+    if gateway_url != ""
+        && !gateway_url.starts_with("ws://")
+        && !gateway_url.starts_with("wss://")
+    {
+        throw "gateway_url must start with ws:// or wss://";
+    }
+    if sub != "" {
+        try {
+            sub.to_int();
+        } catch (e) {
+            throw "default_subscription_id must be an integer";
+        }
+    }
+
     if api_key == "" {
         vault_delete("api_key");
     } else {
@@ -420,24 +437,34 @@ fn admin_set_config(req) {
     if gateway_url == "" {
         vault_delete("gateway_url");
     } else {
-        if !gateway_url.starts_with("ws://") && !gateway_url.starts_with("wss://") {
-            throw "gateway_url must start with ws:// or wss://";
-        }
         vault_put("gateway_url", gateway_url);
     }
     if sub == "" {
         vault_delete("default_subscription_id");
     } else {
-        // Validate it's an integer.
-        try {
-            sub.to_int();
-        } catch (e) {
-            throw "default_subscription_id must be an integer";
-        }
         vault_put("default_subscription_id", sub);
     }
-    log_info("sms-socket: config updated");
-    #{ "ok": true, "restart_required": "Restart the plugin (Settings → Plugins → SMS Socket → disable + enable) to reconnect with the new credentials." }
+
+    // Reconnect in place so the operator doesn't have to bounce
+    // the plugin to pick up new credentials. ws_close_active()
+    // cancels the existing WS (if any) cooperatively — the
+    // consumer task drops on the next loop tick. on_enable() then
+    // opens a fresh subscription with the values we just wrote.
+    //
+    // Both calls are no-ops in the obvious edge cases:
+    //   * ws_close_active() returns false when there's no active
+    //     handle (first save before anything was running).
+    //   * on_enable() returns early when api_key is missing /
+    //     gateway_url is malformed, logging a warn — exactly the
+    //     same as the cold-start path.
+    let was_active = ws_close_active();
+    on_enable();
+    log_info(
+        "sms-socket: config updated; "
+            + (if was_active { "old WS torn down, " } else { "" })
+            + "reconnected with new credentials"
+    );
+    #{ "ok": true, "reconnected": true }
 }
 
 fn admin_test_message(req) {
