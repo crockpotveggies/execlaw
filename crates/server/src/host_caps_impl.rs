@@ -35,6 +35,16 @@ use std::time::Duration;
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const WS_MIN_BACKOFF: Duration = Duration::from_millis(500);
 const WS_MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Special-case backoff for connections the peer closed gracefully
+/// (RFC 6455 close frame). The sms-socket-app gateway restarts its
+/// WebSocket server on every inbound SMS broadcast — see
+/// SmsDeliverReceiver -> ensureStarted -> startServer's
+/// stop-and-restart pattern. The new server typically binds within
+/// 1-2 seconds; reconnecting at the default 500ms hits the
+/// rebind-in-progress window and gets TCP RST, escalating backoff
+/// unnecessarily. selfhosted-claw used a fixed 3s delay for the
+/// same reason; 2s gives us a comfortable margin.
+const WS_GRACEFUL_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 /// Host-side capability surface backed by an [`AppState`].
 /// Cheap to clone (Arc inside) — the script engine carries one
@@ -432,9 +442,7 @@ async fn consumer_loop(
                         }
                         Some(Ok(Message::Close(frame))) => {
                             // Surface the close code + reason from
-                            // the peer; the previous `stream ended`
-                            // log gave us nothing to act on. RFC
-                            // 6455 close codes:
+                            // the peer. RFC 6455 codes:
                             //   1000 normal, 1001 going away,
                             //   1002 protocol error, 1003 unsupported
                             //   data, 1006 abnormal close (no frame),
@@ -454,6 +462,15 @@ async fn consumer_loop(
                                 close_reason = %reason,
                                 "<<< close frame; reconnecting"
                             );
+                            // Force the post-loop sleep to use the
+                            // graceful-reconnect delay so we land
+                            // cleanly on a peer that's mid-restart
+                            // (sms-socket-app gateway pattern). For
+                            // any close code we treat the close as
+                            // graceful — if the peer sent a frame at
+                            // all, it intended a clean shutdown,
+                            // even if the code is 1011 etc.
+                            backoff = WS_GRACEFUL_RECONNECT_DELAY;
                             break;
                         }
                         None => {

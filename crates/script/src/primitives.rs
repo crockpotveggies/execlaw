@@ -293,6 +293,28 @@ pub(crate) fn register(
     // ---- Time ----------------------------------------------------
 
     engine.register_fn("now", || -> i64 { chrono::Utc::now().timestamp() });
+    engine.register_fn("now_ms", || -> i64 {
+        chrono::Utc::now().timestamp_millis()
+    });
+
+    // ---- String → int parsing -------------------------------------
+    //
+    // Rhai's stdlib registers `parse_int` against `&str` /
+    // `ImmutableString` / `String` only when the BasicMathPackage's
+    // string variant is loaded — depending on Rhai version this is
+    // either default-on or off, and our tests showed `s.to_int()`
+    // and `parse_int(s)` both throw `ErrorFunctionNotFound` against
+    // a 13-digit timestamp string ("1776355864000"). Until we can
+    // confirm Rhai's surface, ship our own — guaranteed to be
+    // available regardless of upstream package configuration.
+    //
+    // Returns `i64` on success, `()` (Unit) on parse failure.
+    engine.register_fn("host_parse_int", |s: ImmutableString| -> Dynamic {
+        match s.parse::<i64>() {
+            Ok(n) => Dynamic::from(n),
+            Err(_) => Dynamic::UNIT,
+        }
+    });
 
     // sleep_ms(millis) — cooperative sleep. Plugins call this from
     // boot-time polling loops (e.g. waiting for a sidecar's HTTP

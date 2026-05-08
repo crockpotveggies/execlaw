@@ -69,15 +69,45 @@ fn on_enable() {
     let headers = #{ "Authorization": "Bearer " + api_key };
 
     // Anchor the rehydrate cursor before we connect. First-install
-    // case (no `last_seen_ms` in vault) defaults to NOW so we
-    // don't dump pre-install history through the agent. Live
-    // delivery takes over from this point. See route_inbound_event
-    // for the cursor-update path that runs on every routed event.
-    let last_seen_ms = vault_get("last_seen_ms");
-    if last_seen_ms == () || last_seen_ms == "" {
-        let anchor = now() * 1000;
-        vault_put("last_seen_ms", anchor.to_string());
-        log_info("sms-socket: first connect — anchoring rehydrate cursor at " + anchor + "ms");
+    // case (no `last_seen_ms` in vault) defaults to NOW so we don't
+    // dump pre-install history through the agent. Live delivery
+    // takes over from this point. See advance_cursor for the
+    // cursor-update path that runs on every replayed/live event.
+    //
+    // Also re-anchor when the vault holds 0 (or any non-positive /
+    // unparseable value). That state happens when an earlier
+    // version of the plugin wrote a sentinel, or the operator
+    // manually nuked the row — without re-anchoring, every connect
+    // would request `since=0` and the gateway returns its full
+    // event buffer, flooding the agent with belated auto-replies.
+    // Anchor logic. Three cases:
+    //
+    //   1. Empty / "0" sentinel — first install or wiped. Anchor
+    //      to NOW so we don't replay pre-install history.
+    //   2. Stale cursor (older than 60s) — operator's gateway had
+    //      a long downtime window OR the cursor wasn't being
+    //      updated due to bugs in earlier plugin versions. Clamp
+    //      to NOW to stop the rehydrate flood; we accept losing
+    //      <=60s of inbound that landed during the disabled window.
+    //   3. Recent cursor — leave it alone; live delivery / brief
+    //      reconnects covered by it.
+    let last_seen_ms_raw = vault_get("last_seen_ms");
+    let now_ms = now() * 1000;
+    let stale_threshold = now_ms - 60_000;
+    let needs_anchor = false;
+    if last_seen_ms_raw == () || last_seen_ms_raw == "" || last_seen_ms_raw == "0" {
+        needs_anchor = true;
+    } else {
+        let parsed = host_parse_int(last_seen_ms_raw);
+        if parsed == () || parsed < stale_threshold {
+            needs_anchor = true;
+        }
+    }
+    if needs_anchor {
+        vault_put("last_seen_ms", now_ms.to_string());
+        log_info("sms-socket: anchoring rehydrate cursor at " + now_ms + "ms (was: " + last_seen_ms_raw + ")");
+    } else {
+        log_info("sms-socket: vault has cursor=" + last_seen_ms_raw);
     }
 
     // Sequential handshake — send `getGatewayState` ONLY as the
@@ -201,19 +231,38 @@ fn on_frame(handle, raw) {
             log_info("sms-socket: rehydrate returned " + count + " event(s); cursor=" + cursor + "ms");
             let routed = 0;
             let skipped = 0;
+            let advanced = 0;
             for nested in env.payload.events {
                 if type_of(nested) != "map" { continue; }
                 let nested_type = nested.type;
                 if nested_type == () || nested_type == "" { continue; }
-                if nested_type != "sms.received" && nested_type != "mms.received" {
-                    continue;
-                }
+
+                // Pull the timestamp first; we use it for BOTH the
+                // skip filter AND the cursor advance below.
                 let nested_ts = ();
                 if nested.payload != () && nested.payload.receivedAt != () {
                     nested_ts = nested.payload.receivedAt;
                 } else if nested.timestamp != () {
                     nested_ts = nested.timestamp;
                 }
+
+                // Advance the cursor for EVERY event regardless of
+                // type — outbound-sent / delivered / unknown types
+                // we don't dispatch still need to move the cursor
+                // past them, otherwise the next rehydrate re-fetches
+                // them forever and the response grows unboundedly.
+                advance_cursor(nested_ts);
+
+                // Only sms.received and mms.received route through
+                // the agent.
+                if nested_type != "sms.received" && nested_type != "mms.received" {
+                    advanced += 1;
+                    continue;
+                }
+                // Defense-in-depth: skip events at or before the
+                // cursor we PASSED IN. Captures gateway bugs that
+                // ignore `since` and the case where vault was just
+                // re-anchored mid-batch.
                 if nested_ts != () && nested_ts <= cursor {
                     skipped += 1;
                     continue;
@@ -222,7 +271,11 @@ fn on_frame(handle, raw) {
                     routed += 1;
                 }
             }
-            log_info("sms-socket: rehydrate replay done; routed=" + routed + " skipped=" + skipped);
+            log_info(
+                "sms-socket: rehydrate replay done; routed=" + routed
+                    + " skipped=" + skipped
+                    + " cursor-advanced=" + advanced
+            );
         }
         return;
     }
@@ -261,13 +314,7 @@ fn route_inbound_event(env_type, env) {
     // ingest), we still want the cursor moved past this event so
     // the NEXT rehydrate doesn't re-fetch it. The host's own dedup
     // is a safety net; the cursor is the primary correctness lever.
-    let ts = inbound.timestamp_ms;
-    if ts != () {
-        let prev = read_last_seen_ms();
-        if ts > prev {
-            vault_put("last_seen_ms", ts.to_string());
-        }
-    }
+    advance_cursor(inbound.timestamp_ms);
     try {
         host_route_inbound(inbound);
     } catch (e) {
@@ -276,14 +323,36 @@ fn route_inbound_event(env_type, env) {
     true
 }
 
+// Advance last_seen_ms in vault to max(prev, ts). Called from
+// route_inbound_event AND from the rehydrate-replay loop for every
+// event the gateway returns (including outbound-sent / delivered /
+// other types we don't dispatch). Must run for ALL events otherwise
+// non-dispatched types (sms.outbound.sent, mms.outbound.delivered,
+// etc.) keep coming back on every rehydrate, growing the response
+// unboundedly.
+fn advance_cursor(ts) {
+    if ts == () { return; }
+    if type_of(ts) != "i64" && type_of(ts) != "int" { return; }
+    if ts <= 0 { return; }
+    let prev = read_last_seen_ms();
+    if ts > prev {
+        vault_put("last_seen_ms", ts.to_string());
+    }
+}
+
 fn read_last_seen_ms() {
     let raw = vault_get("last_seen_ms");
     if raw == () || raw == "" { return 0; }
-    try {
-        return raw.to_int();
-    } catch (e) {
-        return 0;
-    }
+    // CRITICAL: Rhai's stdlib does NOT register `to_int` for
+    // &str / ImmutableString / String in this engine config —
+    // the method-style `s.to_int()` call throws
+    // ErrorFunctionNotFound which try/catch silently swallowed,
+    // returning 0 and breaking every cursor-aware code path. The
+    // host registers a guaranteed-available `host_parse_int(s)`
+    // primitive in primitives.rs.
+    let parsed = host_parse_int(raw);
+    if parsed == () { return 0; }
+    parsed
 }
 
 fn decode_event(env_type, env) {
@@ -472,13 +541,12 @@ fn strip_data_url_prefix(s) {
 }
 
 fn with_subscription(payload) {
-    // admin_set_config validates that default_subscription_id is
-    // an integer at write time, so we don't need a runtime catch
-    // here — if the vault has anything else, the install is
-    // already corrupt and a thrown error is the right surface.
     let sub = vault_get("default_subscription_id");
     if sub != () && sub != "" {
-        payload.subscriptionId = sub.to_int();
+        let parsed = host_parse_int(sub);
+        if parsed != () {
+            payload.subscriptionId = parsed;
+        }
     }
     payload
 }
@@ -490,12 +558,12 @@ fn next_request_id() {
     // counter that increments on every call. The vault RMW is a
     // tradeoff: rare in practice (tool calls serialise per
     // conversation), and the cost of a duplicate ID is gateway
-    // confusion (which we just got bitten by — see the close-1001
-    // bug fix in the handshake), worse than a vault read.
+    // confusion, worse than a vault read.
     let raw = vault_get("req_counter");
     let n = 0;
     if raw != () && raw != "" {
-        try { n = raw.to_int(); } catch (e) {}
+        let parsed = host_parse_int(raw);
+        if parsed != () { n = parsed; }
     }
     n += 1;
     vault_put("req_counter", n.to_string());
@@ -585,9 +653,8 @@ fn admin_set_config(req) {
         throw "gateway_url must start with ws:// or wss://";
     }
     if sub != "" {
-        try {
-            sub.to_int();
-        } catch (e) {
+        let parsed = host_parse_int(sub);
+        if parsed == () {
             throw "default_subscription_id must be an integer";
         }
     }
