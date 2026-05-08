@@ -45,6 +45,15 @@ const WS_MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// unnecessarily. selfhosted-claw used a fixed 3s delay for the
 /// same reason; 2s gives us a comfortable margin.
 const WS_GRACEFUL_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+/// Backoff cap used after we've seen a clean Close frame from the
+/// peer. Lower than `WS_MAX_BACKOFF` because a graceful close
+/// usually means the peer is intentionally cycling (Android
+/// foreground-service restart, gateway restart-on-sms, k8s pod
+/// rotation) and will be back within tens of seconds; the default
+/// 60s cap leaves the operator staring at "actively refused" much
+/// longer than necessary. Resets to MAX as soon as we successfully
+/// connect again.
+const WS_GRACEFUL_RECONNECT_CAP: Duration = Duration::from_secs(10);
 
 /// Host-side capability surface backed by an [`AppState`].
 /// Cheap to clone (Arc inside) — the script engine carries one
@@ -255,6 +264,11 @@ async fn consumer_loop(
     use tokio_tungstenite::tungstenite::http::HeaderValue;
 
     let mut backoff = WS_MIN_BACKOFF;
+    // Backoff cap. Defaults to WS_MAX_BACKOFF (60s) but gets
+    // tightened to WS_GRACEFUL_RECONNECT_CAP (10s) after a clean
+    // close so we land on a cycling peer faster. Reset to default
+    // on each successful connect.
+    let mut cap = WS_MAX_BACKOFF;
     while !cancel.is_cancelled() {
         // Build a client request so we can stamp custom headers
         // on the WS upgrade. Empty `headers` is equivalent to a
@@ -318,8 +332,14 @@ async fn consumer_loop(
         .await;
         let stream = match connect {
             Ok(Ok((stream, _resp))) => {
-                // Reset backoff on a successful handshake.
+                // Reset backoff + cap on a successful handshake. A
+                // peer that just accepted our connection might
+                // misbehave next time, so we deliberately re-open
+                // the cap to its full default — the post-close
+                // tightening only applies to ONE close→reconnect
+                // cycle.
                 backoff = WS_MIN_BACKOFF;
+                cap = WS_MAX_BACKOFF;
                 tracing::info!(target: "host_caps::ws", %url, "connected");
                 stream
             }
@@ -328,7 +348,7 @@ async fn consumer_loop(
                 if !sleep_or_cancel(backoff, &cancel).await {
                     return;
                 }
-                backoff = (backoff * 2).min(WS_MAX_BACKOFF);
+                backoff = (backoff * 2).min(cap);
                 continue;
             }
             Err(_) => {
@@ -336,7 +356,7 @@ async fn consumer_loop(
                 if !sleep_or_cancel(backoff, &cancel).await {
                     return;
                 }
-                backoff = (backoff * 2).min(WS_MAX_BACKOFF);
+                backoff = (backoff * 2).min(cap);
                 continue;
             }
         };
@@ -449,7 +469,7 @@ async fn consumer_loop(
                             //   1008 policy violation, 1009 too big,
                             //   1011 internal error.
                             let (code, reason) = match frame {
-                                Some(f) => (
+                                Some(ref f) => (
                                     u16::from(f.code),
                                     f.reason.to_string(),
                                 ),
@@ -462,6 +482,20 @@ async fn consumer_loop(
                                 close_reason = %reason,
                                 "<<< close frame; reconnecting"
                             );
+                            // RFC 6455 §5.5.1: when receiving a Close
+                            // frame, an endpoint MUST send a Close
+                            // frame in response. Without this, the
+                            // peer's close handshake waits the full
+                            // timeout — sms-socket-app's
+                            // `server.stop(1000)` blocks for a
+                            // gratuitous second per client before
+                            // unbinding the listening port. Echoing
+                            // the same close frame lets the gateway
+                            // rebind faster on its post-SMS restart
+                            // cycle.
+                            let _ = write
+                                .send(Message::Close(frame.clone()))
+                                .await;
                             // Force the post-loop sleep to use the
                             // graceful-reconnect delay so we land
                             // cleanly on a peer that's mid-restart
@@ -471,6 +505,14 @@ async fn consumer_loop(
                             // all, it intended a clean shutdown,
                             // even if the code is 1011 etc.
                             backoff = WS_GRACEFUL_RECONNECT_DELAY;
+                            // Cap subsequent retries at 10s instead
+                            // of the default 60s so we discover a
+                            // rebound peer faster. After a clean
+                            // close the peer is usually
+                            // intentionally cycling (Android service
+                            // restart, gateway restart-on-sms
+                            // pattern) and 60s is way too sparse.
+                            cap = WS_GRACEFUL_RECONNECT_CAP;
                             break;
                         }
                         None => {
@@ -527,7 +569,7 @@ async fn consumer_loop(
         if !sleep_or_cancel(backoff, &cancel).await {
             return;
         }
-        backoff = (backoff * 2).min(WS_MAX_BACKOFF);
+        backoff = (backoff * 2).min(cap);
     }
 }
 

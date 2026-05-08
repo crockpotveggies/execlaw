@@ -174,12 +174,54 @@ async fn decode_canonical_sms_received() {
     assert_eq!(r["text"], "hello there");
     assert_eq!(r["timestamp_ms"], 1700000000000_i64);
     assert!(r["group_id"].is_null(), "SMS has no group concept");
-    assert!(r["display_name"].is_null(), "SMS doesn't carry a name");
+    assert_eq!(
+        r["display_name"], "+14165550100",
+        "decoder must fall back to the phone number so the thread sidebar shows a meaningful label \
+         (was previously null → SPA rendered 'New chat · abc123' for every SMS conversation)"
+    );
     assert!(
         r["attachments"].as_array().unwrap().is_empty(),
         "SMS without MMS payload should have no attachments; got {:?}",
         r["attachments"]
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn decode_uses_gateway_display_name_when_present() {
+    // Rehydrated events carry the gateway's contact-book lookup
+    // result in payload.displayName. When non-empty, we should
+    // prefer it over the phone-number fallback.
+    let plugin = sms_socket_plugin();
+    let raw = r#"{
+        "type": "sms.received",
+        "payload": {
+            "address": "+14165550100",
+            "displayName": "Alice Smith",
+            "body": "hi",
+            "receivedAt": 1700000000000
+        }
+    }"#;
+    let r = invoke_one_str(&plugin, "_test_decode", raw).await;
+    assert_eq!(r["display_name"], "Alice Smith");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn decode_falls_back_to_phone_when_gateway_display_name_empty() {
+    // Live events deliver displayName="" — the gateway does NOT
+    // run contact-lookup on the broadcast hot path. The decoder
+    // must treat empty as missing and fall back to the phone.
+    let plugin = sms_socket_plugin();
+    let raw = r#"{
+        "type": "sms.received",
+        "payload": {
+            "address": "+14165550100",
+            "displayName": "",
+            "body": "hi",
+            "receivedAt": 1700000000000
+        }
+    }"#;
+    let r = invoke_one_str(&plugin, "_test_decode", raw).await;
+    assert_eq!(r["display_name"], "+14165550100");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

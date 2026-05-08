@@ -398,10 +398,26 @@ fn decode_event(env_type, env) {
             ts_ms = env.timestamp;
         }
 
+        // Display name. Sources, in priority order:
+        //   1. Gateway-supplied `displayName` (set on rehydrated
+        //      events when the gateway's contact lookup matched
+        //      the address against the phone's address book).
+        //   2. Fallback: the phone number itself, so the thread
+        //      sidebar shows something meaningful instead of
+        //      "New chat · abc123". The host's identity-resolver
+        //      pipeline (google-contacts etc.) can later overwrite
+        //      this with a real contact name via auto-rename.
+        let display_name = ();
+        if payload.displayName != () {
+            let dn = trim(payload.displayName);
+            if dn != "" { display_name = dn; }
+        }
+        if display_name == () { display_name = phone; }
+
         return #{
             "channel": "sms",
             "native_id": phone,
-            "display_name": (), // SMS doesn't carry a name
+            "display_name": display_name,
             "group_id": (),     // 1:1 only — SMS has no group concept here
             "group_name": (),
             "text": text,
