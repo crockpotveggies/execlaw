@@ -121,14 +121,39 @@ fn ensure_user_token(base) {
     token
 }
 
-// POST /session/connect. Idempotent — wuzapi reports "Connected"
-// on already-connected sessions. Required before /session/qr
-// will return a QR; otherwise that endpoint 500s with "no session".
+// POST /session/connect. Required before /session/qr will return
+// a QR; that endpoint 500s with "no session" without it.
+//
+// Wuzapi is NOT actually idempotent on this endpoint despite the
+// previous comment claiming so — a second /session/connect on an
+// already-connected session returns HTTP 500 with body
+// `{"error":"already connected"}`. We catch that specific error
+// and treat it as success, since "already connected" is exactly
+// what we want. Any OTHER 500 (genuine sidecar fault, missing
+// auth, etc.) re-throws.
 fn ensure_session_connected(base) {
-    sidecar_http_post(base + "/session/connect", #{
-        "Subscribe": ["Message"],
-        "Immediate": true,
-    }, user_headers());
+    try {
+        sidecar_http_post(base + "/session/connect", #{
+            "Subscribe": ["Message"],
+            "Immediate": true,
+        }, user_headers());
+    } catch (e) {
+        // Stringify via concatenation — `e` may be a Rhai Map
+        // (errors from runtime calls come through as ErrorRuntime
+        // structs); `e.to_string()` isn't guaranteed to be
+        // registered, but `"" + e` forces the engine's display
+        // path which is.
+        let msg = "" + e;
+        if msg.contains("already connected") {
+            // Session is already up — that's the desired state.
+            // /session/qr will work for unpaired sessions; for
+            // already-paired sessions the caller should check
+            // status before invoking the QR flow.
+            log_info("whatsapp: session already connected — skipping connect (no-op)");
+            return;
+        }
+        throw e;
+    }
 }
 
 // =====================================================================
