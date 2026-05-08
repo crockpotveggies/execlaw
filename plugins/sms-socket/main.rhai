@@ -37,6 +37,12 @@
 //   * No per-SIM subscription routing through the agent — the
 //     operator's configured `default_subscription_id` is applied
 //     to every send.
+//   * Outbound sends use `ws_send_to_active(json)` — the host
+//     keeps a per-plugin "current active bidi WS handle" slot
+//     populated by `ws_subscribe_bidi`. Tool calls reach the
+//     socket without threading the handle through per-call engine
+//     scope. Concurrent sends are safe (the handle's mpsc outbox
+//     is lock-free for producers).
 
 const DEFAULT_GATEWAY_URL = "ws://127.0.0.1:8787/";
 const REHYDRATE_LIMIT = 200;
@@ -81,15 +87,6 @@ fn on_frame(handle, raw) {
 
     let env_type = env.type;
     if env_type == () || env_type == "" { return; }
-
-    // Drain any queued outbound envelopes over the now-active
-    // socket. See submit_envelope for why this lives here instead
-    // of inline in the tool calls.
-    try {
-        flush_outbox(handle);
-    } catch (e) {
-        log_warn("sms-socket: flush_outbox failed: " + e);
-    }
 
     if env_type == "response" {
         // Outbound request ack. v1 fire-and-forget — log non-ok
@@ -319,95 +316,49 @@ fn strip_data_url_prefix(s) {
 }
 
 fn with_subscription(payload) {
+    // admin_set_config validates that default_subscription_id is
+    // an integer at write time, so we don't need a runtime catch
+    // here — if the vault has anything else, the install is
+    // already corrupt and a thrown error is the right surface.
     let sub = vault_get("default_subscription_id");
     if sub != () && sub != "" {
-        try {
-            payload.subscriptionId = sub.to_int();
-        } catch (e) {
-            // Non-integer in vault — ignore.
-        }
+        payload.subscriptionId = sub.to_int();
     }
     payload
 }
 
 fn next_request_id() {
-    // Monotonic-ish — we don't persist across plugin reloads but
-    // the gateway only correlates within a connection so this
-    // suffices for v1. Tag-prefixed so debugging logs are clear.
-    let raw = vault_get("req_counter");
-    let n = 0;
-    if raw != () && raw != "" {
-        try { n = raw.to_int(); } catch (e) { n = 0; }
-    }
-    n += 1;
-    vault_put("req_counter", n.to_string());
-    "sms-" + n.to_string()
+    // Tag with a unix-second timestamp. v1 is fire-and-forget so
+    // we don't actually correlate response → originating tool
+    // call; collisions on the same second are logging-only noise.
+    //
+    // Why not a vault counter? Two concurrent tool calls would
+    // both read the same value and double-mint (RMW isn't atomic
+    // across calls). The gateway only correlates within a
+    // connection so a "good enough" tag is fine.
+    "sms-" + now().to_string()
 }
 
-// Submit an outbound envelope over the active WS handle. Stashed
-// on every connect by stash_handle below; tool calls (which run
-// in their own Rhai engine instance) read it back.
+// Submit an outbound envelope over the plugin's active bidi WS.
+// `ws_send_to_active` reaches into the host-managed per-plugin
+// slot populated by ws_subscribe_bidi — no per-call engine state
+// needed, no vault RMW, safe under concurrent tool-call producers
+// (the handle's outbox is an mpsc).
 //
-// LIMITATION: the WsSubscriptionHandle is held by the on_enable
-// closure, NOT in the per-call engine scope. Tool calls run in a
-// fresh scope so they can't reach `_handle` directly. v1
-// workaround: cache the URL in vault and reconnect-or-reuse via
-// a side-channel. ACTUALLY simpler — the WS consumer in the host
-// keeps the handle alive (closure holds it), and outbound writes
-// must go through ws_send which needs the handle. So we have to
-// stash the handle somehow accessible to the tool call.
-//
-// For v0.1: tool calls cannot directly send. Instead we queue
-// envelopes via a vault-backed outbox that on_frame drains on
-// the NEXT inbound event. This adds latency (next event needed
-// to flush) but works without per-engine state.
-//
-// This is uglier than I'd like — a follow-up should expose a
-// "current ws handle" engine-level slot. For now, accept the
-// flush-on-next-frame quirk: SMS conversations have natural
-// back-and-forth, the operator's reply will trigger the flush.
+// Returns "ok" on enqueue success; throws on disconnect so the
+// agent sees the failure rather than silent black-hole. The
+// gateway's protocol has no client-side redelivery, so we don't
+// retry — if the socket is down, the operator's connection is
+// hosed and queueing won't fix it.
 fn submit_envelope(envelope, tool_name) {
-    let outbox_raw = vault_get("outbox");
-    let outbox = [];
-    if outbox_raw != () && outbox_raw != "" {
-        try {
-            let parsed = parse_json(outbox_raw);
-            if type_of(parsed) == "array" { outbox = parsed; }
-        } catch (e) {}
+    let json_str = to_json_string(envelope);
+    let ok = ws_send_to_active(json_str);
+    if !ok {
+        throw "sms-socket: " + tool_name + " failed — WebSocket not connected. " +
+              "Check the plugin is enabled and the gateway URL is reachable " +
+              "(Settings → Plugins → SMS Socket → Status).";
     }
-    outbox.push(envelope);
-    vault_put("outbox", to_json_string(outbox));
-    log_info("sms-socket: queued " + tool_name + " envelope #" + envelope.requestId + " (will flush on next inbound frame)");
-}
-
-// Drain the vault-backed outbox over the active WS handle.
-// Called from on_frame on every inbound event — typical SMS
-// back-and-forth flushes near-instantly because the gateway
-// emits gateway.state pings + outbound-sent receipts that
-// trigger this.
-fn flush_outbox(handle) {
-    let raw = vault_get("outbox");
-    if raw == () || raw == "" { return; }
-    let outbox;
-    try {
-        outbox = parse_json(raw);
-    } catch (e) { return; }
-    if type_of(outbox) != "array" || outbox.is_empty() { return; }
-    let remaining = [];
-    for env in outbox {
-        let json_str = to_json_string(env);
-        let ok = ws_send(handle, json_str);
-        if !ok {
-            // Disconnected — keep in queue. Next frame's flush
-            // will retry once the consumer reconnects.
-            remaining.push(env);
-        }
-    }
-    if remaining.is_empty() {
-        vault_delete("outbox");
-    } else {
-        vault_put("outbox", to_json_string(remaining));
-    }
+    log_info("sms-socket: sent " + tool_name + " envelope #" + envelope.requestId);
 }
 
 // =====================================================================
@@ -431,22 +382,12 @@ fn admin_status(req) {
         } catch (e) {}
     }
 
-    let outbox_pending = 0;
-    let outbox_raw = vault_get("outbox");
-    if outbox_raw != () && outbox_raw != "" {
-        try {
-            let parsed = parse_json(outbox_raw);
-            if type_of(parsed) == "array" { outbox_pending = parsed.len(); }
-        } catch (e) {}
-    }
-
     #{
         "sidecar_status": if configured { "configured" } else { "unconfigured" },
         "sidecar_rpc_url": (),
         "gateway_url": gateway_url,
         "configured": configured,
         "gateway_state": gateway_state,
-        "outbox_pending": outbox_pending,
     }
 }
 
@@ -515,7 +456,7 @@ fn admin_test_message(req) {
         }),
     };
     submit_envelope(envelope, "sms.admin_test");
-    #{ "ok": true, "request_id": req_id, "note": "Queued. Will flush on next inbound gateway frame (gateway.state pings every ~5s)." }
+    #{ "ok": true, "request_id": req_id, "note": "Sent on the active gateway WebSocket." }
 }
 
 fn mask(s) {
@@ -534,4 +475,26 @@ fn repeat_char(ch, n) {
         i += 1;
     }
     out
+}
+
+// =====================================================================
+// TEST-ONLY HELPERS
+// =====================================================================
+//
+// `_test_decode(raw_json)` — wraps parse_json + decode_event in a
+// single string-arg call so the unit-test fixture in
+// `crates/script/tests/sms_socket_plugin.rs` doesn't have to
+// hand-construct a Rhai Map across the FFI boundary.
+//
+// Production code paths go through on_frame, never through this
+// helper. The leading underscore is a convention signal — any
+// function whose name starts with `_test_` should be assumed
+// non-load-bearing.
+fn _test_decode(raw) {
+    let env;
+    try { env = parse_json(raw); } catch (e) { return (); }
+    if env == () { return (); }
+    let env_type = env.type;
+    if env_type == () || env_type == "" { return (); }
+    decode_event(env_type, env)
 }

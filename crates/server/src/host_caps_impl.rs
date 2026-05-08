@@ -237,15 +237,45 @@ async fn consumer_loop(
         let request = match url.as_str().into_client_request() {
             Ok(mut r) => {
                 for (name, value) in &headers {
-                    if let Ok(v) = HeaderValue::from_str(value) {
-                        // Best-effort header insert. Bad header
-                        // names (with colons / control chars) get
-                        // dropped; we don't fail the whole
-                        // subscription over one malformed header.
-                        if let Ok(name) = name.parse::<tokio_tungstenite::tungstenite::http::HeaderName>() {
-                            r.headers_mut().insert(name, v);
+                    // Validate value first — control chars / non-
+                    // visible ASCII / etc. land here. Failing this
+                    // is almost always an upstream config bug
+                    // (e.g. an api_key with an embedded newline) so
+                    // emit a warn loudly enough that operators see
+                    // it; otherwise the WS would connect anonymously
+                    // and the failure mode is "auth silently doesn't
+                    // work" — far worse than a noisy log.
+                    let v = match HeaderValue::from_str(value) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "host_caps::ws",
+                                %url,
+                                header_name = %name,
+                                error = %e,
+                                "dropping ws header with invalid value (control chars / non-ascii?) — \
+                                 the WS connect will proceed without it; check the header source"
+                            );
+                            continue;
                         }
-                    }
+                    };
+                    let parsed_name = match name
+                        .parse::<tokio_tungstenite::tungstenite::http::HeaderName>()
+                    {
+                        Ok(n) => n,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "host_caps::ws",
+                                %url,
+                                header_name = %name,
+                                error = %e,
+                                "dropping ws header with invalid name — \
+                                 must be a valid HTTP token (no colons, control chars, or whitespace)"
+                            );
+                            continue;
+                        }
+                    };
+                    r.headers_mut().insert(parsed_name, v);
                 }
                 r
             }
@@ -367,5 +397,184 @@ async fn sleep_or_cancel(
     tokio::select! {
         _ = tokio::time::sleep(duration) => true,
         _ = cancel.cancelled() => false,
+    }
+}
+
+#[cfg(test)]
+mod ws_headers_tests {
+    //! Adversarial coverage for the `consumer_loop` header
+    //! injection path. The sms-socket gateway authenticates via
+    //! `Authorization: Bearer <api_key>` on the WS upgrade — if a
+    //! refactor accidentally drops the header, the connect would
+    //! still succeed (gateway accepts anonymous → silently
+    //! authenticated as the wrong principal) and the failure mode
+    //! would be invisible. These tests pin the wire-level
+    //! behavior so that drop never happens silently.
+    //!
+    //! The fixture spins up a real WS server via
+    //! `tokio_tungstenite::accept_hdr_async`, captures the upgrade
+    //! request's headers in the callback, and asserts what
+    //! `consumer_loop` actually sent.
+    use super::*;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+    /// Spin up a one-shot WS server, return (url, captured_headers_rx).
+    /// The server accepts ONE connection, captures its upgrade headers
+    /// into the oneshot, then closes the socket.
+    async fn one_shot_capture_server() -> (String, oneshot::Receiver<Vec<(String, String)>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let captured: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured_for_cb = captured.clone();
+            let callback = move |req: &Request, resp: Response| {
+                let mut slot = captured_for_cb.lock().expect("mutex");
+                for (name, val) in req.headers().iter() {
+                    let v = val.to_str().unwrap_or("<binary>").to_owned();
+                    slot.push((name.as_str().to_owned(), v));
+                }
+                Ok(resp)
+            };
+            // accept_hdr_async drives the handshake AND fires the
+            // callback synchronously inside it — by the time it
+            // returns Ok, headers are captured.
+            let ws = tokio_tungstenite::accept_hdr_async(stream, callback).await;
+            let captured_now = captured.lock().expect("mutex").clone();
+            let _ = tx.send(captured_now);
+            // Hold the socket open just long enough for the client
+            // to consider the connect successful — otherwise the
+            // client may see an immediate close before our send()
+            // pumps. We'll let the consumer's reconnect loop kick
+            // in after we drop the socket.
+            drop(ws);
+        });
+        (format!("ws://127.0.0.1:{port}/"), rx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ws_subscribe_with_headers_sends_authorization_on_upgrade() {
+        let (url, captured_rx) = one_shot_capture_server().await;
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let handle = WsSubscriptionHandle::new(cancel.clone());
+        let on_frame: WsFrameHandler =
+            Arc::new(|_| Box::pin(async move { /* drop frames */ }));
+        let headers = vec![(
+            "Authorization".to_owned(),
+            "Bearer test-api-key-12345".to_owned(),
+        )];
+        // Run consumer_loop briefly; cancel as soon as we've
+        // captured the upgrade headers.
+        let cancel_for_task = cancel.clone();
+        let task = tokio::spawn(async move {
+            consumer_loop(url, headers, on_frame, cancel_for_task, handle).await;
+        });
+        let captured = tokio::time::timeout(Duration::from_secs(3), captured_rx)
+            .await
+            .expect("server captured headers within 3s")
+            .expect("oneshot received");
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+
+        let auth = captured
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("authorization"));
+        assert!(
+            auth.is_some(),
+            "expected Authorization header on WS upgrade; got headers={captured:?}"
+        );
+        assert_eq!(
+            auth.unwrap().1,
+            "Bearer test-api-key-12345",
+            "Authorization header value should arrive verbatim"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ws_subscribe_with_headers_drops_invalid_header_value_but_keeps_connecting() {
+        // A header value with an embedded newline is invalid per
+        // HeaderValue::from_str — the loop should drop it,
+        // tracing::warn, and proceed to connect anyway. Other
+        // (valid) headers must still arrive.
+        let (url, captured_rx) = one_shot_capture_server().await;
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let handle = WsSubscriptionHandle::new(cancel.clone());
+        let on_frame: WsFrameHandler = Arc::new(|_| Box::pin(async move {}));
+        let headers = vec![
+            ("X-Bad".to_owned(), "value\nwith-newline".to_owned()),
+            ("X-Good".to_owned(), "ok".to_owned()),
+        ];
+        let cancel_for_task = cancel.clone();
+        let task = tokio::spawn(async move {
+            consumer_loop(url, headers, on_frame, cancel_for_task, handle).await;
+        });
+        let captured = tokio::time::timeout(Duration::from_secs(3), captured_rx)
+            .await
+            .expect("server captured headers within 3s")
+            .expect("oneshot received");
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+
+        let bad = captured
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("x-bad"));
+        let good = captured
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("x-good"));
+        assert!(
+            bad.is_none(),
+            "X-Bad header had a control char in the value and should have been dropped; \
+             got headers={captured:?}"
+        );
+        assert!(
+            good.is_some(),
+            "X-Good is well-formed and must still arrive on the upgrade; \
+             got headers={captured:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ws_subscribe_with_no_headers_still_connects_and_omits_extras() {
+        // Empty headers vec is the default-ws_subscribe path. The
+        // upgrade should succeed and carry only the standard
+        // tungstenite headers (Host, Upgrade, Connection,
+        // Sec-WebSocket-Key, Sec-WebSocket-Version).
+        let (url, captured_rx) = one_shot_capture_server().await;
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let handle = WsSubscriptionHandle::new(cancel.clone());
+        let on_frame: WsFrameHandler = Arc::new(|_| Box::pin(async move {}));
+        let cancel_for_task = cancel.clone();
+        let task = tokio::spawn(async move {
+            consumer_loop(url, vec![], on_frame, cancel_for_task, handle).await;
+        });
+        let captured = tokio::time::timeout(Duration::from_secs(3), captured_rx)
+            .await
+            .expect("server captured headers within 3s")
+            .expect("oneshot received");
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+
+        // Sanity: the standard upgrade headers are present (proves
+        // we actually connected).
+        let upgrade = captured
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("upgrade"));
+        assert!(
+            upgrade.is_some(),
+            "expected Upgrade header on a successful WS handshake; got={captured:?}"
+        );
+        // And no Authorization slipped in from somewhere else.
+        let auth = captured
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("authorization"));
+        assert!(
+            auth.is_none(),
+            "no headers requested but Authorization arrived: {captured:?}"
+        );
     }
 }

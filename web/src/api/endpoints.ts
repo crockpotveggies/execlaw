@@ -2393,7 +2393,6 @@ export interface SmsSocketStatusResponse {
     gateway_url: string;
     configured: boolean;
     gateway_state: unknown;
-    outbox_pending: number;
 }
 
 export async function getSmsSocketConfig(

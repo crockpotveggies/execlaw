@@ -87,6 +87,22 @@ pub(crate) fn register(
     let pid_for_logs = plugin_id.to_owned();
     let owning_plugin: OwningPluginSlot = Arc::new(Mutex::new(None));
 
+    // Per-plugin "current active bidi WS handle" slot. Populated by
+    // both `ws_subscribe_bidi` overloads (registered in
+    // `register_host_cap_bindings`) after their subscribe future
+    // resolves; consumed by `ws_send_to_active(msg)` so tool calls
+    // (which run in their own per-call Rhai scope and don't have
+    // direct access to the on_enable closure's handle variable) can
+    // push frames back over the same socket.
+    //
+    // This deliberately holds ONE slot — a plugin that opens several
+    // bidi WS subscriptions has to multiplex itself. None of the
+    // current plugins do that. If a plugin needs more than one,
+    // promote this to a Map<tag, handle> with a tag arg on the
+    // subscribe + send bindings.
+    let active_bidi_handle: Arc<std::sync::RwLock<Option<WsSubscriptionHandle>>> =
+        Arc::new(std::sync::RwLock::new(None));
+
     // ---- HTTP -----------------------------------------------------
 
     // http_get(url, query_map, bearer) -> map | array | null
@@ -324,6 +340,7 @@ pub(crate) fn register(
         &pid_for_logs,
         host_caps,
         owning_plugin.clone(),
+        active_bidi_handle.clone(),
     );
 
     owning_plugin
@@ -339,6 +356,14 @@ fn register_host_cap_bindings(
     plugin_id: &str,
     host_caps: HostCapsHandle,
     owning_plugin: OwningPluginSlot,
+    // Per-plugin "current active bidi WS handle" slot, owned by the
+    // outer `register()` and threaded through so the
+    // `ws_subscribe_bidi` overloads here can publish into the same
+    // slot the `ws_send_to_active` binding (also registered in
+    // `register()`) reads from. See the doc comment on the
+    // `active_bidi_handle` declaration in `register` for the
+    // multiplexing caveat.
+    active_bidi_handle: Arc<std::sync::RwLock<Option<WsSubscriptionHandle>>>,
 ) {
     // base64_encode(s) -> base64 (standard alphabet, padded).
     // Surface for plugins that need to wrap binary tokens before
@@ -654,6 +679,7 @@ fn register_host_cap_bindings(
         let pid = plugin_id.to_owned();
         let caps = host_caps.clone();
         let owning = owning_plugin.clone();
+        let active_slot = active_bidi_handle.clone();
         engine.register_fn(
             "ws_subscribe_bidi",
             move |url: ImmutableString,
@@ -737,6 +763,13 @@ fn register_host_cap_bindings(
                         if let Ok(mut slot) = handle_cell.write() {
                             *slot = Some(h.clone());
                         }
+                        // Also publish to the per-plugin "active
+                        // handle" slot so tool calls can reach this
+                        // socket via ws_send_to_active without
+                        // touching the per-call engine scope.
+                        if let Ok(mut slot) = active_slot.write() {
+                            *slot = Some(h.clone());
+                        }
                         Ok(Dynamic::from(h))
                     }
                     Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
@@ -753,6 +786,7 @@ fn register_host_cap_bindings(
         let pid = plugin_id.to_owned();
         let caps = host_caps.clone();
         let owning = owning_plugin.clone();
+        let active_slot = active_bidi_handle.clone();
         engine.register_fn(
             "ws_subscribe_bidi",
             move |url: ImmutableString,
@@ -825,12 +859,73 @@ fn register_host_cap_bindings(
                         if let Ok(mut slot) = handle_cell.write() {
                             *slot = Some(h.clone());
                         }
+                        if let Ok(mut slot) = active_slot.write() {
+                            *slot = Some(h.clone());
+                        }
                         Ok(Dynamic::from(h))
                     }
                     Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
                         format!("[{pid}] ws_subscribe_bidi: {}", e.0).into(),
                         rhai::Position::NONE,
                     ))),
+                }
+            },
+        );
+    }
+
+    // ws_send_to_active(text_msg) -> bool
+    //
+    // Send a text frame on the plugin's most recently subscribed
+    // bidi WebSocket, without needing to thread the handle through
+    // every tool call. Solves the per-call-engine-scope problem:
+    // tool calls run in their own Rhai scope and can't see the
+    // handle the on_enable closure stashed.
+    //
+    // Returns:
+    //   * true on enqueue success
+    //   * false when no active connection (never subscribed yet,
+    //     or the socket is currently disconnected and the handle's
+    //     outbox slot is None) — caller should rely on protocol-
+    //     level redelivery rather than spinning a vault-backed retry
+    //     queue.
+    //
+    // Concurrency: the slot is an Arc<RwLock<…>>; multiple tool
+    // calls writing to the WS concurrently each acquire a read lock,
+    // clone the inner handle (cheap — Arc inside), drop the lock,
+    // then call .send() which goes through the handle's mpsc — that
+    // mpsc IS lock-free and safe for concurrent producers. So no
+    // RMW race like the previous vault-outbox approach had.
+    {
+        let pid = plugin_id.to_owned();
+        let active_slot = active_bidi_handle.clone();
+        engine.register_fn(
+            "ws_send_to_active",
+            move |msg: ImmutableString| -> bool {
+                let h_opt = active_slot.read().ok().and_then(|g| g.clone());
+                let h = match h_opt {
+                    Some(h) => h,
+                    None => {
+                        tracing::debug!(
+                            target: "execlaw_script::primitives",
+                            plugin_id = %pid,
+                            "ws_send_to_active: no active subscription — \
+                             plugin probably hasn't called ws_subscribe_bidi yet"
+                        );
+                        return false;
+                    }
+                };
+                match h.send(msg.to_string()) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "execlaw_script::primitives",
+                            plugin_id = %pid,
+                            error = %e.0,
+                            "ws_send_to_active dropped — caller should rely on \
+                             protocol-level redelivery"
+                        );
+                        false
+                    }
                 }
             },
         );

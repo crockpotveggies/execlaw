@@ -14,12 +14,10 @@
 //   * Test button — queues a one-shot SMS so the operator confirms
 //     the round-trip works end-to-end.
 //
-// v0.1 quirk: tool calls cannot directly send over the WS handle
-// (it lives in the on_enable closure, out of reach of per-call
-// engine scope). So sends go to a vault-backed outbox that drains
-// on the next inbound frame. The gateway emits gateway.state
-// pings every ~5s, so latency is bounded but visible. Surface
-// outbox_pending in the status card so it's not invisible.
+// Tool calls reach the WS via the host's per-plugin "active bidi
+// handle" slot (set by ws_subscribe_bidi, read by ws_send_to_active).
+// Sends are immediate, with no vault-backed outbox in between, so
+// concurrent tool calls are safe under the WS handle's mpsc.
 
 import { useCallback, useEffect, useState } from "react";
 import { Alert, Badge, Button, Card, Form, Spinner } from "react-bootstrap";
@@ -166,7 +164,6 @@ export function SmsSocketConfigPage(_props: PluginConfigProps): JSX.Element {
         (status?.gateway_state as GatewayStatePayload | null | undefined) ??
         null;
     const running = gatewayState?.running === true;
-    const outboxPending = status?.outbox_pending ?? 0;
 
     return (
         <div data-testid="sms-socket-config-page">
@@ -318,12 +315,6 @@ export function SmsSocketConfigPage(_props: PluginConfigProps): JSX.Element {
                                         {gatewayState.connectionCount}
                                     </span>
                                 )}
-                                <span className="execlaw-muted small">
-                                    Outbox depth:{" "}
-                                    <code data-testid="sms-socket-outbox">
-                                        {outboxPending}
-                                    </code>
-                                </span>
                             </div>
                             {gatewayState?.addresses &&
                                 gatewayState.addresses.length > 0 && (
