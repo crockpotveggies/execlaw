@@ -68,62 +68,78 @@ fn on_enable() {
     log_info("sms-socket: subscribing to gateway at " + url);
     let headers = #{ "Authorization": "Bearer " + api_key };
 
-    // Handshake the gateway expects on every connect. Without
-    // these, the gateway treats us as a passive listener and never
-    // delivers `gateway.state` pings or live `sms.received` events.
-    // Mirrors selfhosted-claw's onopen sequence
-    // (sms-socket.ts:430-457).
-    //
-    //   1. getGatewayState — registers this connection as an
-    //      active subscriber and prompts the gateway to start
-    //      pushing live events to us.
-    //   2. rehydrate       — replays history we missed while
-    //      disconnected. The `since` cursor is critical: with
-    //      since=0 the gateway returns every buffered event going
-    //      back potentially weeks, and we'd flood the agent with
-    //      historical messages, which in turn would fire 40+
-    //      outbound auto-replies. Track the most-recent received
-    //      event timestamp in vault and pass that as `since`.
-    //
-    // First-install case: no `last_seen_ms` in the vault yet.
-    // Default to NOW so we don't dump pre-install history through
-    // the agent. The trade-off is that any SMS that came in during
-    // the few seconds between install and on_enable would be
-    // missed on the very first connect — acceptable; live delivery
-    // takes over from this point.
+    // Anchor the rehydrate cursor before we connect. First-install
+    // case (no `last_seen_ms` in vault) defaults to NOW so we
+    // don't dump pre-install history through the agent. Live
+    // delivery takes over from this point. See route_inbound_event
+    // for the cursor-update path that runs on every routed event.
     let last_seen_ms = vault_get("last_seen_ms");
-    let since;
-    if last_seen_ms != () && last_seen_ms != "" {
-        try {
-            since = last_seen_ms.to_int();
-        } catch (e) {
-            since = now() * 1000;
-        }
-    } else {
-        since = now() * 1000;
-        vault_put("last_seen_ms", since.to_string());
-        log_info("sms-socket: first connect — anchoring rehydrate cursor at " + since + "ms");
+    if last_seen_ms == () || last_seen_ms == "" {
+        let anchor = now() * 1000;
+        vault_put("last_seen_ms", anchor.to_string());
+        log_info("sms-socket: first connect — anchoring rehydrate cursor at " + anchor + "ms");
     }
 
+    // Sequential handshake — send `getGatewayState` ONLY as the
+    // init frame; `rehydrate` is fired from on_frame after the
+    // state response arrives. This mirrors selfhosted-claw's
+    // onopen sequence (sms-socket.ts:430-457) which awaits the
+    // state response before sending rehydrate.
+    //
+    // Why sequential matters: empirically, pipelining both
+    // requests on the same WS upgrade leaves the
+    // sms-socket-app gateway in a half-initialized state that
+    // appears OK at handshake time (both responses come back) but
+    // corrupts on the NEXT inbound SMS broadcast — the gateway
+    // sends close 1001 and the Android service terminates. The
+    // selfhosted impl never saw this because its handshake was
+    // strictly sequential.
+    //
+    // Why unique requestIds matter: selfhosted uses a per-process
+    // monotonic counter (sms-socket-1, sms-socket-2, …). Our
+    // previous version reused hardcoded "sms-handshake-state" and
+    // "sms-handshake-rehydrate" on every reconnect — same IDs the
+    // gateway likely tracks in a pending-request map, which corrupts
+    // on duplicate-key insertion across reconnects. We use a
+    // per-connect timestamp suffix so reconnects always carry
+    // fresh IDs.
+    let conn_tag = now().to_string();
+    vault_put("conn_tag", conn_tag);
     let init_state = #{
         "type": "getGatewayState",
-        "requestId": "sms-handshake-state",
+        "requestId": "sms-state-" + conn_tag,
         "payload": #{},
     };
-    let init_rehydrate = #{
+    let init_frames = [to_json_string(init_state)];
+    let _handle = ws_subscribe_bidi(url, "on_frame", headers, init_frames);
+    ()
+}
+
+// Build and send the rehydrate request. Called from on_frame
+// after the gateway responds to our getGatewayState — see the
+// "Sequential handshake" comment in on_enable for why we don't
+// pipeline these.
+fn send_rehydrate_request() {
+    let cursor = read_last_seen_ms();
+    let conn_tag = vault_get("conn_tag");
+    if conn_tag == () || conn_tag == "" {
+        conn_tag = now().to_string();
+    }
+    let env = #{
         "type": "rehydrate",
-        "requestId": "sms-handshake-rehydrate",
+        "requestId": "sms-rehydrate-" + conn_tag,
         "payload": #{
-            "since": since,
+            "since": cursor,
             "limit": 200,
         },
     };
-    let init_frames = [
-        to_json_string(init_state),
-        to_json_string(init_rehydrate),
-    ];
-    let _handle = ws_subscribe_bidi(url, "on_frame", headers, init_frames);
-    ()
+    let json = to_json_string(env);
+    let ok = ws_send_to_active(json);
+    if !ok {
+        log_warn("sms-socket: failed to send rehydrate (WS not connected); will retry on next reconnect");
+    } else {
+        log_info("sms-socket: sent rehydrate (since=" + cursor + "ms)");
+    }
 }
 
 // =====================================================================
@@ -155,33 +171,32 @@ fn on_frame(handle, raw) {
             log_warn("sms-socket: gateway rejected requestId=" + env.requestId + ": " + detail);
             return;
         }
+
+        let req_id = if env.requestId != () { env.requestId } else { "" };
+
+        // State handshake completed — send the rehydrate next.
+        // Prefix-match because requestId carries a per-connect
+        // timestamp suffix (see on_enable's `conn_tag`).
+        if req_id.starts_with("sms-state-") {
+            log_info("sms-socket: getGatewayState ok; sending rehydrate");
+            send_rehydrate_request();
+            return;
+        }
+
         // Rehydrate response carries a history of events in
         // payload.events[]. Each is a full envelope (type, payload).
         //
         // Defense-in-depth cursor filter: even though we asked
         // rehydrate `since: last_seen_ms`, defend against gateway
         // bugs that ignore the cursor and dump full history. We
-        // skip any event with a timestamp <= the cursor we PASSED
-        // IN. The cursor was captured at on_enable time, BEFORE
-        // any new events arrived in this connection, so:
-        //
-        //   * Events older than the cursor → already processed in
-        //     a past session, drop them (no agent dispatch).
-        //   * Events newer than the cursor → genuinely missed
-        //     while disconnected; route them.
-        //
-        // Without this filter, a fresh install or a gateway that
-        // returns the full buffer floods the agent with backlog
-        // and triggers 40+ outbound auto-replies.
-        if env.requestId == "sms-handshake-rehydrate"
+        // skip any event with a timestamp <= the cursor we passed
+        // in.
+        if req_id.starts_with("sms-rehydrate-")
             && env.payload != ()
             && env.payload.events != ()
             && type_of(env.payload.events) == "array"
         {
             let count = env.payload.events.len();
-            // Re-read the cursor at replay time. Using the same
-            // value we passed as `since` keeps the replay window
-            // closed under the rehydrate semantics.
             let cursor = read_last_seen_ms();
             log_info("sms-socket: rehydrate returned " + count + " event(s); cursor=" + cursor + "ms");
             let routed = 0;
@@ -469,15 +484,22 @@ fn with_subscription(payload) {
 }
 
 fn next_request_id() {
-    // Tag with a unix-second timestamp. v1 is fire-and-forget so
-    // we don't actually correlate response → originating tool
-    // call; collisions on the same second are logging-only noise.
-    //
-    // Why not a vault counter? Two concurrent tool calls would
-    // both read the same value and double-mint (RMW isn't atomic
-    // across calls). The gateway only correlates within a
-    // connection so a "good enough" tag is fine.
-    "sms-" + now().to_string()
+    // Per-process unique ID. selfhosted-claw uses a monotonic
+    // counter (sms-socket-N); we don't have shared state across
+    // Rhai engine instances, so we use timestamp + a vault
+    // counter that increments on every call. The vault RMW is a
+    // tradeoff: rare in practice (tool calls serialise per
+    // conversation), and the cost of a duplicate ID is gateway
+    // confusion (which we just got bitten by — see the close-1001
+    // bug fix in the handshake), worse than a vault read.
+    let raw = vault_get("req_counter");
+    let n = 0;
+    if raw != () && raw != "" {
+        try { n = raw.to_int(); } catch (e) {}
+    }
+    n += 1;
+    vault_put("req_counter", n.to_string());
+    "sms-" + now().to_string() + "-" + n.to_string()
 }
 
 // Submit an outbound envelope over the plugin's active bidi WS.

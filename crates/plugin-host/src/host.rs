@@ -524,7 +524,19 @@ impl PluginHost {
         if let Some(plugin) = self.inner.subprocesses.write().await.remove(&new_id) {
             plugin.shutdown().await;
         }
-        let _ = self.inner.script_plugins.write().await.remove(&new_id);
+        // Cancel WS subscriptions from the previous install. CRITICAL
+        // for transport plugins: without this, every reinstall stacks
+        // another consumer task — the new engine subscribes (1
+        // connection), the old engine's task keeps reconnecting from
+        // its own captured Arc (2 connections), inbound is dispatched
+        // twice, and the upstream gateway often crashes from the
+        // duplicate work. See plugin.rs `shutdown` for details.
+        if let Some(plugin) = self.inner.script_plugins.write().await.remove(&new_id) {
+            let cancelled = plugin.shutdown();
+            if cancelled > 0 {
+                info!(plugin_id = %new_id, cancelled, "cancelled live WS subscriptions on reinstall");
+            }
+        }
         self.delete_row(&new_id)?;
         // Best-effort remove the OLD staged directory. If it
         // happens to be the SAME path as the new one (operator
@@ -565,7 +577,17 @@ impl PluginHost {
         if let Some(plugin) = self.inner.subprocesses.write().await.remove(plugin_id) {
             plugin.shutdown().await;
         }
-        let _ = self.inner.script_plugins.write().await.remove(plugin_id);
+        // Cancel any live WS subscriptions before dropping the
+        // engine. Without this, the consumer task keeps an Arc to
+        // the engine via its on-frame closure and the
+        // reconnect loop runs forever, double-subscribing on every
+        // reinstall (see crates/script/src/plugin.rs: `shutdown`).
+        if let Some(plugin) = self.inner.script_plugins.write().await.remove(plugin_id) {
+            let cancelled = plugin.shutdown();
+            if cancelled > 0 {
+                info!(plugin_id, cancelled, "cancelled live WS subscriptions on uninstall");
+            }
+        }
 
         // Phase B (2026-05-03) — archive skills owned by this
         // plugin BEFORE deleting the install row so the
@@ -615,9 +637,19 @@ impl PluginHost {
         if let Some(plugin) = self.inner.subprocesses.write().await.remove(plugin_id) {
             plugin.shutdown().await;
         }
-        // Drop the script plugin (if any). No subprocess to kill —
-        // the rhai::Engine is just memory.
-        let _ = self.inner.script_plugins.write().await.remove(plugin_id);
+        // Drop the script plugin (if any). The rhai::Engine is just
+        // memory, BUT the engine's `ws_subscribe*` bindings spawned
+        // long-lived consumer tasks holding cancel tokens we need
+        // to fire before the engine drops — otherwise the consumer
+        // keeps reconnecting and re-running on_frame against a
+        // dead handler closure (which still holds an Arc to the
+        // plugin, hence the leak).
+        if let Some(plugin) = self.inner.script_plugins.write().await.remove(plugin_id) {
+            let cancelled = plugin.shutdown();
+            if cancelled > 0 {
+                info!(plugin_id, cancelled, "cancelled live WS subscriptions on disable");
+            }
+        }
         row.enabled = false;
         row.updated_at = chrono::Utc::now().timestamp();
         self.update_row(&row)?;

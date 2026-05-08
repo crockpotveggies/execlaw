@@ -72,10 +72,46 @@ pub(crate) fn set_owning_plugin(slot: &OwningPluginSlot, plugin: crate::ScriptPl
 /// bindings still register but return clean Rhai errors at call
 /// time — scripts that don't use them keep working unchanged.
 ///
+/// Per-plugin registry of live WS subscription handles. The
+/// engine's `ws_subscribe*` bindings push handles here on every
+/// successful subscribe; `ScriptPlugin::shutdown()` walks the list
+/// and `close()`s them so plugin uninstall / disable / reload
+/// doesn't leak the underlying consumer tasks. Without this,
+/// reinstalling a transport plugin would leave the previous
+/// install's WS consumer running, producing duplicate inbound
+/// dispatches and `connectionCount > 1` on the upstream gateway.
+pub(crate) type SubscriptionRegistry =
+    Arc<std::sync::Mutex<Vec<WsSubscriptionHandle>>>;
+
+pub(crate) fn new_subscription_registry() -> SubscriptionRegistry {
+    Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
+pub(crate) fn cancel_all_subscriptions(registry: &SubscriptionRegistry) -> usize {
+    let Ok(mut list) = registry.lock() else {
+        return 0;
+    };
+    let n = list.len();
+    for handle in list.drain(..) {
+        handle.close();
+    }
+    n
+}
+
+fn track_subscription(registry: &SubscriptionRegistry, handle: WsSubscriptionHandle) {
+    if let Ok(mut list) = registry.lock() {
+        // Garbage-collect already-closed handles so the list
+        // doesn't grow unbounded across many reconnects.
+        list.retain(|h| !h.is_closed());
+        list.push(handle);
+    }
+}
+
 /// Returns the [`OwningPluginSlot`] the engine reaches into when
-/// `ws_subscribe` fires a per-frame callback. The factory plugs
-/// the live `ScriptPlugin` in via [`set_owning_plugin`] once the
-/// plugin's AST is compiled.
+/// `ws_subscribe` fires a per-frame callback, plus a
+/// [`SubscriptionRegistry`] the host can drain on plugin shutdown.
+/// The factory plugs the live `ScriptPlugin` in via
+/// [`set_owning_plugin`] once the plugin's AST is compiled.
 pub(crate) fn register(
     engine: &mut Engine,
     plugin_id: &str,
@@ -83,7 +119,7 @@ pub(crate) fn register(
     cache: Arc<HttpCache>,
     allow_loopback: bool,
     host_caps: HostCapsHandle,
-) -> OwningPluginSlot {
+) -> (OwningPluginSlot, SubscriptionRegistry) {
     let pid_for_logs = plugin_id.to_owned();
     let owning_plugin: OwningPluginSlot = Arc::new(Mutex::new(None));
 
@@ -335,15 +371,17 @@ pub(crate) fn register(
     // clean runtime error — scripts that never call them keep
     // working unchanged.
 
+    let subscription_registry = new_subscription_registry();
     register_host_cap_bindings(
         engine,
         &pid_for_logs,
         host_caps,
         owning_plugin.clone(),
         active_bidi_handle.clone(),
+        subscription_registry.clone(),
     );
 
-    owning_plugin
+    (owning_plugin, subscription_registry)
 }
 
 /// Register the four host-capability bindings:
@@ -364,6 +402,10 @@ fn register_host_cap_bindings(
     // `active_bidi_handle` declaration in `register` for the
     // multiplexing caveat.
     active_bidi_handle: Arc<std::sync::RwLock<Option<WsSubscriptionHandle>>>,
+    // Per-plugin subscription cancel-token registry — every
+    // ws_subscribe* call pushes its token here so
+    // `ScriptPlugin::shutdown` can cancel them on uninstall/disable.
+    subscription_registry: SubscriptionRegistry,
 ) {
     // base64_encode(s) -> base64 (standard alphabet, padded).
     // Surface for plugins that need to wrap binary tokens before
@@ -514,6 +556,7 @@ fn register_host_cap_bindings(
         let pid = plugin_id.to_owned();
         let caps = host_caps.clone();
         let owning = owning_plugin.clone();
+        let subscription_registry = subscription_registry.clone();
         engine.register_fn(
             "ws_subscribe",
             move |url: ImmutableString,
@@ -583,7 +626,10 @@ fn register_host_cap_bindings(
                     runtime.block_on(caps.ws_subscribe_with_headers(url_owned, vec![], handler))
                 });
                 match handle {
-                    Ok(h) => Ok(Dynamic::from(h)),
+                    Ok(h) => {
+                        track_subscription(&subscription_registry, h.clone());
+                        Ok(Dynamic::from(h))
+                    }
                     Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
                         format!("[{pid}] ws_subscribe: {}", e.0).into(),
                         rhai::Position::NONE,
@@ -598,6 +644,7 @@ fn register_host_cap_bindings(
         let pid = plugin_id.to_owned();
         let caps = host_caps.clone();
         let owning = owning_plugin.clone();
+        let subscription_registry = subscription_registry.clone();
         engine.register_fn(
             "ws_subscribe",
             move |url: ImmutableString,
@@ -653,7 +700,10 @@ fn register_host_cap_bindings(
                     ))
                 });
                 match handle {
-                    Ok(h) => Ok(Dynamic::from(h)),
+                    Ok(h) => {
+                        track_subscription(&subscription_registry, h.clone());
+                        Ok(Dynamic::from(h))
+                    }
                     Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
                         format!("[{pid}] ws_subscribe: {}", e.0).into(),
                         rhai::Position::NONE,
@@ -680,6 +730,7 @@ fn register_host_cap_bindings(
         let caps = host_caps.clone();
         let owning = owning_plugin.clone();
         let active_slot = active_bidi_handle.clone();
+        let subscription_registry = subscription_registry.clone();
         engine.register_fn(
             "ws_subscribe_bidi",
             move |url: ImmutableString,
@@ -786,6 +837,7 @@ fn register_host_cap_bindings(
                             }
                             *slot = Some(h.clone());
                         }
+                        track_subscription(&subscription_registry, h.clone());
                         Ok(Dynamic::from(h))
                     }
                     Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
@@ -803,6 +855,7 @@ fn register_host_cap_bindings(
         let caps = host_caps.clone();
         let owning = owning_plugin.clone();
         let active_slot = active_bidi_handle.clone();
+        let subscription_registry = subscription_registry.clone();
         engine.register_fn(
             "ws_subscribe_bidi",
             move |url: ImmutableString,
@@ -890,6 +943,7 @@ fn register_host_cap_bindings(
                             }
                             *slot = Some(h.clone());
                         }
+                        track_subscription(&subscription_registry, h.clone());
                         Ok(Dynamic::from(h))
                     }
                     Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
@@ -921,6 +975,7 @@ fn register_host_cap_bindings(
         let caps = host_caps.clone();
         let owning = owning_plugin.clone();
         let active_slot = active_bidi_handle.clone();
+        let subscription_registry = subscription_registry.clone();
         engine.register_fn(
             "ws_subscribe_bidi",
             move |url: ImmutableString,
@@ -1019,6 +1074,7 @@ fn register_host_cap_bindings(
                             }
                             *slot = Some(h.clone());
                         }
+                        track_subscription(&subscription_registry, h.clone());
                         Ok(Dynamic::from(h))
                     }
                     Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(

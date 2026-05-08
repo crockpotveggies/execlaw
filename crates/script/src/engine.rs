@@ -105,11 +105,19 @@ impl ScriptEngine {
     /// captures `plugin_id` + a fresh per-plugin cache; reusing
     /// it across plugins would cross the cache.
     ///
-    /// Returns `(engine, owning_plugin_slot)` — the slot lets the
-    /// caller plant the live `ScriptPlugin` so `ws_subscribe`'s
-    /// per-frame callback can invoke handlers on the same engine
-    /// without reaching back into the factory.
-    pub fn build_for_plugin(&self, plugin_id: &str) -> (rhai::Engine, OwningPluginSlot) {
+    /// Returns `(engine, owning_plugin_slot, subscription_registry)`.
+    /// The slot lets the caller plant the live `ScriptPlugin` so
+    /// `ws_subscribe`'s per-frame callback can invoke handlers on
+    /// the same engine without reaching back into the factory. The
+    /// registry tracks live WS subscriptions; the host calls
+    /// `cancel_all_subscriptions` on plugin teardown so reinstalls
+    /// don't leak consumer tasks (which would manifest as
+    /// `connectionCount > 1` on upstream gateways and duplicate
+    /// inbound dispatches).
+    pub fn build_for_plugin(
+        &self,
+        plugin_id: &str,
+    ) -> (rhai::Engine, OwningPluginSlot, primitives::SubscriptionRegistry) {
         let mut engine = rhai::Engine::new();
         engine.set_max_operations(MAX_OPS_PER_CALL);
         engine.set_max_call_levels(MAX_CALL_DEPTH);
@@ -125,7 +133,7 @@ impl ScriptEngine {
         // host_caps lazily at call time — caps installed AFTER
         // engine build (the `cli/main.rs` boot order) still flow
         // through.
-        let slot = primitives::register(
+        let (slot, registry) = primitives::register(
             &mut engine,
             plugin_id,
             self.http_agent.clone(),
@@ -133,7 +141,7 @@ impl ScriptEngine {
             self.allow_loopback,
             self.host_caps.clone(),
         );
-        (engine, slot)
+        (engine, slot, registry)
     }
 }
 

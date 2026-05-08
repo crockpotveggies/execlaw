@@ -46,6 +46,12 @@ struct ScriptPluginInner {
     plugin_id: String,
     engine: Engine,
     ast: AST,
+    /// Live WS subscription handles registered by `ws_subscribe*`
+    /// bindings. Drained by `shutdown()` so plugin uninstall /
+    /// disable / reinstall doesn't leak consumer tasks. The host
+    /// calls `shutdown` BEFORE removing the plugin from its
+    /// internal map.
+    subscription_registry: crate::primitives::SubscriptionRegistry,
 }
 
 impl ScriptPlugin {
@@ -58,7 +64,8 @@ impl ScriptPlugin {
         source: &str,
         engine_factory: &ScriptEngine,
     ) -> ScriptResult<Self> {
-        let (engine, owning_slot) = engine_factory.build_for_plugin(plugin_id);
+        let (engine, owning_slot, subscription_registry) =
+            engine_factory.build_for_plugin(plugin_id);
         let ast = engine
             .compile(source)
             .map_err(|e| ScriptError::ParseError(format!("[{plugin_id}] compile: {e}")))?;
@@ -67,6 +74,7 @@ impl ScriptPlugin {
                 plugin_id: plugin_id.to_owned(),
                 engine,
                 ast,
+                subscription_registry,
             }),
         };
         // Plant the live plugin handle so the engine's
@@ -76,6 +84,22 @@ impl ScriptPlugin {
         // plugin.
         set_owning_plugin(&owning_slot, plugin.clone());
         Ok(plugin)
+    }
+
+    /// Cancel every WS subscription this plugin opened. Called by
+    /// the host on uninstall / disable / reinstall so the
+    /// previous instance's consumer tasks don't outlive the
+    /// engine that spawned them. Without this, a re-installed
+    /// transport plugin double-subscribes to its upstream — the
+    /// gateway sees `connectionCount > 1`, every inbound is
+    /// dispatched twice through the host pipeline, and the
+    /// gateway often crashes from the duplicate work.
+    ///
+    /// Returns the number of subscriptions that were cancelled.
+    /// Idempotent: subsequent calls return 0 once the registry is
+    /// drained.
+    pub fn shutdown(&self) -> usize {
+        crate::primitives::cancel_all_subscriptions(&self.inner.subscription_registry)
     }
 
     /// Load + parse a script from disk. Convenience wrapper for
