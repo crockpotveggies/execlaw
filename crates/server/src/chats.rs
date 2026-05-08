@@ -2605,13 +2605,21 @@ impl Drop for TypingIndicatorGuard {
 fn is_send_tool_for_channel(channel: &str, tool_name: &str) -> bool {
     match channel {
         "signal" => matches!(tool_name, "signal.reply" | "signal.send_message"),
-        // Future: "whatsapp" => matches!(tool_name, "whatsapp.send_message"),
-        // etc. Lives here (not on the registry) because the registry's
+        "sms" => matches!(tool_name, "sms.reply" | "sms.send_message"),
+        "whatsapp" => matches!(tool_name, "whatsapp.reply" | "whatsapp.send_message"),
+        "slack" => matches!(tool_name, "slack.reply" | "slack.send_message"),
+        // Lives here (not on the registry) because the registry's
         // job is "give me a TransportApi"; this map is the inverse —
         // "did the agent already use a tool that sends via this
         // transport." Two different concerns; keeping them apart
         // avoids forcing every transport to ship a name list it
         // doesn't actually need.
+        //
+        // CRITICAL when adding a new transport: forgetting to add
+        // its send-tool names here means the auto-bridge will
+        // double-send every agent reply on that channel — the
+        // tool body sends once, then the bridge fires a second
+        // copy because it doesn't recognise the tool that just ran.
         _ => false,
     }
 }
