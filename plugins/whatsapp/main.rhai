@@ -93,8 +93,10 @@ fn on_enable() {
 //
 // Idempotent: on every plugin enable we re-POST so a wuzapi
 // container restart that lost its config gets re-armed. Wuzapi's
-// PUT/POST /webhook endpoints both accept the same payload shape
-// `{webhook, subscribe, ...}`; we use POST.
+// POST /webhook expects the field names `webhookurl` (one word)
+// and `events`, per upstream `webhookStruct` in handlers.go.
+// Sending `webhook`/`subscribe` is silently accepted but writes
+// empty strings to the DB — webhook never fires.
 fn ensure_webhook_registered(base) {
     // Generate the secret once, persist for life of the install.
     let secret = vault_get("webhook_secret");
@@ -114,8 +116,8 @@ fn ensure_webhook_registered(base) {
     // bind; future improvement: read from config_general.bind_address.
     let webhook_url = "http://host.docker.internal:3031/api/webhooks/whatsapp/event?token=" + secret;
     let body = #{
-        "webhook": webhook_url,
-        "subscribe": ["Message"],
+        "webhookurl": webhook_url,
+        "events": ["Message"],
     };
     sidecar_http_post(base + "/webhook", body, user_headers());
     log_info("whatsapp: webhook registered at " + webhook_url.sub_string(0, 50) + "...");
