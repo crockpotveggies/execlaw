@@ -433,9 +433,18 @@ fn decode_event_map(env) {
 
         let chat = info.Chat;
         let sender = info.Sender;
+        let sender_alt = info.SenderAlt;
         let is_group = info.IsGroup == true || (chat != () && chat.contains("@g.us"));
 
-        let native_id = if sender != () { strip_jid(sender) } else { strip_jid(chat) };
+        // WhatsApp's privacy mode encodes the real phone-number JID
+        // in `SenderAlt` (e.g. "16047005800:4@s.whatsapp.net"), while
+        // `Sender` is a `:N@lid` pseudonym (e.g.
+        // "93681910550531:4@lid"). The host's identity bindings are
+        // keyed on the E.164 phone with a `+` prefix
+        // (e.g. "+16047005800") — so prefer SenderAlt, strip both
+        // the `:N` device suffix AND the `@s.whatsapp.net` JID
+        // suffix, then re-prefix `+` to match controller bindings.
+        let native_id = native_id_from_jid(sender_alt, sender, chat);
         let group_id = if is_group { chat } else { () };
 
         return #{
@@ -445,7 +454,7 @@ fn decode_event_map(env) {
             "group_id": group_id,
             "group_name": (),
             "text": trimmed,
-            "timestamp_ms": if info.Timestamp != () { info.Timestamp * 1000 } else { () },
+            "timestamp_ms": ts_to_ms(info.Timestamp),
             "attachments": attachments,
         };
     } catch (e) {
@@ -459,6 +468,49 @@ fn strip_jid(s) {
     let at = s.index_of("@");
     if at < 0 { return s; }
     s.sub_string(0, at)
+}
+
+// Resolve the inbound message's native_id (E.164 phone) from the
+// three JID fields whatsmeow surfaces. Order:
+//   1. SenderAlt — present when the chat is in WhatsApp's privacy
+//      mode; carries the real phone JID even when Sender is a
+//      `:N@lid` pseudonym.
+//   2. Sender — fall back when SenderAlt is empty (private mode
+//      off, group chats, etc.).
+//   3. Chat — last resort for legacy events without sender.
+//
+// Strips the device-id `:N` suffix and `@s.whatsapp.net` /
+// `@lid` host parts, then prefixes `+` for E.164 alignment with
+// the controller's identity binding (which the SPA pairs as
+// `whatsapp:+16047005800` etc).
+fn native_id_from_jid(sender_alt, sender, chat) {
+    let pick = ();
+    if sender_alt != () && sender_alt != "" { pick = sender_alt; }
+    else if sender != () && sender != "" { pick = sender; }
+    else if chat != () && chat != "" { pick = chat; }
+    if pick == () { return (); }
+    let at = pick.index_of("@");
+    let local = if at >= 0 { pick.sub_string(0, at) } else { pick };
+    let colon = local.index_of(":");
+    let phone = if colon >= 0 { local.sub_string(0, colon) } else { local };
+    if phone == "" { return (); }
+    if phone.starts_with("+") { return phone; }
+    // Only prefix `+` when the local-part is purely digits — group
+    // identifiers and broadcast list pseudonyms aren't phones.
+    if host_parse_int(phone) != () { "+" + phone } else { phone }
+}
+
+// Normalise wuzapi's Timestamp field into a millisecond-epoch i64.
+// whatsmeow's Go time.Time JSON-encodes as RFC3339 (e.g.
+// "2026-05-08T15:18:53-03:00"). Older wuzapi forks may also send
+// a raw int seconds-epoch — handle both shapes, return () on
+// anything else so the host falls back to receive-time.
+fn ts_to_ms(t) {
+    if t == () { return (); }
+    let ty = type_of(t);
+    if ty == "i64" || ty == "int" { return t * 1000; }
+    if ty == "string" { return parse_rfc3339_ms(t); }
+    ()
 }
 
 // =====================================================================

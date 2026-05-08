@@ -350,6 +350,19 @@ pub(crate) fn register(
         chrono::Utc::now().timestamp_millis()
     });
 
+    // parse_rfc3339_ms("2026-05-08T15:18:53-03:00") -> i64 (ms epoch)
+    //
+    // Returns Unit if the string isn't valid RFC3339. Plugins that
+    // bridge to webhook payloads (wuzapi serialises whatsmeow's
+    // time.Time as RFC3339 — `\"Timestamp\":\"2026-05-08T15:18:53-03:00\"`)
+    // need this to normalise inbound timestamp_ms.
+    engine.register_fn("parse_rfc3339_ms", |s: ImmutableString| -> Dynamic {
+        match chrono::DateTime::parse_from_rfc3339(&s) {
+            Ok(dt) => Dynamic::from(dt.timestamp_millis()),
+            Err(_) => Dynamic::UNIT,
+        }
+    });
+
     // ---- String → int parsing -------------------------------------
     //
     // Rhai's stdlib registers `parse_int` against `&str` /
