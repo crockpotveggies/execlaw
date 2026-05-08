@@ -283,6 +283,22 @@ fn on_webhook_event(args) {
         // those — accept and ack so wuzapi doesn't retry.
         return #{ "ok": true };
     }
+    // Idempotency by message ID. The synchronous block-on-agent
+    // bug that caused wuzapi to time out + retry + run the agent
+    // 3-5× per inbound is fixed by `host_route_inbound_spawn`
+    // below (we 200 in <10ms now), but defense-in-depth: dedupe
+    // at the plugin layer in case wuzapi ever re-delivers for
+    // network/restart reasons. seen_msg_id() round-robins a 100-
+    // entry vault list — at WhatsApp's typical message rate
+    // that's many minutes of replay protection.
+    let msg_id = ();
+    if event_map.event != () && event_map.event.Info != () && event_map.event.Info.ID != () {
+        msg_id = event_map.event.Info.ID;
+    }
+    if msg_id != () && already_seen_msg_id(msg_id) {
+        log_info("whatsapp: skipping duplicate inbound id=" + msg_id);
+        return #{ "ok": true };
+    }
     // Enrich with the group's user-facing name when this is a
     // group inbound. Wuzapi's per-message webhook payload doesn't
     // include the group title — only the JID. Without a name the
@@ -304,23 +320,62 @@ fn on_webhook_event(args) {
             log_warn("whatsapp: resolve_group_name failed for " + inbound.group_id + ": " + e);
         }
     }
+    // Spawn the routing async — wuzapi's resty client times out at
+    // 30s per webhook POST. If the agent takes longer than that to
+    // produce a reply (common for non-trivial turns), wuzapi treats
+    // the slow ack as a failure, retries (5×30s default, 10×30s
+    // with our env override), and the handler runs again — same
+    // event, same Info.ID, but a fresh agent turn each time, so
+    // the user receives the same reply N times. The fire-and-
+    // forget spawn means we 200 in single-digit ms regardless of
+    // how long inference takes.
     try {
-        host_route_inbound(inbound);
+        host_route_inbound_spawn(inbound);
     } catch (e) {
-        log_warn("whatsapp: host_route_inbound rejected: " + e);
+        log_warn("whatsapp: host_route_inbound_spawn rejected: " + e);
     }
-    // Fire-and-forget read receipt back to wuzapi so the sender's
-    // single-tick turns to double-tick-blue. Done after dispatch
-    // because the agent should appear to read THEN reply, mirroring
-    // how a human conversation looks. Failures are logged but do
-    // not affect the webhook response — read receipts are cosmetic
-    // and can be retried by the user re-opening the chat.
+    // Read receipt is also fire-and-forget — but it's a quick
+    // round-trip to the local sidecar (~100ms), well inside the
+    // 30s timeout, so we don't need to spawn it.
     try {
         mark_inbound_read(event_map);
     } catch (e) {
         log_warn("whatsapp: markread failed: " + e);
     }
     #{ "ok": true }
+}
+
+// Vault-backed dedupe ring of recent message IDs, capped at 100.
+// Returns true when `id` is already in the ring (duplicate),
+// false on first sight (and inserts).
+//
+// Storage: vault key `seen_msg_ids` holds a JSON-encoded array.
+// FIFO eviction at the cap. Reads + writes happen on every
+// inbound, but the array is small (~100 ids × ~20 chars =
+// 2KB) and vault_get is in-process, so the overhead is
+// well under a millisecond — fine inside the webhook handler's
+// fast-ack window.
+fn already_seen_msg_id(id) {
+    let cap = 100;
+    let key = "seen_msg_ids";
+    let raw = vault_get(key);
+    let ids = [];
+    if raw != () && raw != "" {
+        try {
+            let parsed = parse_json(raw);
+            if type_of(parsed) == "array" { ids = parsed; }
+        } catch (e) {
+            // Corrupt cache — start fresh.
+            ids = [];
+        }
+    }
+    for existing in ids {
+        if existing == id { return true; }
+    }
+    ids.push(id);
+    while ids.len() > cap { ids.shift(); }
+    vault_put(key, to_json_string(ids));
+    false
 }
 
 // Best-effort POST /chat/markread for an inbound message event.

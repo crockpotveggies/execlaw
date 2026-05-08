@@ -1366,6 +1366,66 @@ fn register_host_cap_bindings(
         );
     }
 
+    // host_route_inbound_spawn(message_map) -> "Spawned"
+    //
+    // Same as `host_route_inbound` but fire-and-forget: spawns
+    // the route_inbound future on the tokio runtime and returns
+    // immediately. Routing outcome (and any agent reply) flow
+    // through the host's normal pipeline — they just won't surface
+    // back to the script.
+    //
+    // Required for HTTP-webhook callers like the WhatsApp plugin's
+    // `on_webhook_event`: third-party services (wuzapi, Slack-events,
+    // GitHub) impose per-request timeouts (wuzapi's resty client is
+    // 30s) and treat a non-200 inside that window as failure → they
+    // retry → handler runs again → agent runs again → user receives
+    // the same reply N times. Spawning lets us 200 in milliseconds
+    // and run the agent off-request.
+    //
+    // WS-driven plugins (Signal, sms-socket) keep using the
+    // synchronous `host_route_inbound` because their consumer is
+    // already a background task; blocking is harmless and the
+    // synchronous outcome is useful for logging.
+    {
+        let pid = plugin_id.to_owned();
+        let caps = host_caps.clone();
+        engine.register_fn(
+            "host_route_inbound_spawn",
+            move |msg: Map| -> Result<Dynamic, Box<EvalAltResult>> {
+                let caps = match caps.get() {
+                    Some(c) => c.clone(),
+                    None => {
+                        return Err(host_cap_unavailable_err(&pid, "host_route_inbound_spawn"));
+                    }
+                };
+                let inbound = inbound_from_rhai_map(&pid, &msg)?;
+                let runtime = match tokio::runtime::Handle::try_current() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        return Err(Box::new(EvalAltResult::ErrorRuntime(
+                            format!(
+                                "[{pid}] host_route_inbound_spawn: no tokio runtime: {e}"
+                            )
+                            .into(),
+                            rhai::Position::NONE,
+                        )));
+                    }
+                };
+                let pid_for_log = pid.clone();
+                runtime.spawn(async move {
+                    if let Err(e) = caps.route_inbound(inbound).await {
+                        tracing::warn!(
+                            plugin_id = %pid_for_log,
+                            error = %e.0,
+                            "host_route_inbound_spawn: routing failed in background task"
+                        );
+                    }
+                });
+                Ok(Dynamic::from(ImmutableString::from("Spawned")))
+            },
+        );
+    }
+
     // sidecar_http_get / sidecar_http_post / sidecar_http_delete
     //
     // SSRF-aware HTTP for plugin → sidecar communication. The
