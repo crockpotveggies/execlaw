@@ -260,7 +260,23 @@ fn on_webhook_event(args) {
     if body == () || type_of(body) != "map" {
         return #{ "ok": false, "error": "missing_body" };
     }
-    let inbound = decode_event_map(body);
+    // wuzapi wraps the actual whatsmeow event in a string-typed
+    // `jsonData` field on an envelope `{instanceName, jsonData,
+    // userID}`. Verified from the upstream container logs:
+    //   webhookData={"instanceName":"...","jsonData":"{\"event\":{...},\"type\":\"Message\"}","userID":"..."}
+    // Our `decode_event_map` expects the *inner* object — parse
+    // jsonData first if present, else fall back to treating the
+    // body as the inner shape (covers wuzapi forks that flatten).
+    let event_map = body;
+    if body.jsonData != () && type_of(body.jsonData) == "string" {
+        try {
+            event_map = parse_json(body.jsonData);
+        } catch (e) {
+            log_warn("whatsapp: webhook jsonData unparseable: " + e);
+            return #{ "ok": false, "error": "unparseable_jsonData" };
+        }
+    }
+    let inbound = decode_event_map(event_map);
     if inbound == () {
         // Most events are non-content (read receipts, presence,
         // history sync chunks). decode_event_map returns Unit for
