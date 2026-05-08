@@ -92,9 +92,10 @@ impl HostCapabilities for AppStateHostCapabilities {
         supervisor.has_published_port(port).await
     }
 
-    async fn ws_subscribe(
+    async fn ws_subscribe_with_headers(
         &self,
         url: String,
+        headers: Vec<(String, String)>,
         on_frame: WsFrameHandler,
     ) -> Result<WsSubscriptionHandle, HostCapError> {
         let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
@@ -106,7 +107,7 @@ impl HostCapabilities for AppStateHostCapabilities {
         // refreshed by the consumer on every successful connect so
         // plugins can `ws_send` text frames back through the same
         // socket (Slack Socket Mode envelope_id ACKs, etc.).
-        tokio::spawn(consumer_loop(url, on_frame, cancel, handle.clone()));
+        tokio::spawn(consumer_loop(url, headers, on_frame, cancel, handle.clone()));
 
         Ok(handle)
     }
@@ -217,6 +218,7 @@ impl HostCapabilities for AppStateHostCapabilities {
 /// reads).
 async fn consumer_loop(
     url: String,
+    headers: Vec<(String, String)>,
     on_frame: WsFrameHandler,
     cancel: Arc<tokio_util::sync::CancellationToken>,
     handle: WsSubscriptionHandle,
@@ -224,14 +226,39 @@ async fn consumer_loop(
     use futures::sink::SinkExt;
     use futures::stream::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::HeaderValue;
 
     let mut backoff = WS_MIN_BACKOFF;
     while !cancel.is_cancelled() {
+        // Build a client request so we can stamp custom headers
+        // on the WS upgrade. Empty `headers` is equivalent to a
+        // bare `connect_async(url)`.
+        let request = match url.as_str().into_client_request() {
+            Ok(mut r) => {
+                for (name, value) in &headers {
+                    if let Ok(v) = HeaderValue::from_str(value) {
+                        // Best-effort header insert. Bad header
+                        // names (with colons / control chars) get
+                        // dropped; we don't fail the whole
+                        // subscription over one malformed header.
+                        if let Ok(name) = name.parse::<tokio_tungstenite::tungstenite::http::HeaderName>() {
+                            r.headers_mut().insert(name, v);
+                        }
+                    }
+                }
+                r
+            }
+            Err(e) => {
+                tracing::warn!(target: "host_caps::ws", %url, error = %e, "invalid ws url; aborting consumer");
+                return;
+            }
+        };
         // Connect with a hard timeout so a hung server doesn't
         // wedge the consumer on a single attempt.
         let connect = tokio::time::timeout(
             WS_CONNECT_TIMEOUT,
-            tokio_tungstenite::connect_async(&url),
+            tokio_tungstenite::connect_async(request),
         )
         .await;
         let stream = match connect {

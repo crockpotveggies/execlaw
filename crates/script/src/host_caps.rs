@@ -271,6 +271,26 @@ pub trait HostCapabilities: Send + Sync {
         &self,
         url: String,
         on_frame: WsFrameHandler,
+    ) -> Result<WsSubscriptionHandle, HostCapError> {
+        // Default delegates to ws_subscribe_with_headers with no
+        // headers, so existing impls only need to implement one.
+        self.ws_subscribe_with_headers(url, vec![], on_frame).await
+    }
+
+    /// Same as [`ws_subscribe`] but adds custom HTTP headers on the
+    /// upgrade request. Required for protocols that authenticate
+    /// via `Authorization: Bearer …` on connect (sms-socket
+    /// gateway, some MCP-over-WS implementations) — alternatives
+    /// to URL-query-param tokens (Slack Socket Mode) where the
+    /// server only honors headers.
+    ///
+    /// `headers` is a list of `(name, value)` pairs. Empty vec is
+    /// equivalent to calling `ws_subscribe`.
+    async fn ws_subscribe_with_headers(
+        &self,
+        url: String,
+        headers: Vec<(String, String)>,
+        on_frame: WsFrameHandler,
     ) -> Result<WsSubscriptionHandle, HostCapError>;
 
     /// Push a decoded inbound message through the host's standard

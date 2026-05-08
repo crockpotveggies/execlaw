@@ -1,0 +1,15 @@
+{
+    "type": "object",
+    "properties": {
+        "to": {
+            "type": "string",
+            "description": "Recipient. E.164 phone (e.g. +14165550100) or `sms:+E164` JID. Plain digits without a country code are rejected — the gateway requires E.164."
+        },
+        "text": {
+            "type": "string",
+            "description": "Message body. Carriers split SMS at 160 chars (or 70 chars for non-GSM-7 alphabets); long messages get concatenated server-side. The gateway doesn't truncate."
+        }
+    },
+    "required": ["to", "text"],
+    "additionalProperties": false
+}

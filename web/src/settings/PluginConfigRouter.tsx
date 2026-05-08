@@ -35,6 +35,7 @@ import type { PluginConfigComponent } from "./PluginConfigBase";
 import { PushoverConfigPage } from "./PushoverConfigPage";
 import { SignalConfigPage } from "./SignalConfigPage";
 import { SlackConfigPage } from "./SlackConfigPage";
+import { SmsSocketConfigPage } from "./SmsSocketConfigPage";
 import { WhatsAppConfigPage } from "./WhatsAppConfigPage";
 
 const KNOWN_CONFIGS: Record<string, PluginConfigComponent> = {
@@ -46,6 +47,7 @@ const KNOWN_CONFIGS: Record<string, PluginConfigComponent> = {
     pushover: PushoverConfigPage,
     signal: SignalConfigPage,
     slack: SlackConfigPage,
+    "sms-socket": SmsSocketConfigPage,
     whatsapp: WhatsAppConfigPage,
 };
 

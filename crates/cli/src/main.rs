@@ -1586,6 +1586,20 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                 icon: slack_icon,
             },
         );
+        const SMS_SOCKET_MANIFEST: &str =
+            include_str!("../../../plugins/sms-socket/plugin.toml");
+        let sms_socket_icon =
+            execlaw_plugin_sdk::manifest::PluginManifest::parse(SMS_SOCKET_MANIFEST)
+                .ok()
+                .and_then(|m| m.transport.and_then(|t| t.icon))
+                .unwrap_or_else(|| "phone".to_owned());
+        reg.register(
+            "sms",
+            execlaw_server::transport_registry::ChannelInfo {
+                plugin_id: "sms-socket".into(),
+                icon: sms_socket_icon,
+            },
+        );
         tracing::info!(channels = reg.len(), "host-transport registry populated");
         reg
     };

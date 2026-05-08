@@ -2372,6 +2372,84 @@ export async function testPushoverNotification(
     );
 }
 
+// ---- /api/admin/plugins/sms-socket/* ------------------------------
+//
+// SMS Socket plugin admin endpoints. The plugin holds an api_key +
+// gateway_url (ws://… on the operator's Android phone running
+// sms-socket-app) plus an optional default_subscription_id. No
+// sidecar — the plugin opens the WebSocket directly via the
+// ws_subscribe_bidi primitive.
+
+export interface SmsSocketConfigResponse {
+    api_key_set: boolean;
+    api_key_masked: string;
+    gateway_url: string;
+    default_subscription_id: string;
+}
+
+export interface SmsSocketStatusResponse {
+    sidecar_status: string;
+    sidecar_rpc_url: string | null;
+    gateway_url: string;
+    configured: boolean;
+    gateway_state: unknown;
+    outbox_pending: number;
+}
+
+export async function getSmsSocketConfig(
+    tokenAccessor: () => string | null,
+): Promise<SmsSocketConfigResponse> {
+    return apiFetch<SmsSocketConfigResponse>(
+        "/api/admin/plugins/sms-socket/config",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function setSmsSocketConfig(
+    api_key: string,
+    gateway_url: string,
+    default_subscription_id: string,
+    tokenAccessor: () => string | null,
+): Promise<{ ok: boolean; restart_required?: string }> {
+    return apiFetch<{ ok: boolean; restart_required?: string }>(
+        "/api/admin/plugins/sms-socket/config",
+        {
+            method: "POST",
+            body: { api_key, gateway_url, default_subscription_id },
+        },
+        tokenAccessor,
+    );
+}
+
+export async function getSmsSocketStatus(
+    tokenAccessor: () => string | null,
+): Promise<SmsSocketStatusResponse> {
+    return apiFetch<SmsSocketStatusResponse>(
+        "/api/admin/plugins/sms-socket/status",
+        {},
+        tokenAccessor,
+    );
+}
+
+export interface SmsSocketTestResponse {
+    ok?: boolean;
+    request_id?: string;
+    note?: string;
+    error?: string;
+}
+
+export async function testSmsSocketMessage(
+    to: string,
+    tokenAccessor: () => string | null,
+): Promise<SmsSocketTestResponse> {
+    return apiFetch<SmsSocketTestResponse>(
+        "/api/admin/plugins/sms-socket/test",
+        { method: "POST", body: { to } },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/routines (Phase 10 — §5.6) -------------------------
 
 export type RoutineRunStatus = "Pending" | "Success" | "Failed" | "Skipped";

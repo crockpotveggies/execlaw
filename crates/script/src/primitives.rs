@@ -474,12 +474,17 @@ fn register_host_cap_bindings(
         );
     }
 
-    // ws_subscribe(url, callback_name) -> handle
+    // ws_subscribe(url, callback_name, [headers]) -> handle
     //
     // Spawn a long-lived WebSocket consumer. The host owns
     // reconnect + backoff; per-frame it invokes the named Rhai
     // function with the raw text payload. Returns a handle the
     // plugin can `.close()` to cancel.
+    //
+    // Optional 3-arg overload accepts a headers Map applied to
+    // the WS upgrade request — required for protocols that auth
+    // via `Authorization: Bearer …` on connect (sms-socket
+    // gateway, MCP-over-WS variants).
     {
         let pid = plugin_id.to_owned();
         let caps = host_caps.clone();
@@ -550,7 +555,77 @@ fn register_host_cap_bindings(
                 };
                 let url_owned = url.to_string();
                 let handle = tokio::task::block_in_place(|| {
-                    runtime.block_on(caps.ws_subscribe(url_owned, handler))
+                    runtime.block_on(caps.ws_subscribe_with_headers(url_owned, vec![], handler))
+                });
+                match handle {
+                    Ok(h) => Ok(Dynamic::from(h)),
+                    Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
+                        format!("[{pid}] ws_subscribe: {}", e.0).into(),
+                        rhai::Position::NONE,
+                    ))),
+                }
+            },
+        );
+    }
+
+    // 3-arg overload: ws_subscribe(url, callback, headers_map)
+    {
+        let pid = plugin_id.to_owned();
+        let caps = host_caps.clone();
+        let owning = owning_plugin.clone();
+        engine.register_fn(
+            "ws_subscribe",
+            move |url: ImmutableString,
+                  callback: ImmutableString,
+                  headers: Map|
+                  -> Result<Dynamic, Box<EvalAltResult>> {
+                let caps = match caps.get() {
+                    Some(c) => c.clone(),
+                    None => return Err(host_cap_unavailable_err(&pid, "ws_subscribe")),
+                };
+                let plugin = owning
+                    .lock()
+                    .expect("OwningPluginSlot mutex poisoned")
+                    .clone();
+                let plugin = match plugin {
+                    Some(p) => p,
+                    None => {
+                        return Err(Box::new(EvalAltResult::ErrorRuntime(
+                            format!("[{pid}] ws_subscribe: owning plugin not yet wired").into(),
+                            rhai::Position::NONE,
+                        )));
+                    }
+                };
+                let pid_for_handler = pid.clone();
+                let cb_name: String = callback.to_string();
+                let handler: WsFrameHandler = Arc::new(move |frame: String| {
+                    let plugin = plugin.clone();
+                    let pid = pid_for_handler.clone();
+                    let cb = cb_name.clone();
+                    Box::pin(async move {
+                        let args = vec![Dynamic::from(ImmutableString::from(frame))];
+                        if let Err(e) = plugin.invoke_async_owned(cb, args).await {
+                            tracing::warn!(plugin_id = %pid, error = %e, "ws frame handler returned an error");
+                        }
+                    })
+                });
+                let runtime = match tokio::runtime::Handle::try_current() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        return Err(Box::new(EvalAltResult::ErrorRuntime(
+                            format!("[{pid}] ws_subscribe: no tokio runtime: {e}").into(),
+                            rhai::Position::NONE,
+                        )));
+                    }
+                };
+                let url_owned = url.to_string();
+                let header_pairs = headers_map_to_pairs(&headers);
+                let handle = tokio::task::block_in_place(|| {
+                    runtime.block_on(caps.ws_subscribe_with_headers(
+                        url_owned,
+                        header_pairs,
+                        handler,
+                    ))
                 });
                 match handle {
                     Ok(h) => Ok(Dynamic::from(h)),
@@ -652,7 +727,7 @@ fn register_host_cap_bindings(
                 };
                 let url_owned = url.to_string();
                 let handle = tokio::task::block_in_place(|| {
-                    runtime.block_on(caps.ws_subscribe(url_owned, handler))
+                    runtime.block_on(caps.ws_subscribe_with_headers(url_owned, vec![], handler))
                 });
                 match handle {
                     Ok(h) => {
@@ -672,6 +747,95 @@ fn register_host_cap_bindings(
             },
         );
     }
+
+    // 3-arg overload: ws_subscribe_bidi(url, callback, headers_map)
+    {
+        let pid = plugin_id.to_owned();
+        let caps = host_caps.clone();
+        let owning = owning_plugin.clone();
+        engine.register_fn(
+            "ws_subscribe_bidi",
+            move |url: ImmutableString,
+                  callback: ImmutableString,
+                  headers: Map|
+                  -> Result<Dynamic, Box<EvalAltResult>> {
+                let caps = match caps.get() {
+                    Some(c) => c.clone(),
+                    None => return Err(host_cap_unavailable_err(&pid, "ws_subscribe_bidi")),
+                };
+                let plugin = owning
+                    .lock()
+                    .expect("OwningPluginSlot mutex poisoned")
+                    .clone();
+                let plugin = match plugin {
+                    Some(p) => p,
+                    None => {
+                        return Err(Box::new(EvalAltResult::ErrorRuntime(
+                            format!("[{pid}] ws_subscribe_bidi: owning plugin not yet wired").into(),
+                            rhai::Position::NONE,
+                        )));
+                    }
+                };
+                let handle_cell: Arc<std::sync::RwLock<Option<WsSubscriptionHandle>>> =
+                    Arc::new(std::sync::RwLock::new(None));
+                let handle_cell_for_handler = handle_cell.clone();
+                let pid_for_handler = pid.clone();
+                let cb_name: String = callback.to_string();
+                let handler: WsFrameHandler = Arc::new(move |frame: String| {
+                    let plugin = plugin.clone();
+                    let pid = pid_for_handler.clone();
+                    let cb = cb_name.clone();
+                    let h_opt = handle_cell_for_handler.read().ok().and_then(|g| g.clone());
+                    Box::pin(async move {
+                        let mut args: Vec<Dynamic> = Vec::with_capacity(2);
+                        args.push(match h_opt {
+                            Some(h) => Dynamic::from(h),
+                            None => Dynamic::UNIT,
+                        });
+                        args.push(Dynamic::from(ImmutableString::from(frame)));
+                        if let Err(e) = plugin.invoke_async_owned(cb, args).await {
+                            tracing::warn!(
+                                plugin_id = %pid,
+                                error = %e,
+                                "ws_subscribe_bidi frame handler returned an error",
+                            );
+                        }
+                    })
+                });
+                let runtime = match tokio::runtime::Handle::try_current() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        return Err(Box::new(EvalAltResult::ErrorRuntime(
+                            format!("[{pid}] ws_subscribe_bidi: no tokio runtime: {e}").into(),
+                            rhai::Position::NONE,
+                        )));
+                    }
+                };
+                let url_owned = url.to_string();
+                let header_pairs = headers_map_to_pairs(&headers);
+                let handle = tokio::task::block_in_place(|| {
+                    runtime.block_on(caps.ws_subscribe_with_headers(
+                        url_owned,
+                        header_pairs,
+                        handler,
+                    ))
+                });
+                match handle {
+                    Ok(h) => {
+                        if let Ok(mut slot) = handle_cell.write() {
+                            *slot = Some(h.clone());
+                        }
+                        Ok(Dynamic::from(h))
+                    }
+                    Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
+                        format!("[{pid}] ws_subscribe_bidi: {}", e.0).into(),
+                        rhai::Position::NONE,
+                    ))),
+                }
+            },
+        );
+    }
+
 
     // Method on WsSubscriptionHandle — `handle.close()` from Rhai.
     engine.register_fn("close", |h: &mut WsSubscriptionHandle| h.close());
@@ -1135,6 +1299,22 @@ fn register_sidecar_http_post(
 
 /// Apply every key from `headers` as a request header. Values
 /// are stringified via Rhai's standard conversion.
+/// Convert a Rhai `Map` of header values into a `Vec<(name, value)>`
+/// pair list for the host's WS connect builder. Non-string values
+/// are stringified via Dynamic's default conversion.
+fn headers_map_to_pairs(headers: &Map) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(k, v)| {
+            let value = match v.clone().into_string() {
+                Ok(s) => s,
+                Err(_) => format!("{v}"),
+            };
+            (k.to_string(), value)
+        })
+        .collect()
+}
+
 fn apply_headers(mut req: ureq::Request, headers: &Map) -> ureq::Request {
     for (k, v) in headers.iter() {
         let value = match v.clone().into_string() {
