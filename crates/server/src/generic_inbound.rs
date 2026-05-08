@@ -38,8 +38,7 @@ pub async fn route_inbound(
 
     // 1. Resolve / mint the sender's principal via the shared
     //    admit helper. Same shape `signal_inbound` uses today.
-    let hint_pid =
-        PrincipalId::from(format!("pri_{channel}_{native}", native = msg.native_id));
+    let hint_pid = PrincipalId::from(format!("pri_{channel}_{native}", native = msg.native_id));
     let (sender, _flat_trust) = crate::principal_admit::admit_external_principal(
         &state.db,
         &state.plugin_host,
@@ -80,8 +79,7 @@ pub async fn route_inbound(
 
     // 4. Trust gate.
     let trust_tag = sender.trust_level.class_tag();
-    let trust_flat =
-        TrustLevel::parse(trust_tag).unwrap_or(TrustLevel::UnknownPending);
+    let trust_flat = TrustLevel::parse(trust_tag).unwrap_or(TrustLevel::UnknownPending);
 
     if trust_flat == TrustLevel::Blocked {
         return Ok(RouteOutcome::Blocked);
@@ -94,32 +92,57 @@ pub async fn route_inbound(
         return Ok(RouteOutcome::ColdContact);
     }
 
-    // 5. Group address filter.
-    if msg.group_id.is_some() {
-        let addressed =
-            crate::group_addressing::should_dispatch_to_agent(state, &cid, &msg.text)
-                .await;
-        if !addressed {
-            // Persist for context; skip dispatch.
-            if let Err(e) = crate::chats::commit_inbound_user_msg_silently(
-                state,
-                &cid,
-                sender.id.as_str(),
-                &msg.text,
-                channel,
-            )
-            .await
-            {
-                tracing::warn!(
-                    target: "generic_inbound",
-                    error = %e,
-                    conversation_id = %cid.as_str(),
-                    "silent commit of unaddressed group message failed",
-                );
+    // 5. Group address filter + group-context resolution. For DMs
+    // we leave `group_context = None` and dispatch directly. For
+    // groups we consult the addressing classifier; on Skip we
+    // silent-commit; on Dispatch we build the per-turn group
+    // context (name + member count + addressed reason) so the
+    // agent's system prompt knows it's in a group AND why this
+    // message reached it.
+    let group_context: Option<crate::chats::GroupTurnContext> = if msg.group_id.is_some() {
+        let decision = crate::group_addressing::should_dispatch_to_agent(
+            state,
+            &cid,
+            &msg.text,
+            msg.mention_of_self,
+        )
+        .await;
+        match decision {
+            crate::group_addressing::DispatchDecision::Skip => {
+                // Persist for context; skip dispatch.
+                if let Err(e) = crate::chats::commit_inbound_user_msg_silently(
+                    state,
+                    &cid,
+                    sender.id.as_str(),
+                    &msg.text,
+                    channel,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        target: "generic_inbound",
+                        error = %e,
+                        conversation_id = %cid.as_str(),
+                        "silent commit of unaddressed group message failed",
+                    );
+                }
+                return Ok(RouteOutcome::GroupNotAddressed);
             }
-            return Ok(RouteOutcome::GroupNotAddressed);
+            crate::group_addressing::DispatchDecision::Dispatch(reason) => {
+                // The classifier already ran the eligibility +
+                // members lookups internally. The resolver here
+                // re-runs the cheap members/name lookups to build
+                // the per-turn context — duplicate cost is small
+                // (two SQLite reads on indexed tables) and keeping
+                // the resolver self-contained simplifies the
+                // approval-replay paths that don't have a verdict
+                // to thread.
+                crate::chats::resolve_group_turn_context(state, &cid, reason)
+            }
         }
-    }
+    } else {
+        None
+    };
 
     // 6. Dispatch the turn through the standard pipeline.
     crate::chats::dispatch_external_turn(
@@ -129,6 +152,7 @@ pub async fn route_inbound(
         trust_flat,
         &msg.text,
         Some(channel),
+        group_context,
     )
     .await
     .map_err(|e| HostCapError::new(format!("dispatch_external_turn: {e}")))?;
@@ -168,9 +192,7 @@ async fn resolve_group(
                 binding_store
                     .lookup_principal_group(channel, group_id)
                     .map_err(|e| HostCapError::new(format!("group binding re-lookup: {e}")))?
-                    .ok_or_else(|| {
-                        HostCapError::new("group binding vanished after insert race")
-                    })?
+                    .ok_or_else(|| HostCapError::new("group binding vanished after insert race"))?
             } else {
                 pg.group_id
             }
@@ -230,15 +252,18 @@ async fn resolve_dm(
                 transport: channel.to_owned(),
                 handle: native_id.to_owned(),
             };
-            if !updated.identifiers.iter().any(|i| i.transport == ident.transport && i.handle == ident.handle) {
+            if !updated
+                .identifiers
+                .iter()
+                .any(|i| i.transport == ident.transport && i.handle == ident.handle)
+            {
                 updated.identifiers.push(ident);
                 let _ = PrincipalStore::new(&state.db).upsert(&updated);
             }
             pg.group_id
         }
     };
-    let is_controller =
-        matches!(sender.trust_level, CoreTrustLevel::Controller);
+    let is_controller = matches!(sender.trust_level, CoreTrustLevel::Controller);
     let resolver = ConversationResolver::new(&state.db);
     let outcome = resolver
         .resolve_or_mint(&ResolveInput {

@@ -215,6 +215,16 @@ fn decode_event(team_id, event, payload) {
         let is_group = !is_dm;
         let group_id = if is_group { "slack:" + event.channel } else { () };
 
+        // Slack already gated on `<@bot-user-id>` for non-DM channels
+        // above (only mentioning messages reach this point), so any
+        // group inbound that escapes the early-return is by definition
+        // mentioning the agent. Surface that as a hard verdict to the
+        // host's group-addressing layer so it can short-circuit the
+        // LLM classifier — explicit mention is never group banter.
+        // DMs leave this `()` (1:1 doesn't have an addressing
+        // question; the host's eligibility gate already exempts them).
+        let mention_of_self = if is_group { true } else { () };
+
         return #{
             "channel": "slack",
             "native_id": event.user,
@@ -224,6 +234,7 @@ fn decode_event(team_id, event, payload) {
             "text": normalized,
             "timestamp_ms": parse_slack_ts_ms(event.ts),
             "attachments": attachments,
+            "mention_of_self": mention_of_self,
         };
     } catch (e) {
         log_warn("slack: undecodable event: " + e);

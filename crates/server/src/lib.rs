@@ -34,8 +34,6 @@ pub mod generic_inbound;
 pub mod group_addressing;
 pub mod host_caps_impl;
 pub mod inference_resolver;
-pub mod plugin_admin_routes;
-pub mod plugin_webhook_routes;
 pub mod mcp_admin;
 pub mod mcp_host;
 pub mod mcp_http_client;
@@ -45,10 +43,11 @@ pub mod oauth_provider;
 pub mod oauth_sweeper;
 pub mod observability;
 pub mod personality;
+pub mod plugin_admin_routes;
+pub mod plugin_webhook_routes;
 pub mod plugins;
 pub mod principal_admit;
 pub mod research;
-pub mod transport_registry;
 pub mod research_admin;
 pub mod routes;
 pub mod routine_runner;
@@ -66,6 +65,7 @@ pub mod settings_search;
 pub mod setup_preflight;
 pub mod sidecar_supervisor;
 pub mod sidecars_admin;
+pub mod transport_registry;
 // Phase B: signal_admin / signal_inbound / signal_tools /
 // signal_transport retired. Every Signal capability lives in
 // plugins/signal/main.rhai (v0.4.0+) and reaches the sidecar via

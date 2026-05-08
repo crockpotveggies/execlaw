@@ -69,10 +69,7 @@ impl ServerAttachmentApi {
         self
     }
 
-    pub fn with_plugin_host(
-        mut self,
-        plugin_host: execlaw_plugin_host::PluginHost,
-    ) -> Self {
+    pub fn with_plugin_host(mut self, plugin_host: execlaw_plugin_host::PluginHost) -> Self {
         self.plugin_host = Some(plugin_host);
         self
     }
@@ -184,12 +181,8 @@ impl AttachmentApi for ServerAttachmentApi {
         // caption falls back to the filename so the contact sees
         // something useful next to the file rather than a bare
         // attachment with no context.
-        self.bridge_to_originating_transport(
-            attachment_id,
-            &filename,
-            title_caption.as_deref(),
-        )
-        .await;
+        self.bridge_to_originating_transport(attachment_id, &filename, title_caption.as_deref())
+            .await;
 
         Ok(DeliveredAttachmentView {
             attachment_id: attachment_id.to_owned(),

@@ -298,7 +298,12 @@ async fn google_contacts_plugin_full_install_and_dispatch_roundtrip() {
     // ---- 5. call_tool contacts.list with token -------------------
     let res = state
         .plugin_host
-        .call_tool("contacts.list", serde_json::json!({"limit": 5}), &["*"], None)
+        .call_tool(
+            "contacts.list",
+            serde_json::json!({"limit": 5}),
+            &["*"],
+            None,
+        )
         .await
         .expect("contacts.list dispatch should succeed with valid token + caps");
     let contacts = res["contacts"]

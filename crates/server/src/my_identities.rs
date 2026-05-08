@@ -164,8 +164,16 @@ fn handle_placeholder_for(transport_id: &str) -> String {
     // contain one of these substrings; the heuristic catches them
     // without code changes.
     let phone_hints = [
-        "sms", "mms", "phone", "voice", "call", "signal", "whatsapp",
-        "telegram", "imessage", "messenger",
+        "sms",
+        "mms",
+        "phone",
+        "voice",
+        "call",
+        "signal",
+        "whatsapp",
+        "telegram",
+        "imessage",
+        "messenger",
     ];
     if phone_hints.iter().any(|h| id.contains(h)) {
         return "+15551234".into();

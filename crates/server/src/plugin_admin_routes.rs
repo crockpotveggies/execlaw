@@ -116,9 +116,7 @@ async fn dispatch_handler(
     } else {
         match serde_json::from_slice(&body) {
             Ok(v) => v,
-            Err(_) => serde_json::Value::String(
-                String::from_utf8_lossy(&body).to_string(),
-            ),
+            Err(_) => serde_json::Value::String(String::from_utf8_lossy(&body).to_string()),
         }
     };
     let query_value = serde_json::Value::Object(

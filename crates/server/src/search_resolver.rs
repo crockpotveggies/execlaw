@@ -190,10 +190,7 @@ mod tests {
     /// Disable the seed DDG row so a single-other-provider test
     /// gets the single-passthrough path (vs the rotating wrapper).
     fn disable_ddg(store: &SearchProviderStore) {
-        let mut row = store
-            .get(SearchProviderKind::DuckDuckGo)
-            .unwrap()
-            .unwrap();
+        let mut row = store.get(SearchProviderKind::DuckDuckGo).unwrap().unwrap();
         row.enabled = false;
         row.is_default = false;
         store.upsert(&row).unwrap();

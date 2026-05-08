@@ -78,7 +78,10 @@ impl ScriptEngine {
     /// the cli boot path: AppState is built first; once it exists,
     /// `AppStateHostCapabilities::new(state.clone())` becomes
     /// available and the engine's caps slot can be filled.
-    pub fn set_host_capabilities(&self, caps: HostCapabilitiesArc) -> Result<(), HostCapabilitiesArc> {
+    pub fn set_host_capabilities(
+        &self,
+        caps: HostCapabilitiesArc,
+    ) -> Result<(), HostCapabilitiesArc> {
         self.host_caps.set(caps)
     }
 
@@ -117,7 +120,11 @@ impl ScriptEngine {
     pub fn build_for_plugin(
         &self,
         plugin_id: &str,
-    ) -> (rhai::Engine, OwningPluginSlot, primitives::SubscriptionRegistry) {
+    ) -> (
+        rhai::Engine,
+        OwningPluginSlot,
+        primitives::SubscriptionRegistry,
+    ) {
         let mut engine = rhai::Engine::new();
         engine.set_max_operations(MAX_OPS_PER_CALL);
         engine.set_max_call_levels(MAX_CALL_DEPTH);
@@ -169,7 +176,7 @@ mod tests {
     #[test]
     fn engine_rejects_runaway_loop_via_operations_limit() {
         let factory = ScriptEngine::new();
-        let (engine, _slot) = factory.build_for_plugin("loop");
+        let (engine, _slot, _reg) = factory.build_for_plugin("loop");
         let runaway = "let n = 0; loop { n += 1; }";
         let err = engine.eval::<rhai::Dynamic>(runaway).unwrap_err();
         let s = err.to_string();

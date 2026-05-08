@@ -257,10 +257,7 @@ impl ScriptPlugin {
                 .engine
                 .call_fn::<Dynamic>(&mut scope, &inner.ast, &function, args)
                 .map_err(|e| {
-                    ScriptError::Runtime(format!(
-                        "[{}] {function}: {e}",
-                        inner.plugin_id,
-                    ))
+                    ScriptError::Runtime(format!("[{}] {function}: {e}", inner.plugin_id,))
                 })
         })
         .await

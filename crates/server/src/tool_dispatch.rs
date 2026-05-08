@@ -227,11 +227,7 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
     /// bindings. These shims kept for API compat with call sites
     /// still passing `None` (e.g. tests, dispatch_routine_turn);
     /// remove in a follow-up cleanup.
-    pub fn with_signal_transport<T>(
-        self,
-        _resolver: T,
-        _self_number: Option<String>,
-    ) -> Self {
+    pub fn with_signal_transport<T>(self, _resolver: T, _self_number: Option<String>) -> Self {
         self
     }
 
@@ -401,7 +397,11 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             // for non-Controller trust would let a future policy
             // edit accidentally widen the surface. Hard-code the
             // gate here too.
-            if self.caller_trust.as_str().eq_ignore_ascii_case("Controller") {
+            if self
+                .caller_trust
+                .as_str()
+                .eq_ignore_ascii_case("Controller")
+            {
                 if let Some(host) = &self.mcp_host {
                     ctx.mcp_admin = Some(Arc::new(crate::tool_apis_mcp::DbMcpAdminApi::new(
                         self.host.db().clone(),

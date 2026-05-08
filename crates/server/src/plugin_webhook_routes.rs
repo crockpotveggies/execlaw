@@ -59,10 +59,7 @@ use std::collections::BTreeMap;
 /// Mount the catch-all under `/api/webhooks/:plugin_id/...`.
 /// Match-anything `*tail` lets a plugin declare nested paths.
 pub(crate) fn webhook_routes_router() -> Router<AppState> {
-    Router::new().route(
-        "/api/webhooks/{plugin_id}/{*tail}",
-        any(dispatch_handler),
-    )
+    Router::new().route("/api/webhooks/{plugin_id}/{*tail}", any(dispatch_handler))
 }
 
 async fn dispatch_handler(
@@ -79,10 +76,7 @@ async fn dispatch_handler(
     // routes are auth-gated by /api/admin/plugins/... and a
     // webhook hit must match a public webhook decl, never an
     // admin one.
-    let routes = state
-        .plugin_host
-        .registry()
-        .webhook_routes_for(&plugin_id);
+    let routes = state.plugin_host.registry().webhook_routes_for(&plugin_id);
     let upper = method.as_str().to_uppercase();
     let decl = routes
         .into_iter()
@@ -119,9 +113,7 @@ async fn dispatch_handler(
     } else {
         match serde_json::from_slice(&body) {
             Ok(v) => v,
-            Err(_) => serde_json::Value::String(
-                String::from_utf8_lossy(&body).to_string(),
-            ),
+            Err(_) => serde_json::Value::String(String::from_utf8_lossy(&body).to_string()),
         }
     };
     let query_value = serde_json::Value::Object(

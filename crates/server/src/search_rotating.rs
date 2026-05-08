@@ -140,7 +140,11 @@ impl WebSearchApi for RotatingWebSearchApi {
 
             // Skip if in cooldown.
             let in_cooldown = match self.state.cooldowns.lock() {
-                Ok(map) => map.get(kind).copied().map(|until| until > now).unwrap_or(false),
+                Ok(map) => map
+                    .get(kind)
+                    .copied()
+                    .map(|until| until > now)
+                    .unwrap_or(false),
                 Err(_) => false, // poisoned — best-effort, treat as not cooling
             };
             if in_cooldown {
@@ -402,8 +406,14 @@ mod tests {
 
     #[tokio::test]
     async fn all_failing_returns_aggregated_error() {
-        let a = Arc::new(StubProvider::fail("a", ApiError::Storage("HTTP 429".into())));
-        let b = Arc::new(StubProvider::fail("b", ApiError::Storage("HTTP 429".into())));
+        let a = Arc::new(StubProvider::fail(
+            "a",
+            ApiError::Storage("HTTP 429".into()),
+        ));
+        let b = Arc::new(StubProvider::fail(
+            "b",
+            ApiError::Storage("HTTP 429".into()),
+        ));
         let rot = RotatingWebSearchApi::with_state(
             vec![
                 (SearchProviderKind::DuckDuckGo, a),

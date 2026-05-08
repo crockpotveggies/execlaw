@@ -183,12 +183,10 @@ impl McpHost {
             .get(server_id)
             .map(|kv| kv.value().clone())
             .ok_or_else(|| format!("MCP server '{server_id}' not connected"))?;
-        let client = handle
-            .client
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| format!("MCP server '{server_id}' has no live connection right now"))?;
+        let client =
+            handle.client.lock().await.clone().ok_or_else(|| {
+                format!("MCP server '{server_id}' has no live connection right now")
+            })?;
         let r = client
             .call_tool(remote_name, args)
             .await
@@ -254,7 +252,8 @@ async fn stdio_actor_loop(
                     now,
                 );
                 info!(server = %row.id, "MCP server connected");
-                if let Err(e) = sync_tools(&db, &row, &ConnectedClient::Stdio(client.clone())).await {
+                if let Err(e) = sync_tools(&db, &row, &ConnectedClient::Stdio(client.clone())).await
+                {
                     warn!(server = %row.id, error = %e, "initial tool sync failed");
                 }
 
@@ -464,7 +463,11 @@ async fn http_actor_loop(
 /// Reflect a server's `tools/list` response into `config_tool_access`.
 /// Transport-agnostic — works for both stdio and streamable_http
 /// because both arms of `ConnectedClient` expose the same surface.
-async fn sync_tools(db: &Database, row: &McpServerRow, client: &ConnectedClient) -> McpResult<usize> {
+async fn sync_tools(
+    db: &Database,
+    row: &McpServerRow,
+    client: &ConnectedClient,
+) -> McpResult<usize> {
     let tools: Vec<McpTool> = client.list_tools().await?;
     let store = ToolAccessStore::new(db);
     let now = chrono::Utc::now().timestamp();

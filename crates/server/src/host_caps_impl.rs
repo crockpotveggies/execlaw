@@ -145,10 +145,7 @@ impl HostCapabilities for AppStateHostCapabilities {
         Ok(handle)
     }
 
-    async fn route_inbound(
-        &self,
-        msg: InboundMessage,
-    ) -> Result<RouteOutcome, HostCapError> {
+    async fn route_inbound(&self, msg: InboundMessage) -> Result<RouteOutcome, HostCapError> {
         crate::generic_inbound::route_inbound(&self.state, msg).await
     }
 
@@ -194,11 +191,7 @@ impl HostCapabilities for AppStateHostCapabilities {
         })
     }
 
-    async fn vault_get(
-        &self,
-        plugin_id: &str,
-        name: &str,
-    ) -> Result<Option<String>, HostCapError> {
+    async fn vault_get(&self, plugin_id: &str, name: &str) -> Result<Option<String>, HostCapError> {
         use execlaw_core::vault_row::VaultRowStore;
         let store = VaultRowStore::new(&self.state.db);
         let raw = store
@@ -230,11 +223,7 @@ impl HostCapabilities for AppStateHostCapabilities {
         Ok(())
     }
 
-    async fn vault_delete(
-        &self,
-        plugin_id: &str,
-        name: &str,
-    ) -> Result<bool, HostCapError> {
+    async fn vault_delete(&self, plugin_id: &str, name: &str) -> Result<bool, HostCapError> {
         use execlaw_core::vault_row::VaultRowStore;
         let store = VaultRowStore::new(&self.state.db);
         store
@@ -576,10 +565,7 @@ async fn consumer_loop(
 /// Sleep that wakes early on cancellation. Returns `false` when
 /// the cancel token fired (so the caller should exit), `true`
 /// when the sleep finished naturally.
-async fn sleep_or_cancel(
-    duration: Duration,
-    cancel: &tokio_util::sync::CancellationToken,
-) -> bool {
+async fn sleep_or_cancel(duration: Duration, cancel: &tokio_util::sync::CancellationToken) -> bool {
     tokio::select! {
         _ = tokio::time::sleep(duration) => true,
         _ = cancel.cancelled() => false,
@@ -648,8 +634,7 @@ mod ws_headers_tests {
         let (url, captured_rx) = one_shot_capture_server().await;
         let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
         let handle = WsSubscriptionHandle::new(cancel.clone());
-        let on_frame: WsFrameHandler =
-            Arc::new(|_| Box::pin(async move { /* drop frames */ }));
+        let on_frame: WsFrameHandler = Arc::new(|_| Box::pin(async move { /* drop frames */ }));
         let headers = vec![(
             "Authorization".to_owned(),
             "Bearer test-api-key-12345".to_owned(),
@@ -829,13 +814,10 @@ mod ws_keepalive_tests {
             // Wait for the response. We expect Message::Pong with
             // the same payload. Bounded — if the consumer never
             // pongs, the test fails on the outer timeout.
-            let frame = tokio::time::timeout(
-                Duration::from_secs(5),
-                server_read.next(),
-            )
-            .await
-            .ok()
-            .flatten();
+            let frame = tokio::time::timeout(Duration::from_secs(5), server_read.next())
+                .await
+                .ok()
+                .flatten();
             let payload = match frame {
                 Some(Ok(Message::Pong(p))) => Some(p.to_vec()),
                 _ => None,
@@ -853,8 +835,7 @@ mod ws_keepalive_tests {
 
         let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
         let handle = WsSubscriptionHandle::new(cancel.clone());
-        let on_frame: WsFrameHandler =
-            Arc::new(|_| Box::pin(async move { /* drop */ }));
+        let on_frame: WsFrameHandler = Arc::new(|_| Box::pin(async move { /* drop */ }));
         let cancel_for_task = cancel.clone();
         let task = tokio::spawn(async move {
             consumer_loop(url, vec![], vec![], on_frame, cancel_for_task, handle).await;

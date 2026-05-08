@@ -81,6 +81,18 @@ pub struct InboundMessage {
     /// The host fetches the bytes through the originating
     /// transport (`fetch_attachment` on the plugin's `TransportApi`).
     pub attachments: Vec<InboundAttachmentMeta>,
+    /// Did the underlying transport's wire format flag this message
+    /// as mentioning the agent? Slack populates `Some(true)` when
+    /// `<@bot-user-id>` appears in the channel-message text;
+    /// transports without a structured mention concept (Signal,
+    /// WhatsApp, SMS, email) leave this `None` and the host falls
+    /// back to a substring check on the agent's `display_name`.
+    ///
+    /// Agent-routing (`should_dispatch_to_agent`) treats `Some(true)`
+    /// as a hard "directed" verdict and short-circuits the LLM
+    /// classifier — saving inference cost AND ensuring an explicit
+    /// `@agent` mention is never misclassified as group banter.
+    pub mention_of_self: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -175,9 +187,9 @@ impl WsSubscriptionHandle {
             .read()
             .map_err(|_| HostCapError::new("ws send: outbox lock poisoned"))?;
         match slot.as_ref() {
-            Some(tx) => tx
-                .send(msg)
-                .map_err(|_| HostCapError::new("ws send: writer task gone (likely just disconnected)")),
+            Some(tx) => tx.send(msg).map_err(|_| {
+                HostCapError::new("ws send: writer task gone (likely just disconnected)")
+            }),
             None => Err(HostCapError::new(
                 "ws send: not connected (plugin should rely on protocol-level redelivery)",
             )),
@@ -225,11 +237,7 @@ pub trait HostCapabilities: Send + Sync {
     /// Returns the URL on success, `None` on timeout. The polling
     /// cadence is implementation-defined; the default impl polls
     /// every 500ms.
-    async fn sidecar_url_blocking(
-        &self,
-        sidecar_name: &str,
-        timeout_ms: u64,
-    ) -> Option<String> {
+    async fn sidecar_url_blocking(&self, sidecar_name: &str, timeout_ms: u64) -> Option<String> {
         let start = std::time::Instant::now();
         let deadline = start + std::time::Duration::from_millis(timeout_ms);
         loop {
@@ -336,10 +344,7 @@ pub trait HostCapabilities: Send + Sync {
     /// vs GroupNotAddressed) flows back through the Ok variant of
     /// [`RouteOutcome`] for plugins that want to log per-message
     /// telemetry.
-    async fn route_inbound(
-        &self,
-        msg: InboundMessage,
-    ) -> Result<RouteOutcome, HostCapError>;
+    async fn route_inbound(&self, msg: InboundMessage) -> Result<RouteOutcome, HostCapError>;
 
     /// Read an attachment's bytes from the host's attachment
     /// store, returned as a base64-encoded data URL the plugin
@@ -366,30 +371,18 @@ pub trait HostCapabilities: Send + Sync {
     /// through a config form. Stored bytes are interpreted as
     /// UTF-8; non-UTF-8 blobs surface an error rather than silently
     /// returning garbage.
-    async fn vault_get(
-        &self,
-        plugin_id: &str,
-        name: &str,
-    ) -> Result<Option<String>, HostCapError>;
+    async fn vault_get(&self, plugin_id: &str, name: &str) -> Result<Option<String>, HostCapError>;
 
     /// Write a per-plugin secret to `vault_secrets`. Idempotent on
     /// `(plugin_id, name)` — the row's `value_blob` is replaced
     /// and `updated_at` is bumped. Plugins call this from admin-
     /// route handlers when the operator submits a config form.
-    async fn vault_put(
-        &self,
-        plugin_id: &str,
-        name: &str,
-        value: &str,
-    ) -> Result<(), HostCapError>;
+    async fn vault_put(&self, plugin_id: &str, name: &str, value: &str)
+    -> Result<(), HostCapError>;
 
     /// Delete a per-plugin secret. Returns `true` when a row was
     /// removed, `false` when no such row existed. Idempotent.
-    async fn vault_delete(
-        &self,
-        plugin_id: &str,
-        name: &str,
-    ) -> Result<bool, HostCapError>;
+    async fn vault_delete(&self, plugin_id: &str, name: &str) -> Result<bool, HostCapError>;
 }
 
 /// Output of [`HostCapabilities::get_attachment_bytes_b64`].

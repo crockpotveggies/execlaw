@@ -356,6 +356,15 @@ fn bench_research_extract_readable_text(c: &mut Criterion) {
 // not signal-cli.
 // ---------------------------------------------------------------------------
 
+// 2026-05-08 — Signal benches gated out: `signal_inbound` /
+// `signal_transport` / `signal_tools` modules were retired when
+// Signal moved to the Rhai plugin tier (commit history:
+// "signal: typing-indicator wants PUT not POST", "signal v0.4.0:
+// script-tier plugin (Phase B)"). The plugin has its own surface
+// for these — a future commit can restore equivalent benchmarks
+// against the plugin host. Until then, `#[cfg(any())]` makes
+// these bodies compile out so the rest of the bench file builds.
+#[cfg(any())]
 fn bench_signal_send_outbound(c: &mut Criterion) {
     use execlaw_core::Database;
     use execlaw_core::db::DbConfig;
@@ -449,6 +458,7 @@ fn bench_signal_send_outbound(c: &mut Criterion) {
 // shape detection.
 // ---------------------------------------------------------------------------
 
+#[cfg(any())]
 fn bench_signal_inbound_decode(c: &mut Criterion) {
     let text_frame = serde_json::json!({
         "account": "+15551234567",
@@ -519,6 +529,7 @@ fn bench_signal_inbound_decode(c: &mut Criterion) {
 // about (leaving a group on the agent's behalf).
 // ---------------------------------------------------------------------------
 
+#[cfg(any())]
 fn bench_signal_group_name_resolution(c: &mut Criterion) {
     use async_trait::async_trait;
     use execlaw_core::tool::{ApiError, TransportApi, TransportGroupSummary};
@@ -586,6 +597,7 @@ fn bench_signal_group_name_resolution(c: &mut Criterion) {
 // not spike the consumer's per-message cost.
 // ---------------------------------------------------------------------------
 
+#[cfg(any())]
 fn bench_signal_inbound_decode_with_attachments(c: &mut Criterion) {
     let attachments: Vec<serde_json::Value> = (0..10)
         .map(|i| {
@@ -638,6 +650,7 @@ fn bench_signal_inbound_decode_with_attachments(c: &mut Criterion) {
 // without any signal-cli mock noise.
 // ---------------------------------------------------------------------------
 
+#[cfg(any())]
 fn bench_signal_outbound_attachment_encode(c: &mut Criterion) {
     use base64::Engine;
     // 500 KiB of pseudo-random bytes — typical jpeg payload size.
@@ -659,6 +672,109 @@ fn bench_signal_outbound_attachment_encode(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Group-addressing + per-turn group context (2026-05-08).
+//
+// Every inbound on a transport with groups (Signal, WhatsApp, Slack)
+// hits these paths:
+//
+//   * `name_in_text` — host-side cheap shortcut that checks if the
+//     agent's display name appears in the message. Runs BEFORE the
+//     LLM classifier on every group inbound that didn't already
+//     carry a transport-level `mention_of_self: true` hint. Must be
+//     fast enough that we'd rather call it than skip — sub-µs target.
+//
+//   * `build_turn_context_prose` — assembles the per-turn system-
+//     prompt context block that includes (now) the group-conversation
+//     section. Runs once per turn. The new group block adds a
+//     handful of `format!` calls; the budget is the same as the
+//     wider function (microseconds, not milliseconds — anything
+//     more would be measurable next to the LLM round-trip).
+//
+// Budgets:
+//   * name_in_text/typical → ≤ 1µs
+//   * build_turn_context_prose/with_group → ≤ 100µs (well under the
+//     LLM round-trip's milliseconds)
+// ---------------------------------------------------------------------------
+
+fn bench_group_addressing_name_in_text(c: &mut Criterion) {
+    use execlaw_server::group_addressing::name_in_text;
+
+    // Hit (substring match found): typical "Lena, can you ..." case
+    // that fires the cheap shortcut and avoids the classifier.
+    c.bench_function("group_addressing/name_in_text/hit", |b| {
+        b.iter(|| {
+            name_in_text(
+                black_box("Lena"),
+                black_box("hey Lena, can you check the calendar tomorrow?"),
+            )
+        })
+    });
+
+    // Miss (substring not found): exercises the worst-case path —
+    // we walk the lower-cased text fully without finding the name.
+    c.bench_function("group_addressing/name_in_text/miss", |b| {
+        b.iter(|| {
+            name_in_text(
+                black_box("Lena"),
+                black_box(
+                    "anyone know a good Thai place near downtown for tomorrow night? \
+                     I'm thinking around 6pm. Might be 4 of us.",
+                ),
+            )
+        })
+    });
+}
+
+fn bench_build_turn_context_prose(c: &mut Criterion) {
+    use execlaw_server::chats::{GroupTurnContext, build_turn_context_prose};
+    use execlaw_server::group_addressing::AddressedReason;
+
+    let now = chrono::DateTime::parse_from_rfc3339("2026-05-08T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    // Baseline: DM / web — the original happy path before the group
+    // block was added. Establishes the "no group" cost so a
+    // regression in the with_group case stands out.
+    c.bench_function("turn_context/prose/no_group", |b| {
+        b.iter(|| {
+            build_turn_context_prose(
+                black_box(now),
+                black_box("conv-bench"),
+                black_box(Some("controller")),
+                black_box("Controller"),
+                black_box(Some("signal")),
+                black_box(Some("America/Los_Angeles")),
+                black_box(None),
+            )
+        })
+    });
+
+    // With the group block populated: the new code path. This is
+    // the worst-case prose size — the longest reason description
+    // (FallOpen) is selected so the format! calls don't get
+    // optimised down to the trivial path.
+    let g = GroupTurnContext {
+        group_name: Some("Project Loon Planning".into()),
+        member_count: 8,
+        addressed_reason: AddressedReason::FallOpenClassifierError,
+    };
+    c.bench_function("turn_context/prose/with_group", |b| {
+        b.iter(|| {
+            build_turn_context_prose(
+                black_box(now),
+                black_box("conv-bench"),
+                black_box(Some("controller")),
+                black_box("Controller"),
+                black_box(Some("signal")),
+                black_box(Some("America/Los_Angeles")),
+                black_box(Some(&g)),
+            )
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_jwt_access,
@@ -670,10 +786,11 @@ criterion_group!(
     bench_runner_frame_codec,
     bench_research_parse_ddg_html,
     bench_research_extract_readable_text,
-    bench_signal_send_outbound,
-    bench_signal_inbound_decode,
-    bench_signal_group_name_resolution,
-    bench_signal_inbound_decode_with_attachments,
-    bench_signal_outbound_attachment_encode,
+    // Signal benches `#[cfg(any())]`-gated since the modules they
+    // depend on (signal_inbound, signal_transport, signal_tools)
+    // moved to the Rhai plugin tier. Restore via plugin-host
+    // benches when that surface is ready.
+    bench_group_addressing_name_in_text,
+    bench_build_turn_context_prose,
 );
 criterion_main!(benches);

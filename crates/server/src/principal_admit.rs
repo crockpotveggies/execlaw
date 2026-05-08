@@ -41,12 +41,12 @@
 use chrono::Utc;
 use execlaw_core::db::DbError;
 use execlaw_core::ids::{PluginId, PrincipalId};
-use execlaw_core::principal::{Identifier, Principal, PrincipalStore, TrustLevel as CoreTrustLevel};
+use execlaw_core::principal::{
+    Identifier, Principal, PrincipalStore, TrustLevel as CoreTrustLevel,
+};
 use execlaw_core::principal_groups::PrincipalGroupStore;
 use execlaw_core::transport_bindings::TransportBindingStore;
-use execlaw_core::trust_policy::{
-    AutoTrustClass, MinTrustHint, TrustPolicy, TrustPolicyStore,
-};
+use execlaw_core::trust_policy::{AutoTrustClass, MinTrustHint, TrustPolicy, TrustPolicyStore};
 use execlaw_plugin_host::PluginHost;
 use execlaw_policy::trust::TrustLevel;
 use rusqlite::params;
@@ -116,9 +116,7 @@ pub async fn admit_external_principal(
     // matches the handle.
     let (trust_level, resolved_by, flat_trust) = if policy.auto_trust_contacts {
         let resolver_kind = resolver_kind_for(transport, handle);
-        let matches = plugin_host
-            .resolve_identity(&resolver_kind, handle)
-            .await;
+        let matches = plugin_host.resolve_identity(&resolver_kind, handle).await;
         classify_matches(&matches, &policy, now)
     } else {
         unknown_pending(now)
@@ -355,10 +353,7 @@ pub fn reconcile_against_my_identities(
         std::collections::HashMap::new();
     for p in &all {
         for ident in &p.identifiers {
-            by_ident
-                .entry(ident.clone())
-                .or_default()
-                .push(p.clone());
+            by_ident.entry(ident.clone()).or_default().push(p.clone());
         }
     }
 
@@ -442,22 +437,22 @@ pub fn reconcile_against_my_identities(
                         // to the resolver_kind we picked for the
                         // identifier — not perfect, but better than
                         // hardcoded "signal".
-                        stale.identifiers
+                        stale
+                            .identifiers
                             .first()
                             .map(|i| i.transport.clone())
                             .unwrap_or_default()
                     });
                 let is_controller = matches!(target.trust_level, CoreTrustLevel::Controller);
-                let target_group = pg_store
-                    .resolve(
-                        &execlaw_core::principal_groups::GroupKey {
-                            channel: &stale_channel,
-                            native_group_id: None,
-                            principals: &[target.id.clone()],
-                            includes_controller: is_controller,
-                        },
-                        now,
-                    )?;
+                let target_group = pg_store.resolve(
+                    &execlaw_core::principal_groups::GroupKey {
+                        channel: &stale_channel,
+                        native_group_id: None,
+                        principals: &[target.id.clone()],
+                        includes_controller: is_controller,
+                    },
+                    now,
+                )?;
                 if target_group.group_id == *stale_group_id {
                     continue;
                 }
@@ -574,10 +569,7 @@ fn flip_awaiting_trust_to_idle(
     })
 }
 
-fn drop_group_members(
-    db: &execlaw_core::db::Database,
-    group_id: &str,
-) -> Result<(), DbError> {
+fn drop_group_members(db: &execlaw_core::db::Database, group_id: &str) -> Result<(), DbError> {
     db.with_conn(|c| {
         c.execute(
             "DELETE FROM state_principal_group_members WHERE group_id = ?1",
@@ -975,7 +967,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(got.id.as_str(), "pri_signal_+19998887777");
-        assert!(matches!(got.trust_level, CoreTrustLevel::UnknownPending { .. }));
+        assert!(matches!(
+            got.trust_level,
+            CoreTrustLevel::UnknownPending { .. }
+        ));
         assert_eq!(flat, TrustLevel::UnknownPending);
         // Identifier was written so the next inbound finds it via
         // exact-id hit (step 1).

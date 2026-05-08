@@ -310,7 +310,10 @@ pub async fn connect_handler(
     // strict superset — collapses to "use manifest scopes".
     {
         let accounts = state.plugin_host.registry().oauth_accounts_for(&plugin_id);
-        if let Some(decl) = accounts.into_iter().find(|a| a.account_name == account_name) {
+        if let Some(decl) = accounts
+            .into_iter()
+            .find(|a| a.account_name == account_name)
+        {
             if !decl.scopes.is_empty() {
                 let persisted = client.scopes();
                 let mut merged: Vec<String> = persisted.clone();
@@ -811,9 +814,7 @@ mod tests {
         // Connect now reconciles persisted ∪ manifest BEFORE building
         // the authorize URL so the next consent prompt requests the
         // expanded scopes.
-        use execlaw_plugin_sdk::manifest::{
-            OauthAccountDecl, PluginHeader, PluginManifest,
-        };
+        use execlaw_plugin_sdk::manifest::{OauthAccountDecl, PluginHeader, PluginManifest};
 
         let state = test_app_state();
 
@@ -858,6 +859,7 @@ mod tests {
             health_checks: vec![],
             skills: vec![],
             admin_routes: vec![],
+            webhook_routes: vec![],
             runtime: None,
         };
         state
@@ -925,8 +927,16 @@ mod tests {
             .unwrap()
             .expect("client row must exist after upsert");
         let scopes = row.scopes();
-        assert!(scopes.iter().any(|s| s == "https://www.googleapis.com/auth/calendar.events"));
-        assert!(scopes.iter().any(|s| s == "https://www.googleapis.com/auth/calendar.readonly"));
+        assert!(
+            scopes
+                .iter()
+                .any(|s| s == "https://www.googleapis.com/auth/calendar.events")
+        );
+        assert!(
+            scopes
+                .iter()
+                .any(|s| s == "https://www.googleapis.com/auth/calendar.readonly")
+        );
         assert!(scopes.iter().any(|s| s == "openid"));
         assert!(scopes.iter().any(|s| s == "email"));
     }

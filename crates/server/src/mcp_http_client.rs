@@ -116,10 +116,9 @@ impl HttpMcpClient {
     /// `tools/list` — same return shape as the stdio client.
     pub async fn list_tools(&self) -> McpResult<Vec<McpTool>> {
         let result: Value = self.call("tools/list", None).await?;
-        let tools = result
-            .get("tools")
-            .cloned()
-            .ok_or_else(|| McpError::Protocol("tools/list response missing `tools` field".into()))?;
+        let tools = result.get("tools").cloned().ok_or_else(|| {
+            McpError::Protocol("tools/list response missing `tools` field".into())
+        })?;
         let parsed: Vec<McpTool> = serde_json::from_value(tools)
             .map_err(|e| McpError::Protocol(format!("decode tools/list: {e}")))?;
         Ok(parsed)
@@ -255,8 +254,11 @@ fn rpc_to_result(method: &str, resp: RpcResponse) -> McpResult<Value> {
             err.code, err.message
         )));
     }
-    resp.result
-        .ok_or_else(|| McpError::Protocol(format!("rpc {method}: response had neither result nor error")))
+    resp.result.ok_or_else(|| {
+        McpError::Protocol(format!(
+            "rpc {method}: response had neither result nor error"
+        ))
+    })
 }
 
 fn truncate(s: &str, max: usize) -> String {

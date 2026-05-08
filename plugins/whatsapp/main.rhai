@@ -265,12 +265,72 @@ fn on_webhook_event(args) {
         // those — accept and ack so wuzapi doesn't retry.
         return #{ "ok": true };
     }
+    // Enrich with the group's user-facing name when this is a
+    // group inbound. Wuzapi's per-message webhook payload doesn't
+    // include the group title — only the JID. Without a name the
+    // host's auto-rename leaves the conversation display_name
+    // empty AND the agent's per-turn group-context block falls
+    // back to "this group" instead of the real title. Look it up
+    // through `/group/list` and cache so subsequent inbounds for
+    // the same group don't pay the round-trip.
+    if inbound.group_id != () && inbound.group_id != "" {
+        try {
+            let name = resolve_group_name_cached(inbound.group_id);
+            if name != () && name != "" {
+                inbound["group_name"] = name;
+            }
+        } catch (e) {
+            // Best-effort: a name-resolution failure must not drop
+            // the inbound. The agent loses the group title for this
+            // turn but the rest of the pipeline runs.
+            log_warn("whatsapp: resolve_group_name failed for " + inbound.group_id + ": " + e);
+        }
+    }
     try {
         host_route_inbound(inbound);
     } catch (e) {
         log_warn("whatsapp: host_route_inbound rejected: " + e);
     }
     #{ "ok": true }
+}
+
+// Resolve a WhatsApp group JID to its user-facing title, with a
+// vault-backed cache so we hit /group/list at most once per group
+// per process lifetime (the cache is keyed in the vault, so
+// installs survive restarts too).
+//
+// On miss: fetches the full group list, populates the cache for
+// EVERY group in the response (not just the one we asked for —
+// the round-trip cost is paid either way and pre-warming saves
+// work on the next group's first inbound), and returns the match.
+//
+// Returns `()` when the lookup can't find the group (e.g. wuzapi
+// not yet aware of it, or a JID for a group the controller
+// recently left). Caller is expected to handle `()` — the
+// webhook handler does.
+//
+// Vault key shape: `group_name:<jid>`. Stored as a plain string;
+// no TTL — group renames are rare enough that this can age
+// gracefully, and a future `whatsapp.refresh_group_names` admin
+// tool can blow the cache when a rename surfaces.
+fn resolve_group_name_cached(group_jid) {
+    let cache_key = "group_name:" + group_jid;
+    let cached = vault_get(cache_key);
+    if cached != () && cached != "" {
+        return cached;
+    }
+    // Cache miss — fetch /group/list.
+    let listed = list_groups_impl();
+    if listed == () || listed.groups == () { return (); }
+    let hit = ();
+    for g in listed.groups {
+        if g.id == () || g.name == () || g.name == "" { continue; }
+        // Cache the name for every returned group so the next
+        // inbound on a sibling group is free.
+        vault_put("group_name:" + g.id, g.name);
+        if g.id == group_jid { hit = g.name; }
+    }
+    hit
 }
 
 // Pure helper: decode a wuzapi WS event into the channel-agnostic

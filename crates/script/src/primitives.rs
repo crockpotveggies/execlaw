@@ -80,8 +80,7 @@ pub(crate) fn set_owning_plugin(slot: &OwningPluginSlot, plugin: crate::ScriptPl
 /// reinstalling a transport plugin would leave the previous
 /// install's WS consumer running, producing duplicate inbound
 /// dispatches and `connectionCount > 1` on the upstream gateway.
-pub(crate) type SubscriptionRegistry =
-    Arc<std::sync::Mutex<Vec<WsSubscriptionHandle>>>;
+pub(crate) type SubscriptionRegistry = Arc<std::sync::Mutex<Vec<WsSubscriptionHandle>>>;
 
 pub(crate) fn new_subscription_registry() -> SubscriptionRegistry {
     Arc::new(std::sync::Mutex::new(Vec::new()))
@@ -174,7 +173,13 @@ pub(crate) fn register(
                   headers: Map|
                   -> Result<Dynamic, Box<EvalAltResult>> {
                 http_get_impl_with_headers(
-                    &agent, &pid, &url, &query, &bearer, Some(&headers), allow_loopback,
+                    &agent,
+                    &pid,
+                    &url,
+                    &query,
+                    &bearer,
+                    Some(&headers),
+                    allow_loopback,
                 )
             },
         );
@@ -207,7 +212,13 @@ pub(crate) fn register(
                   headers: Map|
                   -> Result<Dynamic, Box<EvalAltResult>> {
                 http_post_impl_with_headers(
-                    &agent, &pid, &url, body, &bearer, Some(&headers), allow_loopback,
+                    &agent,
+                    &pid,
+                    &url,
+                    body,
+                    &bearer,
+                    Some(&headers),
+                    allow_loopback,
                 )
             },
         );
@@ -566,9 +577,7 @@ fn register_host_cap_bindings(
                         )));
                     }
                 };
-                let url = tokio::task::block_in_place(|| {
-                    runtime.block_on(caps.sidecar_url(&name))
-                });
+                let url = tokio::task::block_in_place(|| runtime.block_on(caps.sidecar_url(&name)));
                 Ok(match url {
                     Some(u) => Dynamic::from(ImmutableString::from(u)),
                     None => Dynamic::UNIT,
@@ -600,13 +609,16 @@ fn register_host_cap_bindings(
                     Ok(h) => h,
                     Err(e) => {
                         return Err(Box::new(EvalAltResult::ErrorRuntime(
-                            format!("[{pid}] sidecar_url_blocking: no tokio runtime: {e}")
-                                .into(),
+                            format!("[{pid}] sidecar_url_blocking: no tokio runtime: {e}").into(),
                             rhai::Position::NONE,
                         )));
                     }
                 };
-                let timeout = if timeout_ms < 0 { 0u64 } else { timeout_ms as u64 };
+                let timeout = if timeout_ms < 0 {
+                    0u64
+                } else {
+                    timeout_ms as u64
+                };
                 let url = tokio::task::block_in_place(|| {
                     runtime.block_on(caps.sidecar_url_blocking(&name, timeout))
                 });
@@ -825,10 +837,8 @@ fn register_host_cap_bindings(
                     Some(p) => p,
                     None => {
                         return Err(Box::new(EvalAltResult::ErrorRuntime(
-                            format!(
-                                "[{pid}] ws_subscribe_bidi: owning plugin not yet wired"
-                            )
-                            .into(),
+                            format!("[{pid}] ws_subscribe_bidi: owning plugin not yet wired")
+                                .into(),
                             rhai::Position::NONE,
                         )));
                     }
@@ -844,10 +854,7 @@ fn register_host_cap_bindings(
                     let plugin = plugin.clone();
                     let pid = pid_for_handler.clone();
                     let cb = cb_name.clone();
-                    let h_opt = handle_cell_for_handler
-                        .read()
-                        .ok()
-                        .and_then(|g| g.clone());
+                    let h_opt = handle_cell_for_handler.read().ok().and_then(|g| g.clone());
                     Box::pin(async move {
                         let mut args: Vec<Dynamic> = Vec::with_capacity(2);
                         if let Some(h) = h_opt {
@@ -873,8 +880,7 @@ fn register_host_cap_bindings(
                     Ok(h) => h,
                     Err(e) => {
                         return Err(Box::new(EvalAltResult::ErrorRuntime(
-                            format!("[{pid}] ws_subscribe_bidi: no tokio runtime: {e}")
-                                .into(),
+                            format!("[{pid}] ws_subscribe_bidi: no tokio runtime: {e}").into(),
                             rhai::Position::NONE,
                         )));
                     }
@@ -951,7 +957,8 @@ fn register_host_cap_bindings(
                     Some(p) => p,
                     None => {
                         return Err(Box::new(EvalAltResult::ErrorRuntime(
-                            format!("[{pid}] ws_subscribe_bidi: owning plugin not yet wired").into(),
+                            format!("[{pid}] ws_subscribe_bidi: owning plugin not yet wired")
+                                .into(),
                             rhai::Position::NONE,
                         )));
                     }
@@ -1072,7 +1079,8 @@ fn register_host_cap_bindings(
                     Some(p) => p,
                     None => {
                         return Err(Box::new(EvalAltResult::ErrorRuntime(
-                            format!("[{pid}] ws_subscribe_bidi: owning plugin not yet wired").into(),
+                            format!("[{pid}] ws_subscribe_bidi: owning plugin not yet wired")
+                                .into(),
                             rhai::Position::NONE,
                         )));
                     }
@@ -1238,39 +1246,35 @@ fn register_host_cap_bindings(
     {
         let pid = plugin_id.to_owned();
         let active_slot = active_bidi_handle.clone();
-        engine.register_fn(
-            "ws_send_to_active",
-            move |msg: ImmutableString| -> bool {
-                let h_opt = active_slot.read().ok().and_then(|g| g.clone());
-                let h = match h_opt {
-                    Some(h) => h,
-                    None => {
-                        tracing::debug!(
-                            target: "execlaw_script::primitives",
-                            plugin_id = %pid,
-                            "ws_send_to_active: no active subscription — \
-                             plugin probably hasn't called ws_subscribe_bidi yet"
-                        );
-                        return false;
-                    }
-                };
-                match h.send(msg.to_string()) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        tracing::debug!(
-                            target: "execlaw_script::primitives",
-                            plugin_id = %pid,
-                            error = %e.0,
-                            "ws_send_to_active dropped — caller should rely on \
-                             protocol-level redelivery"
-                        );
-                        false
-                    }
+        engine.register_fn("ws_send_to_active", move |msg: ImmutableString| -> bool {
+            let h_opt = active_slot.read().ok().and_then(|g| g.clone());
+            let h = match h_opt {
+                Some(h) => h,
+                None => {
+                    tracing::debug!(
+                        target: "execlaw_script::primitives",
+                        plugin_id = %pid,
+                        "ws_send_to_active: no active subscription — \
+                         plugin probably hasn't called ws_subscribe_bidi yet"
+                    );
+                    return false;
                 }
-            },
-        );
+            };
+            match h.send(msg.to_string()) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::debug!(
+                        target: "execlaw_script::primitives",
+                        plugin_id = %pid,
+                        error = %e.0,
+                        "ws_send_to_active dropped — caller should rely on \
+                         protocol-level redelivery"
+                    );
+                    false
+                }
+            }
+        });
     }
-
 
     // Method on WsSubscriptionHandle — `handle.close()` from Rhai.
     engine.register_fn("close", |h: &mut WsSubscriptionHandle| h.close());
@@ -1336,9 +1340,8 @@ fn register_host_cap_bindings(
                         )));
                     }
                 };
-                let outcome = tokio::task::block_in_place(|| {
-                    runtime.block_on(caps.route_inbound(inbound))
-                });
+                let outcome =
+                    tokio::task::block_in_place(|| runtime.block_on(caps.route_inbound(inbound)));
                 match outcome {
                     Ok(o) => Ok(Dynamic::from(ImmutableString::from(format!("{o:?}")))),
                     Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
@@ -1381,11 +1384,7 @@ fn register_host_cap_bindings(
 /// persist operator-supplied API keys (Pushover user/token,
 /// future plugins' bearer tokens, etc.) and by tool-call handlers
 /// that read those keys at dispatch time.
-fn register_vault_bindings(
-    engine: &mut Engine,
-    plugin_id: &str,
-    host_caps: HostCapsHandle,
-) {
+fn register_vault_bindings(engine: &mut Engine, plugin_id: &str, host_caps: HostCapsHandle) {
     {
         let pid = plugin_id.to_owned();
         let caps = host_caps.clone();
@@ -1517,8 +1516,14 @@ fn register_host_get_attachment_bytes(
             match res {
                 Ok(a) => {
                     let mut m = rhai::Map::new();
-                    m.insert("data_url".into(), Dynamic::from(ImmutableString::from(a.data_url)));
-                    m.insert("mime_type".into(), Dynamic::from(ImmutableString::from(a.mime_type)));
+                    m.insert(
+                        "data_url".into(),
+                        Dynamic::from(ImmutableString::from(a.data_url)),
+                    );
+                    m.insert(
+                        "mime_type".into(),
+                        Dynamic::from(ImmutableString::from(a.mime_type)),
+                    );
                     m.insert("size_bytes".into(), Dynamic::from(a.size_bytes as i64));
                     Ok(Dynamic::from(m))
                 }
@@ -1604,18 +1609,19 @@ fn http_get_bytes_impl(
     let mut m = rhai::Map::new();
     m.insert(
         "data_url".into(),
-        Dynamic::from(ImmutableString::from(format!("data:{mime};base64,{encoded}"))),
+        Dynamic::from(ImmutableString::from(format!(
+            "data:{mime};base64,{encoded}"
+        ))),
     );
-    m.insert("mime_type".into(), Dynamic::from(ImmutableString::from(mime)));
+    m.insert(
+        "mime_type".into(),
+        Dynamic::from(ImmutableString::from(mime)),
+    );
     m.insert("size_bytes".into(), Dynamic::from(buf.len() as i64));
     Ok(Dynamic::from(m))
 }
 
-fn register_sidecar_http_get(
-    engine: &mut Engine,
-    plugin_id: &str,
-    host_caps: HostCapsHandle,
-) {
+fn register_sidecar_http_get(engine: &mut Engine, plugin_id: &str, host_caps: HostCapsHandle) {
     let pid = plugin_id.to_owned();
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
@@ -1669,11 +1675,7 @@ fn register_sidecar_http_get(
     );
 }
 
-fn register_sidecar_http_post(
-    engine: &mut Engine,
-    plugin_id: &str,
-    host_caps: HostCapsHandle,
-) {
+fn register_sidecar_http_post(engine: &mut Engine, plugin_id: &str, host_caps: HostCapsHandle) {
     let pid = plugin_id.to_owned();
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
@@ -1761,11 +1763,7 @@ fn apply_headers(mut req: ureq::Request, headers: &Map) -> ureq::Request {
     req
 }
 
-fn register_sidecar_http_put(
-    engine: &mut Engine,
-    plugin_id: &str,
-    host_caps: HostCapsHandle,
-) {
+fn register_sidecar_http_put(engine: &mut Engine, plugin_id: &str, host_caps: HostCapsHandle) {
     let pid = plugin_id.to_owned();
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
@@ -1824,11 +1822,7 @@ fn register_sidecar_http_put(
     );
 }
 
-fn register_sidecar_http_delete(
-    engine: &mut Engine,
-    plugin_id: &str,
-    host_caps: HostCapsHandle,
-) {
+fn register_sidecar_http_delete(engine: &mut Engine, plugin_id: &str, host_caps: HostCapsHandle) {
     let pid = plugin_id.to_owned();
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
@@ -1898,9 +1892,7 @@ fn sidecar_url_check(
             rhai::Position::NONE,
         ))
     })?;
-    let known = tokio::task::block_in_place(|| {
-        runtime.block_on(caps.is_known_sidecar_url(url))
-    });
+    let known = tokio::task::block_in_place(|| runtime.block_on(caps.is_known_sidecar_url(url)));
     if !known {
         return Err(Box::new(EvalAltResult::ErrorRuntime(
             format!(
@@ -1919,20 +1911,15 @@ fn sidecar_url_check(
 /// map. Missing optional fields default to `None`; missing
 /// required fields (`channel`, `native_id`) return a clean Rhai
 /// error so the plugin author sees what they forgot.
-fn inbound_from_rhai_map(
-    plugin_id: &str,
-    msg: &Map,
-) -> Result<InboundMessage, Box<EvalAltResult>> {
+fn inbound_from_rhai_map(plugin_id: &str, msg: &Map) -> Result<InboundMessage, Box<EvalAltResult>> {
     let required_str = |key: &str| -> Result<String, Box<EvalAltResult>> {
         msg.get(key)
             .and_then(|v| v.clone().into_string().ok())
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| {
                 Box::new(EvalAltResult::ErrorRuntime(
-                    format!(
-                        "[{plugin_id}] host_route_inbound: missing required field `{key}`"
-                    )
-                    .into(),
+                    format!("[{plugin_id}] host_route_inbound: missing required field `{key}`")
+                        .into(),
                     rhai::Position::NONE,
                 ))
             })
@@ -1942,10 +1929,8 @@ fn inbound_from_rhai_map(
             .and_then(|v| v.clone().into_string().ok())
             .filter(|s| !s.is_empty())
     };
-    let opt_i64 = |key: &str| -> Option<i64> {
-        msg.get(key)
-            .and_then(|v| v.as_int().ok())
-    };
+    let opt_i64 = |key: &str| -> Option<i64> { msg.get(key).and_then(|v| v.as_int().ok()) };
+    let opt_bool = |key: &str| -> Option<bool> { msg.get(key).and_then(|v| v.as_bool().ok()) };
 
     let channel = required_str("channel")?;
     let native_id = required_str("native_id")?;
@@ -1973,7 +1958,9 @@ fn inbound_from_rhai_map(
                 .and_then(|v| v.clone().into_string().ok())
                 .filter(|s| !s.is_empty());
             let size_bytes = m.get("size_bytes").and_then(|v| {
-                v.as_int().ok().and_then(|n| if n >= 0 { Some(n as u64) } else { None })
+                v.as_int()
+                    .ok()
+                    .and_then(|n| if n >= 0 { Some(n as u64) } else { None })
             });
             Some(InboundAttachmentMeta {
                 bridge_id,
@@ -1992,6 +1979,7 @@ fn inbound_from_rhai_map(
         text,
         timestamp_ms: opt_i64("timestamp_ms"),
         attachments,
+        mention_of_self: opt_bool("mention_of_self"),
     })
 }
 
@@ -2417,7 +2405,7 @@ mod tests {
     #[test]
     fn digits_only_strips_non_digits() {
         let factory = ScriptEngine::new();
-        let (engine, _slot) = factory.build_for_plugin("test");
+        let (engine, _slot, _reg) = factory.build_for_plugin("test");
         let v: String = engine
             .eval::<ImmutableString>(r#"digits_only("+1 (555) 123-4567")"#)
             .unwrap()
@@ -2428,7 +2416,7 @@ mod tests {
     #[test]
     fn lower_and_trim_compose() {
         let factory = ScriptEngine::new();
-        let (engine, _slot) = factory.build_for_plugin("test");
+        let (engine, _slot, _reg) = factory.build_for_plugin("test");
         let v: String = engine
             .eval::<ImmutableString>(r#"trim(lower("  ALICE@Example.COM  "))"#)
             .unwrap()
@@ -2439,7 +2427,7 @@ mod tests {
     #[test]
     fn hash_is_stable_for_same_input() {
         let factory = ScriptEngine::new();
-        let (engine, _slot) = factory.build_for_plugin("test");
+        let (engine, _slot, _reg) = factory.build_for_plugin("test");
         let a: ImmutableString = engine.eval(r#"hash("people/c12345")"#).unwrap();
         let b: ImmutableString = engine.eval(r#"hash("people/c12345")"#).unwrap();
         assert_eq!(a, b);
@@ -2453,7 +2441,7 @@ mod tests {
     #[test]
     fn unix_to_rfc3339_formats_known_timestamp() {
         let factory = ScriptEngine::new();
-        let (engine, _slot) = factory.build_for_plugin("test");
+        let (engine, _slot, _reg) = factory.build_for_plugin("test");
         // 1700000000 = 2023-11-14T22:13:20Z
         let s: ImmutableString = engine.eval("unix_to_rfc3339(1700000000)").unwrap();
         assert_eq!(s.as_str(), "2023-11-14T22:13:20Z");
@@ -2462,7 +2450,7 @@ mod tests {
     #[test]
     fn url_encode_percent_encodes_reserved_characters() {
         let factory = ScriptEngine::new();
-        let (engine, _slot) = factory.build_for_plugin("test");
+        let (engine, _slot, _reg) = factory.build_for_plugin("test");
         let cases: &[(&str, &str)] = &[
             ("user@example.com", "user%40example.com"),
             ("a/b:c", "a%2Fb%3Ac"),
@@ -2480,7 +2468,7 @@ mod tests {
     #[test]
     fn now_returns_a_recent_unix_timestamp() {
         let factory = ScriptEngine::new();
-        let (engine, _slot) = factory.build_for_plugin("test");
+        let (engine, _slot, _reg) = factory.build_for_plugin("test");
         let t: i64 = engine.eval("now()").unwrap();
         // Sanity range: between 2024-01-01 and 2030-01-01.
         assert!(t > 1_700_000_000);
@@ -2490,7 +2478,7 @@ mod tests {
     #[test]
     fn json_path_extracts_nested_values() {
         let factory = ScriptEngine::new();
-        let (engine, _slot) = factory.build_for_plugin("test");
+        let (engine, _slot, _reg) = factory.build_for_plugin("test");
         let script = r#"
             let doc = #{
                 "connections": [
@@ -2562,7 +2550,7 @@ mod tests {
         // Test mock is on 127.0.0.1, so opt out of the SSRF guard
         // for this test only — production never uses this constructor.
         let factory = ScriptEngine::with_loopback_allowed_for_tests();
-        let (engine, _slot) = factory.build_for_plugin("http-test");
+        let (engine, _slot, _reg) = factory.build_for_plugin("http-test");
         let script = format!(
             r#"
             let r = http_get("http://{addr}/", #{{ }}, "");
@@ -2581,7 +2569,7 @@ mod tests {
     #[test]
     fn http_get_to_closed_port_surfaces_runtime_error() {
         let factory = ScriptEngine::new();
-        let (engine, _slot) = factory.build_for_plugin("http-fail");
+        let (engine, _slot, _reg) = factory.build_for_plugin("http-fail");
         let result = engine.eval::<Dynamic>(r#"http_get("http://127.0.0.1:1/", #{ }, "")"#);
         let err = result.unwrap_err().to_string();
         assert!(err.contains("http_get"), "got: {err}");
@@ -2596,7 +2584,7 @@ mod tests {
     #[test]
     fn ssrf_guard_rejects_loopback_in_production_default() {
         let factory = ScriptEngine::new();
-        let (engine, _slot) = factory.build_for_plugin("ssrf-test");
+        let (engine, _slot, _reg) = factory.build_for_plugin("ssrf-test");
         for url in [
             "http://127.0.0.1/",
             "http://localhost/",
@@ -2618,7 +2606,7 @@ mod tests {
     #[test]
     fn ssrf_guard_rejects_non_http_schemes() {
         let factory = ScriptEngine::new();
-        let (engine, _slot) = factory.build_for_plugin("ssrf-test");
+        let (engine, _slot, _reg) = factory.build_for_plugin("ssrf-test");
         for url in ["file:///etc/passwd", "gopher://x/", "ftp://x/"] {
             let script = format!(r#"http_get("{url}", #{{ }}, "")"#);
             let err = engine.eval::<Dynamic>(&script).unwrap_err().to_string();
@@ -2632,7 +2620,7 @@ mod tests {
     #[test]
     fn ssrf_guard_allows_public_addresses() {
         let factory = ScriptEngine::new();
-        let (engine, _slot) = factory.build_for_plugin("ssrf-test");
+        let (engine, _slot, _reg) = factory.build_for_plugin("ssrf-test");
         // No DNS resolution happens at validate-time — we just
         // accept the hostname. Confirm parsing + validation pass
         // for the realistic public-API hostnames a plugin uses.

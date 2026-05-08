@@ -26,8 +26,8 @@ fn google_places_plugin() -> ScriptPlugin {
     path.pop(); // crates/
     path.pop(); // workspace root
     path.push("plugins/google-places/main.rhai");
-    let source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("could not read {path:?}: {e}"));
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("could not read {path:?}: {e}"));
     let factory = ScriptEngine::new();
     ScriptPlugin::from_source("google-places", &source, &factory)
         .expect("plugins/google-places/main.rhai must parse")
@@ -47,11 +47,7 @@ async fn invoke_one_str(
         .unwrap_or_else(|e| panic!("{fn_name}('{arg}') failed: {e}"))
 }
 
-async fn invoke_clamp(
-    plugin: &ScriptPlugin,
-    arg: i64,
-    fallback: i64,
-) -> serde_json::Value {
+async fn invoke_clamp(plugin: &ScriptPlugin, arg: i64, fallback: i64) -> serde_json::Value {
     plugin
         .invoke_async(
             "_test_clamp_max_results",
@@ -263,10 +259,7 @@ async fn filter_no_min_rating_keeps_all_up_to_cap() {
 async fn parse_min_rating_throws_above_5() {
     let plugin = google_places_plugin();
     let r = plugin
-        .invoke_async(
-            "_test_parse_min_rating",
-            vec![Dynamic::from(6.0_f64)],
-        )
+        .invoke_async("_test_parse_min_rating", vec![Dynamic::from(6.0_f64)])
         .await;
     match r {
         Ok(v) => panic!("expected throw for min_rating=6.0; got Ok({v})"),
@@ -281,10 +274,7 @@ async fn parse_min_rating_throws_above_5() {
 async fn parse_min_rating_throws_below_0() {
     let plugin = google_places_plugin();
     let r = plugin
-        .invoke_async(
-            "_test_parse_min_rating",
-            vec![Dynamic::from(-0.1_f64)],
-        )
+        .invoke_async("_test_parse_min_rating", vec![Dynamic::from(-0.1_f64)])
         .await;
     assert!(
         r.is_err(),

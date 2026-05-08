@@ -99,11 +99,7 @@ impl WebSearchApi for SearchApiSearchApi {
         let resp = self
             .client
             .get(SEARCHAPI_ENDPOINT)
-            .query(&[
-                ("engine", "google"),
-                ("q", query),
-                ("num", num.as_str()),
-            ])
+            .query(&[("engine", "google"), ("q", query), ("num", num.as_str())])
             .bearer_auth(&self.api_key)
             .header("Accept", "application/json")
             .send()

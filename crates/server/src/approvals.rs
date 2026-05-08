@@ -51,18 +51,16 @@ use crate::state::AppState;
 /// Callers thread the result into `dispatch_external_turn`'s
 /// `origin_channel` so the auto-bridge / typing indicator / system
 /// prose all surface the right transport.
-fn origin_channel_for_conversation(
-    state: &AppState,
-    cid: &ConversationId,
-) -> Option<String> {
+fn origin_channel_for_conversation(state: &AppState, cid: &ConversationId) -> Option<String> {
     use execlaw_core::principal_groups::PrincipalGroupStore;
     use execlaw_core::transport_bindings::TransportBindingStore;
     let pg_store = PrincipalGroupStore::new(&state.db);
-    let pg_id = pg_store.principal_group_id_for(cid.as_str()).ok().flatten()?;
+    let pg_id = pg_store
+        .principal_group_id_for(cid.as_str())
+        .ok()
+        .flatten()?;
     let binding_store = TransportBindingStore::new(&state.db);
-    let bindings = binding_store
-        .bindings_for_group_any_channel(&pg_id)
-        .ok()?;
+    let bindings = binding_store.bindings_for_group_any_channel(&pg_id).ok()?;
     state
         .host_transports
         .lookup_first_supported_binding(&bindings)
@@ -367,6 +365,17 @@ pub async fn respond_handler(
         // installed transport (sms, whatsapp, slack, ...) gets the
         // right origin channel without code changes here.
         let origin_channel = origin_channel_for_conversation(&state, &cid);
+        // Post-approval replay: the controller has explicitly trusted
+        // this contact, so the addressing question is moot — fall
+        // through with `EligibilityBypass`. The conversation may
+        // still be a group, in which case the resolver returns
+        // Some(...) and the agent gets the same room-awareness it
+        // would on a directly addressed inbound.
+        let replay_group_ctx = crate::chats::resolve_group_turn_context(
+            &state,
+            &cid,
+            crate::group_addressing::AddressedReason::EligibilityBypass,
+        );
         if let Err(e) = crate::chats::dispatch_external_turn(
             &state,
             &cid,
@@ -374,6 +383,7 @@ pub async fn respond_handler(
             trust_flat,
             &original_text,
             origin_channel.as_deref(),
+            replay_group_ctx,
         )
         .await
         {
@@ -542,6 +552,15 @@ async fn claim_as_me(
     // Look up the actual origin channel; see
     // origin_channel_for_conversation for rationale.
     let origin_channel = origin_channel_for_conversation(&state, cid);
+    // Same rationale as the post-approval replay: the controller
+    // explicitly claimed this turn, so addressing is moot — but
+    // resolve the group context anyway so a controller-claimed
+    // turn in a Signal group still gets the room-awareness block.
+    let claim_group_ctx = crate::chats::resolve_group_turn_context(
+        &state,
+        cid,
+        crate::group_addressing::AddressedReason::EligibilityBypass,
+    );
     if let Err(e) = crate::chats::dispatch_external_turn(
         &state,
         cid,
@@ -549,6 +568,7 @@ async fn claim_as_me(
         trust_flat,
         &original_text,
         origin_channel.as_deref(),
+        claim_group_ctx,
     )
     .await
     {
@@ -1015,8 +1035,7 @@ mod tests {
             sender_principal_id: "pri_signal_+15551234567".to_owned(),
             approval_id: "appr-phantom-1".to_owned(),
         };
-        let pending =
-            PendingEvent::encode(EventKind::ColdContactArrived, &payload, None).unwrap();
+        let pending = PendingEvent::encode(EventKind::ColdContactArrived, &payload, None).unwrap();
         let log = event_log(&state);
         log.commit_turn(&cid, EventSeq(0), vec![pending]).unwrap();
 
@@ -1031,8 +1050,7 @@ mod tests {
         );
 
         // Pending-list endpoint must NOT surface this event.
-        let (status, body) =
-            read_json(&app, Some(&token), "/api/admin/approvals").await;
+        let (status, body) = read_json(&app, Some(&token), "/api/admin/approvals").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             body["approvals"].as_array().unwrap().len(),
@@ -1077,13 +1095,11 @@ mod tests {
             sender_principal_id: pid.as_str().to_owned(),
             approval_id: "appr-real-1".to_owned(),
         };
-        let pending =
-            PendingEvent::encode(EventKind::ColdContactArrived, &payload, None).unwrap();
+        let pending = PendingEvent::encode(EventKind::ColdContactArrived, &payload, None).unwrap();
         let log = event_log(&state);
         log.commit_turn(&cid, EventSeq(0), vec![pending]).unwrap();
 
-        let (status, body) =
-            read_json(&app, Some(&token), "/api/admin/approvals").await;
+        let (status, body) = read_json(&app, Some(&token), "/api/admin/approvals").await;
         assert_eq!(status, StatusCode::OK);
         let arr = body["approvals"].as_array().unwrap();
         assert_eq!(arr.len(), 1);

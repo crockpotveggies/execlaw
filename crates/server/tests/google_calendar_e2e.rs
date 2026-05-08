@@ -313,7 +313,12 @@ async fn google_calendar_plugin_full_install_and_dispatch_roundtrip() {
     // Returns Err since the plugin's tool_call throws on missing token.
     let err = state
         .plugin_host
-        .call_tool("calendar.list_calendars", serde_json::json!({}), &["*"], None)
+        .call_tool(
+            "calendar.list_calendars",
+            serde_json::json!({}),
+            &["*"],
+            None,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -325,7 +330,12 @@ async fn google_calendar_plugin_full_install_and_dispatch_roundtrip() {
     seed_oauth(&state.db, "ya29.fake");
     let res = state
         .plugin_host
-        .call_tool("calendar.list_calendars", serde_json::json!({}), &["*"], None)
+        .call_tool(
+            "calendar.list_calendars",
+            serde_json::json!({}),
+            &["*"],
+            None,
+        )
         .await
         .expect("calendar.list_calendars should succeed with token + caps");
     let cals = res["calendars"].as_array().unwrap();

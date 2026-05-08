@@ -3,11 +3,9 @@
 //! AND `McpHost::reconcile()` (server) to make a freshly-added
 //! row actually connect.
 
-use crate::mcp_host::{McpHost, MCP_TOOL_PREFIX};
+use crate::mcp_host::{MCP_TOOL_PREFIX, McpHost};
 use execlaw_core::Database;
-use execlaw_core::mcp_servers::{
-    McpServerInsert, McpServerRow, McpServerStore, McpTransport,
-};
+use execlaw_core::mcp_servers::{McpServerInsert, McpServerRow, McpServerStore, McpTransport};
 use execlaw_core::tool::{ApiError, McpAdminApi, McpServerSpec, McpServerView};
 use execlaw_core::tool_access::{ToolAccessStore, ToolSource};
 use execlaw_core::vault_row::VaultRowStore;
@@ -90,17 +88,17 @@ impl McpAdminApi for DbMcpAdminApi {
         // Persist the bearer token (if any) in the vault under a
         // generated, plugin-scope-less key. The row's
         // auth_secret_ref points at it.
-        let auth_secret_ref = if let Some(tok) = spec.auth_token.as_deref().filter(|s| !s.is_empty())
-        {
-            let key = format!("mcp:{}/auth_token", spec.id);
-            let now = chrono::Utc::now().timestamp();
-            VaultRowStore::new(&self.db)
-                .put(None, &key, tok.as_bytes(), now)
-                .map_err(|e| ApiError::Storage(format!("vault put: {e}")))?;
-            Some(key)
-        } else {
-            None
-        };
+        let auth_secret_ref =
+            if let Some(tok) = spec.auth_token.as_deref().filter(|s| !s.is_empty()) {
+                let key = format!("mcp:{}/auth_token", spec.id);
+                let now = chrono::Utc::now().timestamp();
+                VaultRowStore::new(&self.db)
+                    .put(None, &key, tok.as_bytes(), now)
+                    .map_err(|e| ApiError::Storage(format!("vault put: {e}")))?;
+                Some(key)
+            } else {
+                None
+            };
 
         // Default trust classes: Controller + Delegated. Operators
         // can broaden in Settings → Tools later.

@@ -26,14 +26,18 @@ fn sms_socket_plugin() -> ScriptPlugin {
     path.pop(); // crates/
     path.pop(); // workspace root
     path.push("plugins/sms-socket/main.rhai");
-    let source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("could not read {path:?}: {e}"));
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("could not read {path:?}: {e}"));
     let factory = ScriptEngine::new();
     ScriptPlugin::from_source("sms-socket", &source, &factory)
         .expect("plugins/sms-socket/main.rhai must parse")
 }
 
-async fn invoke_one_str(plugin: &ScriptPlugin, fn_name: &'static str, arg: &str) -> serde_json::Value {
+async fn invoke_one_str(
+    plugin: &ScriptPlugin,
+    fn_name: &'static str,
+    arg: &str,
+) -> serde_json::Value {
     plugin
         .invoke_async(
             fn_name,
@@ -56,9 +60,9 @@ async fn invoke_one_str_expect_throw(
         )
         .await;
     match r {
-        Ok(v) => panic!(
-            "{fn_name}('{arg}') was supposed to throw containing '{needle}'; got Ok({v})"
-        ),
+        Ok(v) => {
+            panic!("{fn_name}('{arg}') was supposed to throw containing '{needle}'; got Ok({v})")
+        }
         Err(e) => {
             let msg = e.to_string();
             assert!(
@@ -84,13 +88,7 @@ async fn validate_e164_accepts_canonical_numbers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn validate_e164_rejects_missing_plus() {
     let plugin = sms_socket_plugin();
-    invoke_one_str_expect_throw(
-        &plugin,
-        "validate_e164",
-        "14165550100",
-        "must be E.164",
-    )
-    .await;
+    invoke_one_str_expect_throw(&plugin, "validate_e164", "14165550100", "must be E.164").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -245,7 +243,10 @@ async fn decode_drops_empty_text_no_attachments() {
         "payload": { "address": "+14165550100", "body": "", "receivedAt": 1 }
     }"#;
     let r = invoke_one_str(&plugin, "_test_decode", raw).await;
-    assert!(r.is_null(), "empty text + no attachments must drop; got {r}");
+    assert!(
+        r.is_null(),
+        "empty text + no attachments must drop; got {r}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

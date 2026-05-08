@@ -34,8 +34,8 @@ fn signal_plugin() -> ScriptPlugin {
     path.pop(); // crates/
     path.pop(); // workspace root
     path.push("plugins/signal/main.rhai");
-    let source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("could not read {path:?}: {e}"));
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("could not read {path:?}: {e}"));
     // No host_caps wired — pure decode/wire functions don't reach
     // any binding that requires them. Tool-dispatch paths would
     // throw; we don't exercise those here.

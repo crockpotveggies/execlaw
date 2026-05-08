@@ -338,6 +338,19 @@ pub async fn send_message(
         None
     };
 
+    // Resolve group context once for every web-chat send path.
+    // `EligibilityBypass` is the right reason: the controller is
+    // deliberately typing into the SPA, so the addressing question
+    // doesn't apply — but the agent still benefits from knowing
+    // "this conversation is a Signal group of N people" when reading
+    // history and shaping its tone. `None` for DM / single-actor /
+    // unbridged conversations (the resolver returns None there).
+    let group_context_for_turn = resolve_group_turn_context(
+        &state,
+        &cid,
+        crate::group_addressing::AddressedReason::EligibilityBypass,
+    );
+
     let (user_msg_seq, assistant_text, assistant_seq) =
         match (inference_for_turn, runner_routed.as_deref()) {
             (Some(_inference), Some(group_id)) => {
@@ -360,6 +373,7 @@ pub async fn send_message(
                     // no transport-bridge here.
                     inbound_channel_origin: None,
                     caller_timezone: req.timezone.as_deref(),
+                    group_context: group_context_for_turn.clone(),
                 })
                 .await
                 {
@@ -386,6 +400,7 @@ pub async fn send_message(
                 sender_trust,
                 None,
                 req.timezone.as_deref(),
+                group_context_for_turn.clone(),
             )
             .await
             {
@@ -413,6 +428,7 @@ pub async fn send_message(
                     cancel_flag.clone(),
                     None,
                     req.timezone.as_deref(),
+                    group_context_for_turn.clone(),
                 )
                 .await
                 {
@@ -430,7 +446,13 @@ pub async fn send_message(
                 }
             }
             (None, _) => {
-                match run_stub_turn(&state, &cid, &req.text, req.sender_principal_id.clone(), None) {
+                match run_stub_turn(
+                    &state,
+                    &cid,
+                    &req.text,
+                    req.sender_principal_id.clone(),
+                    None,
+                ) {
                     Ok(out) => out,
                     Err(e) => {
                         let chain = format!("{e:#}");
@@ -634,6 +656,7 @@ async fn run_real_turn(
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     inbound_channel_origin: Option<&str>,
     caller_timezone: Option<&str>,
+    group_context: Option<GroupTurnContext>,
 ) -> Result<(i64, String, i64), String> {
     use execlaw_inference_api::{ChatMessage, ChatRequest};
     use execlaw_policy::spotlighting::Spotlight;
@@ -687,6 +710,7 @@ async fn run_real_turn(
         sender_trust.as_str(),
         inbound_channel_origin,
         caller_timezone,
+        group_context.as_ref(),
     );
     let composed_system = assemble_system_prompt(
         &state.db,
@@ -966,6 +990,14 @@ pub(crate) struct RunnerTurnCtx<'a> {
     /// "for 6pm" landing at 11am after the agent emitted UTC
     /// without any local-time anchor.
     pub caller_timezone: Option<&'a str>,
+    /// Per-turn group-conversation context. `Some(...)` when the
+    /// router resolved the conversation as a mixed group with at
+    /// least one non-Controller human; `None` for DMs / web /
+    /// single-actor flows. Threaded into `build_turn_context_prose`
+    /// so the agent's system prompt knows it's in a group, who
+    /// else is in the room, and why the upstream router decided
+    /// this turn should run.
+    pub group_context: Option<GroupTurnContext>,
 }
 
 pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, String, i64), String> {
@@ -981,6 +1013,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         caller_trust,
         inbound_channel_origin,
         caller_timezone,
+        group_context,
     } = ctx;
     let supervisor = state
         .runner_supervisor
@@ -1047,6 +1080,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         caller_trust.as_str(),
         inbound_channel_origin,
         caller_timezone,
+        group_context.as_ref(),
     );
     let composed_system = assemble_system_prompt(
         &state.db,
@@ -1121,28 +1155,35 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
             ToolDeclaration::function(d.name.clone(), d.description.clone(), d.schema.clone())
         })
         .collect();
-    tool_decls.extend(state.plugin_host.registry().agent_callable_tools().iter().map(|t| {
-        // Pre-fix this advertised every plugin tool as
-        // `Plugin tool 'X' (latency: Y)` with an empty
-        // `{"type":"object"}` schema — the model couldn't
-        // tell what any of them did. Now we ship the
-        // manifest's `description` + the JSON Schema loaded
-        // at register time. Falls back only when the plugin
-        // itself omitted them.
-        let description = t.description.clone().unwrap_or_else(|| {
-            format!(
-                "Plugin tool '{}' from '{}' (latency: {}). \
+    tool_decls.extend(
+        state
+            .plugin_host
+            .registry()
+            .agent_callable_tools()
+            .iter()
+            .map(|t| {
+                // Pre-fix this advertised every plugin tool as
+                // `Plugin tool 'X' (latency: Y)` with an empty
+                // `{"type":"object"}` schema — the model couldn't
+                // tell what any of them did. Now we ship the
+                // manifest's `description` + the JSON Schema loaded
+                // at register time. Falls back only when the plugin
+                // itself omitted them.
+                let description = t.description.clone().unwrap_or_else(|| {
+                    format!(
+                        "Plugin tool '{}' from '{}' (latency: {}). \
                          The plugin manifest did not supply a description; \
                          ask the operator to add one for better tool selection.",
-                t.tool_name, t.plugin_id, t.latency,
-            )
-        });
-        let schema = t
-            .schema_json
-            .clone()
-            .unwrap_or_else(|| serde_json::json!({"type": "object"}));
-        ToolDeclaration::function(t.tool_name.clone(), description, schema)
-    }));
+                        t.tool_name, t.plugin_id, t.latency,
+                    )
+                });
+                let schema = t
+                    .schema_json
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+                ToolDeclaration::function(t.tool_name.clone(), description, schema)
+            }),
+    );
 
     // Trust-class string the runner copies into log lines + the
     // model's "from:" header. The flat policy tag is canonical.
@@ -1375,9 +1416,8 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
                 if matches!(kind_enum, EventKind::ModelTurn) {
                     if let Some(origin) = inbound_channel_origin {
                         if let serde_json::Value::Object(ref mut map) = payload {
-                            map.entry("channel_origin".to_owned()).or_insert(
-                                serde_json::Value::String(origin.to_owned()),
-                            );
+                            map.entry("channel_origin".to_owned())
+                                .or_insert(serde_json::Value::String(origin.to_owned()));
                         }
                     }
                 }
@@ -1459,6 +1499,7 @@ async fn run_tool_capable_turn(
     caller_trust: TrustLevel,
     inbound_channel_origin: Option<&str>,
     caller_timezone: Option<&str>,
+    group_context: Option<GroupTurnContext>,
 ) -> Result<(i64, String, i64), String> {
     use execlaw_inference_api::ToolDeclaration;
     use execlaw_runner_local::turn::{TurnConfig, TurnExecutor};
@@ -1484,20 +1525,27 @@ async fn run_tool_capable_turn(
             ToolDeclaration::function(d.name.clone(), d.description.clone(), d.schema.clone())
         })
         .collect();
-    tool_decls.extend(state.plugin_host.registry().agent_callable_tools().iter().map(|t| {
-        let description = t.description.clone().unwrap_or_else(|| {
-            format!(
-                "Plugin tool '{}' from '{}' (latency: {}). The plugin manifest did not \
+    tool_decls.extend(
+        state
+            .plugin_host
+            .registry()
+            .agent_callable_tools()
+            .iter()
+            .map(|t| {
+                let description = t.description.clone().unwrap_or_else(|| {
+                    format!(
+                        "Plugin tool '{}' from '{}' (latency: {}). The plugin manifest did not \
                  supply a description; ask the operator to add one for better tool selection.",
-                t.tool_name, t.plugin_id, t.latency,
-            )
-        });
-        let schema = t
-            .schema_json
-            .clone()
-            .unwrap_or_else(|| serde_json::json!({"type": "object"}));
-        ToolDeclaration::function(t.tool_name.clone(), description, schema)
-    }));
+                        t.tool_name, t.plugin_id, t.latency,
+                    )
+                });
+                let schema = t
+                    .schema_json
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+                ToolDeclaration::function(t.tool_name.clone(), description, schema)
+            }),
+    );
 
     // Phase-8a: dispatch consults `config_tool_access` for every
     // call, so a tool the operator has restricted to (say)
@@ -1572,6 +1620,7 @@ async fn run_tool_capable_turn(
         caller_trust.as_str(),
         inbound_channel_origin,
         caller_timezone,
+        group_context.as_ref(),
     );
     let cfg = TurnConfig {
         model: ModelId(state.config.model_id.clone()),
@@ -1938,6 +1987,17 @@ pub async fn dispatch_routine_turn(
     };
     let routine_tz_ref = routine_timezone.as_deref();
 
+    // Routines fire as the controller; the addressing question
+    // doesn't apply (the schedule explicitly invoked the agent).
+    // But the conversation may still be a group, so resolve the
+    // group context with EligibilityBypass so the agent's prompt
+    // describes the room when relevant.
+    let routine_group_ctx = resolve_group_turn_context(
+        state,
+        &cid,
+        crate::group_addressing::AddressedReason::EligibilityBypass,
+    );
+
     let result = match inference_for_turn {
         Some(inference) if has_plugin_tools => {
             run_tool_capable_turn(
@@ -1950,6 +2010,7 @@ pub async fn dispatch_routine_turn(
                 caller_trust,
                 None,
                 routine_tz_ref,
+                routine_group_ctx.clone(),
             )
             .await
         }
@@ -1980,6 +2041,7 @@ pub async fn dispatch_routine_turn(
                 cancel_flag,
                 None,
                 routine_tz_ref,
+                routine_group_ctx.clone(),
             )
             .await;
             drop(cancel_guard);
@@ -2215,6 +2277,7 @@ pub async fn dispatch_external_turn(
     sender_trust: TrustLevel,
     text: &str,
     inbound_channel_origin: Option<&str>,
+    group_context: Option<GroupTurnContext>,
 ) -> Result<(), String> {
     use execlaw_policy::trust::{TurnPolicyInput, evaluate_turn};
 
@@ -2305,6 +2368,7 @@ pub async fn dispatch_external_turn(
                 caller_trust,
                 inbound_channel_origin,
                 caller_timezone,
+                group_context.clone(),
             )
             .await
         }
@@ -2325,6 +2389,7 @@ pub async fn dispatch_external_turn(
                 cancel_flag,
                 inbound_channel_origin,
                 caller_timezone,
+                group_context.clone(),
             )
             .await;
             drop(cancel_guard);
@@ -2412,9 +2477,7 @@ async fn bridge_text_reply_to_originating_transport(
     // recent turn. We need (a) the last model_turn's text and
     // (b) any tool_use names emitted in the same turn.
     let log = event_log(state);
-    let last_seq = log
-        .last_seq(cid)
-        .map_err(|e| format!("last_seq: {e}"))?;
+    let last_seq = log.last_seq(cid).map_err(|e| format!("last_seq: {e}"))?;
     if last_seq.0 == 0 {
         return Ok(());
     }
@@ -2515,10 +2578,7 @@ impl TypingIndicatorGuard {
     /// degraded — the agent still runs the turn. We don't surface
     /// errors to the caller because typing is a UX nicety, not a
     /// correctness step.
-    pub async fn for_conversation(
-        state: &AppState,
-        cid: &ConversationId,
-    ) -> TypingIndicatorGuard {
+    pub async fn for_conversation(state: &AppState, cid: &ConversationId) -> TypingIndicatorGuard {
         use execlaw_core::principal_groups::PrincipalGroupStore;
         use execlaw_core::transport_bindings::TransportBindingStore;
 
@@ -2553,8 +2613,7 @@ impl TypingIndicatorGuard {
         let cancel = tokio_util::sync::CancellationToken::new();
         let task_cancel = cancel.clone();
         tokio::spawn(async move {
-            const REFRESH_INTERVAL: std::time::Duration =
-                std::time::Duration::from_secs(4);
+            const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(4);
             let tool_name = format!("{channel}.set_typing");
             loop {
                 let args = serde_json::json!({"to": recipient, "active": true});
@@ -2738,6 +2797,16 @@ pub async fn dispatch_clarification_turn(
     // The model just relays a question; date arithmetic isn't on
     // this path's hot list.
     let caller_timezone: Option<&str> = None;
+    // Synthetic orchestrator-driven turn. Resolve group context so
+    // the relayed clarification question carries the same room
+    // awareness as a normal turn would in this conversation;
+    // EligibilityBypass is the right reason since this isn't a
+    // human-addressed inbound.
+    let synth_group_ctx = resolve_group_turn_context(
+        state,
+        cid,
+        crate::group_addressing::AddressedReason::EligibilityBypass,
+    );
     let result = match inference_for_turn {
         Some(inference) if has_plugin_tools => {
             run_tool_capable_turn(
@@ -2750,6 +2819,7 @@ pub async fn dispatch_clarification_turn(
                 caller_trust,
                 None,
                 caller_timezone,
+                synth_group_ctx.clone(),
             )
             .await
         }
@@ -2770,6 +2840,7 @@ pub async fn dispatch_clarification_turn(
                 cancel_flag,
                 None,
                 caller_timezone,
+                synth_group_ctx.clone(),
             )
             .await;
             drop(cancel_guard);
@@ -2830,6 +2901,108 @@ pub async fn dispatch_clarification_turn(
     mapped
 }
 
+/// Per-turn group-conversation context. Threaded into
+/// [`build_turn_context_prose`] so the agent's system prompt can
+/// describe the room it's answering in: how many other humans are
+/// present, what the group is called, and **why** the upstream
+/// router decided this turn should run.
+///
+/// `None` for DM / web / single-actor conversations. The value of
+/// telling a model "you're in a DM, behave normally" is low; the
+/// value of telling it "you're in a group with 5 people, default
+/// to staying quiet unless directly addressed" is high — so the
+/// block only renders for actual groups.
+#[derive(Debug, Clone)]
+pub struct GroupTurnContext {
+    /// User-facing group name when the transport supplies one
+    /// (Signal does, WhatsApp doesn't yet, Slack channels surface
+    /// as the channel id). Renders as a quoted phrase in the
+    /// prompt; `None` falls back to "this group" wording.
+    pub group_name: Option<String>,
+    /// Total participants in the principal_group, including the
+    /// Controller. Drives the "you are in a group with N other
+    /// participants" line. We don't subtract the agent — the agent
+    /// isn't a `Principal`, the group's members are the humans.
+    pub member_count: usize,
+    /// Why the router decided this turn should reach the agent.
+    /// See [`crate::group_addressing::AddressedReason`] for the
+    /// full taxonomy. The strength of the signal shapes how
+    /// reserved the agent should be in its reply — a transport
+    /// `<@mention>` is a clear invitation; a fall-open dispatch
+    /// is a hint to be cautious.
+    pub addressed_reason: crate::group_addressing::AddressedReason,
+}
+
+/// Resolve the group-conversation context from runtime state, when
+/// applicable. Returns `None` for conversations the
+/// [`build_turn_context_prose`] group block should NOT render for:
+///
+/// * No `principal_group` binding (web-only / unbridged conversation).
+/// * Single-member group (just the Controller — degenerate "group").
+/// * All-Controller group (every member is the operator's identity —
+///   no other humans to barge in front of).
+///
+/// In every other case, builds a [`GroupTurnContext`] from the
+/// `conversation_display_name` (group name) + member count + the
+/// caller-supplied addressed reason. The reason MUST come from the
+/// router's `should_dispatch_to_agent` decision so the agent's
+/// prompt accurately reflects why the turn ran.
+///
+/// Cheap (one principal_group lookup, one members query, one
+/// conversation row read). Safe to call on every turn — but the
+/// production hot path threads the value through from
+/// `route_inbound` to avoid a redundant DB round-trip.
+pub fn resolve_group_turn_context(
+    state: &AppState,
+    cid: &ConversationId,
+    addressed_reason: crate::group_addressing::AddressedReason,
+) -> Option<GroupTurnContext> {
+    use execlaw_core::principal::{PrincipalStore, TrustLevel};
+    use execlaw_core::principal_groups::PrincipalGroupStore;
+
+    let pg_store = PrincipalGroupStore::new(&state.db);
+    let pg_id = pg_store
+        .principal_group_id_for(cid.as_str())
+        .ok()
+        .flatten()?;
+    let members = pg_store.members(&pg_id).ok()?;
+    if members.len() < 2 {
+        return None;
+    }
+    // Skip all-Controller groups for the same reason
+    // `should_dispatch_to_agent` does — there's nobody to be careful
+    // about. The `any` short-circuits the moment it sees a
+    // non-Controller, so the lookup cost is bounded.
+    let principals = PrincipalStore::new(&state.db);
+    let has_non_controller = members.iter().any(|pid| {
+        match principals.get(pid) {
+            Ok(Some(p)) => !matches!(p.trust_level, TrustLevel::Controller),
+            // Lookup failure → treat as non-controller. The block
+            // is informational; over-rendering is harmless, under-
+            // rendering misses the "behave like a group" nudge.
+            _ => true,
+        }
+    });
+    if !has_non_controller {
+        return None;
+    }
+
+    // Read the conversation row's display_name as the group's
+    // user-facing title — `apply_auto_display_name` seeds this from
+    // the inbound `group_name` field for transports that supply one.
+    let group_name = ConversationStore::new(&state.db)
+        .get(cid)
+        .ok()
+        .flatten()
+        .and_then(|row| row.display_name);
+
+    Some(GroupTurnContext {
+        group_name,
+        member_count: members.len(),
+        addressed_reason,
+    })
+}
+
 /// Build the per-turn context block — runtime facts the model
 /// needs to answer recency- and identity-sensitive questions
 /// without round-tripping a tool. Selfhosted-claw baked these
@@ -2845,16 +3018,24 @@ pub async fn dispatch_clarification_turn(
 ///   * caller's principal id — usually `controller`, sometimes a
 ///     plugin-resolved contact id;
 ///   * caller's trust class — drives the model's posture for
-///     approval-gated tools and confidential output.
+///     approval-gated tools and confidential output;
+///   * **group context (when present)** — name, member count, and
+///     the upstream router's "why this turn ran" verdict, plus an
+///     explicit "default to silence in groups" posture nudge that
+///     replaces the implicit "DM behavior" fallback.
 ///
-/// Pure function — caller assembles the inputs.
-pub(crate) fn build_turn_context_prose(
+/// Pure function — caller assembles the inputs. `pub` (not
+/// `pub(crate)`) so the benchmark suite can measure it in isolation;
+/// the function has no side effects so the wider visibility doesn't
+/// invite misuse.
+pub fn build_turn_context_prose(
     now_utc: chrono::DateTime<chrono::Utc>,
     conversation_id: &str,
     sender_principal_id: Option<&str>,
     sender_trust: &str,
     origin_channel: Option<&str>,
     caller_timezone: Option<&str>,
+    group: Option<&GroupTurnContext>,
 ) -> String {
     let mut out = String::from("## Turn context\n\n");
     // Date framing matters more than it looks. Earlier prompts
@@ -2941,6 +3122,59 @@ pub(crate) fn build_turn_context_prose(
         }
     } else {
         out.push_str("* Origin channel: `web`\n");
+    }
+    // Group-conversation block. Only renders for actual groups
+    // (mixed-membership with ≥1 non-Controller human) — the
+    // resolver returns `None` for DMs / web / single-actor flows
+    // so the prompt stays small there. The block has three jobs:
+    //
+    //   1. Tell the agent it's in a group (it had no way to know
+    //      before this — the system prompt looked identical to a
+    //      DM, which is why operators saw the agent barge into
+    //      group conversations).
+    //
+    //   2. Give it the room's shape: name when known, member
+    //      count so it can calibrate "many people are talking"
+    //      vs "small group."
+    //
+    //   3. Surface the upstream router's verdict so the agent
+    //      can match its posture to the strength of the signal
+    //      that woke it up. An explicit `<@mention>` is a clear
+    //      invitation; a fall-open dispatch is "you might NOT
+    //      have been addressed, behave accordingly."
+    if let Some(g) = group {
+        out.push_str("\n## Group conversation context\n\n");
+        let group_label = match &g.group_name {
+            Some(n) => format!("\"{}\"", n.replace('"', "\\\"")),
+            None => "this group".to_owned(),
+        };
+        out.push_str(&format!(
+            "* You are answering in {group_label}, a group conversation with \
+             {n} participants (including the operator).\n",
+            n = g.member_count,
+        ));
+        out.push_str(&format!(
+            "* Why this turn was routed to you: {desc}.\n",
+            desc = g.addressed_reason.description(),
+        ));
+        // Default-to-silence posture nudge. The classifier upstream
+        // can already drop unaddressed messages (returning Skip),
+        // but its verdict is fallible — and many group messages
+        // that DO reach the agent are still ambiguous. The right
+        // posture is "answer concisely when clearly addressed,
+        // otherwise stay quiet." The wording here is deliberate:
+        // operators consistently report "barging in" as the most
+        // annoying agent failure mode in groups, so the prompt
+        // says it explicitly.
+        out.push_str(
+            "* Group posture: in a group, the DEFAULT is to stay silent unless you were \
+             clearly addressed. If this message reads more like banter between other \
+             humans than a request to you, reply with a short acknowledgement only when \
+             genuinely useful — or stay silent. NEVER barge into general group chatter, \
+             multi-human scheduling, or messages aimed at someone else by name. Brevity \
+             beats verbosity in groups: a one-line answer is almost always better than a \
+             paragraph.\n",
+        );
     }
     out
 }
@@ -3673,9 +3907,7 @@ pub async fn list_threads(
     let mut threads: Vec<ThreadSummaryView> = Vec::with_capacity(summaries.len());
     for s in summaries {
         let mut view: ThreadSummaryView = s.into();
-        if let Ok(Some(pg_id)) =
-            pg_store.principal_group_id_for(&view.conversation_id)
-        {
+        if let Ok(Some(pg_id)) = pg_store.principal_group_id_for(&view.conversation_id) {
             if let Ok(bindings) = binding_store.bindings_for_group_any_channel(&pg_id) {
                 if let Some(b) = bindings.first() {
                     view.transport_channel = Some(b.channel.clone());
@@ -4457,7 +4689,10 @@ mod tests {
 
     #[test]
     fn is_send_tool_recognises_whatsapp_send_tools() {
-        assert!(is_send_tool_for_channel("whatsapp", "whatsapp.send_message"));
+        assert!(is_send_tool_for_channel(
+            "whatsapp",
+            "whatsapp.send_message"
+        ));
         assert!(is_send_tool_for_channel("whatsapp", "whatsapp.reply"));
     }
 
@@ -4483,11 +4718,17 @@ mod tests {
         // tools from OTHER channels must not match — otherwise the
         // bridge would suppress legitimate dispatches.
         assert!(!is_send_tool_for_channel("sms", "sms.set_typing"));
-        assert!(!is_send_tool_for_channel("sms", "sms.send_with_attachments"));
+        assert!(!is_send_tool_for_channel(
+            "sms",
+            "sms.send_with_attachments"
+        ));
         assert!(!is_send_tool_for_channel("sms", "sms.fetch_attachment"));
         assert!(!is_send_tool_for_channel("signal", "sms.send_message"));
         assert!(!is_send_tool_for_channel("sms", "signal.send_message"));
-        assert!(!is_send_tool_for_channel("sms", "google_calendar.create_event"));
+        assert!(!is_send_tool_for_channel(
+            "sms",
+            "google_calendar.create_event"
+        ));
         assert!(!is_send_tool_for_channel("sms", ""));
     }
 
@@ -4499,7 +4740,10 @@ mod tests {
         assert!(!is_send_tool_for_channel("sms", "smsfoo.send_message"));
         // And `sms.send_message_extended` (or any other suffix
         // variant) is not a known send tool.
-        assert!(!is_send_tool_for_channel("sms", "sms.send_message_extended"));
+        assert!(!is_send_tool_for_channel(
+            "sms",
+            "sms.send_message_extended"
+        ));
         assert!(!is_send_tool_for_channel("sms", "sms.replyall"));
     }
 
@@ -4543,7 +4787,9 @@ mod tests {
 
         // 4. Operator renames via PATCH → source flips to 'manual',
         //    transport inbounds become no-ops.
-        store.set_display_name(&cid, Some("My weekend group")).unwrap();
+        store
+            .set_display_name(&cid, Some("My weekend group"))
+            .unwrap();
         let row = store.get(&cid).unwrap().unwrap();
         assert_eq!(row.display_name_source, "manual");
         apply_auto_display_name(&state.db, &cid, Some("Signal renamed it again"));
@@ -4982,6 +5228,7 @@ mod tests {
             "Controller",
             None,
             None,
+            None,
         );
         // ISO timestamp still present (precise form for any tool
         // call that needs it).
@@ -5003,20 +5250,13 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2026-05-02T10:23:45Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let prose = super::build_turn_context_prose(
-            now,
-            "conv-abc",
-            None,
-            "Controller",
-            None,
-            None,
-        );
+        let prose =
+            super::build_turn_context_prose(now, "conv-abc", None, "Controller", None, None, None);
         // Tight one-liner reframes the date as real (not
         // hypothetical) and points at the search escape valves.
         // Order matters less than presence of both signals.
         assert!(
-            prose.contains("real, not hypothetical")
-                || prose.contains("not hypothetical"),
+            prose.contains("real, not hypothetical") || prose.contains("not hypothetical"),
             "the date-is-real reframe must be in the prose"
         );
         assert!(prose.contains("web_search") || prose.contains("research_start"));
@@ -5039,6 +5279,7 @@ mod tests {
             "Controller",
             None,
             Some("America/Los_Angeles"),
+            None,
         );
         // Local clock-time form ("3:00 PM" in PDT for 22:00 UTC on
         // 2026-05-05). %-I trims leading zero so the test pins the
@@ -5077,8 +5318,13 @@ mod tests {
             "Controller",
             None,
             None,
+            None,
         );
-        assert!(prose.to_lowercase().contains("operator timezone is unknown"));
+        assert!(
+            prose
+                .to_lowercase()
+                .contains("operator timezone is unknown")
+        );
         assert!(prose.to_lowercase().contains("ask which zone"));
     }
 
@@ -5095,8 +5341,13 @@ mod tests {
             "Controller",
             None,
             Some("Not/A/Real/Zone"),
+            None,
         );
-        assert!(prose.to_lowercase().contains("operator timezone is unknown"));
+        assert!(
+            prose
+                .to_lowercase()
+                .contains("operator timezone is unknown")
+        );
     }
 
     #[test]
@@ -5105,7 +5356,8 @@ mod tests {
         // yet; the line just disappears rather than emitting "From
         // principal: `none`" which the model could misread.
         let now = chrono::Utc::now();
-        let prose = super::build_turn_context_prose(now, "conv-x", None, "Controller", None, None);
+        let prose =
+            super::build_turn_context_prose(now, "conv-x", None, "Controller", None, None, None);
         assert!(!prose.contains("From principal"));
         assert!(prose.contains("conv-x"));
         assert!(prose.contains("Controller"));
@@ -5126,6 +5378,7 @@ mod tests {
             Some("controller"),
             "Controller",
             Some("signal"),
+            None,
             None,
         );
         assert!(prose.contains("Origin channel: `signal`"));
@@ -5149,9 +5402,253 @@ mod tests {
             "Controller",
             None,
             None,
+            None,
         );
         assert!(prose.contains("Origin channel: `web`"));
         assert!(!prose.to_lowercase().contains("not describe web-ui"));
+    }
+
+    #[test]
+    fn build_turn_context_prose_omits_group_block_when_none() {
+        // Default for DM / web / single-actor turns: no group
+        // section, no "default to silence" nudge — that prose is
+        // wrong outside groups.
+        let now = chrono::Utc::now();
+        let prose = super::build_turn_context_prose(
+            now,
+            "conv-dm",
+            Some("controller"),
+            "Controller",
+            None,
+            None,
+            None,
+        );
+        assert!(!prose.contains("Group conversation context"));
+        assert!(!prose.to_lowercase().contains("default is to stay silent"));
+    }
+
+    #[test]
+    fn build_turn_context_prose_renders_group_block_with_strong_signal() {
+        // Pin the wording the agent reads when it was clearly
+        // addressed: TransportMention is the strongest verdict, the
+        // block names the group + member count + reason in plain
+        // English, AND the "default to silence" posture nudge is
+        // present so even on a strong signal the agent is reminded
+        // of group etiquette.
+        let now = chrono::Utc::now();
+        let g = super::GroupTurnContext {
+            group_name: Some("Project Loon".into()),
+            member_count: 4,
+            addressed_reason: crate::group_addressing::AddressedReason::TransportMention,
+        };
+        let prose = super::build_turn_context_prose(
+            now,
+            "conv-grp",
+            Some("controller"),
+            "Controller",
+            Some("slack"),
+            None,
+            Some(&g),
+        );
+        assert!(prose.contains("Group conversation context"));
+        assert!(prose.contains("\"Project Loon\""));
+        assert!(prose.contains("4 participants"));
+        // The reason wording must appear so the model understands
+        // the strength of the upstream signal. TransportMention
+        // language is the "explicit @-mention" line.
+        assert!(
+            prose.to_lowercase().contains("explicit @-mention")
+                || prose.to_lowercase().contains("@-mention"),
+            "transport-mention reason text should be in the prose; got: {prose}",
+        );
+        // Posture nudge — present regardless of signal strength.
+        assert!(prose.to_lowercase().contains("default is to stay silent"));
+    }
+
+    #[test]
+    fn build_turn_context_prose_group_block_warns_on_fall_open() {
+        // FallOpen variants are weak signals — the agent should
+        // know it might NOT have been addressed. Pin the "may NOT
+        // have been addressed" wording so a future prompt rewrite
+        // doesn't quietly delete the warning.
+        let now = chrono::Utc::now();
+        let g = super::GroupTurnContext {
+            group_name: None,
+            member_count: 5,
+            addressed_reason: crate::group_addressing::AddressedReason::FallOpenClassifierError,
+        };
+        let prose = super::build_turn_context_prose(
+            now,
+            "conv-grp",
+            Some("controller"),
+            "Controller",
+            Some("signal"),
+            None,
+            Some(&g),
+        );
+        // No group name → falls back to "this group".
+        assert!(prose.contains("this group"));
+        // Fall-open warning text must appear.
+        assert!(
+            prose.to_lowercase().contains("may not have been addressed"),
+            "fall-open reason must surface the 'may NOT have been addressed' warning; got: {prose}",
+        );
+    }
+
+    #[test]
+    fn resolve_group_turn_context_returns_none_for_dm() {
+        // DM / unbridged: no principal_group binding → resolver
+        // returns None so the prompt skips the group block.
+        let state = test_app_state();
+        let cid = ConversationId::from("conv-no-group");
+        let got = super::resolve_group_turn_context(
+            &state,
+            &cid,
+            crate::group_addressing::AddressedReason::EligibilityBypass,
+        );
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn resolve_group_turn_context_returns_none_for_all_controller_group() {
+        // All-Controller "group" — no other humans, no addressing
+        // problem, the prompt block isn't useful. Pin so a future
+        // resolver simplification doesn't turn this on by accident
+        // and clutter prompts for multi-controller deployments.
+        use execlaw_core::ids::PrincipalId;
+        use execlaw_core::principal::{Identifier, Principal, PrincipalStore, TrustLevel};
+        use execlaw_core::principal_groups::{GroupKey, PrincipalGroupStore};
+        let state = test_app_state();
+        let cid = ConversationId::from("conv-all-ctrl");
+        let now = chrono::Utc::now().timestamp();
+        let pstore = PrincipalStore::new(&state.db);
+        for id in &["ctrl-a", "ctrl-b"] {
+            pstore
+                .upsert(&Principal {
+                    id: PrincipalId::from((*id).to_owned()),
+                    identifiers: vec![Identifier {
+                        transport: "test".into(),
+                        handle: (*id).to_owned(),
+                    }],
+                    trust_level: TrustLevel::Controller,
+                    resolved_by: vec![],
+                    metadata: serde_json::json!({}),
+                    first_seen: now,
+                    last_seen: Some(now),
+                    controller_notes: None,
+                })
+                .unwrap();
+        }
+        let pg_store = PrincipalGroupStore::new(&state.db);
+        let pids = vec![
+            PrincipalId::from("ctrl-a".to_owned()),
+            PrincipalId::from("ctrl-b".to_owned()),
+        ];
+        let pg = pg_store
+            .resolve(
+                &GroupKey {
+                    channel: "test",
+                    native_group_id: Some(cid.as_str()),
+                    principals: &pids,
+                    includes_controller: true,
+                },
+                now,
+            )
+            .unwrap();
+        // bind_conversation is an UPDATE — materialize the
+        // conversation row first or the binding silently no-ops.
+        super::ensure_conversation_for(&state.db, &cid);
+        pg_store
+            .bind_conversation(cid.as_str(), &pg.group_id)
+            .unwrap();
+        let got = super::resolve_group_turn_context(
+            &state,
+            &cid,
+            crate::group_addressing::AddressedReason::EligibilityBypass,
+        );
+        assert!(
+            got.is_none(),
+            "all-Controller group must not get a group block"
+        );
+    }
+
+    #[test]
+    fn resolve_group_turn_context_returns_some_for_mixed_group() {
+        // Mixed-membership group (Controller + non-Controller) →
+        // resolver returns Some with the right member_count and
+        // the reason the caller passed.
+        use execlaw_core::ids::PrincipalId;
+        use execlaw_core::principal::{Identifier, Principal, PrincipalStore, TrustLevel};
+        use execlaw_core::principal_groups::{GroupKey, PrincipalGroupStore};
+        let state = test_app_state();
+        let cid = ConversationId::from("conv-mixed");
+        let now = chrono::Utc::now().timestamp();
+        let pstore = PrincipalStore::new(&state.db);
+        pstore
+            .upsert(&Principal {
+                id: PrincipalId::from("ctrl".to_owned()),
+                identifiers: vec![Identifier {
+                    transport: "test".into(),
+                    handle: "ctrl".into(),
+                }],
+                trust_level: TrustLevel::Controller,
+                resolved_by: vec![],
+                metadata: serde_json::json!({}),
+                first_seen: now,
+                last_seen: Some(now),
+                controller_notes: None,
+            })
+            .unwrap();
+        pstore
+            .upsert(&Principal {
+                id: PrincipalId::from("friend".to_owned()),
+                identifiers: vec![Identifier {
+                    transport: "test".into(),
+                    handle: "friend".into(),
+                }],
+                trust_level: TrustLevel::KnownTrusted {
+                    resolvers: vec![],
+                    approved_at: now,
+                    approved_by: PrincipalId::from("ctrl".to_owned()),
+                },
+                resolved_by: vec![],
+                metadata: serde_json::json!({}),
+                first_seen: now,
+                last_seen: Some(now),
+                controller_notes: None,
+            })
+            .unwrap();
+        let pg_store = PrincipalGroupStore::new(&state.db);
+        let pids = vec![
+            PrincipalId::from("ctrl".to_owned()),
+            PrincipalId::from("friend".to_owned()),
+        ];
+        let pg = pg_store
+            .resolve(
+                &GroupKey {
+                    channel: "test",
+                    native_group_id: Some(cid.as_str()),
+                    principals: &pids,
+                    includes_controller: true,
+                },
+                now,
+            )
+            .unwrap();
+        super::ensure_conversation_for(&state.db, &cid);
+        pg_store
+            .bind_conversation(cid.as_str(), &pg.group_id)
+            .unwrap();
+        let got = super::resolve_group_turn_context(
+            &state,
+            &cid,
+            crate::group_addressing::AddressedReason::ClassifierDirected,
+        )
+        .expect("mixed group must resolve to Some");
+        assert_eq!(got.member_count, 2);
+        assert_eq!(
+            got.addressed_reason,
+            crate::group_addressing::AddressedReason::ClassifierDirected
+        );
     }
 
     #[test]
