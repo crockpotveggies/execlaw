@@ -490,6 +490,17 @@ fn decode_event_map(env) {
         let msg = event.Message;
         if info == () || msg == () { return (); }
 
+        // Drop messages the controller sent themselves. Whatsmeow
+        // (and therefore wuzapi) echoes self-sent messages back via
+        // the same webhook so multi-device clients can stay in
+        // sync. Without this guard, the operator typing in their
+        // own WhatsApp app gets reflected back here as an "inbound"
+        // and reaches `route_inbound`, where the trust gate sees
+        // `Controller` and dispatches a turn — i.e. the operator
+        // sends a message to another human in a group, and the
+        // agent inserts itself into the conversation. Drop early.
+        if info.IsFromMe == true { return (); }
+
         let text = ();
         if msg.conversation != () { text = msg.conversation; }
         if text == () && msg.extendedTextMessage != () && msg.extendedTextMessage.text != () {

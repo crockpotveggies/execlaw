@@ -124,7 +124,9 @@ async fn decode_canonical_dm_text_event() {
     });
     let out = invoke_map(&plugin, "decode_event_map", event).await;
     assert_eq!(out["channel"], "whatsapp");
-    assert_eq!(out["native_id"], "15553334444");
+    // E.164 prefix added by `native_id_from_jid` so the principal
+    // matches the controller's identity bindings (`whatsapp:+...`).
+    assert_eq!(out["native_id"], "+15553334444");
     assert_eq!(out["display_name"], "Alice");
     assert!(out["group_id"].is_null());
     assert_eq!(out["text"], "hi from a whatsapp dm");
@@ -157,7 +159,9 @@ async fn decode_group_event_sets_group_id_from_chat_jid() {
     });
     let out = invoke_map(&plugin, "decode_event_map", event).await;
     assert_eq!(out["channel"], "whatsapp");
-    assert_eq!(out["native_id"], "15553334444");
+    // E.164 prefix added by `native_id_from_jid` so the principal
+    // matches the controller's identity bindings (`whatsapp:+...`).
+    assert_eq!(out["native_id"], "+15553334444");
     assert_eq!(out["group_id"], "12345678901-1700000000@g.us");
     // Decoder doesn't supply the human group title — the cache-
     // backed lookup in `on_webhook_event` does. Pin so a future
@@ -166,6 +170,41 @@ async fn decode_group_event_sets_group_id_from_chat_jid() {
     // decode depend on a live sidecar).
     assert!(out["group_name"].is_null());
     assert_eq!(out["text"], "hi everyone");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn decode_drops_self_sent_messages() {
+    // Whatsmeow / wuzapi echoes the controller's own outbound
+    // messages back through the inbound webhook so multi-device
+    // clients can sync sent state. Without this filter, the
+    // operator typing on their own phone reaches `route_inbound`
+    // as a Controller-trusted "inbound", the trust gate passes,
+    // and the agent dispatches a turn — i.e. the operator messages
+    // a human in a group and the agent barges into the
+    // conversation. This is a hard regression line: drop the
+    // event in decode_event_map.
+    let plugin = whatsapp_plugin();
+    let event = serde_json::json!({
+        "type": "Message",
+        "event": {
+            "Info": {
+                "Chat": "12345678901-1700000000@g.us",
+                "Sender": "15553334444@s.whatsapp.net",
+                "PushName": "Operator",
+                "IsGroup": true,
+                "IsFromMe": true,
+                "Timestamp": 1700000000_i64,
+            },
+            "Message": {
+                "conversation": "hey alice, did you book the venue?",
+            }
+        }
+    });
+    let out = invoke_map(&plugin, "decode_event_map", event).await;
+    assert!(
+        out.is_null(),
+        "self-sent (IsFromMe: true) messages must decode to Unit so they never reach route_inbound; got: {out}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

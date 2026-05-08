@@ -73,9 +73,70 @@ pub async fn route_inbound(
         msg.display_name.as_deref()
     };
     crate::chats::apply_auto_display_name(&state.db, &cid, display_name_for_seed);
-    PrincipalGroupStore::new(&state.db)
+    let pg_store = PrincipalGroupStore::new(&state.db);
+    pg_store
         .bind_conversation(cid.as_str(), &principal_group_id)
         .map_err(|e| HostCapError::new(format!("bind conversation: {e}")))?;
+
+    // 3b. For groups, opportunistically grow the principal_group's
+    // member list as senders appear. `resolve_group` mints with
+    // empty `principals: &[]` because the transport plugins
+    // (Signal / WhatsApp / Slack) only know the *current* sender
+    // + the group JID on each inbound — none of them include the
+    // full roster in their per-message wire format. Without this
+    // step the member table stays empty forever, and
+    // `should_dispatch_to_agent`'s eligibility gate
+    // (`members.len() < 2`) returns `EligibilityBypass` on every
+    // turn — the classifier never runs. That's the root cause of
+    // "the agent keeps barging into group conversations."
+    //
+    // We seed two principal_ids per group inbound:
+    //   * the observed sender (so subsequent messages from the
+    //     same person reuse the row and we accumulate distinct
+    //     senders over time)
+    //   * the controller (always implicitly in the group — the
+    //     operator owns the bridged WhatsApp/Signal/Slack identity
+    //     — but never sends inbound there, so otherwise wouldn't
+    //     get added)
+    //
+    // Together these bring `members.len()` to ≥2 as soon as the
+    // first non-Controller speaks, which is exactly when the
+    // addressing classifier becomes useful.
+    if msg.group_id.is_some() {
+        if let Err(e) = pg_store.add_member(&principal_group_id, &sender.id, now) {
+            tracing::warn!(
+                target: "generic_inbound",
+                error = %e,
+                group_id = %principal_group_id,
+                principal_id = %sender.id.as_str(),
+                "could not add sender to group membership; addressing classifier may bypass on this turn",
+            );
+        }
+        match crate::routes::controller_principal_id(&state.db) {
+            Ok(controller_pid) => {
+                if let Err(e) =
+                    pg_store.add_member(&principal_group_id, &controller_pid, now)
+                {
+                    tracing::warn!(
+                        target: "generic_inbound",
+                        error = %e,
+                        group_id = %principal_group_id,
+                        "could not add controller to group membership",
+                    );
+                }
+            }
+            Err(e) => {
+                // Fresh install before bootstrap finishes can land
+                // here. Not fatal — the next inbound after
+                // bootstrap will succeed.
+                tracing::debug!(
+                    target: "generic_inbound",
+                    error = ?e,
+                    "controller_principal_id unavailable; skipping controller-membership seed",
+                );
+            }
+        }
+    }
 
     // 4. Trust gate.
     let trust_tag = sender.trust_level.class_tag();

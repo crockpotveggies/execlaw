@@ -300,6 +300,48 @@ impl<'db> PrincipalGroupStore<'db> {
         })
     }
 
+    /// Idempotent insert of a single `(group_id, principal_id)` row
+    /// into `state_principal_group_members`. Unlike `resolve` (which
+    /// reconciles via wipe-and-rewrite), this grows the membership
+    /// without disturbing existing rows.
+    ///
+    /// The use case is "I observed one participant on the wire and
+    /// want the host to know about them" — the per-message routing
+    /// path in `generic_inbound::route_inbound` calls this for the
+    /// sender + controller on every group inbound. Transports that
+    /// don't expose the full group roster up-front (Signal,
+    /// WhatsApp, Slack — none of their per-message webhooks include
+    /// "here are all 8 participants") need this to grow the
+    /// membership lazily; otherwise `members.len()` stays 0
+    /// forever and `should_dispatch_to_agent`'s eligibility gate
+    /// short-circuits to `EligibilityBypass` on every turn.
+    ///
+    /// Bumps `last_active_at` on the parent row so reaper bookkeeping
+    /// stays current — the same way `resolve` does.
+    pub fn add_member(
+        &self,
+        group_id: &str,
+        principal_id: &PrincipalId,
+        now: i64,
+    ) -> Result<(), DbError> {
+        self.db.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            tx.execute(
+                "INSERT OR IGNORE INTO state_principal_group_members \
+                 (group_id, principal_id) VALUES (?1, ?2)",
+                params![group_id, principal_id.as_str()],
+            )?;
+            tx.execute(
+                "UPDATE state_principal_groups \
+                 SET last_active_at = ?1 \
+                 WHERE group_id = ?2",
+                params![now, group_id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     /// List every member principal_id of `group_id`. Empty when the
     /// group doesn't exist.
     pub fn members(&self, group_id: &str) -> Result<Vec<PrincipalId>, DbError> {
@@ -691,6 +733,64 @@ mod tests {
         assert_eq!(store.members(&g.group_id).unwrap().len(), 0);
         // Idempotent on second call.
         assert!(!store.delete(&g.group_id).unwrap());
+    }
+
+    #[test]
+    fn add_member_grows_membership_idempotently() {
+        // The per-message routing path mints a group with empty
+        // members and then accumulates senders one inbound at a
+        // time via `add_member`. The contract here:
+        //
+        //   * first call inserts the row + bumps last_active_at
+        //   * second call with the same id is a clean no-op (no
+        //     duplicate row, no error)
+        //   * inserting a different principal grows the count
+        //
+        // Pinning this is the regression guard for "the agent keeps
+        // barging into group conversations" — a fix that's silently
+        // a no-op (e.g., a future refactor that drops the OR IGNORE
+        // clause) would re-introduce the bug.
+        let db = fresh_db();
+        let store = PrincipalGroupStore::new(&db);
+        let g = store
+            .resolve(
+                &GroupKey {
+                    channel: "whatsapp",
+                    native_group_id: Some("group-jid-x"),
+                    principals: &[],
+                    includes_controller: true,
+                },
+                1000,
+            )
+            .unwrap();
+        assert_eq!(
+            store.members(&g.group_id).unwrap().len(),
+            0,
+            "fresh group with empty principals must start with 0 members"
+        );
+
+        let alice = PrincipalId::from("alice".to_owned());
+        let bob = PrincipalId::from("bob".to_owned());
+
+        store.add_member(&g.group_id, &alice, 1100).unwrap();
+        let m1 = store.members(&g.group_id).unwrap();
+        assert_eq!(m1.len(), 1);
+        assert_eq!(m1[0].as_str(), "alice");
+        let after1 = store.get(&g.group_id).unwrap().unwrap();
+        assert_eq!(
+            after1.last_active_at, 1100,
+            "add_member must bump last_active_at"
+        );
+
+        // Second call with the same id is a no-op — no duplicate.
+        store.add_member(&g.group_id, &alice, 1200).unwrap();
+        let m2 = store.members(&g.group_id).unwrap();
+        assert_eq!(m2.len(), 1, "duplicate add must be a no-op");
+
+        // Different principal grows the count.
+        store.add_member(&g.group_id, &bob, 1300).unwrap();
+        let m3 = store.members(&g.group_id).unwrap();
+        assert_eq!(m3.len(), 2);
     }
 
     #[test]
