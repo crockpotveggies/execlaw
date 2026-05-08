@@ -12,8 +12,8 @@
 //! - `read_memory` — reads a key from the caller's trust scope, with
 //!   read-down cascade.
 //! - `write_memory` — writes a key at the caller's trust scope.
-//! - `list_memory` — stub; returns an empty list (the underlying
-//!   `MemoryStore` doesn't yet have a scan method).
+//! - `list_memory` — prefix scan over the caller's read-down chain,
+//!   excluding COLD entries (post migration 0035).
 //! - `set_thread_name` — writes `state_conversations.display_name` for
 //!   the caller's conversation.
 //! - `get_thread` — returns the caller's thread's metadata (display
@@ -288,7 +288,6 @@ impl ToolImpl for ListMemoryTool {
                     "key": e.key,
                     "updated_at": e.updated_at,
                 })).collect::<Vec<_>>(),
-                "note": "list_memory scan not yet implemented; use read_memory for known keys"
             })),
             Err(e) => e.into_outcome(),
         }
@@ -2796,19 +2795,143 @@ mod tests {
     // --- list_memory ---
 
     #[tokio::test]
-    async fn list_memory_returns_stub_shape() {
+    async fn list_memory_returns_keys_matching_prefix() {
+        // Post-migration-0035: `list_memory` is no longer a stub.
+        // Seed two matching keys and one non-matching, then verify
+        // the prefix filter, the read-down trust visibility, and the
+        // shape returned to the agent (key + updated_at).
         let db = fresh_db();
         let cid = seed_conversation(&db, "c9");
+
+        // Seed three memory rows directly via the store. The Tool
+        // ctx's MemoryApi will be Controller-scoped so all three
+        // are readable (all written under Controller).
+        let now = 1_700_000_000;
+        let store = crate::memory::MemoryStore::new(&db);
+        for k in &["pref_voice", "pref_tone", "other"] {
+            store
+                .upsert(&crate::memory::MemoryEntry {
+                    scope: "global".into(),
+                    trust_class: "Controller".into(),
+                    key: (*k).into(),
+                    value_blob: b"v".to_vec(),
+                    ttl_expires: None,
+                    updated_at: now,
+                    tier: crate::memory::MemoryTier::Warm,
+                    hits: 0,
+                    last_used_at: None,
+                    created_at: now,
+                })
+                .unwrap();
+        }
+
         let tool = ListMemoryTool::new();
         let ctx = build_ctx(&db, cid, "Controller", false, true);
-        let out = tool.invoke(ctx, json!({"scope": "s"})).await;
+        let out = tool
+            .invoke(
+                ctx,
+                json!({"scope": "global", "prefix": "pref_"}),
+            )
+            .await;
         match out {
             ToolOutcome::Ok(v) => {
-                assert_eq!(v["keys"], json!([]));
-                assert!(v["note"].as_str().unwrap().contains("not yet implemented"));
+                let keys = v["keys"].as_array().expect("keys array");
+                let names: std::collections::HashSet<_> = keys
+                    .iter()
+                    .map(|e| e["key"].as_str().unwrap().to_owned())
+                    .collect();
+                assert_eq!(names.len(), 2);
+                assert!(names.contains("pref_voice"));
+                assert!(names.contains("pref_tone"));
+                assert!(!names.contains("other"));
+                // The "not yet implemented" note from the stub era
+                // must be gone — the tool now returns just the keys
+                // array, no apologetic disclaimer.
+                assert!(v.get("note").is_none());
             }
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn list_memory_excludes_cold_entries() {
+        // COLD rows must not surface to the agent through `list_memory`
+        // — they exist for audit / explicit lookup only.
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "c9b");
+        let store = crate::memory::MemoryStore::new(&db);
+        let now = 1_700_000_000;
+        let mut warm = crate::memory::MemoryEntry {
+            scope: "global".into(),
+            trust_class: "Controller".into(),
+            key: "live_pref".into(),
+            value_blob: b"v".to_vec(),
+            ttl_expires: None,
+            updated_at: now,
+            tier: crate::memory::MemoryTier::Warm,
+            hits: 0,
+            last_used_at: None,
+            created_at: now,
+        };
+        store.upsert(&warm).unwrap();
+        warm.key = "archived_pref".into();
+        warm.tier = crate::memory::MemoryTier::Cold;
+        store.upsert(&warm).unwrap();
+
+        let tool = ListMemoryTool::new();
+        let ctx = build_ctx(&db, cid, "Controller", false, true);
+        let out = tool
+            .invoke(ctx, json!({"scope": "global", "prefix": ""}))
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                let keys: Vec<_> = v["keys"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e["key"].as_str().unwrap().to_owned())
+                    .collect();
+                assert!(keys.contains(&"live_pref".to_owned()));
+                assert!(!keys.contains(&"archived_pref".to_owned()));
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_memory_bumps_hit_counter_and_last_used_at() {
+        // Self-improving lifecycle: a successful read must bump the
+        // row's `hits` and stamp `last_used_at` so the promotion
+        // sweeper can find candidates. This is the read-side half
+        // of the frequency-promotion path.
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "c9c");
+        let store = crate::memory::MemoryStore::new(&db);
+        let now = 1_700_000_000;
+        store
+            .upsert(&crate::memory::MemoryEntry {
+                scope: "global".into(),
+                trust_class: "Controller".into(),
+                key: "tracked".into(),
+                value_blob: b"v".to_vec(),
+                ttl_expires: None,
+                updated_at: now,
+                tier: crate::memory::MemoryTier::Warm,
+                hits: 0,
+                last_used_at: None,
+                created_at: now,
+            })
+            .unwrap();
+
+        let tool = ReadMemoryTool::new();
+        let ctx = build_ctx(&db, cid, "Controller", false, true);
+        let _ = tool
+            .invoke(ctx, json!({"scope": "global", "key": "tracked"}))
+            .await;
+
+        let row = store.get("global", "Controller", "tracked").unwrap().unwrap();
+        assert_eq!(row.hits, 1, "successful read must bump hits");
+        assert!(row.last_used_at.is_some(), "must stamp last_used_at");
     }
 
     // --- set_thread_name ---

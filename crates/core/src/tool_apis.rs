@@ -297,11 +297,18 @@ impl MemoryApi for DbMemoryApi {
                 self.caller_trust
             )));
         }
+        // Note: `bump_hit` updates the row whose trust_class actually
+        // matched in the read-down cascade — we capture that level
+        // here so the counter advances on the right row, not on the
+        // (possibly absent) caller-class row. The bump runs in the
+        // same `spawn_blocking` so it stays atomic with the lookup.
+        let now = self.clock_now_unix;
         let got = tokio::task::spawn_blocking(move || {
             let store = MemoryStore::new(&db);
             for class in classes {
                 let entry = store.get(&scope, class, &key)?;
                 if let Some(entry) = entry {
+                    let _ = store.bump_hit(&scope, class, &key, now);
                     return Ok::<_, crate::DbError>(Some(entry));
                 }
             }
@@ -336,6 +343,10 @@ impl MemoryApi for DbMemoryApi {
             value_blob: value.as_bytes().to_vec(),
             ttl_expires: None,
             updated_at: self.clock_now_unix,
+            tier: crate::memory::MemoryTier::Warm,
+            hits: 0,
+            last_used_at: None,
+            created_at: self.clock_now_unix,
         };
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || MemoryStore::new(&db).upsert(&entry))
@@ -346,11 +357,36 @@ impl MemoryApi for DbMemoryApi {
     }
 
     async fn list(&self, scope: &str, prefix: &str) -> Result<Vec<MemoryListEntry>, ApiError> {
-        // The underlying `MemoryStore` doesn't have a scan method yet
-        // (Phase 1 stub). Returning an empty list with the same shape
-        // keeps the contract honest until that lands.
-        let _ = (scope, prefix);
-        Ok(Vec::new())
+        // Post-migration-0035: real prefix scan, restricted to the
+        // caller's read-down chain. COLD entries are excluded — they
+        // exist for audit / never-truly-forget, not for the agent's
+        // working set. The cap (200) is generous; the runner trims
+        // further at the system-prompt assembly layer.
+        let classes: Vec<&'static str> = readable_classes(&self.caller_trust);
+        if classes.is_empty() {
+            return Err(ApiError::NotAuthorized(format!(
+                "trust class {:?} cannot list memory",
+                self.caller_trust
+            )));
+        }
+        let db = self.db.clone();
+        let scope = scope.to_owned();
+        let prefix = prefix.to_owned();
+        let summaries = tokio::task::spawn_blocking(move || {
+            let store = MemoryStore::new(&db);
+            let class_refs: Vec<&str> = classes.iter().copied().collect();
+            store.list(&scope, &class_refs, &prefix, 200)
+        })
+        .await
+        .map_err(|e| ApiError::Storage(format!("join: {e}")))?
+        .map_err(|e| ApiError::Storage(format!("memory list: {e}")))?;
+        Ok(summaries
+            .into_iter()
+            .map(|s| MemoryListEntry {
+                key: s.key,
+                updated_at: s.updated_at,
+            })
+            .collect())
     }
 }
 
@@ -1422,16 +1458,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_api_list_is_currently_empty_stub() {
+    async fn memory_api_list_returns_keys_after_write() {
+        // Post-migration-0035: `list` is no longer a stub. After a
+        // controller-class write, a controller-class list at the
+        // same scope must surface that key.
         let db = fresh_db();
         DbMemoryApi::new(db.clone(), "Controller", 0)
             .write("s", "k1", "v")
             .await
             .unwrap();
-        let v = DbMemoryApi::new(db, "Controller", 0)
+        DbMemoryApi::new(db.clone(), "Controller", 0)
+            .write("s", "k2", "v")
+            .await
+            .unwrap();
+        let v = DbMemoryApi::new(db.clone(), "Controller", 0)
             .list("s", "")
             .await
             .unwrap();
-        assert!(v.is_empty());
+        let keys: std::collections::HashSet<_> =
+            v.iter().map(|e| e.key.clone()).collect();
+        assert!(keys.contains("k1"));
+        assert!(keys.contains("k2"));
+    }
+
+    #[tokio::test]
+    async fn memory_api_list_filters_by_prefix() {
+        let db = fresh_db();
+        let api = DbMemoryApi::new(db.clone(), "Controller", 0);
+        api.write("s", "alpha_one", "v").await.unwrap();
+        api.write("s", "alpha_two", "v").await.unwrap();
+        api.write("s", "beta_one", "v").await.unwrap();
+        let v = api.list("s", "alpha_").await.unwrap();
+        let keys: std::collections::HashSet<_> =
+            v.iter().map(|e| e.key.clone()).collect();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains("alpha_one"));
+        assert!(keys.contains("alpha_two"));
+        assert!(!keys.contains("beta_one"));
+    }
+
+    #[tokio::test]
+    async fn memory_api_list_unknown_trust_class_fails_closed() {
+        let db = fresh_db();
+        let api = DbMemoryApi::new(db, "Goblin", 0);
+        match api.list("s", "").await.unwrap_err() {
+            ApiError::NotAuthorized(_) => {}
+            other => panic!("expected NotAuthorized, got {other:?}"),
+        }
     }
 }

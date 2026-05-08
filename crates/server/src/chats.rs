@@ -5596,6 +5596,10 @@ mod tests {
                 value_blob: b"super-secret".to_vec(),
                 ttl_expires: None,
                 updated_at: 1,
+                tier: execlaw_core::memory::MemoryTier::Warm,
+                hits: 0,
+                last_used_at: None,
+                created_at: 1,
             })
             .unwrap();
 

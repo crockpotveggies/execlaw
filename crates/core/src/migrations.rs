@@ -197,6 +197,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "display-name-source",
         sql: include_str!("../migrations/0034_display_name_source.sql"),
     },
+    Migration {
+        id: 35,
+        name: "memory-lifecycle",
+        sql: include_str!("../migrations/0035_memory_lifecycle.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -332,7 +337,7 @@ mod tests {
             applied,
             vec![
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
             ]
         );
 
@@ -383,6 +388,8 @@ mod tests {
             "config_skills",
             "state_skill_proposals",
             "state_transport_bindings",
+            "memory_promotions",
+            "memory_reflections",
         ];
         db.with_conn(|c| {
             for t in &tables {
@@ -410,7 +417,7 @@ mod tests {
             first,
             vec![
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
             ]
         );
         assert!(

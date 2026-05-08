@@ -35,6 +35,7 @@ pub mod log_retention;
 pub mod logs;
 pub mod mcp_servers;
 pub mod memory;
+pub mod memory_lifecycle;
 pub mod migrations;
 pub mod oauth;
 pub mod outbox;
