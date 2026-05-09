@@ -28,8 +28,12 @@ load-bearing abstractions:
    sensitivity.
 
 The Rust workspace lives in `crates/`. The SPA lives in `web/`.
-First-party plugins live in `plugins/`. Documentation lives in `docs/`.
-Design rationale lives in `MIGRATION_PLAN.md`.
+First-party plugins live in `plugins/`. Documentation lives in
+`docs/` (architecture, agent-model, plugins, sidecar-supervisor,
+runner-design, voice-followups). Inline source comments still
+cite `MIGRATION_PLAN.md` §X for historical rationale; the file
+itself was retired once its content was distributed across the
+in-tree docs.
 
 ---
 
@@ -104,7 +108,6 @@ execlaw/
 ├── scripts/               dev-server.sh / dev-server.ps1
 ├── evals/                 Rubric TOML files
 ├── spec/                  OpenAPI + AsyncAPI specs
-├── MIGRATION_PLAN.md      Section-by-section design rationale
 ├── README.md              Quick start + dev mode
 └── AGENTS.md              You are here
 ```
@@ -291,7 +294,8 @@ The user-facing docs are:
 - `docs/architecture.md` — what the system is.
 - `docs/agent-model.md` — how a turn executes.
 - `docs/plugins.md` — plugin author reference.
-- `MIGRATION_PLAN.md` — design rationale.
+- `docs/sidecar-supervisor-design.md` — supervised-container layer.
+- `docs/runner-design.md` — per-conversation runner model.
 - `AGENTS.md` — this file.
 
 Match the existing tone (terse, technical, citation-heavy). Cite file

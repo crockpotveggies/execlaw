@@ -19,7 +19,6 @@ hardware.
 | [`docs/sidecar-supervisor-design.md`](docs/sidecar-supervisor-design.md) | Supervised-container layer plugins compose against. |
 | [`docs/runner-design.md`](docs/runner-design.md) | Per-conversation runner container model. |
 | [`docs/voice-followups.md`](docs/voice-followups.md) | Voice modality design notes. |
-| [`MIGRATION_PLAN.md`](MIGRATION_PLAN.md) | Section-by-section design rationale + research citations — the **why**. §0 "Grounding Principles" is the non-negotiable list (no cloud LLMs, container deployment, minimal images). |
 | [`AGENTS.md`](AGENTS.md) | Onboarding for AI coding agents working on this repo. |
 
 ## What ships today
@@ -201,8 +200,6 @@ warm dev box). If `cargo-watch` rebuilds start failing with
 ---
 
 ## Workspace layout
-
-See [`MIGRATION_PLAN.md` §3.1](MIGRATION_PLAN.md) for the full rationale.
 
 | Path | Purpose |
 |---|---|
