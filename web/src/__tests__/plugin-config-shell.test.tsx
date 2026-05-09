@@ -152,8 +152,17 @@ describe("PluginConfigShell", () => {
         // Confirm dialog → accept.
         vi.stubGlobal("confirm", () => true);
         mountAt("/settings/plugins/test-plugin");
+        // Wait for the button to be both present AND enabled. The
+        // shell renders the button immediately with `disabled={summary
+        // === "loading"}`; if we click while still loading, React
+        // suppresses the handler and the test races against the
+        // pending /api/admin/plugins GET. Slow CI runners (this
+        // surfaced on GitHub-hosted Linux at ~5x the local-machine
+        // time per test) flake exactly here. Waiting on `not.disabled`
+        // is the deterministic gate.
         await waitFor(() => {
-            expect(screen.getByTestId("plugin-config-uninstall")).toBeInTheDocument();
+            const btn = screen.getByTestId("plugin-config-uninstall");
+            expect(btn).not.toBeDisabled();
         });
         fireEvent.click(screen.getByTestId("plugin-config-uninstall"));
         await waitFor(() => {
@@ -182,8 +191,14 @@ describe("PluginConfigShell", () => {
         );
         vi.stubGlobal("confirm", () => false);
         mountAt("/settings/plugins/test-plugin");
+        // Same enabled-state wait as the accept-path test above —
+        // click-on-disabled is a no-op which would make the
+        // `confirm` stub never get a chance to return false, and
+        // the `DELETE not fired` assertion would pass for the
+        // wrong reason.
         await waitFor(() => {
-            expect(screen.getByTestId("plugin-config-uninstall")).toBeInTheDocument();
+            const btn = screen.getByTestId("plugin-config-uninstall");
+            expect(btn).not.toBeDisabled();
         });
         fireEvent.click(screen.getByTestId("plugin-config-uninstall"));
         // Give any in-flight async a tick.
