@@ -202,6 +202,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "memory-lifecycle",
         sql: include_str!("../migrations/0035_memory_lifecycle.sql"),
     },
+    Migration {
+        id: 36,
+        name: "default-bind-port-3031",
+        sql: include_str!("../migrations/0036_default_bind_port_3031.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]

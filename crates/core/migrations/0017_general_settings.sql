@@ -13,7 +13,7 @@
 --                     re-runs the service registration.
 --
 --   * bind_address  — host:port the service listens on. Default
---                     loopback:3031. Editing this saves to the DB
+--                     loopback:3030. Editing this saves to the DB
 --                     and prompts the operator to re-run
 --                     `execlaw service restart` (the binary reads
 --                     this on next start).
@@ -26,11 +26,11 @@ CREATE TABLE IF NOT EXISTS config_general (
     -- the table can never grow beyond a single row.
     id              INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
     start_on_boot   INTEGER NOT NULL DEFAULT 1 CHECK (start_on_boot IN (0, 1)),
-    bind_address    TEXT    NOT NULL DEFAULT '127.0.0.1:3031',
+    bind_address    TEXT    NOT NULL DEFAULT '127.0.0.1:3030',
     updated_at      INTEGER NOT NULL
 );
 
 -- Seed the singleton row so /api/admin/settings/general always
 -- returns a payload without a per-route NULL fallback.
 INSERT OR IGNORE INTO config_general (id, start_on_boot, bind_address, updated_at)
-VALUES (1, 1, '127.0.0.1:3031', unixepoch());
+VALUES (1, 1, '127.0.0.1:3030', unixepoch());
