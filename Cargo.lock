@@ -1844,8 +1844,6 @@ dependencies = [
 [[package]]
 name = "hardware-query"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc3d948f6f8dc8f726b1511b34c64b2ba839bbdf56f3851bb07091b91f211ddf"
 dependencies = [
  "async-trait",
  "bytesize",

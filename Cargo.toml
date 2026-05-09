@@ -167,3 +167,13 @@ panic = "abort"
 # Faster rebuilds; debug assertions on.
 opt-level = 0
 debug = 1
+
+# Pin a patched fork of hardware-query 0.2.1 — upstream's `src/npu.rs`
+# gates `use std::process::Command;` to `cfg(target_os = "linux")` but
+# also calls `Command::new("sysctl")` inside a macOS-only block, so a
+# stock build fails on macOS with E0433. The vendored copy widens the
+# import gate to `cfg(unix)`. Drop this `[patch.crates-io]` block once
+# upstream cuts a release with the fix (no 0.2.2 / 0.3.0 published as
+# of 2026-05-09 — see https://crates.io/crates/hardware-query/versions).
+[patch.crates-io]
+hardware-query = { path = "vendor/hardware-query" }

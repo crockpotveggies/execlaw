@@ -571,13 +571,16 @@ mod tests {
 
     #[test]
     fn null_and_numeric_values_are_preserved() {
+        // Pick a fractional value that doesn't trip clippy::approx_constant
+        // (3.14 / 3.1415 are flagged as "did you mean PI?" — we just want
+        // a non-integer JSON number; the actual value is irrelevant).
         let (s, _) = sanitize_one(
-            json!({"x": null, "n": 42, "f": 3.14, "b": false}),
+            json!({"x": null, "n": 42, "f": 1.5, "b": false}),
             Ok(json!({})),
         );
         assert_eq!(s.args_json["x"], JsonValue::Null);
         assert_eq!(s.args_json["n"], 42);
-        assert_eq!(s.args_json["f"], 3.14);
+        assert_eq!(s.args_json["f"], 1.5);
         assert_eq!(s.args_json["b"], false);
     }
 }
