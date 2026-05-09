@@ -79,7 +79,7 @@ regex.workspace = true
 #     4 KB of mostly-chrome HTML soup, killing extraction quality).
 #     The original `readability` crate is unmaintained as of 2026.
 scraper = "0.21"
-dom_smoothie = "0.10"
+dom_smoothie = "0.17"
 
 utoipa.workspace = true
 utoipa-axum.workspace = true
