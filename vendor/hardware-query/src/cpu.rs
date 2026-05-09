@@ -479,7 +479,11 @@ impl CPUInfo {
     }
 
     fn detect_vulnerabilities() -> Result<Vec<String>> {
-        let vulnerabilities = Vec::new();
+        // execlaw vendoring fix: upstream binds `vulnerabilities`
+        // immutably but pushes to it inside the Linux-cfg block
+        // below (line 494). E0596 on Linux builds.
+        #[allow(unused_mut)]
+        let mut vulnerabilities = Vec::new();
 
         #[cfg(target_os = "linux")]
         {

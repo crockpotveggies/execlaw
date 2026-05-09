@@ -186,7 +186,10 @@ impl TPUInfo {
     
     /// Detect Google Coral Edge TPUs
     fn detect_edge_tpus() -> Result<Vec<TPUInfo>> {
-        let tpus = Vec::new();
+        // execlaw vendoring fix: upstream binds `tpus` immutably but
+        // pushes inside the Linux-cfg block (lines ~198, ~240). E0596.
+        #[allow(unused_mut)]
+        let mut tpus = Vec::new();
         
         #[cfg(target_os = "linux")]
         {
@@ -280,7 +283,10 @@ impl TPUInfo {
     
     /// Detect Intel Habana accelerators
     fn detect_intel_habana() -> Result<Vec<TPUInfo>> {
-        let tpus = Vec::new();
+        // execlaw vendoring fix: upstream binds `tpus` immutably but
+        // pushes inside the Linux-cfg block (line ~305). E0596.
+        #[allow(unused_mut)]
+        let mut tpus = Vec::new();
         
         #[cfg(target_os = "linux")]
         {
