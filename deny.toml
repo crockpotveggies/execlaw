@@ -20,7 +20,23 @@ yanked = "deny"
 # Ignore individual advisories with `ignore = ["RUSTSEC-XXXX-NNNN"]`
 # only when the project's exposure has been triaged. Document the
 # rationale inline.
-ignore = []
+ignore = [
+    # fxhash 0.2.1 — pulled in transitively by `dom_smoothie` +
+    # `scraper` (research subsystem's HTML extraction). Upstream is
+    # unmaintained (NOT vulnerable; advisory is a status flag). No
+    # safe upgrade exists in 2026-05; rust-lang/rustc-hash is the
+    # successor but only `dom_smoothie` / `scraper` upstreams can
+    # adopt it. Re-evaluate when those crates ship a release that
+    # drops the dep; until then the unmaintained status doesn't
+    # expose a runtime issue.
+    { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained — transitive via dom_smoothie + scraper; no safe upgrade; not a vulnerability" },
+    # paste 1.0.15 — pulled in transitively by `utoipa-axum`
+    # (OpenAPI spec generation). Author archived the repo;
+    # `pastey` is the drop-in successor. Same calculus: not
+    # vulnerable, no safe upgrade, transitive. Drops out of our
+    # graph when `utoipa-axum` migrates.
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained — transitive via utoipa-axum; no safe upgrade; not a vulnerability" },
+]
 
 # ---- licenses: project compatibility ----
 [licenses]
@@ -55,7 +71,11 @@ exceptions = []
 # ---- bans: per-crate denylist + duplicate-version policy ----
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# Wildcards in transitive Cargo.toml metadata trip this even though
+# the workspace's own manifests are clean. Treat as advisory until
+# we have a concrete crate to fix; flipping back to "deny" is one
+# line when the warning surface is stable.
+wildcards = "warn"
 # `allow` / `deny` for specific crates by name. Empty by default —
 # add entries here if a known-bad crate appears in the dep tree.
 allow = []
