@@ -1,6 +1,14 @@
 use crate::{HardwareQueryError, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+// execlaw vendoring fix: upstream forgot `use std::fs;` even though
+// `fs::read_to_string("/proc/cpuinfo")` and friends are called from
+// Linux-cfg-gated blocks all over this file (lines 412-681). Gate
+// the import to `cfg(target_os = "linux")` so non-Linux targets
+// don't drag in an unused-import warning. Upstream issue tracked
+// at https://github.com/ciresnave/hardware-query
+#[cfg(target_os = "linux")]
+use std::fs;
 use sysinfo::System;
 
 /// CPU vendor information

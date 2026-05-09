@@ -204,7 +204,11 @@ impl TPUInfo {
                             memory_gb: None, // Uses host memory
                             memory_bandwidth_gbps: Some(2.0), // USB 3.0 bandwidth
                             core_count: Some(1),
-                            driver_version: Self::get_edge_tpu_driver_version(),
+                            // execlaw vendoring fix: upstream calls
+                            // `get_edge_tpu_driver_version` here but never
+                            // defines it. The compiler suggests
+                            // `get_tpu_driver_version` (the only impl).
+                            driver_version: Self::get_tpu_driver_version(),
                             firmware_version: None,
                             device_id: Some("18d1:9302".to_string()),
                             supported_frameworks: vec![
@@ -242,7 +246,11 @@ impl TPUInfo {
                             memory_gb: None,
                             memory_bandwidth_gbps: Some(8.0), // PCIe bandwidth
                             core_count: Some(1),
-                            driver_version: Self::get_edge_tpu_driver_version(),
+                            // execlaw vendoring fix: upstream calls
+                            // `get_edge_tpu_driver_version` here but never
+                            // defines it. The compiler suggests
+                            // `get_tpu_driver_version` (the only impl).
+                            driver_version: Self::get_tpu_driver_version(),
                             firmware_version: None,
                             device_id: None,
                             supported_frameworks: vec![
@@ -303,7 +311,10 @@ impl TPUInfo {
                                                 memory_gb: Some(32.0), // Typical for Gaudi
                                                 memory_bandwidth_gbps: Some(2400.0), // HBM2E bandwidth
                                                 core_count: Some(8), // Typical core count
-                                                driver_version: Self::get_habana_driver_version(),
+                                                // execlaw vendoring fix: upstream
+                                                // calls `get_habana_driver_version`
+                                                // here but never defines it.
+                                                driver_version: Self::get_tpu_driver_version(),
                                                 firmware_version: None,
                                                 device_id: Some(device.trim().to_string()),
                                                 supported_frameworks: vec![
