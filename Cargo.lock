@@ -1154,7 +1154,7 @@ dependencies = [
  "execlaw-core",
  "futures-util",
  "hardware-query",
- "nvml-wrapper",
+ "nvml-wrapper 0.12.1",
  "reqwest",
  "serde",
  "serde_json",
@@ -1853,7 +1853,7 @@ dependencies = [
  "libc",
  "nix",
  "num_cpus",
- "nvml-wrapper",
+ "nvml-wrapper 0.11.0",
  "regex",
  "serde",
  "serde_json",
@@ -2728,6 +2728,20 @@ name = "nvml-wrapper"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d5c6c0ef9702176a570f06ad94f3198bc29c524c8b498f1b9346e1b1bdcbb3a"
+dependencies = [
+ "bitflags",
+ "libloading",
+ "nvml-wrapper-sys",
+ "static_assertions",
+ "thiserror 1.0.69",
+ "wrapcenum-derive",
+]
+
+[[package]]
+name = "nvml-wrapper"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f049ae562349fefb8e837eb15443da1e7c6dcbd8a11f52a228f92220c2e5c85e"
 dependencies = [
  "bitflags",
  "libloading",
