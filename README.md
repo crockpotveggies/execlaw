@@ -327,4 +327,7 @@ warm dev box). If `cargo-watch` rebuilds start failing with
 
 ## License
 
-AGPL-3.0-or-later.
+Apache License, Version 2.0 — see [`LICENSE`](LICENSE) and
+[`NOTICE`](NOTICE).
+
+Copyright (c) 2026 Justin Long.

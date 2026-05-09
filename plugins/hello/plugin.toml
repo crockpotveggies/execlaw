@@ -4,7 +4,7 @@ name = "Hello (reference plugin)"
 version = "0.1.0"
 description = "In-tree reference plugin exercising the subprocess tier. Declares one low-latency tool `hello.echo` that echoes its args back wrapped in a {greeting, echoed} object. Used by execlaw's integration tests and as a template for new plugin authors."
 author = "execlaw"
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
 
 [[tools]]
 name = "hello.echo"

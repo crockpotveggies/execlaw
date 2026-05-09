@@ -4,7 +4,7 @@ name = "Google Calendar"
 version = "0.2.2"
 description = "Google Calendar API tools — list calendars/events, check availability, get/create/update/delete events. Mutations send notifications when attendees are present."
 author = "execlaw"
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
 
 [[oauth_accounts]]
 name = "controller"

@@ -4,7 +4,7 @@ name = "SMS Socket"
 version = "0.1.0"
 description = "SMS / MMS via the Android SMS Socket app's local WebSocket gateway. Sidecar-free — opens a WebSocket directly to the gateway URL on the operator's LAN with `Authorization: Bearer <api_key>`. Mirrors the Signal/WhatsApp tool surface (send_message, reply, list_groups n/a, send_with_attachments, fetch_attachment, set_typing). The gateway lives on the operator's Android phone running https://github.com/crockpotveggies/sms-socket-app."
 author = "execlaw"
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
 
 # No sidecar. The Android gateway is the operator's phone running
 # the sms-socket-app, reachable on the LAN at a configurable

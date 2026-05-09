@@ -4,7 +4,7 @@ name = "Slack"
 version = "0.1.1"
 description = "Slack transport via Socket Mode (no public URL needed). Multi-workspace from day 1: each workspace contributes its own bot+app token pair and runs its own Socket Mode connection. Mirrors the Signal/WhatsApp tool surface but is sidecar-free — pure-Rhai over the host's http_post + ws_subscribe + ws_send bindings."
 author = "execlaw"
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
 
 # No sidecar — Slack is public REST + Socket Mode WS. The plugin
 # reaches it via the existing `http_post` (SSRF guard accepts

@@ -4,7 +4,7 @@ name = "Google Contacts"
 version = "0.1.0"
 description = "Google People-API-backed identity provider + contacts.list tool. Resolves email and phone identifiers against the operator's connected Google account so saved contacts auto-trust as Contact-class principals."
 author = "execlaw"
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
 
 [[oauth_accounts]]
 name = "controller"

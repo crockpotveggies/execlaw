@@ -174,16 +174,31 @@ version:
 
 ## Licensing
 
-execlaw is licensed under [AGPL-3.0-or-later](LICENSE). Contributions
-are accepted under the same license — by submitting a PR you certify
-that you have the right to license your contribution under AGPL-3.0,
-and that you do.
+execlaw is licensed under the [Apache License, Version 2.0](LICENSE).
+The repository's [`NOTICE`](NOTICE) file carries the project copyright.
 
-If you're contributing on behalf of an employer, confirm with your
-employer that they're aware of and consent to the AGPL terms (notably:
-network-use-as-distribution, source-disclosure-on-modification). The
-AGPL's network clause is non-trivial — read it before shipping
-proprietary modifications.
+Contributions are accepted under the same license. By submitting a
+pull request you certify that:
+
+1. You have the right to license your contribution under
+   Apache-2.0 (you're the author, or your employer has signed off,
+   or the upstream code you're vendoring is itself
+   Apache-2.0-compatible).
+2. You agree your contribution is licensed under Apache-2.0 with
+   no additional restrictions.
+
+We don't currently require a separate Contributor License Agreement
+or DCO sign-off line — the act of opening a PR against this
+repository is the certification. If your employer requires a CLA
+arrangement before you can contribute, open an issue and we'll work
+something out.
+
+Apache-2.0 includes a patent grant (§3) and an explicit
+contribution-back clause (§5). If you contribute proprietary patches
+through a fork without merging upstream, those terms still apply to
+the patches you publish, but Apache-2.0 imposes no
+network-use-as-distribution clause — you can deploy modified versions
+without disclosing source.
 
 ---
 

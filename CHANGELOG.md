@@ -66,6 +66,16 @@ this changelog is for operators and plugin authors who want to see the
 
 ### Changed
 
+- **Project license relicensed from AGPL-3.0-or-later to Apache-2.0.**
+  `LICENSE` file replaced with the canonical Apache-2.0 text. New
+  `NOTICE` file at the repo root carries the project copyright
+  (Copyright © 2026 Justin Long). All 11 plugin manifests + the
+  workspace `Cargo.toml` flipped their `license` SPDX identifier.
+  CONTRIBUTING.md `## Licensing` section rewritten — the
+  AGPL-network-clause language is dropped; Apache-2.0's patent
+  grant + contribution-back clause are summarized in its place.
+  No CLA / DCO requirement is being added; opening a PR remains
+  the certification.
 - **Default bind port aligned to `127.0.0.1:3031` everywhere** —
   production service, dev-server, Vite proxy, and tests. Previous
   state had the production service on 3030 and the dev-server on

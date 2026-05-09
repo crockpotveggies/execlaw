@@ -32,7 +32,7 @@ name = "Test Script Plugin"
 version = "0.1.0"
 description = "Inline-Rhai identity provider for the integration test."
 author = "execlaw-test"
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
 
 [identity_provider]
 resolves = ["email"]
@@ -239,7 +239,7 @@ name = "Upgrade Test"
 version = "0.1.0"
 description = "v1"
 author = "execlaw-test"
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
 
 [[oauth_accounts]]
 name = "controller"
@@ -258,7 +258,7 @@ name = "Upgrade Test"
 version = "0.2.0"
 description = "v2"
 author = "execlaw-test"
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
 
 [[oauth_accounts]]
 name = "controller"
@@ -398,7 +398,7 @@ name = "Rich Tool Test"
 version = "0.1.0"
 description = "tests that descriptions plumb through"
 author = "execlaw-test"
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
 
 [[tools]]
 name = "rt.search"
@@ -444,7 +444,7 @@ name = "Schema Test"
 version = "0.1.0"
 description = "tests JSON schema loading"
 author = "execlaw-test"
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
 
 [[tools]]
 name = "st.search"
@@ -505,7 +505,7 @@ name = "Tools Upgrade Test"
 version = "0.1.0"
 description = "v1"
 author = "execlaw-test"
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
 
 [[tools]]
 name = "tut.alpha"
@@ -529,7 +529,7 @@ name = "Tools Upgrade Test"
 version = "0.2.0"
 description = "v2"
 author = "execlaw-test"
-license = "AGPL-3.0-or-later"
+license = "Apache-2.0"
 
 [[tools]]
 name = "tut.beta"

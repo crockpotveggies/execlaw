@@ -326,7 +326,7 @@ name        = "Weather"
 version     = "0.1.0"
 description = "Look up current conditions for a city via Open-Meteo."
 author      = "your-name"
-license     = "AGPL-3.0-or-later"
+license     = "Apache-2.0"
 
 [[tools]]
 name        = "weather.lookup"
@@ -485,7 +485,7 @@ Use this when the script tier can't do what you need (native libraries, ML infer
 id          = "plugin-hello"
 name        = "Hello (reference plugin)"
 version     = "0.1.0"
-license     = "AGPL-3.0-or-later"
+license     = "Apache-2.0"
 
 [[tools]]
 name        = "hello.echo"
