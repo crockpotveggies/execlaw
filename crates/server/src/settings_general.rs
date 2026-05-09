@@ -336,7 +336,7 @@ mod tests {
         let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["start_on_boot"], true);
-        assert_eq!(v["bind_address"], "127.0.0.1:3030");
+        assert_eq!(v["bind_address"], "127.0.0.1:3031");
         assert_eq!(v["bind_address_requires_restart"], true);
     }
 

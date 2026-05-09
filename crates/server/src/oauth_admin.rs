@@ -684,7 +684,7 @@ mod tests {
             "provider": "google",
             "client_id": "abc.apps.googleusercontent.com",
             "client_secret": "GOCSPX-secret",
-            "redirect_uri": "http://localhost:3030/api/oauth/google/callback",
+            "redirect_uri": "http://localhost:3031/api/oauth/google/callback",
             "scopes": ["https://www.googleapis.com/auth/contacts.readonly"],
         })
         .to_string();
@@ -774,7 +774,7 @@ mod tests {
             "provider": "google",
             "client_id": "cid",
             "client_secret": "secret",
-            "redirect_uri": "http://localhost:3030/api/oauth/google/callback",
+            "redirect_uri": "http://localhost:3031/api/oauth/google/callback",
             "scopes": ["https://www.googleapis.com/auth/contacts.readonly"],
         });
         app.clone()
@@ -876,7 +876,7 @@ mod tests {
             "provider": "google",
             "client_id": "cid",
             "client_secret": "secret",
-            "redirect_uri": "http://localhost:3030/api/oauth/google/callback",
+            "redirect_uri": "http://localhost:3031/api/oauth/google/callback",
             "scopes": ["https://www.googleapis.com/auth/calendar.readonly"],
         });
         app.clone()

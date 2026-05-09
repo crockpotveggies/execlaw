@@ -163,8 +163,9 @@ bash scripts/dev-server.sh
 cd web && npm run dev
 ```
 
-Server lands on `:3031` (avoiding Docker Desktop's `:3030` squat). SPA
-proxies `/api → :3031` and serves at `:5173`.
+Server binds `127.0.0.1:3031` (the default everywhere — production
+service, dev server, and the Vite proxy all agree). SPA serves at
+`:5173` and proxies `/api → :3031`.
 
 ### Database / vault / state
 

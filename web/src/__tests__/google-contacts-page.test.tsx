@@ -97,7 +97,7 @@ describe("GoogleContactsPage", () => {
                         provider: "google",
                         client_id: "abc.apps.googleusercontent.com",
                         redirect_uri:
-                            "http://localhost:3030/api/oauth/google/callback",
+                            "http://localhost:3031/api/oauth/google/callback",
                         scopes: [
                             "https://www.googleapis.com/auth/contacts.readonly",
                         ],
@@ -145,7 +145,7 @@ describe("GoogleContactsPage", () => {
                         provider: "google",
                         client_id: "abc.apps.googleusercontent.com",
                         redirect_uri:
-                            "http://localhost:3030/api/oauth/google/callback",
+                            "http://localhost:3031/api/oauth/google/callback",
                         scopes: [
                             "https://www.googleapis.com/auth/contacts.readonly",
                         ],
@@ -237,7 +237,7 @@ describe("GoogleContactsPage", () => {
             target: { value: "GOCSPX-test" },
         });
         fireEvent.change(screen.getByTestId("redirect-uri-input"), {
-            target: { value: "http://localhost:3030/api/oauth/google/callback" },
+            target: { value: "http://localhost:3031/api/oauth/google/callback" },
         });
         fireEvent.click(screen.getByTestId("save-button"));
         await waitFor(() => {
@@ -247,7 +247,7 @@ describe("GoogleContactsPage", () => {
             provider: "google",
             client_id: "test.apps.googleusercontent.com",
             client_secret: "GOCSPX-test",
-            redirect_uri: "http://localhost:3030/api/oauth/google/callback",
+            redirect_uri: "http://localhost:3031/api/oauth/google/callback",
         });
         expect(putBody!.scopes).toEqual(
             expect.arrayContaining([

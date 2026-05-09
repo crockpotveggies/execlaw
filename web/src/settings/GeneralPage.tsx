@@ -202,17 +202,17 @@ export function GeneralPage() {
                                 setBindAddress(e.target.value);
                                 setBindDirty(true);
                             }}
-                            placeholder="127.0.0.1:3030"
+                            placeholder="127.0.0.1:3031"
                             disabled={!canMutate || busy}
                             data-testid="general-bind-address"
                         />
                         <Form.Text className="execlaw-muted">
                             The address the control plane listens on. Use{" "}
-                            <code>127.0.0.1:3030</code> for loopback only,{" "}
-                            <code>0.0.0.0:3030</code> to bind every
+                            <code>127.0.0.1:3031</code> for loopback only,{" "}
+                            <code>0.0.0.0:3031</code> to bind every
                             interface (put a reverse proxy in front for TLS),
                             or an IPv6 literal like{" "}
-                            <code>[::1]:3030</code>.
+                            <code>[::1]:3031</code>.
                         </Form.Text>
                         {bindDirty && settings.bind_address_requires_restart && (
                             <div

@@ -52,7 +52,7 @@ enum Command {
         /// Skip db migrate (e.g. operator already ran it).
         #[arg(long, default_value_t = false)]
         skip_migrate: bool,
-        /// Override the default bind address (loopback:3030).
+        /// Override the default bind address (loopback:3031).
         #[arg(long)]
         bind: Option<String>,
         /// Override the default DB path (`~/.execlaw/execlaw.db`).
@@ -83,7 +83,7 @@ enum Command {
         /// Override the configured bind address for this run. When
         /// omitted, the value falls back to
         /// `config_general.bind_address` (set in Settings → General),
-        /// then to the hardcoded `127.0.0.1:3030`. Passing `--bind`
+        /// then to the hardcoded `127.0.0.1:3031`. Passing `--bind`
         /// is intended for one-off dev runs; persistent changes
         /// should go through the SPA.
         #[arg(long)]
@@ -1180,7 +1180,7 @@ fn parse_range(s: &str) -> anyhow::Result<(i64, i64)> {
 ///   1. The `--bind` CLI flag, if passed (one-off overrides for dev).
 ///   2. `config_general.bind_address` from the DB, if a row exists
 ///      (the SPA's Settings → General writes here).
-///   3. `127.0.0.1:3030` — the install-time hardcoded default.
+///   3. `127.0.0.1:3031` — the install-time hardcoded default.
 ///
 /// Returns the resolved value plus a short source label suitable for
 /// the boot log, so an operator chasing "why am I bound to X" has a
@@ -1192,7 +1192,7 @@ fn resolve_bind(cli: Option<String>, db: Option<String>) -> (String, &'static st
     if let Some(s) = db.filter(|s| !s.trim().is_empty()) {
         return (s, "config_general");
     }
-    ("127.0.0.1:3030".to_string(), "default")
+    ("127.0.0.1:3031".to_string(), "default")
 }
 
 async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> anyhow::Result<()> {
@@ -1357,7 +1357,7 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     }
 
     // Phase 7e: build the WebAuthn relying-party from EXECLAW_WEBAUTHN_*
-    // env vars. Falling back to localhost:3030 keeps local-dev working
+    // env vars. Falling back to localhost:3031 keeps local-dev working
     // out of the box; production must set these to the real public
     // origin (HTTPS only — webauthn-rs rejects http origins outside
     // of `localhost`).
@@ -2171,7 +2171,7 @@ mod tests {
 
     #[test]
     fn resolve_bind_prefers_cli_over_db() {
-        let (bind, src) = resolve_bind(Some("0.0.0.0:9000".into()), Some("127.0.0.1:3030".into()));
+        let (bind, src) = resolve_bind(Some("0.0.0.0:9000".into()), Some("127.0.0.1:3031".into()));
         assert_eq!(bind, "0.0.0.0:9000");
         assert_eq!(src, "cli");
     }
@@ -2186,7 +2186,7 @@ mod tests {
     #[test]
     fn resolve_bind_falls_back_to_default_when_neither_provided() {
         let (bind, src) = resolve_bind(None, None);
-        assert_eq!(bind, "127.0.0.1:3030");
+        assert_eq!(bind, "127.0.0.1:3031");
         assert_eq!(src, "default");
     }
 
@@ -2197,7 +2197,7 @@ mod tests {
         // it as whitespace; bind to the safe loopback default rather
         // than passing `""` to TcpListener::bind.
         let (bind, src) = resolve_bind(None, Some("   ".into()));
-        assert_eq!(bind, "127.0.0.1:3030");
+        assert_eq!(bind, "127.0.0.1:3031");
         assert_eq!(src, "default");
     }
 }

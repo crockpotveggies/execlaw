@@ -9,7 +9,7 @@ info:
 
 servers:
   local:
-    host: 127.0.0.1:3030
+    host: 127.0.0.1:3031
     protocol: ws
     description: Local control-plane WebSocket.
 

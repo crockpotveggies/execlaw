@@ -146,7 +146,7 @@ fn wipe_all_user_tables(db: &execlaw_core::Database) -> Result<usize, execlaw_co
         tx.execute(
             "INSERT OR IGNORE INTO config_general \
                 (id, start_on_boot, bind_address, updated_at) \
-             VALUES (1, 1, '127.0.0.1:3030', unixepoch())",
+             VALUES (1, 1, '127.0.0.1:3031', unixepoch())",
             [],
         )?;
         Ok(names.len())

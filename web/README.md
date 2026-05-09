@@ -7,12 +7,12 @@ Phase 6a scope (this scaffold): boot detection (`/api/ping`), setup wizard, logi
 ## Quick start (hands-on test)
 
 ```sh
-# Terminal 1 — Rust server. The `serve` subcommand binds 127.0.0.1:3030
+# Terminal 1 — Rust server. The `serve` subcommand binds 127.0.0.1:3031
 # by default; --no-encrypt skips SQLCipher so the dev DB is portable.
 cd /path/to/execlaw
 cargo run -p execlaw -- serve --no-encrypt
 
-# Terminal 2 — Vite dev (proxies /api → :3030, no CORS needed).
+# Terminal 2 — Vite dev (proxies /api → :3031, no CORS needed).
 cd web
 npm install        # first time
 npm run dev
@@ -29,7 +29,7 @@ After signup/login you can hard-reload the page; the auth context restores token
 
 ## Scripts
 
-- `npm run dev` — Vite dev server with HMR + `/api → :3030` proxy.
+- `npm run dev` — Vite dev server with HMR + `/api → :3031` proxy.
 - `npm run build` — typecheck + production bundle into `dist/`.
 - `npm run preview` — serve `dist/` on `:4173` for prod-mode smoke testing.
 - `npm test` — vitest run, jsdom env.

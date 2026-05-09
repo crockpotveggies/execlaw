@@ -242,7 +242,7 @@ fn seed_oauth(db: &Database, token: &str) {
             provider: "google".into(),
             client_id: "fake.apps.googleusercontent.com".into(),
             client_secret: "fake-secret".into(),
-            redirect_uri: "http://localhost:3030/api/oauth/google/callback".into(),
+            redirect_uri: "http://localhost:3031/api/oauth/google/callback".into(),
             scopes_json: serde_json::to_string(&vec![
                 "https://www.googleapis.com/auth/calendar.readonly".to_owned(),
             ])

@@ -4,18 +4,9 @@ Self-hosted Rust agent framework with persistent memory, hook-based plugins,
 tools, and skills. **No cloud LLMs, ever.** All inference runs on operator
 hardware.
 
-execlaw is a from-scratch rebuild of
-[`selfhosted-claw`](https://github.com/justinelgenlong/selfhosted-claw),
-driven by a Rust control plane, a WordPress-style plugin framework, a
-unified container manager, a chat-first UI, and a participant-aware
-agent model.
-
 <p align="center">
-  <img src="docs/screenshots/skills-screenshot.png" alt="execlaw — Skills page in the SPA" width="820">
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/deep-research-screenshot.png" alt="execlaw — Deep research session" width="820">
+  <img src="docs/screenshots/skills-screenshot.png" alt="execlaw — Skills page" width="48%">
+  <img src="docs/screenshots/deep-research-screenshot.png" alt="execlaw — Deep research session" width="48%">
 </p>
 
 ## Documentation
@@ -71,8 +62,8 @@ control plane itself is a single Rust binary.
 ```bash
 cargo install --path crates/cli   # or `cargo build --release` and copy the binary
 execlaw install                   # migrate DB → register service → start it
-curl http://127.0.0.1:3030/api/health    # → {"status":"ok"}
-open  http://127.0.0.1:3030/api/docs     # Swagger + AsyncAPI
+curl http://127.0.0.1:3031/api/health    # → {"status":"ok"}
+open  http://127.0.0.1:3031/api/docs     # Swagger + AsyncAPI
 ```
 
 `execlaw install` registers a per-user service by default. Add
@@ -113,12 +104,12 @@ forward to the equivalent `execlaw …` invocations
 ### First-run setup
 
 ```bash
-curl -X POST http://127.0.0.1:3030/api/setup \
+curl -X POST http://127.0.0.1:3031/api/setup \
   -H 'content-type: application/json' \
   -d '{"admin_password":"pick-something-longer"}'
 ```
 
-The SPA at `http://127.0.0.1:3030/` will guide you through the rest
+The SPA at `http://127.0.0.1:3031/` will guide you through the rest
 (backend wizard, plugin install, personality, etc.).
 
 ---
@@ -147,11 +138,10 @@ bash scripts/dev-server.sh         # POSIX / WSL / Git Bash on Windows
 # or:
 pwsh scripts/dev-server.ps1        # Windows PowerShell
 # or, from inside web/:
-cd web && npm run dev:server        # alias for the bash script
+cd web && npm run dev:server       # alias for the bash script
 
 # Terminal 2 — SPA hot-reload. Vite HMR; proxies /api → :3031.
-cd web && npm run dev               # standard Vite dev server
-# (use `npm run dev:3031` if you need the explicit VITE_API_TARGET wiring)
+cd web && npm run dev
 ```
 
 Open <http://127.0.0.1:5173/> — the SPA hits the Vite dev server, which
@@ -160,24 +150,20 @@ a `.tsx` file triggers a Vite HMR push; editing a `.rs` file triggers
 a `cargo build` + binary restart and the next API call hits the new
 code (typically <5s for incremental edits).
 
-### Why port 3031, not 3030
-
-Docker Desktop's vpnkit squats `:3030` on Windows hosts, so the dev
-server steers off it to avoid `EADDRINUSE`. The Vite proxy reads
-`VITE_API_TARGET` to match. Override on hosts where Docker isn't a
-problem:
+The dev server, the installed production service, and the Vite proxy
+all default to `127.0.0.1:3031` — there's no port-swizzling between
+modes. Override for one-off testing:
 
 ```bash
-EXECLAW_DEV_BIND=127.0.0.1:3030 bash scripts/dev-server.sh
-# ... and adjust web/vite.config.ts proxy target accordingly.
+EXECLAW_DEV_BIND=127.0.0.1:9000 bash scripts/dev-server.sh
+VITE_API_TARGET=http://127.0.0.1:9000 npm run dev
 ```
 
 ### Useful npm scripts (in `web/`)
 
 | Script | What it does |
 |---|---|
-| `npm run dev` | Vite dev server with HMR (default port 5173). |
-| `npm run dev:3031` | Same as `dev` but pins `VITE_API_TARGET=http://127.0.0.1:3031`. |
+| `npm run dev` | Vite dev server with HMR on `:5173`. Proxies `/api → :3031`. |
 | `npm run dev:server` | Forwards to `bash ../scripts/dev-server.sh` so you can launch the Rust server from inside `web/`. |
 | `npm run build` | Production SPA bundle (`web/dist/`). |
 | `npm run preview` | Serve the built bundle locally. |

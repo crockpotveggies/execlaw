@@ -13,10 +13,10 @@
 #     hot-reload via this script — together you get a full-stack
 #     restart-free workflow.
 #
-# Why a separate port (3031): Docker Desktop's vpnkit squats :3030
-# on Windows, so we steer execlaw to :3031 to avoid the conflict.
-# The Vite proxy reads `VITE_API_TARGET=http://127.0.0.1:3031` from
-# the env to match.
+# Bind port: 127.0.0.1:3031 is the default everywhere — `execlaw
+# serve`, `SERVICE_BIND` in crates/cli/src/service.rs, and the Vite
+# proxy default in web/vite.config.ts all agree. Override via
+# EXECLAW_DEV_BIND if you need a different port for one-off testing.
 #
 # Tweakables (all overridable via env):
 #   EXECLAW_DEV_BIND       — server bind addr        (127.0.0.1:3031)

@@ -442,7 +442,7 @@ mod tests {
             provider: "google".into(),
             client_id: "abc.apps.googleusercontent.com".into(),
             client_secret: "GOCSPX-secret".into(),
-            redirect_uri: "http://localhost:3030/api/oauth/google/callback".into(),
+            redirect_uri: "http://localhost:3031/api/oauth/google/callback".into(),
             scopes_json: serde_json::to_string(&vec![
                 "https://www.googleapis.com/auth/contacts.readonly".to_owned(),
             ])

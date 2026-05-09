@@ -46,7 +46,7 @@ pub struct RunnerSpec {
     /// Hex-encoded one-time spawn secret. Forwarded as
     /// `EXECLAW_SPAWN_SECRET` env var.
     pub spawn_secret_hex: String,
-    /// `ws://control-plane:3030` style. Runner appends
+    /// `ws://control-plane:3031` style. Runner appends
     /// `/api/runner/register/<group_id>`.
     pub rpc_url: String,
     /// Default vLLM URL the runner should hit. Per-turn overrides
@@ -375,7 +375,7 @@ mod tests {
             group_id: group_id.to_owned(),
             image: "execlaw/runner:dev".into(),
             spawn_secret_hex: "ff".repeat(32),
-            rpc_url: "ws://test:3030".into(),
+            rpc_url: "ws://test:3031".into(),
             inference_url: "http://infer:8000/v1".into(),
             memory_bytes: Some(2 * 1024 * 1024 * 1024),
             network: None,

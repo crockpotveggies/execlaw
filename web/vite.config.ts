@@ -5,17 +5,16 @@ import react from "@vitejs/plugin-react";
 // or react-native plumbing.
 //
 // In dev: Vite serves on 127.0.0.1:5173 and proxies /api → the Rust
-// server (default 127.0.0.1:3030) so the SPA looks like a same-origin
-// app and we don't need CORS. The proxy target is overridable via
-// `VITE_API_TARGET` so a workstation where Docker Desktop's vpnkit
-// is squatting port 3030 can run the backend on a different port,
-// e.g.:
-//   cargo run -p execlaw -- serve --bind 127.0.0.1:3031 --no-encrypt
-//   VITE_API_TARGET=http://127.0.0.1:3031 npm run dev
+// server (default 127.0.0.1:3031, set in `crates/cli/src/service.rs`
+// SERVICE_BIND so dev-server, prod service, and the Vite proxy all
+// agree on the same port). The proxy target is overridable via
+// `VITE_API_TARGET` for one-off ports, e.g.:
+//   cargo run -p execlaw -- serve --bind 127.0.0.1:9000 --no-encrypt
+//   VITE_API_TARGET=http://127.0.0.1:9000 npm run dev
 //
-// In prod (Phase 6c-d): the built bundle is embedded in the Rust
-// binary via rust-embed; same-origin by construction.
-const API_TARGET = process.env.VITE_API_TARGET ?? "http://127.0.0.1:3030";
+// In prod the built bundle is embedded in the Rust binary via
+// rust-embed; same-origin by construction.
+const API_TARGET = process.env.VITE_API_TARGET ?? "http://127.0.0.1:3031";
 
 export default defineConfig({
     plugins: [react()],

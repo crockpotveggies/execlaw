@@ -32,7 +32,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_addr: "127.0.0.1:3030".parse().expect("valid default addr"),
+            bind_addr: "127.0.0.1:3031".parse().expect("valid default addr"),
             jwt_issuer: "execlaw".to_owned(),
             access_token_ttl_secs: 15 * 60, // 15 minutes, §7.1
             refresh_token_ttl_secs: 7 * 24 * 60 * 60, // 7 days, §7.1

@@ -8,7 +8,7 @@
 //   to clear stale tokens).
 //
 // Same-origin in production (rust-embed serves the bundle); same-origin-
-// like in dev because Vite proxies /api → :3030.
+// like in dev because Vite proxies /api → :3031.
 
 import {
     reportRestNetworkError,

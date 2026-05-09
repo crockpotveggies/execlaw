@@ -24,7 +24,7 @@ function settingsResponse(overrides: Partial<Record<string, unknown>> = {}) {
     return new Response(
         JSON.stringify({
             start_on_boot: true,
-            bind_address: "127.0.0.1:3030",
+            bind_address: "127.0.0.1:3031",
             updated_at: 100,
             bind_address_requires_restart: true,
             history_retention_days: 30,
@@ -71,7 +71,7 @@ describe("GeneralPage", () => {
             "general-bind-address",
         ) as HTMLInputElement;
         expect(startOnBoot.checked).toBe(true);
-        expect(bindAddr.value).toBe("127.0.0.1:3030");
+        expect(bindAddr.value).toBe("127.0.0.1:3031");
     });
 
     it("disables Save until a field changes", async () => {

@@ -17,7 +17,7 @@ pub struct GeneralSettings {
     /// `service-manager`'s `autostart` flag on `execlaw install` /
     /// `execlaw service install`.
     pub start_on_boot: bool,
-    /// `host:port` the service listens on. Default `127.0.0.1:3030`.
+    /// `host:port` the service listens on. Default `127.0.0.1:3031`.
     /// Edit takes effect on next `execlaw service restart`.
     pub bind_address: String,
     pub updated_at: i64,
@@ -245,7 +245,7 @@ impl<'a> GeneralSettingsStore<'a> {
                 .ok();
             let (cur_boot, cur_bind, cur_dismissed, cur_retention) = current.unwrap_or((
                 1,
-                "127.0.0.1:3030".to_owned(),
+                "127.0.0.1:3031".to_owned(),
                 None,
                 crate::retention::DEFAULT_RETENTION_DAYS as i64,
             ));
@@ -348,7 +348,7 @@ mod tests {
         let store = GeneralSettingsStore::new(&db);
         let s = store.get().unwrap().expect("seed must exist");
         assert!(s.start_on_boot);
-        assert_eq!(s.bind_address, "127.0.0.1:3030");
+        assert_eq!(s.bind_address, "127.0.0.1:3031");
     }
 
     #[test]
@@ -367,7 +367,7 @@ mod tests {
         let s = store.get().unwrap().unwrap();
         assert!(!s.start_on_boot);
         assert_eq!(
-            s.bind_address, "127.0.0.1:3030",
+            s.bind_address, "127.0.0.1:3031",
             "untouched field must keep its prior value"
         );
     }
@@ -431,7 +431,7 @@ mod tests {
         store
             .update(
                 &GeneralSettingsUpdate {
-                    bind_address: Some("[::1]:3030".into()),
+                    bind_address: Some("[::1]:3031".into()),
                     ..Default::default()
                 },
                 100,

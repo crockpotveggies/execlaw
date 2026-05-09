@@ -771,14 +771,14 @@ mod tests {
 
     #[test]
     fn build_accepts_localhost_http() {
-        let svc = WebauthnSvc::new("localhost", "http://localhost:3030", "execlaw").unwrap();
+        let svc = WebauthnSvc::new("localhost", "http://localhost:3031", "execlaw").unwrap();
         let (r, a) = svc.pending_count();
         assert_eq!((r, a), (0, 0));
     }
 
     #[test]
     fn finish_with_unknown_ceremony_id_rejected() {
-        let svc = WebauthnSvc::new("localhost", "http://localhost:3030", "execlaw").unwrap();
+        let svc = WebauthnSvc::new("localhost", "http://localhost:3031", "execlaw").unwrap();
         // Construct any well-formed RegisterPublicKeyCredential; the
         // unknown-id branch fires before the credential is parsed.
         let cred: RegisterPublicKeyCredential = serde_json::from_value(serde_json::json!({
@@ -798,7 +798,7 @@ mod tests {
 
     #[test]
     fn prune_expired_clears_old_pending() {
-        let svc = WebauthnSvc::new("localhost", "http://localhost:3030", "execlaw").unwrap();
+        let svc = WebauthnSvc::new("localhost", "http://localhost:3031", "execlaw").unwrap();
         let (ceremony_id, _) = svc
             .begin_registration("u1", "alice", "Alice", "k".into(), vec![])
             .unwrap();

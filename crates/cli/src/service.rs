@@ -47,7 +47,7 @@ pub const SERVICE_LABEL: &str = "execlaw";
 /// Default bind address the installed service listens on. Loopback
 /// only — operators put a reverse proxy in front if they want to
 /// expose it on a LAN.
-pub const SERVICE_BIND: &str = "127.0.0.1:3030";
+pub const SERVICE_BIND: &str = "127.0.0.1:3031";
 
 fn label() -> ServiceLabel {
     SERVICE_LABEL

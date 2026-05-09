@@ -311,7 +311,7 @@ mod tests {
         let url = p
             .build_authorize_url(&AuthorizeParams {
                 client_id: "abc.apps.googleusercontent.com".into(),
-                redirect_uri: "http://localhost:3030/api/oauth/google/callback".into(),
+                redirect_uri: "http://localhost:3031/api/oauth/google/callback".into(),
                 scopes: vec![
                     "https://www.googleapis.com/auth/contacts.readonly".to_owned(),
                     "openid".to_owned(),
@@ -368,7 +368,7 @@ mod tests {
             .exchange_code(&ExchangeParams {
                 client_id: "cid".into(),
                 client_secret: "secret".into(),
-                redirect_uri: "http://localhost:3030/cb".into(),
+                redirect_uri: "http://localhost:3031/cb".into(),
                 code: "auth-code".into(),
             })
             .await
@@ -404,7 +404,7 @@ mod tests {
             .exchange_code(&ExchangeParams {
                 client_id: "cid".into(),
                 client_secret: "secret".into(),
-                redirect_uri: "http://localhost:3030/cb".into(),
+                redirect_uri: "http://localhost:3031/cb".into(),
                 code: "stale".into(),
             })
             .await
