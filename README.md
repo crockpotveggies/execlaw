@@ -49,6 +49,99 @@ Drop UI screenshots into [`docs/screenshots/`](docs/screenshots/) and reference 
 
 ---
 
+## Minimum requirements
+
+execlaw is **self-hosted by design** — there is no SaaS tier, no cloud
+fallback, and no plan for one. Inference happens on the operator's own
+hardware against a local OpenAI-compatible endpoint. The hardware
+floor is set by the LLM you choose to run, not by execlaw itself.
+
+### Operating system
+
+| Platform | Status | Service backend |
+|---|---|---|
+| Linux x86_64 (Ubuntu 22.04+, Debian 12+, Fedora 39+, Arch, …) | Supported | systemd |
+| macOS x86_64 (Intel) | Supported | launchd |
+| macOS arm64 (Apple Silicon, M1+) | Supported | launchd |
+| Windows 10 / 11 (x86_64, MSVC toolchain) | Supported | Service Control Manager |
+
+Service registration is handled by the
+[`service-manager`](https://crates.io/crates/service-manager) crate —
+`execlaw install` picks the right backend per platform.
+
+### GPU / inference acceleration
+
+You need a GPU capable of running the LLM you intend to use. The
+in-tree default is **Qwen3.5-27B-AWQ** (~14 GB VRAM for weights + a
+working KV cache budget for ~8K-token contexts). Two acceleration paths
+are supported out-of-the-box:
+
+| Path | Hardware | Backend container | Typical floor |
+|---|---|---|---|
+| **NVIDIA CUDA** | RTX 30-series or newer with **≥16 GB VRAM** | `service-vllm` (vLLM) | RTX 4090 / 3090 / A4000 |
+| **Intel Arc / Xeon** | Arc A770 / B580, Battlemage, Xeon w/ AMX | `service-openarc` (OpenVINO) | Arc A770 16 GB |
+
+CPU-only inference is technically possible via llama.cpp or similar
+sidecars, but at 27B-AWQ the latency makes the agent loop unusable.
+Smaller models (Qwen2.5-7B-AWQ at ~5 GB VRAM) work on consumer 8 GB
+cards if you accept the quality drop — operators swap the model spec
+in Settings → Backends.
+
+The voice subsystem (Whisper STT, Kokoro TTS) runs alongside the LLM —
+add ~1-2 GB VRAM headroom if you want both on the same card. Operators
+with a second GPU (typical Intel-Arc-for-voice + NVIDIA-for-LLM split)
+can pin each backend per-card via Settings → Runners.
+
+### Memory + disk
+
+| Resource | Floor | Comfortable |
+|---|---|---|
+| System RAM | 16 GB | 32 GB |
+| Free disk for `~/.execlaw/` | 2 GB | 10 GB (DB + log retention + plugin sidecar volumes) |
+| Free disk for Docker images | 30 GB | 80 GB+ (LLM weights dominate; vLLM + Whisper + Kokoro + plugin sidecars) |
+
+### Required runtime dependencies
+
+- **[Docker](https://docs.docker.com/engine/install/)** — required for
+  per-conversation runner containers, plugin sidecars (signal-cli,
+  wuzapi, …), and managed-mode inference backends. The control plane
+  talks to the local Docker daemon via the standard socket
+  (`/var/run/docker.sock` on Linux/macOS, `\\.\pipe\docker_engine` on
+  Windows). Docker Desktop is fine on macOS/Windows; Docker Engine or
+  Podman-with-the-docker-socket-shim works on Linux. **Without
+  Docker the agent loop runs text-only with the runner in-process;
+  sidecars and managed inference are unavailable** — usable for plain
+  chat but not for the bridged-transport plugins.
+- **An NVIDIA or Intel GPU driver stack** matching the inference path
+  you choose — CUDA 12+ runtime for NVIDIA, the OpenVINO drivers for
+  Intel. Both are normally installed alongside the GPU; `execlaw doctor`
+  prints what's missing.
+- **An OS keyring backend** for vault master-key storage — Keychain
+  on macOS, Credential Manager on Windows, Secret Service / KWallet
+  on Linux. The vault falls back to `~/.execlaw/master.key` if the
+  keyring is unavailable; the file fallback is also the durable sink
+  on Windows where Credential Manager has documented drift issues
+  (see [`docs/security.md`](docs/security.md) §5).
+
+### Build-from-source dependencies
+
+Only required if you're compiling rather than installing a release
+binary:
+
+- **Rust 1.85+** (edition 2024). MSRV documented at the workspace root;
+  CI runs against current stable.
+- **Node.js 20+** for the SPA build (`web/`).
+- **A C toolchain** for the SQLite bundling: `gcc`/`clang` on
+  Linux/macOS, MSVC on Windows.
+- **Strawberry Perl 5.32+** on Windows *only* if you build the
+  production `sqlcipher` feature (vendored OpenSSL needs Perl). Not
+  required for default `bundled-sqlite-plain` dev builds.
+
+`execlaw doctor` runs preflight checks for all of the above and prints
+remediation pointers per platform.
+
+---
+
 ## Quick start (production)
 
 execlaw's control plane runs as a host service on bare metal —

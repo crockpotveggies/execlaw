@@ -33,10 +33,12 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Pin a recent stable. The README documents MSRV 1.85+ (edition
-  # 2024); CI pins one revision higher to surface any post-edition
-  # regression early.
-  RUST_TOOLCHAIN: "1.85"
+  # CI builds against the latest Rust stable. The README documents MSRV
+  # 1.85+ for the project's stated edition-2024 floor, but transitive
+  # dependencies routinely require a newer toolchain than the floor —
+  # tracking stable matches what most contributors install via rustup.
+  # If we ever need MSRV-floor verification, add a separate
+  # `msrv` job pinning `dtolnay/rust-toolchain@1.85`.
 
 jobs:
   rust:
@@ -60,7 +62,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
           components: clippy, rustfmt
 
