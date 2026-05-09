@@ -1,0 +1,56 @@
+name: Feature request
+description: Propose a new capability or design change
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before opening: skim [`docs/architecture.md` §2 design
+        principles](../../docs/architecture.md) and §17 non-goals.
+        Features that conflict with axiom #1 (no cloud LLMs) or
+        the trust/policy/runner architecture are very unlikely to
+        land.
+
+  - type: textarea
+    id: pain
+    attributes:
+      label: Operator pain you're solving
+      description: |
+        Describe what you're trying to accomplish in operator
+        terms — not your proposed implementation. "I want
+        execlaw to do X when Y" is great; "add a Z field to the
+        W table" is implementation, not requirement.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Architectural context
+      description: |
+        Which doc section in `docs/` would your change amend?
+        (architecture / agent-model / plugins / sidecar-supervisor
+        / security)
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: |
+        What else have you tried or thought about? Why are those
+        not enough?
+    validations:
+      required: false
+
+  - type: textarea
+    id: ack
+    attributes:
+      label: Sketch (optional)
+      description: |
+        If you have a rough implementation sketch, drop it here.
+        Don't worry about correctness — the goal is to give the
+        maintainer a concrete starting point.
+    validations:
+      required: false

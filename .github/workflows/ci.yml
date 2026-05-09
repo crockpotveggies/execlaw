@@ -125,3 +125,64 @@ jobs:
 
       - name: bundle-size budget
         run: npm run size
+
+  # cargo-deny: license compatibility, advisory database scan,
+  # version-ban policy. Runs on Linux only — the four sub-checks
+  # (advisories / bans / licenses / sources) are platform-independent
+  # so duplicating across the matrix is wasted CI minutes.
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-deny
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # The four sub-commands map directly to the [advisories],
+          # [licenses], [bans], [sources] tables in `deny.toml` at
+          # the repo root.
+          command: check advisories bans licenses sources
+
+  # Code-coverage. Uses cargo-llvm-cov (LLVM source-based coverage,
+  # which works for both unit and integration tests with the
+  # `--workspace --all-features` switches we run elsewhere).
+  # Output is uploaded to Codecov as `lcov.info`. The badge in
+  # README pulls from the same source.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: cargo llvm-cov --workspace --lcov
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          # No `token:` — Codecov accepts unauthenticated uploads from
+          # public repos via tokenless mode. Add a CODECOV_TOKEN secret
+          # if the repo ever flips private.
+          fail_ci_if_error: false

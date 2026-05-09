@@ -1,5 +1,9 @@
 # execlaw
 
+[![CI](https://github.com/crockpotveggies/execlaw/actions/workflows/ci.yml/badge.svg?branch=foundation)](https://github.com/crockpotveggies/execlaw/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/crockpotveggies/execlaw/branch/foundation/graph/badge.svg)](https://codecov.io/gh/crockpotveggies/execlaw)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 Self-hosted Rust agent framework with persistent memory, hook-based plugins,
 tools, and skills. **No cloud LLMs, ever.** All inference runs on operator
 hardware.
@@ -16,9 +20,12 @@ hardware.
 | [`docs/architecture.md`](docs/architecture.md) | System topology, design principles, FSM, data model, recovery, observability — the **what**. |
 | [`docs/agent-model.md`](docs/agent-model.md) | TurnExecutor, memory layers, reflection loop, planner/executor split — the **how** of one turn. |
 | [`docs/plugins.md`](docs/plugins.md) | Plugin manifest schema, runtime tiers, sidecar model, Rhai primitives, and a step-by-step guide for writing a custom plugin. |
+| [`docs/setup-walkthroughs.md`](docs/setup-walkthroughs.md) | Operator-facing pairing flows for Signal QR, WhatsApp wuzapi, Slack OAuth, Google OAuth + API-key. |
+| [`docs/security.md`](docs/security.md) | Disclosure path, threat model, cryptography, trust assumptions, known limitations, hardening checklist. |
 | [`docs/sidecar-supervisor-design.md`](docs/sidecar-supervisor-design.md) | Supervised-container layer plugins compose against. |
 | [`docs/runner-design.md`](docs/runner-design.md) | Per-conversation runner container model. |
 | [`docs/voice-followups.md`](docs/voice-followups.md) | Voice modality design notes. |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Workflow, code conventions, AGPL→Apache-2.0 licensing notes. |
 | [`AGENTS.md`](AGENTS.md) | Onboarding for AI coding agents working on this repo. |
 
 ## What ships today
