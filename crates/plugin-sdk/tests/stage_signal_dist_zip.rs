@@ -58,7 +58,10 @@ fn dist_signal_zip_stages_cleanly() {
     // read-receipts wrapper entrypoint. Without any of these the
     // operator's pairing flow either returns a blank QR or signal-cli
     // silently drops read-receipt acks.
-    assert_eq!(signal_cli.env.get("MODE").map(|s| s.as_str()), Some("json-rpc"));
+    assert_eq!(
+        signal_cli.env.get("MODE").map(|s| s.as_str()),
+        Some("json-rpc")
+    );
     assert!(
         signal_cli
             .mounts

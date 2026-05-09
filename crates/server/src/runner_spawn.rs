@@ -46,7 +46,7 @@ pub struct RunnerSpec {
     /// Hex-encoded one-time spawn secret. Forwarded as
     /// `EXECLAW_SPAWN_SECRET` env var.
     pub spawn_secret_hex: String,
-    /// `ws://control-plane:3031` style. Runner appends
+    /// `ws://host.docker.internal:3031` style. Runner appends
     /// `/api/runner/register/<group_id>`.
     pub rpc_url: String,
     /// Default vLLM URL the runner should hit. Per-turn overrides

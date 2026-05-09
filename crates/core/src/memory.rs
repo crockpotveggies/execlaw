@@ -250,8 +250,7 @@ impl<'db> MemoryStore<'db> {
                 trust_classes.len() + 2
             );
             let mut stmt = c.prepare(&sql)?;
-            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
-                vec![Box::new(scope.to_owned())];
+            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(scope.to_owned())];
             for cls in trust_classes {
                 params_vec.push(Box::new(cls.to_string()));
             }
@@ -308,10 +307,8 @@ impl<'db> MemoryStore<'db> {
                 trust_classes.len() + 3
             );
             let mut stmt = c.prepare(&sql)?;
-            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
-                Box::new(scope.to_owned()),
-                Box::new(prefix_pattern),
-            ];
+            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+                vec![Box::new(scope.to_owned()), Box::new(prefix_pattern)];
             for cls in trust_classes {
                 params_vec.push(Box::new(cls.to_string()));
             }
@@ -473,7 +470,9 @@ mod tests {
     fn trust_class_scoping_is_enforced_by_primary_key() {
         let db = fresh();
         let store = MemoryStore::new(&db);
-        store.upsert(&entry("s", "Controller", "k", "c", 1)).unwrap();
+        store
+            .upsert(&entry("s", "Controller", "k", "c", 1))
+            .unwrap();
         store
             .upsert(&entry("s", "KnownTrusted", "k", "kt", 1))
             .unwrap();
@@ -526,7 +525,11 @@ mod tests {
         let got = store.get("s", "Controller", "k").unwrap().unwrap();
         assert_eq!(got.value_blob, b"v2");
         assert_eq!(got.updated_at, 2);
-        assert_eq!(got.tier, MemoryTier::Hot, "tier must survive value overwrite");
+        assert_eq!(
+            got.tier,
+            MemoryTier::Hot,
+            "tier must survive value overwrite"
+        );
         assert_eq!(got.hits, 5, "hit count must survive value overwrite");
     }
 
@@ -534,7 +537,9 @@ mod tests {
     fn bump_hit_increments_and_stamps_last_used_at() {
         let db = fresh();
         let store = MemoryStore::new(&db);
-        store.upsert(&entry("s", "Controller", "k", "v", 1)).unwrap();
+        store
+            .upsert(&entry("s", "Controller", "k", "v", 1))
+            .unwrap();
         let n1 = store.bump_hit("s", "Controller", "k", 1000).unwrap();
         let n2 = store.bump_hit("s", "Controller", "k", 1100).unwrap();
         assert_eq!(n1, 1);
@@ -600,7 +605,11 @@ mod tests {
         store.upsert(&ctrl).unwrap();
         store.upsert(&kt).unwrap();
         let rows = store
-            .list_hot(scope, &["KnownTrusted", "KnownLimited", "UnknownPending"], 10)
+            .list_hot(
+                scope,
+                &["KnownTrusted", "KnownLimited", "UnknownPending"],
+                10,
+            )
             .unwrap();
         let keys: Vec<_> = rows.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(keys, vec!["shared"]);
@@ -621,9 +630,7 @@ mod tests {
         for e in [&hot, &warm, &cold, &unrelated] {
             store.upsert(e).unwrap();
         }
-        let rows = store
-            .list(scope, &["Controller"], "pref_", 10)
-            .unwrap();
+        let rows = store.list(scope, &["Controller"], "pref_", 10).unwrap();
         let keys: Vec<_> = rows.iter().map(|r| r.key.as_str()).collect();
         // Cold excluded, unrelated excluded, prefix matches kept.
         assert_eq!(keys.len(), 2);

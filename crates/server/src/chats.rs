@@ -5472,7 +5472,9 @@ mod tests {
         // Rule #1 is specifically what catches "Elyssa are you
         // taking the Tesla?" — the failure mode operators reported.
         assert!(
-            prose.to_lowercase().contains("addresses any person by name"),
+            prose
+                .to_lowercase()
+                .contains("addresses any person by name"),
             "rule against addressing-someone-else must be present; got: {prose}",
         );
         // The router's verdict must be present AND framed as a

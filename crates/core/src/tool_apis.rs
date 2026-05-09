@@ -1475,8 +1475,7 @@ mod tests {
             .list("s", "")
             .await
             .unwrap();
-        let keys: std::collections::HashSet<_> =
-            v.iter().map(|e| e.key.clone()).collect();
+        let keys: std::collections::HashSet<_> = v.iter().map(|e| e.key.clone()).collect();
         assert!(keys.contains("k1"));
         assert!(keys.contains("k2"));
     }
@@ -1489,8 +1488,7 @@ mod tests {
         api.write("s", "alpha_two", "v").await.unwrap();
         api.write("s", "beta_one", "v").await.unwrap();
         let v = api.list("s", "alpha_").await.unwrap();
-        let keys: std::collections::HashSet<_> =
-            v.iter().map(|e| e.key.clone()).collect();
+        let keys: std::collections::HashSet<_> = v.iter().map(|e| e.key.clone()).collect();
         assert_eq!(keys.len(), 2);
         assert!(keys.contains("alpha_one"));
         assert!(keys.contains("alpha_two"));

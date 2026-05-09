@@ -1211,10 +1211,7 @@ mod tests {
                 .iter()
                 .find(|t| t.name == name)
                 .unwrap_or_else(|| panic!("{name} must be declared"));
-            assert!(
-                !t.host_implemented,
-                "{name} must be script-tier in v0.4.0+"
-            );
+            assert!(!t.host_implemented, "{name} must be script-tier in v0.4.0+");
         }
         // Three admin routes — pairing flow + unregister are
         // plugin-served now.

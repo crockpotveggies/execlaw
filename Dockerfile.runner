@@ -5,7 +5,7 @@
 #   docker build -f Dockerfile.runner -t execlaw/runner:dev .
 #
 # At runtime the supervisor passes the env vars the binary reads:
-#   EXECLAW_RPC_URL=ws://control-plane:3031
+#   EXECLAW_RPC_URL=ws://host.docker.internal:3031
 #   EXECLAW_GROUP_ID=<uuid>
 #   EXECLAW_SPAWN_SECRET=<hex>
 #   EXECLAW_INFERENCE_URL=http://127.0.0.1:8101/v1   # default; per-turn overridable

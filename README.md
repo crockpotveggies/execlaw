@@ -51,10 +51,14 @@ Drop UI screenshots into [`docs/screenshots/`](docs/screenshots/) and reference 
 
 ## Quick start (production)
 
-execlaw runs as a host service on bare metal — systemd on Linux,
-launchd on macOS, the Service Control Manager on Windows. Docker is
-optional and only needed for managed-mode inference backends; the
-control plane itself is a single Rust binary.
+execlaw's control plane runs as a host service on bare metal —
+systemd on Linux, launchd on macOS, the Service Control Manager on
+Windows. The control plane itself is a single native binary; Docker
+is required only for the things the control plane spawns *out* (per-
+conversation runner containers, plugin sidecars like signal-cli /
+wuzapi, managed-mode inference backends). On a host without Docker
+the agent loop still works text-only with the runner running
+in-process; sidecars and managed inference are unavailable.
 
 ### One-shot install
 

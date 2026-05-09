@@ -41,7 +41,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 /// the only one we never print, and we keep it out of `Debug`).
 #[derive(Clone)]
 pub struct RunnerConfig {
-    /// Control-plane WS base URL, e.g. `ws://control-plane:3031`.
+    /// Control-plane WS base URL, e.g. `ws://host.docker.internal:3031`
     /// The runner appends `/api/runner/register/<group_id>`.
     pub rpc_url: String,
     pub group_id: String,

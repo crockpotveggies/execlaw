@@ -120,7 +120,13 @@ async fn dispatch_handler(
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(';').next().unwrap_or("").trim().to_ascii_lowercase())
+        .map(|s| {
+            s.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
         .unwrap_or_default();
     let body_value: serde_json::Value = if body.is_empty() {
         serde_json::Value::Null

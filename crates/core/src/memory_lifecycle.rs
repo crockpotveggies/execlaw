@@ -249,12 +249,7 @@ impl<'db> PromotionStore<'db> {
                 "UPDATE memory_promotions \
                     SET decided_at = ?2, decision = ?3, decision_note = ?4 \
                   WHERE id = ?1 AND decided_at IS NULL",
-                params![
-                    id,
-                    now_unix,
-                    PromotionDecision::Approved.as_sql(),
-                    note
-                ],
+                params![id, now_unix, PromotionDecision::Approved.as_sql(), note],
             )?;
             Ok(())
         })?;
@@ -262,12 +257,7 @@ impl<'db> PromotionStore<'db> {
     }
 
     /// Reject a pending proposal without changing the target row.
-    pub fn reject(
-        &self,
-        id: i64,
-        now_unix: i64,
-        note: Option<&str>,
-    ) -> Result<(), LifecycleError> {
+    pub fn reject(&self, id: i64, now_unix: i64, note: Option<&str>) -> Result<(), LifecycleError> {
         let proposal = self.get(id)?.ok_or(LifecycleError::NotFound(id))?;
         if proposal.decided_at.is_some() {
             return Err(LifecycleError::AlreadyDecided(id));
@@ -277,12 +267,7 @@ impl<'db> PromotionStore<'db> {
                 "UPDATE memory_promotions \
                     SET decided_at = ?2, decision = ?3, decision_note = ?4 \
                   WHERE id = ?1 AND decided_at IS NULL",
-                params![
-                    id,
-                    now_unix,
-                    PromotionDecision::Rejected.as_sql(),
-                    note
-                ],
+                params![id, now_unix, PromotionDecision::Rejected.as_sql(), note],
             )?;
             Ok(())
         })?;
@@ -294,21 +279,17 @@ fn row_to_proposal(r: &rusqlite::Row<'_>) -> rusqlite::Result<PromotionProposal>
     use crate::memory::MemoryTier;
     let from_tier = MemoryTier::parse(&r.get::<_, String>(4)?).unwrap_or(MemoryTier::Warm);
     let to_tier = MemoryTier::parse(&r.get::<_, String>(5)?).unwrap_or(MemoryTier::Warm);
-    let reason =
-        PromotionReason::parse(&r.get::<_, String>(6)?).unwrap_or(PromotionReason::Manual);
+    let reason = PromotionReason::parse(&r.get::<_, String>(6)?).unwrap_or(PromotionReason::Manual);
     let proposed_by_str = r.get::<_, String>(7)?;
     let proposed_by = match proposed_by_str.as_str() {
         "sweeper" => ProposedBy::Sweeper,
         "planner" => ProposedBy::Planner,
         _ => ProposedBy::Controller,
     };
-    let decision = r
-        .get::<_, Option<String>>(10)?
-        .as_deref()
-        .map(|s| match s {
-            "approved" => PromotionDecision::Approved,
-            _ => PromotionDecision::Rejected,
-        });
+    let decision = r.get::<_, Option<String>>(10)?.as_deref().map(|s| match s {
+        "approved" => PromotionDecision::Approved,
+        _ => PromotionDecision::Rejected,
+    });
     Ok(PromotionProposal {
         id: r.get(0)?,
         scope: r.get(1)?,
@@ -566,7 +547,11 @@ mod tests {
             .get("global", "Controller", "k")
             .unwrap()
             .unwrap();
-        assert_eq!(row.tier, MemoryTier::Warm, "rejected proposal must NOT promote");
+        assert_eq!(
+            row.tier,
+            MemoryTier::Warm,
+            "rejected proposal must NOT promote"
+        );
         let p = store.get(id).unwrap().unwrap();
         assert_eq!(p.decision, Some(PromotionDecision::Rejected));
     }
@@ -686,7 +671,11 @@ mod tests {
         let pending = store.list_pending(10).unwrap();
         let keys: Vec<_> = pending.iter().map(|p| p.key.as_str()).collect();
         assert_eq!(keys, vec!["b", "c"]);
-        assert!(pending.iter().all(|p| p.id != id_a && p.id != id_c || p.id == id_c));
+        assert!(
+            pending
+                .iter()
+                .all(|p| p.id != id_a && p.id != id_c || p.id == id_c)
+        );
     }
 
     // ---------------- ReflectionStore ----------------

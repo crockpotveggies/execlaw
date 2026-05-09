@@ -207,10 +207,7 @@ impl PluginHost {
     /// subprocess-tier plugins, plugins not yet loaded, or unknown
     /// ids. Surfaced for the admin-route dispatcher (and future
     /// plugin-introspection paths).
-    pub async fn script_plugin(
-        &self,
-        plugin_id: &str,
-    ) -> Option<execlaw_script::ScriptPlugin> {
+    pub async fn script_plugin(&self, plugin_id: &str) -> Option<execlaw_script::ScriptPlugin> {
         self.inner
             .script_plugins
             .read()
@@ -585,7 +582,10 @@ impl PluginHost {
         if let Some(plugin) = self.inner.script_plugins.write().await.remove(plugin_id) {
             let cancelled = plugin.shutdown();
             if cancelled > 0 {
-                info!(plugin_id, cancelled, "cancelled live WS subscriptions on uninstall");
+                info!(
+                    plugin_id,
+                    cancelled, "cancelled live WS subscriptions on uninstall"
+                );
             }
         }
 
@@ -647,7 +647,10 @@ impl PluginHost {
         if let Some(plugin) = self.inner.script_plugins.write().await.remove(plugin_id) {
             let cancelled = plugin.shutdown();
             if cancelled > 0 {
-                info!(plugin_id, cancelled, "cancelled live WS subscriptions on disable");
+                info!(
+                    plugin_id,
+                    cancelled, "cancelled live WS subscriptions on disable"
+                );
             }
         }
         row.enabled = false;

@@ -114,9 +114,7 @@ pub async fn route_inbound(
         }
         match crate::routes::controller_principal_id(&state.db) {
             Ok(controller_pid) => {
-                if let Err(e) =
-                    pg_store.add_member(&principal_group_id, &controller_pid, now)
-                {
+                if let Err(e) = pg_store.add_member(&principal_group_id, &controller_pid, now) {
                     tracing::warn!(
                         target: "generic_inbound",
                         error = %e,

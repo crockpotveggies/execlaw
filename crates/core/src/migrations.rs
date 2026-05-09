@@ -321,12 +321,11 @@ impl<'a> MigrationRunner<'a> {
     /// meaningful ways (a column was renamed, a table dropped),
     /// this is the wrong tool — write a follow-up migration instead.
     pub fn repair_checksum(&self, id: u32) -> Result<bool, MigrationError> {
-        let migration = MIGRATIONS
-            .iter()
-            .find(|m| m.id == id)
-            .ok_or_else(|| MigrationError::Db(DbError::Migration(format!(
+        let migration = MIGRATIONS.iter().find(|m| m.id == id).ok_or_else(|| {
+            MigrationError::Db(DbError::Migration(format!(
                 "no embedded migration with id {id}"
-            ))))?;
+            )))
+        })?;
         let new_checksum = simple_checksum(migration.sql);
         let updated: usize = self.db.with_conn(|c| {
             let n = c.execute(
@@ -824,7 +823,10 @@ mod tests {
         let patched = runner.repair_checksum(35).unwrap();
         assert!(patched, "row for id 35 must exist post-apply_all");
         let next = runner.apply_all().unwrap();
-        assert!(next.is_empty(), "no migrations should re-apply after repair");
+        assert!(
+            next.is_empty(),
+            "no migrations should re-apply after repair"
+        );
     }
 
     #[test]

@@ -1,0 +1,119 @@
+name: CI
+
+# Compile + run tests on every push and every pull request, across the
+# four supported targets:
+#
+#   x86_64-unknown-linux-gnu      — ubuntu-latest
+#   x86_64-pc-windows-msvc        — windows-latest
+#   x86_64-apple-darwin           — macos-13
+#   aarch64-apple-darwin          — macos-14 (Apple Silicon runners)
+#
+# Default Cargo features (plaintext SQLite) are used so the matrix
+# builds cleanly without needing Strawberry Perl on Windows. The
+# production SQLCipher path is exercised by the release pipeline,
+# not the per-push CI.
+#
+# Docker-dependent integration tests (`runner_e2e_docker.rs`) are
+# opt-in via `EXECLAW_E2E_DOCKER=1` and stay off in this workflow —
+# GitHub-hosted runners don't have a usable Docker daemon on macOS or
+# Windows.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+# Cancel any in-flight run for the same ref when a fresh push lands —
+# saves CI minutes during rapid pushes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Pin a recent stable. The README documents MSRV 1.85+ (edition
+  # 2024); CI pins one revision higher to surface any post-edition
+  # regression early.
+  RUST_TOOLCHAIN: "1.85"
+
+jobs:
+  rust:
+    name: rust / ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo build --workspace
+        run: cargo build --workspace --locked
+
+      - name: cargo clippy --workspace
+        # `-D warnings` would break on existing warnings the workspace
+        # already carries (mcp_http_client dead_code, voice-pipeline
+        # unused_assignments). Tighten this to `-D warnings` once those
+        # are scrubbed; for now we treat clippy as advisory.
+        run: cargo clippy --workspace --all-targets
+
+      - name: cargo test --workspace
+        # `--no-fail-fast` keeps the run going past the first failure so
+        # the report shows everything broken, not just the first.
+        run: cargo test --workspace --locked --no-fail-fast
+
+  spa:
+    name: spa
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      - name: typecheck
+        run: npm run lint
+
+      - name: vitest
+        run: npm test
+
+      - name: build
+        run: npm run build
+
+      - name: bundle-size budget
+        run: npm run size

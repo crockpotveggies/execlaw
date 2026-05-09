@@ -14,7 +14,7 @@ Relationship to other docs:
 
 ## 1. One-paragraph pitch
 
-**execlaw is a deterministic state machine over an append-only SQLite event log that occasionally calls an LLM.** The LLM is the interesting but *replaceable* part. The durability, policy, and isolation around it are the product. Everything runs on the operator's hardware (no cloud LLMs, ever). The control plane is a single Docker container; the runner is a per-conversation Docker container; inference backends (vLLM, Whisper, Kokoro) are separate local service containers. Plugins extend the system via a WordPress-style hook framework loaded from ZIP uploads.
+**execlaw is a deterministic state machine over an append-only SQLite event log that occasionally calls an LLM.** The LLM is the interesting but *replaceable* part. The durability, policy, and isolation around it are the product. Everything runs on the operator's hardware (no cloud LLMs, ever). The control plane is a single native binary that registers as a host service (systemd / launchd / Windows SCM); the per-conversation runner is a Docker container the control plane spawns; inference backends (vLLM, Whisper, Kokoro) are separate local service containers. Plugins extend the system via a WordPress-style hook framework loaded from ZIP uploads.
 
 ---
 
@@ -32,8 +32,8 @@ From `MIGRATION_PLAN.md` §0 — restated here so this doc stands alone:
 8. **Participant-aware, trust-class-scoped.**
 9. **Rule of Two** for untrusted turns.
 10. **Sideband HITL** via a different transport than the one that introduced untrusted content.
-11. **Portable control-plane container** — deployment artifact is a container image.
-12. **Minimal containers** — every image ships only what its single job requires.
+11. **Native control-plane binary** — deployment artifact is a per-OS native binary registered as a host service via the `service-manager` crate (systemd on Linux, launchd on macOS, Service Control Manager on Windows). No Docker image for the control plane.
+12. **Minimal containers** — every container image execlaw spawns (per-conversation runner, inference backends, plugin sidecars) ships only what its single job requires.
 
 The rest of this document is these principles made concrete.
 
@@ -46,11 +46,13 @@ The rest of this document is these principles made concrete.
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                                                                             │
 │   ┌──────────────┐   HTTP+WS    ┌───────────────────────────────────────┐   │
-│   │              │ ◀──────────▶ │  control-plane container              │   │
-│   │   Chat UI    │   (JWT)      │  (Rust binary + CA certs + pci.ids)   │   │
-│   │   (SPA)      │              │                                        │   │
-│   │              │              │  axum server  event log  scheduler    │   │
-│   └──────────────┘              │  ┌──────────┐ ┌─────────┐ ┌─────────┐ │   │
+│   │              │ ◀──────────▶ │  execlaw control plane                │   │
+│   │   Chat UI    │   (JWT)      │  (native binary registered as a       │   │
+│   │   (SPA)      │              │   host service via service-manager:   │   │
+│   │              │              │   systemd / launchd / Windows SCM)    │   │
+│   └──────────────┘              │                                        │   │
+│                                 │  axum server  event log  scheduler    │   │
+│                                 │  ┌──────────┐ ┌─────────┐ ┌─────────┐ │   │
 │                                 │  │ REST/WS  │ │ SQLite  │ │ wakeup  │ │   │
 │                                 │  │ + OpenAPI│ │ SQLCipher│ │ queue  │ │   │
 │                                 │  │ + AsyncAPI│ └─────────┘ └─────────┘ │   │
@@ -104,7 +106,7 @@ Every arrow is local IPC or loopback HTTP. Nothing in the default path reaches t
 
 ## 4. Actors and responsibilities
 
-### 4.1 Control plane (one container, Rust binary)
+### 4.1 Control plane (single native binary, host service)
 
 The coordinator. Owns:
 
@@ -112,12 +114,12 @@ The coordinator. Owns:
 - **Scheduler** — priority queue for wakeups, sub-second precision.
 - **Policy engine** — capability tokens, trust resolution, Rule of Two, input guards.
 - **Plugin host** — manifest parsing, ZIP install, hook registry.
-- **Container manager** — bollard client wrapping all Docker operations; hardware profile.
+- **Container manager** — bollard client wrapping all Docker operations the control plane delegates *out* (per-conversation runner spawns, plugin sidecars, inference services).
 - **Outbox relay** — drains `state_outbox` to transport plugins with idempotency.
 - **Axum server** — REST + WebSocket surface for UI and plugins.
 - **Vault** — SQLCipher-encrypted secrets; master key from OS keyring.
 
-Minimal image: Rust binary + `libssl` + CA certs + embedded `pci.ids` database. No CUDA, no OpenVINO, no Python, no vendor SDKs. Runs as `nobody`, read-only root filesystem.
+Deployed as a per-OS native binary (one of `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `x86_64-apple-darwin`, `aarch64-apple-darwin`). The `service-manager` crate registers it as a host service — systemd unit on Linux, launchd plist on macOS, Service Control Manager entry on Windows. State lives at `~/.execlaw/` (SQLite DB, master key, per-plugin sidecar volumes). No Docker image for the control plane itself; `execlaw install` migrates the DB, registers the service, and starts it.
 
 ### 4.2 Runner (one container *per active conversation*)
 
@@ -725,7 +727,7 @@ Sub-runners have a narrower tool set (`search_web`, `fetch_url`, `read_pdf`, `de
 |---|---|---|
 | **User cancels mid-turn** | Runner closes SSE stream; cancellation `tool_result`s committed for open `tool_use`s; phase → `Idle` | Pairing invariant enforcement |
 | **Runner crash** (OOM, panic, docker kill) | Bollard event detected; cancellation results committed; new runner spawns and hydrates | Pairing invariant + stateless runners + respawn |
-| **Control plane restart** (compose down/up, upgrade) | Scan `state_conversations` for stale leases; cancellation for dangling `tool_use`; phase → `Idle`; scheduler picks up pending wakeups | Lease expiry + pairing invariant + event log as source of truth |
+| **Control plane restart** (`execlaw service restart`, OS reboot, deploy) | Scan `state_conversations` for stale leases; cancellation for dangling `tool_use`; phase → `Idle`; scheduler picks up pending wakeups | Lease expiry + pairing invariant + event log as source of truth |
 | **Host power loss** | SQLite WAL replay restores last committed state; same flow as control-plane restart. Outbox rows in `in_flight` retry on startup | SQLite atomicity + outbox idempotency + inbox dedup |
 | **Transport drop** | Transport plugin reconnects, resumes inbound poll from `transport_cursors.cursor_value`; inbox dedup absorbs duplicates | Stable `(plugin_id, source_event_id)` dedup at ingress |
 | **External API timeout** (we don't know if send landed) | Outbox row stays `in_flight`; retry uses same idempotency key; consumer-side inbox returns stored delivery ID; mark success | Framework-minted idempotency + consumer inbox |
@@ -838,7 +840,7 @@ These are *not* oversights — they are chosen constraints:
 - **Multi-agent by default — with exception for research.** Default is single-threaded. Sub-agents are endorsed for guardrails, research fan-out, and deep escalation; never for untrusted conversations.
 - **Hosted plugin registries.** Plugins install via ZIP upload. No central index, no `cargo install`-style package manager for plugins.
 - **Complex observability stack.** No OpenTelemetry, Langfuse, Phoenix. JSONL + SQLite, same as selfhosted-claw.
-- **Distributed operation.** Single host. SQLite is enough; the whole thing runs in one `docker compose up`.
+- **Distributed operation.** Single host. SQLite is enough; the control plane runs as one host service, the runner + inference + plugin sidecars are local containers it spawns over the host's Docker socket.
 
 ---
 

@@ -1403,10 +1403,8 @@ fn register_host_cap_bindings(
                     Ok(h) => h,
                     Err(e) => {
                         return Err(Box::new(EvalAltResult::ErrorRuntime(
-                            format!(
-                                "[{pid}] host_route_inbound_spawn: no tokio runtime: {e}"
-                            )
-                            .into(),
+                            format!("[{pid}] host_route_inbound_spawn: no tokio runtime: {e}")
+                                .into(),
                             rhai::Position::NONE,
                         )));
                     }

@@ -228,10 +228,7 @@ impl<'db> PrincipalStore<'db> {
     /// higher-trust principal that owns the same handle). Returns
     /// matches in stable id order so the caller can dedupe
     /// deterministically.
-    pub fn find_all_by_identifier(
-        &self,
-        ident: &Identifier,
-    ) -> Result<Vec<Principal>, DbError> {
+    pub fn find_all_by_identifier(&self, ident: &Identifier) -> Result<Vec<Principal>, DbError> {
         let all = self.list_all()?;
         Ok(all
             .into_iter()

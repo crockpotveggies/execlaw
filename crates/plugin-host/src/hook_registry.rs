@@ -500,11 +500,7 @@ impl HookRegistry {
                         image: s.image.clone(),
                         rpc_port: b.rpc_port,
                         rpc_health_path: b.rpc_health_path.clone(),
-                        env: s
-                            .env
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
+                        env: s.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                         mounts: s.mounts.clone(),
                         entrypoint: s.entrypoint.clone(),
                         stage_path: stage_path.map(|p| p.to_path_buf()),

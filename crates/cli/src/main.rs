@@ -1579,8 +1579,7 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     // ...)` directly. No TransportApi adapter layer.
     let host_transports = {
         let mut reg = execlaw_server::transport_registry::HostTransportRegistry::new();
-        const SIGNAL_MANIFEST: &str =
-            include_str!("../../../plugins/signal/plugin.toml");
+        const SIGNAL_MANIFEST: &str = include_str!("../../../plugins/signal/plugin.toml");
         let signal_icon = execlaw_plugin_sdk::manifest::PluginManifest::parse(SIGNAL_MANIFEST)
             .ok()
             .and_then(|m| m.transport.and_then(|t| t.icon))
@@ -1592,13 +1591,11 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                 icon: signal_icon,
             },
         );
-        const WHATSAPP_MANIFEST: &str =
-            include_str!("../../../plugins/whatsapp/plugin.toml");
-        let whatsapp_icon =
-            execlaw_plugin_sdk::manifest::PluginManifest::parse(WHATSAPP_MANIFEST)
-                .ok()
-                .and_then(|m| m.transport.and_then(|t| t.icon))
-                .unwrap_or_else(|| "whatsapp".to_owned());
+        const WHATSAPP_MANIFEST: &str = include_str!("../../../plugins/whatsapp/plugin.toml");
+        let whatsapp_icon = execlaw_plugin_sdk::manifest::PluginManifest::parse(WHATSAPP_MANIFEST)
+            .ok()
+            .and_then(|m| m.transport.and_then(|t| t.icon))
+            .unwrap_or_else(|| "whatsapp".to_owned());
         reg.register(
             "whatsapp",
             execlaw_server::transport_registry::ChannelInfo {
@@ -1606,8 +1603,7 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                 icon: whatsapp_icon,
             },
         );
-        const SLACK_MANIFEST: &str =
-            include_str!("../../../plugins/slack/plugin.toml");
+        const SLACK_MANIFEST: &str = include_str!("../../../plugins/slack/plugin.toml");
         let slack_icon = execlaw_plugin_sdk::manifest::PluginManifest::parse(SLACK_MANIFEST)
             .ok()
             .and_then(|m| m.transport.and_then(|t| t.icon))
@@ -1619,8 +1615,7 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                 icon: slack_icon,
             },
         );
-        const SMS_SOCKET_MANIFEST: &str =
-            include_str!("../../../plugins/sms-socket/plugin.toml");
+        const SMS_SOCKET_MANIFEST: &str = include_str!("../../../plugins/sms-socket/plugin.toml");
         let sms_socket_icon =
             execlaw_plugin_sdk::manifest::PluginManifest::parse(SMS_SOCKET_MANIFEST)
                 .ok()
@@ -1699,14 +1694,10 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     // returning real results from this call onward; before this
     // they error cleanly with "host capabilities not wired."
     {
-        let caps = execlaw_server::host_caps_impl::AppStateHostCapabilities::new(
-            state.clone(),
-        )
-        .into_arc();
+        let caps =
+            execlaw_server::host_caps_impl::AppStateHostCapabilities::new(state.clone()).into_arc();
         if state.plugin_host.attach_host_capabilities(caps).is_err() {
-            tracing::warn!(
-                "host_caps already attached — second wiring call ignored"
-            );
+            tracing::warn!("host_caps already attached — second wiring call ignored");
         } else {
             tracing::info!("script-tier host capabilities attached");
         }

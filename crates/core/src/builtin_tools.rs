@@ -2187,13 +2187,12 @@ impl McpListServersTool {
         Self {
             descriptor: ToolDescriptor {
                 name: "mcp_list_servers".into(),
-                description:
-                    "List every configured MCP server. Use BEFORE proposing a new \
+                description: "List every configured MCP server. Use BEFORE proposing a new \
                      `mcp_add_server` call so you don't double-add a server the \
                      operator already wired up. Returns a list of {id, display_name, \
                      transport, url, command, enabled, status, last_error, tool_count} \
                      per server."
-                        .into(),
+                    .into(),
                 schema: json!({
                     "type": "object",
                     "properties": {},
@@ -2247,8 +2246,7 @@ impl McpAddServerTool {
         Self {
             descriptor: ToolDescriptor {
                 name: "mcp_add_server".into(),
-                description:
-                    "Add and immediately connect a new MCP server. Use this when the \
+                description: "Add and immediately connect a new MCP server. Use this when the \
                      user asks the agent to integrate / install / wire up an MCP \
                      server (e.g. \"agent, integrate the Atlassian MCP server\").\n\n\
                      CONNECT MODEL: only `streamable_http` is supported here — agent \
@@ -2267,7 +2265,7 @@ impl McpAddServerTool {
                      trailing hyphen. After the call returns, the server's tools \
                      auto-flow into your tool catalog as `mcp:<id>:<name>` — you \
                      can call them on the next turn without further setup."
-                        .into(),
+                    .into(),
                 schema: json!({
                     "type": "object",
                     "properties": {
@@ -2363,14 +2361,13 @@ impl McpRemoveServerTool {
         Self {
             descriptor: ToolDescriptor {
                 name: "mcp_remove_server".into(),
-                description:
-                    "Remove a configured MCP server. Stops the connection actor, \
+                description: "Remove a configured MCP server. Stops the connection actor, \
                      drops the row from `state_mcp_servers`, marks every \
                      `mcp:<id>:*` tool removed in your catalog. Idempotent — \
                      removing a non-existent id returns NotFound. Ask the user \
                      for confirmation before calling this; uninstalls are not \
                      reversible (they have to re-add the server)."
-                        .into(),
+                    .into(),
                 schema: json!({
                     "type": "object",
                     "properties": {
@@ -2828,10 +2825,7 @@ mod tests {
         let tool = ListMemoryTool::new();
         let ctx = build_ctx(&db, cid, "Controller", false, true);
         let out = tool
-            .invoke(
-                ctx,
-                json!({"scope": "global", "prefix": "pref_"}),
-            )
+            .invoke(ctx, json!({"scope": "global", "prefix": "pref_"}))
             .await;
         match out {
             ToolOutcome::Ok(v) => {
@@ -2929,7 +2923,10 @@ mod tests {
             .invoke(ctx, json!({"scope": "global", "key": "tracked"}))
             .await;
 
-        let row = store.get("global", "Controller", "tracked").unwrap().unwrap();
+        let row = store
+            .get("global", "Controller", "tracked")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.hits, 1, "successful read must bump hits");
         assert!(row.last_used_at.is_some(), "must stamp last_used_at");
     }
