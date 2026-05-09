@@ -37,7 +37,7 @@ authors = ["Justin Long <justinelgenlong@gmail.com>"]
 
 [workspace.dependencies]
 # --- async runtime ---
-tokio = { version = "1.47", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 # CancellationToken (in tokio_util::sync) is enabled by default —
 # no extra feature flag needed beyond the base crate.
