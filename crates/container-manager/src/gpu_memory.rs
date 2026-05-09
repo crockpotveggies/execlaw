@@ -59,7 +59,7 @@ pub fn nvidia_memory_mb_via_nvml() -> Vec<u64> {
 ///
 /// The registry layout we read:
 ///
-/// ```
+/// ```text
 /// HKLM\SYSTEM\CurrentControlSet\Control\Class\
 ///     {4d36e968-e325-11ce-bfc1-08002be10318}\<index>\
 ///     HardwareInformation.qwMemorySize        REG_QWORD (bytes)
