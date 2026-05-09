@@ -1,0 +1,20 @@
+[package]
+name = "execlaw-transport-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Traits transports implement (receive, send, identify)."
+
+[dependencies]
+execlaw-core = { path = "../core" }
+async-trait.workspace = true
+serde.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

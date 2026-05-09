@@ -1,0 +1,2088 @@
+// execlaw SPA theme.
+//
+// Subtle dark default per the 2026-04-25 UX decisions. Bootstrap's
+// dark theme provides the base palette; we override a few tokens to
+// pull the page background a notch darker (closer to GitHub Dark)
+// so the chat surface "breathes" against the sidebar.
+
+@use "sass:color";
+
+// ---- Brand tokens --------------------------------------------------
+$bg-deep:        #0d1117;
+$bg-surface:     #161b22;
+$bg-elev:        #1f2630;
+// `$border-subtle` is kept as a token for the few places we still use
+// a 1px line (composer input focus, tab indicator) but the goal of
+// the Phase 14.D redesign is to eliminate explicit borders from
+// cards, badges, panels, and the sidebar in favour of background
+// fill + soft drop-shadow + spacing for hierarchy. Treat any
+// remaining `border:` declaration as a deliberate exception, not the
+// default.
+$border-subtle:  #30363d;
+$text-primary:   #e6edf3;
+$text-muted:     #7d8590;
+$accent:         #4493f8;     // controller-thread blue
+$success:        #3fb950;
+$warning:        #d29922;
+$danger:         #f85149;
+
+// ---- Geometry tokens ----------------------------------------------
+// Floating-sidebar gutter: distance from each viewport edge to the
+// sidebar card's corresponding edge. Mirrors the Hanaoka reference's
+// 2rem inset; a touch tighter so we don't lose horizontal space on
+// 13" laptops.
+$shell-gutter:   1.5rem;
+// Width of the floating sidebar (excluding its gutter on either
+// side).
+$sidebar-width:  16rem;
+// Total horizontal offset the main pane needs to clear the sidebar
+// (sidebar-width + 2× gutter so there's air both inside the page
+// edge AND between sidebar + content).
+$main-offset:    calc(#{$sidebar-width} + #{$shell-gutter} * 2);
+$radius-card:    1rem;     // 16 px — sidebar wrapper, dialogs
+// 2026-04-30 — `$radius-md` was referenced by the card primitive
+// (`.execlaw-card-task` wrapper + its `__error` inline block) but
+// never defined; production `npm run build` failed with
+// "Undefined variable" for ~5 days. Added here to land the
+// intended in-between rounding (12 px is the standard intermediate
+// between pill 8 px and card 16 px). The card-task wrapper isn't a
+// sidebar (would want $radius-card) and isn't a button (would want
+// $radius-pill) — soft 12 px reads cleanly for both.
+$radius-md:      0.75rem;  // 12 px — card-task wrapper, inline errors
+$radius-pill:    0.5rem;   // 8 px — nav items, buttons, inputs
+// 2026-04-28 — chat thread column max-width. Matches ChatGPT's
+// `--max-thread-content-width: 48rem` so message + composer line
+// up at a consistent 768 px column on wide displays. Smaller
+// viewports fall back to 100% naturally via `max-width`.
+$thread-max-width: 48rem;
+$shadow-float:   0 0.75rem 2.5rem rgba(0, 0, 0, 0.45);
+$shadow-soft:    0 0.25rem 0.75rem rgba(0, 0, 0, 0.25);
+
+// Bootstrap variable overrides (must come before bootstrap import).
+$body-bg:                 $bg-deep;
+$body-color:              $text-primary;
+$body-secondary-bg:       $bg-surface;
+$body-tertiary-bg:        $bg-elev;
+$border-color:            $border-subtle;
+$primary:                 $accent;
+
+// Type — slightly tighter line-height than Bootstrap default for
+// chat density without sacrificing readability.
+//
+// 2026-04-29 — typography split:
+//   * `$font-system` (system stack) — sidebar, brand mark, badges,
+//     dense chrome where the OS font's tighter rhythm reads better.
+//   * `$font-body` (IBM Plex Sans, self-hosted via @fontsource) —
+//     chat body (agent + user bubbles) and chat / page titles.
+//     Imported in `main.tsx`. Fall back to the system stack if the
+//     woff2 fails to load.
+$font-system: -apple-system, BlinkMacSystemFont, "Segoe UI",
+              Roboto, "Helvetica Neue", Arial, sans-serif;
+$font-body:   "IBM Plex Sans", #{$font-system};
+// Bootstrap's $font-family-sans-serif drives the body default.
+// Keep the system stack here so global controls (forms, buttons,
+// non-chat pages) don't all jump to the body font; we opt-in per
+// surface further down.
+$font-family-sans-serif: $font-system;
+$font-size-base:         0.95rem;
+$line-height-base:       1.5;
+
+// ---- Bootstrap + icon set -----------------------------------------
+@import "bootstrap/scss/bootstrap";
+@import "bootstrap-icons/font/bootstrap-icons.css";
+
+// ---- Global Bootstrap flattening (Phase 14.D) ---------------------
+//
+// We keep Bootstrap's components but strip their default 1 px
+// borders so they fit the no-border house style. Inputs lift via
+// `$bg-elev` background + an accent box-shadow on focus instead of
+// a border colour shift. Outline buttons become text-buttons with
+// hover background. Modals use the same surface colour as cards
+// instead of a separately-bordered dialog.
+.form-control,
+.form-select {
+    background-color: $bg-elev;
+    color: $text-primary;
+    border-color: transparent;
+    border-radius: $radius-pill;
+
+    &:focus {
+        background-color: $bg-elev;
+        color: $text-primary;
+        border-color: transparent;
+        box-shadow: 0 0 0 2px rgba($accent, 0.35);
+    }
+
+    &:disabled,
+    &[readonly] {
+        background-color: $bg-surface;
+    }
+}
+
+.input-group .form-control,
+.input-group .form-select,
+.input-group .btn {
+    border: 0;
+}
+
+.btn {
+    border-radius: $radius-pill;
+}
+
+// Outline-style buttons get a flat treatment: no resting outline,
+// background tint on hover. The accent / success / warning / danger
+// colour comes from the text only.
+.btn-outline-primary,
+.btn-outline-secondary,
+.btn-outline-success,
+.btn-outline-warning,
+.btn-outline-danger {
+    border-color: transparent;
+    background-color: transparent;
+
+    &:hover,
+    &:focus,
+    &:active {
+        border-color: transparent;
+    }
+}
+
+.btn-outline-primary {
+    color: color.adjust($accent, $lightness: 12%);
+    &:hover { background-color: rgba($accent, 0.12); color: color.adjust($accent, $lightness: 18%); }
+}
+.btn-outline-secondary {
+    color: $text-muted;
+    &:hover { background-color: $bg-surface; color: $text-primary; }
+}
+.btn-outline-success {
+    color: color.adjust($success, $lightness: 6%);
+    &:hover { background-color: rgba($success, 0.12); }
+}
+.btn-outline-warning {
+    color: color.adjust($warning, $lightness: 6%);
+    &:hover { background-color: rgba($warning, 0.12); }
+}
+.btn-outline-danger {
+    color: color.adjust($danger, $lightness: 6%);
+    &:hover { background-color: rgba($danger, 0.12); }
+}
+
+.modal-content {
+    background-color: $bg-surface;
+    color: $text-primary;
+    border: 0;
+    border-radius: $radius-card;
+    box-shadow: $shadow-float;
+}
+
+.modal-header,
+.modal-footer {
+    border: 0;
+}
+
+// Bootstrap dropdown menus borrow the same surface contract.
+.dropdown-menu {
+    background-color: $bg-surface;
+    border: 0;
+    border-radius: $radius-pill;
+    box-shadow: $shadow-soft;
+}
+
+// Cards rendered via vanilla Bootstrap (rare, but possible from
+// plugin panels) get the same flat treatment.
+.card {
+    background-color: $bg-surface;
+    border: 0;
+    border-radius: $radius-pill;
+}
+
+// ---- App-level tweaks ---------------------------------------------
+html, body, #root {
+    height: 100%;
+}
+
+// Bootstrap's `[data-bs-theme=dark]` rule (which `index.html` opts
+// into) re-defines `--bs-body-bg`, `--bs-body-color`, etc. to its
+// stock dark palette (`#212529` etc.). That override has higher
+// CSS specificity than the `:root` declarations Bootstrap emits
+// from our SCSS `$body-bg` override, so by default body bg
+// rendered as `#212529` while `.execlaw-main` rendered as
+// `$bg-deep` (`#0d1117`) — visible as a slightly-bluish margin
+// around the floating sidebar that didn't match the chat or
+// settings panes. We re-pin every dark-theme custom property to
+// our token palette so the body and inner panes share one
+// background.
+[data-bs-theme="dark"] {
+    --bs-body-bg: #{$bg-deep};
+    --bs-body-bg-rgb: 13, 17, 23;
+    --bs-body-color: #{$text-primary};
+    --bs-secondary-bg: #{$bg-surface};
+    --bs-secondary-bg-rgb: 22, 27, 34;
+    --bs-tertiary-bg: #{$bg-elev};
+    --bs-tertiary-bg-rgb: 31, 38, 48;
+    --bs-border-color: #{$border-subtle};
+}
+
+body {
+    overflow: hidden;          // chat shell owns its own scroll
+    // Defensive — match the explicit token even on browsers that
+    // ignore the dark-theme attribute (e.g. tests with no
+    // <html data-bs-theme="dark">).
+    background-color: $bg-deep;
+}
+
+// Centered shell used by setup + login screens.
+.execlaw-auth-shell {
+    min-height: 100vh;
+    display: flex;
+    // Top-aligned with vertical scroll so a tall wizard step (e.g.
+    // the backend picker with model dropdown + serving choice) can
+    // grow past the viewport instead of overflowing off-screen with
+    // no way to reach the buttons below.
+    align-items: flex-start;
+    justify-content: center;
+    padding: 3rem 1.5rem;
+    overflow-y: auto;
+}
+
+.execlaw-auth-card {
+    width: 100%;
+    // Wizard steps with model lists + multiple form rows want a
+    // little more horizontal room than the original 28rem login
+    // card. 32rem stays mobile-friendly while letting the dropdowns
+    // breathe.
+    max-width: 32rem;
+    background-color: $bg-surface;
+    border-radius: $radius-card;
+    box-shadow: $shadow-soft;
+    padding: 2rem;
+    margin: auto 0;
+}
+
+// Setup wizard timeline indicator (Phase 14).
+//
+// Three-step horizontal stepper with circle markers connected by
+// short lines, mirroring the Microsoft 365 onboarding pattern.
+// Upcoming = open circle, current = filled accent, done = filled
+// success with checkmark.
+.execlaw-stepper {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.25rem;
+    margin: 0.25rem 0 1.5rem;
+}
+
+.execlaw-stepper__step {
+    flex: 1 1 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    position: relative;
+    min-width: 0;
+}
+
+.execlaw-stepper__circle {
+    width: 1.75rem;
+    height: 1.75rem;
+    border-radius: 50%;
+    background-color: $bg-elev;
+    color: $text-muted;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.85rem;
+    font-weight: 600;
+    transition: border-color 200ms ease, background-color 200ms ease,
+        color 200ms ease;
+    flex: 0 0 auto;
+}
+
+.execlaw-stepper__step.is-current .execlaw-stepper__circle {
+    border-color: $primary;
+    background-color: $primary;
+    color: #fff;
+}
+
+.execlaw-stepper__step.is-done .execlaw-stepper__circle {
+    border-color: $success;
+    background-color: $success;
+    color: #0d1117;
+}
+
+.execlaw-stepper__label {
+    margin-top: 0.4rem;
+    font-size: 0.75rem;
+    color: $text-muted;
+    line-height: 1.2;
+    word-break: break-word;
+}
+
+.execlaw-stepper__step.is-current .execlaw-stepper__label {
+    color: $text-primary;
+    font-weight: 600;
+}
+
+.execlaw-stepper__step.is-done .execlaw-stepper__label {
+    color: $text-primary;
+}
+
+// Connector line lives on the step itself as an absolutely-positioned
+// pseudo-element so it spans across the gap to the next circle. We
+// skip it on the last step.
+.execlaw-stepper__step::after {
+    content: "";
+    position: absolute;
+    top: calc(0.875rem - 1px);
+    left: calc(50% + 1.05rem);
+    right: calc(-50% + 1.05rem);
+    height: 2px;
+    background-color: $border-subtle;
+    z-index: 0;
+}
+
+.execlaw-stepper__step:last-child::after {
+    display: none;
+}
+
+.execlaw-stepper__step.is-done::after {
+    background-color: $success;
+}
+
+// Keep the circle above the connector line.
+.execlaw-stepper__circle {
+    position: relative;
+    z-index: 1;
+}
+
+.execlaw-brand {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    color: $text-primary;
+}
+
+.execlaw-muted {
+    color: $text-muted;
+}
+
+// Form-error banner used by setup wizard / login.
+.execlaw-error-banner {
+    background-color: rgba($danger, 0.16);
+    color: color.adjust($danger, $lightness: 10%);
+    padding: 0.625rem 0.875rem;
+    border-radius: $radius-pill;
+    font-size: 0.875rem;
+}
+
+// ---- Chat shell ---------------------------------------------------
+.execlaw-shell {
+    display: flex;
+    height: 100vh;
+    width: 100%;
+}
+
+// Phase 14.D — floating sidebar.
+//
+// The sidebar lives outside the document flow as a fixed card
+// inset on three sides (top/left/bottom), separated from the main
+// pane by `$shell-gutter` of empty body background. No border
+// lines anywhere — separation comes from the surface-color
+// contrast + a soft drop-shadow.
+//
+// The brand sits at the top, navigation in the middle, and the
+// user/sign-out chip at the bottom. Internal regions are divided
+// by spacing alone, NOT border lines.
+.execlaw-sidebar {
+    position: fixed;
+    top: $shell-gutter;
+    left: $shell-gutter;
+    bottom: $shell-gutter;
+    width: $sidebar-width;
+    background-color: $bg-surface;
+    border-radius: $radius-card;
+    // No drop-shadow. Sidebar separation comes purely from the
+    // `$bg-surface` vs `$bg-deep` colour contrast + the rounded
+    // corners — keeping the surface flat against the body avoids
+    // the subtle haloing the float-shadow used to cast on the
+    // surrounding margin.
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    z-index: 10;
+    overflow: hidden;          // child scrolls live inside __threads
+}
+
+.execlaw-sidebar__head {
+    padding: 1.1rem 1rem 0.75rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+// Inline status pip rendered next to the `execlaw` wordmark. Default
+// state is a small green dot; flips to an alert-triangle when there
+// are firing alerts (clickable, links to /settings/alerts), and to a
+// wifi-off glyph when the SPA has lost its connection to the control
+// plane. Sized to feel like a piece of the wordmark — not a button.
+.execlaw-brand-status {
+    flex: 0 0 auto;
+    width: 0.48rem;
+    height: 0.48rem;
+    border-radius: 999px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+    text-decoration: none;
+
+    &.is-ok {
+        background-color: $success;
+        box-shadow: 0 0 6px rgba($success, 0.55);
+    }
+
+    // Alert + disconnected variants render an icon glyph, so we
+    // expand the box past the 0.6rem dot footprint and drop the
+    // background fill — the icon does the visual work.
+    &.is-alert,
+    &.is-disconnected {
+        width: auto;
+        height: auto;
+        background-color: transparent;
+        box-shadow: none;
+        font-size: 0.95rem;
+    }
+
+    &.is-alert {
+        color: $danger;
+        // Pulse so it catches the eye without being noisy.
+        animation: execlaw-brand-status-pulse 1.6s ease-in-out infinite;
+        &:hover { color: color.adjust($danger, $lightness: 6%); }
+    }
+
+    &.is-disconnected {
+        color: $warning;
+    }
+}
+
+@keyframes execlaw-brand-status-pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.55; }
+}
+
+.execlaw-sidebar__nav {
+    padding: 0.25rem 0.5rem;
+}
+
+.execlaw-sidebar__threads {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 0 0.5rem 1rem;
+    min-height: 0;
+}
+
+.execlaw-sidebar__foot {
+    padding: 0.75rem 1rem 1rem;
+    color: $text-muted;
+    // 2026-04-28 — was 0.85rem.
+    font-size: 0.75rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+// Mobile fallback. Below 768 px the sidebar would eat too much
+// width; collapse it for now (a proper bottom-bar rendering can
+// land later if mobile becomes a real target). Setting `display:
+// none` is deliberate — the chat shell's `flex` layout still
+// works, the main pane just gets the full viewport.
+@media (max-width: 767.98px) {
+    .execlaw-sidebar {
+        display: none;
+    }
+}
+
+// Small uppercase-tracking-widest section label inside the
+// sidebar — "Browse" on the reference site. Render as
+// `<div class="execlaw-sidebar__section">Threads</div>` etc.
+.execlaw-sidebar__section {
+    // 2026-04-28 — was 0.7rem; tightened to keep the visual rhythm
+    // when thread rows shrank to 0.8rem.
+    font-size: 0.6rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: $text-muted;
+    padding: 0.5rem 0.85rem 0.25rem;
+}
+
+.execlaw-thread-item {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    width: 100%;
+    border: none;
+    background: transparent;
+    color: $text-primary;
+    text-align: left;
+    // 2026-04-28 — tighter vertical rhythm. Sidebar previously
+    // padded each row to 0.5rem top+bottom which made even short
+    // lists scroll on a laptop screen. 0.3rem keeps the pill
+    // affordance without wasting space.
+    padding: 0.3rem 0.7rem;
+    border-radius: $radius-pill;
+    // 2026-04-28 — reduced from 0.9rem so the sidebar list reads
+    // as secondary chrome rather than competing with the chat
+    // pane's body text.
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: background-color 0.12s ease, color 0.12s ease;
+    // The class is used on <button>, <div>, AND <a> (NavLink) elements.
+    // Without these rules, anchors render with the default browser
+    // underline + link color, which looks broken next to the buttons.
+    text-decoration: none;
+
+    &:hover,
+    &:focus,
+    &:visited,
+    &:active {
+        color: $text-primary;
+        text-decoration: none;
+    }
+
+    &:hover {
+        background-color: $bg-elev;
+    }
+
+    &.is-active {
+        background-color: rgba($accent, 0.15);
+        color: color.adjust($accent, $lightness: 18%);
+
+        // Re-assert active color over the link pseudo-classes above so
+        // the highlight doesn't get reset back to $text-primary.
+        &:hover,
+        &:focus,
+        &:visited,
+        &:active {
+            color: color.adjust($accent, $lightness: 18%);
+        }
+    }
+}
+
+.execlaw-thread-item__name {
+    flex: 1 1 auto;
+    // `min-width: 0` is the hidden contract of flex children that
+    // need to ellipsis-truncate. Without it the auto min-width
+    // (intrinsic content size) fights against `overflow: hidden`
+    // and the row line-wraps when the title gets long.
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.execlaw-thread-item__icon {
+    flex: 0 0 auto;
+    width: 0.7rem;
+    height: 0.7rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+// 2026-04-28 — per-thread hover-revealed actions. The 3-dot button
+// sits inside `.execlaw-thread-item` (only on thread rows, not the
+// nav link rows) and is hidden until the row is hovered or the
+// menu it owns is open. The pop-up itself anchors to the right
+// edge of the row.
+.execlaw-thread-row {
+    position: relative;
+}
+
+.execlaw-thread-row__menu-btn {
+    flex: 0 0 auto;
+    margin-left: 0.25rem;
+    padding: 0;
+    width: 1.25rem;
+    height: 1.25rem;
+    border: none;
+    background: transparent;
+    color: $text-muted;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.1s ease, background-color 0.1s ease;
+
+    &:hover,
+    &:focus-visible,
+    &.is-open {
+        background-color: rgba($text-primary, 0.12);
+        color: $text-primary;
+    }
+}
+
+.execlaw-thread-row:hover .execlaw-thread-row__menu-btn,
+.execlaw-thread-row__menu-btn.is-open,
+.execlaw-thread-row__menu-btn:focus-visible {
+    opacity: 1;
+}
+
+.execlaw-thread-menu {
+    position: absolute;
+    z-index: 50;
+    top: 100%;
+    right: 0.25rem;
+    margin-top: 0.15rem;
+    min-width: 9rem;
+    background-color: $bg-elev;
+    border-radius: $radius-card;
+    padding: 0.25rem;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+
+.execlaw-thread-menu__item {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.6rem;
+    border: none;
+    background: transparent;
+    color: $text-primary;
+    text-align: left;
+    font-size: 0.85rem;
+    border-radius: $radius-pill;
+    cursor: pointer;
+
+    &:hover,
+    &:focus-visible {
+        background-color: rgba($text-primary, 0.08);
+    }
+
+    &.is-danger {
+        color: #f08585;
+        &:hover,
+        &:focus-visible {
+            background-color: rgba(240, 80, 80, 0.18);
+        }
+    }
+}
+
+.execlaw-thread-rename-input {
+    flex: 1 1 auto;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid rgba($text-primary, 0.4);
+    color: $text-primary;
+    font: inherit;
+    padding: 0;
+    min-width: 0;
+
+    &:focus {
+        outline: none;
+        border-bottom-color: $accent;
+    }
+}
+
+.execlaw-nav-badge {
+    flex: 0 0 auto;
+    background-color: $accent;
+    color: #fff;
+    border-radius: 999px;
+    font-size: 0.7rem;
+    line-height: 1;
+    padding: 0.18rem 0.45rem;
+    min-width: 1.25rem;
+    text-align: center;
+    font-weight: 600;
+}
+
+.execlaw-thread-dot {
+    width: 0.55rem;
+    height: 0.55rem;
+    border-radius: 50%;
+    background-color: $border-subtle;
+
+    &.is-unread {
+        background-color: $accent;
+    }
+}
+
+.execlaw-thread-spinner {
+    width: 0.7rem;
+    height: 0.7rem;
+    border: 2px solid rgba($accent, 0.3);
+    border-top-color: $accent;
+    border-radius: 50%;
+    animation: execlaw-spin 0.8s linear infinite;
+}
+
+@keyframes execlaw-spin {
+    to { transform: rotate(360deg); }
+}
+
+// ---- Main chat panel ----------------------------------------------
+//
+// The main pane is offset to clear the floating sidebar
+// (`$main-offset` = sidebar-width + 2× gutter). On widths below
+// 768 px the sidebar collapses (see media query above), so we
+// reset the offset to 0 to recover the lost real estate.
+.execlaw-main {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    background-color: $bg-deep;
+    margin-left: $main-offset;
+}
+
+@media (max-width: 767.98px) {
+    .execlaw-main {
+        margin-left: 0;
+    }
+}
+
+.execlaw-main__head {
+    // The sidebar is `position: fixed; top: $shell-gutter` and then
+    // adds 1.1rem of its own __head padding, so its `.execlaw-brand`
+    // sits `$shell-gutter + 1.1rem` from the viewport top. The main
+    // pane is in normal flow, so we have to cover the gutter here.
+    padding: calc(#{$shell-gutter} + 1.1rem) 1.25rem 0.85rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+
+    // 2026-04-29 — page/chat title in IBM Plex Sans.
+    h1,
+    h2,
+    h3,
+    .execlaw-thread-rename {
+        font-family: $font-body;
+        font-weight: 500;
+    }
+}
+
+// 2026-04-28 — wrapper holds the scroll surface + the floating
+// "scroll to latest" button. Takes the flex space the bare
+// `.execlaw-stream` used to hold; the inner stream now fills the
+// wrapper. Stays `position: relative` so the absolute-positioned
+// button can anchor at the wrapper's bottom edge.
+.execlaw-stream-wrap {
+    flex: 1 1 auto;
+    min-height: 0;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+}
+
+.execlaw-stream {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    // Outer scroll surface stays full width so the scrollbar
+    // anchors at the viewport edge (matches ChatGPT). Each
+    // message inside is clamped + centered via `.execlaw-msg`'s
+    // `margin-inline: auto` below, so the reading column is
+    // 48rem max while the scroll background extends to the
+    // sidebar's right edge.
+    padding: 1.25rem 1.25rem 0.5rem;
+    min-height: 0;
+}
+
+// Floating ↓ button that surfaces when the operator scrolls up
+// past the latest message. Centered above the composer; hover/focus
+// state matches the rest of the chrome.
+.execlaw-scroll-to-bottom {
+    position: absolute;
+    left: 50%;
+    bottom: 0.5rem;
+    transform: translateX(-50%);
+    width: 2rem;
+    height: 2rem;
+    padding: 0;
+    border-radius: 50%;
+    background-color: $bg-elev;
+    color: $text-primary;
+    border: 1px solid $border-subtle;
+    box-shadow: $shadow-soft;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    z-index: 5;
+    transition: background-color 0.12s ease, transform 0.12s ease;
+
+    i {
+        font-size: 1rem;
+        line-height: 1;
+    }
+
+    &:hover {
+        background-color: $bg-surface;
+        transform: translateX(-50%) translateY(-1px);
+    }
+
+    &:focus-visible {
+        outline: 2px solid rgba($accent, 0.5);
+        outline-offset: 2px;
+    }
+}
+
+.execlaw-msg {
+    display: flex;
+    flex-direction: column;
+    margin-bottom: 1rem;
+    // 2026-04-28 — match the ChatGPT thread column. The reading
+    // column is centered (margin-inline: auto) and capped at
+    // $thread-max-width on wide viewports; narrower screens
+    // collapse to 100% via the `min(...)` fallback so the layout
+    // doesn't horizontal-scroll on phones.
+    width: 100%;
+    max-width: $thread-max-width;
+    margin-inline: auto;
+
+    // User messages: right-align the inner bubble so the pill
+    // hugs the right edge of the column. The bubble itself
+    // (`.execlaw-msg__bubble.is-user`) does shrink-to-fit so the
+    // pill width tracks the text.
+    &.is-user {
+        align-items: flex-end;
+    }
+}
+
+.execlaw-msg__meta {
+    color: $text-muted;
+    font-size: 0.75rem;
+    margin-bottom: 0.2rem;
+}
+
+.execlaw-msg__bubble {
+    // 2026-04-28 — agent reply renders flush against the page
+    // background (ChatGPT-style "no bubble"). User + tool
+    // messages keep an explicit fill below so they still read
+    // as distinct callouts. Padding is dropped on the agent
+    // path so the text aligns with the column edge instead of
+    // sitting inset by 0.9rem; user/tool restore their own
+    // padding to keep the pill geometry intact.
+    background-color: transparent;
+    border-radius: $radius-pill;
+    padding: 0;
+    word-wrap: break-word;
+    color: $text-primary;
+    // IBM Plex Sans for chat body. Set on the bubble itself
+    // rather than on `body` so settings pages, forms, and chrome
+    // stay on the system stack.
+    font-family: $font-body;
+    font-size: 0.92rem;
+    line-height: 1.5;
+
+    &.is-user {
+        background-color: rgba($accent, 0.14);
+        padding: 0.7rem 0.9rem;
+        // 2026-04-28 — pill should hug the message text. Without
+        // this the bubble inherits the parent column's full width
+        // (768 px) and looks like a banner. `width: fit-content`
+        // shrinks to the longest line; `max-width` keeps the
+        // bubble from running off the right edge on very long
+        // single-line messages.
+        width: fit-content;
+        max-width: 75%;
+    }
+
+    &.is-tool {
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        font-size: 0.8rem;
+        color: $text-muted;
+        background-color: $bg-elev;
+        padding: 0.7rem 0.9rem;
+        // Tool messages render as raw text (no markdown). Keep
+        // pre-wrap so JSON / multiline tool output retains its
+        // original whitespace.
+        white-space: pre-wrap;
+    }
+
+    // ---- Markdown element styles (2026-04-28) -----------------
+    // Both agent and user messages flow through `MarkdownContent`,
+    // so the elements below land inside `.execlaw-msg__bubble`.
+    // Tool messages bypass markdown — these rules only apply to
+    // markdown-emitted DOM, not to the literal `display` string
+    // we render under `.is-tool`.
+
+    p {
+        margin: 0 0 0.5rem;
+        &:last-child {
+            margin-bottom: 0;
+        }
+    }
+
+    h1, h2, h3, h4, h5, h6 {
+        font-family: $font-body;
+        font-weight: 600;
+        margin: 0.75rem 0 0.4rem;
+        line-height: 1.3;
+        &:first-child { margin-top: 0; }
+    }
+    h1 { font-size: 1.25rem; }
+    h2 { font-size: 1.15rem; }
+    h3 { font-size: 1.05rem; }
+    h4, h5, h6 { font-size: 1rem; }
+
+    ul, ol {
+        margin: 0 0 0.5rem;
+        padding-left: 1.4rem;
+        &:last-child { margin-bottom: 0; }
+    }
+    li > p {
+        margin: 0;
+    }
+    li {
+        margin-bottom: 0.15rem;
+    }
+
+    a {
+        color: $accent;
+        text-decoration: none;
+        &:hover, &:focus-visible {
+            text-decoration: underline;
+        }
+    }
+
+    blockquote {
+        margin: 0 0 0.5rem;
+        padding: 0 0 0 0.75rem;
+        border-left: 3px solid $border-subtle;
+        color: $text-muted;
+    }
+
+    // Inline code — subtle fill so it pops against the bubble.
+    :not(pre) > code {
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        font-size: 0.85em;
+        background-color: rgba($text-primary, 0.08);
+        padding: 0.1rem 0.35rem;
+        border-radius: 0.25rem;
+    }
+
+    // Fenced code blocks — distinct fill, horizontal scroll for
+    // long lines so the chat column doesn't widen.
+    pre {
+        margin: 0 0 0.5rem;
+        padding: 0.6rem 0.75rem;
+        background-color: $bg-elev;
+        border-radius: 0.5rem;
+        overflow-x: auto;
+        &:last-child { margin-bottom: 0; }
+
+        code {
+            font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+            font-size: 0.85em;
+            background: transparent;
+            padding: 0;
+            color: $text-primary;
+            // Markdown inside a code block is preserved as literal
+            // text by remark — we don't override that here, just
+            // visually distinguish it.
+            white-space: pre;
+        }
+    }
+
+    table {
+        border-collapse: collapse;
+        margin: 0 0 0.5rem;
+        font-size: 0.9em;
+
+        th, td {
+            border: 1px solid $border-subtle;
+            padding: 0.3rem 0.5rem;
+            text-align: left;
+        }
+        th {
+            background-color: rgba($text-primary, 0.05);
+        }
+    }
+
+    hr {
+        margin: 0.75rem 0;
+        border: 0;
+        border-top: 1px solid $border-subtle;
+    }
+
+    &.is-clamped {
+        position: relative;
+        // Soft fade at the bottom of clamped messages cues that
+        // there's more content under the "Read more…" button.
+        mask-image: linear-gradient(
+            to bottom,
+            #000 60%,
+            rgba(0, 0, 0, 0.65) 100%
+        );
+        -webkit-mask-image: linear-gradient(
+            to bottom,
+            #000 60%,
+            rgba(0, 0, 0, 0.65) 100%
+        );
+    }
+}
+
+.execlaw-streaming-cursor {
+    display: inline-block;
+    margin-left: 0.25rem;
+    color: $accent;
+    animation: execlaw-cursor-blink 1.1s steps(2, end) infinite;
+}
+
+@keyframes execlaw-cursor-blink {
+    to { opacity: 0; }
+}
+
+// ---- Composer + approval card -------------------------------------
+.execlaw-composer {
+    padding: 0.85rem 1.25rem 1rem;
+    background-color: $bg-deep;
+}
+
+// 2026-05-02 — inline loader that surfaces the agent's current
+// tool activity ("Searching the web for X…") inside the
+// MessageStream where the next assistant message will land.
+// Reuses `.execlaw-msg`'s grid + max-width layout so it sits in
+// the same column as the surrounding bubbles; the override
+// modifier just swaps the bubble background for transparent
+// muted text and tucks a tiny mascot SVG to the left.
+.execlaw-msg.execlaw-tool-activity {
+    // No bubble background — render as plain greyed-out inline text.
+    // Spacing matches `.execlaw-msg__bubble`'s vertical rhythm so
+    // it doesn't jump the scroll position when it appears/disappears.
+    padding-block: 0.25rem;
+}
+
+.execlaw-tool-activity__row {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: $text-muted;
+    font-size: 0.9rem;
+    line-height: 1.4;
+}
+
+.execlaw-tool-activity__label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 60ch;
+    font-style: italic;
+    opacity: 0.85;
+}
+
+// Mini mascot used by the loader. The outer rotor group spins
+// at a leisurely pace; the iris stays put visually because its
+// `transform` is set per-frame from the cursor-tracking JS.
+.execlaw-mini-mascot {
+    color: $text-muted;
+    flex-shrink: 0;
+    display: inline-block;
+    vertical-align: middle;
+}
+
+.execlaw-mini-mascot__rotor {
+    // 2026-05-02 — `view-box` is the spec default for SVG
+    // elements but several browsers (Safari, older Chromium)
+    // silently fall back to `fill-box`, which puts the
+    // transform-origin in the rotor's own bounding-box frame.
+    // The mascot's hair extends much higher than the beard
+    // extends low, so the bbox centre is below the eye and the
+    // face wobbles in a tilted ellipse. Pinning to `view-box` +
+    // `50% 50%` rotates around the SVG canvas centre (627, 627
+    // for the 1254-unit viewBox), which is where the operator
+    // expects the pivot.
+    transform-box: view-box;
+    transform-origin: 50% 50%;
+    animation: execlaw-mini-mascot-spin 1.6s linear infinite;
+}
+
+@keyframes execlaw-mini-mascot-spin {
+    from {
+        transform: rotate(0deg);
+    }
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.execlaw-composer__form {
+    // Center the composer chip at the same max-width as the
+    // message column so the input lines up vertically with the
+    // text above it (ChatGPT layout).
+    width: 100%;
+    max-width: $thread-max-width;
+    margin-inline: auto;
+}
+
+// ChatGPT-style chip composer (Phase 14.D):
+//   * `.execlaw-composer__shell` is the visible element — rounded,
+//     fills with $bg-elev, owns the focus-within ring.
+//   * `.execlaw-composer__input` (the textarea) is transparent, no
+//     border, no own focus shadow — it reads as part of the chip.
+//   * `.execlaw-composer__tools` is the bottom row holding tool
+//     icons on the left and the send button on the right.
+.execlaw-composer__shell {
+    background-color: $bg-elev;
+    border-radius: $radius-card;
+    padding: 0.5rem 0.5rem 0.5rem 0.875rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    transition: box-shadow 0.12s ease;
+
+    // Focus ring lives on the OUTER chip, not the textarea —
+    // gives the whole input its own ring on focus instead of
+    // a tight rectangle around just the text area.
+    &:focus-within {
+        box-shadow: 0 0 0 2px rgba($accent, 0.35);
+    }
+}
+
+// Make the textarea visually a transparent overlay on the chip.
+// Border and shadow are flattened so Bootstrap's defaults can't
+// cast their own outline; padding shrinks because the chip itself
+// owns the chip's outer padding.
+.execlaw-composer__input.form-control,
+.execlaw-composer__input {
+    background-color: transparent;
+    color: $text-primary;
+    border: 0;
+    box-shadow: none;
+    resize: none;
+    min-height: 1.75rem;
+    max-height: 12rem;
+    padding: 0.4rem 0;
+    line-height: 1.45;
+
+    &:focus,
+    &:focus-visible {
+        background-color: transparent;
+        color: $text-primary;
+        border: 0;
+        // Critical: kill Bootstrap's `:focus` box-shadow so the
+        // ring lives on the parent shell instead.
+        box-shadow: none;
+        outline: none;
+    }
+
+    &::placeholder {
+        color: $text-muted;
+    }
+}
+
+.execlaw-composer__tools {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+}
+
+.execlaw-composer__tools-left,
+.execlaw-composer__tools-right {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+// Tool buttons inside the composer chip — voice mic, future
+// attachments / web-search / tool-picker, etc. Compact 32×32 icon
+// buttons with hover-bg, no resting border.
+.execlaw-composer__tools .btn {
+    min-width: 2rem;
+    width: 2rem;
+    height: 2rem;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    color: $text-muted;
+    background-color: transparent;
+    border: 0;
+
+    &:hover,
+    &:focus-visible {
+        background-color: rgba($text-primary, 0.08);
+        color: $text-primary;
+    }
+
+    &:disabled {
+        opacity: 0.4;
+    }
+}
+
+// The send button is the one chip element with a filled accent —
+// it's the primary action so it gets weight. Circular, accent
+// background, white icon.
+.execlaw-composer__send.btn,
+.execlaw-composer__send.btn-primary {
+    background-color: $text-primary;
+    color: $bg-deep;
+    border: 0;
+
+    &:hover,
+    &:focus-visible {
+        background-color: $text-primary;
+        color: $bg-deep;
+        opacity: 0.85;
+    }
+
+    &:disabled {
+        background-color: rgba($text-primary, 0.2);
+        color: rgba($bg-deep, 0.6);
+        opacity: 1;
+    }
+}
+
+// 2026-04-28 — stop variant. Same circular pill as the send button
+// but with a square stop icon. Distinct hover so the operator
+// notices they're cancelling, not sending.
+.execlaw-composer__send--stop.btn,
+.execlaw-composer__send--stop.btn-primary {
+    background-color: $text-primary;
+    color: $bg-deep;
+
+    &:hover,
+    &:focus-visible {
+        background-color: color.adjust($text-primary, $lightness: -8%);
+        color: $bg-deep;
+        opacity: 1;
+    }
+}
+
+.execlaw-approval-card {
+    background-color: rgba($accent, 0.08);
+    border-radius: $radius-pill;
+    padding: 0.85rem 1rem;
+    margin-bottom: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.execlaw-approval-card__title {
+    font-weight: 600;
+    color: color.adjust($accent, $lightness: 18%);
+}
+
+.execlaw-empty-state {
+    margin: auto;
+    color: $text-muted;
+    text-align: center;
+    padding: 2rem 1rem;
+}
+
+// ---- Settings shell ----------------------------------------------
+.execlaw-settings {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 1.5rem 2rem 3rem;
+}
+
+.execlaw-settings__head {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+
+    // Page titles in IBM Plex Sans (matches chat header).
+    h1,
+    h2,
+    h3 {
+        font-family: $font-body;
+        font-weight: 500;
+    }
+}
+
+.execlaw-settings__tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    padding-bottom: 0.5rem;
+    margin-bottom: 1.5rem;
+}
+
+.execlaw-settings__tab {
+    background: transparent;
+    border: 0;
+    color: $text-muted;
+    padding: 0.4rem 0.85rem;
+    border-radius: $radius-pill;
+    font-size: 0.9rem;
+    cursor: pointer;
+    text-decoration: none;
+    transition: background-color 0.12s ease, color 0.12s ease;
+
+    &:hover {
+        background-color: $bg-surface;
+        color: $text-primary;
+    }
+
+    &.is-active {
+        background-color: rgba($accent, 0.18);
+        color: color.adjust($accent, $lightness: 18%);
+    }
+}
+
+.execlaw-card {
+    background-color: $bg-surface;
+    border-radius: $radius-pill;
+    padding: 1rem 1.1rem;
+    margin-bottom: 0.75rem;
+}
+
+.execlaw-card__title {
+    font-weight: 600;
+    margin-bottom: 0.4rem;
+}
+
+// Plugins-page row title-and-description column. The container
+// MUST have `min-width: 0` so the inner description's
+// nowrap+ellipsis can actually constrain — without it, the column
+// expands to the description's natural width and pushes the
+// version/badge/icons off the row.
+.execlaw-plugin-row__title-col {
+    min-width: 0;
+}
+
+// Plugins-page row description (manifest's `[plugin].description`).
+// Single-line ellipsis truncation — long descriptions stay on one
+// row so the list reads as a tidy table; the operator can hover
+// the row to see the full string via the `title` attribute.
+.execlaw-plugin-row__desc {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.execlaw-card__row {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.55rem 0;
+
+    // Sibling rows are separated by an inset background strip
+    // rather than a hairline rule — keeps the no-border feel
+    // while preserving the row delineation the operator needs to
+    // scan a list of GPUs / users / etc.
+    & + & {
+        box-shadow: inset 0 1px 0 rgba($text-muted, 0.08);
+    }
+
+    &:first-child {
+        padding-top: 0;
+    }
+}
+
+.execlaw-trust-badge {
+    display: inline-block;
+    font-size: 0.75rem;
+    padding: 0.18rem 0.55rem;
+    border-radius: 999px;
+    background-color: $bg-elev;
+    color: $text-muted;
+    line-height: 1.3;
+
+    // Each variant fills its own background tint at low alpha and
+    // colours its text at high lightness — borders are gone.
+    &.is-controller {
+        color: color.adjust($accent, $lightness: 18%);
+        background-color: rgba($accent, 0.18);
+    }
+    &.is-known {
+        color: color.adjust($success, $lightness: 8%);
+        background-color: rgba($success, 0.18);
+    }
+    &.is-limited {
+        color: color.adjust($warning, $lightness: 8%);
+        background-color: rgba($warning, 0.18);
+    }
+    &.is-pending {
+        color: color.adjust($warning, $lightness: 12%);
+        background-color: rgba($warning, 0.18);
+    }
+    &.is-blocked {
+        color: color.adjust($danger, $lightness: 8%);
+        background-color: rgba($danger, 0.18);
+    }
+}
+
+// Container-logs panel for the BackendsPage logs modal. Mono font,
+// preserved whitespace, dark background so the operator's eye
+// distinguishes log output from the surrounding chrome at a glance.
+.execlaw-log-tail {
+    background-color: $bg-elev;
+    color: $text-primary;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    line-height: 1.4;
+    padding: 0.75rem;
+    border-radius: $radius-pill;
+    max-height: 65vh;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin-bottom: 0;
+}
+
+// Inline spinner dot for the "Provisioning" status pill — a small
+// pulsing circle that signals "the supervisor is doing work" without
+// crowding the badge with a full Bootstrap spinner.
+.execlaw-spinner-dot {
+    display: inline-block;
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background-color: currentColor;
+    animation: execlaw-spinner-dot-pulse 1.2s ease-in-out infinite;
+    vertical-align: middle;
+}
+
+@keyframes execlaw-spinner-dot-pulse {
+    0%, 100% { opacity: 0.35; transform: scale(0.85); }
+    50%      { opacity: 1.0;  transform: scale(1.05); }
+}
+
+.execlaw-log-row {
+    display: grid;
+    grid-template-columns: 7rem 4.5rem 9rem 1fr;
+    gap: 0.5rem;
+    padding: 0.35rem 0.5rem;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    color: $text-primary;
+
+    & + & {
+        box-shadow: inset 0 1px 0 rgba($text-muted, 0.08);
+    }
+
+    .execlaw-log-row__ts { color: $text-muted; }
+    .execlaw-log-row__level { font-weight: 600; }
+    .execlaw-log-row__level.is-error { color: $danger; }
+    .execlaw-log-row__level.is-warn  { color: $warning; }
+    .execlaw-log-row__level.is-info  { color: $accent; }
+    .execlaw-log-row__level.is-debug { color: $text-muted; }
+    .execlaw-log-row__target { color: $text-muted; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .execlaw-log-row__msg { white-space: pre-wrap; word-break: break-word; }
+}
+
+.execlaw-thread-rename {
+    background: transparent;
+    border: none;
+    border-bottom: 1px dashed transparent;
+    color: $text-primary;
+    font-size: 1rem;
+    font-weight: 600;
+    padding: 0.05rem 0.15rem;
+    min-width: 6rem;
+
+    &:hover {
+        border-bottom-color: $border-subtle;
+    }
+
+    &:focus {
+        outline: none;
+        border-bottom-color: $accent;
+    }
+}
+
+// ---- Welcome view (fresh / empty thread) -------------------------
+.execlaw-welcome {
+    position: relative;
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1.5rem;
+    padding: 2rem 1.5rem;
+    min-height: 0;
+    // Y scrolls when content is tall; X stays visible so the
+    // mascot greeting's morphed brackets can extend past the
+    // mascot's nominal slot without being clipped or
+    // triggering a horizontal scrollbar.
+    overflow-x: visible;
+    overflow-y: auto;
+}
+
+// 2026-04-28 — incognito toggle. Off-state is an outline icon; on-
+// state inverts to a filled circle with a contrasting icon so the
+// "this won't be saved" state reads from across the room.
+.execlaw-welcome__incognito {
+    position: absolute;
+    top: 1rem;
+    right: 1rem;
+    width: 2.25rem;
+    height: 2.25rem;
+    border: none;
+    background: transparent;
+    color: $text-muted;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.1rem;
+    cursor: pointer;
+    transition: background-color 0.15s ease, color 0.15s ease;
+
+    &:hover,
+    &:focus-visible {
+        background-color: rgba($text-primary, 0.08);
+        color: $text-primary;
+    }
+
+    &.is-on {
+        background-color: $text-primary;
+        color: $bg-deep;
+
+        &:hover,
+        &:focus-visible {
+            background-color: $text-primary;
+            color: $bg-deep;
+            opacity: 0.9;
+        }
+    }
+}
+
+// Small "Incognito chat" label that shows above the chat header
+// when an incognito session is active so the operator can't lose
+// track of which mode they're in mid-conversation.
+.execlaw-incognito-banner {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    background-color: rgba($text-primary, 0.08);
+    color: $text-muted;
+    padding: 0.2rem 0.6rem;
+    border-radius: $radius-pill;
+    font-size: 0.75rem;
+    margin-left: 0.5rem;
+}
+
+.execlaw-welcome__brand {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: $text-primary;
+    letter-spacing: -0.015em;
+
+    i {
+        color: $accent;
+        font-size: 2rem;
+    }
+}
+
+// Mascot — vector avatar with a GSAP-driven iris that tracks the
+// cursor. The hair, beard, and parent eye inherit `currentColor`,
+// painted with the brand accent. The iris is filled with the
+// page-deep background colour so it reads as a hole punched
+// through the eye (matching the fill-rule cutout the source SVG
+// produced).
+//
+// `overflow: visible` is critical: the greeting morph slides the
+// hair / beard groups well outside the SVG's viewBox in viewBox
+// coordinates, and SVG's default `overflow: hidden` would clip
+// them at the rim.
+.execlaw-mascot {
+    color: $accent;
+    flex-shrink: 0;
+    overflow: visible;
+
+    .execlaw-mascot__iris path {
+        fill: $bg-deep;
+    }
+}
+
+// Mascot greeting stage — the host frame for the mascot SVG and
+// the welcome overlay. The SVG's own shapes morph into bracket-
+// like silhouettes via GSAP; the welcome line is a plain HTML
+// span centred over the SVG, fading in once the morph completes.
+// `overflow: visible` mirrors the SVG override above — when the
+// brackets slide outward they extend horizontally past the
+// stage's nominal `size × size` slot.
+.execlaw-mascot-stage {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    overflow: visible;
+}
+
+// Centred over the SVG, allowed to overflow horizontally so
+// longer names don't get clipped by the SVG's square slot. GSAP
+// owns the opacity/scale; the static `opacity: 0` here is just
+// the initial state before the timeline fires.
+// 2026-04-29 — generic card primitive. Long-running tools
+// (research, future shell-session, etc.) emit cards over the WS
+// event stream; this is the fallback `LongRunningTask` renderer
+// styling. Per-kind renderers may extend or replace these classes.
+.execlaw-card-task {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    background-color: $bg-elev;
+    border-radius: $radius-md;
+    padding: 0.85rem 1rem;
+    // 2026-05-03 — match the chat-thread reading-column scaffold
+    // (`.execlaw-msg` uses the same `$thread-max-width` clamp +
+    // centered margin) so cards align with messages instead of
+    // bleeding to the scroll edge.
+    width: 100%;
+    max-width: $thread-max-width;
+    margin: 0.4rem auto;
+
+    &__head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 0.75rem;
+    }
+
+    &__title {
+        font-weight: 600;
+        font-size: 0.95rem;
+        color: $text-primary;
+    }
+
+    &__state {
+        font-size: 0.75rem;
+        color: $text-muted;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+
+    &__phase {
+        font-size: 0.85rem;
+        color: $text-muted;
+    }
+
+    &__progress {
+        position: relative;
+        height: 0.5rem;
+        background-color: rgba($text-primary, 0.08);
+        border-radius: $radius-pill;
+        overflow: hidden;
+    }
+
+    &__progress-bar {
+        height: 100%;
+        background-color: $accent;
+        border-radius: inherit;
+        transition: width 0.3s ease-out;
+    }
+
+    &__progress-label {
+        position: absolute;
+        top: -1.4rem;
+        right: 0;
+        font-size: 0.75rem;
+        color: $text-muted;
+    }
+
+    &__summary {
+        font-size: 0.9rem;
+        color: $text-primary;
+    }
+
+    &__error {
+        font-size: 0.85rem;
+        color: $danger;
+        background-color: rgba($danger, 0.08);
+        padding: 0.4rem 0.6rem;
+        border-radius: $radius-md;
+    }
+
+    &__actions {
+        display: flex;
+        gap: 0.4rem;
+    }
+
+    &__action {
+        background-color: rgba($text-primary, 0.06);
+        color: $text-primary;
+        border: none;
+        padding: 0.3rem 0.7rem;
+        border-radius: $radius-pill;
+        font-size: 0.8rem;
+        cursor: pointer;
+
+        &:hover {
+            background-color: rgba($text-primary, 0.12);
+        }
+    }
+}
+
+.execlaw-mascot-stage__text {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    // Match `.execlaw-brand` — same monospace stack, same weight,
+    // same tight letter-spacing. The welcome greeting reads as a
+    // continuation of the brand identity rather than a separate
+    // typographic register.
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 1.4rem;
+    font-weight: 600;
+    color: $text-primary;
+    letter-spacing: -0.02em;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+}
+
+.execlaw-welcome__composer {
+    width: 100%;
+    // 2026-04-28 — match the active-chat thread column so the
+    // composer doesn't visibly re-flow between WelcomeView and
+    // ChatPane.
+    max-width: $thread-max-width;
+    // The composer's InputGroup is the visual unit — no double-border
+    // around it. Just hold the width.
+}
+
+.execlaw-welcome__suggestions {
+    width: 100%;
+    max-width: 720px;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    color: $text-muted;
+}
+
+.execlaw-welcome__suggestions-label {
+    font-size: 0.85rem;
+    color: $text-muted;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.25rem;
+}
+
+.execlaw-welcome__suggestion {
+    text-align: left;
+    background: transparent;
+    border: 0;
+    color: $text-primary;
+    padding: 0.6rem 0.75rem;
+    border-radius: $radius-pill;
+    cursor: pointer;
+    line-height: 1.4;
+    transition: background-color 0.12s ease;
+
+    &:hover {
+        background-color: $bg-surface;
+    }
+
+    .execlaw-welcome__suggestion-title {
+        font-weight: 500;
+    }
+
+    .execlaw-welcome__suggestion-sub {
+        color: $text-muted;
+        font-size: 0.85rem;
+        margin-left: 0.4rem;
+    }
+}
+
+// ---- Generic page shell (non-chat routes) ------------------------
+//
+// `.execlaw-page` is the load-bearing scaffold for every non-chat
+// destination that renders inside `.execlaw-main` (Research,
+// Routines, Skills, Settings, future pages). It enforces the
+// flex/min-height contract so children can scroll inside the
+// remaining viewport height — which the bare per-page wrappers
+// kept getting wrong, leaving content overflowing the viewport
+// with no scrollbar.
+//
+// Two flavours via a modifier:
+//   * default — flex column that fills remaining height with no
+//     overflow handling. Use when the page wants to manage its
+//     own scroll surfaces (two-pane list+detail layouts like
+//     Research and Skills).
+//   * `.execlaw-page--scroll` — single scrollable column with
+//     standard page padding. Use for stack-of-sections content
+//     pages like Routines.
+.execlaw-page {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    background-color: $bg-deep;
+}
+
+.execlaw-page--scroll {
+    overflow-y: auto;
+    padding: 1.25rem 1.75rem 3rem;
+
+    @media (max-width: 767.98px) {
+        padding: 1rem 1rem 2rem;
+    }
+}
+
+// ---- Research page (/research) -----------------------------------
+//
+// Two-pane operator drill-down: a left list of every research job,
+// plus a right detail pane with plan tree + report. Outer shell is
+// `.execlaw-page`; this layer adds the filter row + split panes.
+.execlaw-research {
+    // Inherits flex column + min-height: 0 + bg from `.execlaw-page`.
+}
+
+.execlaw-research__filters {
+    display: inline-flex;
+    gap: 0.25rem;
+    margin-left: auto;
+}
+
+.execlaw-research__filter {
+    background: transparent;
+    border: 0;
+    color: $text-muted;
+    padding: 0.25rem 0.7rem;
+    border-radius: $radius-pill;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: background-color 0.12s ease, color 0.12s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+
+    &:hover {
+        background-color: $bg-surface;
+        color: $text-primary;
+    }
+
+    &.is-active {
+        background-color: rgba($accent, 0.18);
+        color: color.adjust($accent, $lightness: 18%);
+    }
+}
+
+.execlaw-research__filter-count {
+    font-size: 0.7rem;
+    background-color: rgba($text-primary, 0.1);
+    color: $text-muted;
+    padding: 0.05rem 0.4rem;
+    border-radius: 999px;
+    line-height: 1.4;
+    .execlaw-research__filter.is-active & {
+        background-color: rgba($accent, 0.25);
+        color: color.adjust($accent, $lightness: 18%);
+    }
+}
+
+.execlaw-research__split {
+    width: 100%;
+}
+
+.execlaw-research__list {
+    width: 22rem;
+    flex: 0 0 22rem;
+    overflow-y: auto;
+    padding: 0.5rem 0.75rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+
+    @media (max-width: 991.98px) {
+        width: 18rem;
+        flex: 0 0 18rem;
+    }
+}
+
+.execlaw-research__list-row {
+    background-color: $bg-surface;
+    border: 0;
+    border-radius: $radius-md;
+    padding: 0.6rem 0.75rem;
+    text-align: left;
+    color: $text-primary;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    transition: background-color 0.12s ease, transform 0.06s ease;
+
+    &:hover {
+        background-color: $bg-elev;
+    }
+
+    &.is-active {
+        background-color: rgba($accent, 0.18);
+        outline: 1px solid rgba($accent, 0.35);
+    }
+}
+
+.execlaw-research__list-row-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+}
+
+.execlaw-research__list-time {
+    flex: 0 0 auto;
+}
+
+.execlaw-research__list-query {
+    font-size: 0.88rem;
+    line-height: 1.35;
+    // Two-line clamp keeps the row a predictable height while
+    // letting longer questions still convey enough context to
+    // pick the right job.
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    word-break: break-word;
+}
+
+.execlaw-research__detail {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-y: auto;
+    background-color: $bg-deep;
+}
+
+.execlaw-research__detail-empty {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 2rem;
+}
+
+.execlaw-research__detail-body {
+    padding: 1.25rem 1.75rem 3rem;
+    max-width: 56rem;
+    margin: 0 auto;
+}
+
+.execlaw-research__detail-head {
+    margin-bottom: 1.25rem;
+}
+
+.execlaw-research__detail-title {
+    font-family: $font-body;
+    font-weight: 500;
+    font-size: 1.25rem;
+    line-height: 1.35;
+    margin: 0;
+}
+
+.execlaw-research__section {
+    background-color: $bg-surface;
+    border-radius: $radius-md;
+    padding: 1rem 1.1rem;
+    margin-bottom: 1rem;
+}
+
+.execlaw-research__section-title {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: $text-muted;
+    margin: 0 0 0.6rem;
+}
+
+.execlaw-research__thesis {
+    font-size: 0.92rem;
+    margin-bottom: 0.75rem;
+}
+
+.execlaw-research__steps {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+}
+
+.execlaw-research__step {
+    background-color: $bg-elev;
+    border-radius: $radius-pill;
+    padding: 0.6rem 0.8rem;
+}
+
+.execlaw-research__step-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.execlaw-research__step-query {
+    font-size: 0.9rem;
+    font-weight: 500;
+}
+
+.execlaw-research__step-rationale {
+    margin-top: 0.25rem;
+}
+
+.execlaw-research__step-excerpt {
+    margin-top: 0.5rem;
+    font-size: 0.88rem;
+    line-height: 1.5;
+    color: $text-primary;
+}
+
+.execlaw-research__sources {
+    margin: 0.5rem 0 0;
+    padding-left: 1.1rem;
+    font-size: 0.8rem;
+    color: $text-muted;
+
+    a {
+        color: $accent;
+        text-decoration: none;
+        &:hover, &:focus-visible { text-decoration: underline; }
+    }
+}
+
+.execlaw-research__report {
+    background-color: $bg-elev;
+    border-radius: $radius-md;
+    padding: 1rem;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.82rem;
+    line-height: 1.55;
+    color: $text-primary;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: none;
+    margin: 0;
+}
+
+@media (max-width: 767.98px) {
+    .execlaw-research__split {
+        flex-direction: column;
+    }
+    .execlaw-research__list {
+        width: 100%;
+        flex: 0 0 auto;
+        max-height: 40vh;
+    }
+}
+

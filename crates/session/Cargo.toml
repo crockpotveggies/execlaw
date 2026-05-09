@@ -1,0 +1,18 @@
+[package]
+name = "execlaw-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Session abstraction — drives the pipeline composition per modality."
+
+[dependencies]
+execlaw-core = { path = "../core" }
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,15 @@
+{
+    "type": "object",
+    "properties": {
+        "to": {
+            "type": "string",
+            "description": "Recipient. For 1:1, an E.164 phone (e.g. +14165550100) or wuzapi-formatted JID (`<digits>@s.whatsapp.net`). For groups, the group's JID (`<id>@g.us`)."
+        },
+        "text": {
+            "type": "string",
+            "description": "Message body. WhatsApp's per-message ceiling is ~4096 chars; longer messages get truncated by the sidecar."
+        }
+    },
+    "required": ["to", "text"],
+    "additionalProperties": false
+}

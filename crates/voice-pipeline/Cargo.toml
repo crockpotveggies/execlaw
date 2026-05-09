@@ -1,0 +1,30 @@
+[package]
+name = "execlaw-voice-pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Two-lane Tokio graph for the voice pipeline (VAD, STT, LLM, TTS, barge-in)."
+
+[dependencies]
+execlaw-core = { path = "../core" }
+execlaw-runner-local = { path = "../runner-local" }
+execlaw-policy = { path = "../policy" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+rusqlite.workspace = true
+
+[[bench]]
+name = "voice_hot_paths"
+harness = false

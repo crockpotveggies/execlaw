@@ -1,0 +1,179 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/session",
+    "crates/inference-api",
+    "crates/runner-local",
+    "crates/runner-protocol",
+    "crates/runner-binary",
+    "crates/voice-pipeline",
+    "crates/plugin-host",
+    "crates/plugin-sdk",
+    "crates/container-manager",
+    "crates/policy",
+    "crates/vault",
+    "crates/transport-api",
+    "crates/identity-api",
+    "crates/outbox",
+    "crates/server",
+    "crates/cli",
+    "crates/mcp-client",
+    "crates/script",
+    "plugins/hello",
+    "plugins/identity-local-address-book",
+    "crates/eval-harness",
+    "crates/skills",
+    "crates/model-adapter",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/justinelgenlong/execlaw"
+authors = ["Justin Long <justinelgenlong@gmail.com>"]
+
+[workspace.dependencies]
+# --- async runtime ---
+tokio = { version = "1.47", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+# CancellationToken (in tokio_util::sync) is enabled by default —
+# no extra feature flag needed beyond the base crate.
+futures = "0.3"
+async-trait = "0.1"
+
+# --- HTTP / web ---
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "fs", "catch-panic"] }
+hyper = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+url = "2"
+tokio-tungstenite = "0.24"
+
+# --- storage ---
+# SQLCipher (encrypted SQLite) via bundled build with vendored OpenSSL.
+# Per MIGRATION_PLAN §6.4 — one binary, one encrypted DB file, no system deps.
+#
+# The `bundled-sqlcipher-vendored-openssl` feature is enabled by the core
+# crate's `sqlcipher` feature (the default). A Windows-host developer can
+# pass `--no-default-features -F bundled-sqlite-plain` to core (via the
+# workspace command they run) to skip the OpenSSL build, which requires
+# Strawberry Perl; the Linux container image always builds with the
+# default SQLCipher feature.
+rusqlite = { version = "0.32", default-features = false }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
+
+# --- serialization ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1.3"
+toml = "0.9"
+
+# --- docs / schema ---
+schemars = "0.8"
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-axum = "0.2"
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+
+# --- auth / crypto ---
+# JWT EdDSA (Ed25519) signing; no RSA.
+jsonwebtoken = "9"
+argon2 = "0.5"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+rand_chacha = "0.3"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+base64 = "0.22"
+# WebAuthn second-factor (Phase 7e). Passkey-only API; FIDO/U2F path not used.
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+webauthn-rs-proto = "0.5"
+
+# --- logging / tracing ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-appender = "0.2"
+
+# --- errors ---
+anyhow = "1"
+thiserror = "2"
+
+# --- time / uuid ---
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.9"
+# Parses cron expressions (used by §6 routines). 7-field syntax with
+# seconds + optional year, but we restrict to standard 5-field at the
+# validation layer for predictable operator UX.
+cron = "0.12"
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["serde", "macros"] }
+
+# --- cli ---
+clap = { version = "4", features = ["derive", "env"] }
+dialoguer = "0.11"
+
+# --- os integration ---
+bollard = "0.18"
+keyring = "3"
+directories = "5"
+
+# --- misc ---
+once_cell = "1"
+regex = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tempfile = "3"
+dashmap = "6"
+bytes = "1"
+async-stream = "0.3"
+# Pure-Rust PDF generation for deep-research report.pdf delivery.
+# `printpdf` ships the 14 standard PDF fonts so we don't bundle TTFs;
+# `textwrap` does the line-wrapping the renderer's manual layout
+# needs. Both are ~200KB compiled, no external system deps.
+printpdf = { version = "0.7", default-features = false }
+textwrap = "0.16"
+
+# Embedded scripting engine for the script-tier plugin runtime.
+# Pure-Rust (no C deps), pinned to its built-in sandbox features
+# (operations limit, max function call depth) so a misbehaving
+# script can't wedge the host. ~250 KB compiled, no runtime install.
+rhai = { version = "1.21", default-features = false, features = ["std", "sync", "serde"] }
+serde_json_path = "0.7"
+# Pure-sync HTTP client for the script tier. reqwest::blocking
+# spins up its own tokio runtime per request which conflicts with
+# the host's runtime — ureq has no runtime, just blocking sockets,
+# safe to call from inside spawn_blocking.
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+
+# --- testing ---
+tempdir = "0.3"
+pretty_assertions = "1"
+
+# --- benchmarking ---
+# Criterion for microbenchmarks on hot paths (axiom #14).
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+# Faster rebuilds; debug assertions on.
+opt-level = 0
+debug = 1
+
+# Pin a patched fork of hardware-query 0.2.1 — upstream's `src/npu.rs`
+# gates `use std::process::Command;` to `cfg(target_os = "linux")` but
+# also calls `Command::new("sysctl")` inside a macOS-only block, so a
+# stock build fails on macOS with E0433. The vendored copy widens the
+# import gate to `cfg(unix)`. Drop this `[patch.crates-io]` block once
+# upstream cuts a release with the fix (no 0.2.2 / 0.3.0 published as
+# of 2026-05-09 — see https://crates.io/crates/hardware-query/versions).
+[patch.crates-io]
+hardware-query = { path = "vendor/hardware-query" }

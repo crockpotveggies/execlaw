@@ -1,0 +1,188 @@
+name: CI
+
+# Compile + run tests on every push and every pull request, across the
+# three CI-active targets:
+#
+#   x86_64-unknown-linux-gnu      — ubuntu-latest
+#   x86_64-pc-windows-msvc        — windows-latest
+#   aarch64-apple-darwin          — macos-14 (Apple Silicon runners)
+#
+# `x86_64-apple-darwin` is intentionally NOT in the matrix. The
+# project still claims it as a supported target in the README and
+# code paths, but GitHub-hosted Intel-Mac runners (macos-13) are on
+# a deprecation path and were spending most of their CI window
+# queued rather than running. Apple Silicon coverage exercises the
+# same `target_os = "macos"` cfg surface, so dropping the Intel
+# variant doesn't materially weaken signal — if/when GitHub ships
+# a stable Intel-Mac replacement runner, add it back as a fourth
+# matrix entry.
+#
+# Default Cargo features (plaintext SQLite) are used so the matrix
+# builds cleanly without needing Strawberry Perl on Windows. The
+# production SQLCipher path is exercised by the release pipeline,
+# not the per-push CI.
+#
+# Docker-dependent integration tests (`runner_e2e_docker.rs`) are
+# opt-in via `EXECLAW_E2E_DOCKER=1` and stay off in this workflow —
+# GitHub-hosted runners don't have a usable Docker daemon on macOS or
+# Windows.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+# Cancel any in-flight run for the same ref when a fresh push lands —
+# saves CI minutes during rapid pushes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # CI builds against the latest Rust stable. The README documents MSRV
+  # 1.85+ for the project's stated edition-2024 floor, but transitive
+  # dependencies routinely require a newer toolchain than the floor —
+  # tracking stable matches what most contributors install via rustup.
+  # If we ever need MSRV-floor verification, add a separate
+  # `msrv` job pinning `dtolnay/rust-toolchain@1.85`.
+
+jobs:
+  rust:
+    name: rust / ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo build --workspace
+        run: cargo build --workspace --locked
+
+      - name: cargo clippy --workspace
+        # `-D warnings` would break on existing warnings the workspace
+        # already carries (mcp_http_client dead_code, voice-pipeline
+        # unused_assignments). Tighten this to `-D warnings` once those
+        # are scrubbed; for now we treat clippy as advisory.
+        run: cargo clippy --workspace --all-targets
+
+      - name: cargo test --workspace
+        # `--no-fail-fast` keeps the run going past the first failure so
+        # the report shows everything broken, not just the first.
+        run: cargo test --workspace --locked --no-fail-fast
+
+  spa:
+    name: spa
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      - name: typecheck
+        run: npm run lint
+
+      - name: vitest
+        run: npm test
+
+      - name: build
+        run: npm run build
+
+      - name: bundle-size budget
+        run: npm run size
+
+  # cargo-deny: license compatibility, advisory database scan,
+  # version-ban policy. Runs on Linux only — the four sub-checks
+  # (advisories / bans / licenses / sources) are platform-independent
+  # so duplicating across the matrix is wasted CI minutes.
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-deny
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # The four sub-commands map directly to the [advisories],
+          # [licenses], [bans], [sources] tables in `deny.toml` at
+          # the repo root.
+          command: check advisories bans licenses sources
+
+  # Code-coverage. Uses cargo-llvm-cov (LLVM source-based coverage,
+  # which works for both unit and integration tests with the
+  # `--workspace --all-features` switches we run elsewhere).
+  # Output is uploaded to Codecov as `lcov.info`. The badge in
+  # README pulls from the same source.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: cargo llvm-cov --workspace --lcov
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          # No `token:` — Codecov accepts unauthenticated uploads from
+          # public repos via tokenless mode. Add a CODECOV_TOKEN secret
+          # if the repo ever flips private.
+          fail_ci_if_error: false

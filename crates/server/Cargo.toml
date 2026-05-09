@@ -1,0 +1,141 @@
+[package]
+name = "execlaw-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Axum HTTP + WebSocket server. Auth, admin API, WS event stream."
+
+[dependencies]
+execlaw-core = { path = "../core" }
+execlaw-vault = { path = "../vault" }
+execlaw-policy = { path = "../policy" }
+execlaw-plugin-sdk = { path = "../plugin-sdk" }
+execlaw-inference-api = { path = "../inference-api" }
+execlaw-runner-local = { path = "../runner-local" }
+execlaw-runner-protocol = { path = "../runner-protocol" }
+bollard = { workspace = true }
+execlaw-plugin-host = { path = "../plugin-host" }
+execlaw-container-manager = { path = "../container-manager" }
+execlaw-mcp-client = { path = "../mcp-client" }
+execlaw-model-adapter = { path = "../model-adapter" }
+execlaw-skills = { path = "../skills" }
+execlaw-voice-pipeline = { path = "../voice-pipeline" }
+execlaw-script = { path = "../script" }
+printpdf.workspace = true
+textwrap.workspace = true
+futures.workspace = true
+
+axum = { workspace = true, features = ["ws"] }
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_urlencoded = "0.7"
+jsonwebtoken.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core", "pkcs8", "pem"] }
+rand.workspace = true
+hex.workspace = true
+base64.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+uuid.workspace = true
+async-trait.workspace = true
+dashmap.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+rmp-serde.workspace = true
+
+# Phase 13.C — voice STT/TTS adapters POST audio to the managed
+# faster-whisper / Kokoro containers. Multipart for the WAV upload,
+# json for the TTS request body. No default features so OpenSSL
+# doesn't sneak back in. The `stream` feature was reserved for
+# barge-in but isn't used today; add it back if/when KokoroClient
+# ever consumes a streaming response body.
+reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls", "multipart", "stream"] }
+url.workspace = true
+regex.workspace = true
+
+# 2026-05-03 — deep-research gather quality fix.
+#   * `scraper` replaces the hand-rolled DDG result regex with a
+#     CSS-selector parser over `html5ever`. Robust to DDG markup
+#     drift (the regex broke silently the moment classes shifted);
+#     also gives us a clean foundation for adding other search
+#     providers + page-structure inspection.
+#   * `dom_smoothie` is a maintained Rust port of Mozilla's
+#     Readability — it strips nav / sidebar / ads / footer chrome
+#     from a fetched HTML page and returns the clean article body.
+#     Replaces the previous `truncate_body` (which fed the subagent
+#     4 KB of mostly-chrome HTML soup, killing extraction quality).
+#     The original `readability` crate is unmaintained as of 2026.
+scraper = "0.21"
+dom_smoothie = "0.10"
+
+utoipa.workspace = true
+utoipa-axum.workspace = true
+utoipa-swagger-ui.workspace = true
+
+# Phase 14.D — disk-free probe.
+# `directories` resolves the default ~/.execlaw cache path; `fs4`
+# wraps the platform-native free-space syscalls (statvfs / GetDiskFreeSpaceExW)
+# behind a safe `available_space(path)` API — needed because the
+# server crate forbids unsafe.
+directories = { workspace = true }
+fs4 = "0.13"
+
+# Phase 7e: WebAuthn second-factor for the controller login. Optional
+# feature because the underlying `webauthn-rs` pulls in `openssl-sys`,
+# which doesn't build out of the box on Windows-host dev (needs
+# Strawberry Perl + libssl headers). Linux + Docker builds enable
+# `webauthn` so production gets the second factor; Windows dev runs
+# with `default-no-webauthn` and the routes return 503 unconfigured.
+webauthn-rs = { workspace = true, optional = true }
+webauthn-rs-proto = { workspace = true, optional = true }
+openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
+
+[features]
+default = []
+# Phase 16 — exposes the in-memory `MockRunnerLauncher` to other
+# crates (server tests, future cli probes). Production builds keep
+# only the bollard-backed launcher.
+test-mock = []
+# Compile-in the WebAuthn relying-party + routes + login second-factor
+# branch. OFF by default because `webauthn-rs` pulls in `openssl-sys`,
+# which fails to build on a stock Windows-host dev environment without
+# Strawberry Perl + libssl headers. The production Docker image enables
+# the feature explicitly (`--features webauthn`) and CI runs the test
+# suite both with and without it. When the feature is off, every
+# webauthn route returns 503 `webauthn_unconfigured` and the login
+# route never demands a second factor (because registration is
+# impossible).
+webauthn = ["dep:webauthn-rs", "dep:webauthn-rs-proto", "dep:openssl-sys"]
+
+[dev-dependencies]
+tempfile.workspace = true
+reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { workspace = true, features = ["util"] }
+criterion.workspace = true
+zip = { workspace = true }
+execlaw-plugin-sdk = { path = "../plugin-sdk" }
+# Phase 12.B/C — supervisor tests use the in-memory mock controller
+# that the container-manager crate exposes behind the test-mock
+# feature.
+execlaw-container-manager = { path = "../container-manager", features = ["test-mock"] }
+# Phase 13.C — integration tests build their own AppState with mock
+# voice clients, which live in the voice-pipeline crate.
+execlaw-voice-pipeline = { path = "../voice-pipeline" }
+
+[[bench]]
+name = "server_hot_paths"
+harness = false

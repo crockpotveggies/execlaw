@@ -1,0 +1,10 @@
+# Pin the toolchain so `rustup` installs the right version automatically
+# when someone clones the repo. The MSRV in `Cargo.toml` is 1.85
+# (edition 2024); this file pins the channel rather than a specific
+# version so we always pick up patch releases on stable.
+#
+# Override locally with `rustup override set <version>` if you're
+# bisecting a regression.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,31 @@
+[package]
+name = "execlaw-mcp-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "MCP (Model Context Protocol) client for execlaw — talks to external MCP servers over stdio or Streamable HTTP and surfaces their tools + resources."
+
+[dependencies]
+tokio = { workspace = true, features = ["process", "io-util", "sync", "macros", "rt", "time"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile.workspace = true
+pretty_assertions.workspace = true
+
+# Mock MCP server binary — a synchronous stdin/stdout reflector the
+# integration tests spawn instead of pulling in a real Python/Node
+# MCP runtime. Lives behind `dev` so it doesn't ship.
+[[bin]]
+name = "mock_mcp_server"
+path = "tests/bin/mock_mcp_server.rs"
+test = false

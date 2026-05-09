@@ -1,0 +1,208 @@
+asyncapi: "3.0.0"
+info:
+  title: execlaw WebSocket event stream
+  version: "0.1.0"
+  description: |
+    Event vocabulary for `/api/stream` per MIGRATION_PLAN.md §8.4.
+    Hand-authored and kept in sync with the Rust side. Message names
+    mirror event kinds in `state_events` (see `crates/core/src/events.rs`).
+
+servers:
+  local:
+    host: 127.0.0.1:3031
+    protocol: ws
+    description: Local control-plane WebSocket.
+
+channels:
+  stream:
+    address: /api/stream
+    description: Unified live event stream for UI + admin consumers.
+    messages:
+      chatMessageInbound:
+        $ref: "#/components/messages/ChatMessageInbound"
+      chatMessageOutbound:
+        $ref: "#/components/messages/ChatMessageOutbound"
+      chatTokenDelta:
+        $ref: "#/components/messages/ChatTokenDelta"
+      agentThinking:
+        $ref: "#/components/messages/AgentThinking"
+      agentToolUse:
+        $ref: "#/components/messages/AgentToolUse"
+      agentToolResult:
+        $ref: "#/components/messages/AgentToolResult"
+      researchProgress:
+        $ref: "#/components/messages/ResearchProgress"
+      alertFired:
+        $ref: "#/components/messages/AlertFired"
+      alertAcked:
+        $ref: "#/components/messages/AlertAcked"
+      alertResolved:
+        $ref: "#/components/messages/AlertResolved"
+      pluginStatus:
+        $ref: "#/components/messages/PluginStatus"
+      containerLifecycle:
+        $ref: "#/components/messages/ContainerLifecycle"
+      voiceUserUtterance:
+        $ref: "#/components/messages/VoiceUserUtterance"
+      voiceAgentUtterance:
+        $ref: "#/components/messages/VoiceAgentUtterance"
+      voiceInterrupt:
+        $ref: "#/components/messages/VoiceInterrupt"
+      voiceInterruptRescinded:
+        $ref: "#/components/messages/VoiceInterruptRescinded"
+
+operations:
+  receiveStream:
+    action: receive
+    channel:
+      $ref: "#/channels/stream"
+    summary: Subscribe to the unified event stream.
+
+components:
+  messages:
+    ChatMessageInbound:
+      name: chat.message_inbound
+      payload: { $ref: "#/components/schemas/ChatMessageEvent" }
+    ChatMessageOutbound:
+      name: chat.message_outbound
+      payload: { $ref: "#/components/schemas/ChatMessageEvent" }
+    ChatTokenDelta:
+      name: chat.token_delta
+      payload: { $ref: "#/components/schemas/TokenDelta" }
+    AgentThinking:
+      name: agent.thinking
+      payload: { $ref: "#/components/schemas/AgentThinking" }
+    AgentToolUse:
+      name: agent.tool_use
+      payload: { $ref: "#/components/schemas/ToolUse" }
+    AgentToolResult:
+      name: agent.tool_result
+      payload: { $ref: "#/components/schemas/ToolResult" }
+    ResearchProgress:
+      name: research.progress
+      payload: { $ref: "#/components/schemas/ResearchProgress" }
+    AlertFired:
+      name: alert.fired
+      payload: { $ref: "#/components/schemas/Alert" }
+    AlertAcked:
+      name: alert.acked
+      payload: { $ref: "#/components/schemas/AlertAck" }
+    AlertResolved:
+      name: alert.resolved
+      payload: { $ref: "#/components/schemas/AlertResolve" }
+    PluginStatus:
+      name: plugin.status
+      payload: { $ref: "#/components/schemas/PluginStatus" }
+    ContainerLifecycle:
+      name: container.lifecycle
+      payload: { $ref: "#/components/schemas/ContainerLifecycle" }
+    VoiceUserUtterance:
+      name: voice.user_utterance
+      payload: { $ref: "#/components/schemas/VoiceUtterance" }
+    VoiceAgentUtterance:
+      name: voice.agent_utterance
+      payload: { $ref: "#/components/schemas/VoiceUtterance" }
+    VoiceInterrupt:
+      name: voice.interrupt
+      payload: { $ref: "#/components/schemas/VoiceInterrupt" }
+    VoiceInterruptRescinded:
+      name: voice.interrupt_rescinded
+      payload: { $ref: "#/components/schemas/VoiceInterruptRescinded" }
+  schemas:
+    ChatMessageEvent:
+      type: object
+      required: [conversation_id, seq, text, sender]
+      properties:
+        conversation_id: { type: string }
+        seq: { type: integer, format: int64 }
+        text: { type: string }
+        sender: { type: string }
+    TokenDelta:
+      type: object
+      required: [conversation_id, seq, text]
+      properties:
+        conversation_id: { type: string }
+        seq: { type: integer, format: int64 }
+        text: { type: string }
+    AgentThinking:
+      type: object
+      required: [conversation_id]
+      properties:
+        conversation_id: { type: string }
+        phase: { type: string }
+    ToolUse:
+      type: object
+      required: [conversation_id, tool, args]
+      properties:
+        conversation_id: { type: string }
+        tool: { type: string }
+        args: { type: object, additionalProperties: true }
+    ToolResult:
+      type: object
+      required: [conversation_id, tool]
+      properties:
+        conversation_id: { type: string }
+        tool: { type: string }
+        ok: { type: boolean }
+        error: { type: string, nullable: true }
+    ResearchProgress:
+      type: object
+      required: [research_id, status]
+      properties:
+        research_id: { type: string }
+        status: { type: string }
+        summary: { type: string }
+    Alert:
+      type: object
+      required: [id, fingerprint, severity, title]
+      properties:
+        id: { type: string }
+        fingerprint: { type: string }
+        severity: { type: string, enum: [Critical, Error, Warning, Info] }
+        title: { type: string }
+        source: { type: string }
+        detail: { type: string }
+    AlertAck:
+      type: object
+      required: [id, by]
+      properties:
+        id: { type: string }
+        by: { type: string }
+    AlertResolve:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+        by: { type: string }
+    PluginStatus:
+      type: object
+      required: [plugin_id, status]
+      properties:
+        plugin_id: { type: string }
+        status: { type: string, enum: [installed, enabled, disabled, uninstalled, crashed] }
+    ContainerLifecycle:
+      type: object
+      required: [container_id, kind, event]
+      properties:
+        container_id: { type: string }
+        kind: { type: string, enum: [runner, service, probe] }
+        event: { type: string, enum: [start, healthy, exit, oom, crash] }
+    VoiceUtterance:
+      type: object
+      required: [conversation_id, text]
+      properties:
+        conversation_id: { type: string }
+        text: { type: string }
+        duration_ms: { type: integer }
+    VoiceInterrupt:
+      type: object
+      required: [conversation_id, source]
+      properties:
+        conversation_id: { type: string }
+        source: { type: string, enum: [user_speech, user_cancel, net_drop] }
+    VoiceInterruptRescinded:
+      type: object
+      required: [conversation_id]
+      properties:
+        conversation_id: { type: string }
+        matched_phrase: { type: string }

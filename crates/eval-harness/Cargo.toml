@@ -1,0 +1,23 @@
+[package]
+name = "execlaw-eval-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "LLM-judge harness — runs rubric prompts against the local OpenAI-compatible inference endpoint and prints pass/fail per case."
+
+[[bin]]
+name = "eval-harness"
+path = "src/main.rs"
+
+[dependencies]
+execlaw-inference-api = { path = "../inference-api" }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+clap.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

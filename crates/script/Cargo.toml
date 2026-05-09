@@ -1,0 +1,34 @@
+[package]
+name = "execlaw-script"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Embedded Rhai engine for the script-tier plugin runtime."
+publish = false
+
+[dependencies]
+rhai.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_json_path.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros", "time"] }
+ureq.workspace = true
+url.workspace = true
+sha2.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
+base64.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full"] }
+criterion.workspace = true
+
+[[bench]]
+name = "script_hot_paths"
+harness = false

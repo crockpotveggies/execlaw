@@ -1,0 +1,60 @@
+[plugin]
+id = "pushover"
+name = "Pushover"
+version = "0.1.1"
+description = "Pushover push-notification provider. Sends short notifications to the operator's phone via the Pushover API. Exposes the `pushover.notify` tool to the agent and an admin route to configure the user_key + app_token."
+author = "execlaw"
+license = "Apache-2.0"
+
+# No sidecar — Pushover is a public REST API at api.pushover.net.
+# The plugin reaches it via the `http_post` Rhai binding, which
+# allows arbitrary external HTTPS but rejects loopback / private
+# ranges (SSRF guard).
+
+# Agent-callable notification tool. Reads the configured
+# user_key + app_token from the per-plugin vault at dispatch time.
+[[tools]]
+name = "pushover.notify"
+description = """Send a push notification to the operator's phone(s) \
+via Pushover. Use sparingly — the operator pays per-notification \
+quota and won't appreciate spam. Good for: long-running task \
+completion, alert escalation the operator should hear about right \
+now, time-sensitive answers when the operator is away from the \
+device. Args: { message: string (required, body of the \
+notification, max 1024 chars), title?: string (max 250 chars), \
+priority?: int (-2 lowest, -1 quiet, 0 default, 1 high, 2 \
+emergency-with-confirm; defaults to 0), url?: string (clickable \
+link), url_title?: string (anchor text for `url`) }."""
+schema = "schemas/pushover.notify.json"
+trust_floor = "Controller"
+latency = "low"
+
+# Plugin-served admin endpoints. Mounted by the host under
+# `/api/admin/plugins/pushover{path}`. The SPA's Pushover
+# config page reads + writes via these.
+[[admin_routes]]
+method = "GET"
+path = "/config"
+handler = "admin_get_config"
+description = "Return the configured user_key + app_token (masked)."
+
+[[admin_routes]]
+method = "POST"
+path = "/config"
+handler = "admin_set_config"
+description = "Persist the operator-supplied user_key + app_token."
+
+[[admin_routes]]
+method = "POST"
+path = "/test"
+handler = "admin_test_notification"
+description = "Send a 'execlaw test notification' so the operator can confirm the keys work end-to-end."
+
+# SPA settings page mount.
+[[ui_panels]]
+mount = "admin/plugins/pushover"
+entry = "ui/panel.js"
+
+[runtime]
+tier = "script"
+source = "main.rhai"

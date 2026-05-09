@@ -1,0 +1,37 @@
+{
+    "type": "object",
+    "properties": {
+        "latitude": {
+            "type": "number",
+            "description": "Latitude of the search center, in decimal degrees."
+        },
+        "longitude": {
+            "type": "number",
+            "description": "Longitude of the search center, in decimal degrees."
+        },
+        "radius": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 50000,
+            "description": "Search radius in meters (max 50000)."
+        },
+        "type": {
+            "type": "string",
+            "description": "Optional Google place type (e.g. `restaurant`, `gas_station`)."
+        },
+        "max_results": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "description": "Maximum results (1-20, default 10)."
+        },
+        "min_rating": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 5,
+            "description": "Optional client-side rating filter."
+        }
+    },
+    "required": ["latitude", "longitude", "radius"],
+    "additionalProperties": false
+}

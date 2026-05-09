@@ -1,0 +1,32 @@
+[package]
+name = "execlaw-plugin-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Plugin host: discovery, lifecycle, isolation tiers."
+
+[dependencies]
+execlaw-core = { path = "../core" }
+execlaw-plugin-sdk = { path = "../plugin-sdk" }
+execlaw-script = { path = "../script" }
+execlaw-skills = { path = "../skills" }
+tokio = { workspace = true, features = ["full", "macros", "process", "io-util", "sync"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+rusqlite.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "plugin_host_hot_paths"
+harness = false

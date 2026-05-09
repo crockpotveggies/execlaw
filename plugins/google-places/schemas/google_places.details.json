@@ -1,0 +1,11 @@
+{
+    "type": "object",
+    "properties": {
+        "place_id": {
+            "type": "string",
+            "description": "Google Place ID, returned in search/nearby results as `place_id`."
+        }
+    },
+    "required": ["place_id"],
+    "additionalProperties": false
+}

@@ -1,0 +1,63 @@
+[package]
+name = "execlaw-container-manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Docker client + hardware profile detection (sysfs + docker info + probes)."
+
+[features]
+# Exposes `MockServiceController` for downstream test crates (server)
+# that exercise BackendSupervisor. Production builds do NOT enable
+# this — the mock is gated behind cfg(any(test, feature = "test-mock"))
+# so the trait + bollard impl ship alone.
+test-mock = []
+
+[dependencies]
+execlaw-core = { path = "../core" }
+bollard.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+# Phase 12.B — service-container HTTP health probes + bollard pull
+# stream draining.
+reqwest = { workspace = true }
+futures-util = "0.3"
+
+# Phase 14.C — host-side HuggingFace model downloader. We call the
+# raw HTTP HF Hub API ourselves rather than pulling in the `hf-hub`
+# crate because hf-hub 0.4 brings hard deps on `ureq` + `native-tls`,
+# duplicating reqwest's TLS stack and inflating the binary by ~3 MB.
+# Our needs are narrow (resolve manifest → stream files into a cache
+# dir), so a 200-line direct implementation costs less than the
+# crate-graph weight.
+
+# Phase 14 — cross-platform hardware probe. Replaces our hand-rolled
+# sysfs walker for the production code path; tests still exercise
+# `detect_sysfs` directly to keep the mock-tree assertions. The crate
+# wraps WMI (Windows), sysfs (Linux), and IOKit (macOS) behind one
+# `HardwareInfo::query()` call that returns multi-GPU enumerations.
+hardware-query = "0.2"
+
+# hardware-query 0.2.1's `query_all` has a known bug — it does not
+# propagate `memory_mb` from the NVIDIA NVML enrichment back into the
+# merged `GPUInfo`, so WMI's UINT32-capped 4 GB wins over NVML's
+# accurate value. We call NVML directly to override.
+nvml-wrapper = "0.11"
+
+# Windows-only: read the per-display-class registry node that
+# `Win32_VideoController.AdapterRAM` truncates. The 64-bit
+# `HardwareInformation.qwMemorySize` value gives us accurate VRAM
+# for >4 GB Intel Arc / large NVIDIA cards. WMI alone caps out.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

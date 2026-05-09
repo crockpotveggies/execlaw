@@ -1,0 +1,23 @@
+[package]
+name = "execlaw-vault"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Encrypted secret storage + OS keyring loader for the SQLCipher master key."
+
+[dependencies]
+execlaw-core = { path = "../core" }
+keyring.workspace = true
+rand.workspace = true
+serde.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+argon2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

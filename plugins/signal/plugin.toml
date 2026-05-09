@@ -1,0 +1,173 @@
+[plugin]
+id = "signal"
+name = "Signal"
+version = "0.4.7"
+description = "Signal Messenger transport — fully script-tier (Phase B). All host-side signal_*.rs code retired; this plugin's main.rhai owns inbound consumer, outbound, group ops, and admin pairing."
+author = "execlaw"
+license = "Apache-2.0"
+
+# The supervised signal-cli sidecar. The sidecar supervisor owns
+# spawning, healthchecking, restarting; the plugin's main.rhai
+# uses `sidecar_url("signal-cli")` to dial it.
+[[services]]
+name = "signal-cli"
+image = "bbernhard/signal-cli-rest-api:latest"
+ports = []
+entrypoint = ["/bin/sh", "/enable-read-receipts.sh"]
+
+[services.env]
+MODE = "json-rpc"
+JSON_RPC_TRUST_NEW_IDENTITIES = "on-first-use"
+
+[[services.mounts]]
+source = "state://data"
+target = "/home/.local/share/signal-cli"
+read_only = false
+
+[[services.mounts]]
+source = "stage://enable-read-receipts.sh"
+target = "/enable-read-receipts.sh"
+read_only = true
+
+[services.sidecar]
+rpc_port = 8080
+rpc_health_path = "/v1/about"
+
+# Channel declaration. The icon flows into the SPA sidebar's
+# bridged-thread row marker; the host still uses
+# `HostTransportRegistry` for that lookup.
+[transport]
+transport_id = "signal"
+supports_attachments = true
+supports_groups = true
+icon = "chat-quote"
+
+# Tools. host_implemented is gone — every tool dispatches into
+# main.rhai's `tool_call(name, args, oauth)`.
+[[tools]]
+name = "signal.send_message"
+description = """Send a Signal message to a person or group. \
+This tool IS the user-visible message — do NOT also produce a text \
+reply summarising what you sent. After calling this tool, return an \
+empty text response to end your turn. \
+Args: { to: string (name, phone, or `signal:user:<uuid>` JID), \
+text: string }."""
+trust_floor = "Controller"
+latency = "low"
+
+[[tools]]
+name = "signal.reply"
+description = """Reply in the current Signal conversation. \
+This tool IS the user-visible reply — do NOT also produce a text \
+response summarising what you replied. After calling this tool, \
+return an empty text response to end your turn. \
+Args: { to: string (recipient — host fills from the conversation's binding), \
+text: string }."""
+latency = "low"
+
+[[tools]]
+name = "signal.list_groups"
+description = """List Signal groups the controller is a member of. \
+Returns: { groups: [{ id, name, member_count }] }."""
+trust_floor = "Controller"
+latency = "medium"
+
+[[tools]]
+name = "signal.create_group"
+description = """Create a new Signal group with the specified members. \
+The tool result includes an `ack_text` field — your final reply to \
+the user MUST be exactly that ack_text with no additions, no emoji, \
+and no rephrasing. Args: { title?: string, members: string[] (names \
+or phone numbers), message?: string (initial post) }."""
+trust_floor = "Controller"
+latency = "medium"
+
+[[tools]]
+name = "signal.add_group_members"
+description = """Add members to an existing Signal group, looking up \
+the group by exact name match. The tool result includes an `ack_text` \
+field — your final reply to the user MUST be exactly that ack_text with \
+no additions, no emoji, and no rephrasing. Args: \
+{ groupName: string, members: string[] (names or phone numbers) }."""
+trust_floor = "Controller"
+latency = "medium"
+
+[[tools]]
+name = "signal.leave_group"
+description = """Leave an existing Signal group, looking up the group \
+by exact name match. The tool result includes an `ack_text` field — \
+your final reply to the user MUST be exactly that ack_text with no \
+additions, no emoji, and no rephrasing. Args: { groupName: string }."""
+trust_floor = "Controller"
+latency = "medium"
+
+# Host-called convention tools. These exist so the host's auto-bridge
+# code (typing-indicator guard, research-PDF dispatcher, attachment
+# fetcher) can dial into the plugin via plugin_host.call_tool — the
+# host doesn't care that the agent COULD also see them in its tool
+# catalog. Agents shouldn't call these directly: typing fires
+# automatically per-turn; send_with_attachments is reachable via the
+# normal send_message + attachment flow; fetch_attachment is a
+# host-side bridge primitive.
+[[tools]]
+name = "signal.set_typing"
+description = """Host-internal: drive the Signal "typing…" indicator \
+for the active recipient. The host fires this automatically while \
+the agent composes a reply; agents do not need to call it directly. \
+Args: { to: string, active: bool }."""
+trust_floor = "Controller"
+latency = "low"
+host_internal = true
+
+[[tools]]
+name = "signal.send_with_attachments"
+description = """Send a Signal message with one or more attachments \
+referenced by host-side attachment ids. Used by the deep-research \
+auto-bridge to deliver a finished PDF report through the originating \
+Signal thread. Agents normally rely on send_message + the attachment \
+chip flow; this is the host-internal equivalent. \
+Args: { to: string, text?: string, attachments: int[] (host \
+attachment ids) }."""
+trust_floor = "Controller"
+latency = "medium"
+host_internal = true
+
+[[tools]]
+name = "signal.fetch_attachment"
+description = """Host-internal: fetch the raw bytes of a Signal \
+inbound attachment by its sidecar-side bridge id. Used by the host's \
+attachment ingest pipeline; agents do not call this directly. \
+Args: { attachment_id: string }."""
+trust_floor = "Controller"
+latency = "low"
+host_internal = true
+
+# Plugin-served admin endpoints. Each maps to a Rhai handler in
+# main.rhai. Mounted by the host under
+# `/api/admin/plugins/signal{path}`.
+[[admin_routes]]
+method = "GET"
+path = "/status"
+handler = "admin_status"
+description = "Pairing + sidecar status snapshot."
+
+[[admin_routes]]
+method = "GET"
+path = "/qrcodelink"
+handler = "admin_qrcodelink"
+description = "QR code data URL the operator scans to pair signal-cli with their phone."
+
+[[admin_routes]]
+method = "DELETE"
+path = "/unregister-account"
+handler = "admin_unregister_account"
+description = "Unlink this execlaw install from a paired Signal account. Number passed as ?number=<E.164>."
+
+# SPA settings page mount.
+[[ui_panels]]
+mount = "admin/plugins/signal"
+entry = "ui/panel.js"
+
+[runtime]
+tier = "script"
+source = "main.rhai"

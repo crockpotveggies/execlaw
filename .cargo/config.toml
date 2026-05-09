@@ -1,0 +1,32 @@
+# Cargo aliases for the execlaw bare-metal lifecycle.
+#
+# Phase 14 — these invoke the `execlaw` CLI (crates/cli) which talks
+# to systemd / launchd / Windows SCM via the service-manager crate.
+# The Phase-0 `docker compose` wrappers are gone; the control plane
+# runs as a host service now.
+#
+# Available aliases:
+#
+#   cargo bootstrap    First-run install: db migrate + register service + start.
+#   cargo start        Start the service.
+#   cargo restart      Restart the service.
+#   cargo stop         Stop the service.
+#   cargo svc-status   Print install state + per-OS log commands.
+#   cargo doctor       Preflight environment checks (DB, vault, optional Docker).
+#
+# Not aliased (intentional) because they collide with native cargo subcommands:
+#   - `cargo build`    — reserved for Rust compilation.
+#   - `cargo install`  — reserved for installing crates; use `cargo bootstrap`.
+#   - `cargo test`, `cargo run`, `cargo clippy`, `cargo fmt` — unchanged.
+#
+# The aliases all accept `--` to forward extra args, e.g.:
+#   cargo bootstrap -- --system
+#   cargo start -- --system
+
+[alias]
+bootstrap  = "run --quiet -p execlaw --bin execlaw -- install"
+start      = "run --quiet -p execlaw --bin execlaw -- service start"
+restart    = "run --quiet -p execlaw --bin execlaw -- service restart"
+stop       = "run --quiet -p execlaw --bin execlaw -- service stop"
+svc-status = "run --quiet -p execlaw --bin execlaw -- service status"
+doctor     = "run --quiet -p execlaw --bin execlaw -- doctor"

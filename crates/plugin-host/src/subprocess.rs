@@ -1,0 +1,454 @@
+//! Subprocess plugin tier (§4.4 tier 2).
+//!
+//! A plugin runs as a child process; the control plane exchanges
+//! JSON-RPC messages over its stdin/stdout. This is the cheapest
+//! isolation tier — no container, no runtime boundary — suitable for
+//! porting existing Node / Python integrations without rewriting in
+//! Rust.
+//!
+//! Wire format (one message per line):
+//!
+//! ```text
+//! → {"id": 1, "method": "tool.call", "params": {...}}
+//! ← {"id": 1, "result": {...}}
+//! ← {"id": 1, "error": {"code": ..., "message": "..."}}
+//! ```
+//!
+//! No cloud deps; just `tokio::process` + `serde_json`.
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tracing::{debug, warn};
+
+/// Config for launching a subprocess plugin.
+#[derive(Debug, Clone)]
+pub struct SubprocessSpec {
+    pub plugin_id: String,
+    pub executable: String,
+    pub args: Vec<String>,
+    pub cwd: Option<std::path::PathBuf>,
+}
+
+/// A JSON-RPC request the control plane sends to a plugin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcRequest {
+    pub id: u64,
+    pub method: String,
+    pub params: serde_json::Value,
+}
+
+/// One JSON-RPC response from a plugin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcResponse {
+    pub id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<RpcError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcError {
+    pub code: i32,
+    pub message: String,
+}
+
+/// Phase D.2 (2026-05-03) — unsolicited message a plugin can send
+/// the host. JSON-RPC convention: no `id` field, has `method` + `params`.
+/// Used for `skill.register` / `skill.unregister` (and any future
+/// plugin → host events, e.g. `notify`, `log`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcNotification {
+    pub method: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+/// Inbound discriminator: an unparsed line from a plugin's stdout
+/// is either a response to a host-issued request OR a one-way
+/// notification. We try Response first because every existing
+/// plugin sends only responses; the Notification branch fires for
+/// new D.2-aware plugins.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum InboundMessage {
+    Response(RpcResponse),
+    Notification(RpcNotification),
+}
+
+/// What the reader pushes to the host's notification channel when a
+/// notification arrives. The host's drain task knows which plugin
+/// each notification came from via `plugin_id`.
+#[derive(Debug, Clone)]
+pub struct PluginNotification {
+    pub plugin_id: String,
+    pub method: String,
+    pub params: serde_json::Value,
+}
+
+/// Live handle to a running subprocess plugin.
+#[derive(Debug)]
+pub struct SubprocessPlugin {
+    spec: SubprocessSpec,
+    child: Arc<Mutex<Child>>,
+    stdin: Arc<Mutex<tokio::process::ChildStdin>>,
+    next_id: AtomicU64,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<RpcResponse>>>>,
+}
+
+impl SubprocessPlugin {
+    /// Spawn the plugin process and start its stdout reader task.
+    /// `notifications` is an optional sink the reader forwards
+    /// unsolicited (no-id) messages to (Phase D.2). When `None`,
+    /// notifications are logged and dropped — backward-compatible
+    /// with pre-D.2 plugin tests.
+    pub async fn spawn(
+        spec: SubprocessSpec,
+        notifications: Option<mpsc::UnboundedSender<PluginNotification>>,
+    ) -> Result<Self, String> {
+        let mut cmd = Command::new(&spec.executable);
+        cmd.args(&spec.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(d) = &spec.cwd {
+            cmd.current_dir(d);
+        }
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("spawn '{}': {e}", spec.executable))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or("missing stdin on spawned plugin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("missing stdout on spawned plugin")?;
+
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<RpcResponse>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let pending_for_reader = pending.clone();
+        let plugin_id = spec.plugin_id.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout).lines();
+            loop {
+                match reader.next_line().await {
+                    Ok(Some(line)) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        match serde_json::from_str::<InboundMessage>(trimmed) {
+                            Ok(InboundMessage::Response(resp)) => {
+                                let id = resp.id;
+                                let mut p = pending_for_reader.lock().await;
+                                if let Some(tx) = p.remove(&id) {
+                                    let _ = tx.send(resp);
+                                } else {
+                                    warn!(
+                                        plugin_id = %plugin_id,
+                                        id,
+                                        "rpc response with no matching pending request"
+                                    );
+                                }
+                            }
+                            Ok(InboundMessage::Notification(n)) => {
+                                // Phase D.2: forward to host. When no
+                                // sink is wired (older tests), log
+                                // and drop so behavior is unchanged.
+                                match &notifications {
+                                    Some(tx) => {
+                                        let _ = tx.send(PluginNotification {
+                                            plugin_id: plugin_id.clone(),
+                                            method: n.method,
+                                            params: n.params,
+                                        });
+                                    }
+                                    None => {
+                                        debug!(
+                                            plugin_id = %plugin_id,
+                                            method = %n.method,
+                                            "plugin sent a notification but no sink is wired"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => warn!(
+                                plugin_id = %plugin_id,
+                                error = %e,
+                                line,
+                                "unparseable rpc line from plugin"
+                            ),
+                        }
+                    }
+                    Ok(None) => {
+                        debug!(plugin_id = %plugin_id, "plugin stdout closed");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(plugin_id = %plugin_id, error = %e, "plugin stdout read error");
+                        break;
+                    }
+                }
+            }
+            // Reader exited (stdout EOF or read error). Drain the
+            // pending map so any in-flight `call().await` errors out
+            // with "plugin dropped before responding" instead of
+            // hanging forever. Without this, a plugin whose
+            // `shutdown` handler does `std::process::exit(0)` before
+            // writing a response wedges the calling task indefinitely
+            // — the reader's clone of the Arc gets dropped here, but
+            // SubprocessPlugin still holds the strong ref + the live
+            // oneshot::Senders, so rx.await never resolves.
+            let mut p = pending_for_reader.lock().await;
+            let dropped = std::mem::take(&mut *p);
+            if !dropped.is_empty() {
+                debug!(
+                    plugin_id = %plugin_id,
+                    count = dropped.len(),
+                    "draining in-flight RPCs after plugin stdout closed",
+                );
+            }
+            // Senders drop here → every parked rx.await resolves Err.
+            drop(dropped);
+        });
+
+        Ok(Self {
+            spec,
+            child: Arc::new(Mutex::new(child)),
+            stdin: Arc::new(Mutex::new(stdin)),
+            next_id: AtomicU64::new(1),
+            pending,
+        })
+    }
+
+    pub fn plugin_id(&self) -> &str {
+        &self.spec.plugin_id
+    }
+
+    /// Send a JSON-RPC call, await response.
+    pub async fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+
+        let req = RpcRequest {
+            id,
+            method: method.to_owned(),
+            params,
+        };
+        let mut line = serde_json::to_vec(&req).map_err(|e| format!("encode rpc: {e}"))?;
+        line.push(b'\n');
+
+        {
+            let mut stdin = self.stdin.lock().await;
+            stdin
+                .write_all(&line)
+                .await
+                .map_err(|e| format!("write rpc: {e}"))?;
+            stdin.flush().await.map_err(|e| format!("flush rpc: {e}"))?;
+        }
+
+        let resp = rx
+            .await
+            .map_err(|_| "plugin dropped before responding".to_string())?;
+        if let Some(err) = resp.error {
+            return Err(format!("rpc error {}: {}", err.code, err.message));
+        }
+        Ok(resp.result.unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Ask the child to exit. Best-effort; the `kill_on_drop` guarantee
+    /// still holds if this fails.
+    ///
+    /// Hard-bounded by [`SHUTDOWN_TIMEOUT`] so a plugin whose
+    /// shutdown handler exits before writing a response (or hangs
+    /// outright) can't wedge the caller. The reader-task drain in
+    /// `spawn` makes the `call` resolve cleanly on plugin exit, and
+    /// the timeout is the second layer of defense.
+    pub async fn shutdown(&self) {
+        let _ = tokio::time::timeout(
+            SHUTDOWN_TIMEOUT,
+            self.call("shutdown", serde_json::Value::Null),
+        )
+        .await;
+        let mut child = self.child.lock().await;
+        let _ = child.start_kill();
+    }
+}
+
+/// Cap on the graceful-shutdown RPC. The reader-task drain
+/// usually resolves the call within a tick of the plugin
+/// exiting; this is a backstop for "plugin's shutdown handler
+/// hangs without ever exiting." After the timeout, kill_on_drop
+/// + start_kill takes over.
+const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpc_request_serializes_as_expected() {
+        let req = RpcRequest {
+            id: 7,
+            method: "tool.call".into(),
+            params: serde_json::json!({"name": "ping"}),
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains("\"id\":7"));
+        assert!(s.contains("\"method\":\"tool.call\""));
+        assert!(s.contains("\"name\":\"ping\""));
+    }
+
+    #[test]
+    fn rpc_response_decodes_success_and_error() {
+        let ok: RpcResponse = serde_json::from_str(r#"{"id":1,"result":{"ok":true}}"#).unwrap();
+        assert_eq!(ok.id, 1);
+        assert!(ok.result.is_some());
+        assert!(ok.error.is_none());
+
+        let err: RpcResponse =
+            serde_json::from_str(r#"{"id":2,"error":{"code":-1,"message":"boom"}}"#).unwrap();
+        assert_eq!(err.id, 2);
+        assert!(err.result.is_none());
+        assert_eq!(err.error.unwrap().message, "boom");
+    }
+
+    #[tokio::test]
+    async fn spawn_nonexistent_binary_returns_error() {
+        let spec = SubprocessSpec {
+            plugin_id: "p1".into(),
+            executable: "definitely-not-a-real-binary-xyz-123".into(),
+            args: vec![],
+            cwd: None,
+        };
+        let err = SubprocessPlugin::spawn(spec, None).await.unwrap_err();
+        assert!(err.to_lowercase().contains("spawn"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn echo_plugin_round_trips_rpc() {
+        // On unix we can use `sh -c` to provide a tiny JSON-RPC echo
+        // responder. On Windows we skip this test (see cfg).
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  printf '{"id":%s,"result":{"echo":"ok"}}\n' "$id"
+done
+"#;
+        let spec = SubprocessSpec {
+            plugin_id: "echo".into(),
+            executable: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            cwd: None,
+        };
+        let plugin = SubprocessPlugin::spawn(spec, None).await.unwrap();
+        let result = plugin
+            .call("ping", serde_json::json!({"x": 1}))
+            .await
+            .unwrap();
+        assert_eq!(result, serde_json::json!({"echo": "ok"}));
+        plugin.shutdown().await;
+    }
+
+    /// Adversarial: a plugin whose `shutdown` handler exits BEFORE
+    /// writing a JSON-RPC response (the shape used by every
+    /// existing subprocess plugin: `"shutdown" => exit 0`) used to
+    /// wedge the host's `shutdown()` call forever — the reader
+    /// task dropped its Arc clone of `pending` on EOF but
+    /// SubprocessPlugin still held the strong ref + the live
+    /// `oneshot::Sender`, so `rx.await` never resolved.
+    ///
+    /// The fix drains the pending map when the reader exits;
+    /// every parked `rx.await` resolves Err. This test pins that
+    /// shutdown returns within ~100 ms even when the plugin
+    /// behaves the way every existing one does.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shutdown_does_not_deadlock_when_plugin_exits_without_responding() {
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *shutdown*) exit 0 ;;
+    *) id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+       printf '{"id":%s,"result":null}\n' "$id" ;;
+  esac
+done
+"#;
+        let spec = SubprocessSpec {
+            plugin_id: "exit-no-reply".into(),
+            executable: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            cwd: None,
+        };
+        let plugin = SubprocessPlugin::spawn(spec, None).await.unwrap();
+        // Sanity: regular call works first.
+        let _ = plugin.call("ping", serde_json::Value::Null).await.unwrap();
+        // The bug: shutdown used to hang until the test runner
+        // killed it. With the fix, it returns within the
+        // SHUTDOWN_TIMEOUT (500 ms) — but actually within a tick
+        // because the reader-task drain resolves the parked rx
+        // immediately on EOF.
+        let started = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(2), plugin.shutdown())
+            .await
+            .expect("shutdown must return within 2s — deadlock if it doesn't");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(800),
+            "shutdown should resolve quickly via reader-task drain; took {elapsed:?}",
+        );
+    }
+
+    /// A second-order check: when the plugin exits unexpectedly
+    /// while a normal RPC is in flight, the call resolves Err
+    /// instead of hanging.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn pending_call_resolves_err_when_plugin_dies_mid_request() {
+        // Plugin sleeps 200ms then dies. The first `call` is in
+        // flight when stdin closes.
+        let script = r#"
+read line
+sleep 0.2
+exit 1
+"#;
+        let spec = SubprocessSpec {
+            plugin_id: "die-mid-call".into(),
+            executable: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            cwd: None,
+        };
+        let plugin = SubprocessPlugin::spawn(spec, None).await.unwrap();
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            plugin.call("anything", serde_json::Value::Null),
+        )
+        .await
+        .expect("call must not hang past plugin exit");
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("dropped"),
+            "expected drop-error from reader drain; got {err:?}",
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+}

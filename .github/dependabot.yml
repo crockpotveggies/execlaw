@@ -1,0 +1,61 @@
+# Dependabot configuration. Opens weekly bump PRs across the three
+# ecosystems the workspace touches. Patch + minor bumps are auto-
+# proposed; major bumps surface as separate PRs the maintainer
+# reviews manually.
+#
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+
+updates:
+  # Cargo (workspace) — covers the Rust workspace at the repo root.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 10
+    labels: ["dependencies", "rust"]
+    commit-message:
+      prefix: "deps"
+      include: scope
+    groups:
+      patch:
+        update-types: ["patch"]
+      minor:
+        update-types: ["minor"]
+
+  # npm (SPA) — `web/` Vite + React stack.
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 10
+    labels: ["dependencies", "javascript"]
+    commit-message:
+      prefix: "deps(web)"
+      include: scope
+    groups:
+      patch:
+        update-types: ["patch"]
+      minor:
+        update-types: ["minor"]
+
+  # GitHub Actions versions used in `.github/workflows/`.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "ci"]
+    commit-message:
+      prefix: "ci(actions)"
+      include: scope

@@ -1,0 +1,94 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/
+#
+# Run locally:
+#   cargo install cargo-deny --locked
+#   cargo deny check
+#
+# CI runs `cargo deny check advisories bans licenses sources` per
+# push and per PR. The four sub-checks correspond to the four
+# tables below.
+
+# ---- advisories: rustsec.org vulnerability database ----
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Yank policy: refuse builds against yanked crates so we don't ship
+# binaries with known-broken upstreams.
+yanked = "deny"
+# Ignore individual advisories with `ignore = ["RUSTSEC-XXXX-NNNN"]`
+# only when the project's exposure has been triaged. Document the
+# rationale inline.
+ignore = [
+    # fxhash 0.2.1 — pulled in transitively by `dom_smoothie` +
+    # `scraper` (research subsystem's HTML extraction). Upstream is
+    # unmaintained (NOT vulnerable; advisory is a status flag). No
+    # safe upgrade exists in 2026-05; rust-lang/rustc-hash is the
+    # successor but only `dom_smoothie` / `scraper` upstreams can
+    # adopt it. Re-evaluate when those crates ship a release that
+    # drops the dep; until then the unmaintained status doesn't
+    # expose a runtime issue.
+    { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained — transitive via dom_smoothie + scraper; no safe upgrade; not a vulnerability" },
+    # paste 1.0.15 — pulled in transitively by `utoipa-axum`
+    # (OpenAPI spec generation). Author archived the repo;
+    # `pastey` is the drop-in successor. Same calculus: not
+    # vulnerable, no safe upgrade, transitive. Drops out of our
+    # graph when `utoipa-axum` migrates.
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained — transitive via utoipa-axum; no safe upgrade; not a vulnerability" },
+]
+
+# ---- licenses: project compatibility ----
+[licenses]
+version = 2
+# Allow-list of SPDX identifiers we'll ship transitively. Keep this
+# narrow — every entry is a license execlaw's downstream operators
+# transitively accept by running the binary.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "Zlib",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "OpenSSL",
+    "BSL-1.0",
+    "0BSD",
+]
+# Score: 0 = "I want to be told about this"; higher means stricter.
+confidence-threshold = 0.85
+# Per-crate exceptions for dual-licensed deps where the canonical
+# allow-list above isn't expressive enough. Each entry needs a
+# rationale comment.
+exceptions = []
+
+# ---- bans: per-crate denylist + duplicate-version policy ----
+[bans]
+multiple-versions = "warn"
+# Wildcards in transitive Cargo.toml metadata trip this even though
+# the workspace's own manifests are clean. Treat as advisory until
+# we have a concrete crate to fix; flipping back to "deny" is one
+# line when the warning surface is stable.
+wildcards = "warn"
+# `allow` / `deny` for specific crates by name. Empty by default —
+# add entries here if a known-bad crate appears in the dep tree.
+allow = []
+deny = []
+# Skip deduplication checks on these crates — many widely-used
+# crates have inevitable major-version splits (e.g. `windows`
+# 0.52 + 0.61 from different transitive deps). Document each.
+skip = []
+skip-tree = []
+
+# ---- sources: which registries / git remotes are allowed ----
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

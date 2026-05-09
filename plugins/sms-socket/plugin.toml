@@ -1,0 +1,108 @@
+[plugin]
+id = "sms-socket"
+name = "SMS Socket"
+version = "0.1.0"
+description = "SMS / MMS via the Android SMS Socket app's local WebSocket gateway. Sidecar-free — opens a WebSocket directly to the gateway URL on the operator's LAN with `Authorization: Bearer <api_key>`. Mirrors the Signal/WhatsApp tool surface (send_message, reply, list_groups n/a, send_with_attachments, fetch_attachment, set_typing). The gateway lives on the operator's Android phone running https://github.com/crockpotveggies/sms-socket-app."
+author = "execlaw"
+license = "Apache-2.0"
+
+# No sidecar. The Android gateway is the operator's phone running
+# the sms-socket-app, reachable on the LAN at a configurable
+# ws:// URL (default ws://127.0.0.1:8787/ when port-forwarded
+# over USB). The plugin connects via the new ws_subscribe_bidi +
+# header support primitive.
+
+[transport]
+transport_id = "sms"
+supports_attachments = true
+supports_groups = false
+icon = "phone"
+
+# ===== Agent-callable tools =====================================
+[[tools]]
+name = "sms.send_message"
+description = """Send an SMS to a phone number. \
+This tool IS the user-visible message — do NOT also produce a text \
+reply summarising what you sent. After calling this tool, return an \
+empty text response to end your turn. \
+Args: { to: string (E.164 phone, e.g. +14165550100, or `sms:+E164` JID), \
+text: string }."""
+schema = "schemas/sms.send_message.json"
+trust_floor = "Controller"
+latency = "low"
+
+[[tools]]
+name = "sms.reply"
+description = """Reply in the current SMS conversation. \
+This tool IS the user-visible reply — do NOT also produce a text \
+response summarising what you replied. After calling this tool, \
+return an empty text response to end your turn. \
+Args: { to: string (recipient — host fills from the conversation's binding), \
+text: string }."""
+schema = "schemas/sms.send_message.json"
+latency = "low"
+
+# ===== Host-internal convention tools ============================
+[[tools]]
+name = "sms.set_typing"
+description = """Host-internal NO-OP. SMS has no typing indicator; \
+this returns ok silently so the host's typing-guard call doesn't \
+error. Args: { to: string, active: bool }."""
+trust_floor = "Controller"
+latency = "low"
+host_internal = true
+
+[[tools]]
+name = "sms.send_with_attachments"
+description = """Send MMS with one or more attachments referenced \
+by host-side attachment ids. Used by the deep-research auto-bridge. \
+Each attachment goes as its own MMS — the gateway accepts one \
+attachment per sendMms request. \
+Args: { to: string, text?: string, attachments: int[] (host attachment ids) }."""
+trust_floor = "Controller"
+latency = "medium"
+host_internal = true
+
+[[tools]]
+name = "sms.fetch_attachment"
+description = """Host-internal: not yet implemented. MMS attachments \
+arrive embedded in the inbound event (base64 in the gateway's \
+event payload) — the host's attachment ingest captures them \
+directly from on_frame, so this fetch path isn't hit for SMS. \
+Args: { attachment_id: string }."""
+trust_floor = "Controller"
+latency = "low"
+host_internal = true
+
+# ===== Admin routes ==============================================
+[[admin_routes]]
+method = "GET"
+path = "/status"
+handler = "admin_status"
+description = "Connection state + masked credential preview."
+
+[[admin_routes]]
+method = "GET"
+path = "/config"
+handler = "admin_get_config"
+description = "Return the masked api_key + gateway_url + default_subscription_id."
+
+[[admin_routes]]
+method = "POST"
+path = "/config"
+handler = "admin_set_config"
+description = "Persist the operator-supplied api_key + gateway_url + default_subscription_id."
+
+[[admin_routes]]
+method = "POST"
+path = "/test"
+handler = "admin_test_message"
+description = "Send a one-shot test SMS so the operator can confirm wiring."
+
+[[ui_panels]]
+mount = "admin/plugins/sms-socket"
+entry = "ui/panel.js"
+
+[runtime]
+tier = "script"
+source = "main.rhai"

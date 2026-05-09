@@ -1,0 +1,47 @@
+[package]
+name = "execlaw-runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "execlaw runner — long-lived per-principal-group container that talks to vLLM and proxies tool calls back to the control plane."
+
+[[bin]]
+name = "execlaw-runner"
+path = "src/main.rs"
+
+[dependencies]
+execlaw-runner-protocol = { path = "../runner-protocol" }
+execlaw-inference-api = { path = "../inference-api" }
+
+# async runtime + websocket client
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
+tokio-tungstenite = { workspace = true }
+futures.workspace = true
+futures-util = "0.3"
+url = "2"
+
+# wire format + errors
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+
+# logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# 32-byte random nonces / heartbeat ids
+rand.workspace = true
+hex.workspace = true
+
+# Faster allocator. musl's malloc is ~2-3× slower than glibc under
+# multi-thread contention; mimalloc closes the gap entirely and beats
+# both on most concurrent workloads. `default-features = false` skips
+# `secure` mode (overhead we don't need for a sandboxed runner).
+mimalloc = { version = "0.1", default-features = false }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

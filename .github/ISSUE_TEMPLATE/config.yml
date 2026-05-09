@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/crockpotveggies/execlaw/security/advisories/new
+    about: Report security issues privately via GitHub Security Advisories. See SECURITY.md for the full disclosure path.
+  - name: Plugin authoring guide
+    url: https://github.com/crockpotveggies/execlaw/blob/foundation/docs/plugins.md
+    about: Manifest schema, runtime tiers, sidecar model, and walkthroughs for writing a custom plugin.
+  - name: Architecture overview
+    url: https://github.com/crockpotveggies/execlaw/blob/foundation/docs/architecture.md
+    about: System topology, design principles, FSM, data model — start here if you want to understand how it fits together.

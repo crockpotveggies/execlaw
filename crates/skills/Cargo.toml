@@ -1,0 +1,35 @@
+[package]
+name = "execlaw-skills"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "DB-backed, versioned, content-addressed procedural-knowledge artifacts (skills) the agent loads on demand. Phase A: schema + store + secret scanner + read tools + admin-gated write tools."
+
+[dependencies]
+execlaw-core = { path = "../core" }
+execlaw-plugin-sdk = { path = "../plugin-sdk" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+hex.workspace = true
+regex.workspace = true
+once_cell.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+pretty_assertions.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+criterion.workspace = true
+
+[[bench]]
+name = "skills_hot_paths"
+harness = false

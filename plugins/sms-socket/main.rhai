@@ -1,0 +1,773 @@
+// sms-socket — SMS / MMS via the Android SMS Socket app's local WebSocket.
+//
+// Mirrors Slack's "no-sidecar, just open a WebSocket" shape:
+// op pastes API key + gateway URL → plugin opens a bidirectional
+// WS to the Android phone running sms-socket-app → inbound events
+// fan out to host_route_inbound, outbound tool calls submit
+// envelopes back over the same socket.
+//
+// Wire format (https://github.com/crockpotveggies/sms-socket-app):
+//
+// Outbound envelopes plugin → gateway:
+//   { type: "sendSms",          requestId, payload: { destination, body, subscriptionId? } }
+//   { type: "sendMms",          requestId, payload: { destination, body?, attachment, subscriptionId? } }
+//   { type: "rehydrate",        requestId, payload: { since, limit } }
+//   { type: "getGatewayState",  requestId, payload: {} }
+//
+// Inbound envelopes gateway → plugin:
+//   { type: "response", requestId, ok, payload }   — request acks
+//   { type: "sms.received",       payload: { address, body, receivedAt, messageId } }
+//   { type: "sms.outbound.sent",  payload: { destination, body, sentAt, messageId } }
+//   { type: "mms.received",       payload: { address, body?, attachments[], receivedAt } }
+//   { type: "mms.outbound.sent",  payload: { destination, body?, attachments[], sentAt } }
+//   { type: "gateway.state",      payload: { running, enabled, addresses[], connectionCount, apiKeyPreview } }
+//
+// v1 simplifications vs the selfhosted-claw integration:
+//   * Fire-and-forget outbound — we don't track requestId →
+//     waiter promises (Rhai's per-call scope makes this awkward).
+//     Errors surface via the next response frame, which we log
+//     but don't pipe back to the agent. Followup if this matters.
+//   * No history rehydrate cursor — we don't persist
+//     lastSeenTimestamp across reboots in v1. The gateway will
+//     re-deliver recent events on every reconnect; the host's
+//     dedup on (channel, native_id, timestamp_ms, text) catches
+//     the duplicates.
+//   * MMS attachment ingest pulls the embedded base64 into the
+//     host's attachment store via the standard inbound flow.
+//   * No per-SIM subscription routing through the agent — the
+//     operator's configured `default_subscription_id` is applied
+//     to every send.
+//   * Outbound sends use `ws_send_to_active(json)` — the host
+//     keeps a per-plugin "current active bidi WS handle" slot
+//     populated by `ws_subscribe_bidi`. Tool calls reach the
+//     socket without threading the handle through per-call engine
+//     scope. Concurrent sends are safe (the handle's mpsc outbox
+//     is lock-free for producers).
+
+const DEFAULT_GATEWAY_URL = "ws://127.0.0.1:8787/";
+const REHYDRATE_LIMIT = 200;
+
+// =====================================================================
+// LIFECYCLE
+// =====================================================================
+
+fn on_enable() {
+    let api_key = vault_get("api_key");
+    if api_key == () || api_key == "" {
+        log_info("sms-socket: no api_key in vault — visit Settings → Plugins → SMS Socket to configure");
+        return;
+    }
+    let url = vault_get("gateway_url");
+    if url == () || url == "" {
+        url = "ws://127.0.0.1:8787/";
+    }
+    if !url.starts_with("ws://") && !url.starts_with("wss://") {
+        log_warn("sms-socket: gateway_url must start with ws:// or wss:// (got '" + url + "')");
+        return;
+    }
+    log_info("sms-socket: subscribing to gateway at " + url);
+    let headers = #{ "Authorization": "Bearer " + api_key };
+
+    // Anchor the rehydrate cursor before we connect. First-install
+    // case (no `last_seen_ms` in vault) defaults to NOW so we don't
+    // dump pre-install history through the agent. Live delivery
+    // takes over from this point. See advance_cursor for the
+    // cursor-update path that runs on every replayed/live event.
+    //
+    // Also re-anchor when the vault holds 0 (or any non-positive /
+    // unparseable value). That state happens when an earlier
+    // version of the plugin wrote a sentinel, or the operator
+    // manually nuked the row — without re-anchoring, every connect
+    // would request `since=0` and the gateway returns its full
+    // event buffer, flooding the agent with belated auto-replies.
+    // Anchor logic. Three cases:
+    //
+    //   1. Empty / "0" sentinel — first install or wiped. Anchor
+    //      to NOW so we don't replay pre-install history.
+    //   2. Stale cursor (older than 60s) — operator's gateway had
+    //      a long downtime window OR the cursor wasn't being
+    //      updated due to bugs in earlier plugin versions. Clamp
+    //      to NOW to stop the rehydrate flood; we accept losing
+    //      <=60s of inbound that landed during the disabled window.
+    //   3. Recent cursor — leave it alone; live delivery / brief
+    //      reconnects covered by it.
+    let last_seen_ms_raw = vault_get("last_seen_ms");
+    let now_ms = now() * 1000;
+    let stale_threshold = now_ms - 60_000;
+    let needs_anchor = false;
+    if last_seen_ms_raw == () || last_seen_ms_raw == "" || last_seen_ms_raw == "0" {
+        needs_anchor = true;
+    } else {
+        let parsed = host_parse_int(last_seen_ms_raw);
+        if parsed == () || parsed < stale_threshold {
+            needs_anchor = true;
+        }
+    }
+    if needs_anchor {
+        vault_put("last_seen_ms", now_ms.to_string());
+        log_info("sms-socket: anchoring rehydrate cursor at " + now_ms + "ms (was: " + last_seen_ms_raw + ")");
+    } else {
+        log_info("sms-socket: vault has cursor=" + last_seen_ms_raw);
+    }
+
+    // Sequential handshake — send `getGatewayState` ONLY as the
+    // init frame; `rehydrate` is fired from on_frame after the
+    // state response arrives. This mirrors selfhosted-claw's
+    // onopen sequence (sms-socket.ts:430-457) which awaits the
+    // state response before sending rehydrate.
+    //
+    // Why sequential matters: empirically, pipelining both
+    // requests on the same WS upgrade leaves the
+    // sms-socket-app gateway in a half-initialized state that
+    // appears OK at handshake time (both responses come back) but
+    // corrupts on the NEXT inbound SMS broadcast — the gateway
+    // sends close 1001 and the Android service terminates. The
+    // selfhosted impl never saw this because its handshake was
+    // strictly sequential.
+    //
+    // Why unique requestIds matter: selfhosted uses a per-process
+    // monotonic counter (sms-socket-1, sms-socket-2, …). Our
+    // previous version reused hardcoded "sms-handshake-state" and
+    // "sms-handshake-rehydrate" on every reconnect — same IDs the
+    // gateway likely tracks in a pending-request map, which corrupts
+    // on duplicate-key insertion across reconnects. We use a
+    // per-connect timestamp suffix so reconnects always carry
+    // fresh IDs.
+    let conn_tag = now().to_string();
+    vault_put("conn_tag", conn_tag);
+    let init_state = #{
+        "type": "getGatewayState",
+        "requestId": "sms-state-" + conn_tag,
+        "payload": #{},
+    };
+    let init_frames = [to_json_string(init_state)];
+    let _handle = ws_subscribe_bidi(url, "on_frame", headers, init_frames);
+    ()
+}
+
+// Build and send the rehydrate request. Called from on_frame
+// after the gateway responds to our getGatewayState — see the
+// "Sequential handshake" comment in on_enable for why we don't
+// pipeline these.
+fn send_rehydrate_request() {
+    let cursor = read_last_seen_ms();
+    let conn_tag = vault_get("conn_tag");
+    if conn_tag == () || conn_tag == "" {
+        conn_tag = now().to_string();
+    }
+    let env = #{
+        "type": "rehydrate",
+        "requestId": "sms-rehydrate-" + conn_tag,
+        "payload": #{
+            "since": cursor,
+            "limit": 200,
+        },
+    };
+    let json = to_json_string(env);
+    let ok = ws_send_to_active(json);
+    if !ok {
+        log_warn("sms-socket: failed to send rehydrate (WS not connected); will retry on next reconnect");
+    } else {
+        log_info("sms-socket: sent rehydrate (since=" + cursor + "ms)");
+    }
+}
+
+// =====================================================================
+// INBOUND
+// =====================================================================
+
+fn on_frame(handle, raw) {
+    let env;
+    try {
+        env = parse_json(raw);
+    } catch (e) {
+        log_warn("sms-socket: parse_json failed: " + e);
+        return;
+    }
+    if env == () { return; }
+
+    let env_type = env.type;
+    if env_type == () || env_type == "" { return; }
+
+    if env_type == "response" {
+        // Outbound request ack. v1 fire-and-forget — log non-ok
+        // responses so the operator sees server-side errors, but
+        // don't propagate to the agent (it already returned).
+        if env.ok != true {
+            let detail = ();
+            if env.payload != () && env.payload.error != () {
+                detail = env.payload.error;
+            }
+            log_warn("sms-socket: gateway rejected requestId=" + env.requestId + ": " + detail);
+            return;
+        }
+
+        let req_id = if env.requestId != () { env.requestId } else { "" };
+
+        // State handshake completed — send the rehydrate next.
+        // Prefix-match because requestId carries a per-connect
+        // timestamp suffix (see on_enable's `conn_tag`).
+        if req_id.starts_with("sms-state-") {
+            log_info("sms-socket: getGatewayState ok; sending rehydrate");
+            send_rehydrate_request();
+            return;
+        }
+
+        // Rehydrate response carries a history of events in
+        // payload.events[]. Each is a full envelope (type, payload).
+        //
+        // Defense-in-depth cursor filter: even though we asked
+        // rehydrate `since: last_seen_ms`, defend against gateway
+        // bugs that ignore the cursor and dump full history. We
+        // skip any event with a timestamp <= the cursor we passed
+        // in.
+        if req_id.starts_with("sms-rehydrate-")
+            && env.payload != ()
+            && env.payload.events != ()
+            && type_of(env.payload.events) == "array"
+        {
+            let count = env.payload.events.len();
+            let cursor = read_last_seen_ms();
+            log_info("sms-socket: rehydrate returned " + count + " event(s); cursor=" + cursor + "ms");
+            let routed = 0;
+            let skipped = 0;
+            let advanced = 0;
+            for nested in env.payload.events {
+                if type_of(nested) != "map" { continue; }
+                let nested_type = nested.type;
+                if nested_type == () || nested_type == "" { continue; }
+
+                // Pull the timestamp first; we use it for BOTH the
+                // skip filter AND the cursor advance below.
+                let nested_ts = ();
+                if nested.payload != () && nested.payload.receivedAt != () {
+                    nested_ts = nested.payload.receivedAt;
+                } else if nested.timestamp != () {
+                    nested_ts = nested.timestamp;
+                }
+
+                // Advance the cursor for EVERY event regardless of
+                // type — outbound-sent / delivered / unknown types
+                // we don't dispatch still need to move the cursor
+                // past them, otherwise the next rehydrate re-fetches
+                // them forever and the response grows unboundedly.
+                advance_cursor(nested_ts);
+
+                // Only sms.received and mms.received route through
+                // the agent.
+                if nested_type != "sms.received" && nested_type != "mms.received" {
+                    advanced += 1;
+                    continue;
+                }
+                // Defense-in-depth: skip events at or before the
+                // cursor we PASSED IN. Captures gateway bugs that
+                // ignore `since` and the case where vault was just
+                // re-anchored mid-batch.
+                if nested_ts != () && nested_ts <= cursor {
+                    skipped += 1;
+                    continue;
+                }
+                if route_inbound_event(nested_type, nested) {
+                    routed += 1;
+                }
+            }
+            log_info(
+                "sms-socket: rehydrate replay done; routed=" + routed
+                    + " skipped=" + skipped
+                    + " cursor-advanced=" + advanced
+            );
+        }
+        return;
+    }
+
+    if env_type == "gateway.state" {
+        // Periodic state ping — cache in vault so the SPA's
+        // /status reads can surface it without a fresh request.
+        if env.payload != () {
+            try {
+                vault_put("gateway_state", to_json_string(env.payload));
+            } catch (e) {}
+        }
+        return;
+    }
+
+    // Filter to events we route through the host pipeline.
+    // Outbound-self events (sms.outbound.sent, mms.outbound.*) are
+    // dropped — we already wrote the user_msg / model_turn when
+    // the agent sent.
+    if env_type != "sms.received" && env_type != "mms.received" {
+        return;
+    }
+
+    route_inbound_event(env_type, env);
+}
+
+// Single dispatch path used by both live frames + rehydrate replay.
+// Updates last_seen_ms in vault on every routed event so the next
+// rehydrate's `since` cursor reflects what we've actually consumed.
+// Returns true on successful dispatch, false on decode/skip.
+fn route_inbound_event(env_type, env) {
+    let inbound = decode_event(env_type, env);
+    if inbound == () { return false; }
+    // Persist the cursor BEFORE dispatching, not after. If the
+    // host dispatch throws (e.g. UNIQUE constraint on duplicate
+    // ingest), we still want the cursor moved past this event so
+    // the NEXT rehydrate doesn't re-fetch it. The host's own dedup
+    // is a safety net; the cursor is the primary correctness lever.
+    advance_cursor(inbound.timestamp_ms);
+    try {
+        host_route_inbound(inbound);
+    } catch (e) {
+        log_warn("sms-socket: host_route_inbound rejected: " + e);
+    }
+    true
+}
+
+// Advance last_seen_ms in vault to max(prev, ts). Called from
+// route_inbound_event AND from the rehydrate-replay loop for every
+// event the gateway returns (including outbound-sent / delivered /
+// other types we don't dispatch). Must run for ALL events otherwise
+// non-dispatched types (sms.outbound.sent, mms.outbound.delivered,
+// etc.) keep coming back on every rehydrate, growing the response
+// unboundedly.
+fn advance_cursor(ts) {
+    if ts == () { return; }
+    if type_of(ts) != "i64" && type_of(ts) != "int" { return; }
+    if ts <= 0 { return; }
+    let prev = read_last_seen_ms();
+    if ts > prev {
+        vault_put("last_seen_ms", ts.to_string());
+    }
+}
+
+fn read_last_seen_ms() {
+    let raw = vault_get("last_seen_ms");
+    if raw == () || raw == "" { return 0; }
+    // CRITICAL: Rhai's stdlib does NOT register `to_int` for
+    // &str / ImmutableString / String in this engine config —
+    // the method-style `s.to_int()` call throws
+    // ErrorFunctionNotFound which try/catch silently swallowed,
+    // returning 0 and breaking every cursor-aware code path. The
+    // host registers a guaranteed-available `host_parse_int(s)`
+    // primitive in primitives.rs.
+    let parsed = host_parse_int(raw);
+    if parsed == () { return 0; }
+    parsed
+}
+
+fn decode_event(env_type, env) {
+    try {
+        let payload = env.payload;
+        if payload == () { return (); }
+
+        // Sender phone: gateway uses `address` for inbound (the
+        // contact's number), `destination` for outbound. Inbound-
+        // only path so just read `address`.
+        let phone = if payload.address != () { trim(payload.address) } else { "" };
+        if phone == "" { return (); }
+
+        let text = if payload.body != () { trim(payload.body) } else { "" };
+
+        // MMS may include attachments. Surface them as
+        // `bridge_id` = the gateway's per-attachment id; the host
+        // pulls the bytes via the standard inbound attachment
+        // ingest path. base64 is also embedded in the payload —
+        // we don't decode it here; that's the host's job.
+        let attachments = [];
+        if payload.attachments != () && type_of(payload.attachments) == "array" {
+            for a in payload.attachments {
+                let bridge_id = if a.id != () { a.id } else if a.fileName != () { a.fileName } else { () };
+                if bridge_id == () || bridge_id == "" { continue; }
+                attachments.push(#{
+                    "bridge_id": bridge_id,
+                    "content_type": a.mimeType,
+                    "filename": a.fileName,
+                    "size_bytes": a.sizeBytes,
+                });
+            }
+        }
+
+        // Drop empty messages with no attachments.
+        if text == "" && attachments.is_empty() { return (); }
+
+        // Timestamp: gateway sends `receivedAt` as Unix ms.
+        let ts_ms = ();
+        if payload.receivedAt != () {
+            ts_ms = payload.receivedAt;
+        } else if env.timestamp != () {
+            ts_ms = env.timestamp;
+        }
+
+        // Display name. Sources, in priority order:
+        //   1. Gateway-supplied `displayName` (set on rehydrated
+        //      events when the gateway's contact lookup matched
+        //      the address against the phone's address book).
+        //   2. Fallback: the phone number itself, so the thread
+        //      sidebar shows something meaningful instead of
+        //      "New chat · abc123". The host's identity-resolver
+        //      pipeline (google-contacts etc.) can later overwrite
+        //      this with a real contact name via auto-rename.
+        let display_name = ();
+        if payload.displayName != () {
+            let dn = trim(payload.displayName);
+            if dn != "" { display_name = dn; }
+        }
+        if display_name == () { display_name = phone; }
+
+        return #{
+            "channel": "sms",
+            "native_id": phone,
+            "display_name": display_name,
+            "group_id": (),     // 1:1 only — SMS has no group concept here
+            "group_name": (),
+            "text": text,
+            "timestamp_ms": ts_ms,
+            "attachments": attachments,
+        };
+    } catch (e) {
+        log_warn("sms-socket: undecodable event: " + e);
+        return ();
+    }
+}
+
+// =====================================================================
+// TOOL DISPATCH
+// =====================================================================
+
+fn tool_call(name, args, oauth) {
+    if name == "sms.send_message"           { return send_message_impl(args); }
+    if name == "sms.reply"                  { return reply_impl(args); }
+    if name == "sms.send_with_attachments"  { return send_with_attachments_impl(args); }
+    if name == "sms.set_typing"             { return set_typing_impl(args); }
+    if name == "sms.fetch_attachment"       { return fetch_attachment_impl(args); }
+    throw "unknown tool '" + name + "'";
+}
+
+fn send_message_impl(args) {
+    let to = args.to;
+    let text = args.text;
+    if to == () || to == "" { throw "sms.send_message requires `to`"; }
+    if text == () || text == "" { throw "sms.send_message requires `text`"; }
+    let destination = strip_sms_prefix(to);
+    validate_e164(destination);
+    let req_id = next_request_id();
+    let envelope = #{
+        "type": "sendSms",
+        "requestId": req_id,
+        "payload": with_subscription(#{
+            "destination": destination,
+            "body": text,
+        }),
+    };
+    submit_envelope(envelope, "sms.send_message");
+    "ok"
+}
+
+fn reply_impl(args) {
+    if args.to == () || args.to == "" {
+        throw "sms.reply requires `to` — host fills this from the conversation's binding";
+    }
+    send_message_impl(args)
+}
+
+fn send_with_attachments_impl(args) {
+    let to = args.to;
+    let text = if args.text != () { args.text } else { "" };
+    let attachments = args.attachments;
+    if to == () || to == "" { throw "sms.send_with_attachments requires `to`"; }
+    let destination = strip_sms_prefix(to);
+    validate_e164(destination);
+
+    // No attachments → fall through to plain SMS.
+    if attachments == () || type_of(attachments) != "array" || attachments.is_empty() {
+        return send_message_impl(#{ "to": to, "text": text });
+    }
+    if attachments.len() > 4 {
+        throw "sms.send_with_attachments: max 4 MMS attachments per send; got " + attachments.len();
+    }
+
+    // Each attachment is its own sendMms request — the gateway
+    // accepts one attachment per send. Caption rides on the
+    // first send only.
+    let i = 0;
+    for aid in attachments {
+        let a = host_get_attachment_bytes(aid);
+        // host_get_attachment_bytes returns {data_url, mime_type, size_bytes}
+        // The gateway wants raw base64 (no data: prefix). Strip it.
+        let b64 = strip_data_url_prefix(a.data_url);
+        let filename = "attachment-" + (i + 1);
+        if a.filename != () && a.filename != "" { filename = a.filename; }
+        let req_id = next_request_id();
+        let envelope = #{
+            "type": "sendMms",
+            "requestId": req_id,
+            "payload": with_subscription(#{
+                "destination": destination,
+                "body": if i == 0 && text != "" { text } else { () },
+                "attachment": #{
+                    "fileName": filename,
+                    "mimeType": a.mime_type,
+                    "sizeBytes": a.size_bytes,
+                    "base64": b64,
+                },
+            }),
+        };
+        submit_envelope(envelope, "sms.send_with_attachments");
+        i += 1;
+    }
+    "ok"
+}
+
+fn set_typing_impl(args) {
+    // SMS has no typing indicator. Return ok silently so the
+    // host's typing-guard doesn't error.
+    if args == () { return #{ "ok": true }; }
+    #{ "ok": true }
+}
+
+fn fetch_attachment_impl(args) {
+    throw "sms.fetch_attachment: not implemented in v0.1 — MMS attachments arrive embedded in the inbound event payload, not via a separate fetch endpoint";
+}
+
+// =====================================================================
+// HELPERS
+// =====================================================================
+
+fn strip_sms_prefix(s) {
+    if s == () || s == "" { return s; }
+    if s.starts_with("sms:") { return s.sub_string(4); }
+    s
+}
+
+fn validate_e164(phone) {
+    if phone == () || phone == "" { throw "phone number is empty"; }
+    if !phone.starts_with("+") { throw "phone must be E.164 (start with '+'): got '" + phone + "'"; }
+    let digits = phone.sub_string(1);
+    let n = digits.len();
+    if n < 7 || n > 15 { throw "phone has wrong digit count for E.164: '" + phone + "'"; }
+}
+
+fn strip_data_url_prefix(s) {
+    // host_get_attachment_bytes returns "data:<mime>;base64,<payload>".
+    // The gateway wants just the payload.
+    if s == () || s == "" { return s; }
+    let comma = s.index_of(",");
+    if comma < 0 { return s; }
+    s.sub_string(comma + 1)
+}
+
+fn with_subscription(payload) {
+    let sub = vault_get("default_subscription_id");
+    if sub != () && sub != "" {
+        let parsed = host_parse_int(sub);
+        if parsed != () {
+            payload.subscriptionId = parsed;
+        }
+    }
+    payload
+}
+
+fn next_request_id() {
+    // Per-process unique ID. selfhosted-claw uses a monotonic
+    // counter (sms-socket-N); we don't have shared state across
+    // Rhai engine instances, so we use timestamp + a vault
+    // counter that increments on every call. The vault RMW is a
+    // tradeoff: rare in practice (tool calls serialise per
+    // conversation), and the cost of a duplicate ID is gateway
+    // confusion, worse than a vault read.
+    let raw = vault_get("req_counter");
+    let n = 0;
+    if raw != () && raw != "" {
+        let parsed = host_parse_int(raw);
+        if parsed != () { n = parsed; }
+    }
+    n += 1;
+    vault_put("req_counter", n.to_string());
+    "sms-" + now().to_string() + "-" + n.to_string()
+}
+
+// Submit an outbound envelope over the plugin's active bidi WS.
+// `ws_send_to_active` reaches into the host-managed per-plugin
+// slot populated by ws_subscribe_bidi — no per-call engine state
+// needed, no vault RMW, safe under concurrent tool-call producers
+// (the handle's outbox is an mpsc).
+//
+// Returns "ok" on enqueue success; throws on disconnect so the
+// agent sees the failure rather than silent black-hole. The
+// gateway's protocol has no client-side redelivery, so we don't
+// retry — if the socket is down, the operator's connection is
+// hosed and queueing won't fix it.
+fn submit_envelope(envelope, tool_name) {
+    let json_str = to_json_string(envelope);
+    let ok = ws_send_to_active(json_str);
+    if !ok {
+        throw "sms-socket: " + tool_name + " failed — WebSocket not connected. " +
+              "Check the plugin is enabled and the gateway URL is reachable " +
+              "(Settings → Plugins → SMS Socket → Status).";
+    }
+    log_info("sms-socket: sent " + tool_name + " envelope #" + envelope.requestId);
+}
+
+// =====================================================================
+// ADMIN ROUTES
+// =====================================================================
+
+fn admin_status(req) {
+    let api_key = vault_get("api_key");
+    let configured = api_key != () && api_key != "";
+    let gateway_url = vault_get("gateway_url");
+    if gateway_url == () || gateway_url == "" {
+        gateway_url = "ws://127.0.0.1:8787/";
+    }
+
+    // Surface the most recent gateway.state ping if any.
+    let gateway_state = ();
+    let raw = vault_get("gateway_state");
+    if raw != () && raw != "" {
+        try {
+            gateway_state = parse_json(raw);
+        } catch (e) {}
+    }
+
+    #{
+        "sidecar_status": if configured { "configured" } else { "unconfigured" },
+        "sidecar_rpc_url": (),
+        "gateway_url": gateway_url,
+        "configured": configured,
+        "gateway_state": gateway_state,
+    }
+}
+
+fn admin_get_config(req) {
+    let api_key = vault_get("api_key");
+    let gateway_url = vault_get("gateway_url");
+    let sub = vault_get("default_subscription_id");
+    #{
+        "api_key_set": api_key != () && api_key != "",
+        "api_key_masked": mask(api_key),
+        "gateway_url": if gateway_url != () && gateway_url != "" { gateway_url } else { "ws://127.0.0.1:8787/" },
+        "default_subscription_id": if sub != () { sub } else { "" },
+    }
+}
+
+fn admin_set_config(req) {
+    if req.body == () { throw "missing request body"; }
+    let raw_key = if req.body.api_key != () { req.body.api_key } else { "" };
+    let raw_url = if req.body.gateway_url != () { req.body.gateway_url } else { "" };
+    let raw_sub = if req.body.default_subscription_id != () { req.body.default_subscription_id } else { "" };
+    let api_key = trim(raw_key);
+    let gateway_url = trim(raw_url);
+    let sub = trim(raw_sub);
+
+    // Pre-validate before mutating anything in the vault — half-
+    // applied config (new url written, ws:// check throws) leaves
+    // the plugin in a confusing state. Validate first, then write.
+    if gateway_url != ""
+        && !gateway_url.starts_with("ws://")
+        && !gateway_url.starts_with("wss://")
+    {
+        throw "gateway_url must start with ws:// or wss://";
+    }
+    if sub != "" {
+        let parsed = host_parse_int(sub);
+        if parsed == () {
+            throw "default_subscription_id must be an integer";
+        }
+    }
+
+    if api_key == "" {
+        vault_delete("api_key");
+    } else {
+        vault_put("api_key", api_key);
+    }
+    if gateway_url == "" {
+        vault_delete("gateway_url");
+    } else {
+        vault_put("gateway_url", gateway_url);
+    }
+    if sub == "" {
+        vault_delete("default_subscription_id");
+    } else {
+        vault_put("default_subscription_id", sub);
+    }
+
+    // Reconnect in place so the operator doesn't have to bounce
+    // the plugin to pick up new credentials. ws_close_active()
+    // cancels the existing WS (if any) cooperatively — the
+    // consumer task drops on the next loop tick. on_enable() then
+    // opens a fresh subscription with the values we just wrote.
+    //
+    // Both calls are no-ops in the obvious edge cases:
+    //   * ws_close_active() returns false when there's no active
+    //     handle (first save before anything was running).
+    //   * on_enable() returns early when api_key is missing /
+    //     gateway_url is malformed, logging a warn — exactly the
+    //     same as the cold-start path.
+    let was_active = ws_close_active();
+    on_enable();
+    log_info(
+        "sms-socket: config updated; "
+            + (if was_active { "old WS torn down, " } else { "" })
+            + "reconnected with new credentials"
+    );
+    #{ "ok": true, "reconnected": true }
+}
+
+fn admin_test_message(req) {
+    if req.body == () { throw "missing request body"; }
+    let to = if req.body.to != () { trim(req.body.to) } else { "" };
+    if to == "" { throw "to required"; }
+    let destination = strip_sms_prefix(to);
+    validate_e164(destination);
+    let req_id = next_request_id();
+    let envelope = #{
+        "type": "sendSms",
+        "requestId": req_id,
+        "payload": with_subscription(#{
+            "destination": destination,
+            "body": "execlaw test message — SMS Socket plugin v0.1.0 wiring confirmed.",
+        }),
+    };
+    submit_envelope(envelope, "sms.admin_test");
+    #{ "ok": true, "request_id": req_id, "note": "Sent on the active gateway WebSocket." }
+}
+
+fn mask(s) {
+    if s == () || s == "" { return ""; }
+    let n = s.len();
+    let dots = repeat_char("*", if n <= 4 { n } else { n - 4 });
+    if n <= 4 { return dots; }
+    dots + s.sub_string(n - 4)
+}
+
+fn repeat_char(ch, n) {
+    let out = "";
+    let i = 0;
+    while i < n {
+        out += ch;
+        i += 1;
+    }
+    out
+}
+
+// =====================================================================
+// TEST-ONLY HELPERS
+// =====================================================================
+//
+// `_test_decode(raw_json)` — wraps parse_json + decode_event in a
+// single string-arg call so the unit-test fixture in
+// `crates/script/tests/sms_socket_plugin.rs` doesn't have to
+// hand-construct a Rhai Map across the FFI boundary.
+//
+// Production code paths go through on_frame, never through this
+// helper. The leading underscore is a convention signal — any
+// function whose name starts with `_test_` should be assumed
+// non-load-bearing.
+fn _test_decode(raw) {
+    let env;
+    try { env = parse_json(raw); } catch (e) { return (); }
+    if env == () { return (); }
+    let env_type = env.type;
+    if env_type == () || env_type == "" { return (); }
+    decode_event(env_type, env)
+}
