@@ -188,8 +188,9 @@ fn disk_free_bytes_for(path: &std::path::Path) -> std::io::Result<u64> {
 fn detect_cached_models() -> std::collections::HashMap<String, u64> {
     let cache_root = match std::env::var("EXECLAW_HF_CACHE") {
         Ok(p) => Some(std::path::PathBuf::from(p)),
-        Err(_) => directories::ProjectDirs::from("", "", "execlaw")
-            .map(|d| d.data_dir().join("hf-cache")),
+        Err(_) => {
+            directories::ProjectDirs::from("", "", "execlaw").map(|d| d.data_dir().join("hf-cache"))
+        }
     };
     let Some(root) = cache_root else {
         return std::collections::HashMap::new();
@@ -628,7 +629,8 @@ mod tests {
         std::fs::write(hub.join("models--solo").join("x"), b"abc").unwrap();
         std::fs::create_dir_all(hub.join("datasets--foo--bar")).unwrap();
         std::fs::create_dir_all(
-            hub.join("models--Qwen--Qwen2.5-14B-Instruct-AWQ").join("blobs"),
+            hub.join("models--Qwen--Qwen2.5-14B-Instruct-AWQ")
+                .join("blobs"),
         )
         .unwrap();
         std::fs::write(

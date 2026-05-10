@@ -26,8 +26,7 @@ use execlaw_core::MigrationRunner;
 use execlaw_core::db::DbConfig;
 
 fn main() {
-    let db = Database::open(&DbConfig::in_memory_unencrypted())
-        .expect("open in-memory db");
+    let db = Database::open(&DbConfig::in_memory_unencrypted()).expect("open in-memory db");
     MigrationRunner::new(&db)
         .apply_all()
         .expect("apply_all should succeed on a fresh db");
@@ -63,14 +62,13 @@ fn main() {
         // auto-creation. Detect by the synthesized SQL signature
         // (single-quoted table name, which sqlite never emits for
         // user-defined tables) and skip.
-        let mut stmt = c
-            .prepare(
-                "SELECT name, sql FROM sqlite_master \
+        let mut stmt = c.prepare(
+            "SELECT name, sql FROM sqlite_master \
                  WHERE type = 'table' \
                    AND name NOT LIKE 'sqlite_%' \
                    AND name != 'schema_version' \
                  ORDER BY name",
-            )?;
+        )?;
         let raw_tables: Vec<(String, String)> = stmt
             .query_map([], |r| {
                 let name: String = r.get(0)?;
@@ -90,9 +88,13 @@ fn main() {
                 !sql.trim_start().starts_with("CREATE TABLE '")
             })
             .collect();
-        out.push_str("-- =========================================================================\n");
+        out.push_str(
+            "-- =========================================================================\n",
+        );
         out.push_str("-- TABLES\n");
-        out.push_str("-- =========================================================================\n\n");
+        out.push_str(
+            "-- =========================================================================\n\n",
+        );
         for (_, sql) in &tables {
             if sql.is_empty() {
                 continue;
@@ -113,9 +115,13 @@ fn main() {
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<Result<_, _>>()?;
         if !indexes.is_empty() {
-            out.push_str("-- =========================================================================\n");
+            out.push_str(
+                "-- =========================================================================\n",
+            );
             out.push_str("-- INDEXES\n");
-            out.push_str("-- =========================================================================\n\n");
+            out.push_str(
+                "-- =========================================================================\n\n",
+            );
             for sql in &indexes {
                 out.push_str(sql.trim());
                 out.push_str(";\n");
@@ -134,9 +140,13 @@ fn main() {
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<Result<_, _>>()?;
         if !triggers.is_empty() {
-            out.push_str("-- =========================================================================\n");
+            out.push_str(
+                "-- =========================================================================\n",
+            );
             out.push_str("-- TRIGGERS\n");
-            out.push_str("-- =========================================================================\n\n");
+            out.push_str(
+                "-- =========================================================================\n\n",
+            );
             for sql in &triggers {
                 out.push_str(sql.trim());
                 out.push_str(";\n\n");
@@ -154,9 +164,13 @@ fn main() {
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<Result<_, _>>()?;
         if !views.is_empty() {
-            out.push_str("-- =========================================================================\n");
+            out.push_str(
+                "-- =========================================================================\n",
+            );
             out.push_str("-- VIEWS\n");
-            out.push_str("-- =========================================================================\n\n");
+            out.push_str(
+                "-- =========================================================================\n\n",
+            );
             for sql in &views {
                 out.push_str(sql.trim());
                 out.push_str(";\n\n");
@@ -167,13 +181,17 @@ fn main() {
         // A non-empty table after apply_all on an empty DB was seeded
         // by migration SQL. Capture those rows as INSERT OR IGNORE
         // so the baseline reproduces the same starting state.
-        out.push_str("-- =========================================================================\n");
+        out.push_str(
+            "-- =========================================================================\n",
+        );
         out.push_str("-- SEEDED ROWS\n");
-        out.push_str("-- =========================================================================\n\n");
+        out.push_str(
+            "-- =========================================================================\n\n",
+        );
         for (table, _) in &tables {
             // Count rows; emit INSERTs only for non-empty tables.
-            let count: i64 = c
-                .query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |r| {
+            let count: i64 =
+                c.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |r| {
                     r.get(0)
                 })?;
             if count == 0 {
