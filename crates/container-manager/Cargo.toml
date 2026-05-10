@@ -49,7 +49,7 @@ hardware-query = "0.2"
 # propagate `memory_mb` from the NVIDIA NVML enrichment back into the
 # merged `GPUInfo`, so WMI's UINT32-capped 4 GB wins over NVML's
 # accurate value. We call NVML directly to override.
-nvml-wrapper = "0.11"
+nvml-wrapper = "0.12"
 
 # Windows-only: read the per-display-class registry node that
 # `Win32_VideoController.AdapterRAM` truncates. The 64-bit
