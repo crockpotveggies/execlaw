@@ -151,38 +151,7 @@ jobs:
           # the repo root.
           command: check advisories bans licenses sources
 
-  # Code-coverage. Uses cargo-llvm-cov (LLVM source-based coverage,
-  # which works for both unit and integration tests with the
-  # `--workspace --all-features` switches we run elsewhere).
-  # Output is uploaded to Codecov as `lcov.info`. The badge in
-  # README pulls from the same source.
-  coverage:
-    name: coverage
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-
-      - name: Cache cargo registry + build artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: coverage
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-
-      - name: cargo llvm-cov --workspace --lcov
-        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
-        with:
-          files: lcov.info
-          # No `token:` — Codecov accepts unauthenticated uploads from
-          # public repos via tokenless mode. Add a CODECOV_TOKEN secret
-          # if the repo ever flips private.
-          fail_ci_if_error: false
+  # Code-coverage job is currently disabled — re-enable when we wire
+  # up a CODECOV_TOKEN or otherwise restore the lcov upload pipeline.
+  # The previous job ran cargo-llvm-cov over the workspace and pushed
+  # `lcov.info` to Codecov; the README badge depends on that upload.
