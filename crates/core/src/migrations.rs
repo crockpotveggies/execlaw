@@ -202,6 +202,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "memory-lifecycle",
         sql: include_str!("../migrations/0035_memory_lifecycle.sql"),
     },
+    Migration {
+        id: 36,
+        name: "general-settings-default-port-3031",
+        sql: include_str!("../migrations/0036_general_settings_default_port_3031.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -386,7 +391,7 @@ mod tests {
             applied,
             vec![
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
             ]
         );
 
@@ -466,12 +471,108 @@ mod tests {
             first,
             vec![
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
             ]
         );
         assert!(
             second.is_empty(),
             "rerun must not re-apply already-applied migrations"
+        );
+    }
+
+    #[test]
+    fn migration_36_bumps_default_port_only_when_unchanged() {
+        // 0036 corrects a stale-default for installs that ran 0017
+        // when the seed was `127.0.0.1:3030`. Operators who already
+        // edited their bind_address must NOT be silently moved.
+        //
+        // Three scenarios — each reflects a real install state:
+        //   1. fresh install (table doesn't exist yet) → 0017 seeds
+        //      :3030, then 0036 flips it to :3031
+        //   2. existing install on the original :3030 default →
+        //      0036 flips it to :3031 (matches the original commit's
+        //      "fresh installs get :3031" intent now applied
+        //      uniformly)
+        //   3. operator manually changed to e.g. :8080 → 0036 must
+        //      leave :8080 alone (the WHERE clause is the guard)
+        //
+        // Apply migrations through 0017 first to get the original
+        // seed, mutate to simulate the third scenario, then run
+        // 0036 directly via the runner so we exercise the actual
+        // shipped SQL.
+        // Scenario 1+2 collapse: starting from a fresh DB, the full
+        // chain of migrations seeds :3030 at 0017 and 0036 then
+        // flips it to :3031.
+        let db1 = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db1).apply_all().unwrap();
+        let port_after: String = db1
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT bind_address FROM config_general WHERE id = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap())
+            })
+            .unwrap();
+        assert_eq!(
+            port_after, "127.0.0.1:3031",
+            "fresh install should land on :3031 after 0036"
+        );
+
+        // Scenario 3: operator changed to a non-default value before
+        // 0036 ran. Apply through 0017 by direct SQL, mutate, then
+        // run apply_all (which applies 0018..=0036 — 0036 must
+        // leave the manually-edited value alone).
+        let db2 = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        db2.with_conn(|c| {
+            for m in MIGRATIONS.iter().take_while(|m| m.id <= 17) {
+                c.execute_batch(m.sql).unwrap();
+            }
+            // Stamp these into schema_version too so apply_all
+            // doesn't try to re-run them.
+            c.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_version (\
+                    id          INTEGER PRIMARY KEY,\
+                    name        TEXT NOT NULL,\
+                    checksum    TEXT NOT NULL,\
+                    applied_at  INTEGER NOT NULL\
+                 );",
+            )
+            .unwrap();
+            for m in MIGRATIONS.iter().take_while(|m| m.id <= 17) {
+                c.execute(
+                    "INSERT OR IGNORE INTO schema_version(id, name, checksum, applied_at) \
+                     VALUES (?1, ?2, ?3, strftime('%s','now'))",
+                    params![m.id, m.name, simple_checksum(m.sql)],
+                )
+                .unwrap();
+            }
+            // Operator manually changed bind_address.
+            c.execute(
+                "UPDATE config_general SET bind_address = '127.0.0.1:8080' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        // Now apply the rest — 0036 lands and must NOT touch the
+        // edited row.
+        MigrationRunner::new(&db2).apply_all().unwrap();
+        let preserved: String = db2
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT bind_address FROM config_general WHERE id = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap())
+            })
+            .unwrap();
+        assert_eq!(
+            preserved, "127.0.0.1:8080",
+            "0036 must not overwrite an operator's manually-edited bind_address",
         );
     }
 
