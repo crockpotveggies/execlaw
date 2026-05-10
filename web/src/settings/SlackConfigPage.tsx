@@ -11,7 +11,7 @@
 // so the host's principal-admit pipeline treats inbound messages
 // from that Slack user as Controller-class.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type JSX } from "react";
 import { Alert, Badge, Button, Card, Form, Spinner, Table } from "react-bootstrap";
 import {
     addMyIdentifier,

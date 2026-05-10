@@ -23,7 +23,7 @@
 // "starting" sidecar surfaces here instead of leaving the operator
 // confused why the QR endpoint 503s.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type JSX } from "react";
 import Button from "react-bootstrap/Button";
 import {
     fetchSignalQrCodeLink,

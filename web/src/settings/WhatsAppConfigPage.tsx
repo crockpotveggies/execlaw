@@ -7,7 +7,7 @@
 // / SignalQrCodeLinkResponse types are reused via type aliases
 // in api/endpoints.ts.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type JSX } from "react";
 import Button from "react-bootstrap/Button";
 import {
     fetchWhatsAppQrCodeLink,
