@@ -295,14 +295,41 @@ pub async fn should_dispatch_to_agent(
 /// * Substring, not word-boundary. We accept "Lena's" matching
 ///   "lena" — false positives here cost a turn that wouldn't have
 ///   run anyway, false negatives skip a clear address.
+/// * **Multi-word names**: when `name` has multiple whitespace-
+///   separated tokens (e.g. "Lena Executive Assistant"), we ALSO
+///   check whether the first token alone (≥3 chars) appears in
+///   `text`. That's the form humans actually use to address the
+///   agent ("Lena, how are you?") — without this, a multi-word
+///   `display_name` makes the cheap shortcut miss every real
+///   address and forces the slow LLM classifier path on every
+///   group message. Operators consistently set their agent's
+///   display_name to "Firstname Role" (e.g. "Lena Executive
+///   Assistant"), so this case isn't an edge — it's the default.
 pub fn name_in_text(name: &str, text: &str) -> bool {
     let name = name.trim();
     if name.chars().count() < 2 {
         return false;
     }
-    let name_l = name.to_lowercase();
     let text_l = text.to_lowercase();
-    text_l.contains(&name_l)
+    let name_l = name.to_lowercase();
+    if text_l.contains(&name_l) {
+        return true;
+    }
+    // Multi-word fallback. Take the first whitespace-delimited
+    // token; only fire when it's ≥3 chars to avoid pathological
+    // matches on a leading "A " or "I " (initial / pronoun).
+    if let Some(first) = name.split_whitespace().next() {
+        if first.chars().count() >= 3 {
+            let first_l = first.to_lowercase();
+            // Skip the redundant check when first == name (single-
+            // word name — the substring check above already covered
+            // it).
+            if first_l != name_l && text_l.contains(&first_l) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Read the agent's `display_name` + `role` from the personality
@@ -357,45 +384,26 @@ async fn classify_via_llm(
     } else {
         agent_role
     };
-    // Few-shot prompt — small classifier models (Haiku-class) do
-    // much better with concrete examples than with rule lists.
-    // The earlier rule-based version was getting "Elyssa are you
-    // taking the Tesla?" wrong (returning directed=true) because
-    // the model saw "could answer this" and overrode the rules.
-    //
-    // Examples are chosen to cover the failure modes operators
-    // reported, anchored to two key patterns the model needs to
-    // distinguish:
-    //   * direct address to the agent → true
-    //   * direct address to another human (by name OR pronoun) → false
-    //
-    // Wording is deliberately blunt: small models lose nuance under
-    // long instructions. The single classifier rule is the example
-    // set + "match the closest example."
+    // Compact few-shot prompt. Earlier versions tried 15+ examples
+    // + rule paragraphs; that bloated the prefill (~600 tokens) on
+    // a deployment where Small backend isn't configured and the
+    // classifier shares the main Standard model — every group
+    // inbound paid 2-5s of extra prefill, which operators noticed
+    // immediately. Six examples cover the patterns we actually
+    // need to distinguish: address-to-agent, address-to-other-by-
+    // name, generic-to-room, and short-acks.
     let system_prompt = format!(
-        "Classify whether a group-chat message is directed at the agent named \"{agent_name}\" \
-         (role: {role_phrase}).\n\n\
-         Examples (match the closest pattern):\n\
+        "Is this group-chat message directed at \"{agent_name}\" (the {role_phrase})?\n\n\
+         Examples:\n\
          \"{agent_name}, can you check the calendar?\" → {{\"directed\": true}}\n\
          \"hey {agent_name}\" → {{\"directed\": true}}\n\
-         \"@{agent_name} what time tomorrow?\" → {{\"directed\": true}}\n\
-         \"{agent_name} please draft a reply\" → {{\"directed\": true}}\n\
-         \"thanks {agent_name}\" → {{\"directed\": true}}\n\
          \"Alice, did you book the venue?\" → {{\"directed\": false}}\n\
-         \"Bob are you taking the car?\" → {{\"directed\": false}}\n\
          \"Elyssa are you taking the Tesla?\" → {{\"directed\": false}}\n\
          \"anyone know a good Thai place?\" → {{\"directed\": false}}\n\
-         \"what time are we meeting tomorrow?\" → {{\"directed\": false}}\n\
-         \"now\" → {{\"directed\": false}}\n\
-         \"lol\" → {{\"directed\": false}}\n\
-         \"ok cool\" → {{\"directed\": false}}\n\
-         \"👍\" → {{\"directed\": false}}\n\
-         \"on my way\" → {{\"directed\": false}}\n\n\
-         Rules:\n\
-         - If the message addresses ANY person by name and that name is NOT \"{agent_name}\", \
-         output false. Always. The named person will answer.\n\
-         - If unsure, output false. The default in a group is silence.\n\n\
-         Now classify. Output ONLY one JSON object: {{\"directed\": true}} or {{\"directed\": false}}."
+         \"ok cool\" → {{\"directed\": false}}\n\n\
+         Rule: if the message names a person who is NOT \"{agent_name}\", output false. \
+         If unsure, output false.\n\n\
+         Output ONLY {{\"directed\": true}} or {{\"directed\": false}}."
     );
 
     let req = ChatRequest {
@@ -417,8 +425,16 @@ async fn classify_via_llm(
         chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
     };
 
+    // Tighter timeout: when Small backend isn't configured the
+    // classifier shares the Standard model with the main turn, and
+    // the inference server serializes requests. A 5s ceiling meant
+    // a busy main turn could starve the classifier, blocking the
+    // group inbound for the full window. 2s is enough headroom for
+    // a 32-token output on any reasonable backend; on the rare
+    // overload, falling open + dispatching with the agent's hard-
+    // rules block is the right tradeoff.
     let resp = match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(2),
         inference.chat_completions(&req),
     )
     .await
@@ -435,7 +451,7 @@ async fn classify_via_llm(
         Err(_) => {
             tracing::warn!(
                 target: "group_addressing",
-                "address classifier timed out after 5s; falling open"
+                "address classifier timed out after 2s; falling open"
             );
             return DispatchDecision::Dispatch(AddressedReason::FallOpenClassifierError);
         }
@@ -633,6 +649,48 @@ mod tests {
         // defence.
         assert!(!name_in_text("L", "this is a long sentence"));
         assert!(!name_in_text("", "anything"));
+    }
+
+    #[test]
+    fn name_in_text_matches_first_word_of_multi_word_name() {
+        // Operators consistently set their agent's display_name to
+        // a "Firstname Role" form, e.g. "Lena Executive Assistant".
+        // Humans address the agent by the first name only ("Lena,
+        // how are you?"). Without first-word matching, the cheap
+        // shortcut misses every real address and forces every
+        // group inbound through the slow LLM classifier — the exact
+        // regression operators reported as "transport channels are
+        // slow."
+        assert!(name_in_text(
+            "Lena Executive Assistant",
+            "Lena, how are you?"
+        ));
+        assert!(name_in_text(
+            "Lena Executive Assistant",
+            "hey lena can you draft a reply?"
+        ));
+        assert!(name_in_text(
+            "Olivia Strategist",
+            "olivia what time tomorrow"
+        ));
+        // Negative: first word doesn't appear.
+        assert!(!name_in_text(
+            "Lena Executive Assistant",
+            "Alice, did you book the venue?"
+        ));
+    }
+
+    #[test]
+    fn name_in_text_first_word_fallback_skips_short_first_words() {
+        // Defensive: if someone configured `display_name = "A B C"`,
+        // the first-word fallback shouldn't fire on the 1-letter
+        // token. The substring path already matches the full string
+        // when present; the fallback only adds the first-word case.
+        assert!(!name_in_text("A B C", "this is a sentence about something"));
+        // 2-letter first word also blocked (threshold is 3) so we
+        // don't pathologically match "Hi there" against display_name
+        // = "Bo Xilai".
+        assert!(!name_in_text("Bo Xilai", "Hi there how are you"));
     }
 
     #[test]
