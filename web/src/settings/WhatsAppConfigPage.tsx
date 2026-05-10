@@ -17,6 +17,7 @@ import {
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
+import { SidecarStatusBlock } from "../components/SidecarStatusBlock";
 import type { PluginConfigProps } from "./PluginConfigBase";
 
 const POLL_INTERVAL_MS = 3_000;
@@ -77,7 +78,23 @@ export function WhatsAppConfigPage(_props: PluginConfigProps): JSX.Element {
                 <div className="execlaw-muted small">Loading status…</div>
             ) : (
                 <>
-                    <SidecarStatusBlock status={status} />
+                    <SidecarStatusBlock
+                        sidecarLabel="wuzapi"
+                        status={status.sidecar_status}
+                        rpcUrl={status.sidecar_rpc_url}
+                        fetchError={status.fetch_error}
+                        testidPrefix="whatsapp"
+                        followupHint={
+                            status.sidecar_status === "awaiting_pairing" ? (
+                                <>
+                                    Sidecar is up; waiting for the wuzapi
+                                    user to be provisioned. The plugin
+                                    auto-creates one on the first poll —
+                                    usually a few seconds.
+                                </>
+                            ) : undefined
+                        }
+                    />
                     {status.registered_accounts.length === 0 ? (
                         <PairingBlock
                             sidecarRunning={status.sidecar_rpc_url !== null}
@@ -96,58 +113,10 @@ export function WhatsAppConfigPage(_props: PluginConfigProps): JSX.Element {
     );
 }
 
-function SidecarStatusBlock({
-    status,
-}: {
-    status: WhatsAppStatusResponse;
-}): JSX.Element {
-    const chipClass = badgeClassForStatus(status.sidecar_status);
-    return (
-        <div className="execlaw-card mb-3" data-testid="whatsapp-sidecar-block">
-            <div className="execlaw-card__title mb-2">wuzapi sidecar</div>
-            <div className="d-flex align-items-center gap-2 small mb-2">
-                <span
-                    className={`badge ${chipClass}`}
-                    data-testid="whatsapp-sidecar-status"
-                >
-                    {status.sidecar_status}
-                </span>
-                {status.sidecar_rpc_url && (
-                    <code
-                        className="execlaw-muted"
-                        title="Loopback URL the supervisor published"
-                    >
-                        {status.sidecar_rpc_url}
-                    </code>
-                )}
-            </div>
-            {status.fetch_error && (
-                <div
-                    className="execlaw-muted small"
-                    data-testid="whatsapp-sidecar-fetch-error"
-                >
-                    Account fetch failed: {status.fetch_error}
-                </div>
-            )}
-            {status.sidecar_status === "awaiting_pairing" && (
-                <div className="execlaw-muted small">
-                    Sidecar is up; waiting for the wuzapi user to be
-                    provisioned. The plugin auto-creates one on the
-                    first poll — usually a few seconds.
-                </div>
-            )}
-            {status.sidecar_status !== "healthy" &&
-                status.sidecar_status !== "awaiting_pairing" && (
-                    <div className="execlaw-muted small">
-                        Sidecar isn&apos;t healthy yet. Pairing waits
-                        until the supervisor brings it up — see{" "}
-                        <strong>Settings → Sidecars</strong> for restart
-                        attempts and recent errors.
-                    </div>
-                )}
-        </div>
-    );
-}
+// SidecarStatusBlock moved to ../components/SidecarStatusBlock.tsx
+// and shared with the Signal config page. The `awaiting_pairing`
+// follow-up copy is supplied to the shared block via the
+// `followupHint` prop above.
 
 function PairingBlock({
     sidecarRunning,
@@ -347,22 +316,10 @@ function PairedBlock({
     );
 }
 
-function badgeClassForStatus(status: string): string {
-    switch (status) {
-        case "healthy":
-            return "bg-success";
-        case "starting":
-        case "pulling":
-        case "awaiting_pairing":
-            return "bg-info";
-        case "crashlooping":
-        case "unhealthy":
-            return "bg-danger";
-        case "stopped":
-        case "unwired":
-        case "down":
-            return "bg-secondary";
-        default:
-            return "bg-secondary";
-    }
-}
+// `badgeClassForStatus` moved to the shared SidecarStatusBlock
+// component (see `presentationFor` in
+// `../components/SidecarStatusBlock.tsx`). The shared mapping
+// also handles the `crash_looping` underscore-spelling that the
+// supervisor's wire format actually emits — the local table here
+// matched only `crashlooping` (no underscore) and so never fired
+// for real crash-looping sidecars.

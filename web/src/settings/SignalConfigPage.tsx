@@ -33,6 +33,7 @@ import {
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
+import { SidecarStatusBlock } from "../components/SidecarStatusBlock";
 import type { PluginConfigProps } from "./PluginConfigBase";
 
 /// Poll cadence while the operator is on-page. The QR-code scan
@@ -108,7 +109,13 @@ export function SignalConfigPage(_props: PluginConfigProps): JSX.Element {
                 <div className="execlaw-muted small">Loading status…</div>
             ) : (
                 <>
-                    <SidecarStatusBlock status={status} />
+                    <SidecarStatusBlock
+                        sidecarLabel="signal-cli"
+                        status={status.sidecar_status}
+                        rpcUrl={status.sidecar_rpc_url}
+                        fetchError={status.fetch_error}
+                        testidPrefix="signal"
+                    />
                     {status.registered_accounts.length === 0 ? (
                         <PairingBlock
                             sidecarRunning={status.sidecar_rpc_url !== null}
@@ -127,50 +134,10 @@ export function SignalConfigPage(_props: PluginConfigProps): JSX.Element {
     );
 }
 
-function SidecarStatusBlock({
-    status,
-}: {
-    status: SignalStatusResponse;
-}): JSX.Element {
-    const chipClass = badgeClassForStatus(status.sidecar_status);
-    return (
-        <div className="execlaw-card mb-3" data-testid="signal-sidecar-block">
-            <div className="execlaw-card__title mb-2">signal-cli sidecar</div>
-            <div className="d-flex align-items-center gap-2 small mb-2">
-                <span
-                    className={`badge ${chipClass}`}
-                    data-testid="signal-sidecar-status"
-                >
-                    {status.sidecar_status}
-                </span>
-                {status.sidecar_rpc_url && (
-                    <code
-                        className="execlaw-muted"
-                        title="Loopback URL the supervisor published"
-                    >
-                        {status.sidecar_rpc_url}
-                    </code>
-                )}
-            </div>
-            {status.fetch_error && (
-                <div
-                    className="execlaw-muted small"
-                    data-testid="signal-sidecar-fetch-error"
-                >
-                    Account fetch failed: {status.fetch_error}
-                </div>
-            )}
-            {status.sidecar_status !== "healthy" && (
-                <div className="execlaw-muted small">
-                    Sidecar isn&apos;t healthy yet. Pairing waits until the
-                    supervisor brings it up — see{" "}
-                    <strong>Settings → Sidecars</strong> for restart attempts
-                    and recent errors.
-                </div>
-            )}
-        </div>
-    );
-}
+// SidecarStatusBlock moved to ../components/SidecarStatusBlock.tsx
+// and shared with the WhatsApp config page. The status presentation
+// (chip color, "booting up" header with spinner, stage-appropriate
+// explainer) lives there.
 
 function PairingBlock({
     sidecarRunning,
@@ -421,19 +388,12 @@ function PairedBlock({
     );
 }
 
-function badgeClassForStatus(status: string): string {
-    switch (status) {
-        case "healthy":
-            return "bg-success";
-        case "starting":
-        case "pulling":
-            return "bg-info";
-        case "crashlooping":
-            return "bg-danger";
-        case "stopped":
-        case "unwired":
-            return "bg-secondary";
-        default:
-            return "bg-secondary";
-    }
-}
+// `badgeClassForStatus` moved to the shared SidecarStatusBlock
+// component (see `presentationFor` in
+// `../components/SidecarStatusBlock.tsx`). The supervisor's wire
+// format is `crash_looping` (with the underscore — see
+// `crates/server/src/sidecars_admin.rs::view_from_status`); the old
+// local implementation here checked for `crashlooping` (without)
+// and so never matched, leaving crash-looping sidecars rendered in
+// neutral grey instead of red. The shared component handles both
+// spellings explicitly.
