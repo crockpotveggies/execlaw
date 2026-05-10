@@ -41,7 +41,7 @@ axum.workspace = true
 # (Linux) / launchd (macOS) / Windows SCM behind one trait so the
 # `execlaw service install/start/stop/uninstall` commands carry one
 # Rust impl instead of three platform-specific install scripts.
-service-manager = "0.8"
+service-manager = "0.11"
 
 # windows-service is the runtime side of the Windows story: when
 # running as a Windows service, the binary needs to handle SCM

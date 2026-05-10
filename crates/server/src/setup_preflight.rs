@@ -58,6 +58,14 @@ pub struct PreflightResponse {
     /// operator knows where to free up space when they hit the
     /// "not enough room" warning.
     pub disk_free_path: Option<String>,
+    /// HuggingFace model id → cached bytes on disk, for every model
+    /// already present under `<cache>/hub/`. The setup wizard
+    /// subtracts the picked model's cached bytes from "required
+    /// disk space" so an operator who already has the weights
+    /// downloaded doesn't see a false "not enough disk" error
+    /// (the weights don't need to be re-acquired). Empty map on a
+    /// fresh install or when the cache dir doesn't exist yet.
+    pub cached_models: std::collections::HashMap<String, u64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -92,11 +100,13 @@ pub async fn get_handler(
     let docker = detect_docker();
     let profile = detect();
     let (disk_free_bytes, disk_free_path) = detect_disk_free();
+    let cached_models = detect_cached_models();
     Json(PreflightResponse {
         docker,
         gpus: profile.gpus,
         disk_free_bytes,
         disk_free_path,
+        cached_models,
     })
 }
 
@@ -152,6 +162,116 @@ fn detect_disk_free() -> (Option<u64>, Option<String>) {
 /// server crate forbids unsafe code.
 fn disk_free_bytes_for(path: &std::path::Path) -> std::io::Result<u64> {
     fs4::available_space(path)
+}
+
+/// Enumerate the HF cache and return `model_id → bytes_on_disk` for
+/// every model present. The HF cache layout is
+/// `<cache>/hub/models--<owner>--<repo>/...`, so we read directory
+/// entries under `<cache>/hub/`, strip the `models--` prefix, and
+/// convert the first `--` back to `/` to recover the canonical
+/// `owner/repo` model id. Sizes are summed via a recursive walk.
+///
+/// Returns an empty map when:
+///   * the HF cache dir doesn't exist yet (fresh install)
+///   * `<cache>/hub` doesn't exist
+///   * any I/O error mid-walk (best-effort; we don't fail preflight
+///     over a stale symlink in someone's cache)
+///
+/// Drives the wizard's "this model is already cached" path: the
+/// frontend looks up the picked model's id in this map, subtracts
+/// those bytes from `required = disk_mb + safety_margin`, and
+/// suppresses the "not enough disk" warning when the cached bytes
+/// cover the weights. Catches the regression where an operator with
+/// the model fully downloaded saw a false-positive "free up 3.1 GB"
+/// because the volume was full but the model didn't need any
+/// additional bytes.
+fn detect_cached_models() -> std::collections::HashMap<String, u64> {
+    let cache_root = match std::env::var("EXECLAW_HF_CACHE") {
+        Ok(p) => Some(std::path::PathBuf::from(p)),
+        Err(_) => {
+            directories::ProjectDirs::from("", "", "execlaw").map(|d| d.data_dir().join("hf-cache"))
+        }
+    };
+    let Some(root) = cache_root else {
+        return std::collections::HashMap::new();
+    };
+    cached_models_in(&root)
+}
+
+/// Pure helper: enumerate `<cache_root>/hub/models--*` and produce
+/// the `model_id → bytes` map. Split out from `detect_cached_models`
+/// so tests can point at a temp directory without touching env vars
+/// (the crate forbids unsafe code, and `std::env::set_var` is
+/// unsafe in the 2024 edition).
+pub(crate) fn cached_models_in(
+    cache_root: &std::path::Path,
+) -> std::collections::HashMap<String, u64> {
+    let hub = cache_root.join("hub");
+    let entries = match std::fs::read_dir(&hub) {
+        Ok(e) => e,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    let mut out = std::collections::HashMap::new();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let stripped = match name.strip_prefix("models--") {
+            Some(s) => s,
+            None => continue,
+        };
+        // HF stores `owner/repo` as `owner--repo` in the directory
+        // name. Replace the first `--` with `/`. HF model ids are
+        // always two-part (`org/name`), so a single replacement is
+        // exact — but we use `splitn` rather than `replacen` to be
+        // explicit about the structure.
+        let model_id = match stripped.splitn(2, "--").collect::<Vec<_>>().as_slice() {
+            [owner, repo] => format!("{owner}/{repo}"),
+            _ => continue,
+        };
+        let bytes = dir_size(&entry.path()).unwrap_or(0);
+        if bytes > 0 {
+            out.insert(model_id, bytes);
+        }
+    }
+    out
+}
+
+/// Recursive directory size in bytes. Skips entries whose metadata
+/// or directory walk fails — the cache is operator-managed and we
+/// don't want a single broken symlink to fail the whole probe.
+fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let entries = match std::fs::read_dir(&p) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total = total.saturating_add(meta.len());
+            }
+            // Symlinks: meta.is_dir/is_file follow the link target, so
+            // we land on the linked file's bytes if the target is
+            // valid. A dangling symlink falls through both branches.
+        }
+    }
+    Ok(total)
 }
 
 /// Probe `docker info` to determine Docker daemon availability.
@@ -424,6 +544,107 @@ mod tests {
                 "disk_free_bytes should be positive on a working host"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn preflight_includes_cached_models_field() {
+        // The wizard subtracts `cached_models[picked_id]` from the
+        // disk-space requirement so an operator with the model
+        // already downloaded doesn't see a false "not enough disk"
+        // warning. The endpoint must always return a (possibly
+        // empty) object so the frontend can read it without a
+        // null-check branch.
+        let app = build_router(test_app_state());
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/admin/setup/preflight")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["cached_models"].is_object(),
+            "cached_models must be an object (possibly empty); got {:?}",
+            v["cached_models"]
+        );
+    }
+
+    #[test]
+    fn detect_cached_models_finds_models_in_a_seeded_cache_dir() {
+        // Build a fake HF cache layout in a temp dir and verify the
+        // pure enumerator (`cached_models_in`) returns the right
+        // model_id → bytes map.
+        //
+        // The HF cache layout is:
+        //   <cache>/hub/models--<owner>--<repo>/blobs/<sha256>
+        // and the enumerator walks `models--*` dirs recursively.
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        let model_dir = hub.join("models--QuantTrio--Qwen3.5-27B-AWQ").join("blobs");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("part-1"), vec![0u8; 1024]).unwrap();
+        std::fs::write(model_dir.join("part-2"), vec![0u8; 2048]).unwrap();
+
+        // Also seed a non-models entry to confirm it's ignored.
+        std::fs::create_dir_all(hub.join("ignored-other-thing")).unwrap();
+        std::fs::write(hub.join("ignored-other-thing").join("x"), b"hello").unwrap();
+
+        let map = cached_models_in(tmp.path());
+
+        assert_eq!(
+            map.get("QuantTrio/Qwen3.5-27B-AWQ"),
+            Some(&3072),
+            "enumerator must report the summed file bytes under the model dir; got map = {map:?}",
+        );
+        // Non-models entries don't appear.
+        assert!(!map.contains_key("ignored-other-thing"));
+    }
+
+    #[test]
+    fn detect_cached_models_returns_empty_when_cache_missing() {
+        // Fresh install: the hub/ dir doesn't exist yet. The
+        // enumerator must handle this gracefully — empty map, no
+        // error. Without this guarantee, the wizard's first-run
+        // path would 500 on every preflight.
+        let tmp = tempfile::tempdir().unwrap();
+        // Pass a path that's missing the `hub` subdir.
+        let map = cached_models_in(tmp.path());
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn detect_cached_models_skips_dirs_with_unexpected_naming() {
+        // Defensive: a directory under `hub/` that doesn't follow
+        // the `models--<owner>--<repo>` shape is silently skipped
+        // — could be a partial download, an unrelated cache, or
+        // future HF additions like `datasets--…`. We don't want a
+        // single non-conforming entry to poison the rest of the
+        // map.
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        std::fs::create_dir_all(hub.join("models--solo")).unwrap();
+        std::fs::write(hub.join("models--solo").join("x"), b"abc").unwrap();
+        std::fs::create_dir_all(hub.join("datasets--foo--bar")).unwrap();
+        std::fs::create_dir_all(
+            hub.join("models--Qwen--Qwen2.5-14B-Instruct-AWQ")
+                .join("blobs"),
+        )
+        .unwrap();
+        std::fs::write(
+            hub.join("models--Qwen--Qwen2.5-14B-Instruct-AWQ")
+                .join("blobs")
+                .join("file"),
+            vec![0u8; 512],
+        )
+        .unwrap();
+
+        let map = cached_models_in(tmp.path());
+        // Only the well-formed model is returned.
+        assert_eq!(map.get("Qwen/Qwen2.5-14B-Instruct-AWQ"), Some(&512));
+        assert_eq!(map.len(), 1, "unexpected entries: {map:?}");
     }
 
     #[test]

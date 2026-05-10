@@ -19,7 +19,7 @@
 // Sends are immediate, with no vault-backed outbox in between, so
 // concurrent tool calls are safe under the WS handle's mpsc.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type JSX } from "react";
 import { Alert, Badge, Button, Card, Form, Spinner } from "react-bootstrap";
 import {
     getSmsSocketConfig,

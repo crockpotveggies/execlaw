@@ -10,7 +10,7 @@
 //     the operator confirms the keys actually work before the
 //     agent's first call.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type JSX } from "react";
 import { Alert, Badge, Button, Card, Form, Spinner } from "react-bootstrap";
 import {
     getPushoverConfig,

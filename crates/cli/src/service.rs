@@ -32,8 +32,8 @@
 use crate::default_data_dir;
 use anyhow::Context;
 use service_manager::{
-    ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager, ServiceStartCtx, ServiceStopCtx,
-    ServiceUninstallCtx,
+    RestartPolicy, ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager, ServiceStartCtx,
+    ServiceStopCtx, ServiceUninstallCtx,
 };
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -145,7 +145,7 @@ pub fn install(system: bool, bind: Option<String>, db: Option<PathBuf>) -> anyho
         working_directory: Some(default_data_dir()),
         environment: None,
         autostart: true,
-        disable_restart_on_failure: false,
+        restart_policy: RestartPolicy::default(),
     };
     if let Err(e) = mgr.install(ctx) {
         return Err(decorate_permission_error(e, system, "install"));

@@ -7,6 +7,8 @@
 // danger-zone footer; those are owned by `PluginConfigShell`
 // (uninstall is intentionally not overridable).
 
+import type { JSX } from "react";
+
 export interface PluginConfigProps {
     /// Plugin id from the manifest. Plugins use this to scope
     /// API calls (e.g. `/api/admin/oauth/clients/<id>/...`).

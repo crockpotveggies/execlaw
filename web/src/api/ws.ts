@@ -115,7 +115,19 @@ export class WsClient {
             return false;
         }
         try {
-            this.socket.send(bytes);
+            // TS 5.7+ split `Uint8Array<ArrayBuffer>` from
+            // `Uint8Array<SharedArrayBuffer>`; WebSocket.send takes
+            // the former. We never construct from a SharedArrayBuffer,
+            // so feed the underlying ArrayBuffer directly when we
+            // hold a typed-array view.
+            const payload =
+                bytes instanceof Uint8Array
+                    ? (bytes.buffer.slice(
+                          bytes.byteOffset,
+                          bytes.byteOffset + bytes.byteLength,
+                      ) as ArrayBuffer)
+                    : bytes;
+            this.socket.send(payload);
             return true;
         } catch {
             return false;
