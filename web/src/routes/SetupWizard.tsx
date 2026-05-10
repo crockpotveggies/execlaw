@@ -690,6 +690,7 @@ function BackendStep({
     const dockerAvailable = preflight?.docker.available ?? false;
     const diskFreeBytes = preflight?.disk_free_bytes ?? null;
     const diskFreePath = preflight?.disk_free_path ?? null;
+    const cachedModels = preflight?.cached_models ?? {};
 
     // First-run wizard always configures the Standard slot. Settings →
     // Backends uses the same component for all four purposes via a
@@ -718,6 +719,7 @@ function BackendStep({
                 dockerAvailable={dockerAvailable}
                 diskFreeBytes={diskFreeBytes}
                 diskFreePath={diskFreePath}
+                cachedModels={cachedModels}
                 onSubmit={handleSubmit}
                 onSkip={onSkip}
                 testIdPrefix="setup-backend"

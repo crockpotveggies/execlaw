@@ -193,6 +193,9 @@ export function BackendsPage() {
     const [preflightDockerOk, setPreflightDockerOk] = useState<boolean>(true);
     const [preflightDiskFree, setPreflightDiskFree] = useState<number | null>(null);
     const [preflightDiskPath, setPreflightDiskPath] = useState<string | null>(null);
+    const [preflightCachedModels, setPreflightCachedModels] = useState<
+        Record<string, number>
+    >({});
     const [preflightLoaded, setPreflightLoaded] = useState<boolean>(false);
     /// Container-logs modal state. Surfaces the supervisor's
     /// captured tail (last 200 lines) so the operator can diagnose
@@ -264,12 +267,14 @@ export function BackendsPage() {
                 setPreflightDockerOk(r.docker.available);
                 setPreflightDiskFree(r.disk_free_bytes ?? null);
                 setPreflightDiskPath(r.disk_free_path ?? null);
+                setPreflightCachedModels(r.cached_models ?? {});
             } catch {
                 if (cancelled) return;
                 setPreflightGpus([]);
                 setPreflightDockerOk(false);
                 setPreflightDiskFree(null);
                 setPreflightDiskPath(null);
+                setPreflightCachedModels({});
             } finally {
                 if (!cancelled) setPreflightLoaded(true);
             }
@@ -739,6 +744,7 @@ export function BackendsPage() {
                                             dockerAvailable={preflightDockerOk}
                                             diskFreeBytes={preflightDiskFree}
                                             diskFreePath={preflightDiskPath}
+                                            cachedModels={preflightCachedModels}
                                             onSubmit={onWizardSubmit}
                                             onSkip={() => setWizardActive(false)}
                                             submitLabel="Save backend"

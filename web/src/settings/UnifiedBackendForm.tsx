@@ -211,6 +211,13 @@ export interface UnifiedBackendFormProps {
     /// "couldn't detect" warning instead.
     diskFreeBytes?: number | null;
     diskFreePath?: string | null;
+    /// `model_id → bytes already cached on disk` from the preflight
+    /// endpoint. When the picked model has an entry here, the form
+    /// subtracts those bytes from the required-disk-space calculation
+    /// (the weights don't need to be re-downloaded). Empty `{}` is
+    /// fine — the disk check then assumes a fresh download. Defaults
+    /// to `{}` for callers that haven't wired the new prop yet.
+    cachedModels?: Record<string, number>;
     /// Called with the fully-formed UpsertBackendRequest. The parent
     /// owns the actual PUT so the form is reusable across both the
     /// first-run wizard's direct-save path and the Settings page's
@@ -252,6 +259,7 @@ export function UnifiedBackendForm({
     dockerAvailable,
     diskFreeBytes,
     diskFreePath,
+    cachedModels = {},
     onSubmit,
     onSkip,
     submitLabel = "Save backend",
@@ -503,6 +511,7 @@ export function UnifiedBackendForm({
                                         )}
                                         diskFreeBytes={diskFreeBytes}
                                         diskFreePath={diskFreePath}
+                                        cachedBytes={cachedModels[modelId] ?? 0}
                                         testIdPrefix={testIdPrefix}
                                     />
                                 </>
@@ -688,17 +697,36 @@ function DiskSpaceWarning({
     modelOption,
     diskFreeBytes,
     diskFreePath,
+    cachedBytes,
     testIdPrefix,
 }: {
     modelOption: ModelOption | undefined;
     diskFreeBytes: number | null | undefined;
     diskFreePath: string | null | undefined;
+    /// Bytes of the picked model already present in the HF cache.
+    /// Subtracted from the model's disk requirement — the weights
+    /// don't need to be re-acquired. `0` (default) means a fresh
+    /// download is assumed.
+    cachedBytes: number;
     testIdPrefix: string;
 }) {
     if (!modelOption) return null;
-    const requiredMb =
-        (modelOption.disk_mb ?? modelOption.min_mb) + DISK_SAFETY_MARGIN_MB;
-    const requiredBytes = requiredMb * 1024 * 1024;
+    const totalMb = modelOption.disk_mb ?? modelOption.min_mb;
+    const totalBytes = totalMb * 1024 * 1024;
+    // How many additional bytes do we actually need to download?
+    // Assumes the cached files cover the model — a partial download
+    // could leave us short, but vLLM resumes correctly via the HF
+    // cache lock so this is the conservative-enough estimate. Clamp
+    // to 0 so a slightly-larger-on-disk-than-our-estimate cache hit
+    // doesn't go negative.
+    const additionalBytesNeeded = Math.max(0, totalBytes - cachedBytes);
+    const safetyMarginBytes = DISK_SAFETY_MARGIN_MB * 1024 * 1024;
+    const requiredBytes = additionalBytesNeeded + safetyMarginBytes;
+    const requiredMb = Math.ceil(requiredBytes / (1024 * 1024));
+    // Cached enough to cover the weights — render a positive
+    // confirmation chip so the operator knows the warning was
+    // correctly suppressed (rather than a probe failure).
+    const isFullyCached = cachedBytes >= totalBytes;
 
     if (diskFreeBytes === undefined || diskFreeBytes === null) {
         // Probe failed — render a soft warning rather than block
@@ -715,11 +743,9 @@ function DiskSpaceWarning({
                 data-testid={`${testIdPrefix}-disk-warning-unknown`}
             >
                 <strong>Couldn&rsquo;t detect free disk space.</strong>{" "}
-                Downloading the model{" "}
-                ({fmtMb(modelOption.disk_mb ?? modelOption.min_mb)})
-                and running it may fail if there isn&rsquo;t enough
-                room on the volume hosting the cache. Free up at
-                least{" "}
+                Downloading the model ({fmtMb(totalMb)}) and running
+                it may fail if there isn&rsquo;t enough room on the
+                volume hosting the cache. Free up at least{" "}
                 <strong>{fmtMb(requiredMb)}</strong> before continuing.
             </div>
         );
@@ -733,11 +759,22 @@ function DiskSpaceWarning({
                 role="alert"
                 data-testid={`${testIdPrefix}-disk-warning-insufficient`}
             >
-                <strong>Not enough disk space.</strong> This model needs{" "}
-                <strong>{fmtMb(modelOption.disk_mb ?? modelOption.min_mb)}</strong>
-                {" "}for weights plus a 5 GB safety margin (
-                <strong>{fmtMb(requiredMb)}</strong> total). Free space
-                detected: <strong>{fmtBytes(diskFreeBytes)}</strong>
+                <strong>Not enough disk space.</strong>{" "}
+                {cachedBytes > 0 ? (
+                    <>
+                        {fmtBytes(cachedBytes)} of this model is already
+                        cached, but the remaining{" "}
+                        <strong>{fmtBytes(additionalBytesNeeded)}</strong>{" "}
+                    </>
+                ) : (
+                    <>
+                        This model needs <strong>{fmtMb(totalMb)}</strong>{" "}
+                    </>
+                )}
+                plus a 5 GB safety margin (
+                <strong>{fmtMb(requiredMb)}</strong> total) won&rsquo;t
+                fit. Free space detected:{" "}
+                <strong>{fmtBytes(diskFreeBytes)}</strong>
                 {diskFreePath ? (
                     <>
                         {" "}on{" "}
@@ -749,6 +786,22 @@ function DiskSpaceWarning({
                 . Free up{" "}
                 <strong>{fmtBytes(shortfallBytes)}</strong> or pick a
                 smaller model.
+            </div>
+        );
+    }
+
+    if (isFullyCached) {
+        // All weights already on disk + headroom is sufficient.
+        // Surface a small confirmation so the operator knows why no
+        // warning is rendered for what looks like an "almost-full
+        // disk" scenario (the cached bytes are doing the work).
+        return (
+            <div
+                className="execlaw-muted small mt-2"
+                data-testid={`${testIdPrefix}-disk-warning-cached`}
+            >
+                Model already cached ({fmtBytes(cachedBytes)}). No
+                additional download required.
             </div>
         );
     }
