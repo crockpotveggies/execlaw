@@ -34,9 +34,15 @@ RUN apk add --no-cache musl-dev
 # Workspace `Cargo.toml` references many crates we don't need at
 # runtime (server, cli, etc.), so we copy the whole tree but only
 # build the runner-binary target.
+#
+# `vendor/` carries the patched hardware-query fork that the
+# workspace pins via `path = "vendor/hardware-query"` — the build
+# fails with "Unable to update /build/vendor/hardware-query" if
+# this isn't copied alongside `crates/`.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY plugins ./plugins
+COPY vendor ./vendor
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
