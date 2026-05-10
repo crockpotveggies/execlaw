@@ -21,11 +21,13 @@ const BUDGETS_BYTES = {
     // subset × woff/woff2). Trim @fontsource subsets to bring this
     // down — that's the cheapest win once we cross 2.5 MB.
     total: 2500 * 1024,
-    // JS only (the cold-load critical path). Currently ~775 KB —
+    // JS only (the cold-load critical path). Currently ~845 KB —
     // bootstrap + react + GSAP + react-bootstrap account for most
     // of it. Tighten via tree-shaking / code-splitting before
-    // raising this further.
-    js: 800 * 1024,
+    // raising this further. Last raise: 800 → 900 KB after the
+    // React 18 → 19 + react-router-dom 6 → 7 bumps added ~54 KB
+    // to the cold-load JS.
+    js: 900 * 1024,
     // CSS only. Bootstrap + bootstrap-icons together land near 300 KB
     // out-of-the-box; the budget is cushioned to ~400 KB so we notice
     // when we've added ANOTHER 100 KB of CSS — at that point we should

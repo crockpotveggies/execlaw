@@ -43,6 +43,27 @@ Object.defineProperty(globalThis, "localStorage", {
     writable: true,
 });
 
+// jsdom 26 (vitest 4 default) no longer ships a `matchMedia` stub;
+// tests that spy on it via `vi.spyOn(window, "matchMedia")` fail
+// with "can only spy on a function". Provide a minimal default the
+// per-test overrides can replace.
+if (typeof window !== "undefined" && typeof window.matchMedia !== "function") {
+    Object.defineProperty(window, "matchMedia", {
+        configurable: true,
+        writable: true,
+        value: (query: string) => ({
+            matches: false,
+            media: query,
+            onchange: null,
+            addListener: () => {},
+            removeListener: () => {},
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            dispatchEvent: () => false,
+        }),
+    });
+}
+
 vi.mock("gsap", () => {
     type Vars = Record<string, unknown> & { onComplete?: () => void };
     const fire = (vars: Vars | undefined) => {

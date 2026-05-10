@@ -78,8 +78,8 @@ regex.workspace = true
 #     Replaces the previous `truncate_body` (which fed the subagent
 #     4 KB of mostly-chrome HTML soup, killing extraction quality).
 #     The original `readability` crate is unmaintained as of 2026.
-scraper = "0.21"
-dom_smoothie = "0.10"
+scraper = "0.26"
+dom_smoothie = "0.17"
 
 utoipa.workspace = true
 utoipa-axum.workspace = true
@@ -91,7 +91,7 @@ utoipa-swagger-ui.workspace = true
 # behind a safe `available_space(path)` API — needed because the
 # server crate forbids unsafe.
 directories = { workspace = true }
-fs4 = "0.13"
+fs4 = "1.1"
 
 # Phase 7e: WebAuthn second-factor for the controller login. Optional
 # feature because the underlying `webauthn-rs` pulls in `openssl-sys`,
