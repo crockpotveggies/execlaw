@@ -100,7 +100,9 @@ describe("VoicePlayback", () => {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         originalAudioContext = (window as any).AudioContext;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (window as any).AudioContext = vi.fn(() => mockContext);
+        (window as any).AudioContext = vi.fn(function () {
+            return mockContext;
+        });
     });
 
     afterEach(() => {
