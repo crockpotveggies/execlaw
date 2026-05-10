@@ -3029,6 +3029,14 @@ export interface PreflightResponse {
     /// Path the free-space probe was run against. Surfaced in the
     /// warning copy so the operator knows which volume to free up.
     disk_free_path?: string | null;
+    /// HuggingFace `model_id → bytes already on disk` map for every
+    /// model present under the HF cache. The wizard subtracts the
+    /// picked model's cached bytes from `disk_mb + safety margin`
+    /// so an operator who already has the weights downloaded
+    /// doesn't see a false "not enough disk space" warning.
+    /// Optional — older server builds without the cache enumerator
+    /// will omit this field entirely; callers default to `{}`.
+    cached_models?: Record<string, number>;
 }
 
 export async function getSetupPreflight(
