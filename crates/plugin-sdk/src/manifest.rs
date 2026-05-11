@@ -1245,6 +1245,66 @@ mod tests {
     }
 
     #[test]
+    fn shipped_discord_manifest_parses_cleanly() {
+        // Same "shipped manifest parses against the SDK validator"
+        // smoke test we have for Signal — catches typos /
+        // validator-tightening regressions at `cargo test` time.
+        const DISCORD_MANIFEST: &str = include_str!("../../../plugins/discord/plugin.toml");
+        let m = PluginManifest::parse(DISCORD_MANIFEST)
+            .expect("plugins/discord/plugin.toml must parse cleanly");
+        assert_eq!(m.plugin.id, "discord");
+        assert_eq!(m.plugin.version, "0.1.0");
+
+        let transport = m.transport.as_ref().expect("[transport] must be present");
+        assert_eq!(transport.transport_id, "discord");
+        assert_eq!(transport.icon.as_deref(), Some("discord"));
+        assert!(transport.supports_attachments);
+        assert!(transport.supports_groups);
+
+        // Three agent-callable tools + three host-internal convention
+        // tools (set_typing, send_with_attachments, fetch_attachment).
+        assert_eq!(m.tools.len(), 6);
+        let send = m
+            .tools
+            .iter()
+            .find(|t| t.name == "discord.send_message")
+            .expect("discord.send_message must be declared");
+        assert_eq!(send.trust_floor.as_deref(), Some("Controller"));
+        let reply = m
+            .tools
+            .iter()
+            .find(|t| t.name == "discord.reply")
+            .expect("discord.reply must be declared");
+        assert!(
+            reply.trust_floor.is_none(),
+            "discord.reply must NOT pin a trust floor — host fills `to` from the inbound binding"
+        );
+
+        // Script-tier — no sidecar, no host-implemented bypasses.
+        for t in &m.tools {
+            assert!(
+                !t.host_implemented,
+                "{} must be script-tier in v0.1",
+                t.name
+            );
+        }
+
+        // Admin routes: status, GET config, POST config, POST test.
+        assert_eq!(m.admin_routes.len(), 4);
+
+        // No sidecar — gateway is public WSS.
+        assert!(m.services.is_empty(), "discord plugin must not declare any sidecar in v0.1");
+
+        // UI panel mount.
+        assert_eq!(m.ui_panels.len(), 1);
+        assert_eq!(m.ui_panels[0].mount, "admin/plugins/discord");
+
+        // Alert-source surface declared for v0.2 use.
+        assert_eq!(m.alert_sources.len(), 1);
+        assert_eq!(m.alert_sources[0].fingerprint_prefix, "plugin.discord");
+    }
+
+    #[test]
     fn is_known_trust_level_covers_full_ladder() {
         for s in [
             "Controller",

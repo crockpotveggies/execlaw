@@ -1,0 +1,127 @@
+[plugin]
+id = "discord"
+name = "Discord"
+version = "0.1.0"
+description = "Discord transport via the official Bot Gateway WebSocket. Sidecar-free — the plugin maintains the long-lived gateway connection itself, sends application-layer heartbeats via ws_set_keepalive, and posts outbound via the REST API. Single bot token spans every guild the bot is invited to; multi-guild is automatic from GUILD_CREATE dispatches. v0.1 does NOT implement slash commands / interactions (deferred to v0.2 via [[webhook_routes]] + Ed25519 verification)."
+author = "execlaw"
+license = "Apache-2.0"
+
+# No sidecar — Discord exposes both the gateway (WSS) and REST API
+# publicly. The plugin reaches them via the existing `http_post` /
+# `http_get` Rhai bindings (4-arg overload required for the
+# mandatory `User-Agent: DiscordBot (...)` header) and
+# `ws_subscribe_bidi` / `ws_send` + the new `ws_set_keepalive` for
+# the application-layer heartbeat.
+
+[transport]
+transport_id = "discord"
+supports_attachments = true
+supports_groups = true
+icon = "discord"
+
+# ===== Agent-callable tools =====================================
+[[tools]]
+name = "discord.send_message"
+description = """Send a Discord message to a channel or DM. \
+This tool IS the user-visible message — do NOT also produce a text \
+reply summarising what you sent. After calling this tool, return an \
+empty text response to end your turn. \
+The plugin auto-applies `message_reference` when replying inside a \
+context the bot just received an inbound from. Long messages are \
+split at 1900-char paragraph/line/space boundaries (Discord's hard \
+limit is 2000; headroom for the split marker). \
+Args: { to: string (channel id, user id, or `discord:<id>` JID), \
+text: string }."""
+schema = "schemas/discord.send_message.json"
+trust_floor = "Controller"
+latency = "low"
+
+[[tools]]
+name = "discord.reply"
+description = """Reply in the current Discord conversation. \
+This tool IS the user-visible reply — do NOT also produce a text \
+response summarising what you replied. After calling this tool, \
+return an empty text response to end your turn. \
+Args: { to: string (recipient — host fills from the conversation's binding), \
+text: string }."""
+schema = "schemas/discord.send_message.json"
+latency = "low"
+
+[[tools]]
+name = "discord.list_channels"
+description = """List Discord guilds + their text channels the bot \
+can see, plus any open DM channels cached on this install. \
+Returns: { channels: [{ id, name, guild, is_dm }] }."""
+trust_floor = "Controller"
+latency = "medium"
+
+# ===== Host-internal convention tools ============================
+[[tools]]
+name = "discord.set_typing"
+description = """Trigger the typing indicator in a Discord channel. \
+Discord auto-clears it after ~10 seconds or when the bot sends a \
+message — there is no explicit "stop typing" API, so `active=false` \
+is a no-op. \
+Args: { to: string, active: bool }."""
+trust_floor = "Controller"
+latency = "low"
+host_internal = true
+
+[[tools]]
+name = "discord.send_with_attachments"
+description = """Send a Discord message with one or more attachments \
+referenced by host-side attachment ids. Used by the deep-research \
+auto-bridge. Discord accepts up to 10 attachments per message via \
+the multipart endpoint; v0.1 falls back to a data-URL preview in \
+the message body until the plugin sdk grows an `http_post_multipart` \
+binding (follow-up). \
+Args: { to: string, text?: string, attachments: int[] (host attachment ids) }."""
+trust_floor = "Controller"
+latency = "medium"
+host_internal = true
+
+[[tools]]
+name = "discord.fetch_attachment"
+description = """Host-internal: fetch the raw bytes of a Discord \
+inbound attachment by its bridge id (the Discord CDN URL). Discord \
+attachment URLs are publicly fetchable without auth, so this is a \
+plain GET. Args: { attachment_id: string }."""
+trust_floor = "Controller"
+latency = "low"
+host_internal = true
+
+# ===== Admin routes ==============================================
+[[admin_routes]]
+method = "GET"
+path = "/status"
+handler = "admin_status"
+description = "Connection state + bot identity + cached guild list."
+
+[[admin_routes]]
+method = "GET"
+path = "/config"
+handler = "admin_get_config"
+description = "Return the masked bot_token + bot user identity."
+
+[[admin_routes]]
+method = "POST"
+path = "/config"
+handler = "admin_set_config"
+description = "Persist the operator-supplied bot_token. Validates via /users/@me before writing. Hot-reloads the gateway connection on success."
+
+[[admin_routes]]
+method = "POST"
+path = "/test"
+handler = "admin_test_message"
+description = "Send a one-shot test message. Body: {channel_id}."
+
+[[ui_panels]]
+mount = "admin/plugins/discord"
+entry = "ui/panel.js"
+
+[[alert_sources]]
+fingerprint_prefix = "plugin.discord"
+
+[runtime]
+tier = "script"
+source = "main.rhai"

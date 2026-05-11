@@ -1628,6 +1628,18 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                 icon: sms_socket_icon,
             },
         );
+        const DISCORD_MANIFEST: &str = include_str!("../../../plugins/discord/plugin.toml");
+        let discord_icon = execlaw_plugin_sdk::manifest::PluginManifest::parse(DISCORD_MANIFEST)
+            .ok()
+            .and_then(|m| m.transport.and_then(|t| t.icon))
+            .unwrap_or_else(|| "discord".to_owned());
+        reg.register(
+            "discord",
+            execlaw_server::transport_registry::ChannelInfo {
+                plugin_id: "discord".into(),
+                icon: discord_icon,
+            },
+        );
         tracing::info!(channels = reg.len(), "host-transport registry populated");
         reg
     };

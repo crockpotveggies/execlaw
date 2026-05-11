@@ -2534,6 +2534,82 @@ export async function testSmsSocketMessage(
     );
 }
 
+// ---- /api/admin/plugins/discord/* ---------------------------------
+//
+// Discord plugin admin endpoints. The plugin holds a single bot
+// token (Authorization: Bot <token>) and discovers guilds + the
+// bot user via the Discord REST API on save. No sidecar — the
+// plugin maintains the gateway WebSocket itself via
+// ws_subscribe_bidi + the application-layer heartbeat installed
+// through ws_set_keepalive.
+
+export interface DiscordConfigResponse {
+    bot_token_masked: string;
+    configured: boolean;
+    bot_user_id?: string | null;
+    bot_username?: string | null;
+}
+
+export interface DiscordStatusResponse {
+    sidecar_status: string;
+    sidecar_rpc_url: string | null;
+    registered_accounts: unknown[];
+    accounts_on_disk: unknown[];
+    fetch_error: string | null;
+    bot_user_id?: string | null;
+    bot_username?: string | null;
+    guilds_known?: number;
+    token_masked?: string;
+}
+
+export async function getDiscordConfig(
+    tokenAccessor: () => string | null,
+): Promise<DiscordConfigResponse> {
+    return apiFetch<DiscordConfigResponse>(
+        "/api/admin/plugins/discord/config",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function setDiscordConfig(
+    bot_token: string,
+    tokenAccessor: () => string | null,
+): Promise<{ ok: boolean; bot_user_id?: string; bot_username?: string }> {
+    return apiFetch<{ ok: boolean; bot_user_id?: string; bot_username?: string }>(
+        "/api/admin/plugins/discord/config",
+        { method: "POST", body: { bot_token } },
+        tokenAccessor,
+    );
+}
+
+export async function getDiscordStatus(
+    tokenAccessor: () => string | null,
+): Promise<DiscordStatusResponse> {
+    return apiFetch<DiscordStatusResponse>(
+        "/api/admin/plugins/discord/status",
+        {},
+        tokenAccessor,
+    );
+}
+
+export interface DiscordTestResponse {
+    ok?: boolean;
+    message_id?: string;
+    error?: string;
+}
+
+export async function testDiscordMessage(
+    channel_id: string,
+    tokenAccessor: () => string | null,
+): Promise<DiscordTestResponse> {
+    return apiFetch<DiscordTestResponse>(
+        "/api/admin/plugins/discord/test",
+        { method: "POST", body: { channel_id } },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/routines (Phase 10 — §5.6) -------------------------
 
 export type RoutineRunStatus = "Pending" | "Success" | "Failed" | "Skipped";
