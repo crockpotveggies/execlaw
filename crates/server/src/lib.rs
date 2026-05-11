@@ -44,6 +44,7 @@ pub mod oauth_sweeper;
 pub mod observability;
 pub mod personality;
 pub mod plugin_admin_routes;
+pub mod plugin_settings_admin;
 pub mod plugin_webhook_routes;
 pub mod plugins;
 pub mod principal_admit;

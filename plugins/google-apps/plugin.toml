@@ -1,0 +1,281 @@
+[plugin]
+id = "google-apps"
+name = "Google Apps"
+version = "0.1.0"
+description = "Consolidated Google plugin — Gmail, Calendar, Contacts, Tasks, and Drive in one OAuth grant. Replaces the separate google-calendar + google-contacts plugins. Individual modules can be toggled on/off without re-running the consent flow."
+author = "execlaw"
+license = "Apache-2.0"
+
+[[oauth_accounts]]
+name = "controller"
+provider = "google"
+# Union of scopes across all five modules. v1 ships them all in one
+# consent screen — operators who only want a subset can toggle
+# modules off in the SPA, which gates dispatch but doesn't shrink
+# the scope grant. Per-scope incrementality is a v0.2 follow-up.
+scopes = [
+    # Gmail
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.modify",
+    # Calendar
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
+    # Contacts
+    "https://www.googleapis.com/auth/contacts.readonly",
+    # Tasks
+    "https://www.googleapis.com/auth/tasks",
+    # Drive — readonly for everything plus drive.file for the
+    # tools that write into the user's Drive (create_file, share).
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive.file",
+    "openid",
+    "email",
+]
+proactive_refresh_window = "10m"
+warn_before_expiry = ["7d", "3d", "1d"]
+
+# Identity provider — same shape as google-contacts. Saved contacts
+# auto-trust as Contact-class principals. Lives under the
+# `contacts` module's toggle: when contacts is disabled the
+# identity_resolve entry point returns no match (the host
+# falls through to the next identity provider).
+[identity_provider]
+resolves = ["email", "phone"]
+trust_hint_default = "Contact"
+confidence_ceiling = 0.95
+
+# =====================================================================
+# Gmail
+# =====================================================================
+
+[[tools]]
+name = "gmail.list_messages"
+description = """List recent Gmail messages with normalised metadata. \
+Args: { q?: string (Gmail search syntax — `from:`, `subject:`, \
+`label:`, `is:unread`, etc.), label_ids?: string[], max_results?: \
+integer (default 25, cap 100) }. Returns \
+[{ id, thread_id, from, to, subject, snippet, date, label_ids }]."""
+latency = "medium"
+
+[[tools]]
+name = "gmail.search"
+description = "Free-text Gmail search. Args: { query: string, max_results?: integer }. Thin wrapper over list_messages with `q`."
+latency = "medium"
+
+[[tools]]
+name = "gmail.get_message"
+description = """Get the full payload of a single Gmail message — \
+headers + decoded text/plain body. Args: { id: string, format?: \
+\"metadata\" | \"full\" (default \"full\") }."""
+latency = "medium"
+
+[[tools]]
+name = "gmail.send_message"
+description = """Send a new Gmail message. Args: { to: string | \
+string[], subject: string, body: string, cc?: string | string[], \
+bcc?: string | string[], in_reply_to_message_id?: string }. The \
+body is sent as text/plain UTF-8; pass a multi-line string to \
+include paragraph breaks. Returns { id, thread_id }."""
+trust_floor = "Controller"
+latency = "medium"
+
+[[tools]]
+name = "gmail.create_draft"
+description = """Create a Gmail draft (does not send). Args: { to, \
+subject, body, cc?, bcc? }. Returns the draft id."""
+trust_floor = "Controller"
+latency = "medium"
+
+[[tools]]
+name = "gmail.reply"
+description = """Reply to an existing Gmail message preserving thread \
++ In-Reply-To headers. Args: { message_id: string, body: string }. \
+The plugin reads the source message's Message-ID + Subject header \
+and synthesises the correct RFC822 reply envelope."""
+trust_floor = "Controller"
+latency = "medium"
+
+[[tools]]
+name = "gmail.list_labels"
+description = "List the Gmail label set (system + user labels). Returns [{ id, name, type }]."
+latency = "low"
+
+[[tools]]
+name = "gmail.add_label"
+description = "Apply one or more labels to a Gmail message. Args: { message_id: string, label_ids: string[] }."
+trust_floor = "Controller"
+latency = "low"
+
+[[tools]]
+name = "gmail.remove_label"
+description = "Remove one or more labels from a Gmail message. Args: { message_id: string, label_ids: string[] }."
+trust_floor = "Controller"
+latency = "low"
+
+[[tools]]
+name = "gmail.trash"
+description = "Move a Gmail message to Trash. Reversible — the message stays for 30 days. Args: { message_id: string }."
+trust_floor = "Controller"
+latency = "low"
+
+# =====================================================================
+# Calendar — ported verbatim from plugins/google-calendar
+# =====================================================================
+
+[[tools]]
+name = "calendar.list_calendars"
+description = "List the operator's Google calendars (id, summary, time zone, primary flag)."
+latency = "medium"
+
+[[tools]]
+name = "calendar.list_events"
+description = "List events on a calendar within a time window. Args: { calendar_id?: string (default 'primary'), time_min?: RFC3339, time_max?: RFC3339, max_results?: integer (default 25, cap 100), query?: string }."
+latency = "medium"
+
+[[tools]]
+name = "calendar.check_availability"
+description = "Free/busy lookup across one or more calendars. Args: { time_min: RFC3339, time_max: RFC3339, calendar_ids?: string[] (default ['primary']) }. Returns the freeBusy response keyed by calendar id."
+latency = "medium"
+
+[[tools]]
+name = "calendar.get_event"
+description = "Get the full event payload by id. Args: { calendar_id?: string (default 'primary'), event_id: string }."
+latency = "medium"
+
+[[tools]]
+name = "calendar.create_event"
+description = """Create a new calendar event. Args: { calendar_id?: string \
+(default 'primary'), summary: string, start: RFC3339, end: RFC3339, \
+description?: string, location?: string, attendees?: string[] (emails) }. \
+`start` and `end` MUST carry the operator's local UTC offset (e.g. \
+`2026-05-05T18:00:00-07:00` for 6pm Pacific) — NEVER use a `Z` suffix \
+unless the operator explicitly asked for UTC, since `Z` lands the event \
+in UTC and renders shifted by the offset in the operator's calendar app. \
+The per-turn context block lists the operator's timezone — use it. \
+Sends invitations when attendees are present."""
+trust_floor = "Controller"
+latency = "medium"
+
+[[tools]]
+name = "calendar.update_event"
+description = """Patch an existing event. Args: { calendar_id?: string \
+(default 'primary'), event_id: string, summary?, start?, end?, description?, \
+location?, attendees? }. Same RFC3339-with-local-offset rule as \
+`create_event` applies to `start` / `end` — use the operator's local \
+offset, never a `Z` suffix unless they explicitly want UTC. Sends update \
+notifications when attendees are present."""
+trust_floor = "Controller"
+latency = "medium"
+
+[[tools]]
+name = "calendar.delete_event"
+description = "Cancel an event. Args: { calendar_id?: string (default 'primary'), event_id: string }. Returns { deleted: true } on success."
+trust_floor = "Controller"
+latency = "medium"
+
+# =====================================================================
+# Contacts — ported verbatim from plugins/google-contacts
+# =====================================================================
+
+[[tools]]
+name = "contacts.list"
+description = "List the operator's Google contacts. Returns name, email addresses, and phone numbers per contact."
+latency = "medium"
+
+# =====================================================================
+# Tasks
+# =====================================================================
+
+[[tools]]
+name = "tasks.list_lists"
+description = "List the operator's Google Tasks task lists. Returns [{ id, title }]."
+latency = "low"
+
+[[tools]]
+name = "tasks.list_tasks"
+description = """List tasks on a task list. Args: { tasklist_id?: \
+string (default '@default'), show_completed?: bool (default false), \
+max_results?: integer }. Returns [{ id, title, notes, due, status, \
+completed, position }]."""
+latency = "medium"
+
+[[tools]]
+name = "tasks.create_task"
+description = """Create a new task. Args: { tasklist_id?: string \
+(default '@default'), title: string, notes?: string, due?: RFC3339 }."""
+trust_floor = "Controller"
+latency = "low"
+
+[[tools]]
+name = "tasks.update_task"
+description = """Patch a task. Args: { tasklist_id?: string \
+(default '@default'), task_id: string, title?, notes?, due?, \
+completed?: bool }. Setting completed=true also stamps the completed \
+timestamp."""
+trust_floor = "Controller"
+latency = "low"
+
+[[tools]]
+name = "tasks.complete_task"
+description = "Mark a task complete. Args: { tasklist_id?: string (default '@default'), task_id: string }."
+trust_floor = "Controller"
+latency = "low"
+
+[[tools]]
+name = "tasks.delete_task"
+description = "Permanently delete a task. Args: { tasklist_id?: string (default '@default'), task_id: string }."
+trust_floor = "Controller"
+latency = "low"
+
+# =====================================================================
+# Drive
+# =====================================================================
+
+[[tools]]
+name = "drive.search"
+description = """Search the operator's Drive. Args: { query: string, \
+max_results?: integer (default 25), mime_type?: string (e.g. \
+'application/pdf') }. Returns [{ id, name, mime_type, modified_time, \
+web_view_link, parents }]."""
+latency = "medium"
+
+[[tools]]
+name = "drive.get_file_metadata"
+description = "Fetch full metadata for one Drive file. Args: { file_id: string }."
+latency = "low"
+
+[[tools]]
+name = "drive.list_folder"
+description = "List files directly inside a Drive folder. Args: { folder_id: string, max_results?: integer (default 25) }."
+latency = "medium"
+
+[[tools]]
+name = "drive.read_file"
+description = """Read a Drive file's contents. Args: { file_id: \
+string, max_bytes?: integer (default 1048576, cap 10485760) }. \
+Returns a UTF-8 string when the file decodes cleanly (Google Docs \
+get exported as plain text); otherwise returns { kind: 'binary', \
+size, base64 }."""
+latency = "medium"
+
+[[tools]]
+name = "drive.create_file"
+description = """Upload a new file to Drive. Args: { name: string, \
+mime_type?: string (default 'text/plain'), content: string, \
+parent_folder_id?: string }. Returns the created file's id + \
+web_view_link."""
+trust_floor = "Controller"
+latency = "medium"
+
+[[tools]]
+name = "drive.share"
+description = """Grant another user access to a Drive file. Args: \
+{ file_id: string, email: string, role: 'reader' | 'writer' | \
+'commenter' (default 'reader') }. Does not send notification email."""
+trust_floor = "Controller"
+latency = "low"
+
+[runtime]
+tier = "script"
+source = "main.rhai"

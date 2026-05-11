@@ -519,6 +519,56 @@ fn register_host_cap_bindings(
             .into()
     });
 
+    // base64url_encode(s) -> base64url (URL-safe alphabet, no padding).
+    // Required by Gmail's `users.messages.send` endpoint which takes
+    // a `raw` field of base64url-encoded RFC822. The standard-alphabet
+    // variant uses `+` and `/` which Gmail's parser rejects, and the
+    // padding `=` is conventionally stripped in URL-safe contexts.
+    engine.register_fn(
+        "base64url_encode",
+        |s: ImmutableString| -> ImmutableString {
+            use base64::Engine as _;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(s.as_bytes())
+                .into()
+        },
+    );
+
+    // base64_decode(s) -> string | unit. Inverse of base64_encode.
+    // Tolerates BOTH the standard and URL-safe alphabets (Gmail sends
+    // bodies back as base64url). Returns `()` if the decoded bytes
+    // aren't valid UTF-8 so plugins can branch on binary content.
+    engine.register_fn("base64_decode", |s: ImmutableString| -> Dynamic {
+        use base64::Engine as _;
+        // Replace URL-safe chars with standard then try standard
+        // decode — covers both alphabets without two attempts.
+        let normalised: String = s
+            .chars()
+            .map(|c| match c {
+                '-' => '+',
+                '_' => '/',
+                other => other,
+            })
+            .collect();
+        // Pad if needed (URL_SAFE_NO_PAD strips padding).
+        let padded = match normalised.len() % 4 {
+            0 => normalised,
+            n => {
+                let mut p = normalised;
+                p.push_str(&"=".repeat(4 - n));
+                p
+            }
+        };
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(padded.as_bytes()) {
+            Ok(b) => b,
+            Err(_) => return Dynamic::UNIT,
+        };
+        match String::from_utf8(bytes) {
+            Ok(s) => Dynamic::from(ImmutableString::from(s)),
+            Err(_) => Dynamic::UNIT,
+        }
+    });
+
     // parse_json(text) -> rhai value. The host's HTTP primitives
     // already auto-decode JSON responses; this is for raw frames
     // (WebSocket text frames, SSE bodies) that arrive as a String.

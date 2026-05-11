@@ -30,6 +30,7 @@ import {
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
 import { DiscordConfigPage } from "./DiscordConfigPage";
+import { GoogleAppsPage } from "./GoogleAppsPage";
 import { GoogleCalendarPage } from "./GoogleCalendarPage";
 import { GoogleContactsPage } from "./GoogleContactsPage";
 import { GooglePlacesConfigPage } from "./GooglePlacesConfigPage";
@@ -45,6 +46,7 @@ const KNOWN_CONFIGS: Record<string, PluginConfigComponent> = {
     // The component is wrapped by the shell below — it can't
     // remove the danger zone or back button.
     discord: DiscordConfigPage,
+    "google-apps": GoogleAppsPage,
     "google-contacts": GoogleContactsPage,
     "google-calendar": GoogleCalendarPage,
     "google-places": GooglePlacesConfigPage,

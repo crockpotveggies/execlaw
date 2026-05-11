@@ -1305,6 +1305,132 @@ mod tests {
     }
 
     #[test]
+    fn shipped_google_apps_manifest_parses_cleanly() {
+        // Pin the on-disk `plugins/google-apps/plugin.toml` against
+        // this crate's parser so a manifest typo (or an SDK validator
+        // change that breaks the existing description prose) is caught
+        // at `cargo test` time, not at install time.
+        //
+        // Asserts:
+        //   * tool count covers all five modules (Gmail, Calendar,
+        //     Contacts, Tasks, Drive).
+        //   * destructive tools carry a Controller trust floor.
+        //   * read-only tools have NO trust floor.
+        //   * the [identity_provider] section is present (contacts
+        //     module still serves as an identity provider).
+        //   * the oauth scope set includes the union across all five
+        //     modules.
+        const GOOGLE_APPS_MANIFEST: &str = include_str!("../../../plugins/google-apps/plugin.toml");
+        let m = PluginManifest::parse(GOOGLE_APPS_MANIFEST)
+            .expect("plugins/google-apps/plugin.toml must parse cleanly");
+        assert_eq!(m.plugin.id, "google-apps");
+        assert_eq!(m.plugin.version, "0.1.0");
+
+        // Identity provider survives the consolidation — same shape
+        // as google-contacts had.
+        let idp = m
+            .identity_provider
+            .as_ref()
+            .expect("[identity_provider] must be declared");
+        assert!(idp.resolves.iter().any(|r| r == "email"));
+        assert!(idp.resolves.iter().any(|r| r == "phone"));
+
+        // Single OAuth account, with union scopes across all 5 modules.
+        assert_eq!(m.oauth_accounts.len(), 1);
+        let acc = &m.oauth_accounts[0];
+        assert_eq!(acc.name, "controller");
+        assert_eq!(acc.provider, "google");
+        for required in [
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/gmail.send",
+            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/calendar.readonly",
+            "https://www.googleapis.com/auth/calendar.events",
+            "https://www.googleapis.com/auth/contacts.readonly",
+            "https://www.googleapis.com/auth/tasks",
+            "https://www.googleapis.com/auth/drive.readonly",
+            "https://www.googleapis.com/auth/drive.file",
+        ] {
+            assert!(
+                acc.scopes.iter().any(|s| s == required),
+                "manifest must declare scope '{required}'",
+            );
+        }
+
+        // Tool count: Gmail (10) + Calendar (7) + Contacts (1) + Tasks (6)
+        // + Drive (6) = 30. If you add or remove a tool, update both
+        // here and the dispatch table in main.rhai.
+        assert_eq!(m.tools.len(), 30);
+
+        // Destructive tools MUST pin Controller. This is the v1 trust
+        // contract — letting a Signal contact (KnownTrusted at best)
+        // send mail or delete events from the operator's account is
+        // the exact attack the trust-floor system exists to prevent.
+        const CONTROLLER_FLOOR_TOOLS: &[&str] = &[
+            "gmail.send_message",
+            "gmail.create_draft",
+            "gmail.reply",
+            "gmail.add_label",
+            "gmail.remove_label",
+            "gmail.trash",
+            "calendar.create_event",
+            "calendar.update_event",
+            "calendar.delete_event",
+            "tasks.create_task",
+            "tasks.update_task",
+            "tasks.complete_task",
+            "tasks.delete_task",
+            "drive.create_file",
+            "drive.share",
+        ];
+        for name in CONTROLLER_FLOOR_TOOLS {
+            let t = m
+                .tools
+                .iter()
+                .find(|t| t.name == *name)
+                .unwrap_or_else(|| panic!("{name} must be declared"));
+            assert_eq!(
+                t.trust_floor.as_deref(),
+                Some("Controller"),
+                "{name} must pin Controller floor",
+            );
+        }
+
+        // Read-only tools MUST NOT pin a floor — they're agent-callable
+        // from any conversation that reaches the dispatcher.
+        const NO_FLOOR_TOOLS: &[&str] = &[
+            "gmail.list_messages",
+            "gmail.search",
+            "gmail.get_message",
+            "gmail.list_labels",
+            "calendar.list_calendars",
+            "calendar.list_events",
+            "calendar.check_availability",
+            "calendar.get_event",
+            "contacts.list",
+            "tasks.list_lists",
+            "tasks.list_tasks",
+            "drive.search",
+            "drive.get_file_metadata",
+            "drive.list_folder",
+            "drive.read_file",
+        ];
+        for name in NO_FLOOR_TOOLS {
+            let t = m
+                .tools
+                .iter()
+                .find(|t| t.name == *name)
+                .unwrap_or_else(|| panic!("{name} must be declared"));
+            assert!(t.trust_floor.is_none(), "{name} must NOT pin a trust floor",);
+        }
+
+        // Runtime tier — script, source = main.rhai.
+        let rt = m.runtime.as_ref().expect("[runtime] must be declared");
+        assert_eq!(rt.parsed_tier(), Some(RuntimeTier::Script));
+        assert_eq!(rt.source.as_deref(), Some("main.rhai"));
+    }
+
+    #[test]
     fn is_known_trust_level_covers_full_ladder() {
         for s in [
             "Controller",

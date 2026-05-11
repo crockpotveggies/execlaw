@@ -3233,6 +3233,54 @@ export async function disconnectOauth(
 
 
 // ============================================================
+// Per-plugin settings (PUT/GET /api/admin/plugins/{id}/settings/{key})
+// ============================================================
+//
+// Generic flat-key store backed by the vault. Plugin pages read +
+// write opaque strings here for non-secret operator config — toggles,
+// behaviour flags, per-plugin display preferences. Distinct from the
+// OAuth client surface and from `vault_put` inside Rhai scripts (the
+// latter reaches the same SQLite row, just from the script side).
+
+export interface PluginSettingView {
+    plugin_id: string;
+    key: string;
+    value: string;
+}
+
+export async function getPluginSetting(
+    pluginId: string,
+    key: string,
+    tokenAccessor: () => string | null,
+): Promise<PluginSettingView | null> {
+    try {
+        return await apiFetch<PluginSettingView>(
+            `/api/admin/plugins/${encodeURIComponent(pluginId)}/settings/${encodeURIComponent(key)}`,
+            {},
+            tokenAccessor,
+        );
+    } catch (e) {
+        if (e instanceof ApiError && e.status === 404) {
+            return null;
+        }
+        throw e;
+    }
+}
+
+export async function putPluginSetting(
+    pluginId: string,
+    key: string,
+    value: string,
+    tokenAccessor: () => string | null,
+): Promise<PluginSettingView> {
+    return apiFetch<PluginSettingView>(
+        `/api/admin/plugins/${encodeURIComponent(pluginId)}/settings/${encodeURIComponent(key)}`,
+        { method: "PUT", body: { value } },
+        tokenAccessor,
+    );
+}
+
+// ============================================================
 // Settings → Search (search-provider registry)
 // ============================================================
 
