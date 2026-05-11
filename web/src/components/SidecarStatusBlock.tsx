@@ -155,13 +155,17 @@ function presentationFor(status: string): StatusPresentation {
             // Plugin-defined "sidecar is up but the per-tenant
             // upstream account hasn't been provisioned yet" state
             // (WhatsApp uses this between sidecar-healthy and
-            // wuzapi-user-created). Caller should override via
-            // `followupHint` for plugin-specific copy.
+            // wuzapi-user-created). The SIDECAR is fully booted at
+            // this point, so DO NOT show the "Sidecar is booting
+            // up…" header — the chip + caller's `followupHint`
+            // explain the next-step state. The chip stays bg-info
+            // because the operator's expected action is "wait" not
+            // "fix".
             return {
                 label: "Awaiting pairing",
                 badgeClass: "bg-info",
                 showSpinner: true,
-                isBooting: true,
+                isBooting: false,
                 explainer: null,
             };
         default:

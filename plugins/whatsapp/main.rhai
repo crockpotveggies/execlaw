@@ -881,20 +881,43 @@ fn admin_status(req) {
         };
     }
 
-    // No user provisioned yet → not actually unhealthy. on_enable
-    // either hasn't fired (cold-boot race) or its provisioning
-    // step failed (admin token mismatch, wuzapi rejecting create).
-    // Either way the SPA's pairing card is the right thing to
-    // render — it'll keep polling until a token shows up.
+    // Vault might be empty for three reasons that all look the same
+    // from here:
+    //   (a) on_enable hasn't fired yet (cold-boot race).
+    //   (b) on_enable's provisioning step failed earlier and the
+    //       operator hasn't disabled+re-enabled to retry.
+    //   (c) the operator wiped/restored execlaw's DB (or the plugin
+    //       was uninstalled+re-installed) but wuzapi's container
+    //       volume — which lives at `state://data` and survives
+    //       execlaw restarts — still holds the upstream user.
+    //
+    // Case (c) is the dominant real-world cause of a stuck
+    // `awaiting_pairing` state, and silently bailing out makes the
+    // status poller spin forever despite wuzapi being one
+    // re-provision call away from healthy. Try `ensure_user_token`
+    // opportunistically — it's idempotent (POST /admin/users will
+    // 4xx on duplicate, the verify-via-list path catches that) and
+    // re-stamps the vault. On the next poll the cache hit fast-path
+    // takes over and we proceed to the /session/status branch.
     let token = vault_get("user_token");
     if token == () || token == "" {
-        return #{
-            "sidecar_status": "awaiting_pairing",
-            "sidecar_rpc_url": base,
-            "registered_accounts": [],
-            "accounts_on_disk": [],
-            "fetch_error": (),
-        };
+        try {
+            token = ensure_user_token(base);
+        } catch (e) {
+            // Provisioning genuinely failed — surface the cause in
+            // `fetch_error` so the SPA can render something better
+            // than a generic "still booting" hint. Common causes:
+            // admin-token mismatch (operator overrode
+            // WUZAPI_ADMIN_TOKEN in docker-compose), wuzapi DB
+            // schema drift after a major-version sidecar upgrade.
+            return #{
+                "sidecar_status": "awaiting_pairing",
+                "sidecar_rpc_url": base,
+                "registered_accounts": [],
+                "accounts_on_disk": [],
+                "fetch_error": "couldn't provision wuzapi user: " + e,
+            };
+        }
     }
 
     // Opportunistically re-register the webhook on every status

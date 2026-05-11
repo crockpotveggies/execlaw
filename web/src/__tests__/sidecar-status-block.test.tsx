@@ -34,11 +34,11 @@ describe("SidecarStatusBlock — booting-state UX", () => {
         ).toBeInTheDocument();
     });
 
-    it("shows the booting-up header during `awaiting_pairing`", () => {
+    it("does NOT show the booting-up header during `awaiting_pairing` (the sidecar IS up at that point — only the next-stage provisioning is pending)", () => {
         render(<SidecarStatusBlock {...PROPS} status="awaiting_pairing" />);
         expect(
-            screen.getByTestId("signal-sidecar-booting-header"),
-        ).toBeInTheDocument();
+            screen.queryByTestId("signal-sidecar-booting-header"),
+        ).toBeNull();
     });
 
     it("does NOT show the booting-up header when healthy", () => {
