@@ -518,6 +518,277 @@ pub async fn list_ui_panels_handler(State(state): State<AppState>) -> impl IntoR
         .into_response()
 }
 
+// ---------------------------------------------------------------------------
+// Factory reset (per-plugin)
+// ---------------------------------------------------------------------------
+
+/// Literal token the operator must include in the request body — same
+/// pattern as the system-wide factory reset in `factory_reset.rs`. Not
+/// a security boundary on its own; the controller-only auth gate is
+/// what actually protects the endpoint. Documented to the operator
+/// inline in the SPA's confirm dialog.
+const PLUGIN_FACTORY_RESET_CONFIRM: &str = "RESET";
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct PluginFactoryResetRequest {
+    /// Must equal the literal string `"RESET"`. Anything else returns 400.
+    pub confirm: String,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct PluginFactoryResetResponse {
+    /// How many sidecar state directories under
+    /// `~/.execlaw/sidecars/<plugin>/<sidecar>/` were removed.
+    pub sidecars_wiped: usize,
+    /// How many `vault_secrets` rows scoped to this plugin were
+    /// deleted.
+    pub vault_keys_wiped: usize,
+    /// How many `state_oauth_tokens` rows scoped to this plugin were
+    /// deleted. (`state_oauth_clients` are PRESERVED — those carry
+    /// operator-supplied credentials we don't want to force them to
+    /// re-paste; only the runtime tokens get cleared.)
+    pub oauth_tokens_wiped: usize,
+}
+
+/// Resolve the per-(plugin, sidecar) state directory the supervisor
+/// uses for `state://` mounts. Mirrors the private `state_dir_for`
+/// in `crates/server/src/sidecar_supervisor.rs`. Duplicated rather
+/// than exposed because (a) the path layout is convention, not
+/// contract, (b) factory-reset is the only second consumer.
+fn sidecar_state_dir(plugin_id: &str, sidecar_name: &str) -> std::path::PathBuf {
+    use directories::UserDirs;
+    let home = UserDirs::new()
+        .map(|d| d.home_dir().to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join(".execlaw")
+        .join("sidecars")
+        .join(plugin_id)
+        .join(sidecar_name)
+}
+
+/// `POST /api/admin/plugins/:id/factory-reset`
+///
+/// Wipe runtime state for one plugin and re-bootstrap it. Distinct
+/// from `DELETE /api/admin/plugins/:id` (uninstall) and from the
+/// system-wide `POST /api/admin/factory-reset` in two ways:
+///
+/// 1. **Scope is one plugin.** Other plugins, the operator's account,
+///    routines, principals, etc. are untouched.
+/// 2. **The plugin install record stays.** This is "go back to
+///    first-boot for THIS plugin," not "remove the plugin." So the
+///    plugin is still enabled when the call returns; the operator
+///    doesn't have to re-install or re-enable.
+///
+/// What gets wiped:
+///   * Every `vault_secrets` row scoped to the plugin (cached
+///     tokens, webhook secrets, anything the plugin's `vault_put`
+///     wrote).
+///   * Every `state_oauth_tokens` row scoped to the plugin (refresh
+///     + access tokens). On next OAuth grant the operator re-clicks
+///     "Authorize" and the token shows up again.
+///   * Every supervised sidecar's state volume at
+///     `~/.execlaw/sidecars/<plugin>/<sidecar>/`. For Signal that's
+///     the linked-device pairing; for WhatsApp it's the wuzapi
+///     SQLite + paired-account state.
+///
+/// What is PRESERVED:
+///   * `state_plugins` install record (the plugin stays installed).
+///   * `state_oauth_clients` rows (operator-supplied client_id +
+///     client_secret + redirect_uri — typing those again is
+///     friction without payoff).
+///   * Plugin-shipped skills + skill invocation history (uninstall
+///     archives those; factory-reset is meant to be lighter).
+///
+/// Flow:
+///   1. Disable the plugin (registry drops its hooks, subprocess
+///      gets killed, WS subscriptions close, supervisor sees the
+///      sidecar list shrink and stops containers on next reconcile).
+///   2. Wait for the supervisor to actually stop the containers
+///      (kick + brief sleep). Without this the volume wipe could
+///      race a still-running container's last write.
+///   3. Remove sidecar state directories.
+///   4. Wipe vault + oauth-token rows.
+///   5. Re-enable the plugin (registry re-registers, fires
+///      `on_enable`, supervisor respawns containers fresh against
+///      the now-empty volumes).
+///
+/// Idempotent: calling twice is harmless. The second call wipes
+/// already-empty state and re-enables an already-enabled plugin
+/// (which is itself a no-op).
+#[utoipa::path(
+    post,
+    path = "/api/admin/plugins/{plugin_id}/factory-reset",
+    params(
+        ("plugin_id" = String, Path, description = "Installed plugin id"),
+    ),
+    request_body = PluginFactoryResetRequest,
+    responses(
+        (status = 200, description = "Plugin runtime state wiped + re-enabled", body = PluginFactoryResetResponse),
+        (status = 400, description = "Missing or wrong confirm token"),
+        (status = 404, description = "Plugin not installed"),
+    ),
+    tag = "plugins"
+)]
+pub async fn factory_reset_handler(
+    State(state): State<AppState>,
+    Path(plugin_id): Path<String>,
+    Json(req): Json<PluginFactoryResetRequest>,
+) -> impl IntoResponse {
+    if req.confirm != PLUGIN_FACTORY_RESET_CONFIRM {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "missing_confirm",
+                "message": format!(
+                    "POST body must contain `confirm: \"{PLUGIN_FACTORY_RESET_CONFIRM}\"`."
+                ),
+            })),
+        )
+            .into_response();
+    }
+
+    // Snapshot the registered sidecars BEFORE disable — disable drops
+    // them from the registry, so we'd otherwise lose the (plugin_id,
+    // sidecar_name) pairs we need to compute volume paths.
+    let sidecar_names: Vec<String> = state
+        .plugin_host
+        .registry()
+        .all_sidecars()
+        .into_iter()
+        .filter(|s| s.plugin_id == plugin_id)
+        .map(|s| s.name)
+        .collect();
+
+    // Step 1: disable. Fails 404 if plugin isn't installed.
+    if let Err(e) = state.plugin_host.disable(&plugin_id).await {
+        return plugin_error_response(e);
+    }
+    // Disable removes hooks; mark every owned tool removed so the
+    // dispatch gate stops accepting them in the brief window
+    // before re-enable repopulates them.
+    let now = chrono::Utc::now().timestamp();
+    if let Err(e) = crate::tool_sync::mark_plugin_tools_removed(
+        &state.db,
+        &plugin_id,
+        &state.plugin_host,
+        now,
+    ) {
+        tracing::warn!(
+            plugin_id = %plugin_id,
+            error = %e,
+            "mark_plugin_tools_removed failed during factory reset",
+        );
+    }
+
+    // Step 2: ask the supervisor to reconcile NOW so containers stop
+    // before we touch the volumes. Then a small grace window for
+    // the actual stop call to land. If the supervisor isn't wired
+    // (test rigs, doctor checks), we skip and rely on Docker's
+    // bind-mount semantics to tolerate a racing write.
+    if let Some(sup) = state.sidecar_supervisor.as_ref() {
+        sup.kick();
+        // 750 ms is empirically enough for Docker's stop() to drain;
+        // longer waits make the SPA's spinner feel sluggish without
+        // adding safety. The supervisor's normal reconcile cadence
+        // is 5 s, so this is well under that.
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    }
+
+    // Step 3: remove sidecar state volumes.
+    let mut sidecars_wiped = 0usize;
+    for sidecar in &sidecar_names {
+        let dir = sidecar_state_dir(&plugin_id, sidecar);
+        if dir.exists() {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {
+                    sidecars_wiped += 1;
+                    tracing::info!(
+                        plugin_id = %plugin_id,
+                        sidecar = %sidecar,
+                        path = %dir.display(),
+                        "wiped sidecar state directory",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin_id = %plugin_id,
+                        sidecar = %sidecar,
+                        path = %dir.display(),
+                        error = %e,
+                        "factory-reset: failed to remove sidecar state dir; \
+                         operator may need to delete manually",
+                    );
+                }
+            }
+        }
+    }
+
+    // Step 4: wipe vault + oauth token rows. Both are scoped on
+    // `plugin_id` so the SQL is straightforward; we count rows
+    // affected for the response body.
+    let (vault_keys_wiped, oauth_tokens_wiped) = match state.db.with_conn(|c| {
+        let v = c.execute(
+            "DELETE FROM vault_secrets WHERE plugin_id = ?1",
+            rusqlite::params![plugin_id],
+        )?;
+        let t = c.execute(
+            "DELETE FROM state_oauth_tokens WHERE plugin_id = ?1",
+            rusqlite::params![plugin_id],
+        )?;
+        Ok((v, t))
+    }) {
+        Ok((v, t)) => (v, t),
+        Err(e) => {
+            tracing::error!(
+                plugin_id = %plugin_id,
+                error = %e,
+                "factory-reset: vault/oauth wipe failed; plugin is disabled — \
+                 operator should re-enable from Settings → Plugins manually",
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "wipe_failed",
+                    "message": format!("DB wipe failed: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Step 5: re-enable. Re-registers hooks, fires on_enable, and
+    // the supervisor's next reconcile spawns the sidecars against
+    // the now-empty volumes.
+    if let Err(e) = state.plugin_host.enable(&plugin_id).await {
+        tracing::error!(
+            plugin_id = %plugin_id,
+            error = %e,
+            "factory-reset: re-enable failed — plugin will remain disabled, \
+             operator should retry from Settings → Plugins",
+        );
+        return plugin_error_response(e);
+    }
+    sync_after_lifecycle_change(&state, &plugin_id);
+
+    tracing::info!(
+        plugin_id = %plugin_id,
+        sidecars_wiped,
+        vault_keys_wiped,
+        oauth_tokens_wiped,
+        "plugin factory-reset complete",
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(PluginFactoryResetResponse {
+            sidecars_wiped,
+            vault_keys_wiped: vault_keys_wiped as usize,
+            oauth_tokens_wiped: oauth_tokens_wiped as usize,
+        })),
+    )
+        .into_response()
+}
+
 /// Sub-router mounted at `/api/admin/plugins/...`.
 pub fn plugins_router() -> Router<AppState> {
     Router::new()
@@ -532,6 +803,10 @@ pub fn plugins_router() -> Router<AppState> {
         .route(
             "/api/admin/plugins/{plugin_id}/disable",
             post(disable_handler),
+        )
+        .route(
+            "/api/admin/plugins/{plugin_id}/factory-reset",
+            post(factory_reset_handler),
         )
         .route("/api/admin/plugins/{plugin_id}", delete(uninstall_handler))
 }

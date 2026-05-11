@@ -260,3 +260,158 @@ describe("PluginConfigShell", () => {
         expect(back.getAttribute("href")).toBe("/settings/plugins");
     });
 });
+
+describe("PluginConfigShell — Factory reset", () => {
+    it("renders the Factory reset button alongside Uninstall", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/plugins")
+                return pluginsResponse("test-plugin", false);
+            return new Response("{}", { status: 200 });
+        });
+        mountAt("/settings/plugins/test-plugin");
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("plugin-config-danger-zone"),
+            ).toBeInTheDocument();
+        });
+        expect(
+            screen.getByTestId("plugin-config-factory-reset"),
+        ).toBeInTheDocument();
+        expect(
+            screen.getByTestId("plugin-config-uninstall"),
+        ).toBeInTheDocument();
+    });
+
+    it("declining the confirm dialog does NOT issue the POST", async () => {
+        const calls: string[] = [];
+        fetchMock.mockImplementation(
+            async (url: string, init?: RequestInit) => {
+                calls.push(`${init?.method ?? "GET"} ${url}`);
+                if (url === "/api/admin/me") return meResponse();
+                if (url === "/api/admin/plugins")
+                    return pluginsResponse("test-plugin", false);
+                return new Response("{}", { status: 200 });
+            },
+        );
+        vi.stubGlobal("confirm", () => false);
+        mountAt("/settings/plugins/test-plugin");
+        await waitFor(() => {
+            const btn = screen.getByTestId("plugin-config-factory-reset");
+            expect(btn).not.toBeDisabled();
+        });
+        fireEvent.click(screen.getByTestId("plugin-config-factory-reset"));
+        // Brief tick for any async to land.
+        await new Promise((r) => setTimeout(r, 50));
+        expect(
+            calls.some((c) => c.includes("/factory-reset")),
+        ).toBe(false);
+        // Still on the config page (no navigate happened).
+        expect(screen.queryByTestId("plugins-list-page")).toBeNull();
+    });
+
+    it("accepting the confirm dialog POSTs to /factory-reset with the RESET token + renders the success summary", async () => {
+        const calls: { url: string; method: string; body?: string }[] = [];
+        fetchMock.mockImplementation(
+            async (url: string, init?: RequestInit) => {
+                calls.push({
+                    url,
+                    method: init?.method ?? "GET",
+                    body:
+                        typeof init?.body === "string" ? init.body : undefined,
+                });
+                if (url === "/api/admin/me") return meResponse();
+                if (url === "/api/admin/plugins")
+                    return pluginsResponse("test-plugin", false);
+                if (
+                    url ===
+                        "/api/admin/plugins/test-plugin/factory-reset" &&
+                    init?.method === "POST"
+                ) {
+                    return new Response(
+                        JSON.stringify({
+                            sidecars_wiped: 1,
+                            vault_keys_wiped: 2,
+                            oauth_tokens_wiped: 0,
+                        }),
+                        { status: 200 },
+                    );
+                }
+                return new Response("{}", { status: 200 });
+            },
+        );
+        vi.stubGlobal("confirm", () => true);
+        mountAt("/settings/plugins/test-plugin");
+        await waitFor(() => {
+            const btn = screen.getByTestId("plugin-config-factory-reset");
+            expect(btn).not.toBeDisabled();
+        });
+        fireEvent.click(screen.getByTestId("plugin-config-factory-reset"));
+
+        // Result block appears with the wipe counts.
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("plugin-config-reset-result"),
+            ).toBeInTheDocument();
+        });
+        const result = screen.getByTestId("plugin-config-reset-result");
+        expect(result.textContent).toMatch(/1.*sidecar/);
+        expect(result.textContent).toMatch(/2.*vault entries/);
+        expect(result.textContent).toMatch(/0.*OAuth/);
+
+        // The POST happened, with the literal `"RESET"` body the
+        // backend requires.
+        const resetCall = calls.find(
+            (c) => c.url === "/api/admin/plugins/test-plugin/factory-reset",
+        );
+        expect(resetCall).toBeDefined();
+        expect(resetCall?.method).toBe("POST");
+        expect(resetCall?.body).toContain('"confirm":"RESET"');
+    });
+
+    it("disables Uninstall while a Factory reset is in flight (and vice versa)", async () => {
+        // Resolve the factory-reset POST manually so the button stays
+        // in `resetting` state for as long as the test wants.
+        let resolveReset: ((value: Response) => void) | null = null;
+        fetchMock.mockImplementation(
+            async (url: string, init?: RequestInit) => {
+                if (url === "/api/admin/me") return meResponse();
+                if (url === "/api/admin/plugins")
+                    return pluginsResponse("test-plugin", false);
+                if (
+                    url === "/api/admin/plugins/test-plugin/factory-reset" &&
+                    init?.method === "POST"
+                ) {
+                    return new Promise<Response>((r) => {
+                        resolveReset = r;
+                    });
+                }
+                return new Response("{}", { status: 200 });
+            },
+        );
+        vi.stubGlobal("confirm", () => true);
+        mountAt("/settings/plugins/test-plugin");
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("plugin-config-factory-reset"),
+            ).not.toBeDisabled();
+        });
+        fireEvent.click(screen.getByTestId("plugin-config-factory-reset"));
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("plugin-config-uninstall"),
+            ).toBeDisabled();
+        });
+        // Release the in-flight reset to let the test exit cleanly.
+        resolveReset?.(
+            new Response(
+                JSON.stringify({
+                    sidecars_wiped: 0,
+                    vault_keys_wiped: 0,
+                    oauth_tokens_wiped: 0,
+                }),
+                { status: 200 },
+            ),
+        );
+    });
+});

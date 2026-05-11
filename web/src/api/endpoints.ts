@@ -487,6 +487,41 @@ export async function uninstallPlugin(
     );
 }
 
+/// Result of `POST /api/admin/plugins/:id/factory-reset` — counts of
+/// what was actually wiped, so the SPA's success toast can show
+/// "Wiped 1 sidecar volume + 2 vault entries" rather than a generic
+/// "done" that leaves the operator wondering what happened.
+export interface FactoryResetPluginResponse {
+    sidecars_wiped: number;
+    vault_keys_wiped: number;
+    oauth_tokens_wiped: number;
+}
+
+/// Wipe a plugin's runtime state — vault entries, sidecar volumes,
+/// OAuth tokens — and re-bootstrap. Distinct from `uninstallPlugin`:
+/// the install record stays, the plugin remains enabled, and
+/// operator-supplied OAuth client credentials are preserved.
+///
+/// Backed by `crates/server/src/plugins.rs::factory_reset_handler`,
+/// which expects a literal `"RESET"` string in the body — same
+/// pattern as the system-wide factory reset.
+export async function factoryResetPlugin(
+    pluginId: string,
+    tokenAccessor: () => string | null,
+): Promise<FactoryResetPluginResponse> {
+    return apiFetch<FactoryResetPluginResponse>(
+        `/api/admin/plugins/${encodeURIComponent(pluginId)}/factory-reset`,
+        {
+            method: "POST",
+            // `apiFetch` JSON-serialises the body and stamps
+            // `content-type: application/json` automatically — see
+            // DEFAULT_HEADERS in `client.ts`.
+            body: { confirm: "RESET" },
+        },
+        tokenAccessor,
+    );
+}
+
 export interface InstallPluginResponse {
     plugin_id: string;
     version: string;

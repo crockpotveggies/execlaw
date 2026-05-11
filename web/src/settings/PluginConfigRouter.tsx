@@ -23,8 +23,10 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import Button from "react-bootstrap/Button";
 import Spinner from "react-bootstrap/Spinner";
 import {
+    factoryResetPlugin,
     listPlugins,
     uninstallPlugin,
+    type FactoryResetPluginResponse,
     type PluginSummary,
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
@@ -71,6 +73,12 @@ export function PluginConfigRouter() {
     );
     const [error, setError] = useState<string | null>(null);
     const [uninstalling, setUninstalling] = useState(false);
+    const [resetting, setResetting] = useState(false);
+    /// Result of the most recent factory-reset call, used to render
+    /// a transient success message ("Wiped 1 sidecar volume + 2
+    /// vault entries"). Cleared on next refresh / next reset.
+    const [resetResult, setResetResult] =
+        useState<FactoryResetPluginResponse | null>(null);
 
     const refresh = useCallback(async () => {
         try {
@@ -105,6 +113,36 @@ export function PluginConfigRouter() {
             setUninstalling(false);
         }
     }, [getAccessToken, id, navigate]);
+
+    /// Wipe runtime state for this plugin and re-bootstrap. Distinct
+    /// from uninstall: install record stays, plugin remains enabled,
+    /// operator-supplied OAuth client credentials are preserved.
+    /// Wired to `POST /api/admin/plugins/:id/factory-reset`.
+    const onFactoryReset = useCallback(async () => {
+        if (
+            !window.confirm(
+                `Factory-reset plugin "${id}"?\n\nThis wipes:\n  • cached vault entries (tokens, secrets the plugin stored)\n  • OAuth access + refresh tokens (re-authorize after)\n  • sidecar state volumes (signal-cli / wuzapi pairing)\n\nIt KEEPS:\n  • the plugin install itself (no need to reinstall)\n  • OAuth client credentials you typed in (client_id, client_secret)\n\nThe plugin is disabled, wiped, then re-enabled. Existing inbound conversations on bridged transports will need re-pairing.`,
+            )
+        ) {
+            return;
+        }
+        setResetting(true);
+        setResetResult(null);
+        try {
+            const r = await factoryResetPlugin(id, getAccessToken);
+            setResetResult(r);
+            setError(null);
+            // Refresh the install summary so any state-derived UI
+            // upstream (e.g. enabled chip) re-fetches; the plugin's
+            // own config component will refetch its status on its
+            // next poll cadence.
+            await refresh();
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setResetting(false);
+        }
+    }, [getAccessToken, id, refresh]);
 
     return (
         <section
@@ -186,22 +224,76 @@ export function PluginConfigRouter() {
                     <i className="bi bi-exclamation-triangle me-2" aria-hidden />
                     Danger zone
                 </div>
-                <div className="execlaw-muted small mb-2">
-                    Uninstalling removes the staged plugin files plus any
-                    plugin-scoped credentials in the vault. The hooks the
-                    plugin registered (tools, identity providers, etc.)
-                    are dropped immediately.
-                </div>
+
                 <ErrorBanner
                     message={error}
                     onDismiss={() => setError(null)}
                     className="mb-2"
                 />
+
+                {resetResult && (
+                    <div
+                        className="alert alert-success small py-2 mb-3"
+                        data-testid="plugin-config-reset-result"
+                    >
+                        Factory reset complete:{" "}
+                        <strong>{resetResult.sidecars_wiped}</strong> sidecar
+                        volume(s),{" "}
+                        <strong>{resetResult.vault_keys_wiped}</strong> vault
+                        entr{resetResult.vault_keys_wiped === 1 ? "y" : "ies"},
+                        {" "}
+                        <strong>{resetResult.oauth_tokens_wiped}</strong> OAuth
+                        token(s) wiped. Plugin re-enabled.
+                    </div>
+                )}
+
+                {/* Factory reset — non-destructive to the install itself.
+                    Wipes runtime state (vault, sidecar volumes, OAuth
+                    tokens) but keeps the install record and any operator-
+                    typed config. Pairs with the existing Uninstall button
+                    below for the case where wiping isn't enough. */}
+                <div className="execlaw-muted small mb-2">
+                    <strong>Factory reset</strong> wipes the plugin's runtime
+                    state (cached vault entries, OAuth tokens, sidecar volumes
+                    such as signal-cli / wuzapi pairing) but keeps the install
+                    record and your operator-typed config (e.g. OAuth client
+                    credentials). Use this when a sidecar is in a bad state
+                    or pairing has drifted.
+                </div>
+                <Button
+                    variant="outline-warning"
+                    size="sm"
+                    className="mb-3"
+                    onClick={() => void onFactoryReset()}
+                    disabled={resetting || uninstalling || summary === "loading"}
+                    data-testid="plugin-config-factory-reset"
+                >
+                    {resetting ? (
+                        <>
+                            <Spinner size="sm" animation="border" className="me-1" />
+                            Resetting…
+                        </>
+                    ) : (
+                        <>
+                            <i className="bi bi-arrow-counterclockwise me-1" aria-hidden />
+                            Factory reset {id}
+                        </>
+                    )}
+                </Button>
+
+                <hr className="my-3" />
+
+                <div className="execlaw-muted small mb-2">
+                    <strong>Uninstall</strong> removes the staged plugin files
+                    plus any plugin-scoped credentials in the vault. The hooks
+                    the plugin registered (tools, identity providers, etc.)
+                    are dropped immediately.
+                </div>
                 <Button
                     variant="outline-danger"
                     size="sm"
                     onClick={() => void onUninstall()}
-                    disabled={uninstalling || summary === "loading"}
+                    disabled={uninstalling || resetting || summary === "loading"}
                     data-testid="plugin-config-uninstall"
                 >
                     {uninstalling ? (

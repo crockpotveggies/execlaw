@@ -458,6 +458,7 @@ mod tests {
             ("/api/admin/plugins/ui_panels", &["get"]),
             ("/api/admin/plugins/{plugin_id}/enable", &["post"]),
             ("/api/admin/plugins/{plugin_id}/disable", &["post"]),
+            ("/api/admin/plugins/{plugin_id}/factory-reset", &["post"]),
             ("/api/admin/plugins/{plugin_id}", &["delete"]),
             ("/api/admin/logs", &["get"]),
             ("/api/admin/eval/flags", &["get"]),
