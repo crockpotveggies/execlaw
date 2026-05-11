@@ -56,11 +56,13 @@ Args: { q?: string (Gmail search syntax — `from:`, `subject:`, \
 `label:`, `is:unread`, etc.), label_ids?: string[], max_results?: \
 integer (default 25, cap 100) }. Returns \
 [{ id, thread_id, from, to, subject, snippet, date, label_ids }]."""
+trust_floor = "Controller"
 latency = "medium"
 
 [[tools]]
 name = "gmail.search"
 description = "Free-text Gmail search. Args: { query: string, max_results?: integer }. Thin wrapper over list_messages with `q`."
+trust_floor = "Controller"
 latency = "medium"
 
 [[tools]]
@@ -68,6 +70,7 @@ name = "gmail.get_message"
 description = """Get the full payload of a single Gmail message — \
 headers + decoded text/plain body. Args: { id: string, format?: \
 \"metadata\" | \"full\" (default \"full\") }."""
+trust_floor = "Controller"
 latency = "medium"
 
 [[tools]]
@@ -99,6 +102,7 @@ latency = "medium"
 [[tools]]
 name = "gmail.list_labels"
 description = "List the Gmail label set (system + user labels). Returns [{ id, name, type }]."
+trust_floor = "Controller"
 latency = "low"
 
 [[tools]]
@@ -126,13 +130,21 @@ latency = "low"
 [[tools]]
 name = "calendar.list_calendars"
 description = "List the operator's Google calendars (id, summary, time zone, primary flag)."
+trust_floor = "Controller"
 latency = "medium"
 
 [[tools]]
 name = "calendar.list_events"
 description = "List events on a calendar within a time window. Args: { calendar_id?: string (default 'primary'), time_min?: RFC3339, time_max?: RFC3339, max_results?: integer (default 25, cap 100), query?: string }."
+trust_floor = "Controller"
 latency = "medium"
 
+# calendar.check_availability is the ONLY tool without a trust floor —
+# outside-class principals (Signal contacts trying to schedule a
+# meeting with the operator, etc.) legitimately need to query
+# free/busy to propose times. The freeBusy response is opaque
+# busy/free intervals, NOT event details, so the leak surface is
+# minimal compared to list_events / get_event.
 [[tools]]
 name = "calendar.check_availability"
 description = "Free/busy lookup across one or more calendars. Args: { time_min: RFC3339, time_max: RFC3339, calendar_ids?: string[] (default ['primary']) }. Returns the freeBusy response keyed by calendar id."
@@ -141,6 +153,7 @@ latency = "medium"
 [[tools]]
 name = "calendar.get_event"
 description = "Get the full event payload by id. Args: { calendar_id?: string (default 'primary'), event_id: string }."
+trust_floor = "Controller"
 latency = "medium"
 
 [[tools]]
@@ -181,6 +194,7 @@ latency = "medium"
 [[tools]]
 name = "contacts.list"
 description = "List the operator's Google contacts. Returns name, email addresses, and phone numbers per contact."
+trust_floor = "Controller"
 latency = "medium"
 
 # =====================================================================
@@ -190,6 +204,7 @@ latency = "medium"
 [[tools]]
 name = "tasks.list_lists"
 description = "List the operator's Google Tasks task lists. Returns [{ id, title }]."
+trust_floor = "Controller"
 latency = "low"
 
 [[tools]]
@@ -198,6 +213,7 @@ description = """List tasks on a task list. Args: { tasklist_id?: \
 string (default '@default'), show_completed?: bool (default false), \
 max_results?: integer }. Returns [{ id, title, notes, due, status, \
 completed, position }]."""
+trust_floor = "Controller"
 latency = "medium"
 
 [[tools]]
@@ -238,16 +254,19 @@ description = """Search the operator's Drive. Args: { query: string, \
 max_results?: integer (default 25), mime_type?: string (e.g. \
 'application/pdf') }. Returns [{ id, name, mime_type, modified_time, \
 web_view_link, parents }]."""
+trust_floor = "Controller"
 latency = "medium"
 
 [[tools]]
 name = "drive.get_file_metadata"
 description = "Fetch full metadata for one Drive file. Args: { file_id: string }."
+trust_floor = "Controller"
 latency = "low"
 
 [[tools]]
 name = "drive.list_folder"
 description = "List files directly inside a Drive folder. Args: { folder_id: string, max_results?: integer (default 25) }."
+trust_floor = "Controller"
 latency = "medium"
 
 [[tools]]
@@ -257,6 +276,7 @@ string, max_bytes?: integer (default 1048576, cap 10485760) }. \
 Returns a UTF-8 string when the file decodes cleanly (Google Docs \
 get exported as plain text); otherwise returns { kind: 'binary', \
 size, base64 }."""
+trust_floor = "Controller"
 latency = "medium"
 
 [[tools]]

@@ -1362,24 +1362,49 @@ mod tests {
         // here and the dispatch table in main.rhai.
         assert_eq!(m.tools.len(), 30);
 
-        // Destructive tools MUST pin Controller. This is the v1 trust
-        // contract — letting a Signal contact (KnownTrusted at best)
-        // send mail or delete events from the operator's account is
-        // the exact attack the trust-floor system exists to prevent.
+        // EVERY tool except `calendar.check_availability` pins
+        // Controller. This is the v1 trust contract — the plugin's
+        // tools all touch the operator's personal Google account
+        // (mailbox, contacts, files, calendar, tasks), and outside
+        // principals (Signal/Discord/WhatsApp contacts reaching the
+        // agent over a bridged transport) MUST NOT be able to read
+        // or mutate any of that. The single exception is free/busy,
+        // which returns opaque busy intervals (NOT event details)
+        // and is needed for legitimate "find a meeting time with
+        // the operator" workflows from outside contacts.
         const CONTROLLER_FLOOR_TOOLS: &[&str] = &[
+            // Gmail — all tools (read AND write touch the mailbox).
+            "gmail.list_messages",
+            "gmail.search",
+            "gmail.get_message",
+            "gmail.list_labels",
             "gmail.send_message",
             "gmail.create_draft",
             "gmail.reply",
             "gmail.add_label",
             "gmail.remove_label",
             "gmail.trash",
+            // Calendar — everything except check_availability.
+            "calendar.list_calendars",
+            "calendar.list_events",
+            "calendar.get_event",
             "calendar.create_event",
             "calendar.update_event",
             "calendar.delete_event",
+            // Contacts.
+            "contacts.list",
+            // Tasks — all tools.
+            "tasks.list_lists",
+            "tasks.list_tasks",
             "tasks.create_task",
             "tasks.update_task",
             "tasks.complete_task",
             "tasks.delete_task",
+            // Drive — all tools.
+            "drive.search",
+            "drive.get_file_metadata",
+            "drive.list_folder",
+            "drive.read_file",
             "drive.create_file",
             "drive.share",
         ];
@@ -1396,25 +1421,11 @@ mod tests {
             );
         }
 
-        // Read-only tools MUST NOT pin a floor — they're agent-callable
-        // from any conversation that reaches the dispatcher.
-        const NO_FLOOR_TOOLS: &[&str] = &[
-            "gmail.list_messages",
-            "gmail.search",
-            "gmail.get_message",
-            "gmail.list_labels",
-            "calendar.list_calendars",
-            "calendar.list_events",
-            "calendar.check_availability",
-            "calendar.get_event",
-            "contacts.list",
-            "tasks.list_lists",
-            "tasks.list_tasks",
-            "drive.search",
-            "drive.get_file_metadata",
-            "drive.list_folder",
-            "drive.read_file",
-        ];
+        // The single intentional exception. If you're adding another
+        // tool that can safely be called from outside principals,
+        // add it here and document why — the default for this
+        // plugin is "Controller-only".
+        const NO_FLOOR_TOOLS: &[&str] = &["calendar.check_availability"];
         for name in NO_FLOOR_TOOLS {
             let t = m
                 .tools
@@ -1423,6 +1434,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} must be declared"));
             assert!(t.trust_floor.is_none(), "{name} must NOT pin a trust floor",);
         }
+
+        // Sanity check: every tool is accounted for in exactly one of
+        // the two lists above. Adding a tool to the manifest without
+        // categorising it would otherwise pass this test.
+        assert_eq!(
+            CONTROLLER_FLOOR_TOOLS.len() + NO_FLOOR_TOOLS.len(),
+            m.tools.len(),
+            "every declared tool must appear in CONTROLLER_FLOOR_TOOLS or NO_FLOOR_TOOLS",
+        );
 
         // Runtime tier — script, source = main.rhai.
         let rt = m.runtime.as_ref().expect("[runtime] must be declared");

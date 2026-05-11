@@ -294,11 +294,21 @@ async fn google_apps_plugin_installs_and_registers_all_five_modules() {
     }
 
     // ---- Seed OAuth + dispatch a tool from each module ----------
+    // Every google-apps tool except calendar.check_availability now
+    // pins Controller, so the caller must be Controller-trust to
+    // reach the script. Sub-Controller adversarial coverage lives in
+    // `controller_floor_tool_rejects_sub_controller_caller` below;
+    // here we just want to verify dispatch wiring works end-to-end.
     seed_oauth(&state.db, "ya29.fake");
     // Gmail
     let res = state
         .plugin_host
-        .call_tool("gmail.list_labels", serde_json::json!({}), &["*"], None)
+        .call_tool(
+            "gmail.list_labels",
+            serde_json::json!({}),
+            &["*"],
+            Some("Controller"),
+        )
         .await
         .expect("gmail.list_labels should succeed");
     assert!(res["labels"].as_array().is_some());
@@ -309,7 +319,7 @@ async fn google_apps_plugin_installs_and_registers_all_five_modules() {
             "calendar.list_calendars",
             serde_json::json!({}),
             &["*"],
-            None,
+            Some("Controller"),
         )
         .await
         .expect("calendar.list_calendars should succeed");
@@ -317,14 +327,24 @@ async fn google_apps_plugin_installs_and_registers_all_five_modules() {
     // Contacts
     let res = state
         .plugin_host
-        .call_tool("contacts.list", serde_json::json!({}), &["*"], None)
+        .call_tool(
+            "contacts.list",
+            serde_json::json!({}),
+            &["*"],
+            Some("Controller"),
+        )
         .await
         .expect("contacts.list should succeed");
     assert!(res["contacts"].as_array().is_some());
     // Tasks
     let res = state
         .plugin_host
-        .call_tool("tasks.list_lists", serde_json::json!({}), &["*"], None)
+        .call_tool(
+            "tasks.list_lists",
+            serde_json::json!({}),
+            &["*"],
+            Some("Controller"),
+        )
         .await
         .expect("tasks.list_lists should succeed");
     assert!(res["task_lists"].as_array().is_some());
@@ -335,7 +355,7 @@ async fn google_apps_plugin_installs_and_registers_all_five_modules() {
             "drive.search",
             serde_json::json!({"query": "anything"}),
             &["*"],
-            None,
+            Some("Controller"),
         )
         .await
         .expect("drive.search should succeed");
@@ -364,15 +384,23 @@ async fn enabled_modules_setting_gates_dispatch() {
         .put(Some(PLUGIN_ID), "enabled_modules", br#"["gmail"]"#, now)
         .unwrap();
 
-    // Gmail still flows.
+    // Gmail still flows. (Caller is Controller — every gmail tool
+    // pins Controller now, so anything sub-Controller bounces at the
+    // trust-floor gate before reaching the module check.)
     let _ = state
         .plugin_host
-        .call_tool("gmail.list_labels", serde_json::json!({}), &["*"], None)
+        .call_tool(
+            "gmail.list_labels",
+            serde_json::json!({}),
+            &["*"],
+            Some("Controller"),
+        )
         .await
         .expect("gmail module still enabled");
 
     // Each of the other four modules must throw with the clear
-    // "<module> module is disabled" error.
+    // "<module> module is disabled" error. Pass Controller trust so
+    // we get past the trust-floor gate and exercise the module gate.
     for (tool, expected_module) in [
         ("calendar.list_calendars", "calendar"),
         ("contacts.list", "contacts"),
@@ -381,12 +409,105 @@ async fn enabled_modules_setting_gates_dispatch() {
     ] {
         let err = state
             .plugin_host
-            .call_tool(tool, serde_json::json!({"query": "x"}), &["*"], None)
+            .call_tool(
+                tool,
+                serde_json::json!({"query": "x"}),
+                &["*"],
+                Some("Controller"),
+            )
             .await
             .unwrap_err();
         assert!(
             err.contains(&format!("{expected_module} module is disabled")),
             "expected '{expected_module} module is disabled' in error for {tool}; got: {err}",
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn check_availability_is_the_only_tool_callable_from_outside_principals() {
+    // Trust-contract carve-out: `calendar.check_availability` is the
+    // single tool reachable by sub-Controller principals (e.g. a
+    // Signal contact asking "when can we meet?"). Every other tool
+    // touches the operator's mailbox / contacts / files / calendar
+    // event details and MUST refuse. freeBusy is opaque busy/free
+    // intervals — no event titles, descriptions, or attendees — so
+    // the leak surface is acceptable.
+    //
+    // This test pins the carve-out: a KnownTrusted caller reaches
+    // `check_availability` (it hits the script and tries to fetch
+    // freeBusy from the mock; we just assert dispatch crossed the
+    // trust gate without rejection), and every read-only tool from
+    // the other modules is rejected at the gate.
+    let (mock_url, _calls) = spawn_mock_api();
+    let stage_dir = tempfile::tempdir().unwrap();
+    let (app, state) = build_app(stage_dir.path().to_path_buf());
+
+    let (manifest, script) = load_plugin_files(&mock_url);
+    let zip = build_zip(&[
+        ("plugin.toml", manifest.as_bytes()),
+        ("main.rhai", script.as_bytes()),
+    ]);
+    let (status, _) = post_zip(app.clone(), zip).await;
+    assert_eq!(status, StatusCode::OK);
+    seed_oauth(&state.db, "ya29.fake");
+
+    // The carve-out tool must clear the trust gate. We don't care
+    // about the HTTP result — the script's freeBusy URL isn't
+    // intercepted by our mock so the actual call will fail with a
+    // 401 from real Google. What we DO care about is the failure
+    // mode: it must come from inside the script (Rhai runtime error
+    // / http_post), NOT from the trust-floor gate. Anything
+    // mentioning "Controller" or "trust" in the error would mean
+    // the gate slammed shut and the test must fail.
+    let outcome = state
+        .plugin_host
+        .call_tool(
+            "calendar.check_availability",
+            serde_json::json!({
+                "time_min": "2026-05-11T00:00:00Z",
+                "time_max": "2026-05-12T00:00:00Z",
+            }),
+            &["*"],
+            Some("KnownTrusted"),
+        )
+        .await;
+    match outcome {
+        Ok(_) => {}
+        Err(e) => {
+            assert!(
+                !e.to_lowercase().contains("trust") && !e.contains("Controller"),
+                "calendar.check_availability must clear the trust gate for KnownTrusted; \
+                 got trust-floor rejection: {e}",
+            );
+            // Any other failure (http_post 401 from the unmocked URL,
+            // rhai-side decode error) means the gate opened — that's
+            // the contract this test pins.
+        }
+    }
+
+    // Every other read-only tool must be rejected for the same caller.
+    for tool in [
+        "gmail.list_labels",
+        "calendar.list_calendars",
+        "calendar.list_events",
+        "contacts.list",
+        "tasks.list_lists",
+        "drive.search",
+    ] {
+        let err = state
+            .plugin_host
+            .call_tool(
+                tool,
+                serde_json::json!({"query": "x"}),
+                &["*"],
+                Some("KnownTrusted"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_lowercase().contains("trust") || err.contains("Controller"),
+            "{tool}: expected trust-floor rejection for KnownTrusted caller; got: {err}",
         );
     }
 }
