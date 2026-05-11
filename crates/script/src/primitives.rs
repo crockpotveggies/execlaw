@@ -26,7 +26,7 @@
 use crate::cache::{HttpCache, cache_key};
 use crate::host_caps::{
     HostCapabilitiesArc, InboundAttachmentMeta, InboundMessage, WsFrameHandler,
-    WsSubscriptionHandle,
+    WsKeepaliveCallback, WsSubscriptionHandle,
 };
 use rhai::{Dynamic, Engine, EvalAltResult, ImmutableString, Map};
 use sha2::{Digest, Sha256};
@@ -1325,6 +1325,76 @@ fn register_host_cap_bindings(
         );
     }
 
+    // ws_set_keepalive(handle, interval_ms, callback_name) -> bool
+    // ws_set_keepalive(handle, interval_ms, callback_name, jitter_first) -> bool
+    //
+    // Install a periodic application-layer keepalive on a bidi WS
+    // handle. The named Rhai callback runs every `interval_ms`
+    // and returns the text-frame body to write (empty string to
+    // skip that tick). Required for protocols where the server
+    // expects the client to send a periodic heartbeat — Discord's
+    // gateway `{"op":1,"d":<seq>}` is the canonical example.
+    //
+    // RFC-6455 protocol-level Ping/Pong is host-handled in
+    // consumer_loop and does NOT need plugin participation;
+    // ws_set_keepalive is strictly for application-layer
+    // heartbeats whose payload depends on mutable plugin state.
+    //
+    // `jitter_first` (default true) jitters the first tick across
+    // 0..1 × interval — Discord's gateway docs explicitly require
+    // this to avoid a thundering-herd on mass reconnect. Plugins
+    // can opt out with the 4-arg overload.
+    //
+    // Returns true when the timer was installed (replacing any
+    // previously-installed keepalive on the same handle). Returns
+    // false if host_caps is unavailable, the handle is already
+    // closed, or interval_ms is zero.
+    {
+        let pid = plugin_id.to_owned();
+        let caps = host_caps.clone();
+        let owning = owning_plugin.clone();
+        engine.register_fn(
+            "ws_set_keepalive",
+            move |h: &mut WsSubscriptionHandle,
+                  interval_ms: i64,
+                  callback: ImmutableString|
+                  -> Result<bool, Box<EvalAltResult>> {
+                ws_set_keepalive_impl(
+                    &pid,
+                    &caps,
+                    &owning,
+                    h,
+                    interval_ms,
+                    &callback,
+                    true,
+                )
+            },
+        );
+    }
+    {
+        let pid = plugin_id.to_owned();
+        let caps = host_caps.clone();
+        let owning = owning_plugin.clone();
+        engine.register_fn(
+            "ws_set_keepalive",
+            move |h: &mut WsSubscriptionHandle,
+                  interval_ms: i64,
+                  callback: ImmutableString,
+                  jitter_first: bool|
+                  -> Result<bool, Box<EvalAltResult>> {
+                ws_set_keepalive_impl(
+                    &pid,
+                    &caps,
+                    &owning,
+                    h,
+                    interval_ms,
+                    &callback,
+                    jitter_first,
+                )
+            },
+        );
+    }
+
     // host_route_inbound(message_map) -> "Dispatched" |
     //                                    "GroupNotAddressed" |
     //                                    "ColdContact" |
@@ -2063,6 +2133,104 @@ fn host_cap_unavailable_err(plugin_id: &str, name: &str) -> Box<EvalAltResult> {
         .into(),
         rhai::Position::NONE,
     ))
+}
+
+/// Shared implementation behind both `ws_set_keepalive` Rhai
+/// overloads. Resolves the host caps + owning plugin, builds a
+/// `WsKeepaliveCallback` that dispatches into a named Rhai
+/// function on every tick, and forwards to
+/// `HostCapabilities::ws_set_keepalive`.
+///
+/// The callback runs from a long-lived tokio task spawned by the
+/// host's default impl. `plugin.invoke_async_owned` returns a
+/// `serde_json::Value`; if it's a string we use it as the
+/// keepalive frame, otherwise we serialize the whole value (Maps
+/// and other shapes the Rhai callback might naively return).
+/// Empty / null returns become the empty string, which
+/// `ws_set_keepalive`'s default impl interprets as "skip this
+/// tick".
+fn ws_set_keepalive_impl(
+    plugin_id: &str,
+    caps: &HostCapsHandle,
+    owning: &OwningPluginSlot,
+    h: &WsSubscriptionHandle,
+    interval_ms: i64,
+    callback: &ImmutableString,
+    jitter_first: bool,
+) -> Result<bool, Box<EvalAltResult>> {
+    let caps_arc = match caps.get() {
+        Some(c) => c.clone(),
+        None => return Err(host_cap_unavailable_err(plugin_id, "ws_set_keepalive")),
+    };
+    if interval_ms <= 0 {
+        return Err(Box::new(EvalAltResult::ErrorRuntime(
+            format!("[{plugin_id}] ws_set_keepalive: interval_ms must be > 0").into(),
+            rhai::Position::NONE,
+        )));
+    }
+    if h.is_closed() {
+        tracing::debug!(
+            target: "execlaw_script::primitives",
+            plugin_id = %plugin_id,
+            "ws_set_keepalive: handle already closed; not installing"
+        );
+        return Ok(false);
+    }
+    let plugin = owning
+        .lock()
+        .expect("OwningPluginSlot mutex poisoned")
+        .clone();
+    let plugin = match plugin {
+        Some(p) => p,
+        None => {
+            return Err(Box::new(EvalAltResult::ErrorRuntime(
+                format!("[{plugin_id}] ws_set_keepalive: owning plugin not yet wired").into(),
+                rhai::Position::NONE,
+            )));
+        }
+    };
+    let pid_for_handler = plugin_id.to_owned();
+    let cb_name: String = callback.to_string();
+    let cb: WsKeepaliveCallback = Arc::new(move || {
+        let plugin = plugin.clone();
+        let cb = cb_name.clone();
+        let pid = pid_for_handler.clone();
+        Box::pin(async move {
+            match plugin.invoke_async_owned(cb, Vec::new()).await {
+                Ok(serde_json::Value::String(s)) => s,
+                Ok(serde_json::Value::Null) => String::new(),
+                Ok(other) => other.to_string(),
+                Err(e) => {
+                    tracing::warn!(
+                        plugin_id = %pid,
+                        error = %e,
+                        "ws_set_keepalive callback errored; skipping this tick",
+                    );
+                    String::new()
+                }
+            }
+        })
+    });
+    let runtime = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(e) => {
+            return Err(Box::new(EvalAltResult::ErrorRuntime(
+                format!("[{plugin_id}] ws_set_keepalive: no tokio runtime: {e}").into(),
+                rhai::Position::NONE,
+            )));
+        }
+    };
+    let h_clone = h.clone();
+    let result = tokio::task::block_in_place(|| {
+        runtime.block_on(caps_arc.ws_set_keepalive(&h_clone, interval_ms as u64, jitter_first, cb))
+    });
+    match result {
+        Ok(()) => Ok(true),
+        Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
+            format!("[{plugin_id}] ws_set_keepalive: {}", e.0).into(),
+            rhai::Position::NONE,
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------

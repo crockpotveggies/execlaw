@@ -1407,6 +1407,7 @@ dependencies = [
  "chrono",
  "criterion",
  "futures",
+ "rand 0.8.6",
  "rhai",
  "serde",
  "serde_json",

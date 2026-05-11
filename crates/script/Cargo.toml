@@ -23,6 +23,7 @@ async-trait.workspace = true
 futures.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
 base64.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

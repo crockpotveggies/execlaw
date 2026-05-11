@@ -141,11 +141,19 @@ pub enum RouteOutcome {
 /// usually assumes the server will re-deliver, and silently
 /// queueing across reconnect would replay stale ACKs.
 ///
+/// Also carries a periodic-keepalive cancellation slot so
+/// `ws_set_keepalive` can replace a previously-installed timer
+/// without leaking the prior task (Discord's gateway raises the
+/// heartbeat interval mid-session via a new Hello on Resume; the
+/// plugin re-registers and the prior task must die). Closing the
+/// handle cancels both the consumer loop and any active keepalive.
+///
 /// Cheap clone (Arc inside everything).
 #[derive(Clone)]
 pub struct WsSubscriptionHandle {
     cancel: Arc<tokio_util::sync::CancellationToken>,
     outbox: Arc<std::sync::RwLock<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    keepalive: Arc<std::sync::RwLock<Option<tokio_util::sync::CancellationToken>>>,
 }
 
 impl WsSubscriptionHandle {
@@ -153,13 +161,21 @@ impl WsSubscriptionHandle {
         Self {
             cancel,
             outbox: Arc::new(std::sync::RwLock::new(None)),
+            keepalive: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
     /// Cooperative cancellation — the subscriber's reconnect loop
     /// checks the token between frames + on every reconnect tick.
+    /// Also cancels any periodic keepalive timer installed via
+    /// `ws_set_keepalive`.
     pub fn close(&self) {
         self.cancel.cancel();
+        if let Ok(mut slot) = self.keepalive.write() {
+            if let Some(tok) = slot.take() {
+                tok.cancel();
+            }
+        }
     }
 
     /// True after `close()` has been called (or the plugin's
@@ -175,6 +191,30 @@ impl WsSubscriptionHandle {
         if let Ok(mut slot) = self.outbox.write() {
             *slot = tx;
         }
+    }
+
+    /// Install a new keepalive cancellation token, cancelling any
+    /// previously-installed one. The keepalive task watches this
+    /// token + the handle's main cancel; replacing the token kills
+    /// the old timer cleanly so a re-`ws_set_keepalive` (e.g.
+    /// Discord Resume issues a fresh Hello with a possibly-changed
+    /// interval) doesn't run two timers in parallel.
+    pub fn install_keepalive(&self, token: tokio_util::sync::CancellationToken) {
+        if let Ok(mut slot) = self.keepalive.write() {
+            if let Some(prev) = slot.replace(token) {
+                prev.cancel();
+            }
+        }
+    }
+
+    /// True when a keepalive timer is currently installed. Used by
+    /// tests + diagnostics; plugins don't need to check this.
+    pub fn has_keepalive(&self) -> bool {
+        self.keepalive
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|_| ()))
+            .is_some()
     }
 
     /// Submit a text frame to be written on the active socket.
@@ -211,6 +251,20 @@ impl WsSubscriptionHandle {
 /// per-frame Rhai handler doesn't pin a tokio worker.
 pub type WsFrameHandler =
     Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, ()> + Send + Sync + 'static>;
+
+/// Callback the host invokes periodically to produce the next
+/// keepalive frame body. Plugins use this for application-layer
+/// heartbeats that carry mutable state — Discord's gateway sends
+/// `{"op":1,"d":<last_sequence>}` every Hello-supplied interval,
+/// where `last_sequence` is the highest sequence the bot has seen
+/// from the server. The callback runs each tick, so it always
+/// captures the latest state.
+///
+/// Returning an empty string skips the send for that tick. Useful
+/// for "we're mid-handshake and don't yet have a valid frame to
+/// send" — the timer keeps firing without spamming the wire.
+pub type WsKeepaliveCallback =
+    Arc<dyn Fn() -> futures::future::BoxFuture<'static, String> + Send + Sync + 'static>;
 
 /// The trait. Implemented by `execlaw-server::host_caps_impl`;
 /// the script tier owns no concrete impl (avoids upstream
@@ -333,6 +387,88 @@ pub trait HostCapabilities: Send + Sync {
         on_frame: WsFrameHandler,
     ) -> Result<WsSubscriptionHandle, HostCapError>;
 
+    /// Install a periodic application-layer keepalive on an existing
+    /// bidi WS handle. Every `interval_ms` the host invokes
+    /// `callback`, takes the returned String, and writes it to the
+    /// handle's outbox as a text frame. Returning an empty string
+    /// from the callback skips that tick — useful when the plugin
+    /// is mid-handshake and doesn't yet have a valid frame body.
+    ///
+    /// This is the *application*-layer keepalive — Discord gateway's
+    /// `{"op":1,"d":<sequence>}`, MCP-over-WS's ping envelope, etc.
+    /// RFC-6455 protocol-level Ping/Pong is auto-handled by the
+    /// consumer loop and does NOT need plugin participation.
+    ///
+    /// When `jitter_first` is true, the first tick fires after a
+    /// random fraction of `interval_ms` (0..1 × interval). Discord's
+    /// gateway docs require this so a fleet of reconnecting bots
+    /// doesn't synchronize their first heartbeat into a thundering
+    /// herd. Subsequent ticks fire exactly on the interval.
+    ///
+    /// Replaces any previously-installed keepalive on the same
+    /// handle (the prior timer is cancelled before this one starts).
+    /// Closing the handle cancels the keepalive. Send failures
+    /// during a disconnect window are silently dropped — the
+    /// consumer loop's reconnect will fire a fresh Hello and the
+    /// plugin re-registers from there.
+    async fn ws_set_keepalive(
+        &self,
+        handle: &WsSubscriptionHandle,
+        interval_ms: u64,
+        jitter_first: bool,
+        callback: WsKeepaliveCallback,
+    ) -> Result<(), HostCapError> {
+        if interval_ms == 0 {
+            return Err(HostCapError::new(
+                "ws_set_keepalive: interval_ms must be > 0",
+            ));
+        }
+        let token = tokio_util::sync::CancellationToken::new();
+        handle.install_keepalive(token.clone());
+
+        let handle = handle.clone();
+        let interval = std::time::Duration::from_millis(interval_ms);
+        tokio::spawn(async move {
+            // Jittered first delay — Discord requires this, others
+            // benefit from it. When jitter_first is false the first
+            // tick fires after a full interval (NOT immediately;
+            // immediately-on-Hello can race with the server's
+            // expected handshake order on some protocols).
+            let first_delay = if jitter_first {
+                let frac: f64 = rand::Rng::gen_range(&mut rand::thread_rng(), 0.0_f64..1.0_f64);
+                std::time::Duration::from_millis((interval_ms as f64 * frac) as u64)
+            } else {
+                interval
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(first_delay) => {}
+                _ = token.cancelled() => return,
+            }
+            // First tick
+            if !ws_keepalive_send_one(&handle, &callback).await {
+                return;
+            }
+            // Subsequent ticks on the steady interval.
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // First tick of `interval` fires immediately by design;
+            // consume it so the cadence is `interval` from now.
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => return,
+                    _ = ticker.tick() => {
+                        if !ws_keepalive_send_one(&handle, &callback).await {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
     /// Push a decoded inbound message through the host's standard
     /// routing pipeline. The host owns trust admit, principal
     /// mint, conversation resolve, group-address classification,
@@ -385,6 +521,27 @@ pub trait HostCapabilities: Send + Sync {
     async fn vault_delete(&self, plugin_id: &str, name: &str) -> Result<bool, HostCapError>;
 }
 
+/// Helper for the default `ws_set_keepalive` impl. Invokes the
+/// callback, sends the result if non-empty, returns false when the
+/// handle has been closed (signalling the spawned task to exit).
+/// A `send()` failure during a disconnect window is NOT fatal —
+/// the task should keep running so the plugin's re-register-after-
+/// reconnect path can fire on the next Hello.
+async fn ws_keepalive_send_one(
+    handle: &WsSubscriptionHandle,
+    callback: &WsKeepaliveCallback,
+) -> bool {
+    if handle.is_closed() {
+        return false;
+    }
+    let frame = callback().await;
+    if frame.is_empty() {
+        return true;
+    }
+    let _ = handle.send(frame);
+    true
+}
+
 /// Output of [`HostCapabilities::get_attachment_bytes_b64`].
 #[derive(Debug, Clone)]
 pub struct AttachmentBytes {
@@ -401,3 +558,212 @@ pub struct AttachmentBytes {
 /// bindings registered as stubs that error cleanly at call time —
 /// scripts without those calls keep working unchanged.
 pub type HostCapabilitiesArc = Arc<dyn HostCapabilities>;
+
+#[cfg(test)]
+mod ws_set_keepalive_default_impl_tests {
+    //! Coverage for the default-trait-method
+    //! `HostCapabilities::ws_set_keepalive`. The default impl
+    //! spawns a tokio task that watches a per-handle cancel
+    //! token and writes to the handle's outbox on each tick.
+    //!
+    //! These tests bypass the real WS consumer by attaching the
+    //! outbox to a plain `mpsc` we can read directly — no socket
+    //! is opened. Lets us assert timing + cancellation behaviour
+    //! deterministically without standing up a fake server.
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    /// Minimal `HostCapabilities` impl that only exists so we can
+    /// call the default `ws_set_keepalive`. All other methods are
+    /// `unreachable!()` — the default impl doesn't call back into
+    /// `self` for anything.
+    struct StubCaps;
+
+    #[async_trait::async_trait]
+    impl HostCapabilities for StubCaps {
+        async fn sidecar_url(&self, _: &str) -> Option<String> {
+            None
+        }
+        async fn ws_subscribe_with_init(
+            &self,
+            _: String,
+            _: Vec<(String, String)>,
+            _: Vec<String>,
+            _: WsFrameHandler,
+        ) -> Result<WsSubscriptionHandle, HostCapError> {
+            unreachable!("test stub")
+        }
+        async fn route_inbound(
+            &self,
+            _: InboundMessage,
+        ) -> Result<RouteOutcome, HostCapError> {
+            unreachable!("test stub")
+        }
+        async fn get_attachment_bytes_b64(
+            &self,
+            _: &str,
+        ) -> Result<AttachmentBytes, HostCapError> {
+            unreachable!("test stub")
+        }
+        async fn vault_get(&self, _: &str, _: &str) -> Result<Option<String>, HostCapError> {
+            Ok(None)
+        }
+        async fn vault_put(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), HostCapError> {
+            Ok(())
+        }
+        async fn vault_delete(&self, _: &str, _: &str) -> Result<bool, HostCapError> {
+            Ok(false)
+        }
+    }
+
+    fn handle_with_outbox() -> (WsSubscriptionHandle, mpsc::UnboundedReceiver<String>) {
+        let cancel = Arc::new(CancellationToken::new());
+        let handle = WsSubscriptionHandle::new(cancel);
+        let (tx, rx) = mpsc::unbounded_channel();
+        handle.set_outbox(Some(tx));
+        (handle, rx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fires_periodically_on_active_handle() {
+        // No jitter so first tick lands at +interval and timing
+        // is predictable. interval=50ms gives a generous margin
+        // against test-runner scheduling jitter while keeping the
+        // whole test under a second.
+        let (handle, mut rx) = handle_with_outbox();
+        let caps = StubCaps;
+        let cb: WsKeepaliveCallback = Arc::new(|| Box::pin(async { "tick".to_string() }));
+        caps.ws_set_keepalive(&handle, 50, false, cb).await.unwrap();
+        let f1 = tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .expect("first tick timed out — keepalive task didn't fire")
+            .expect("outbox closed");
+        let f2 = tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .expect("second tick timed out — keepalive task fired once then stopped")
+            .expect("outbox closed");
+        assert_eq!(f1, "tick");
+        assert_eq!(f2, "tick");
+        assert!(handle.has_keepalive(), "handle should report keepalive installed");
+        handle.close();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_callback_return_skips_the_tick() {
+        // Plugins use empty-string return to mean "mid-handshake;
+        // don't fire". The timer must keep running (so the next
+        // tick re-checks) but no frame should hit the wire.
+        let (handle, mut rx) = handle_with_outbox();
+        let caps = StubCaps;
+        let cb: WsKeepaliveCallback = Arc::new(|| Box::pin(async { String::new() }));
+        caps.ws_set_keepalive(&handle, 50, false, cb).await.unwrap();
+        let r = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            r.is_err(),
+            "expected no frame within 200ms when callback returns empty"
+        );
+        // And the timer is still alive (didn't return-early).
+        assert!(handle.has_keepalive());
+        handle.close();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replace_cancels_prior_timer() {
+        // Install A with a long interval so its first tick won't
+        // fire before we replace it. Then install B with a short
+        // interval and observe only B frames — proving A was
+        // cancelled cleanly before it ever wrote anything.
+        let (handle, mut rx) = handle_with_outbox();
+        let caps = StubCaps;
+        let cb_a: WsKeepaliveCallback = Arc::new(|| Box::pin(async { "A".to_string() }));
+        caps.ws_set_keepalive(&handle, 10_000, false, cb_a)
+            .await
+            .unwrap();
+        // No way for A to have fired yet (interval is 10s).
+        let cb_b: WsKeepaliveCallback = Arc::new(|| Box::pin(async { "B".to_string() }));
+        caps.ws_set_keepalive(&handle, 50, false, cb_b)
+            .await
+            .unwrap();
+        for i in 0..3 {
+            let f = tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("tick {i} timed out after replace"))
+                .expect("outbox closed");
+            assert_eq!(f, "B", "tick {i}: only B frames should arrive after replace");
+        }
+        handle.close();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_stops_timer() {
+        let (handle, mut rx) = handle_with_outbox();
+        let caps = StubCaps;
+        let cb: WsKeepaliveCallback = Arc::new(|| Box::pin(async { "tick".to_string() }));
+        caps.ws_set_keepalive(&handle, 50, false, cb).await.unwrap();
+        // Wait for at least one frame so we know the timer started.
+        let _ = tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .expect("first tick timed out")
+            .expect("outbox closed");
+        handle.close();
+        // Drain any frame already in-flight.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        while rx.try_recv().is_ok() {}
+        // Past close + drain, no further frames should arrive.
+        let r = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(r.is_err(), "no frame should arrive after close()");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zero_interval_errors() {
+        let cancel = Arc::new(CancellationToken::new());
+        let handle = WsSubscriptionHandle::new(cancel);
+        let caps = StubCaps;
+        let cb: WsKeepaliveCallback = Arc::new(|| Box::pin(async { String::new() }));
+        let r = caps.ws_set_keepalive(&handle, 0, false, cb).await;
+        assert!(r.is_err(), "interval_ms=0 must error");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn jitter_first_tick_under_full_interval() {
+        // With a 1000ms interval and jitter, the first tick must
+        // land somewhere in 0..1000ms. We assert it arrives well
+        // before a full interval (< 950ms) — the probability of
+        // jitter landing in the top 5% is 5% even at the
+        // worst-case end of the range, but we repeat with retry
+        // tolerance to keep this from being flaky. If this
+        // empirically flakes we can lower the threshold or use a
+        // seedable RNG; for now 950ms is comfortably non-tight.
+        for attempt in 0..3 {
+            let (handle, mut rx) = handle_with_outbox();
+            let caps = StubCaps;
+            let cb: WsKeepaliveCallback = Arc::new(|| Box::pin(async { "tick".to_string() }));
+            caps.ws_set_keepalive(&handle, 1000, true, cb)
+                .await
+                .unwrap();
+            let start = std::time::Instant::now();
+            let _ = tokio::time::timeout(Duration::from_millis(1200), rx.recv())
+                .await
+                .expect("jittered first tick timed out");
+            let elapsed = start.elapsed();
+            handle.close();
+            if elapsed < Duration::from_millis(950) {
+                return;
+            }
+            tracing::warn!(
+                attempt,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "jittered first tick landed in the top 5% of the interval; retrying"
+            );
+        }
+        panic!("jittered first tick was >=950ms three times in a row — jitter likely broken");
+    }
+}
