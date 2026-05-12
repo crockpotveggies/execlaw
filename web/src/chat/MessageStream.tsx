@@ -18,6 +18,17 @@ import type { Card } from "../cards/types";
 import { ChannelIcon } from "../components/ChannelIcons";
 import { MarkdownContent } from "../components/MarkdownContent";
 import { ToolActivityPill } from "./ToolActivityPill";
+import {
+    detectChatComponent,
+    getChatComponent,
+} from "./chatComponentRegistry";
+// Side-effect imports — each module self-registers its renderer with
+// the chat-component registry at module-load. Listed here so the
+// bundler keeps them in the SPA build; without this they'd be tree-
+// shaken since no symbol from them is referenced directly.
+import "./components/ChartInlineComponent";
+import "./components/WeatherCurrentComponent";
+import "./components/WeatherDailyComponent";
 import { useChatState } from "./store";
 
 interface Props {
@@ -232,6 +243,17 @@ function MessageBubble({ message }: { message: MessageView }) {
 
     const display = isLong && !expanded ? clamp(text, TRUNCATE_LINES, TRUNCATE_CHARS) : text;
 
+    // Rich tool-result rendering: if a tool_result message's payload
+    // is JSON carrying a `chat_component_kind` marker and a renderer
+    // is registered for that kind, render via the chat-component
+    // registry instead of dumping raw JSON. Falls back to plain text
+    // for unknown kinds or non-JSON payloads.
+    const chatComponent =
+        message.kind === "tool_result" ? detectChatComponent(text) : null;
+    const ChatComponentRenderer = chatComponent
+        ? getChatComponent(chatComponent.kind)
+        : undefined;
+
     // 2026-04-28 — meta-line cleanup:
     //   * Hide the channel-origin icon for the default `web` origin
     //     (adds visual noise; only useful when a non-web transport
@@ -274,22 +296,26 @@ function MessageBubble({ message }: { message: MessageView }) {
                     "execlaw-msg__bubble" +
                     (isUserMessage ? " is-user" : "") +
                     (isToolKind(message.kind) ? " is-tool" : "") +
-                    (isLong && !expanded ? " is-clamped" : "")
+                    (isLong && !expanded ? " is-clamped" : "") +
+                    (ChatComponentRenderer ? " is-rich-component" : "")
                 }
                 data-testid={isLong ? "msg-truncated" : undefined}
             >
-                {/* Tool messages are JSON / monospace dumps — render
-                    as raw text. Everything else (agent + user) goes
-                    through the markdown pipeline so headings, lists,
-                    code blocks, links, tables etc. render properly.
-                    Markdown inside fenced code blocks is preserved
-                    as literal text (remark's default). */}
-                {isToolKind(message.kind) ? (
+                {/* Tool messages are JSON / monospace dumps by default —
+                    render as raw text. Exception: when the payload
+                    carries a `chat_component_kind` marker AND a
+                    matching renderer is registered (open-meteo's
+                    weather / chart components), dispatch to the
+                    component instead. Everything else (agent + user)
+                    goes through the markdown pipeline. */}
+                {ChatComponentRenderer && chatComponent ? (
+                    <ChatComponentRenderer data={chatComponent.data} />
+                ) : isToolKind(message.kind) ? (
                     display
                 ) : (
                     <MarkdownContent text={display} />
                 )}
-                {isLong && (
+                {isLong && !ChatComponentRenderer && (
                     <div className="mt-2">
                         <button
                             type="button"

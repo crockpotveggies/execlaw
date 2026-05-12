@@ -1564,6 +1564,8 @@ fn register_host_cap_bindings(
     register_sidecar_http_put(engine, plugin_id, host_caps.clone());
     register_sidecar_http_delete(engine, plugin_id, host_caps.clone());
     register_host_get_attachment_bytes(engine, plugin_id, host_caps.clone());
+    register_host_create_attachment(engine, plugin_id, host_caps.clone());
+    register_host_render_chart(engine, plugin_id, host_caps.clone());
     register_sidecar_http_get_bytes(engine, plugin_id, host_caps.clone());
     register_vault_bindings(engine, plugin_id, host_caps);
 }
@@ -1725,6 +1727,290 @@ fn register_host_get_attachment_bytes(
             }
         },
     );
+}
+
+/// `host_create_attachment(data_url_or_b64, mime, filename, ttl_seconds)
+/// → { attachment_id, sha256, size_bytes }`
+///
+/// Decodes the input as either a `data:` URL or a raw base64 string,
+/// then asks the host to persist the bytes as a plugin artifact. The
+/// returned `attachment_id` flows verbatim into transport plugins'
+/// `send_with_attachments` and into the SPA's
+/// `/api/attachments/<id>` route (same read path as inbound
+/// attachments — both stores share a UUID namespace).
+///
+/// Size cap: 10 MiB. The cap is enforced before the bytes touch disk;
+/// a script that tries to attach a 50 MB PNG gets a clean Rhai error.
+///
+/// `ttl_seconds = 0` is treated as "no TTL" (artifact lives until the
+/// operator manually clears it). Negative values are rejected.
+fn register_host_create_attachment(
+    engine: &mut Engine,
+    plugin_id: &str,
+    host_caps: HostCapsHandle,
+) {
+    /// 10 MiB cap. Chart PNGs typically land in the 30–200 KB range;
+    /// 10 MiB leaves comfortable headroom for higher-resolution renders
+    /// while keeping a runaway plugin from filling the artifacts dir.
+    const MAX_BYTES: usize = 10 * 1024 * 1024;
+    let pid = plugin_id.to_owned();
+    engine.register_fn(
+        "host_create_attachment",
+        move |data: ImmutableString,
+              mime: ImmutableString,
+              filename: ImmutableString,
+              ttl_seconds: i64|
+              -> Result<Dynamic, Box<EvalAltResult>> {
+            let caps = match host_caps.get() {
+                Some(c) => c.clone(),
+                None => return Err(host_cap_unavailable_err(&pid, "host_create_attachment")),
+            };
+            // Accept both `data:<mime>;base64,<payload>` and raw base64.
+            // The plugin author shouldn't have to know which one we want.
+            let payload = data.as_str();
+            let b64 = if let Some(comma) = payload.find(",") {
+                if payload.starts_with("data:") {
+                    &payload[comma + 1..]
+                } else {
+                    payload
+                }
+            } else {
+                payload
+            };
+            use base64::Engine as _;
+            // Tolerate both standard and URL-safe alphabets in case a
+            // plugin author drops a URL-safe-encoded string in.
+            let normalised: String = b64
+                .chars()
+                .map(|c| match c {
+                    '-' => '+',
+                    '_' => '/',
+                    other => other,
+                })
+                .collect();
+            let padded = match normalised.len() % 4 {
+                0 => normalised,
+                n => {
+                    let mut p = normalised;
+                    p.push_str(&"=".repeat(4 - n));
+                    p
+                }
+            };
+            let bytes = match base64::engine::general_purpose::STANDARD.decode(padded.as_bytes()) {
+                Ok(b) => b,
+                Err(e) => {
+                    return Err(Box::new(EvalAltResult::ErrorRuntime(
+                        format!("[{pid}] host_create_attachment: invalid base64: {e}").into(),
+                        rhai::Position::NONE,
+                    )));
+                }
+            };
+            if bytes.len() > MAX_BYTES {
+                return Err(Box::new(EvalAltResult::ErrorRuntime(
+                    format!(
+                        "[{pid}] host_create_attachment: {} bytes exceeds max {}",
+                        bytes.len(),
+                        MAX_BYTES
+                    )
+                    .into(),
+                    rhai::Position::NONE,
+                )));
+            }
+            if ttl_seconds < 0 {
+                return Err(Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_create_attachment: ttl_seconds must be >= 0").into(),
+                    rhai::Position::NONE,
+                )));
+            }
+            let ttl = if ttl_seconds == 0 {
+                None
+            } else {
+                Some(ttl_seconds)
+            };
+            let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_create_attachment: no tokio runtime: {e}").into(),
+                    rhai::Position::NONE,
+                ))
+            })?;
+            let pid_for_call = pid.clone();
+            let filename_owned = filename.to_string();
+            let mime_owned = mime.to_string();
+            let res = tokio::task::block_in_place(|| {
+                runtime.block_on(caps.create_artifact_attachment(
+                    &pid_for_call,
+                    &filename_owned,
+                    &mime_owned,
+                    bytes,
+                    ttl,
+                ))
+            });
+            match res {
+                Ok(a) => {
+                    let mut m = rhai::Map::new();
+                    m.insert(
+                        "attachment_id".into(),
+                        Dynamic::from(ImmutableString::from(a.attachment_id)),
+                    );
+                    m.insert(
+                        "sha256".into(),
+                        Dynamic::from(ImmutableString::from(a.sha256)),
+                    );
+                    m.insert("size_bytes".into(), Dynamic::from(a.size_bytes as i64));
+                    Ok(Dynamic::from(m))
+                }
+                Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_create_attachment: {}", e.0).into(),
+                    rhai::Position::NONE,
+                ))),
+            }
+        },
+    );
+}
+
+/// `host_render_chart(spec_json, width, height, filename, ttl_seconds)
+/// → { attachment_id, sha256, size_bytes, svg, png_data_url }`
+///
+/// Pure-Rust pipeline:
+///   1. Parse `spec_json` as an `execlaw_charting::ChartSpec`.
+///   2. Render to SVG (for inline SPA rendering — returned as the
+///      `svg` field) and to PNG (for transport attachments — stored
+///      via `create_artifact_attachment`).
+///   3. Return both: the attachment_id flows into
+///      `{transport}.send_with_attachments`; the inline SVG goes into
+///      the tool_result so the SPA's chat-component dispatcher can
+///      render it without a follow-up fetch.
+///
+/// width / height are clamped to a sensible range. Setting either to
+/// zero requests the renderer's defaults (720×400).
+fn register_host_render_chart(
+    engine: &mut Engine,
+    plugin_id: &str,
+    host_caps: HostCapsHandle,
+) {
+    /// Minimum and maximum canvas dimensions. The minimum keeps
+    /// axes legible; the maximum stops a runaway script from asking
+    /// for an 8K image and pinning the renderer for seconds.
+    const MIN_DIM: u32 = 240;
+    const MAX_DIM: u32 = 2400;
+    let pid = plugin_id.to_owned();
+    engine.register_fn(
+        "host_render_chart",
+        move |spec_json: ImmutableString,
+              width: i64,
+              height: i64,
+              filename: ImmutableString,
+              ttl_seconds: i64|
+              -> Result<Dynamic, Box<EvalAltResult>> {
+            let caps = match host_caps.get() {
+                Some(c) => c.clone(),
+                None => return Err(host_cap_unavailable_err(&pid, "host_render_chart")),
+            };
+            let spec: execlaw_charting::ChartSpec =
+                serde_json::from_str(&spec_json).map_err(|e| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        format!("[{pid}] host_render_chart: invalid spec_json: {e}").into(),
+                        rhai::Position::NONE,
+                    ))
+                })?;
+            let w = clamp_dim(width, MIN_DIM, MAX_DIM, execlaw_charting::DEFAULT_WIDTH);
+            let h = clamp_dim(height, MIN_DIM, MAX_DIM, execlaw_charting::DEFAULT_HEIGHT);
+            if ttl_seconds < 0 {
+                return Err(Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_render_chart: ttl_seconds must be >= 0").into(),
+                    rhai::Position::NONE,
+                )));
+            }
+            let ttl = if ttl_seconds == 0 {
+                None
+            } else {
+                Some(ttl_seconds)
+            };
+
+            // Render both. Plotters renders are ~1-20ms for the
+            // typical chart so we do them on the calling Rhai thread
+            // (already inside spawn_blocking — the host engine
+            // executes Rhai under tokio::task::block_in_place).
+            let svg = execlaw_charting::render_to_svg(&spec, w, h).map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_render_chart: svg render: {e}").into(),
+                    rhai::Position::NONE,
+                ))
+            })?;
+            let png = execlaw_charting::render_to_png(&spec, w, h).map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_render_chart: png render: {e}").into(),
+                    rhai::Position::NONE,
+                ))
+            })?;
+
+            let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_render_chart: no tokio runtime: {e}").into(),
+                    rhai::Position::NONE,
+                ))
+            })?;
+            let pid_for_call = pid.clone();
+            let filename_owned = filename.to_string();
+            let png_for_caps = png.clone();
+            let created = tokio::task::block_in_place(|| {
+                runtime.block_on(caps.create_artifact_attachment(
+                    &pid_for_call,
+                    &filename_owned,
+                    "image/png",
+                    png_for_caps,
+                    ttl,
+                ))
+            })
+            .map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_render_chart: store: {}", e.0).into(),
+                    rhai::Position::NONE,
+                ))
+            })?;
+
+            // Build the response map. The `svg` field is the
+            // inline-renderable string the SPA's chat-component
+            // dispatcher consumes; `attachment_id` flows into
+            // `{transport}.send_with_attachments`.
+            use base64::Engine as _;
+            let png_b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+            let mut m = rhai::Map::new();
+            m.insert(
+                "attachment_id".into(),
+                Dynamic::from(ImmutableString::from(created.attachment_id)),
+            );
+            m.insert(
+                "sha256".into(),
+                Dynamic::from(ImmutableString::from(created.sha256)),
+            );
+            m.insert("size_bytes".into(), Dynamic::from(created.size_bytes as i64));
+            m.insert("svg".into(), Dynamic::from(ImmutableString::from(svg)));
+            m.insert(
+                "png_data_url".into(),
+                Dynamic::from(ImmutableString::from(format!(
+                    "data:image/png;base64,{png_b64}"
+                ))),
+            );
+            m.insert("width".into(), Dynamic::from(w as i64));
+            m.insert("height".into(), Dynamic::from(h as i64));
+            Ok(Dynamic::from(m))
+        },
+    );
+}
+
+fn clamp_dim(requested: i64, min: u32, max: u32, default: u32) -> u32 {
+    if requested <= 0 {
+        return default;
+    }
+    let r = requested as u64;
+    if r < min as u64 {
+        return min;
+    }
+    if r > max as u64 {
+        return max;
+    }
+    r as u32
 }
 
 fn register_sidecar_http_get_bytes(

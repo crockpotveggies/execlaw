@@ -63,47 +63,110 @@ pub async fn get_attachment_handler(
     user: AuthedUser,
     Path(attachment_id): Path<String>,
 ) -> Result<Response, ApiError> {
+    let store = AttachmentStore::new(&state.db);
     let id = AttachmentId::from(attachment_id.as_str());
-    let row = AttachmentStore::new(&state.db)
-        .get(&id)
-        .map_err(|e| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "db_error",
-            message: e.to_string(),
-        })?
-        .ok_or_else(|| ApiError {
-            status: StatusCode::NOT_FOUND,
-            code: "attachment_not_found",
-            message: format!("no attachment '{attachment_id}'"),
-        })?;
+
+    // Two row kinds share this endpoint:
+    //   * `state_attachments` — inbound transport-minted attachments,
+    //     trust-scoped to the conversation that received them.
+    //   * `state_artifacts`  — plugin-rendered artifacts (e.g. chart
+    //     PNGs from open-meteo's render_chart tool). No conversation
+    //     binding; trust scope is "any authed user" since the
+    //     attachment id is an unguessable UUID and the bytes are
+    //     plugin output not user data.
+    enum Source {
+        /// Conversation-scoped attachment.
+        Attachment {
+            path: String,
+            mime: String,
+            conversation_id: String,
+        },
+        /// Plugin-rendered artifact with the operator-facing filename
+        /// the plugin chose at render time.
+        Artifact {
+            path: String,
+            mime: String,
+            filename: Option<String>,
+        },
+    }
+
+    let source = match store.get(&id).map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "db_error",
+        message: e.to_string(),
+    })? {
+        Some(row) => Source::Attachment {
+            path: row.path,
+            mime: row.mime_type,
+            conversation_id: row.conversation_id.0,
+        },
+        None => match store
+            .get_artifact(attachment_id.as_str())
+            .map_err(|e| ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "db_error",
+                message: e.to_string(),
+            })? {
+            Some(art) => Source::Artifact {
+                path: art.path,
+                mime: art.mime_type,
+                filename: art.filename,
+            },
+            None => {
+                return Err(ApiError {
+                    status: StatusCode::NOT_FOUND,
+                    code: "attachment_not_found",
+                    message: format!("no attachment '{attachment_id}'"),
+                });
+            }
+        },
+    };
 
     // Trust scope: a non-Controller caller may only download
     // attachments tied to a conversation they own / participate in.
     // We use 404 (not 403) so probing for cross-conversation ids
     // doesn't leak existence — same defense pattern as the
     // research_status tool's trust-scope.
-    let is_controller = matches!(user_role(&state, &user), Some(UserRole::Controller));
-    if !is_controller {
-        let caller_owns = caller_owns_conversation(&state, &user, row.conversation_id.as_str())
-            .map_err(|e| ApiError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                code: "db_error",
-                message: e.to_string(),
-            })?;
-        if !caller_owns {
-            return Err(ApiError {
-                status: StatusCode::NOT_FOUND,
-                code: "attachment_not_found",
-                message: format!("no attachment '{attachment_id}'"),
-            });
+    //
+    // Artifacts skip this check (no conversation binding) — any
+    // authed user with the (unguessable) id can fetch.
+    if let Source::Attachment {
+        conversation_id, ..
+    } = &source
+    {
+        let is_controller = matches!(user_role(&state, &user), Some(UserRole::Controller));
+        if !is_controller {
+            let caller_owns = caller_owns_conversation(&state, &user, conversation_id).map_err(
+                |e| ApiError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    code: "db_error",
+                    message: e.to_string(),
+                },
+            )?;
+            if !caller_owns {
+                return Err(ApiError {
+                    status: StatusCode::NOT_FOUND,
+                    code: "attachment_not_found",
+                    message: format!("no attachment '{attachment_id}'"),
+                });
+            }
         }
     }
 
+    let (raw_path, mime_type, preferred_filename) = match source {
+        Source::Attachment { path, mime, .. } => (path, mime, None),
+        Source::Artifact {
+            path,
+            mime,
+            filename,
+        } => (path, mime, filename),
+    };
+
     // Path-traversal defense: reject any `..` component. The path
-    // came from the DB (written by `synthesize::finalize_report`)
-    // so this should never trip in practice — but a defense-in-depth
-    // check costs nothing.
-    let path = std::path::PathBuf::from(&row.path);
+    // came from the DB (written by `synthesize::finalize_report` or
+    // the plugin-artifact insert path) so this should never trip in
+    // practice — but a defense-in-depth check costs nothing.
+    let path = std::path::PathBuf::from(&raw_path);
     if path
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -132,20 +195,23 @@ pub async fn get_attachment_handler(
     let metadata = file.metadata().await.ok();
     let length = metadata.as_ref().map(|m| m.len());
 
-    // Filename for Content-Disposition: take the file basename so
-    // the user sees something meaningful in their save dialog
-    // (`report.pdf`, not `<uuid>`).
-    let filename = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("attachment")
-        .to_owned();
+    // Filename for Content-Disposition. For plugin artifacts we have
+    // the operator-facing filename in the DB row (e.g.
+    // `forecast.png`); for inbound attachments we fall back to the
+    // path basename (which IS the human filename, since the research
+    // pipeline names files like `report.pdf`).
+    let filename = preferred_filename.unwrap_or_else(|| {
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("attachment")
+            .to_owned()
+    });
 
     let stream = ReaderStream::new(file);
     let body = Body::from_stream(stream);
 
     let mut headers = HeaderMap::new();
-    if let Ok(v) = HeaderValue::from_str(&row.mime_type) {
+    if let Ok(v) = HeaderValue::from_str(&mime_type) {
         headers.insert(header::CONTENT_TYPE, v);
     }
     let disposition = format!("attachment; filename=\"{}\"", sanitize_filename(&filename));
@@ -345,6 +411,69 @@ mod tests {
             bytes.starts_with(b"%PDF-"),
             "response body must be the PDF bytes (first 5 chars of the magic header)"
         );
+    }
+
+    #[tokio::test]
+    async fn get_attachment_serves_plugin_artifact_by_id_with_filename_disposition() {
+        // Plugin-rendered artifacts (e.g. open-meteo chart PNGs) live
+        // in `state_artifacts`, not `state_attachments`. The handler
+        // falls back to that store when the attachments lookup misses.
+        // Trust-scope is "any authed user" since artifact ids are
+        // unguessable UUIDs and the bytes are plugin output, not user
+        // data scoped to a conversation.
+        let state = test_app_state();
+        let tmp = TempDir::new().unwrap();
+        let png_bytes = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3];
+        let created = AttachmentStore::new(&state.db)
+            .insert_plugin_artifact(
+                tmp.path(),
+                "open-meteo",
+                "forecast.png",
+                "image/png",
+                &png_bytes,
+                Some(7 * 86400),
+                chrono::Utc::now().timestamp(),
+            )
+            .unwrap();
+        let att_id = created.attachment_id;
+
+        let app = build_router(state);
+        let tok = setup_controller_token(&app).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/attachments/{att_id}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "image/png"
+        );
+        let dispo = resp
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        // Operator-facing filename comes from the artifact row, NOT
+        // the sha256 path basename — this is the key behavior the
+        // fallback path adds.
+        assert!(
+            dispo.contains("forecast.png"),
+            "Content-Disposition must use the row's filename, got: {dispo}"
+        );
+        let bytes = body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(&bytes[..4], &[0x89, 0x50, 0x4e, 0x47]);
     }
 
     #[tokio::test]

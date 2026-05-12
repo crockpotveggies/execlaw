@@ -2457,6 +2457,69 @@ export async function testGooglePlaces(
     );
 }
 
+// ---- /api/admin/plugins/open-meteo/* ------------------------------
+//
+// Open-Meteo plugin admin endpoints. No API key needed (Open-Meteo
+// is free + keyless); the only operator-supplied config is a default
+// location + unit preferences + default chart dimensions. The plugin
+// validates the lat/lon by issuing a 1-day forecast lookup at save
+// time, which doubles as a connectivity check.
+
+export interface OpenMeteoConfigResponse {
+    place_name?: string | null;
+    default_latitude?: number | null;
+    default_longitude?: number | null;
+    default_timezone?: string;
+    temperature_unit?: string;
+    wind_speed_unit?: string;
+    precipitation_unit?: string;
+    default_chart_width?: number;
+    default_chart_height?: number;
+}
+
+export interface OpenMeteoTestResponse {
+    ok?: boolean;
+    latitude?: number;
+    longitude?: number;
+    current?: Record<string, unknown>;
+    error?: string;
+}
+
+export async function getOpenMeteoConfig(
+    tokenAccessor: () => string | null,
+): Promise<OpenMeteoConfigResponse> {
+    return apiFetch<OpenMeteoConfigResponse>(
+        "/api/admin/plugins/open-meteo/config",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function setOpenMeteoConfig(
+    body: OpenMeteoConfigResponse,
+    tokenAccessor: () => string | null,
+): Promise<void> {
+    await apiFetch<unknown>(
+        "/api/admin/plugins/open-meteo/config",
+        {
+            method: "POST",
+            body,
+            rawText: true,
+        },
+        tokenAccessor,
+    );
+}
+
+export async function testOpenMeteoForecast(
+    tokenAccessor: () => string | null,
+): Promise<OpenMeteoTestResponse> {
+    return apiFetch<OpenMeteoTestResponse>(
+        "/api/admin/plugins/open-meteo/test",
+        { method: "POST" },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/plugins/sms-socket/* ------------------------------
 //
 // SMS Socket plugin admin endpoints. The plugin holds an api_key +
@@ -3077,7 +3140,7 @@ export interface DetectedGpu {
     /// — opaque to the SPA. Used as the `gpu_id` value when saving
     /// the Standard backend if the operator picks a specific card.
     id: { 0: string } | string;
-    vendor: "Nvidia" | "Intel" | "Amd" | "Unknown";
+    vendor: "Nvidia" | "Intel" | "Amd" | "Apple" | "Unknown";
     pci_vendor_id: string;
     pci_device_id: string;
     /// Linux-only on bare-metal sysfs paths; empty on Windows/macOS

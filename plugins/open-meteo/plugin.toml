@@ -1,0 +1,157 @@
+[plugin]
+id = "open-meteo"
+name = "Open-Meteo Weather"
+version = "0.1.0"
+description = "Free, key-less weather, marine, air-quality, seasonal, ensemble, flood and climate data via the Open-Meteo public APIs. Covers forecast/historical/marine/air-quality/seasonal/ensemble/flood/climate/geocoding/elevation endpoints plus a generic chart renderer that produces inline SVG for the SPA and PNG attachments for transports that accept file uploads."
+author = "execlaw"
+license = "Apache-2.0"
+
+# No sidecar, no OAuth, no API keys. Plain HTTPS against the public
+# Open-Meteo endpoints (api.open-meteo.com, archive-api.open-meteo.com,
+# marine-api.open-meteo.com, air-quality-api.open-meteo.com,
+# seasonal-api.open-meteo.com, ensemble-api.open-meteo.com,
+# flood-api.open-meteo.com, climate-api.open-meteo.com,
+# geocoding-api.open-meteo.com).
+#
+# Per-API responses cache via http_get_cached with TTLs picked to
+# match how frequently each upstream dataset actually changes:
+#   forecast        10 min   (the model updates a few times a day,
+#                             but the client typically wants a
+#                             "what's it like NOW" answer)
+#   historical      24 hr    (era5 reanalysis backfills slowly)
+#   marine          10 min
+#   air_quality     15 min
+#   seasonal        6 hr     (CFSv2 ensembles publish a few times/day)
+#   ensemble        15 min
+#   flood           1 hr     (GloFAS publishes daily; the model
+#                             accepts a stale window for free)
+#   climate         24 hr    (CMIP6 projections are decadal — TTL
+#                             really just shields us against
+#                             repeated questions in the same turn)
+#   geocoding       24 hr    (place names are stable)
+#   elevation       24 hr    (terrain is stable)
+
+# ===== Agent-callable tools =====================================
+
+[[tools]]
+name = "open_meteo.geocode"
+description = """Resolve a place name to latitude/longitude/elevation/timezone via Open-Meteo's geocoding API. Use this when the operator names a location ("weather in Reykjavík") before any other open_meteo.* tool — they all take lat/lon, not free-text place names. Args: { name: string (required), count?: int (1-20, default 5), language?: string (ISO-639-1, default "en") }. Returns: { results: [{ name, country, admin1, latitude, longitude, elevation, timezone }] }."""
+schema = "schemas/geocode.json"
+trust_floor = "KnownLimited"
+latency = "low"
+
+[[tools]]
+name = "open_meteo.elevation"
+description = """Look up terrain elevation in meters at one or more lat/lon points. Useful for context when discussing weather at altitude. Args: { latitude: number | number[], longitude: number | number[] }. Returns: { elevation: number[] } in meters above sea level."""
+schema = "schemas/elevation.json"
+trust_floor = "KnownLimited"
+latency = "low"
+
+[[tools]]
+name = "open_meteo.forecast"
+description = """Current conditions + hourly + daily weather forecast for a lat/lon. The agent's go-to tool for "what's the weather right now / today / tomorrow / this week". Pick the `current` / `hourly` / `daily` variables that match the question — passing them all wastes tokens. Args: { latitude: number (required), longitude: number (required), place_name?: string (echoed back so the SPA card shows the place), timezone?: string ("auto" or IANA, default "auto"), forecast_days?: int (1-16, default 7), past_days?: int (0-92, default 0), current?: string[] (e.g. ["temperature_2m","apparent_temperature","weather_code","wind_speed_10m","relative_humidity_2m","precipitation"]), hourly?: string[], daily?: string[] (e.g. ["temperature_2m_max","temperature_2m_min","precipitation_sum","precipitation_probability_max","weather_code"]), temperature_unit?: "celsius"|"fahrenheit", wind_speed_unit?: "kmh"|"mph"|"ms"|"kn", precipitation_unit?: "mm"|"inch", models?: string[] }."""
+schema = "schemas/forecast.json"
+trust_floor = "KnownLimited"
+latency = "low"
+
+[[tools]]
+name = "open_meteo.historical"
+description = """Historical weather (ERA5 reanalysis) for a date range. Use when the operator asks about past conditions ("how cold was it last Tuesday", "rainfall in March"). The archive lags real-time by ~5 days. Args: { latitude: number (required), longitude: number (required), start_date: "YYYY-MM-DD" (required), end_date: "YYYY-MM-DD" (required), hourly?: string[], daily?: string[], timezone?: string, temperature_unit?: string, wind_speed_unit?: string, precipitation_unit?: string }."""
+schema = "schemas/historical.json"
+trust_floor = "KnownLimited"
+latency = "medium"
+
+[[tools]]
+name = "open_meteo.marine"
+description = """Marine forecast — wave height, wave period, wave direction, swell components. Use for sailing/surfing/fishing questions. Args: { latitude: number (required), longitude: number (required), hourly?: string[] (e.g. ["wave_height","wave_period","wave_direction","wind_wave_height","swell_wave_height"]), daily?: string[], timezone?: string, length_unit?: "metric"|"imperial", forecast_days?: int (1-7) }."""
+schema = "schemas/marine.json"
+trust_floor = "KnownLimited"
+latency = "low"
+
+[[tools]]
+name = "open_meteo.air_quality"
+description = """Air quality — particulates (PM2.5, PM10), ozone, NO2, SO2, CO, European AQI / US AQI. Args: { latitude: number (required), longitude: number (required), hourly?: string[] (e.g. ["pm2_5","pm10","ozone","european_aqi","us_aqi"]), current?: string[], timezone?: string, forecast_days?: int (1-7), domains?: "cams_europe"|"cams_global" (default cams_global) }."""
+schema = "schemas/air_quality.json"
+trust_floor = "KnownLimited"
+latency = "low"
+
+[[tools]]
+name = "open_meteo.seasonal"
+description = """Seasonal forecast (CFSv2 nine-month outlook). Use for "what's winter / summer looking like" style questions; expect coarse spatial + temporal resolution and only directional skill beyond ~6 weeks. Args: { latitude: number (required), longitude: number (required), six_hourly?: string[] (e.g. ["temperature_2m_member01","temperature_2m_member02",...]), daily?: string[], forecast_days?: int (1-275, default 92), temperature_unit?: string }."""
+schema = "schemas/seasonal.json"
+trust_floor = "KnownLimited"
+latency = "medium"
+
+[[tools]]
+name = "open_meteo.ensemble"
+description = """Multi-member probabilistic forecast for a lat/lon. The response carries one series per ensemble member so the agent (or the chart renderer's band overlay) can show the spread. Use for "what's the uncertainty around the forecast" style questions. Args: { latitude: number (required), longitude: number (required), hourly?: string[], daily?: string[], models?: string[] (e.g. ["gfs_seamless","icon_seamless","ecmwf_ifs04"]), forecast_days?: int (1-35), temperature_unit?: string }."""
+schema = "schemas/ensemble.json"
+trust_floor = "KnownLimited"
+latency = "medium"
+
+[[tools]]
+name = "open_meteo.flood"
+description = """Flood / river-discharge forecast (GloFAS). Returns expected daily river discharge plus quantile bounds for a coordinate near a watercourse. Args: { latitude: number (required), longitude: number (required), daily?: string[] (e.g. ["river_discharge","river_discharge_mean","river_discharge_p25","river_discharge_p75"]), forecast_days?: int (1-210), past_days?: int (0-92) }."""
+schema = "schemas/flood.json"
+trust_floor = "KnownLimited"
+latency = "medium"
+
+[[tools]]
+name = "open_meteo.climate"
+description = """Long-term climate projections (CMIP6, downscaled to ~10km). Use for "what does the climate look like in 2050" style questions. The agent should rarely default to this; mostly used when explicitly asked. Args: { latitude: number (required), longitude: number (required), start_date: "YYYY-MM-DD" (required), end_date: "YYYY-MM-DD" (required), models: string[] (required, e.g. ["MPI_ESM1_2_XR","EC_Earth3P_HR","FGOALS_f3_H"]), daily?: string[] (e.g. ["temperature_2m_mean","temperature_2m_max","temperature_2m_min","precipitation_sum"]), temperature_unit?: string, wind_speed_unit?: string }."""
+schema = "schemas/climate.json"
+trust_floor = "KnownLimited"
+latency = "high"
+
+[[tools]]
+name = "open_meteo.render_chart"
+description = """Render a chart from any open-meteo result (or arbitrary x/y data). Produces both inline SVG (for the SPA chat card) and a PNG attachment (id returned for transports that accept file uploads — Discord/Signal/etc.). Pass the chart spec directly OR pass `from_tool: "forecast"|"historical"|...` plus the tool's raw result for the helper to derive a sensible spec. Args: { title?: string, kind?: "line"|"bar"|"area"|"scatter" (default line), x_label?: string, y_label?: string, y_unit?: string, time_axis?: bool, series?: [{name, points:[{x,y}], color?:[r,g,b]}], band?: {low,high}, width?: int (240-2400, default 720), height?: int (240-2400, default 400), filename?: string }."""
+schema = "schemas/render_chart.json"
+trust_floor = "KnownLimited"
+latency = "medium"
+
+# ===== Admin routes =============================================
+
+[[admin_routes]]
+method = "GET"
+path = "/config"
+handler = "admin_get_config"
+description = "Return the operator's default location (place name / lat / lon / timezone) + unit preferences + chart size."
+
+[[admin_routes]]
+method = "POST"
+path = "/config"
+handler = "admin_set_config"
+description = "Persist the operator-supplied default location + unit preferences. Validates by issuing a 1-day forecast lookup before saving."
+
+[[admin_routes]]
+method = "POST"
+path = "/test"
+handler = "admin_test"
+description = "Fetch a sample forecast so the operator can confirm wiring + connectivity end-to-end."
+
+[[ui_panels]]
+mount = "admin/plugins/open-meteo"
+entry = "ui/panel.js"
+
+# ===== Chat-component renderers =================================
+# All three renderers ship in the host SPA bundle (see
+# web/src/chat/components/*Component.tsx). The plugin's tool_result
+# payloads carry chat_component_kind so the MessageStream's
+# dispatcher routes them to the right component.
+
+[[chat_components]]
+kind = "weather_current"
+entry = "ui/components/WeatherCurrent.js"
+
+[[chat_components]]
+kind = "weather_daily"
+entry = "ui/components/WeatherDaily.js"
+
+[[chat_components]]
+kind = "chart"
+entry = "ui/components/ChartInline.js"
+
+[runtime]
+tier = "script"
+source = "main.rhai"

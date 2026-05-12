@@ -34,6 +34,7 @@ import { GoogleAppsPage } from "./GoogleAppsPage";
 import { GoogleCalendarPage } from "./GoogleCalendarPage";
 import { GoogleContactsPage } from "./GoogleContactsPage";
 import { GooglePlacesConfigPage } from "./GooglePlacesConfigPage";
+import { OpenMeteoConfigPage } from "./OpenMeteoConfigPage";
 import type { PluginConfigComponent } from "./PluginConfigBase";
 import { PushoverConfigPage } from "./PushoverConfigPage";
 import { SignalConfigPage } from "./SignalConfigPage";
@@ -50,6 +51,7 @@ const KNOWN_CONFIGS: Record<string, PluginConfigComponent> = {
     "google-contacts": GoogleContactsPage,
     "google-calendar": GoogleCalendarPage,
     "google-places": GooglePlacesConfigPage,
+    "open-meteo": OpenMeteoConfigPage,
     pushover: PushoverConfigPage,
     signal: SignalConfigPage,
     slack: SlackConfigPage,

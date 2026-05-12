@@ -20,6 +20,7 @@ members = [
     "crates/cli",
     "crates/mcp-client",
     "crates/script",
+    "crates/charting",
     "plugins/hello",
     "plugins/identity-local-address-book",
     "crates/eval-harness",

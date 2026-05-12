@@ -24,6 +24,7 @@ futures.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
 base64.workspace = true
 rand.workspace = true
+execlaw-charting = { path = "../charting" }
 
 [dev-dependencies]
 tempfile.workspace = true

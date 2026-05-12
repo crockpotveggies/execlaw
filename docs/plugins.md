@@ -240,6 +240,51 @@ Public surface is registered in `crates/script/src/primitives.rs`. Grouped by pu
 **Logging**
 - `log_info(msg)` / `log_warn(msg)` — emit to host logs with `plugin_id` tag
 
+**Attachments + charts**
+- `host_get_attachment_bytes(attachment_id) -> { data_url, mime_type, size_bytes }` — read inbound attachments AND plugin-rendered artifacts (one read path; both stores share the UUID namespace).
+- `host_create_attachment(data_url_or_b64, mime_type, filename, ttl_seconds) -> { attachment_id, sha256, size_bytes }` — persist plugin bytes as a downloadable attachment. The returned id flows verbatim into `{transport}.send_with_attachments` and into the SPA's `/api/attachments/<id>` route. 10 MiB cap. `ttl_seconds = 0` means no TTL; positive values trigger the ephemeral sweeper. Accepts either a raw base64 payload or a `data:<mime>;base64,...` URL.
+- `host_render_chart(spec_json, width, height, filename, ttl_seconds) -> { attachment_id, sha256, size_bytes, svg, png_data_url, width, height }` — render a declarative `ChartSpec` (defined in `crates/charting`) to both SVG (returned inline for SPA rendering) and PNG (stored as an artifact for transports that accept file uploads). `width = 0` or `height = 0` requests the renderer's defaults (720×400); other values are clamped to 240..2400.
+
+The `ChartSpec` shape (`crates/charting/src/lib.rs`):
+
+```jsonc
+{
+  "title": "Week-ahead temperature",
+  "kind": "line",         // "line" | "bar" | "area" | "scatter"
+  "x_label": "Hour",
+  "y_label": "°C",
+  "time_axis": false,     // when true, x-values are Unix-milliseconds
+  "series": [
+    {
+      "name": "Temp",
+      "points": [{"x": 0.0, "y": 12.0}, {"x": 1.0, "y": 14.0}],
+      "color": [0, 114, 178]    // optional RGB triple; palette default otherwise
+    }
+  ],
+  "band": {                 // optional — ensemble fan band
+    "low":  [{"x": 0, "y": 10}],
+    "high": [{"x": 0, "y": 18}]
+  },
+  "y_unit": "°C"           // optional suffix on y-axis tick labels
+}
+```
+
+A typical plugin tool returns a result like:
+
+```rhai
+let chart = host_render_chart(to_json_string(spec), 720, 400, "forecast.png", 7 * 86400);
+#{
+    "chat_component_kind": "chart",
+    "title": spec.title,
+    "svg": chart.svg,
+    "attachment_id": chart.attachment_id,
+}
+```
+
+The SPA's chat-component registry (`web/src/chat/chatComponentRegistry.ts`) detects the `chat_component_kind` field and dispatches the payload to the matching renderer. Built-in kinds: `chart`, `weather_current`, `weather_daily`. Plugins ship additional renderers by adding files to `web/src/chat/components/` and registering them with `registerChatComponent(kind, component)` at module load.
+
+For transport delivery (Discord/Signal/etc.), the agent forwards `chart.attachment_id` to `{transport}.send_with_attachments(channel, content, [attachment_id])`. The transport plugin's existing `host_get_attachment_bytes` path picks up the artifact transparently.
+
 ---
 
 ## 6. Tool dispatch + trust gating

@@ -519,6 +519,45 @@ pub trait HostCapabilities: Send + Sync {
     /// Delete a per-plugin secret. Returns `true` when a row was
     /// removed, `false` when no such row existed. Idempotent.
     async fn vault_delete(&self, plugin_id: &str, name: &str) -> Result<bool, HostCapError>;
+
+    /// Persist plugin-rendered bytes as an attachment the agent can
+    /// hand to a transport plugin (`{transport}.send_with_attachments`),
+    /// or that the SPA can fetch via `/api/attachments/<id>`.
+    ///
+    /// The returned `attachment_id` shares a namespace with the inbound
+    /// attachment ids minted by transport plugins — both flow through
+    /// [`get_attachment_bytes_b64`] for read. Plugin artifacts have an
+    /// optional TTL (default policy chosen by the plugin) so chart
+    /// renders don't accumulate forever; the ephemeral sweeper culls
+    /// expired rows + their on-disk bytes.
+    ///
+    /// `mime_type` is what transports announce to the recipient and
+    /// what the SPA's download endpoint puts in `Content-Type`. Common
+    /// values: `image/png`, `image/svg+xml`, `application/pdf`.
+    ///
+    /// `filename` is what the operator sees in the save-as dialog +
+    /// what transports use as the attachment name; it does NOT
+    /// determine the on-disk path (which is sha256-named for content
+    /// addressing).
+    async fn create_artifact_attachment(
+        &self,
+        plugin_id: &str,
+        filename: &str,
+        mime_type: &str,
+        bytes: Vec<u8>,
+        ttl_seconds: Option<i64>,
+    ) -> Result<CreatedArtifact, HostCapError>;
+}
+
+/// Output of [`HostCapabilities::create_artifact_attachment`]. Returned
+/// to the calling Rhai script verbatim — the agent gets the
+/// attachment_id, and downstream tools (`discord.send_with_attachments`,
+/// etc.) accept the same string.
+#[derive(Debug, Clone)]
+pub struct CreatedArtifact {
+    pub attachment_id: String,
+    pub sha256: String,
+    pub size_bytes: u64,
 }
 
 /// Helper for the default `ws_set_keepalive` impl. Invokes the
@@ -621,6 +660,16 @@ mod ws_set_keepalive_default_impl_tests {
         }
         async fn vault_delete(&self, _: &str, _: &str) -> Result<bool, HostCapError> {
             Ok(false)
+        }
+        async fn create_artifact_attachment(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Vec<u8>,
+            _: Option<i64>,
+        ) -> Result<CreatedArtifact, HostCapError> {
+            unreachable!("test stub")
         }
     }
 

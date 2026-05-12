@@ -1,0 +1,33 @@
+{
+    "type": "object",
+    "properties": {
+        "latitude": { "type": "number", "minimum": -90, "maximum": 90 },
+        "longitude": { "type": "number", "minimum": -180, "maximum": 180 },
+        "place_name": { "type": "string" },
+        "hourly": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Per-member hourly variables. Open-Meteo names members like `temperature_2m_member01` through `temperature_2m_member30` depending on the model."
+        },
+        "daily": {
+            "type": "array",
+            "items": { "type": "string" }
+        },
+        "models": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Models to query. Common: \"gfs_seamless\" (NOAA), \"icon_seamless\" (DWD), \"ecmwf_ifs04\" (ECMWF), \"bom_access_global_ensemble\" (BoM)."
+        },
+        "forecast_days": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 35
+        },
+        "temperature_unit": {
+            "type": "string",
+            "enum": ["celsius", "fahrenheit"]
+        }
+    },
+    "required": ["latitude", "longitude"],
+    "additionalProperties": false
+}

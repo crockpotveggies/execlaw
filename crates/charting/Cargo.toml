@@ -1,0 +1,46 @@
+[package]
+name = "execlaw-charting"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pure-Rust chart renderer (SVG + PNG) shared across plugins."
+publish = false
+
+[dependencies]
+# Pure-Rust charting library. Two backends:
+#   * `svg_backend` — produces SVG strings for inline rendering in the
+#     SPA (no client-side chart library needed; the SVG is dropped into
+#     the DOM verbatim).
+#   * `bitmap_backend` — produces PNG bytes for transport attachments
+#     (Discord/Signal/etc.) via the `image` crate's encoder.
+# Both backends share the rest of the API so a single ChartSpec
+# produces visually identical SVG and PNG output.
+plotters = { version = "0.3", default-features = false, features = [
+    "svg_backend",
+    "bitmap_backend",
+    "bitmap_encoder",
+    "line_series",
+    "histogram",
+    "area_series",
+    "point_series",
+    "ttf",
+] }
+# Used directly for PNG encoding — `plotters`'s `bitmap_encoder`
+# feature pulls `image` in as a transitive dep but doesn't re-export
+# it, so we depend on it explicitly. Default-features off keeps the
+# build slim: we only need the PNG codec, not BMP/GIF/JPEG/TIFF/etc.
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "render"
+harness = false

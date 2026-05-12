@@ -54,8 +54,8 @@ mod primitives;
 pub use engine::ScriptEngine;
 pub use errors::{ScriptError, ScriptResult};
 pub use host_caps::{
-    AttachmentBytes, HostCapError, HostCapabilities, HostCapabilitiesArc, InboundAttachmentMeta,
-    InboundMessage, RouteOutcome, WsFrameHandler, WsSubscriptionHandle,
+    AttachmentBytes, CreatedArtifact, HostCapError, HostCapabilities, HostCapabilitiesArc,
+    InboundAttachmentMeta, InboundMessage, RouteOutcome, WsFrameHandler, WsSubscriptionHandle,
 };
 pub use plugin::ScriptPlugin;
 

@@ -35,11 +35,18 @@ pub struct Migration {
 ///
 /// Note: every migration is wrapped in its own transaction by
 /// `MigrationRunner::apply_all`.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    id: 1,
-    name: "baseline",
-    sql: include_str!("../migrations/0001_baseline.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        id: 1,
+        name: "baseline",
+        sql: include_str!("../migrations/0001_baseline.sql"),
+    },
+    Migration {
+        id: 2,
+        name: "plugin_artifacts",
+        sql: include_str!("../migrations/0002_plugin_artifacts.sql"),
+    },
+];
 
 #[derive(Debug, Error)]
 pub enum MigrationError {
@@ -219,7 +226,7 @@ mod tests {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
         let runner = MigrationRunner::new(&db);
         let applied = runner.apply_all().unwrap();
-        assert_eq!(applied, vec![1]);
+        assert_eq!(applied, vec![1, 2]);
 
         // Spot-check: every documented table exists.
         let tables = vec![
@@ -293,7 +300,7 @@ mod tests {
         let runner = MigrationRunner::new(&db);
         let first = runner.apply_all().unwrap();
         let second = runner.apply_all().unwrap();
-        assert_eq!(first, vec![1]);
+        assert_eq!(first, vec![1, 2]);
         assert!(
             second.is_empty(),
             "rerun must not re-apply already-applied migrations"
