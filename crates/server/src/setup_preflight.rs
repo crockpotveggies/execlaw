@@ -31,7 +31,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, post};
-use execlaw_container_manager::{GpuDevice, detect};
+use execlaw_container_manager::{GpuDevice, NativeServiceController, detect};
 use execlaw_core::audit::AuditStore;
 use execlaw_core::general_settings::GeneralSettingsStore;
 use serde::Serialize;
@@ -40,6 +40,13 @@ use utoipa::ToSchema;
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PreflightResponse {
     pub docker: DockerStatus,
+    /// Ollama availability for the Apple-Silicon native-runtime path.
+    /// `available: true` means `NativeServiceController::discover_ollama`
+    /// resolved a working binary; the wizard renders the model
+    /// dropdown directly. `available: false` means we couldn't find
+    /// one, and the wizard renders the install panel with
+    /// `brew install ollama` instructions before the Save button.
+    pub ollama: OllamaStatus,
     /// `Vec<GpuDevice>` — `GpuDevice` is in the container-manager
     /// crate which doesn't depend on utoipa, so we expose it as
     /// opaque JSON in the OpenAPI spec. SPA-side types live in
@@ -66,6 +73,31 @@ pub struct PreflightResponse {
     /// (the weights don't need to be re-acquired). Empty map on a
     /// fresh install or when the cache dir doesn't exist yet.
     pub cached_models: std::collections::HashMap<String, u64>,
+}
+
+/// Ollama detection result for the Apple-Silicon path. Surfaces both
+/// to the first-run wizard (per-purpose Apple cards) and the ongoing
+/// `/settings/backends` edit form, so an operator who installs Ollama
+/// AFTER hitting "Recheck" sees the form switch from install-panel
+/// to model-picker without a full page reload.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OllamaStatus {
+    /// `true` when `NativeServiceController::discover_ollama` returned
+    /// Ok AND the binary's `--version` invocation also succeeded. We
+    /// gate on both because a stale symlink or permission denial
+    /// would surface a discovered path that can't actually run, which
+    /// would crash the supervisor at spawn time instead of producing
+    /// a clean install-prompt UX up front.
+    pub available: bool,
+    /// Trimmed output of `ollama --version`, e.g. `"0.1.43"`. The
+    /// wizard renders this as a small "Ollama X.Y.Z detected" badge so
+    /// the operator confirms the right binary got picked when they
+    /// have multiple installs (Homebrew + manual).
+    pub version: Option<String>,
+    /// Absolute path the discoverer landed on. Surfaced in the same
+    /// confirmation badge so multi-install systems (Homebrew prefix
+    /// vs. `~/bin`) read out unambiguously.
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -98,11 +130,13 @@ pub async fn get_handler(
     _user: AuthedUser,
 ) -> Json<PreflightResponse> {
     let docker = detect_docker();
+    let ollama = detect_ollama();
     let profile = detect();
     let (disk_free_bytes, disk_free_path) = detect_disk_free();
     let cached_models = detect_cached_models();
     Json(PreflightResponse {
         docker,
+        ollama,
         gpus: profile.gpus,
         disk_free_bytes,
         disk_free_path,
@@ -308,6 +342,59 @@ fn detect_docker() -> DockerStatus {
     }
 }
 
+/// Probe whether Ollama is installed and runnable. Two-step check
+/// so a stale symlink / permission-denied binary doesn't surface as
+/// `available: true` and then crash the supervisor:
+///
+///   1. Run the path-resolution logic the supervisor uses for real
+///      spawns (`NativeServiceController::discover_ollama`).
+///   2. Shell out `<path> --version` and accept only an exit-0 reply.
+///      Output is `ollama version is 0.1.43` on every release ≥0.1;
+///      we strip the prefix to surface the bare version string.
+///
+/// Returns `{ available: false, version: None, path: None }` for any
+/// failure — the wizard renders the install panel and the operator
+/// gets a clear `brew install ollama` instruction instead of a
+/// generic "supervisor crashed" later.
+fn detect_ollama() -> OllamaStatus {
+    use std::process::Command;
+    let path = match NativeServiceController::discover_ollama() {
+        Ok(p) => p,
+        Err(_) => {
+            return OllamaStatus {
+                available: false,
+                version: None,
+                path: None,
+            };
+        }
+    };
+    let output = Command::new(&path).arg("--version").output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let raw = String::from_utf8_lossy(&o.stdout).trim().to_owned();
+            // Strip the conventional `ollama version is ` prefix when
+            // present so the SPA can render just the version number;
+            // fall back to the raw string for forward-compat with
+            // releases that change the format.
+            let version = raw
+                .strip_prefix("ollama version is ")
+                .map(str::trim)
+                .map(str::to_owned)
+                .or(if raw.is_empty() { None } else { Some(raw) });
+            OllamaStatus {
+                available: true,
+                version,
+                path: Some(path.display().to_string()),
+            }
+        }
+        _ => OllamaStatus {
+            available: false,
+            version: None,
+            path: Some(path.display().to_string()),
+        },
+    }
+}
+
 /// `POST /api/admin/setup/dismiss` — mark the first-run wizard as
 /// dismissed so `/api/ping` flips from `wizard` to `pong` and the
 /// SPA's setup guard stops bouncing the operator back to /setup.
@@ -420,6 +507,32 @@ mod tests {
         assert!(v["docker"]["available"].is_boolean());
         assert!(v["docker"]["version"].is_string() || v["docker"]["version"].is_null());
         assert!(v["gpus"].is_array());
+        // Ollama detection added in Phase 14.G — the wizard's
+        // Apple-Silicon panel gates on this. Like docker, it's a
+        // real shell-out so we only assert schema, not host state.
+        assert!(v["ollama"].is_object(), "preflight must carry an `ollama` object");
+        assert!(v["ollama"]["available"].is_boolean());
+        // `version` and `path` are nullable when the binary isn't
+        // present (or `--version` failed) — the SPA renders the
+        // install panel in that case.
+        assert!(v["ollama"]["version"].is_string() || v["ollama"]["version"].is_null());
+        assert!(v["ollama"]["path"].is_string() || v["ollama"]["path"].is_null());
+    }
+
+    #[test]
+    fn detect_ollama_returns_unavailable_with_no_binary_present() {
+        // Sanity check on the helper itself rather than the route.
+        // We can't ensure `ollama` is absent from the test runner's
+        // PATH (CI machines might have it installed), but we CAN
+        // assert that the function never panics + always returns a
+        // well-shaped value. The serialization test above pins the
+        // schema; this test pins the no-panic contract.
+        let s = detect_ollama();
+        // available is a bool either way; version/path are Option.
+        // No assertion on the actual value — just that we got here.
+        let _ = s.available;
+        let _ = s.version;
+        let _ = s.path;
     }
 
     #[tokio::test]

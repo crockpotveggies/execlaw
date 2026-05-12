@@ -3135,6 +3135,23 @@ export interface DockerStatus {
     version: string | null;
 }
 
+/// Ollama availability for the Apple-Silicon native-runtime path.
+/// `available: true` means a runnable Ollama binary was found via
+/// PATH / OLLAMA_BINARY / Homebrew prefixes AND its `--version`
+/// invocation succeeded. The wizard renders the model dropdown when
+/// true and the install panel (`brew install ollama`) when false.
+export interface OllamaStatus {
+    available: boolean;
+    version: string | null;
+    /// Absolute path the discoverer resolved. Surfaced in the
+    /// "Ollama X.Y.Z detected" confirmation badge so multi-install
+    /// systems read out unambiguously. Populated even on
+    /// `available: false` when discovery resolved a path but
+    /// `--version` failed — operator can see where the bad install
+    /// sits.
+    path: string | null;
+}
+
 export interface DetectedGpu {
     /// Stringified `GpuId`. Server uses `<vendor_hex>:<device_or_card>`
     /// — opaque to the SPA. Used as the `gpu_id` value when saving
@@ -3159,6 +3176,7 @@ export interface DetectedGpu {
 
 export interface PreflightResponse {
     docker: DockerStatus;
+    ollama: OllamaStatus;
     gpus: DetectedGpu[];
     /// Free space on the volume that hosts execlaw's HF model
     /// cache. `null` when the platform's free-space probe failed

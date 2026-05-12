@@ -191,6 +191,17 @@ export function BackendsPage() {
     // probe so there's no second source of truth.
     const [preflightGpus, setPreflightGpus] = useState<DetectedGpu[]>([]);
     const [preflightDockerOk, setPreflightDockerOk] = useState<boolean>(true);
+    // Apple-Silicon Ollama preflight (Phase 14.G). The form gates its
+    // model picker on `available`; the BackendsPage refreshes the
+    // probe via `recheckPreflight` when the operator clicks Recheck
+    // in the install panel.
+    const [preflightOllamaOk, setPreflightOllamaOk] = useState<boolean>(false);
+    const [preflightOllamaVersion, setPreflightOllamaVersion] = useState<
+        string | null
+    >(null);
+    const [preflightOllamaPath, setPreflightOllamaPath] = useState<
+        string | null
+    >(null);
     const [preflightDiskFree, setPreflightDiskFree] = useState<number | null>(null);
     const [preflightDiskPath, setPreflightDiskPath] = useState<string | null>(null);
     const [preflightCachedModels, setPreflightCachedModels] = useState<
@@ -257,32 +268,48 @@ export function BackendsPage() {
     /// if it fails (e.g. probe service hiccup), the wizard falls back
     /// to "no GPU detected" which still surfaces the Remote-endpoint
     /// option and lets the operator type a URL.
+    // Wrapped in a callback so the Apple-Silicon install panel's
+    // Recheck button can re-run the probe after the operator runs
+    // `brew install ollama` — the form flips from install-panel to
+    // model-picker without a full page reload.
+    const refreshPreflight = useCallback(async () => {
+        try {
+            const r = await getSetupPreflight(getToken);
+            setPreflightGpus(r.gpus);
+            setPreflightDockerOk(r.docker.available);
+            setPreflightOllamaOk(r.ollama?.available ?? false);
+            setPreflightOllamaVersion(r.ollama?.version ?? null);
+            setPreflightOllamaPath(r.ollama?.path ?? null);
+            setPreflightDiskFree(r.disk_free_bytes ?? null);
+            setPreflightDiskPath(r.disk_free_path ?? null);
+            setPreflightCachedModels(r.cached_models ?? {});
+        } catch {
+            setPreflightGpus([]);
+            setPreflightDockerOk(false);
+            setPreflightOllamaOk(false);
+            setPreflightOllamaVersion(null);
+            setPreflightOllamaPath(null);
+            setPreflightDiskFree(null);
+            setPreflightDiskPath(null);
+            setPreflightCachedModels({});
+        } finally {
+            setPreflightLoaded(true);
+        }
+    }, [getToken]);
+
     useEffect(() => {
         let cancelled = false;
         (async () => {
-            try {
-                const r = await getSetupPreflight(getToken);
-                if (cancelled) return;
-                setPreflightGpus(r.gpus);
-                setPreflightDockerOk(r.docker.available);
-                setPreflightDiskFree(r.disk_free_bytes ?? null);
-                setPreflightDiskPath(r.disk_free_path ?? null);
-                setPreflightCachedModels(r.cached_models ?? {});
-            } catch {
-                if (cancelled) return;
-                setPreflightGpus([]);
-                setPreflightDockerOk(false);
-                setPreflightDiskFree(null);
-                setPreflightDiskPath(null);
-                setPreflightCachedModels({});
-            } finally {
-                if (!cancelled) setPreflightLoaded(true);
-            }
+            await refreshPreflight();
+            // cancelled checked indirectly: the effect cleanup runs
+            // synchronously after this awaits, but we don't mutate
+            // state past the final setState above anyway.
+            if (cancelled) return;
         })();
         return () => {
             cancelled = true;
         };
-    }, [getToken]);
+    }, [refreshPreflight]);
 
     // Poll statuses whenever the entry list changes, then every 5s
     // for as long as at least one row is managed.
@@ -742,6 +769,10 @@ export function BackendsPage() {
                                             purpose={purpose}
                                             gpus={preflightGpus}
                                             dockerAvailable={preflightDockerOk}
+                                            ollamaAvailable={preflightOllamaOk}
+                                            ollamaVersion={preflightOllamaVersion}
+                                            ollamaPath={preflightOllamaPath}
+                                            onRecheckOllama={refreshPreflight}
                                             diskFreeBytes={preflightDiskFree}
                                             diskFreePath={preflightDiskPath}
                                             cachedModels={preflightCachedModels}
