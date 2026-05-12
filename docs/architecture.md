@@ -127,9 +127,19 @@ Thin Rust binary (`runner-local`). Speaks OpenAI-compatible API to whichever loc
 
 **Why per-conversation isolation?** Ported the HotRunnerPool pattern from selfhosted-claw. A runner compromised by prompt injection in conversation A can't touch conversation B's data — its capability token scopes it to one `conversation_id`.
 
-### 4.3 Inference services (separate containers)
+### 4.3 Inference services (separate containers — or native subprocesses on Apple Silicon)
 
 `service-vllm` (nvidia), `service-openarc` (Intel), `service-whisper`, `service-kokoro`, etc. Each serves an OpenAI-compatible or protocol-matched endpoint. Control plane calls them via `inference-api` client. These are the containers that carry the heavy vendor runtimes — keeping the control plane minimal (axiom #12).
+
+**Apple Silicon carve-out:** `service-ollama` runs as a host-native subprocess, not a Docker container. Docker Desktop on macOS executes containers inside a Linux microVM with no Metal passthrough — every container-bound inference engine on Mac falls back to CPU and loses the entire point of an Apple-GPU host. The same constraint affects every Metal-backed engine (llama.cpp Metal, Whisper.cpp Metal, MLX), so the control plane manages them as native subprocesses via `NativeServiceController` instead. vLLM is intentionally **not** supported on Apple Silicon — it has no Metal kernels and the CPU build is unusable for any LLM larger than a few billion parameters. See [`setup-mac.md`](setup-mac.md) for first-run setup. The "minimal containers" axiom (#12) still holds — it's the same principle expressed as "minimal native dependencies" because Apple Silicon doesn't offer a container-passthrough surface for the GPU.
+
+| Host class | Standard inference | Process model |
+|---|---|---|
+| Linux + NVIDIA | vLLM | Docker container, `--gpus` passthrough |
+| Linux + Intel Arc | vLLM-CPU / OpenVINO | Docker container, `/dev/dri` bind |
+| Windows + NVIDIA | vLLM (Docker Desktop) | Docker container, `--gpus` passthrough |
+| **macOS + Apple Silicon** | **Ollama** | **Native `ollama serve` subprocess** |
+| Any host, GPU-less | vLLM-CPU | Docker container, CPU-only |
 
 ### 4.4 Plugins (ZIP-installed extensions)
 
@@ -799,7 +809,8 @@ For the reader who wants to jump into code:
 | [`crates/server/src/sidecar_supervisor.rs`](../crates/server/src/sidecar_supervisor.rs) | Supervised-container reconcile loop, health probe, crash-loop guard. See [`docs/sidecar-supervisor-design.md`](sidecar-supervisor-design.md). |
 | [`crates/server/src/plugin_admin_routes.rs`](../crates/server/src/plugin_admin_routes.rs) | Authenticated dispatcher at `/api/admin/plugins/{plugin_id}{path}` |
 | [`crates/server/src/plugin_webhook_routes.rs`](../crates/server/src/plugin_webhook_routes.rs) | Unauthenticated dispatcher at `/api/webhooks/{plugin_id}{path}`; supports both `application/json` and `application/x-www-form-urlencoded` bodies |
-| [`crates/container-manager/src/hardware.rs`](../crates/container-manager/src/hardware.rs) | Tier-1 sysfs GPU detection |
+| [`crates/container-manager/src/hardware.rs`](../crates/container-manager/src/hardware.rs) | Cross-platform GPU detection — Linux sysfs (Tier 1) + `hardware-query` (WMI on Windows) + `system_profiler SPDisplaysDataType -json` parse on macOS (the upstream crate's macOS GPU path is currently stubbed). Apple Silicon SoCs surface as `GpuVendor::Apple` with a unified-memory budget derived from `sysctl hw.memsize × 2/3` (matches macOS's `iogpu.wired_limit` default). |
+| [`crates/container-manager/src/service.rs`](../crates/container-manager/src/service.rs) | `ServiceController` trait + `BollardServiceController` (Docker) + `NativeServiceController` (host subprocess) + `MultiplexedServiceController` (per-spec dispatch). `ServiceSpec::runtime: ServiceRuntime` (Docker / Native) drives which one spawns; default is Docker for backwards-compat. Native is gated on `binary_hint` (`"ollama"` in v1) so future native engines (llama-server, MLX) slot in by adding match arms in `discover_for_hint`. |
 | [`crates/server/src/routes.rs`](../crates/server/src/routes.rs) | REST surface (auth, OpenAPI) |
 | [`crates/server/src/chats.rs`](../crates/server/src/chats.rs) | Chat surface — policy + capability + cold-contact + streaming |
 | [`crates/server/src/approvals.rs`](../crates/server/src/approvals.rs) | `POST /api/admin/approvals/:id/respond` (Phase 3) |

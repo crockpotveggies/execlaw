@@ -25,16 +25,29 @@ pub enum GpuVendor {
     Nvidia,
     Intel,
     Amd,
+    /// Apple Silicon (M1/M2/M3/M4). Reported on macOS hosts via
+    /// `system_profiler SPDisplaysDataType -json` (see
+    /// [`parse_macos_system_profiler`]). The GPU shares unified
+    /// memory with the CPU, so `GpuDevice::memory_mb` reflects a
+    /// budgeted fraction of `hw.memsize` rather than discrete VRAM.
+    /// No container-runtime passthrough exists for Metal — Apple
+    /// hosts run inference engines as native subprocesses; see
+    /// `ServiceRuntime::Native`.
+    Apple,
     Unknown,
 }
 
 impl GpuVendor {
     pub fn from_pci_vendor(hex: &str) -> Self {
-        // sysfs returns `0x10de`, `0x8086`, etc.
+        // sysfs returns `0x10de`, `0x8086`, etc. Apple's `0x106b` is
+        // included for symmetry — Apple Silicon has no real PCI surface,
+        // but external Apple displays / older Intel Macs with Apple
+        // graphics controllers carry this id in IOKit.
         match hex.trim().to_ascii_lowercase().trim_start_matches("0x") {
             "10de" => GpuVendor::Nvidia,
             "8086" => GpuVendor::Intel,
             "1002" => GpuVendor::Amd,
+            "106b" => GpuVendor::Apple,
             _ => GpuVendor::Unknown,
         }
     }
@@ -100,6 +113,22 @@ pub struct HardwareProfile {
 /// "CPU only" in the Backend wizard until they fix the underlying
 /// issue. The error is logged via `tracing::warn!`.
 pub fn detect() -> HardwareProfile {
+    // macOS pre-pass — `hardware-query` 0.2.x has no working macOS GPU
+    // path (its `query_all` runs WMI + NVML + AMD/Intel sysfs probes,
+    // all of which fail on Mac, then synthesises a "Generic Unknown"
+    // GPU as a fallback). We probe `system_profiler` ourselves so
+    // Apple Silicon shows up as `GpuVendor::Apple` instead of getting
+    // folded into Unknown. If detection produces nothing usable we
+    // fall through to the cross-platform path — that way an Intel Mac
+    // with a discrete AMD GPU still gets recognised.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(prof) = detect_macos()
+            && !prof.gpus.is_empty()
+        {
+            return prof;
+        }
+    }
     match hardware_query::HardwareInfo::query() {
         Ok(hw) => {
             let mut gpus: Vec<GpuDevice> = hw.gpus().iter().map(GpuDevice::from_query).collect();
@@ -116,6 +145,144 @@ pub fn detect() -> HardwareProfile {
                 source: SysfsSource::HardwareQuery,
             }
         }
+    }
+}
+
+/// Run `system_profiler` + `sysctl hw.memsize` on a live macOS host
+/// and parse the result through [`parse_macos_system_profiler`].
+///
+/// Returns `None` (not an empty profile) if either shell-out fails or
+/// the parser finds no Apple-vendor GPU entries — letting `detect()`
+/// fall through to the cross-platform `hardware-query` path.
+#[cfg(target_os = "macos")]
+fn detect_macos() -> Option<HardwareProfile> {
+    use std::process::Command;
+    let json_out = match Command::new("system_profiler")
+        .args(["SPDisplaysDataType", "-json"])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => {
+            tracing::warn!(
+                "system_profiler exited {}; falling back to hardware-query",
+                o.status
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!("system_profiler spawn failed: {e}; falling back to hardware-query");
+            return None;
+        }
+    };
+    let memsize: u64 = Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let prof = parse_macos_system_profiler(&json_out, memsize);
+    if prof.gpus.is_empty() {
+        None
+    } else {
+        Some(prof)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// macOS GPU parsing — Apple Silicon support.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct SystemProfilerOutput {
+    #[serde(rename = "SPDisplaysDataType", default)]
+    displays: Vec<SystemProfilerDisplay>,
+}
+
+#[derive(Deserialize)]
+struct SystemProfilerDisplay {
+    #[serde(rename = "_name", default)]
+    name: Option<String>,
+    #[serde(rename = "sppci_model", default)]
+    model: Option<String>,
+    /// macOS 13+. Older releases used `spdisplays_vendor`; we check
+    /// both so the parser is forward + backward compatible.
+    #[serde(rename = "sppci_vendor", default)]
+    vendor: Option<String>,
+    #[serde(rename = "spdisplays_vendor", default)]
+    vendor_alt: Option<String>,
+}
+
+/// Parse `system_profiler SPDisplaysDataType -json` output into a
+/// `HardwareProfile`. Cross-platform: the parser is a pure function
+/// over `(json, memsize_bytes)` so tests can exercise it from any
+/// host without shelling out.
+///
+/// Filters to entries where the vendor string is `sppci_vendor_Apple`
+/// — anything else (discrete AMD on Intel Macs, eGPU NVIDIA on older
+/// Macs) falls through to the cross-platform `hardware-query` path,
+/// which has correct vendor logic for those classes.
+///
+/// `memsize_bytes` is `sysctl -n hw.memsize`. Apple Silicon's GPU shares
+/// unified memory with the CPU; macOS's `iogpu.wired_limit_mb` default
+/// is roughly two-thirds of system RAM. We use that fraction as the
+/// wizard's "GPU memory budget" so the model-catalog filter matches
+/// what Ollama / llama.cpp can actually load without paging:
+///
+///   - 18 GB Mac → ~12 GB budget (7B-q4 fits, 14B-q4 marginal)
+///   - 36 GB Mac → ~24 GB budget (32B-q4 fits)
+///   - 64 GB Mac → ~42 GB budget (70B-q4 fits)
+///
+/// `memsize_bytes == 0` (sysctl failed) → `memory_mb: None`, so the
+/// wizard hides VRAM-gated entries rather than falsely advertising.
+pub fn parse_macos_system_profiler(json: &str, memsize_bytes: u64) -> HardwareProfile {
+    let parsed: SystemProfilerOutput = match serde_json::from_str(json) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("system_profiler JSON parse failed: {e}; no Apple GPUs reported");
+            return HardwareProfile {
+                gpus: Vec::new(),
+                source: SysfsSource::HardwareQuery,
+            };
+        }
+    };
+    let budget_mb = if memsize_bytes == 0 {
+        None
+    } else {
+        Some((memsize_bytes / 1024 / 1024) * 2 / 3)
+    };
+    let mut gpus = Vec::new();
+    for (idx, d) in parsed.displays.iter().enumerate() {
+        let vendor_str = d
+            .vendor
+            .as_deref()
+            .or(d.vendor_alt.as_deref())
+            .unwrap_or("");
+        if !vendor_str.eq_ignore_ascii_case("sppci_vendor_Apple") {
+            continue;
+        }
+        let model = d
+            .model
+            .clone()
+            .or_else(|| d.name.clone())
+            .filter(|s| !s.is_empty());
+        let id_seed = model
+            .clone()
+            .unwrap_or_else(|| format!("apple-gpu-{idx}"));
+        gpus.push(GpuDevice {
+            id: GpuId(format!("0x106b:{id_seed}")),
+            vendor: GpuVendor::Apple,
+            pci_vendor_id: "0x106b".to_owned(),
+            pci_device_id: "0x0000".to_owned(),
+            device_files: Vec::new(),
+            kernel_card_index: idx as u32,
+            model_name: model,
+            memory_mb: budget_mb,
+        });
+    }
+    HardwareProfile {
+        gpus,
+        source: SysfsSource::HardwareQuery,
     }
 }
 
@@ -190,10 +357,17 @@ impl GpuDevice {
             hardware_query::GPUVendor::NVIDIA => (GpuVendor::Nvidia, "0x10de"),
             hardware_query::GPUVendor::Intel => (GpuVendor::Intel, "0x8086"),
             hardware_query::GPUVendor::AMD => (GpuVendor::Amd, "0x1002"),
-            // Apple Silicon, ARM, Qualcomm, and unrecognized vendors
-            // all report as Unknown — the preset library has no path
-            // for them today, so the wizard recommends CPU which is
-            // the truth until those backends ship.
+            // Apple Silicon — `hardware-query`'s `query_all` doesn't
+            // actually reach this arm on real Macs today (its macOS GPU
+            // probe is stubbed; see `detect_macos` for the real path),
+            // but if a future upstream release wires it up, the adapter
+            // will surface it correctly. The Ollama-native preset
+            // recommended by the wizard runs as a native subprocess —
+            // no container passthrough.
+            hardware_query::GPUVendor::Apple => (GpuVendor::Apple, "0x106b"),
+            // ARM, Qualcomm, and unrecognised vendors still fold to
+            // Unknown — the wizard recommends CPU presets for them
+            // until dedicated runtime paths ship.
             _ => (GpuVendor::Unknown, "0x0000"),
         };
         // hardware-query's `pci_device_id` includes Windows PNP
@@ -498,22 +672,36 @@ mod tests {
     }
 
     #[test]
-    fn from_query_maps_apple_to_unknown() {
-        // Apple Silicon GPUs are real GPUs, but the v1 preset library
-        // has no MLX path. Reporting them as Unknown makes the
-        // BackendWizard recommend the CPU preset, which is the truth
-        // until MLX presets ship.
+    fn from_query_maps_apple_to_apple() {
+        // hardware-query's macOS GPU probe is currently stubbed, so this
+        // path isn't exercised on a live Mac (the `detect_macos` shell-out
+        // catches Apple Silicon first). But if a future upstream release
+        // wires up IOKit properly, the adapter must surface it as
+        // GpuVendor::Apple, not get folded into Unknown.
         let g = mk_query_gpu("\"Apple\"", "Apple M3 Pro", Some("0xa07"));
         let dev = GpuDevice::from_query(&g);
-        assert_eq!(dev.vendor, GpuVendor::Unknown);
+        assert_eq!(dev.vendor, GpuVendor::Apple);
+        assert_eq!(dev.pci_vendor_id, "0x106b");
+    }
+
+    #[test]
+    fn from_pci_vendor_maps_apple() {
+        // 0x106b is Apple's PCI vendor id (Apple Silicon SoCs don't sit
+        // on a real PCI bus, but external Apple display controllers and
+        // older Intel Macs with Apple-branded GPUs do).
+        assert_eq!(GpuVendor::from_pci_vendor("0x106b"), GpuVendor::Apple);
+        assert_eq!(GpuVendor::from_pci_vendor("106b"), GpuVendor::Apple);
     }
 
     #[test]
     fn from_query_uses_model_name_when_device_id_missing() {
-        // Two Apple GPUs without device ids should still get distinct
-        // ids so the SPA can render them as separate badges.
-        let g1 = mk_query_gpu("\"Apple\"", "M3 Pro", None);
-        let g2 = mk_query_gpu("\"Apple\"", "M3 Max", None);
+        // Two distinct GPUs without device ids should still get distinct
+        // ids so the SPA can render them as separate badges. We use AMD
+        // here because Apple Silicon now flows through `detect_macos`
+        // rather than this adapter — but the fallback fingerprint logic
+        // is shared, so any vendor exercises it.
+        let g1 = mk_query_gpu("\"AMD\"", "RX 7900 XTX", None);
+        let g2 = mk_query_gpu("\"AMD\"", "RX 7800 XT", None);
         let dev1 = GpuDevice::from_query(&g1);
         let dev2 = GpuDevice::from_query(&g2);
         assert_ne!(dev1.id, dev2.id);
@@ -545,11 +733,10 @@ mod tests {
 
     #[test]
     fn from_query_zero_memory_falls_through_to_none() {
-        // hardware-query reports memory_mb=0 when it can't resolve
-        // (Apple Silicon unified-memory often hits this). Our adapter
-        // must surface None, not Some(0), so the SPA filters models
-        // correctly.
-        let g = mk_query_gpu("\"Apple\"", "M3 Pro", None);
+        // hardware-query reports memory_mb=0 when it can't resolve.
+        // Our adapter must surface None, not Some(0), so the SPA
+        // filters models correctly.
+        let g = mk_query_gpu("\"NVIDIA\"", "Unknown NVIDIA", None);
         let dev = GpuDevice::from_query(&g);
         assert_eq!(dev.memory_mb, None);
     }
@@ -586,5 +773,143 @@ mod tests {
         // failure. Just call it; assert we always get a profile.
         let p = detect();
         assert_eq!(p.source, SysfsSource::HardwareQuery);
+    }
+
+    // ---- macOS Apple Silicon parsing --------------------------------
+
+    /// Frozen `system_profiler SPDisplaysDataType -json` output from an
+    /// M3 Pro 14-inch MacBook (macOS 14.4, 18-core GPU). Trimmed of the
+    /// `spdisplays_ndrvs` (attached-display) noise — the parser doesn't
+    /// need it. Keep this realistic enough that a Mac dev can drop in
+    /// their own capture; field names match what the live tool emits.
+    const M3_PRO_FIXTURE: &str = r#"{
+      "SPDisplaysDataType": [
+        {
+          "_name": "Apple M3 Pro",
+          "spdisplays_mtlgpufamilysupport": "spdisplays_metal3",
+          "sppci_bus": "spdisplays_builtin",
+          "sppci_cores": "18",
+          "sppci_device_type": "spdisplays_gpu",
+          "sppci_model": "Apple M3 Pro",
+          "sppci_vendor": "sppci_vendor_Apple"
+        }
+      ]
+    }"#;
+
+    #[test]
+    fn parse_macos_system_profiler_reads_m3_pro() {
+        // 36 GB unified memory (a common M3 Pro config).
+        let memsize_bytes: u64 = 36 * 1024 * 1024 * 1024;
+        let prof = parse_macos_system_profiler(M3_PRO_FIXTURE, memsize_bytes);
+        assert_eq!(prof.gpus.len(), 1);
+        let gpu = &prof.gpus[0];
+        assert_eq!(gpu.vendor, GpuVendor::Apple);
+        assert_eq!(gpu.pci_vendor_id, "0x106b");
+        assert_eq!(gpu.model_name.as_deref(), Some("Apple M3 Pro"));
+        // 36 GB * 2/3 ≈ 24 GB budget. Allow ±1 MiB for integer rounding.
+        let mb = gpu.memory_mb.expect("memory budget should be populated");
+        let expected = (36 * 1024 * 1024 * 1024u64 / 1024 / 1024) * 2 / 3;
+        assert!((mb as i64 - expected as i64).abs() <= 1, "got {mb}, expected ~{expected}");
+        // Should be a number close to 24576 MiB.
+        assert!(mb > 23_000 && mb < 25_000, "budget {mb} MiB outside expected 36GB×2/3 band");
+    }
+
+    #[test]
+    fn parse_macos_system_profiler_skips_non_apple_vendors() {
+        // Older Intel Macs with a discrete AMD card report
+        // `sppci_vendor_AMD` (or similar). Our parser must skip those
+        // so `detect()` falls through to the cross-platform path that
+        // knows how to deal with them.
+        let json = r#"{
+          "SPDisplaysDataType": [
+            {
+              "_name": "AMD Radeon Pro 5500M",
+              "sppci_model": "AMD Radeon Pro 5500M",
+              "sppci_vendor": "sppci_vendor_AMD"
+            }
+          ]
+        }"#;
+        let prof = parse_macos_system_profiler(json, 16 * 1024 * 1024 * 1024);
+        assert!(prof.gpus.is_empty());
+    }
+
+    #[test]
+    fn parse_macos_system_profiler_handles_legacy_vendor_field() {
+        // Older macOS releases (and some Hackintosh setups) use
+        // `spdisplays_vendor` instead of `sppci_vendor`. The parser
+        // accepts either.
+        let json = r#"{
+          "SPDisplaysDataType": [
+            {
+              "_name": "Apple M1",
+              "sppci_model": "Apple M1",
+              "spdisplays_vendor": "sppci_vendor_Apple"
+            }
+          ]
+        }"#;
+        let prof = parse_macos_system_profiler(json, 8 * 1024 * 1024 * 1024);
+        assert_eq!(prof.gpus.len(), 1);
+        assert_eq!(prof.gpus[0].vendor, GpuVendor::Apple);
+    }
+
+    #[test]
+    fn parse_macos_system_profiler_zero_memsize_yields_none_memory() {
+        // sysctl failed → we don't fabricate a memory budget.
+        let prof = parse_macos_system_profiler(M3_PRO_FIXTURE, 0);
+        assert_eq!(prof.gpus.len(), 1);
+        assert_eq!(prof.gpus[0].memory_mb, None);
+    }
+
+    #[test]
+    fn parse_macos_system_profiler_tolerates_garbage_json() {
+        // Adversarial: a future macOS release renames the top-level
+        // key, or the operator pastes the wrong file into a manual
+        // override path. We must not panic.
+        assert!(
+            parse_macos_system_profiler("not even json", 0)
+                .gpus
+                .is_empty()
+        );
+        assert!(
+            parse_macos_system_profiler("{}", 0).gpus.is_empty()
+        );
+        assert!(
+            parse_macos_system_profiler(r#"{"SPDisplaysDataType":"unexpected"}"#, 0)
+                .gpus
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parse_macos_system_profiler_handles_multi_entry_with_mixed_vendors() {
+        // Hypothetical Mac Pro with both an Apple-branded controller
+        // (for builtin display routing) and a discrete AMD card. The
+        // parser keeps the Apple entry only — AMD goes through the
+        // hardware-query path on Intel Macs.
+        let json = r#"{
+          "SPDisplaysDataType": [
+            {"_name":"Apple M2 Ultra","sppci_model":"Apple M2 Ultra","sppci_vendor":"sppci_vendor_Apple"},
+            {"_name":"AMD Radeon Pro W6800X","sppci_model":"AMD Radeon Pro W6800X","sppci_vendor":"sppci_vendor_AMD"}
+          ]
+        }"#;
+        let prof = parse_macos_system_profiler(json, 64 * 1024 * 1024 * 1024);
+        assert_eq!(prof.gpus.len(), 1);
+        assert_eq!(prof.gpus[0].model_name.as_deref(), Some("Apple M2 Ultra"));
+    }
+
+    #[test]
+    fn parse_macos_system_profiler_assigns_distinct_ids_for_two_apple_entries() {
+        // Mac Studio with M2 Ultra reports as a single GPU, but a
+        // hypothetical multi-die future SoC could surface two. Make
+        // sure ids stay distinct.
+        let json = r#"{
+          "SPDisplaysDataType": [
+            {"_name":"Apple M9 Die 0","sppci_model":"Apple M9 Die 0","sppci_vendor":"sppci_vendor_Apple"},
+            {"_name":"Apple M9 Die 1","sppci_model":"Apple M9 Die 1","sppci_vendor":"sppci_vendor_Apple"}
+          ]
+        }"#;
+        let prof = parse_macos_system_profiler(json, 256 * 1024 * 1024 * 1024);
+        assert_eq!(prof.gpus.len(), 2);
+        assert_ne!(prof.gpus[0].id, prof.gpus[1].id);
     }
 }

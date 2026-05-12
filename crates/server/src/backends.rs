@@ -644,6 +644,7 @@ fn build_presets_response(
             GpuVendor::Nvidia => "nvidia",
             GpuVendor::Intel => "intel",
             GpuVendor::Amd => "amd",
+            GpuVendor::Apple => "apple",
             GpuVendor::Unknown => continue,
         };
         if !detected_str.iter().any(|existing| existing == s) {

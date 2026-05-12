@@ -742,7 +742,11 @@ function HardwareSummary({
     refresh: () => Promise<void>;
 }) {
     const usable = gpus.filter(
-        (g) => g.vendor === "Nvidia" || g.vendor === "Intel" || g.vendor === "Amd",
+        (g) =>
+            g.vendor === "Nvidia" ||
+            g.vendor === "Intel" ||
+            g.vendor === "Amd" ||
+            g.vendor === "Apple",
     );
     return (
         <div

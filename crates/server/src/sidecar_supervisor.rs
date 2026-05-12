@@ -484,14 +484,12 @@ impl SidecarSupervisor {
             let spec = ServiceSpec {
                 name: container_name(&sidecar.plugin_id, &sidecar.name),
                 image: sidecar.image.clone(),
-                args: Vec::new(),
                 entrypoint: sidecar.entrypoint.clone(),
                 env: sidecar.env.clone(),
-                gpu_id: None,
-                gpu_vendor: None,
                 mounts,
                 host_port: port,
                 container_port: sidecar.rpc_port,
+                ..Default::default()
             };
             match self.controller.spawn(&spec).await {
                 Ok(handle) => {

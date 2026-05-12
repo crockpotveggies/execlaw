@@ -39,11 +39,17 @@ use utoipa::ToSchema;
 /// explicit "Cpu" variant for the no-GPU fallback (`GpuVendor::Unknown`
 /// would be ambiguous — Unknown means "we couldn't tell," not "no
 /// GPU was requested").
+///
+/// `Apple` is a special case: there's no Metal-to-container surface,
+/// so Apple presets always materialise into the native-runtime
+/// envelope (`runtime: "native"`) rather than a Docker image. See
+/// [`materialise_spec`] for the dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PresetVendor {
     Nvidia,
     Intel,
+    Apple,
     Cpu,
 }
 
@@ -52,6 +58,7 @@ impl PresetVendor {
         match self {
             Self::Nvidia => "nvidia",
             Self::Intel => "intel",
+            Self::Apple => "apple",
             Self::Cpu => "cpu",
         }
     }
@@ -155,6 +162,35 @@ fn whisper_model_size_field() -> PresetField {
     }
 }
 
+/// Ollama-registry model choices for the Apple-Silicon presets.
+/// Ollama tags differ from HF — these are the names `ollama pull`
+/// understands. The supervisor reads the selected value out of
+/// `model_spec_json.model` and issues `POST /api/pull` before
+/// marking the backend healthy.
+///
+/// Qwen3.5 isn't published to the Ollama registry yet (as of
+/// 2026-05); we pin Qwen2.5-instruct in the same parameter sizes
+/// the NVIDIA presets target so the operator-visible model menu
+/// stays predictable. Operators can override via the wizard's
+/// advanced disclosure.
+fn ollama_model_field(default_model: &str) -> PresetField {
+    PresetField {
+        kind: "model".into(),
+        label: "Model".into(),
+        choices: vec![
+            "qwen2.5:32b-instruct-q4_K_M".into(),
+            "qwen2.5:14b-instruct-q4_K_M".into(),
+            "qwen2.5:7b-instruct-q4_K_M".into(),
+            "qwen2.5:3b-instruct-q4_K_M".into(),
+        ],
+        default: default_model.into(),
+        // Empty template: the model name is not a CLI arg to
+        // `ollama serve`. The supervisor reads it from
+        // `model_spec_json.model` and feeds it to `/api/pull`.
+        arg_template: "".into(),
+    }
+}
+
 fn vllm_model_field(default_model: &str, label: &str) -> PresetField {
     PresetField {
         kind: "model".into(),
@@ -207,6 +243,21 @@ pub fn all_presets() -> Vec<BackendPreset> {
             fields: vec![vllm_model_field("QuantTrio/Qwen3.5-27B-AWQ", "Model")],
         },
         BackendPreset {
+            id: "ollama-apple".into(),
+            purpose: BackendPurpose::Standard.as_str().to_owned(),
+            inference_backend: "service-ollama".into(),
+            name: "Ollama (Apple Silicon)".into(),
+            description: "Native llama.cpp via Ollama on Metal. Runs as a managed `ollama serve` subprocess on the macOS host — Docker Desktop on Mac has no Metal passthrough, so the wizard skips containers for Apple GPUs. Requires `brew install ollama`; the supervisor pulls the selected model via `/api/pull` before serving.".into(),
+            image: "".into(), // native runtime — no image
+            // Ollama's daemon listens on 11434 by default. The
+            // supervisor remaps to host_port_for(Standard) via
+            // OLLAMA_HOST when spawning.
+            container_port: 11434,
+            vendor: PresetVendor::Apple.as_str().to_owned(),
+            default_args: vec!["serve".into()],
+            fields: vec![ollama_model_field("qwen2.5:32b-instruct-q4_K_M")],
+        },
+        BackendPreset {
             id: "vllm-cpu".into(),
             purpose: BackendPurpose::Standard.as_str().to_owned(),
             inference_backend: "service-vllm".into(),
@@ -243,6 +294,18 @@ pub fn all_presets() -> Vec<BackendPreset> {
                 "--enable-prefix-caching".into(),
             ],
             fields: vec![vllm_model_field("Qwen/Qwen2.5-3B-Instruct-AWQ", "Model")],
+        },
+        BackendPreset {
+            id: "ollama-apple-small".into(),
+            purpose: BackendPurpose::Small.as_str().to_owned(),
+            inference_backend: "service-ollama".into(),
+            name: "Ollama Small (Apple Silicon)".into(),
+            description: "Same managed Ollama subprocess as the Standard Apple preset; pinned to a small Qwen quant for voice-mode fast-path latency on Apple Silicon.".into(),
+            image: "".into(),
+            container_port: 11434,
+            vendor: PresetVendor::Apple.as_str().to_owned(),
+            default_args: vec!["serve".into()],
+            fields: vec![ollama_model_field("qwen2.5:3b-instruct-q4_K_M")],
         },
         BackendPreset {
             id: "vllm-small-cpu".into(),
@@ -352,7 +415,7 @@ pub fn presets_for(purpose: BackendPurpose, detected_vendors: &[GpuVendor]) -> V
     // GPU is present.
     let has_supported_gpu = detected_vendors
         .iter()
-        .any(|v| matches!(v, GpuVendor::Nvidia | GpuVendor::Intel));
+        .any(|v| matches!(v, GpuVendor::Nvidia | GpuVendor::Intel | GpuVendor::Apple));
     all_presets()
         .into_iter()
         .filter(|p| p.purpose == purpose_str)
@@ -360,6 +423,7 @@ pub fn presets_for(purpose: BackendPurpose, detected_vendors: &[GpuVendor]) -> V
             let recommended = match p.vendor.as_str() {
                 "nvidia" => detected_vendors.contains(&GpuVendor::Nvidia),
                 "intel" => detected_vendors.contains(&GpuVendor::Intel),
+                "apple" => detected_vendors.contains(&GpuVendor::Apple),
                 "cpu" => !has_supported_gpu,
                 _ => false,
             };
@@ -383,15 +447,44 @@ pub fn materialise_spec(
     field_values: &std::collections::HashMap<String, String>,
 ) -> serde_json::Value {
     let mut args: Vec<String> = preset.default_args.clone();
+    // Track every field's resolved value so the native-runtime
+    // envelope can surface non-arg fields (model name for Ollama)
+    // without re-walking the preset.
+    let mut resolved: std::collections::HashMap<&str, String> =
+        std::collections::HashMap::new();
     for field in &preset.fields {
         let value = field_values
             .get(&field.kind)
             .cloned()
             .unwrap_or_else(|| field.default.clone());
+        resolved.insert(field.kind.as_str(), value.clone());
         if !field.arg_template.is_empty() {
             args.push(field.arg_template.replace("{value}", &value));
         }
     }
+
+    // Apple-vendor presets run as native subprocesses (no Metal
+    // passthrough into Linux containers exists). Emit a different
+    // envelope so the supervisor's runtime-dispatch step picks the
+    // NativeServiceController instead of bollard. `binary_hint` is
+    // derived from the inference-backend plugin id (`service-ollama`
+    // → "ollama") so future engines (`service-mlx`, `service-llama-cpp`)
+    // slot in without touching the preset library.
+    if preset.vendor == PresetVendor::Apple.as_str() {
+        let binary_hint = preset
+            .inference_backend
+            .strip_prefix("service-")
+            .unwrap_or(&preset.inference_backend)
+            .to_owned();
+        return serde_json::json!({
+            "runtime": "native",
+            "binary_hint": binary_hint,
+            "args": args,
+            "container_port": preset.container_port,
+            "model": resolved.get("model").cloned().unwrap_or_default(),
+        });
+    }
+
     serde_json::json!({
         "image": preset.image,
         "args": args,
@@ -615,5 +708,120 @@ mod tests {
         for p in all_presets() {
             assert!(seen.insert(p.id.clone()), "duplicate preset id: {}", p.id);
         }
+    }
+
+    // ---- Apple Silicon presets --------------------------------------
+
+    #[test]
+    fn presets_for_recommends_apple_ollama_when_apple_detected() {
+        let presets = presets_for(BackendPurpose::Standard, &[GpuVendor::Apple]);
+        let apple = presets
+            .iter()
+            .find(|p| p.preset.id == "ollama-apple")
+            .expect("apple Standard preset must exist");
+        assert!(apple.recommended, "Apple GPU should recommend ollama-apple");
+        let cpu = presets
+            .iter()
+            .find(|p| p.preset.id == "vllm-cpu")
+            .expect("CPU fallback present");
+        assert!(
+            !cpu.recommended,
+            "CPU preset must NOT be recommended when an Apple GPU is detected"
+        );
+        let nvidia = presets
+            .iter()
+            .find(|p| p.preset.id == "vllm-cuda")
+            .expect("NVIDIA preset present");
+        assert!(
+            !nvidia.recommended,
+            "NVIDIA preset must NOT be recommended on a non-NVIDIA host"
+        );
+    }
+
+    #[test]
+    fn presets_for_recommends_apple_ollama_small_when_apple_detected() {
+        // Mirrors the Standard test for the Small purpose — confirms
+        // both Apple presets surface as `recommended` on a Mac host.
+        let presets = presets_for(BackendPurpose::Small, &[GpuVendor::Apple]);
+        let apple = presets
+            .iter()
+            .find(|p| p.preset.id == "ollama-apple-small")
+            .expect("apple Small preset must exist");
+        assert!(apple.recommended);
+    }
+
+    #[test]
+    fn apple_preset_materialises_native_runtime_envelope() {
+        let preset = all_presets()
+            .into_iter()
+            .find(|p| p.id == "ollama-apple")
+            .unwrap();
+        let mut values = HashMap::new();
+        values.insert("model".into(), "qwen2.5:14b-instruct-q4_K_M".into());
+        let spec = materialise_spec(&preset, &values);
+        assert_eq!(spec["runtime"], "native");
+        assert_eq!(spec["binary_hint"], "ollama");
+        assert_eq!(spec["model"], "qwen2.5:14b-instruct-q4_K_M");
+        assert_eq!(spec["container_port"], 11434);
+        // No `image` key in the native envelope — the SPA's advanced
+        // disclosure should branch on the runtime field, not look for
+        // an empty image to know "this is a native preset."
+        assert!(
+            spec.get("image").is_none(),
+            "native-runtime envelope must NOT include `image`; got {spec}"
+        );
+        // `args` carries the daemon subcommand even though there's no
+        // model arg — Ollama needs `serve`.
+        let args = spec["args"].as_array().unwrap();
+        assert_eq!(args, &vec![serde_json::Value::String("serve".into())]);
+    }
+
+    #[test]
+    fn apple_preset_uses_default_model_when_no_value_supplied() {
+        // Same forward-compat behaviour as other presets — a wizard
+        // that doesn't include the model field should still produce
+        // a materialised spec with the default.
+        let preset = all_presets()
+            .into_iter()
+            .find(|p| p.id == "ollama-apple")
+            .unwrap();
+        let spec = materialise_spec(&preset, &HashMap::new());
+        assert_eq!(spec["model"], "qwen2.5:32b-instruct-q4_K_M");
+    }
+
+    #[test]
+    fn non_apple_preset_still_emits_docker_envelope() {
+        // Regression guard: the runtime dispatch branches on the
+        // PresetVendor::Apple discriminator only — every other
+        // preset must keep the existing Docker shape.
+        let preset = all_presets()
+            .into_iter()
+            .find(|p| p.id == "vllm-cuda")
+            .unwrap();
+        let spec = materialise_spec(&preset, &HashMap::new());
+        assert!(spec.get("runtime").is_none());
+        assert!(spec.get("binary_hint").is_none());
+        assert_eq!(spec["image"], "vllm/vllm-openai:nightly");
+    }
+
+    #[test]
+    fn presets_for_recommends_cpu_when_no_gpu_even_with_apple_presets() {
+        // No-GPU host should fall back to CPU; the new Apple presets
+        // must NOT win in this case (we don't want a Linux host with
+        // no GPU to suddenly recommend Ollama-Apple).
+        let presets = presets_for(BackendPurpose::Standard, &[]);
+        let apple = presets.iter().find(|p| p.preset.id == "ollama-apple").unwrap();
+        let cpu = presets.iter().find(|p| p.preset.id == "vllm-cpu").unwrap();
+        assert!(!apple.recommended);
+        assert!(cpu.recommended);
+    }
+
+    #[test]
+    fn apple_presets_exist_for_standard_and_small_purposes() {
+        // Sanity: don't ship one without the other — the supervisor
+        // pairs Standard + Small for voice-mode fast-path.
+        let ids: Vec<String> = all_presets().into_iter().map(|p| p.id).collect();
+        assert!(ids.iter().any(|s| s == "ollama-apple"));
+        assert!(ids.iter().any(|s| s == "ollama-apple-small"));
     }
 }

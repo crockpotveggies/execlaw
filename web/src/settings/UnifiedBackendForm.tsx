@@ -634,6 +634,8 @@ function vendorDisplayName(v: DetectedGpu["vendor"]): string {
             return "Intel";
         case "Amd":
             return "AMD";
+        case "Apple":
+            return "Apple Silicon (Metal)";
         default:
             return "GPU";
     }
@@ -677,6 +679,8 @@ export function serverVendorTag(v: DetectedGpu["vendor"]): string | undefined {
             return "intel";
         case "Amd":
             return "amd";
+        case "Apple":
+            return "apple";
         default:
             return undefined;
     }

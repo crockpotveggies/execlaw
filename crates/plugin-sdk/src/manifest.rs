@@ -217,6 +217,22 @@ pub struct InferenceBackendDecl {
     pub openai_compatible_endpoint: String,
     pub supports_streaming: bool,
     pub supports_tools: bool,
+    /// Deployment runtimes this backend can run under. Each entry is
+    /// a lowercase identifier matching the supervisor's runtime
+    /// dispatch (`"docker"`, `"native"`). When omitted, the supervisor
+    /// assumes `["docker"]` — every existing managed-mode preset
+    /// (vLLM, Whisper, Kokoro, Piper) ships as a Docker container.
+    ///
+    /// The first non-Docker entry is `service-ollama`, which on Apple
+    /// Silicon must run as a native macOS subprocess because Docker
+    /// Desktop on macOS has no Metal passthrough — that plugin
+    /// declares `runtimes = ["native"]` so the wizard's plugin store
+    /// can warn ahead of time when the operator is on a host class
+    /// the backend can't deploy to (e.g. an Ollama-native plugin
+    /// shouldn't appear "Ready" on a Linux/NVIDIA host where the
+    /// vLLM Docker preset is the right choice).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtimes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1465,6 +1481,50 @@ mod tests {
         assert!(!is_known_trust_level("admin"));
         assert!(!is_known_trust_level("CONTROLLER"));
         assert!(!is_known_trust_level(""));
+    }
+
+    #[test]
+    fn inference_backend_decl_runtimes_omitted_is_none() {
+        // Backwards-compat: every shipped manifest pre-Apple-Silicon
+        // omits `runtimes`. The default must be `None` (which the
+        // supervisor reads as "docker only"), not an empty Vec — an
+        // empty Vec would imply "no runtimes supported," which is
+        // exactly the opposite intent.
+        let ok = r#"
+            [plugin]
+            id = "x"
+            name = "X"
+            version = "0.1.0"
+
+            [inference_backend]
+            openai_compatible_endpoint = "/v1"
+            supports_streaming = true
+            supports_tools = true
+        "#;
+        let m = PluginManifest::parse(ok).unwrap();
+        let ib = m.inference_backend.as_ref().unwrap();
+        assert!(ib.runtimes.is_none());
+    }
+
+    #[test]
+    fn inference_backend_decl_runtimes_native_parses() {
+        // The service-ollama plugin (Apple Silicon) declares native
+        // because Docker Desktop on macOS has no Metal passthrough.
+        let ok = r#"
+            [plugin]
+            id = "service-ollama"
+            name = "Ollama"
+            version = "0.1.0"
+
+            [inference_backend]
+            openai_compatible_endpoint = "/v1"
+            supports_streaming = true
+            supports_tools = true
+            runtimes = ["native"]
+        "#;
+        let m = PluginManifest::parse(ok).unwrap();
+        let ib = m.inference_backend.as_ref().unwrap();
+        assert_eq!(ib.runtimes.as_deref(), Some(&["native".to_owned()][..]));
     }
 
     #[test]

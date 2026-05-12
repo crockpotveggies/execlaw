@@ -25,6 +25,11 @@ $accent:         #4493f8;     // controller-thread blue
 $success:        #3fb950;
 $warning:        #d29922;
 $danger:         #f85149;
+// "In-progress, not broken" blue — used by the brand-indicator's
+// `is-installing` state while a backend is pulling or warming up.
+// Picked to read distinctly from `$accent` (controller-thread blue)
+// so the pulsing download icon doesn't get mistaken for a thread.
+$info:           #58a6ff;
 
 // ---- Geometry tokens ----------------------------------------------
 // Floating-sidebar gutter: distance from each viewport edge to the
@@ -443,11 +448,12 @@ body {
         box-shadow: 0 0 6px rgba($success, 0.55);
     }
 
-    // Alert + disconnected variants render an icon glyph, so we
-    // expand the box past the 0.6rem dot footprint and drop the
+    // Alert + disconnected + installing variants render an icon glyph,
+    // so we expand the box past the 0.6rem dot footprint and drop the
     // background fill — the icon does the visual work.
     &.is-alert,
-    &.is-disconnected {
+    &.is-disconnected,
+    &.is-installing {
         width: auto;
         height: auto;
         background-color: transparent;
@@ -464,6 +470,23 @@ body {
 
     &.is-disconnected {
         color: $warning;
+    }
+
+    // Installing state — at least one backend is in Pulling /
+    // Starting / DownloadingModel / LoadingModel. Reuses the same
+    // pulse keyframes the alert variant uses so the visual rhythm
+    // stays consistent; the colour says "in-progress, not broken."
+    // Click routes to /settings/backends so the operator can see the
+    // pull % per row.
+    //
+    // Precedence (computed in BrandStatusIndicator): alert > disconnected
+    // > installing > ok. An installing backend during an active
+    // alert keeps the red triangle visible — the alert is the
+    // higher-priority signal.
+    &.is-installing {
+        color: $info;
+        animation: execlaw-brand-status-pulse 1.6s ease-in-out infinite;
+        &:hover { color: color.adjust($info, $lightness: 6%); }
     }
 }
 
