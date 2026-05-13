@@ -250,6 +250,65 @@ impl SidecarSupervisor {
         Ok(())
     }
 
+    /// Stop every running sidecar container and clear the slot map.
+    ///
+    /// Used by factory reset (`POST /api/admin/factory-reset`) to
+    /// guarantee no orphaned containers survive a "back to first
+    /// boot" wipe. Without this the reconcile loop only stops
+    /// containers when their plugin is *disabled* — factory reset
+    /// wipes `state_plugins` directly, leaving the registry empty
+    /// next tick but the live containers stranded under their
+    /// pre-wipe names (signal-cli, wuzapi, …) and ports.
+    ///
+    /// Returns the number of containers actually stopped (useful
+    /// for the factory-reset response + test assertions). Errors
+    /// from individual `controller.stop` calls are logged at
+    /// WARN but do not short-circuit — the goal is "as much
+    /// teardown as docker will give us" rather than transactional
+    /// all-or-nothing.
+    ///
+    /// Safe to call from contexts where the supervisor's main
+    /// reconcile loop is also running — the slots-mutex is held
+    /// for the duration so a concurrent reconcile waits. Callers
+    /// who want a permanent teardown (factory reset) should ALSO
+    /// stop the reconcile task or clear the registry first;
+    /// otherwise the next tick will respawn anything that still
+    /// has a `RegisteredSidecar` entry. Factory reset does both
+    /// (DB wipe → registry empties → reconcile is a no-op).
+    pub async fn stop_all(&self) -> usize {
+        let mut slots = self.slots.lock().await;
+        let names: Vec<String> = slots.keys().cloned().collect();
+        let mut stopped = 0usize;
+        for name in names {
+            let Some(mut slot) = slots.remove(&name) else {
+                continue;
+            };
+            let was_running = slot.handle.is_some();
+            if let Some(handle) = slot.handle.take() {
+                info!(sidecar = %name, "stopping sidecar container for teardown");
+                if let Err(e) = self.controller.stop(&handle).await {
+                    warn!(
+                        sidecar = %name,
+                        error = %e,
+                        "controller.stop failed during stop_all — container may be orphaned",
+                    );
+                } else {
+                    stopped += 1;
+                }
+            }
+            // Emit a UI transition so the SPA's sidecars page
+            // reflects the teardown immediately (the loader-pill
+            // / alerts dock already subscribes to this).
+            if was_running && let Some(bus) = &self.bus {
+                bus.publish(UiEvent::SidecarStatusChanged {
+                    name: name.clone(),
+                    status: format!("{:?}", ServiceStatus::Stopped),
+                });
+            }
+        }
+        stopped
+    }
+
     /// Look up the published host port for a single supervised
     /// sidecar by name. Returns `Some(port)` only when the sidecar
     /// has been spawned at least once (the supervisor mints its
@@ -894,6 +953,87 @@ rpc_port = {port}
         assert_eq!(snap[0].name, "signal");
         assert_eq!(snap[0].status, ServiceStatus::Starting);
         assert_eq!(snap[0].restart_attempts, 0);
+    }
+
+    /// Regression: factory reset's teardown step relies on
+    /// `stop_all` actually stopping every running container.
+    /// Before 2026-05-13 the WhatsApp wuzapi container survived
+    /// a factory reset because the supervisor only stopped
+    /// containers on plugin-disable (registry shrink) — and
+    /// factory reset wipes the DB directly without touching the
+    /// registry.
+    #[tokio::test]
+    async fn stop_all_stops_every_running_container_and_clears_slots() {
+        let mock = Arc::new(MockServiceController::new());
+        // Two sidecars across two plugins — simulating an
+        // operator running both signal-cli AND whatsapp/wuzapi.
+        let m1 = PluginManifest::parse(
+            r#"
+[plugin]
+id = "p-signal"
+name = "P1"
+version = "0.1.0"
+
+[[services]]
+name = "signal-cli"
+image = "execlaw/signal-cli:0.1"
+
+[services.sidecar]
+rpc_port = 8080
+"#,
+        )
+        .unwrap();
+        let m2 = PluginManifest::parse(
+            r#"
+[plugin]
+id = "p-whatsapp"
+name = "P2"
+version = "0.1.0"
+
+[[services]]
+name = "wuzapi"
+image = "execlaw/wuzapi:0.1"
+
+[services.sidecar]
+rpc_port = 8080
+"#,
+        )
+        .unwrap();
+        let reg = HookRegistry::new();
+        reg.enable(&m1).unwrap();
+        reg.enable(&m2).unwrap();
+        let sup = SidecarSupervisor::new(mock.clone(), reg);
+
+        // Two reconcile passes — first spawns both, second is a
+        // no-op (already in Starting). Either way the slot map
+        // has both running handles.
+        sup.reconcile_once().await;
+        assert_eq!(mock.spawn_count().await, 2);
+        assert_eq!(mock.stop_count().await, 0);
+        assert_eq!(sup.snapshot_status().await.len(), 2);
+
+        // Factory-reset teardown call.
+        let stopped = sup.stop_all().await;
+        assert_eq!(stopped, 2, "every running container must be stopped");
+        assert_eq!(
+            mock.stop_count().await,
+            2,
+            "controller.stop must be called once per slot with a live handle",
+        );
+
+        // Slots are gone — subsequent host_port_for / has_published_port
+        // calls return None / false, confirming the slot map is
+        // empty. Snapshot still lists the registered names because
+        // the registry hasn't shrunk (factory reset wipes the DB
+        // which empties it on the next reconcile tick).
+        assert_eq!(sup.host_port_for("signal-cli").await, None);
+        assert_eq!(sup.host_port_for("wuzapi").await, None);
+
+        // Idempotent — calling stop_all twice is fine; second
+        // call sees no slots and stops nothing extra.
+        let stopped_again = sup.stop_all().await;
+        assert_eq!(stopped_again, 0);
+        assert_eq!(mock.stop_count().await, 2, "second stop_all must not double-stop");
     }
 
     #[tokio::test]

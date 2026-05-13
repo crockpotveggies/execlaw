@@ -68,6 +68,29 @@
 // plugin documents.
 
 // ---------------------------------------------------------------------------
+// Lifecycle (2026-05-13)
+//
+// google-calendar is HTTP-only against Google's REST APIs. No
+// WS subscription, no sidecar, no background task. The only
+// state is the OAuth refresh + access tokens in
+// `state_oauth_tokens`, which factory reset's DB-wide truncate
+// wipes.
+//
+// Ideally on_disable would call Google's revocation endpoint
+// (`POST https://oauth2.googleapis.com/revoke?token=...`) so the
+// refresh token is invalidated on Google's side too — leaking
+// only the access tokens (1h TTL) instead of the long-lived
+// refresh token. That requires the host to surface an
+// `oauth_revoke` Rhai binding which doesn't exist yet (tracked
+// separately). For now we just log the lifecycle hook firing;
+// the local token rows are still wiped by the DB truncate.
+
+fn on_disable() {
+    log_info("google-calendar: on_disable — no remote token revocation (oauth_revoke binding not yet available); local tokens will be wiped with the DB");
+    ()
+}
+
+// ---------------------------------------------------------------------------
 // Public dispatch surface (the host calls this by name).
 
 fn tool_call(name, args, oauth) {

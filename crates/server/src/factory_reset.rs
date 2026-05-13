@@ -7,20 +7,39 @@
 //! so the very next request still has its default state without a
 //! migration re-run.
 //!
+//! Teardown ordering (2026-05-13 rework — was DB-wipe-only before):
+//!
+//!   1. **`fire_on_disable_for_all`** — every loaded script plugin gets a
+//!      last chance to run its own cleanup (revoke OAuth refresh tokens,
+//!      send a "going offline" notification on its transport, flush
+//!      in-memory state to vault). Best-effort; a misbehaving plugin
+//!      cannot block the reset.
+//!   2. **`SidecarSupervisor::stop_all`** — every running sidecar
+//!      container (signal-cli, wuzapi/whatsapp, …) is stopped via
+//!      docker. Without this step the wipe leaves orphaned containers
+//!      running under their pre-reset names/ports, which then collide
+//!      with the next install. This is the bug that prompted the
+//!      rework: WhatsApp's wuzapi container survived a factory reset
+//!      and refused to start fresh on the next install.
+//!   3. **DB wipe** — every non-system SQLite table is truncated in a
+//!      single transaction with `defer_foreign_keys = ON`. Re-seeds
+//!      `config_general` so the very next API request has its default
+//!      singleton row without waiting on a migration re-run.
+//!
 //! Scope:
 //!
-//!   * Wipes ONLY persistent SQLite state. In-memory caches (refresh
-//!     tokens, plugin host registry, runner / backend supervisors,
-//!     mcp host, voice sessions) are NOT touched — the operator should
-//!     restart the host service after a factory reset for full
-//!     hygiene. The SPA shows that recommendation alongside the
-//!     success state.
+//!   * Wipes ONLY persistent SQLite state + sidecar containers + the
+//!     plugin lifecycle hook. In-memory caches (refresh tokens, plugin
+//!     host registry, runner / backend supervisors, mcp host, voice
+//!     sessions) are NOT touched — the operator should restart the
+//!     host service after a factory reset for full hygiene. The SPA
+//!     shows that recommendation alongside the success state.
 //!
 //!   * Filesystem artifacts (research workspaces, plugin staging dir,
-//!     attachments) are NOT removed. A future iteration can cover
-//!     those, but a v1 wipe of the DB is enough for a "go back to a
-//!     clean slate" operator workflow — the next setup wizard will
-//!     happily reuse the same paths.
+//!     attachments, sidecar bind-mounts) are NOT removed. A future
+//!     iteration can cover those, but a v1 wipe of DB + containers is
+//!     enough for a "go back to a clean slate" operator workflow —
+//!     the next setup wizard will happily reuse the same paths.
 //!
 //! The endpoint is Controller-only and idempotent — calling it twice
 //! is harmless. The first call destroys the caller's session (the
@@ -59,6 +78,17 @@ pub struct FactoryResetResponse {
     /// post-reset toast and for tests asserting we covered every
     /// table the migration set declares.
     pub tables_wiped: usize,
+    /// Number of plugins whose `on_disable` lifecycle hook fired
+    /// without erroring. Excludes plugins that don't declare the
+    /// hook. Zero is fine — most plugins have nothing to tear down
+    /// beyond what the host's `shutdown()` backstop handles.
+    #[serde(default)]
+    pub plugins_torn_down: usize,
+    /// Number of sidecar containers stopped during the reset.
+    /// Operators with WhatsApp / Signal sidecars should see this
+    /// > 0; tool-only deployments see 0.
+    #[serde(default)]
+    pub sidecars_stopped: usize,
     /// Operator-facing reminder — the in-memory caches are stale
     /// until the host service restarts, so we surface this in the
     /// response body too.
@@ -91,6 +121,38 @@ pub async fn factory_reset_handler(
         });
     }
 
+    // Step 1 — fire `on_disable` for every loaded script plugin so
+    // each one gets a last chance to revoke OAuth tokens, send
+    // farewell notifications on its transport, flush state, etc.
+    // BEFORE the rug-pull. Best-effort: a panicking hook is logged
+    // but doesn't block the reset.
+    let plugins_torn_down = state.plugin_host.fire_on_disable_for_all().await;
+    tracing::info!(
+        target: "factory_reset",
+        plugins_torn_down,
+        "fired on_disable for loaded script plugins",
+    );
+
+    // Step 2 — stop every running sidecar container. Without this
+    // the wipe leaves orphans (the WhatsApp wuzapi container survived
+    // factory reset and refused to start fresh on the next install —
+    // that's the bug this rework is fixing). `stop_all` returns the
+    // count actually stopped; missing supervisor (tests, no-docker
+    // dev builds) is OK — just skip the step.
+    let sidecars_stopped = match &state.sidecar_supervisor {
+        Some(sup) => sup.stop_all().await,
+        None => 0,
+    };
+    tracing::info!(
+        target: "factory_reset",
+        sidecars_stopped,
+        "stopped sidecar containers",
+    );
+
+    // Step 3 — wipe the DB. Done last so the on_disable hooks above
+    // can still read vault rows / OAuth tokens / personality config
+    // while running their cleanup. Once this returns the row backing
+    // the caller's JWT is gone and the SPA must redirect to /login.
     let wiped = wipe_all_user_tables(&state.db).map_err(|e| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         code: "factory_reset_failed",
@@ -99,6 +161,8 @@ pub async fn factory_reset_handler(
 
     Ok(Json(FactoryResetResponse {
         tables_wiped: wiped,
+        plugins_torn_down,
+        sidecars_stopped,
         restart_recommended: true,
     }))
 }
@@ -286,6 +350,48 @@ mod tests {
             "post-reset login should not succeed; got {}",
             resp.status(),
         );
+    }
+
+    #[tokio::test]
+    async fn response_includes_teardown_counts_in_body() {
+        // Regression for the 2026-05-13 teardown rework: the
+        // response body must surface `plugins_torn_down` +
+        // `sidecars_stopped` so the SPA can show a meaningful
+        // "wiped X tables, stopped Y containers, fired Z plugin
+        // teardowns" toast instead of just "tables_wiped".
+        //
+        // In the test harness no plugins are installed and no
+        // sidecar supervisor is wired, so the counts are 0/0 —
+        // but the fields MUST exist in the JSON response (the
+        // SPA can't render them otherwise). This pins the contract.
+        let state = test_app_state();
+        let app = build_router(state.clone());
+        let tok = setup_controller_token(&app).await;
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/admin/factory-reset")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"confirm":"RESET"}).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v.get("plugins_torn_down").is_some(),
+            "response must include plugins_torn_down: {v}",
+        );
+        assert!(
+            v.get("sidecars_stopped").is_some(),
+            "response must include sidecars_stopped: {v}",
+        );
+        // No supervisor + no plugins in the test harness → both 0.
+        assert_eq!(v["plugins_torn_down"], 0);
+        assert_eq!(v["sidecars_stopped"], 0);
     }
 
     #[tokio::test]

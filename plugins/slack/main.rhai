@@ -55,6 +55,31 @@ fn on_enable() {
     ()
 }
 
+// =====================================================================
+// TEARDOWN (2026-05-13)
+//
+// Fired by the plugin host before disable/uninstall/factory-reset.
+// Slack's Socket Mode WS subscriptions are auto-cancelled by the
+// host's `plugin.shutdown()` backstop (it walks every live
+// `ws_subscribe*` handle and fires its cancel token). on_disable
+// here is the audit-log point — confirms the lifecycle hook
+// fired so an operator chasing "did factory reset run cleanly?"
+// has signal in the host log.
+//
+// No remote teardown is attempted: Slack doesn't surface a
+// "close this Socket Mode subscription" endpoint (the Socket Mode
+// URL is single-use and dies on its own once we drop the WS).
+// Workspace OAuth tokens stay in vault for the regular disable
+// path; factory reset wipes them via the DB-wide table truncate.
+// =====================================================================
+
+fn on_disable() {
+    let workspaces = load_workspaces();
+    let count = if type_of(workspaces) == "array" { workspaces.len() } else { 0 };
+    log_info("slack: on_disable — " + count + " workspace WS subscription(s) will be cancelled by host shutdown");
+    ()
+}
+
 fn connect_workspace(ws) {
     if ws.app_token == () || ws.app_token == "" {
         throw "missing app_token for team " + ws.team_id;

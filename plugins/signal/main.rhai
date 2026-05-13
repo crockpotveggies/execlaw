@@ -77,6 +77,34 @@ fn on_enable() {
 }
 
 // =====================================================================
+// TEARDOWN (2026-05-13)
+//
+// Fired by the plugin host before disable/uninstall/factory-reset.
+// signal-cli's WS subscription is auto-cancelled by the host's
+// `plugin.shutdown()` backstop (it walks every live
+// `ws_subscribe*` handle and fires its cancel token). The
+// signal-cli sidecar container is stopped by the
+// `SidecarSupervisor::stop_all` step that runs right after this
+// hook on the factory-reset path.
+//
+// on_disable here is the audit-log point — confirms the lifecycle
+// hook fired so an operator chasing "did factory reset stop
+// signal-cli cleanly?" has signal in the host log.
+//
+// No remote teardown is attempted: signal-cli's account state
+// lives in the bind-mounted `state://data` directory; factory
+// reset DELIBERATELY preserves that (operators don't want to
+// re-pair their phone every time they reset the agent state).
+// To wipe pairing state, manually delete the bind-mount and
+// re-pair after reset.
+// =====================================================================
+
+fn on_disable() {
+    log_info("signal: on_disable — inbound WS subscription will be cancelled by host shutdown; signal-cli container will be stopped by SidecarSupervisor");
+    ()
+}
+
+// =====================================================================
 // INBOUND
 // =====================================================================
 

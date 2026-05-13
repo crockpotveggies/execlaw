@@ -87,6 +87,22 @@ fn require_module(name) {
 }
 
 // ---------------------------------------------------------------------------
+// Lifecycle (2026-05-13)
+//
+// google-apps is HTTP-only against Gmail / Drive / Tasks REST
+// APIs. No WS, no sidecar, no background task. OAuth refresh +
+// access tokens in `state_oauth_tokens` are wiped by factory
+// reset's DB-wide truncate. on_disable logs the hook fire so an
+// operator can confirm the lifecycle ran; remote token
+// revocation against Google's `oauth2.googleapis.com/revoke` is
+// pending the `oauth_revoke` Rhai binding.
+
+fn on_disable() {
+    log_info("google-apps: on_disable — local tokens will be wiped with the DB");
+    ()
+}
+
+// ---------------------------------------------------------------------------
 // Public dispatch surface.
 
 fn tool_call(name, args, oauth) {

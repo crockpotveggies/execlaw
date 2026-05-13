@@ -116,6 +116,38 @@ fn on_enable() {
 }
 
 // =====================================================================
+// TEARDOWN (2026-05-13)
+//
+// Fired by the plugin host before disable/uninstall/factory-reset.
+// The Discord gateway WS subscription is auto-cancelled by the
+// host's `plugin.shutdown()` backstop (it walks every live
+// `ws_subscribe*` handle and fires its cancel token). Discord's
+// gateway tolerates an unannounced disconnect — the bot just
+// drops to "offline" in every guild after the heartbeat timeout
+// (~45s).
+//
+// We DO clear the cached `session` / `last_sequence` vault entries
+// here so that a re-enable starts a fresh gateway session instead
+// of resuming a now-dead one (Discord rejects resume attempts on
+// a session the server has forgotten, with `Invalid Session`).
+// For factory reset this is redundant — the DB wipe nukes the
+// vault rows anyway — but for a regular disable/re-enable cycle
+// it's the difference between "subscribes cleanly" and "drops a
+// confusing INVALID_SESSION on the first heartbeat".
+// =====================================================================
+
+fn on_disable() {
+    log_info("discord: on_disable — clearing session cache so a re-enable starts fresh");
+    try {
+        vault_put("last_sequence", "");
+        vault_put("session", "");
+    } catch (e) {
+        log_info("discord: vault clear skipped (" + e + ")");
+    }
+    ()
+}
+
+// =====================================================================
 // INBOUND
 // =====================================================================
 

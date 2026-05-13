@@ -19,6 +19,27 @@
 // PUSHOVER_ENDPOINT = "https://api.pushover.net/1/messages.json"
 
 // =====================================================================
+// LIFECYCLE (2026-05-13)
+//
+// pushover is HTTP-only: no WS subscription, no sidecar, no
+// background task. The only state is the user_key + app_token
+// pair in vault — both get wiped by factory reset's DB-wide
+// truncate. There's no Pushover-side resource to revoke (their
+// app_tokens are minted by the operator on the Pushover dashboard
+// and live there until deleted manually).
+//
+// on_disable here is the audit-log point — confirms the lifecycle
+// hook fired so an operator chasing "did factory reset run
+// cleanly?" has signal in the host log. No remote teardown
+// attempted; nothing to clean up.
+// =====================================================================
+
+fn on_disable() {
+    log_info("pushover: on_disable — no remote teardown required (no sidecar, no WS, no remote-side tokens)");
+    ()
+}
+
+// =====================================================================
 // AGENT TOOL DISPATCH
 // =====================================================================
 
