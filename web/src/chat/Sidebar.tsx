@@ -27,6 +27,7 @@ import {
     setThreads,
     useChatState,
 } from "./store";
+import { ChannelIcon } from "../components/ChannelIcons";
 import { ThreadRowMenu } from "./ThreadRowMenu";
 
 const CONTROLLER_THREAD_PREFIX = "controller-thread:";
@@ -788,13 +789,32 @@ function ThreadRow({
             ) : (
                 <span className="execlaw-thread-item__name">{label}</span>
             )}
-            {transportChannel && transportIcon && (
-                <i
-                    className={`bi bi-${transportIcon} execlaw-muted`}
+            {transportChannel && (
+                // 2026-05-12 — ChannelIcon owns the brand-vs-bi-*
+                // resolution chain (signal → official SignalLogo
+                // SVG; whatsapp/discord/slack/telegram → bi-<name>
+                // brand glyphs; manifest icon override → bi-<icon>;
+                // default fallback → bi-chat-quote). Pre-rework
+                // every transport row rendered `bi-${manifest.icon}`
+                // with no brand-SVG fallback, so a Signal thread
+                // showed bi-chat-quote (Signal's manifest icon)
+                // instead of the actual Signal logo. The component
+                // also supplies a default when the manifest omits
+                // the field, so future plugins don't need to
+                // declare an icon for the sidebar to look correct.
+                <span
+                    className="execlaw-muted"
                     title={`Bridged on ${transportChannel}`}
-                    aria-label={`Bridged on ${transportChannel}`}
-                    style={{ marginLeft: "0.25rem" }}
-                />
+                    style={{ marginLeft: "0.25rem", display: "inline-flex" }}
+                >
+                    <ChannelIcon
+                        channel={transportChannel}
+                        manifestIcon={transportIcon}
+                        monochrome
+                        decorative
+                        data-testid="thread-channel-icon"
+                    />
+                </span>
             )}
             {isEphemeral && (
                 <i

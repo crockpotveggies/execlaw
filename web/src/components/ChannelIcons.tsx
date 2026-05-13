@@ -1,9 +1,24 @@
-// Brand-correct per-transport icons. Bootstrap Icons doesn't ship
-// a Signal logo, so we inline the official Simple Icons SVG path
-// (https://simpleicons.org/icons/signal — CC0). Other transports
-// pull from `bi-*` since they're generic enough that a stylized
-// envelope / phone / mic communicates the channel without needing
-// the specific brand mark.
+// Brand-correct per-transport icons. Bootstrap Icons does ship
+// brand glyphs for WhatsApp / Discord / Slack / Telegram (the
+// official logos) but NOT for Signal Messenger — `bi-signal` is
+// the generic cellular-meter glyph, not the messaging app. We
+// inline the official Simple Icons SVG path for Signal
+// (https://simpleicons.org/icons/signal — CC0).
+//
+// Resolution order (highest precedence first):
+//   1. Known brand override — currently `signal` → SignalLogo.
+//      Brand marks that bi-* can't represent live here. The
+//      plugin manifest's `icon` field is IGNORED for channels in
+//      this list because the brand SVG is canonical (operator
+//      misconfiguring it shouldn't break the visual).
+//   2. Plugin manifest's `icon` (passed in as `manifestIcon`).
+//      A plugin author sets `icon = "discord"` and gets bi-discord;
+//      a custom transport plugin can use any `bi-*` glyph.
+//   3. Built-in channel → bi mapping for the standard channels
+//      execlaw ships natively (web/email/voice/sms etc.). Keeps
+//      the host honest when a manifest forgets the field.
+//   4. Default fallback — `bi-chat-quote`. Operator-friendly
+//      "this is a chat thread" generic.
 //
 // Sizing + alignment follow the existing `bi` icon convention
 // (1em font-size, vertical-align: -0.125em) so a `<ChannelIcon>`
@@ -11,10 +26,39 @@
 
 import type { CSSProperties } from "react";
 
-export type Channel = "web" | "signal" | "email" | "voice" | "sms";
+/** Channels with a dedicated brand SVG that overrides the bi-* path. */
+const BRAND_SVG_CHANNELS = new Set(["signal"]);
+
+/** Built-in channel → bi-* mapping for transports that don't ship
+ *  their own `icon = …` in the plugin manifest. Native channels
+ *  (web/voice etc.) are the primary inhabitants; well-known
+ *  brand-icon names also land here so a manifest typo doesn't
+ *  produce a broken icon. Manifest values still take precedence
+ *  via resolution-order step 2 above. */
+const KNOWN_CHANNEL_BI: Record<string, string> = {
+    web: "bi-globe",
+    email: "bi-envelope",
+    voice: "bi-mic",
+    sms: "bi-phone",
+    whatsapp: "bi-whatsapp",
+    discord: "bi-discord",
+    slack: "bi-slack",
+    telegram: "bi-telegram",
+    messenger: "bi-messenger",
+};
+
+const DEFAULT_FALLBACK_BI = "bi-chat-quote";
 
 interface Props {
-    channel: Channel;
+    /** Channel id — `"signal"`, `"whatsapp"`, `"discord"`, etc. The
+     *  same string used as the principal-group's transport_channel
+     *  and the plugin manifest's `[transport].transport_id`. */
+    channel: string;
+    /** Optional manifest-supplied icon name (sans `bi-` prefix).
+     *  Used as the second-precedence source after BRAND_SVG_CHANNELS.
+     *  Plugins set this via `[transport].icon` in plugin.toml; the
+     *  host marshals it through `ThreadSummary.transport_icon`. */
+    manifestIcon?: string | null;
     /** Override default size (1em). */
     size?: string | number;
     /** Suppress brand colour and use currentColor instead — useful
@@ -29,6 +73,7 @@ interface Props {
 
 export function ChannelIcon({
     channel,
+    manifestIcon = null,
     size = "1em",
     monochrome = false,
     decorative = false,
@@ -44,7 +89,8 @@ export function ChannelIcon({
         "data-channel": channel,
     };
 
-    if (channel === "signal") {
+    // Step 1: brand-SVG override.
+    if (BRAND_SVG_CHANNELS.has(channel)) {
         return (
             <SignalLogo
                 size={size}
@@ -56,16 +102,13 @@ export function ChannelIcon({
         );
     }
 
-    // The other channels use Bootstrap Icons via a span wrapper so
-    // size + style props compose cleanly with the SVG path above.
-    const biName = (
-        {
-            web: "bi-globe",
-            email: "bi-envelope",
-            voice: "bi-mic",
-            sms: "bi-phone",
-        } as const
-    )[channel];
+    // Steps 2-4: bi-* resolution chain.
+    const trimmed = (manifestIcon ?? "").trim();
+    const biName =
+        (trimmed.length > 0 ? `bi-${trimmed}` : undefined) ??
+        KNOWN_CHANNEL_BI[channel] ??
+        DEFAULT_FALLBACK_BI;
+
     const style: CSSProperties = { fontSize: size };
     return (
         <i

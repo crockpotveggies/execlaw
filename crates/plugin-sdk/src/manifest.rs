@@ -1165,10 +1165,16 @@ mod tests {
         assert_eq!(m.plugin.version, "0.4.7");
         // The transport icon must propagate from manifest → SDK so
         // the SPA's sidebar can render a Signal-shaped marker on
-        // bridged threads. Pin the literal so a typo in the manifest
-        // (or a renamed Bootstrap-icons class) gets caught here.
+        // bridged threads. The SPA's ChannelIcon has a brand-SVG
+        // override path for "signal" (Bootstrap's bi-signal is the
+        // cellular-meter glyph, not the messenger app), so the
+        // manifest's `icon = "signal"` is intentional: it indicates
+        // the channel + plays nicely with the host-side fallback
+        // chain. A future plugin author who copy-pastes the Signal
+        // manifest as a starting point for a new transport gets a
+        // brand-named icon string they can adjust in one place.
         let transport = m.transport.as_ref().expect("[transport] must be present");
-        assert_eq!(transport.icon.as_deref(), Some("chat-quote"));
+        assert_eq!(transport.icon.as_deref(), Some("signal"));
         // 6 agent-callable tools mirror the selfhosted-claw integration,
         // plus 3 host-internal convention tools (v0.4.5+: set_typing,
         // send_with_attachments, fetch_attachment) registered so the

@@ -36,11 +36,18 @@ rpc_health_path = "/v1/about"
 # Channel declaration. The icon flows into the SPA sidebar's
 # bridged-thread row marker; the host still uses
 # `HostTransportRegistry` for that lookup.
+#
+# `icon = "signal"` signals INTENT — the SPA's ChannelIcon
+# component has a brand-SVG override path for the "signal" channel
+# that renders the official Signal logo (Bootstrap's `bi-signal`
+# is the generic cellular-meter glyph, not the messenger app).
+# Pre-2026-05-12 this was set to `chat-quote`, which produced a
+# generic speech-bubble in the sidebar instead of the brand mark.
 [transport]
 transport_id = "signal"
 supports_attachments = true
 supports_groups = true
-icon = "chat-quote"
+icon = "signal"
 
 # Tools. host_implemented is gone — every tool dispatches into
 # main.rhai's `tool_call(name, args, oauth)`.
