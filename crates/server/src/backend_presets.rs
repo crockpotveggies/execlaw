@@ -217,8 +217,8 @@ pub fn all_presets() -> Vec<BackendPreset> {
             purpose: BackendPurpose::Standard.as_str().to_owned(),
             inference_backend: "service-vllm".into(),
             name: "vLLM (NVIDIA)".into(),
-            description: "OpenAI-compatible vLLM server on NVIDIA. Default model is the locked-decision Qwen3.5-27B-AWQ; smaller GPUs override via advanced. Tracks the `nightly` vLLM image because Qwen 3.5 architecture support hasn't reached a stable cut.".into(),
-            image: "vllm/vllm-openai:nightly".into(),
+            description: "OpenAI-compatible vLLM server on NVIDIA. Default model is the locked-decision Qwen3.5-27B-AWQ. Pinned to v0.20.2 (May 10 2026) — the latest stable release with explicit Qwen3.5 AWQ + qwen3_xml tool-parser support. The `nightly` tag was used pre-v0.20 when Qwen3.5 architecture support was unreleased; nightly is now actively risky (operator hit a hang in 0.20.2rc1.dev209 where vLLM accepted a request and never produced a single decode token).".into(),
+            image: "vllm/vllm-openai:v0.20.2".into(),
             container_port: 8000,
             vendor: PresetVendor::Nvidia.as_str().to_owned(),
             // Tool-call args are required: the runner ALWAYS sends
@@ -284,7 +284,7 @@ pub fn all_presets() -> Vec<BackendPreset> {
             inference_backend: "service-vllm".into(),
             name: "vLLM Small (NVIDIA)".into(),
             description: "Same vLLM image as Standard; pinned to the small Qwen variant for voice-mode fast-path latency.".into(),
-            image: "vllm/vllm-openai:nightly".into(),
+            image: "vllm/vllm-openai:v0.20.2".into(),
             container_port: 8000,
             vendor: PresetVendor::Nvidia.as_str().to_owned(),
             default_args: vec![
@@ -801,7 +801,7 @@ mod tests {
         let spec = materialise_spec(&preset, &HashMap::new());
         assert!(spec.get("runtime").is_none());
         assert!(spec.get("binary_hint").is_none());
-        assert_eq!(spec["image"], "vllm/vllm-openai:nightly");
+        assert_eq!(spec["image"], "vllm/vllm-openai:v0.20.2");
     }
 
     #[test]
