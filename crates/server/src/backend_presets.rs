@@ -196,8 +196,13 @@ fn vllm_model_field(default_model: &str, label: &str) -> PresetField {
         kind: "model".into(),
         label: label.into(),
         choices: vec![
-            // The locked-decisions Standard model + the locked-Small variant.
-            // Operators on smaller GPUs can override via advanced disclosure.
+            // Qwen3.6-27B-AWQ is the Standard default (2026-05-12
+            // — superseded the prior Qwen3.5 lock; 3.6 ships
+            // explicit agentic-coding improvements and uses the
+            // `qwen3_coder` tool-call parser in vLLM v0.19+).
+            // Qwen3.5 stays in the picker as a fallback for hosts
+            // that can't run 3.6 (e.g. older GPU drivers).
+            "QuantTrio/Qwen3.6-27B-AWQ".into(),
             "QuantTrio/Qwen3.5-27B-AWQ".into(),
             "Qwen/Qwen2.5-3B-Instruct-AWQ".into(),
         ],
@@ -217,7 +222,7 @@ pub fn all_presets() -> Vec<BackendPreset> {
             purpose: BackendPurpose::Standard.as_str().to_owned(),
             inference_backend: "service-vllm".into(),
             name: "vLLM (NVIDIA)".into(),
-            description: "OpenAI-compatible vLLM server on NVIDIA. Default model is the locked-decision Qwen3.5-27B-AWQ. Pinned to v0.20.2 (May 10 2026) — the latest stable release with explicit Qwen3.5 AWQ + qwen3_xml tool-parser support. The `nightly` tag was used pre-v0.20 when Qwen3.5 architecture support was unreleased; nightly is now actively risky (operator hit a hang in 0.20.2rc1.dev209 where vLLM accepted a request and never produced a single decode token).".into(),
+            description: "OpenAI-compatible vLLM server on NVIDIA. Default model is Qwen3.6-27B-AWQ. Pinned to v0.20.2 (May 10 2026) — Qwen3.6 needs vLLM >= 0.19.0 + the `qwen3_coder` tool-call parser per the vLLM Recipes guide. The `nightly` tag was previously used when Qwen3.5 was unreleased; nightly is now actively risky (operator hit a hang in 0.20.2rc1.dev209 where vLLM accepted a request and never produced a single decode token).".into(),
             image: "vllm/vllm-openai:v0.20.2".into(),
             container_port: 8000,
             vendor: PresetVendor::Nvidia.as_str().to_owned(),
@@ -229,10 +234,13 @@ pub fn all_presets() -> Vec<BackendPreset> {
             default_args: vec![
                 "--gpu-memory-utilization=0.9".into(),
                 "--enable-auto-tool-choice".into(),
-                // Qwen3.5 emits XML-shaped tool calls; hermes
-                // silently fails on them (sets finish_reason but
-                // extracts zero tool_calls).
-                "--tool-call-parser=qwen3_xml".into(),
+                // Qwen3.6 uses the `qwen3_coder` parser (per vLLM
+                // Recipes). Qwen3.5 uses `qwen3_xml`. The supervisor's
+                // `default_tool_parser_for_args` picks the right one
+                // automatically based on the model id; listing
+                // `qwen3_coder` explicitly here documents the
+                // expected parser for the default-model case.
+                "--tool-call-parser=qwen3_coder".into(),
                 // Caches the system-prompt + tool-catalogue prefix
                 // across rounds of a multi-step turn, dropping a
                 // 3-round web_search → web_fetch → synthesise from
@@ -240,7 +248,7 @@ pub fn all_presets() -> Vec<BackendPreset> {
                 // for execlaw's chat path.
                 "--enable-prefix-caching".into(),
             ],
-            fields: vec![vllm_model_field("QuantTrio/Qwen3.5-27B-AWQ", "Model")],
+            fields: vec![vllm_model_field("QuantTrio/Qwen3.6-27B-AWQ", "Model")],
         },
         BackendPreset {
             id: "ollama-apple".into(),
@@ -272,10 +280,10 @@ pub fn all_presets() -> Vec<BackendPreset> {
             vendor: PresetVendor::Cpu.as_str().to_owned(),
             default_args: vec![
                 "--enable-auto-tool-choice".into(),
-                "--tool-call-parser=qwen3_xml".into(),
+                "--tool-call-parser=qwen3_coder".into(),
                 "--enable-prefix-caching".into(),
             ],
-            fields: vec![vllm_model_field("QuantTrio/Qwen3.5-27B-AWQ", "Model")],
+            fields: vec![vllm_model_field("QuantTrio/Qwen3.6-27B-AWQ", "Model")],
         },
         // ---------- Small (fast-path LLM) ----------
         BackendPreset {

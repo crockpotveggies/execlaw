@@ -42,7 +42,7 @@ use execlaw_inference_api::{
 use rusqlite::{Connection, OpenFlags};
 use std::time::{Duration, Instant};
 
-const DEFAULT_MODEL: &str = "QuantTrio/Qwen3.5-27B-AWQ";
+const DEFAULT_MODEL: &str = "QuantTrio/Qwen3.6-27B-AWQ";
 const DEFAULT_URL: &str = "http://127.0.0.1:8101/v1";
 const DEFAULT_ITERS: usize = 3;
 const DEFAULT_MAX_TOKENS: u32 = 16;

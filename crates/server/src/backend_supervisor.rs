@@ -490,6 +490,13 @@ fn default_tool_parser_for_args(args: &[String]) -> &'static str {
         "llama3_json"
     } else if lower.contains("mistral") {
         "mistral"
+    } else if lower.contains("qwen3.6") || lower.contains("qwen3_6") {
+        // Qwen3.6 uses the `qwen3_coder` parser per vLLM Recipes
+        // (https://recipes.vllm.ai/Qwen/Qwen3.6-27B). Distinct from
+        // Qwen3 / Qwen3.5 which emit native XML — Qwen3.6's
+        // tool-call output shape is different enough that
+        // `qwen3_xml` silently extracts zero tool_calls.
+        "qwen3_coder"
     } else if lower.contains("qwen3") {
         // Qwen3 + Qwen3.5 emit XML-shaped tool calls; hermes
         // silently fails on them.
@@ -1532,6 +1539,32 @@ mod tests {
         // Prefix caching is mandatory for tool-loop performance —
         // see the doc comment on inject_required_vllm_tool_args.
         assert!(out.contains(&"--enable-prefix-caching".into()));
+    }
+
+    #[test]
+    fn inject_tool_args_picks_qwen3_coder_for_qwen3_6_models() {
+        // 2026-05-12 — Qwen3.6 uses the `qwen3_coder` tool-call
+        // parser per the vLLM Recipes guide. Distinct from Qwen3 /
+        // Qwen3.5 which use `qwen3_xml`. Test both common spellings
+        // of the model id ("3.6" and the underscore variant some
+        // mirror repos use).
+        for model in [
+            "--model=QuantTrio/Qwen3.6-27B-AWQ",
+            "--model=Qwen/Qwen3.6-27B",
+            "--model=some/Qwen3_6-MoE",
+        ] {
+            let original = vec![model.into()];
+            let mut out = original.clone();
+            inject_required_vllm_tool_args(
+                "vllm/vllm-openai:v0.20.2",
+                &original,
+                &mut out,
+            );
+            assert!(
+                out.contains(&"--tool-call-parser=qwen3_coder".into()),
+                "expected qwen3_coder parser for {model}, got: {out:?}"
+            );
+        }
     }
 
     #[test]
