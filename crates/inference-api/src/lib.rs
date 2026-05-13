@@ -291,20 +291,49 @@ impl InferenceClient {
         req: &ChatRequest,
     ) -> Result<ChatResponse, InferenceError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        // 2026-05-12 — HTTP-layer timing instrumented on the
+        // `agent::turn_timing` target so the operator can split
+        // "vLLM is slow" from "client is slow" without correlating
+        // by hand. `send_ms` = time to get response headers (which
+        // for non-streaming usually means vLLM accepted the request
+        // — generation hasn't started writing the body yet);
+        // `body_ms` = headers → final body byte (this is where
+        // generation latency lives for non-streaming, since vLLM
+        // buffers the entire response server-side).
+        let started_at = std::time::Instant::now();
         let mut r = self.http.post(&url).json(&ChatRequestNonStreaming(req));
         if let Some(key) = &self.api_key {
             r = r.bearer_auth(key);
         }
         let resp = r.send().await?;
+        let send_ms = started_at.elapsed().as_millis() as u64;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            tracing::debug!(
+                target: "agent::turn_timing",
+                url = %url,
+                send_ms,
+                http_status = status.as_u16(),
+                body_chars = body.chars().count(),
+                "chat_completions non-streaming returned non-success status"
+            );
             return Err(InferenceError::BadStatus {
                 status: status.as_u16(),
                 body,
             });
         }
+        let body_started_at = std::time::Instant::now();
         let text = resp.text().await?;
+        let body_ms = body_started_at.elapsed().as_millis() as u64;
+        tracing::debug!(
+            target: "agent::turn_timing",
+            url = %url,
+            send_ms,
+            body_ms,
+            response_chars = text.chars().count(),
+            "chat_completions non-streaming HTTP round-trip"
+        );
         serde_json::from_str::<ChatResponse>(&text).map_err(|e| {
             InferenceError::Decode(format!(
                 "bad /v1/chat/completions response: {e} — body: {text}"
