@@ -1,7 +1,7 @@
 [plugin]
 id = "google-places"
 name = "Google Places"
-version = "0.1.0"
+version = "0.1.1"
 description = "Google Places (New) API tools. Exposes text search, nearby search, and place details so the agent can find restaurants, businesses, points of interest, and addresses. API-key only — no OAuth. The plugin calls https://places.googleapis.com via the host's `http_post` / `http_get` bindings using `X-Goog-Api-Key` header auth."
 author = "execlaw"
 license = "Apache-2.0"

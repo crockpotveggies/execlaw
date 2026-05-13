@@ -1,7 +1,7 @@
 [plugin]
 id = "discord"
 name = "Discord"
-version = "0.1.0"
+version = "0.1.1"
 description = "Discord transport via the official Bot Gateway WebSocket. Sidecar-free — the plugin maintains the long-lived gateway connection itself, sends application-layer heartbeats via ws_set_keepalive, and posts outbound via the REST API. Single bot token spans every guild the bot is invited to; multi-guild is automatic from GUILD_CREATE dispatches. v0.1 does NOT implement slash commands / interactions (deferred to v0.2 via [[webhook_routes]] + Ed25519 verification)."
 author = "execlaw"
 license = "Apache-2.0"

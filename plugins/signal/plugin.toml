@@ -1,7 +1,7 @@
 [plugin]
 id = "signal"
 name = "Signal"
-version = "0.4.7"
+version = "0.4.9"
 description = "Signal Messenger transport — fully script-tier (Phase B). All host-side signal_*.rs code retired; this plugin's main.rhai owns inbound consumer, outbound, group ops, and admin pairing."
 author = "execlaw"
 license = "Apache-2.0"

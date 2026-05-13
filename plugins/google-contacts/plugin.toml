@@ -1,7 +1,7 @@
 [plugin]
 id = "google-contacts"
 name = "Google Contacts"
-version = "0.1.0"
+version = "0.1.1"
 description = "Google People-API-backed identity provider + contacts.list tool. Resolves email and phone identifiers against the operator's connected Google account so saved contacts auto-trust as Contact-class principals."
 author = "execlaw"
 license = "Apache-2.0"
