@@ -42,7 +42,12 @@ pub struct ResearchSupervisor {
     pub db: Database,
     pub inference: Arc<InferenceResolver>,
     pub workspace: ResearchWorkspace,
-    pub model: String,
+    // 2026-05-13 — dropped `pub model: String`. The resolver now
+    // returns `ResolvedInference { model_id, .. }` from the same
+    // DB row that supplied the endpoint, so caching a model string
+    // on the supervisor was a second source of truth that drifted
+    // from the live backend row. Per-job, `spawn_runner_for` reads
+    // `r.model_id` straight off `inference_resolver.resolve(...)`.
     /// EventBus the runner publishes Card.{Opened,Progressed,Closed}
     /// onto so the SPA's chat-pane sees lifecycle ticks live without
     /// waiting on a re-fetch. C3 ran without one (cards committed to
@@ -89,14 +94,12 @@ impl ResearchSupervisor {
         db: Database,
         inference: Arc<InferenceResolver>,
         workspace: ResearchWorkspace,
-        model: String,
         events: EventBus,
     ) -> Self {
         Self {
             db,
             inference,
             workspace,
-            model,
             events,
             cancel_tokens: Arc::new(DashMap::new()),
             wake: Arc::new(Notify::new()),
@@ -271,7 +274,6 @@ impl ResearchSupervisor {
     fn spawn_runner_for(&self, job_id: ResearchJobId) {
         let db = self.db.clone();
         let workspace = self.workspace.clone();
-        let model = self.model.clone();
         let inference_resolver = self.inference.clone();
         let events = self.events.clone();
         let host_transports = self.host_transports.clone();
@@ -286,9 +288,18 @@ impl ResearchSupervisor {
         let job_id_key = job_id.as_str().to_owned();
         tokens.insert(job_id_key.clone(), cancel.clone());
         tokio::spawn(async move {
+            // 2026-05-13 — pair the client + model id from the same
+            // resolver call so they can't drift. Pre-rework the
+            // caller passed `model` separately while the client
+            // came from a different read — exactly the dual-source-
+            // of-truth pattern that caused vLLM 404s on the chat
+            // path. `ResolvedInference` always carries a non-empty
+            // `model_id` (the resolver falls back to
+            // `DEFAULT_FALLBACK_MODEL` if the row is missing one),
+            // so no second-tier fallback is needed here.
             let inference = inference_resolver
                 .resolve(&db, BackendPurpose::Standard)
-                .map(|c| (c, model));
+                .map(|r| (r.client.clone(), r.model_id.clone()));
             let ctx = JobRunCtx {
                 db,
                 job_id: job_id.clone(),
@@ -414,7 +425,6 @@ mod tests {
             db.clone(),
             Arc::new(InferenceResolver::new(None)),
             workspace,
-            "test-model".into(),
             bus,
         );
         let n = sup.recover_interrupted_jobs().await.unwrap();
@@ -477,7 +487,6 @@ mod tests {
             db.clone(),
             resolver,
             workspace,
-            "test-model".into(),
             EventBus::new(),
         );
         sup.tick_once().await.unwrap();
@@ -525,7 +534,6 @@ mod tests {
             db.clone(),
             resolver,
             workspace,
-            "test-model".into(),
             EventBus::new(),
         );
         sup.tick_once().await.unwrap();
@@ -561,7 +569,6 @@ mod tests {
             db.clone(),
             resolver,
             workspace,
-            "test-model".into(),
             EventBus::new(),
         );
         sup.tick_once().await.unwrap();
@@ -604,7 +611,6 @@ mod tests {
             db.clone(),
             resolver,
             workspace,
-            "test-model".into(),
             EventBus::new(),
         );
         // Pre-claim check: registry is empty.

@@ -1687,7 +1687,6 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         db.clone(),
         inference.clone(),
         research_workspace.clone(),
-        config.model_id.clone(),
         events.clone(),
     )
     .with_host_transports(Some(host_transports.clone()))
@@ -1698,12 +1697,16 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     // contended; the worker gates internally on
     // `config_skills.auto_capture_enabled` (default OFF) so an
     // operator who hasn't opted in never burns inference cycles.
+    //
+    // 2026-05-13 — no model_id parameter: the worker's
+    // `InferenceSummarizer` reads `resolved.model_id` from the
+    // same DB row that supplied the endpoint, so caching a model
+    // string at construction time is no longer a drift source.
     let (skill_capture_sink, _skill_capture_handle) =
         execlaw_server::skill_capture_runtime::spawn_capture_worker(
             db.clone(),
             skill_store.clone(),
             inference.clone(),
-            execlaw_inference_api::ModelId(config.model_id.clone()),
         );
     // Phase D.3 — reuse-update worker. Same shape; gates on
     // `config_skills.reuse_update_enabled` (default OFF).
@@ -1712,7 +1715,6 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
             db.clone(),
             skill_store.clone(),
             inference.clone(),
-            execlaw_inference_api::ModelId(config.model_id.clone()),
         );
 
     let state = execlaw_server::AppState {
@@ -1978,7 +1980,6 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         let prewarm_launcher = launcher.clone();
         let prewarm_db = db.clone();
         let prewarm_inference = state.inference.clone();
-        let prewarm_model = state.config.model_id.clone();
         tokio::spawn(async move {
             // Wait briefly so the WS endpoint is up before the
             // runner phones home. (Axum's `serve` task hasn't
@@ -1989,7 +1990,7 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                 &prewarm_db,
                 execlaw_core::backends::BackendPurpose::Standard,
             ) {
-                Some(c) => c.base_url.clone(),
+                Some(c) => c.endpoint.clone(),
                 None => {
                     tracing::info!(
                         "prewarm skipped: no inference backend configured (controller runner will spawn lazily on first chat)"
@@ -2026,7 +2027,6 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
             // group `(web, {controller})`. Mirror that exactly so
             // the prewarmed group_id matches the one the chat
             // path will look up on the first send.
-            let _ = prewarm_model; // reserved for spec.env
             match prewarm_sup
                 .prewarm_controller(
                     prewarm_launcher.as_ref(),

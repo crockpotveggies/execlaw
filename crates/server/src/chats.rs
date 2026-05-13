@@ -647,7 +647,7 @@ fn run_stub_turn(
 /// path for future tool integrations).
 async fn run_real_turn(
     state: &AppState,
-    inference: Arc<execlaw_inference_api::InferenceClient>,
+    resolved: crate::inference_resolver::ResolvedInference,
     cid: &ConversationId,
     user_text: &str,
     sender_principal_id: Option<String>,
@@ -658,6 +658,16 @@ async fn run_real_turn(
     caller_timezone: Option<&str>,
     group_context: Option<GroupTurnContext>,
 ) -> Result<(i64, String, i64), String> {
+    // 2026-05-13 — `resolved` carries the InferenceClient + the
+    // model_id paired from the SAME `config_backends` row read.
+    // Pre-rework these came from two sources (the inference URL
+    // from the DB row, the model id from `state.config.model_id`
+    // baked in at boot) and drifted out of sync as soon as an
+    // operator swapped models without restarting; the chat path
+    // sent model=X while vLLM was loaded with model=Y and 404'd.
+    // One source of truth, one read, both fields atomic.
+    let inference = resolved.client.clone();
+    let resolved_model_id = resolved.model_id.clone();
     use execlaw_inference_api::{ChatMessage, ChatRequest};
     use execlaw_policy::spotlighting::Spotlight;
     use futures::StreamExt;
@@ -767,7 +777,7 @@ async fn run_real_turn(
     // None). This preserves the existing reasoning-enabled toggle
     // while still routing through the per-family adapter.
     let base_req = ChatRequest {
-        model: ModelId(state.config.model_id.clone()),
+        model: ModelId(resolved_model_id.clone()),
         messages,
         tools: None,
         stream: true,
@@ -784,7 +794,7 @@ async fn run_real_turn(
         })),
     };
     let adapter = execlaw_model_adapter::adapter_for(execlaw_model_adapter::ModelFamily::detect(
-        &state.config.model_id,
+        &resolved_model_id,
     ));
     let req = adapter.prepare_request(base_req, execlaw_model_adapter::OutputHint::Conversation);
     let mut stream = inference
@@ -803,7 +813,7 @@ async fn run_real_turn(
     // well-formed and the operator sees their partial reply.
     let mut assembled = String::new();
     let mut finish_reason: Option<String> = None;
-    let mut model_id = state.config.model_id.clone();
+    let mut model_id = resolved_model_id.clone();
     let mut was_cancelled = false;
     // 2026-04-28 — defensive `<think>...</think>` stripper. Even with
     // `enable_thinking=false` in the chat template, the model can
@@ -1118,11 +1128,18 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
 
     // Step 3 — build TurnRequest.
     let turn_id = supervisor.mint_turn_id();
-    let inference_client_for_subagents = state
+    // Resolve client + model id from the SAME backend-row read so
+    // they can't drift (cf. the 2026-05-13 regression where the chat
+    // path sent `model=Qwen3.5` to a vLLM container loaded with
+    // `model=Qwen3.6`, because the URL came from the DB and the
+    // model id came from a stale `state.config.model_id` constant).
+    let resolved = state
         .inference
         .resolve(&state.db, BackendPurpose::Standard)
         .ok_or_else(|| "no inference backend configured".to_owned())?;
-    let inference_url = inference_client_for_subagents.base_url.clone();
+    let inference_client_for_subagents = resolved.client.clone();
+    let resolved_model_id = resolved.model_id.clone();
+    let inference_url = resolved.endpoint.clone();
     // The supervisor resolved the URL from the SERVER's network
     // namespace (likely `http://127.0.0.1:8101/v1` for a local
     // vLLM). Inside a runner container, `127.0.0.1` resolves to
@@ -1202,7 +1219,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         history: hist_messages,
         tool_catalog: tool_decls,
         inference_url,
-        model: state.config.model_id.clone(),
+        model: resolved_model_id.clone(),
         // Delta #6 — explicit 0.3 (was None → vLLM default 1.0).
         // Critical on the runner path because it carries multi-
         // round tool-calling: at temp 1.0 Qwen3.5-AWQ frequently
@@ -1244,7 +1261,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         // child LLM calls against the parent's backend.
         .with_inference(
             inference_client_for_subagents.clone(),
-            state.config.model_id.clone(),
+            resolved_model_id.clone(),
         )
         .with_events(state.events.clone())
         .with_research_supervisor_wake_opt(
@@ -1491,7 +1508,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
 /// signing apply identically.
 async fn run_tool_capable_turn(
     state: &AppState,
-    inference: Arc<execlaw_inference_api::InferenceClient>,
+    resolved: crate::inference_resolver::ResolvedInference,
     cid: &ConversationId,
     user_text: &str,
     sender_principal_id: Option<String>,
@@ -1503,6 +1520,11 @@ async fn run_tool_capable_turn(
 ) -> Result<(i64, String, i64), String> {
     use execlaw_inference_api::ToolDeclaration;
     use execlaw_runner_local::turn::{TurnConfig, TurnExecutor};
+    // 2026-05-13 — see the rationale comment on `run_real_turn`:
+    // client + model_id are paired from one row read so they
+    // can't drift.
+    let inference = resolved.client.clone();
+    let resolved_model_id = resolved.model_id.clone();
 
     // 2026-05-12 — turn-timing instrumentation on the
     // `agent::turn_timing` target (same as inner TurnExecutor).
@@ -1604,7 +1626,7 @@ async fn run_tool_capable_turn(
         // 2026-04-29 — wire the inference client + model so
         // `delegate_task` and any future SubagentSpawn-capability
         // tools have a live child-LLM path for this turn.
-        .with_inference(inference.clone(), state.config.model_id.clone())
+        .with_inference(inference.clone(), resolved_model_id.clone())
         .with_events(state.events.clone())
         .with_research_supervisor_wake_opt(
             state.research_supervisor.as_ref().map(|s| s.wake.clone()),
@@ -1675,7 +1697,7 @@ async fn run_tool_capable_turn(
         "system prompt assembled"
     );
     let cfg = TurnConfig {
-        model: ModelId(state.config.model_id.clone()),
+        model: ModelId(resolved_model_id.clone()),
         system_prompt: composed_system_prompt,
         // Delta #6 — explicit 0.3 (was None → vLLM default 1.0).
         // Same rationale as the runner-tier path above.
@@ -4095,9 +4117,11 @@ async fn run_incognito_send(
     use execlaw_inference_api::{ChatMessage, ChatRequest, Role};
     use futures::StreamExt;
 
-    let Some(inference) = state.inference.resolve(&state.db, BackendPurpose::Standard) else {
+    let Some(resolved) = state.inference.resolve(&state.db, BackendPurpose::Standard) else {
         return err_500("no inference backend configured for incognito chat");
     };
+    let inference = resolved.client.clone();
+    let resolved_model_id = resolved.model_id.clone();
 
     // Compose: static system prompt (no personality merge) +
     // prior client-supplied history + new user text.
@@ -4152,7 +4176,7 @@ async fn run_incognito_send(
     });
 
     let base_req = ChatRequest {
-        model: ModelId(state.config.model_id.clone()),
+        model: ModelId(resolved_model_id.clone()),
         messages,
         tools: None,
         stream: true,
@@ -4165,7 +4189,7 @@ async fn run_incognito_send(
         })),
     };
     let adapter = execlaw_model_adapter::adapter_for(execlaw_model_adapter::ModelFamily::detect(
-        &state.config.model_id,
+        &resolved_model_id,
     ));
     let chat_req =
         adapter.prepare_request(base_req, execlaw_model_adapter::OutputHint::Conversation);
@@ -4355,8 +4379,8 @@ pub async fn generate_title(
             .into_response();
     }
 
-    let inference = match state.inference.resolve(&state.db, BackendPurpose::Standard) {
-        Some(c) => c,
+    let resolved = match state.inference.resolve(&state.db, BackendPurpose::Standard) {
+        Some(r) => r,
         None => {
             return (
                 StatusCode::OK,
@@ -4369,6 +4393,8 @@ pub async fn generate_title(
                 .into_response();
         }
     };
+    let inference = resolved.client.clone();
+    let resolved_model_id = resolved.model_id.clone();
 
     let system = "You produce very short titles for chat conversations. \
                   Reply with ONLY the title — 3 to 5 words, no quotes, no \
@@ -4381,7 +4407,7 @@ pub async fn generate_title(
         format!("First message: {user_text}\n\nAssistant reply: {assistant_text}\n\nTitle:")
     };
     let req = ChatRequest {
-        model: ModelId(state.config.model_id.clone()),
+        model: ModelId(resolved_model_id.clone()),
         messages: vec![ChatMessage::system(system), ChatMessage::user(user_prompt)],
         tools: None,
         stream: false,
@@ -4393,7 +4419,7 @@ pub async fn generate_title(
         chat_template_kwargs: None,
     };
     let adapter = execlaw_model_adapter::adapter_for(execlaw_model_adapter::ModelFamily::detect(
-        &state.config.model_id,
+        &resolved_model_id,
     ));
     let adapted = match adapter
         .chat(&inference, req, execlaw_model_adapter::OutputHint::Plain)

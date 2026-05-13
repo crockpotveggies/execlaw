@@ -23,8 +23,19 @@ pub struct ServerConfig {
     /// string; later phases make this a per-conversation + per-role
     /// composition.
     pub system_prompt: String,
-    /// Model id passed in `/v1/chat/completions` requests.
-    pub model_id: String,
+    // 2026-05-13 — removed `pub model_id: String`. Pre-rework, every
+    // chat turn read this constant and shoved it into the
+    // `/v1/chat/completions` `model` field, while the supervisor
+    // launched vLLM with the model arg from
+    // `config_backends.model_spec_json.args["--model"]`. The two
+    // fields drifted whenever an operator swapped backends without
+    // restarting (or, far worse, when the SPA's hardcoded SPA-side
+    // `MODEL_CATALOG` default overwrote the DB row on a no-op save) —
+    // producing `The model X does not exist` 404s from vLLM. The
+    // resolver now returns `ResolvedInference { client, model_id, .. }`
+    // from the same DB row, so the two fields are atomic by
+    // construction. See `inference_resolver::DEFAULT_FALLBACK_MODEL`
+    // for the last-resort placeholder when no row supplies a model.
     /// Hard cap on tool-call rounds per turn (runaway-loop guard).
     pub max_tool_rounds: u32,
 }
@@ -63,7 +74,6 @@ impl Default for ServerConfig {
                 "8. Never call a tool just to fill space. If there's genuinely nothing useful to do, finish the turn.\n",
                 "9. When you're done answering, stop. Do not ask follow-up questions unless they are required to act.",
             ).to_owned(),
-            model_id: "QuantTrio/Qwen3.5-27B-AWQ".to_owned(),
             // 2026-05 — bumped 3 → 8 alongside the agent-prompting
             // audit's #5. The old cap was set when plugin tool
             // descriptions were placeholders ("Plugin tool 'X'

@@ -24,44 +24,41 @@ use std::sync::Arc;
 /// Production summarizer. Holds an `InferenceResolver` reference and
 /// a per-call `Database` borrow so it can pick the right backend at
 /// each turn (operator may have swapped the Small backend at runtime).
+///
+/// 2026-05-13 — dropped the boot-cached `model_id` field. Per-call the
+/// resolver now returns `ResolvedInference { client, model_id, .. }`
+/// from the same DB row read, so caching a model string at
+/// construction was just another drift source. The summarizer now
+/// uses `resolved.model_id` directly — same single-source-of-truth
+/// fix applied to the chat path.
 pub struct InferenceSummarizer {
     inference: Arc<crate::inference_resolver::InferenceResolver>,
     db: Database,
-    /// Model id to send in the request. The Small backend's vLLM
-    /// instance still requires a `model` field on the request; we
-    /// pass through a stable string and let the backend echo it.
-    /// Defaults to the standard model id; can be overridden per
-    /// deployment when the operator runs a smaller model on the
-    /// Small backend.
-    model_id: ModelId,
 }
 
 impl InferenceSummarizer {
     pub fn new(
         inference: Arc<crate::inference_resolver::InferenceResolver>,
         db: Database,
-        model_id: ModelId,
     ) -> Self {
-        Self {
-            inference,
-            db,
-            model_id,
-        }
+        Self { inference, db }
     }
 }
 
 #[async_trait]
 impl SkillSummarizer for InferenceSummarizer {
     async fn summarize(&self, prompt: SummarizerPrompt) -> Result<SummarizerOutput, String> {
-        let client = self
+        let resolved = self
             .inference
             .resolve(&self.db, BackendPurpose::Small)
             .or_else(|| self.inference.resolve(&self.db, BackendPurpose::Standard))
             .ok_or_else(|| "no inference backend available for summarization".to_string())?;
+        let client = resolved.client.clone();
+        let model_id = ModelId(resolved.model_id.clone());
         let max_tokens = prompt.max_tokens;
         let (system, user) = build_prompt(&prompt);
         let req = ChatRequest {
-            model: self.model_id.clone(),
+            model: model_id.clone(),
             messages: vec![ChatMessage::system(system), ChatMessage::user(user)],
             tools: None,
             stream: false,
@@ -71,7 +68,7 @@ impl SkillSummarizer for InferenceSummarizer {
             chat_template_kwargs: None,
         };
         let adapter = execlaw_model_adapter::adapter_for(
-            execlaw_model_adapter::ModelFamily::detect(self.model_id.as_str()),
+            execlaw_model_adapter::ModelFamily::detect(model_id.as_str()),
         );
         // Summarizer reply is the structured `NAME: ... ---BODY---`
         // protocol parsed by `parse_response`. Use Plain hint so
@@ -94,10 +91,9 @@ pub fn spawn_capture_worker(
     db: Database,
     skill_store: Arc<SkillStore>,
     inference: Arc<crate::inference_resolver::InferenceResolver>,
-    model_id: ModelId,
 ) -> (AutoCaptureSink, tokio::task::JoinHandle<()>) {
     let summarizer: Arc<dyn SkillSummarizer> =
-        Arc::new(InferenceSummarizer::new(inference, db.clone(), model_id));
+        Arc::new(InferenceSummarizer::new(inference, db.clone()));
     let worker = Arc::new(AutoCaptureWorker::new(db, skill_store, summarizer));
     worker.spawn()
 }
@@ -111,10 +107,9 @@ pub fn spawn_reuse_update_worker(
     db: Database,
     skill_store: Arc<SkillStore>,
     inference: Arc<crate::inference_resolver::InferenceResolver>,
-    model_id: ModelId,
 ) -> (execlaw_skills::ReuseUpdateSink, tokio::task::JoinHandle<()>) {
     let summarizer: Arc<dyn SkillSummarizer> =
-        Arc::new(InferenceSummarizer::new(inference, db.clone(), model_id));
+        Arc::new(InferenceSummarizer::new(inference, db.clone()));
     let worker = Arc::new(execlaw_skills::ReuseUpdateWorker::new(
         db,
         skill_store,

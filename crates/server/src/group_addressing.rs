@@ -364,12 +364,12 @@ async fn classify_via_llm(
     // Small isn't wired — better to spend the standard model's
     // latency budget here than to silently dispatch every group
     // message.
-    let inference = state
+    let resolved = state
         .inference
         .resolve(&state.db, BackendPurpose::Small)
         .or_else(|| state.inference.resolve(&state.db, BackendPurpose::Standard));
-    let inference = match inference {
-        Some(c) => c,
+    let resolved = match resolved {
+        Some(r) => r,
         None => {
             tracing::debug!(
                 target: "group_addressing",
@@ -378,6 +378,8 @@ async fn classify_via_llm(
             return DispatchDecision::Dispatch(AddressedReason::FallOpenClassifierUnavailable);
         }
     };
+    let inference = resolved.client.clone();
+    let resolved_model_id = resolved.model_id.clone();
 
     let role_phrase = if agent_role.trim().is_empty() {
         "assistant"
@@ -407,7 +409,7 @@ async fn classify_via_llm(
     );
 
     let req = ChatRequest {
-        model: ModelId(state.config.model_id.clone()),
+        model: ModelId(resolved_model_id.clone()),
         messages: vec![
             ChatMessage::system(system_prompt),
             ChatMessage::user(format!(
