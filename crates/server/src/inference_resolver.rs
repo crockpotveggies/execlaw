@@ -52,7 +52,7 @@ pub const DEFAULT_FALLBACK_MODEL: &str = "QuantTrio/Qwen3.6-27B-AWQ";
 
 /// Resolved inference target for one turn.
 ///
-/// `client` and `model_id` come from the same DB row read, so they
+/// All four fields come from the same DB row read, so they
 /// can't drift. Always carries a non-empty `model_id` (falls back
 /// to [`DEFAULT_FALLBACK_MODEL`] when the row has no `--model=…`).
 #[derive(Debug, Clone)]
@@ -60,6 +60,16 @@ pub struct ResolvedInference {
     pub client: Arc<InferenceClient>,
     pub model_id: String,
     pub endpoint: String,
+    /// Whether the operator toggled "enable thinking" / reasoning
+    /// on this backend row. Pre-2026-05-13 every chat call site did
+    /// its OWN `BackendStore::get(...).ok().flatten().map(|r|
+    /// r.reasoning_enabled).unwrap_or(false)` — a redundant second
+    /// DB read that silently masked errors (`.ok()`) AND opened a
+    /// drift window where the resolver got the row from `t0` and
+    /// reasoning was read at `t1` after a config save. Now carried
+    /// on the resolved struct so it's bound to the same row as the
+    /// endpoint + model id.
+    pub reasoning_enabled: bool,
     /// `"db"` when the resolution came from a backend row;
     /// `"bootstrap"` when it came from the boot-time URL.
     /// Surfaced for the turn-timing trace so the operator can
@@ -144,6 +154,7 @@ impl InferenceResolver {
                     .clone()
                     .filter(|s| !s.trim().is_empty());
                 let row_model = extract_model_arg(&r.model_spec_json);
+                let reasoning_enabled = r.reasoning_enabled;
                 match endpoint {
                     Some(url) => Some(ResolvedInference {
                         client: Arc::new(InferenceClient::new(url.clone())),
@@ -151,6 +162,7 @@ impl InferenceResolver {
                             .or_else(|| self.bootstrap_model.clone())
                             .unwrap_or_else(|| DEFAULT_FALLBACK_MODEL.to_owned()),
                         endpoint: url,
+                        reasoning_enabled,
                         source: "db",
                     }),
                     None => {
@@ -181,6 +193,10 @@ impl InferenceResolver {
                 .bootstrap_model
                 .clone()
                 .unwrap_or_else(|| DEFAULT_FALLBACK_MODEL.to_owned()),
+            // Bootstrap has no row to read this from; default OFF.
+            // Operators who want reasoning on must configure the
+            // Standard backend row via Settings → Backends.
+            reasoning_enabled: false,
             source: "bootstrap",
         })
     }
@@ -405,6 +421,67 @@ mod tests {
             })),
             None
         );
+    }
+
+    #[test]
+    fn reasoning_enabled_round_trips_from_row() {
+        // Pre-2026-05-13 four separate chat sites each re-read this
+        // bool via `.ok().flatten().map(|r| r.reasoning_enabled)`,
+        // opening a drift window (resolver row at t0, reasoning row
+        // at t1) AND silently masking BLOB-decode errors. The field
+        // now rides on `ResolvedInference` from the same row read.
+        let db = fresh_db();
+        let store = BackendStore::new(&db);
+        store
+            .upsert(
+                &BackendUpsert {
+                    purpose: BackendPurpose::Standard,
+                    inference_backend: "service-vllm".into(),
+                    model_spec_json: serde_json::json!({ "args": ["--model=Q"] }),
+                    gpu_id: None,
+                    endpoint: Some("http://127.0.0.1:8101/v1".into()),
+                    notes: None,
+                    reasoning_enabled: true,
+                    mode: BackendMode::External,
+                },
+                100,
+            )
+            .unwrap();
+        let resolver = InferenceResolver::new(None);
+        let got = resolver.resolve(&db, BackendPurpose::Standard).unwrap();
+        assert!(got.reasoning_enabled, "row reasoning_enabled = true must reach the resolved struct");
+
+        // And toggle off: same flow, false comes through.
+        store
+            .upsert(
+                &BackendUpsert {
+                    purpose: BackendPurpose::Standard,
+                    inference_backend: "service-vllm".into(),
+                    model_spec_json: serde_json::json!({ "args": ["--model=Q"] }),
+                    gpu_id: None,
+                    endpoint: Some("http://127.0.0.1:8101/v1".into()),
+                    notes: None,
+                    reasoning_enabled: false,
+                    mode: BackendMode::External,
+                },
+                101,
+            )
+            .unwrap();
+        let got = resolver.resolve(&db, BackendPurpose::Standard).unwrap();
+        assert!(!got.reasoning_enabled, "row reasoning_enabled = false must reach the resolved struct");
+    }
+
+    #[test]
+    fn bootstrap_resolution_defaults_reasoning_off() {
+        // The bootstrap path has no row to read; reasoning defaults
+        // OFF. Operators who want it on must configure the Standard
+        // backend row.
+        let db = fresh_db();
+        let bootstrap = Arc::new(InferenceClient::new("http://boot:8000/v1"));
+        let resolver = InferenceResolver::new(Some(bootstrap));
+        let got = resolver.resolve(&db, BackendPurpose::Standard).unwrap();
+        assert_eq!(got.source, "bootstrap");
+        assert!(!got.reasoning_enabled);
     }
 
     #[test]

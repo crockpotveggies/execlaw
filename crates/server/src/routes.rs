@@ -331,17 +331,54 @@ pub async fn ping(State(state): State<AppState>) -> impl IntoResponse {
     //                resume at the docker step.
     //   * `pong`   — fully provisioned (or wizard dismissed). SPA
     //                → /chat / /login as before.
+    // 2026-05-13 — DB read errors used to be `.ok().flatten()`-
+    // swallowed into "no backend configured", which forced the
+    // operator back into the first-run wizard on every transient
+    // lock-contention or BLOB-decode error. We now log the failure
+    // at WARN and fall CLOSED (treat as "pong" so the operator can
+    // reach the admin UI to fix the underlying row) rather than
+    // re-triggering an already-completed setup flow.
     let body = match UserStore::new(&state.db).any_exist() {
-        Ok(false) | Err(_) => "setup",
+        Ok(false) => "setup",
+        Err(e) => {
+            tracing::warn!(
+                target: "routes::ping",
+                error = %e,
+                "users.any_exist failed — falling open to 'setup' so the operator can recover",
+            );
+            "setup"
+        }
         Ok(true) => {
-            let backend_configured = BackendStore::new(&state.db)
+            let backend_configured = match BackendStore::new(&state.db)
                 .get(BackendPurpose::Standard)
-                .ok()
-                .flatten()
-                .is_some();
-            let dismissed = GeneralSettingsStore::new(&state.db)
-                .wizard_dismissed()
-                .unwrap_or(false);
+            {
+                Ok(row) => row.is_some(),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "routes::ping",
+                        error = %e,
+                        "config_backends read failed on /api/ping — assuming configured to avoid \
+                         re-triggering the first-run wizard. Likely BLOB column corruption; \
+                         check Settings → Backends.",
+                    );
+                    // Treat as "configured" so the SPA doesn't yank
+                    // the operator back into the wizard. The chat
+                    // path will surface the underlying error on the
+                    // next turn via the resolver's WARN log.
+                    true
+                }
+            };
+            let dismissed = match GeneralSettingsStore::new(&state.db).wizard_dismissed() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "routes::ping",
+                        error = %e,
+                        "wizard_dismissed read failed — defaulting to false",
+                    );
+                    false
+                }
+            };
             if backend_configured || dismissed {
                 "pong"
             } else {

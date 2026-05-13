@@ -337,9 +337,27 @@ pub fn name_in_text(name: &str, text: &str) -> bool {
 /// the lookup fails, or the display_name is shorter than 2 chars
 /// after trim — every "I'm not sure who the agent is" path falls
 /// open at the caller.
+///
+/// 2026-05-13 — DB read errors are logged at WARN to the
+/// `group_addressing` target before returning `None`. Pre-rework
+/// the `.ok()?` swallow turned a `config_personality` BLOB-decode
+/// failure into a silent "no agent identity" branch that disabled
+/// the LLM-based addressing classifier for every group conversation
+/// without a peep in the logs.
 fn read_agent_identity(state: &AppState) -> Option<(String, String)> {
     use execlaw_core::personality::PersonalityStore;
-    let row = PersonalityStore::new(&state.db).get_default().ok()?;
+    let row = match PersonalityStore::new(&state.db).get_default() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                target: "group_addressing",
+                error = %e,
+                "config_personality read failed — group-addressing classifier will fall open (treat-as-directed). \
+                 Likely BLOB column corruption from a raw SQL UPDATE; use Settings → Personality instead.",
+            );
+            return None;
+        }
+    };
     let name = row.display_name.trim().to_owned();
     if name.chars().count() < 2 {
         return None;

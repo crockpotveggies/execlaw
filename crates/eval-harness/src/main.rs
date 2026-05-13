@@ -44,8 +44,10 @@ struct Cli {
     /// http://127.0.0.1:8000/v1.
     #[arg(long)]
     base_url: Option<String>,
-    /// Model id passed in the chat request.
-    #[arg(long, default_value = "QuantTrio/Qwen3.5-27B-AWQ")]
+    /// Model id passed in the chat request. Default mirrors
+    /// `execlaw_server::inference_resolver::DEFAULT_FALLBACK_MODEL`
+    /// — keep in sync if that constant moves.
+    #[arg(long, default_value = "QuantTrio/Qwen3.6-27B-AWQ")]
     model: String,
     /// Skip the network call; echo the case's expected verdict.
     /// Used in CI to exercise the harness without a live LLM.

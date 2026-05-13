@@ -55,12 +55,38 @@ fn origin_channel_for_conversation(state: &AppState, cid: &ConversationId) -> Op
     use execlaw_core::principal_groups::PrincipalGroupStore;
     use execlaw_core::transport_bindings::TransportBindingStore;
     let pg_store = PrincipalGroupStore::new(&state.db);
-    let pg_id = pg_store
-        .principal_group_id_for(cid.as_str())
-        .ok()
-        .flatten()?;
+    // 2026-05-13 — log DB errors loudly instead of `.ok()`-
+    // swallowing them. Pre-rework a `principal_groups` or
+    // `transport_bindings` decode failure silently degraded the
+    // approval reply to "no transport bridged this message" with
+    // no diagnostic, which is indistinguishable from a legitimately
+    // web-only chat. The WARN now distinguishes the two.
+    let pg_id = match pg_store.principal_group_id_for(cid.as_str()) {
+        Ok(opt) => opt?,
+        Err(e) => {
+            tracing::warn!(
+                target: "approvals",
+                conversation_id = %cid.as_str(),
+                error = %e,
+                "principal_groups read failed — approval reply will not be bridged via transport. \
+                 Likely BLOB column corruption; check Settings → Groups.",
+            );
+            return None;
+        }
+    };
     let binding_store = TransportBindingStore::new(&state.db);
-    let bindings = binding_store.bindings_for_group_any_channel(&pg_id).ok()?;
+    let bindings = match binding_store.bindings_for_group_any_channel(&pg_id) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                target: "approvals",
+                principal_group_id = %pg_id,
+                error = %e,
+                "transport_bindings read failed — approval reply will not be bridged via transport.",
+            );
+            return None;
+        }
+    };
     state
         .host_transports
         .lookup_first_supported_binding(&bindings)
@@ -609,24 +635,52 @@ fn find_cold_contact_event(
     state: &AppState,
     approval_id: &str,
 ) -> Option<(ConversationId, String, String)> {
+    // 2026-05-13 — log DB errors at WARN instead of `.ok()?`-
+    // swallowing them. Pre-rework a `state_events` query failure
+    // (lock contention, schema mismatch, HMAC reverification error)
+    // silently degraded to "approval not found", which the caller
+    // surfaces as a generic 404 — operators chasing a missing
+    // approval had no signal that the underlying read failed.
     let db = &state.db;
-    let conv_ids: Vec<String> = db
-        .with_conn(|c| {
-            let mut stmt = c
-                .prepare("SELECT DISTINCT conversation_id FROM state_events WHERE kind = 'cold_contact_arrived'")
-                .map_err(execlaw_core::db::DbError::from)?;
-            let rows = stmt
-                .query_map([], |r| r.get::<_, String>(0))
-                .map_err(execlaw_core::db::DbError::from)?;
-            let out: Result<Vec<_>, _> = rows.collect();
-            Ok(out?)
-        })
-        .ok()?;
+    let conv_ids: Vec<String> = match db.with_conn(|c| {
+        let mut stmt = c
+            .prepare("SELECT DISTINCT conversation_id FROM state_events WHERE kind = 'cold_contact_arrived'")
+            .map_err(execlaw_core::db::DbError::from)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(execlaw_core::db::DbError::from)?;
+        let out: Result<Vec<_>, _> = rows.collect();
+        Ok(out?)
+    }) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                target: "approvals::find_cold_contact_event",
+                approval_id = %approval_id,
+                error = %e,
+                "state_events scan failed — caller will see 'approval not found'. \
+                 Likely DB lock contention or schema drift.",
+            );
+            return None;
+        }
+    };
 
     let log = event_log(state);
     for id in conv_ids {
         let cid = ConversationId::from(id);
-        let events = log.replay_since(&cid, EventSeq(0)).ok()?;
+        let events = match log.replay_since(&cid, EventSeq(0)) {
+            Ok(ev) => ev,
+            Err(e) => {
+                tracing::warn!(
+                    target: "approvals::find_cold_contact_event",
+                    approval_id = %approval_id,
+                    conversation_id = %cid.as_str(),
+                    error = %e,
+                    "replay_since failed for one conversation — continuing scan.",
+                );
+                continue;
+            }
+        };
         for ev in events {
             if ev.kind != EventKind::ColdContactArrived {
                 continue;

@@ -757,19 +757,20 @@ async fn run_real_turn(
     // Step 3 — open stream.
     //
     // 2026-04-28 — read the Standard backend row's reasoning_enabled
-    // and forward it as `chat_template_kwargs.enable_thinking`. Qwen3.5
+    // and forward it as `chat_template_kwargs.enable_thinking`. Qwen3
     // honours this knob in its chat template; without it the model
     // defaults to emitting a "Thinking Process:" monologue ahead of
     // every reply. We always send the field (rather than omitting it
     // when false) so the chat template's `if` branch evaluates a
     // concrete bool — Qwen's template treats "missing" as the
     // model-default, which on Qwen3.5 is reasoning-on.
-    let reasoning_enabled = execlaw_core::backends::BackendStore::new(&state.db)
-        .get(BackendPurpose::Standard)
-        .ok()
-        .flatten()
-        .map(|r| r.reasoning_enabled)
-        .unwrap_or(false);
+    //
+    // 2026-05-13 — sourced from `resolved.reasoning_enabled` (the
+    // same DB row that supplied endpoint + model id). Pre-rework
+    // this was a second `BackendStore::get(...).ok().flatten()` read
+    // that silently masked DB errors AND opened a drift window
+    // between the resolve and the reasoning read.
+    let reasoning_enabled = resolved.reasoning_enabled;
     // Pre-set chat_template_kwargs based on the operator's
     // reasoning_enabled flag; the adapter's prepare_request will
     // honor whatever the caller chose for Conversation hint (Qwen3
@@ -1148,12 +1149,9 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
     // the runner. selfhosted-claw does the same dance in its
     // `resolveContainerOpenAIBaseUrl`.
     let inference_url = rewrite_url_for_container(&inference_url);
-    let reasoning_enabled = execlaw_core::backends::BackendStore::new(&state.db)
-        .get(BackendPurpose::Standard)
-        .ok()
-        .flatten()
-        .map(|r| r.reasoning_enabled)
-        .unwrap_or(false);
+    // 2026-05-13 — sourced from the same resolved row as endpoint +
+    // model id; see `ResolvedInference::reasoning_enabled`.
+    let reasoning_enabled = resolved.reasoning_enabled;
 
     // Build the tool catalog the runner advertises to the model.
     // Includes BOTH the trait-based built-in tier (registered at
@@ -1710,17 +1708,12 @@ async fn run_tool_capable_turn(
         tools: tool_decls,
         event_log_hmac_key: state.event_log_hmac_key.as_ref().map(|k| (**k).clone()),
         phase_observer: Some(phase_observer),
-        // Read reasoning toggle from the Standard backend row;
-        // defaults to false when the row isn't configured. The
-        // runner forwards this into Qwen's chat template so a
-        // misconfigured reasoning bit doesn't leak `<think>` blocks
-        // into the operator's chat.
-        reasoning_enabled: execlaw_core::backends::BackendStore::new(&state.db)
-            .get(BackendPurpose::Standard)
-            .ok()
-            .flatten()
-            .map(|r| r.reasoning_enabled)
-            .unwrap_or(false),
+        // 2026-05-13 — sourced from `resolved.reasoning_enabled`
+        // (same DB row as endpoint + model id). Pre-rework this was
+        // a separate `BackendStore::get(...).ok().flatten()` read
+        // that silently swallowed DB errors AND opened a drift
+        // window with the model id field.
+        reasoning_enabled: resolved.reasoning_enabled,
         inbound_channel_origin: inbound_channel_origin.map(|s| s.to_owned()),
     };
     let exec_started_at = std::time::Instant::now();
@@ -4141,12 +4134,9 @@ async fn run_incognito_send(
         tool_calls: vec![],
     });
 
-    let reasoning_enabled = execlaw_core::backends::BackendStore::new(&state.db)
-        .get(BackendPurpose::Standard)
-        .ok()
-        .flatten()
-        .map(|r| r.reasoning_enabled)
-        .unwrap_or(false);
+    // 2026-05-13 — sourced from `resolved.reasoning_enabled` (same
+    // DB row as endpoint + model id); see `ResolvedInference`.
+    let reasoning_enabled = resolved.reasoning_enabled;
 
     // Phase events + cancel flag use the SAME plumbing as the
     // regular path so the SPA's typing indicator + stop button
