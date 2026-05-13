@@ -30,16 +30,20 @@ if ($env:EXECLAW_LOG_DIR) {
 $today = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')
 $logFile = Join-Path $logDir "execlaw.jsonl.$today"
 
-Write-Host "# scripts/trace-turn.ps1"
-Write-Host "#"
-Write-Host "# Before sending your 'hi' — make sure dev-server was started with:"
-Write-Host "#"
-Write-Host "#   `$env:RUST_LOG = `"info,agent::turn_timing=debug`""
-Write-Host "#   bash scripts/dev-server.sh"
-Write-Host "#"
+# Header — use single-quoted strings throughout so Windows PowerShell
+# 5.1's parser doesn't trip on the embedded `$env:` and double-quote
+# escape sequences (the `" sequence parses differently on 5.1 than
+# on pwsh 7 and was breaking script load on Windows PowerShell).
+Write-Host '# scripts/trace-turn.ps1'
+Write-Host '#'
+Write-Host '# Before sending your "hi" — make sure dev-server was started with:'
+Write-Host '#'
+Write-Host '#   $env:RUST_LOG = "info,agent::turn_timing=debug"'
+Write-Host '#   bash scripts/dev-server.sh'
+Write-Host '#'
 Write-Host "# Tailing: $logFile"
-Write-Host "# Press Ctrl-C to stop."
-Write-Host ""
+Write-Host '# Press Ctrl-C to stop.'
+Write-Host ''
 
 if (-not (Test-Path -LiteralPath $logFile)) {
     Write-Error "log file not found yet: $logFile`nstart dev-server first; the file is created on the first log line."
