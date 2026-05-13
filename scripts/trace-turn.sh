@@ -14,7 +14,33 @@
 
 set -euo pipefail
 
-LOG_DIR="${EXECLAW_LOG_DIR:-$HOME/.execlaw/logs}"
+# Default log location follows the host's `directories::UserDirs`
+# resolution: $HOME/.execlaw/logs on Unix, %USERPROFILE%/.execlaw/logs
+# on Windows. Git Bash on Windows sets $HOME to /home/<user>/ (the
+# MSYS faux home, NOT %USERPROFILE%) so falling back to $HOME alone
+# misses the real log dir. We prefer USERPROFILE when present and
+# convert the backslash-separated Windows path to MSYS form so
+# `tail -F` resolves correctly.
+if [[ -n "${EXECLAW_LOG_DIR:-}" ]]; then
+    LOG_DIR="$EXECLAW_LOG_DIR"
+elif [[ -n "${USERPROFILE:-}" ]]; then
+    # Git Bash. USERPROFILE looks like `C:\Users\justi` —
+    # convert to `/c/Users/justi` via MSYS's `cygpath` if available,
+    # else hand-roll the substitution.
+    if command -v cygpath >/dev/null 2>&1; then
+        LOG_DIR="$(cygpath -u "$USERPROFILE")/.execlaw/logs"
+    else
+        # Strip the colon, lowercase the drive letter, swap slashes.
+        win="${USERPROFILE//\\//}"
+        drive="${win:0:1}"
+        rest="${win:2}"
+        drive_lower="$(echo "$drive" | tr '[:upper:]' '[:lower:]')"
+        LOG_DIR="/${drive_lower}${rest}/.execlaw/logs"
+    fi
+else
+    LOG_DIR="$HOME/.execlaw/logs"
+fi
+
 TODAY="$(date -u +%Y-%m-%d)"
 LOG_FILE="$LOG_DIR/execlaw.jsonl.$TODAY"
 
