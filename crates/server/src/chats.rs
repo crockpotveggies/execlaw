@@ -1504,6 +1504,26 @@ async fn run_tool_capable_turn(
     use execlaw_inference_api::ToolDeclaration;
     use execlaw_runner_local::turn::{TurnConfig, TurnExecutor};
 
+    // 2026-05-12 — turn-timing instrumentation on the
+    // `agent::turn_timing` target (same as inner TurnExecutor).
+    // Every step from "request arrives in this handler" to
+    // "TurnExecutor returns" gets a sub-timing so the operator
+    // can see which step actually owns the wall-clock. Enable
+    // with RUST_LOG=info,agent::turn_timing=debug. All measurements
+    // are on the monotonic clock; deltas between events are what's
+    // meaningful, not absolutes.
+    let outer_started_at = std::time::Instant::now();
+    let cid_for_log = cid.as_str().to_owned();
+    let user_text_chars = user_text.chars().count();
+    tracing::debug!(
+        target: "agent::turn_timing",
+        conversation_id = %cid_for_log,
+        path = "run_tool_capable_turn",
+        user_text_chars,
+        channel = inbound_channel_origin.unwrap_or("web"),
+        "turn entry (chats.rs handler)"
+    );
+
     // Same description/schema plumbing fix as the runner-turn path
     // (delta #1) — without this the in-process tool-capable path
     // shipped `Plugin tool 'X' (latency: Y)` + an empty schema.
@@ -1515,6 +1535,7 @@ async fn run_tool_capable_turn(
     // research_* / memory_* / etc. The dispatch chain already
     // routes built-ins via `try_registry_builtin`; we just need to
     // tell the model they're there.
+    let catalog_started_at = std::time::Instant::now();
     let mut tool_decls: Vec<ToolDeclaration> = state
         .plugin_host
         .registry()
@@ -1545,6 +1566,19 @@ async fn run_tool_capable_turn(
                     .unwrap_or_else(|| serde_json::json!({"type": "object"}));
                 ToolDeclaration::function(t.tool_name.clone(), description, schema)
             }),
+    );
+    let catalog_ms = catalog_started_at.elapsed().as_millis() as u64;
+    let catalog_bytes: usize = tool_decls
+        .iter()
+        .map(|t| serde_json::to_string(t).map(|s| s.len()).unwrap_or(0))
+        .sum();
+    tracing::debug!(
+        target: "agent::turn_timing",
+        conversation_id = %cid_for_log,
+        catalog_ms,
+        tool_count = tool_decls.len(),
+        catalog_bytes,
+        "tool catalog assembled"
     );
 
     // Phase-8a: dispatch consults `config_tool_access` for every
@@ -1612,6 +1646,7 @@ async fn run_tool_capable_turn(
         .iter()
         .map(|t| t.tool_name.clone())
         .collect();
+    let prompt_started_at = std::time::Instant::now();
     let routing_prose = build_tool_routing_prose(&routing_builtins, &routing_plugins);
     let turn_context = build_turn_context_prose(
         chrono::Utc::now(),
@@ -1622,15 +1657,26 @@ async fn run_tool_capable_turn(
         caller_timezone,
         group_context.as_ref(),
     );
+    let composed_system_prompt = assemble_system_prompt(
+        &state.db,
+        Some(cid.as_str()),
+        &state.config.system_prompt,
+        &routing_prose,
+        &turn_context,
+    );
+    let prompt_ms = prompt_started_at.elapsed().as_millis() as u64;
+    tracing::debug!(
+        target: "agent::turn_timing",
+        conversation_id = %cid_for_log,
+        prompt_assembly_ms = prompt_ms,
+        system_prompt_chars = composed_system_prompt.chars().count(),
+        routing_prose_chars = routing_prose.chars().count(),
+        turn_context_chars = turn_context.chars().count(),
+        "system prompt assembled"
+    );
     let cfg = TurnConfig {
         model: ModelId(state.config.model_id.clone()),
-        system_prompt: assemble_system_prompt(
-            &state.db,
-            Some(cid.as_str()),
-            &state.config.system_prompt,
-            &routing_prose,
-            &turn_context,
-        ),
+        system_prompt: composed_system_prompt,
         // Delta #6 — explicit 0.3 (was None → vLLM default 1.0).
         // Same rationale as the runner-tier path above.
         temperature: Some(0.3),
@@ -1655,10 +1701,18 @@ async fn run_tool_capable_turn(
             .unwrap_or(false),
         inbound_channel_origin: inbound_channel_origin.map(|s| s.to_owned()),
     };
+    let exec_started_at = std::time::Instant::now();
+    tracing::debug!(
+        target: "agent::turn_timing",
+        conversation_id = %cid_for_log,
+        outer_setup_ms = outer_started_at.elapsed().as_millis() as u64,
+        "TurnExecutor.run_turn starting (per-round timings follow on this target)"
+    );
     let summary = exec
         .run_turn(&state.db, cid, user_text, sender_principal_id, &cfg)
         .await
         .map_err(|e| format!("executor: {e}"))?;
+    let exec_ms = exec_started_at.elapsed().as_millis() as u64;
 
     let log = event_log(state);
     // TurnExecutor appends user_msg via `append` (not commit_turn) so
@@ -1674,6 +1728,16 @@ async fn run_tool_capable_turn(
         .find(|e| e.kind == EventKind::ModelTurn)
         .map(|e| e.seq.0)
         .unwrap_or(last);
+    tracing::debug!(
+        target: "agent::turn_timing",
+        conversation_id = %cid_for_log,
+        outer_total_ms = outer_started_at.elapsed().as_millis() as u64,
+        executor_run_ms = exec_ms,
+        tool_rounds = summary.tool_rounds,
+        events_committed = summary.events_written.len(),
+        assistant_text_chars = summary.assistant_text.chars().count(),
+        "turn exit (chats.rs handler)"
+    );
     Ok((user_seq, summary.assistant_text, assistant_seq))
 }
 
