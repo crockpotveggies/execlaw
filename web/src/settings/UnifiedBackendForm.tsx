@@ -78,12 +78,16 @@ const SERVING_PLUGIN: Record<ServingMethod, string> = {
 // — every spawn against it crashed with "unknown architecture" and
 // the operator had to dig through container logs to figure out why.
 //
-// `nightly` is built daily from main and tested by the vLLM team
-// before publishing. If you need a deterministic build for prod,
-// override the image via the model_spec JSON in Settings → Backends
-// after setup.
+// Pinned to v0.20.2 (May 10 2026) — Qwen3.6 needs vLLM >= 0.19.0
+// + the `qwen3_coder` tool-call parser. Used to track `nightly`
+// while Qwen3.5 architecture support landed pre-stable, but
+// 2026-05-12 an operator hit a hang in `0.20.2rc1.dev209` where
+// vLLM accepted a request and produced zero decode tokens —
+// `nightly` is now actively risky. Operators can override the
+// image post-setup via Settings → Backends → raw JSON if a newer
+// release fixes something they need.
 const SERVING_IMAGE: Record<ServingMethod, string> = {
-    vllm: "vllm/vllm-openai:nightly",
+    vllm: "vllm/vllm-openai:v0.20.2",
     openvino: "execlaw/service-vllm-openvino-arc:v1",
     openarc: "execlaw/service-openarc:v1",
     // Native runtime — no container image. The supervisor reads
@@ -100,18 +104,24 @@ const SERVING_IMAGE: Record<ServingMethod, string> = {
 // with a non-zero code on every spawn (CrashLooping with no obvious
 // cause).
 //
-// The flagship is the locked-decision Qwen 3.5 27B AWQ. Pairs with
-// the `nightly` vLLM image because Qwen 3.5 architecture support
-// hasn't reached a stable cut yet. Smaller fallbacks are Qwen 2.5
-// AWQ which the vLLM nightly also supports — operators on
-// 12 GB / 8 GB / 4 GB cards pick down the list. Operators with a
-// private model override the id post-setup via Settings → Backends
-// → raw JSON.
+// The flagship is Qwen 3.6 27B AWQ (2026-05-12 — superseded the
+// prior Qwen 3.5 default; 3.6 ships explicit agentic-coding
+// improvements and uses the `qwen3_coder` tool-call parser in
+// vLLM v0.19+). Qwen 3.5 stays in the catalog as a fallback for
+// hosts that can't run 3.6 (e.g. older GPU drivers). Smaller
+// fallbacks are Qwen 2.5 AWQ for operators on 12 GB / 8 GB / 4 GB
+// cards. Operators with a private model override the id post-
+// setup via Settings → Backends → raw JSON.
 const MODEL_CATALOG: Record<ServingMethod, ModelOption[]> = {
     vllm: [
         {
+            id: "QuantTrio/Qwen3.6-27B-AWQ",
+            label: "Qwen 3.6 27B (AWQ, ~18 GB) — flagship",
+            min_mb: 18_000,
+        },
+        {
             id: "QuantTrio/Qwen3.5-27B-AWQ",
-            label: "Qwen 3.5 27B (AWQ, ~18 GB) — flagship",
+            label: "Qwen 3.5 27B (AWQ, ~18 GB) — fallback",
             min_mb: 18_000,
         },
         {
@@ -801,7 +811,7 @@ export function UnifiedBackendForm({
                                 value={remoteModel}
                                 onChange={(e) => setRemoteModel(e.target.value)}
                                 disabled={submitting}
-                                placeholder="QuantTrio/Qwen3.5-27B-AWQ"
+                                placeholder="QuantTrio/Qwen3.6-27B-AWQ"
                                 data-testid={`${testIdPrefix}-external-model`}
                             />
                             <Form.Text className="execlaw-muted">

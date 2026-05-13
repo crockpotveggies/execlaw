@@ -372,13 +372,13 @@ describe("SetupWizard — multi-step flow", () => {
         // "fixed serving method" note instead.
         expect(screen.getByTestId("setup-backend-serving-fixed")).toBeInTheDocument();
         expect(screen.queryByTestId("setup-backend-serving-picker")).toBeNull();
-        // Model dropdown should include all five vLLM catalog
+        // Model dropdown should include all SIX vLLM catalog
         // entries because 24 GB fits the 20 GB Qwen 2.5 32B and
-        // the 18 GB Qwen 3.5 27B flagship.
+        // the 18 GB Qwen 3.6 27B flagship + Qwen 3.5 fallback.
         const modelSelect = screen.getByTestId(
             "setup-backend-model-select",
         ) as HTMLSelectElement;
-        expect(modelSelect.options.length).toBe(5);
+        expect(modelSelect.options.length).toBe(6);
         // Save → PUT with vLLM image + chosen model in args.
         fireEvent.click(screen.getByTestId("setup-backend-submit"));
         await waitFor(() => {
@@ -399,13 +399,14 @@ describe("SetupWizard — multi-step flow", () => {
         // The supervisor reads `gpu_vendor` from model_spec to pick
         // the device-passthrough strategy.
         expect(body.model_spec.gpu_vendor).toBe("nvidia");
-        // Wizard tracks the `nightly` vLLM tag because Qwen 3.5
-        // architecture support isn't in any stable cut yet.
-        expect(body.model_spec.image).toBe("vllm/vllm-openai:nightly");
+        // Wizard pins the stable v0.20.2 vLLM tag — `nightly` was
+        // retired 2026-05-12 after it shipped a hang for Qwen3
+        // tool-call requests.
+        expect(body.model_spec.image).toBe("vllm/vllm-openai:v0.20.2");
         // First option in the dropdown is the locked-decision
-        // Qwen 3.5 27B AWQ flagship.
+        // Qwen 3.6 27B AWQ flagship.
         expect(body.model_spec.args).toContain(
-            "--model=QuantTrio/Qwen3.5-27B-AWQ",
+            "--model=QuantTrio/Qwen3.6-27B-AWQ",
         );
     });
 
