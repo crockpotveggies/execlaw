@@ -863,85 +863,11 @@ mod tests {
         assert!(ids.contains("canonical"));
     }
 
-    #[test]
-    fn migration_0004_backfills_index_from_existing_identifiers_json() {
-        // Simulate a pre-0004 install: principal_identifiers exists but
-        // the rows were written before this principal landed. Verify
-        // a fresh fresh_db() (which runs ALL migrations) does the
-        // backfill correctly.
-        let db = fresh_db();
-        // Hand-write a principals row WITHOUT going through upsert
-        // (so the index sync path doesn't pre-populate the index for
-        // us). This is what a pre-migration row would look like.
-        let identifiers_json =
-            r#"[{"transport":"signal","handle":"+12025550100"},{"transport":"email","handle":"x@y.z"}]"#;
-        // All four `*_json` columns are declared BLOB — pass bytes
-        // for each one (not SQL TEXT literals like `'[]'`) so
-        // PrincipalStore::get's `Vec<u8>` reads succeed.
-        db.with_conn(|c| {
-            c.execute(
-                "INSERT INTO principals \
-                 (id, identifiers_json, trust_level_json, resolved_by_json, metadata_json, \
-                  first_seen, last_seen, controller_notes) \
-                 VALUES ('preexisting', ?1, ?2, ?3, ?4, 0, NULL, NULL)",
-                params![
-                    identifiers_json.as_bytes(),
-                    serde_json::to_vec(&TrustLevel::Controller).unwrap(),
-                    b"[]".as_ref(),
-                    b"{}".as_ref(),
-                ],
-            )?;
-            // Clear the index rows that the upsert helper would
-            // have written — we're simulating a pre-backfill state.
-            c.execute(
-                "DELETE FROM principal_identifiers WHERE principal_id = 'preexisting'",
-                [],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-
-        // Now re-run the backfill statement from migration 0004
-        // verbatim (it's idempotent via INSERT OR IGNORE). Note the
-        // CAST AS TEXT — `identifiers_json` is BLOB and SQLite's
-        // json_each won't auto-decode BLOB into JSON.
-        db.with_conn(|c| {
-            c.execute(
-                "INSERT OR IGNORE INTO principal_identifiers(transport, handle, principal_id, last_seen) \
-                 SELECT json_extract(ident.value, '$.transport'), \
-                        json_extract(ident.value, '$.handle'), \
-                        p.id, p.last_seen \
-                 FROM principals p, json_each(CAST(p.identifiers_json AS TEXT)) AS ident \
-                 WHERE json_extract(ident.value, '$.transport') IS NOT NULL \
-                   AND json_extract(ident.value, '$.handle')    IS NOT NULL",
-                [],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-
-
-        // Both identifiers should now resolve via the index.
-        let store = PrincipalStore::new(&db);
-        let by_signal = store
-            .find_by_identifier(&Identifier {
-                transport: "signal".into(),
-                handle: "+12025550100".into(),
-            })
-            .unwrap();
-        assert!(
-            by_signal.is_some_and(|p| p.id.as_str() == "preexisting"),
-            "backfilled signal identifier must resolve",
-        );
-        let by_email = store
-            .find_by_identifier(&Identifier {
-                transport: "email".into(),
-                handle: "x@y.z".into(),
-            })
-            .unwrap();
-        assert!(
-            by_email.is_some_and(|p| p.id.as_str() == "preexisting"),
-            "backfilled email identifier must resolve",
-        );
-    }
+    // (The migration-0004 backfill test was retired 2026-05-14 when
+    // migrations 2-4 were folded into the baseline. The backfill SQL
+    // it pinned no longer ships separately; the baseline now creates
+    // `principal_identifiers` directly and `upsert` keeps it in sync.
+    // The remaining tests in this module cover the runtime behaviour
+    // that matters: upsert-populates-index, resync-on-change,
+    // cascade-on-delete, single + multi claimant lookup.)
 }

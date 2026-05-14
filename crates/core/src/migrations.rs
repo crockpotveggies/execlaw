@@ -41,21 +41,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "baseline",
         sql: include_str!("../migrations/0001_baseline.sql"),
     },
-    Migration {
-        id: 2,
-        name: "plugin_artifacts",
-        sql: include_str!("../migrations/0002_plugin_artifacts.sql"),
-    },
-    Migration {
-        id: 3,
-        name: "max_history_tokens",
-        sql: include_str!("../migrations/0003_max_history_tokens.sql"),
-    },
-    Migration {
-        id: 4,
-        name: "principal_identifiers",
-        sql: include_str!("../migrations/0004_principal_identifiers.sql"),
-    },
+    // 2026-05-14 — migrations 2-4 (plugin_artifacts, max_history_tokens,
+    // principal_identifiers) were folded into the baseline after a
+    // checksum-divergence error blocked a single-developer rebuild.
+    // The columns + tables those migrations added now live inline in
+    // `0001_baseline.sql`; the IDs are retired forever (never reuse).
 ];
 
 #[derive(Debug, Error)]
@@ -236,7 +226,7 @@ mod tests {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
         let runner = MigrationRunner::new(&db);
         let applied = runner.apply_all().unwrap();
-        assert_eq!(applied, vec![1, 2, 3, 4]);
+        assert_eq!(applied, vec![1]);
 
         // Spot-check: every documented table exists.
         let tables = vec![
@@ -310,7 +300,7 @@ mod tests {
         let runner = MigrationRunner::new(&db);
         let first = runner.apply_all().unwrap();
         let second = runner.apply_all().unwrap();
-        assert_eq!(first, vec![1, 2, 3, 4]);
+        assert_eq!(first, vec![1]);
         assert!(
             second.is_empty(),
             "rerun must not re-apply already-applied migrations"
