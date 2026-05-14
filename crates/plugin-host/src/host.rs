@@ -857,7 +857,14 @@ impl PluginHost {
             let manifest = match PluginManifest::parse(&row.manifest_toml) {
                 Ok(m) => m,
                 Err(e) => {
-                    warn!(plugin_id = %row.plugin_id, error = %e, "skipping plugin with unparseable manifest");
+                    // Unparseable manifest in the DB row → the row
+                    // can never hydrate cleanly. Auto-purge so the
+                    // SPA shows the plugin as uninstalled and the
+                    // operator can reinstall from a clean state
+                    // (see `evict_unrecoverable_plugin` for the
+                    // full rationale on auto-purge vs disable).
+                    warn!(plugin_id = %row.plugin_id, error = %e, "unparseable manifest; auto-purging zombie state_plugins row");
+                    self.evict_unrecoverable_plugin(&row.plugin_id, "unparseable manifest");
                     continue;
                 }
             };
@@ -866,6 +873,12 @@ impl PluginHost {
                 .registry
                 .enable_with_stage(&manifest, Some(std::path::Path::new(&row.stage_path)))
             {
+                // Hook conflict isn't necessarily unrecoverable (it
+                // could be a transient state where another plugin
+                // owns the same hook id and will itself be purged
+                // later in this same hydrate pass). We keep the
+                // original "skip + warn" behavior here rather than
+                // auto-purging.
                 warn!(plugin_id = %row.plugin_id, error = %e, "skipping plugin with hook conflict on hydrate");
                 continue;
             }
@@ -879,7 +892,18 @@ impl PluginHost {
                         Some(execlaw_plugin_sdk::manifest::RuntimeTier::Subprocess) => {
                             let exe = match runtime_executable_or_err(runtime) {
                                 Ok(s) => s,
-                                Err(_) => continue,
+                                Err(e) => {
+                                    warn!(
+                                        plugin_id = %row.plugin_id,
+                                        error = %e,
+                                        "subprocess plugin manifest missing runtime.executable; auto-purging",
+                                    );
+                                    self.evict_unrecoverable_plugin(
+                                        &row.plugin_id,
+                                        "missing runtime.executable",
+                                    );
+                                    continue;
+                                }
                             };
                             let spec = SubprocessSpec {
                                 plugin_id: row.plugin_id.clone(),
@@ -902,15 +926,39 @@ impl PluginHost {
                                     debug!(plugin_id = %row.plugin_id, "hydrated subprocess plugin");
                                 }
                                 Err(e) => {
-                                    warn!(plugin_id = %row.plugin_id, error = %e, "failed to respawn subprocess on hydrate");
-                                    self.inner.registry.disable(&row.plugin_id);
+                                    // Subprocess won't spawn → the
+                                    // staged binary is gone or
+                                    // unexec'able. Auto-purge so the
+                                    // operator gets a coherent
+                                    // "install this plugin" affordance
+                                    // instead of a zombie row.
+                                    warn!(
+                                        plugin_id = %row.plugin_id,
+                                        error = %e,
+                                        "subprocess spawn failed on hydrate; auto-purging zombie state_plugins row",
+                                    );
+                                    self.evict_unrecoverable_plugin(
+                                        &row.plugin_id,
+                                        "subprocess spawn failed",
+                                    );
                                 }
                             }
                         }
                         Some(execlaw_plugin_sdk::manifest::RuntimeTier::Script) => {
                             let src = match runtime_source_or_err(runtime) {
                                 Ok(s) => s,
-                                Err(_) => continue,
+                                Err(e) => {
+                                    warn!(
+                                        plugin_id = %row.plugin_id,
+                                        error = %e,
+                                        "script plugin manifest missing runtime.source; auto-purging",
+                                    );
+                                    self.evict_unrecoverable_plugin(
+                                        &row.plugin_id,
+                                        "missing runtime.source",
+                                    );
+                                    continue;
+                                }
                             };
                             let path = stage.join(src);
                             match execlaw_script::ScriptPlugin::from_file(
@@ -931,8 +979,34 @@ impl PluginHost {
                                     // sidecars healthy.
                                 }
                                 Err(e) => {
-                                    warn!(plugin_id = %row.plugin_id, error = %e, "failed to load script on hydrate");
-                                    self.inner.registry.disable(&row.plugin_id);
+                                    // 2026-05-14 — the load-bearing
+                                    // case: the staged `main.rhai`
+                                    // is gone (os error 3 / "system
+                                    // cannot find the path"). Pre-fix
+                                    // this just disabled the plugin
+                                    // in the registry while leaving
+                                    // `state_plugins.enabled=1`,
+                                    // creating a zombie state where
+                                    // the SPA renders the plugin's
+                                    // config page but every admin
+                                    // route 404s with the confusing
+                                    // "no [[admin_routes]] entry on
+                                    // plugin 'X' matching GET /…"
+                                    // error. Auto-purging the row
+                                    // restores DB ↔ registry parity
+                                    // and gives the operator the
+                                    // correct affordance: install
+                                    // this plugin (because it isn't,
+                                    // any more).
+                                    warn!(
+                                        plugin_id = %row.plugin_id,
+                                        error = %e,
+                                        "failed to load script on hydrate; auto-purging zombie state_plugins row",
+                                    );
+                                    self.evict_unrecoverable_plugin(
+                                        &row.plugin_id,
+                                        "script load failed",
+                                    );
                                 }
                             }
                         }
@@ -944,6 +1018,60 @@ impl PluginHost {
             }
         }
         Ok(())
+    }
+
+    /// Tear down the in-memory + DB state for a plugin whose hydrate
+    /// failed in an unrecoverable way (manifest unparseable, stage
+    /// dir missing, runtime binary missing, etc.).
+    ///
+    /// Pre-2026-05-14 hydrate just called `registry.disable(plugin_id)`
+    /// on the in-memory side and left the `state_plugins` row alone.
+    /// That left an "enabled in DB but missing from registry" zombie
+    /// state — the SPA happily rendered the plugin's settings page
+    /// (because it queries `state_plugins` for the install list),
+    /// then every admin route call 404'd with
+    ///   `no [[admin_routes]] entry on plugin 'X' matching GET /…`
+    /// because the registry had nothing for it.
+    ///
+    /// Now we evict both sides:
+    ///
+    ///   1. `registry.disable(plugin_id)` — clear hooks, sidecars,
+    ///      tools, admin_routes, etc. (unchanged from before).
+    ///   2. `delete_row(plugin_id)` — drop the `state_plugins` row
+    ///      so the SPA's install list reflects reality. The operator
+    ///      then sees the plugin as uninstalled and gets a clean
+    ///      "install" affordance instead of a broken config page.
+    ///
+    /// We do NOT call the orchestrator's `purge_plugin` from here —
+    /// that's a server-layer concern (sidecar containers, on-disk
+    /// state, OAuth + vault + artifact cleanup) and pulling it in
+    /// would invert the crate dependency. The orchestrator already
+    /// runs on uninstall + factory reset; this eviction is the
+    /// narrower "the DB row no longer corresponds to a loadable
+    /// plugin" cleanup.
+    ///
+    /// `reason` is logged with the eviction for ops visibility.
+    /// Best-effort: a delete failure is logged at WARN and the
+    /// boot proceeds (the next hydrate will retry the eviction).
+    fn evict_unrecoverable_plugin(&self, plugin_id: &str, reason: &str) {
+        self.inner.registry.disable(plugin_id);
+        match self.delete_row(plugin_id) {
+            Ok(()) => {
+                tracing::info!(
+                    plugin_id,
+                    reason,
+                    "evicted unrecoverable plugin row from state_plugins",
+                );
+            }
+            Err(e) => {
+                warn!(
+                    plugin_id,
+                    reason,
+                    error = %e,
+                    "failed to delete state_plugins row for unrecoverable plugin; SPA may still show zombie state until next boot",
+                );
+            }
+        }
     }
 
     /// Query every registered identity-provider plugin to resolve a
@@ -2355,6 +2483,111 @@ latency = "low"
             .unwrap()
             .expect("row must exist post-upgrade");
         assert_eq!(row.version, "1.4.7");
+    }
+
+    /// Regression for the 2026-05-14 "zombie plugin row" bug.
+    ///
+    /// Scenario (reproduces what the user reported on the Signal
+    /// config page):
+    ///   1. Install a script plugin via `PluginHost::install` → DB
+    ///      row written with `stage_path`, registry populated with
+    ///      admin_routes / tools / etc.
+    ///   2. Something removes the staged directory from disk
+    ///      (factory-reset orphan sweep, manual rm, disk failure).
+    ///   3. Server restarts → boot calls `PluginHost::hydrate`.
+    ///   4. Hydrate tries to load `main.rhai` from the now-missing
+    ///      path, gets `os error 3`.
+    ///
+    /// Pre-fix: hydrate called `registry.disable(plugin_id)` and
+    /// left `state_plugins.enabled=1`. The SPA queried `state_plugins`,
+    /// saw the plugin as installed, rendered its config page, and
+    /// every admin route 404'd with
+    ///   `no [[admin_routes]] entry on plugin 'X' matching GET /…`
+    ///
+    /// Post-fix: hydrate calls `evict_unrecoverable_plugin` which
+    /// disables in the registry AND deletes the `state_plugins` row.
+    /// SPA now correctly sees the plugin as uninstalled.
+    #[tokio::test]
+    async fn hydrate_auto_purges_zombie_row_when_stage_dir_is_missing() {
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
+
+        // Stage + install a script plugin with at least one tool —
+        // we need `needs_runtime = true` (i.e. tools / transport /
+        // identity_provider non-empty) so the hydrate path actually
+        // tries to load `main.rhai`. A tool-less plugin's hydrate
+        // would skip the script-load step entirely and never hit
+        // the eviction branch we're testing.
+        let (_tmp, stage) = stage_script_plugin_with_on_disable("zombie-test", "0.1.0");
+        host.install(&stage).await.unwrap();
+        assert!(
+            host.get_row("zombie-test").unwrap().is_some(),
+            "test setup: install must succeed before we simulate stage-loss",
+        );
+
+        // Simulate the stage-dir loss (factory-reset orphan sweep,
+        // manual rm, etc.).
+        std::fs::remove_dir_all(&stage).unwrap();
+
+        // Spin up a fresh PluginHost backed by the SAME DB so the
+        // install row survives but the in-memory registry is empty
+        // (mirrors what happens at boot: new process, same DB).
+        let registry2 = HookRegistry::new();
+        let host2 = PluginHost::new(db.clone(), registry2, stage_root.path().to_path_buf());
+        host2.hydrate().await.unwrap();
+
+        // Post-hydrate: the zombie row must be gone (auto-purged).
+        assert!(
+            host2.get_row("zombie-test").unwrap().is_none(),
+            "hydrate must auto-purge the state_plugins row when the stage dir is missing — \
+             that's the load-bearing fix for the 'no [[admin_routes]] entry' SPA 404",
+        );
+        // And the registry must reflect uninstalled state.
+        assert!(
+            host2.registry().admin_routes_for("zombie-test").is_empty(),
+            "registry must have no admin_routes for an evicted plugin",
+        );
+    }
+
+    /// Hydrate evicting an unparseable manifest: a hand-edited or
+    /// migration-corrupted `state_plugins.manifest_toml` blob is
+    /// just as unrecoverable as a missing stage dir, and produces
+    /// the same zombie state if we leave it alone. Auto-purge.
+    #[tokio::test]
+    async fn hydrate_auto_purges_zombie_row_when_manifest_is_unparseable() {
+        use rusqlite::params;
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
+
+        // Insert a hand-crafted row whose manifest_toml is garbage.
+        let now = chrono::Utc::now().timestamp();
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO state_plugins(plugin_id, version, manifest_toml, stage_path, enabled, installed_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)",
+                params![
+                    "bad-manifest",
+                    "0.1.0",
+                    "this is not valid toml }} [[",
+                    "/tmp/nonexistent",
+                    now,
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(host.get_row("bad-manifest").unwrap().is_some());
+
+        host.hydrate().await.unwrap();
+
+        assert!(
+            host.get_row("bad-manifest").unwrap().is_none(),
+            "unparseable-manifest rows must be auto-evicted on hydrate",
+        );
     }
 
     // === trust_floor enforcement ===

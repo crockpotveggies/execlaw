@@ -14,6 +14,41 @@ this changelog is for operators and plugin authors who want to see the
 
 ### Fixed
 
+- **Hydrate auto-evicts zombie plugin rows.** When `PluginHost::hydrate`
+  couldn't load a plugin at boot — stage directory missing,
+  `main.rhai` gone, subprocess binary unexec'able, manifest TOML
+  corrupted — it used to call `registry.disable(plugin_id)` and
+  leave `state_plugins.enabled=1` in the DB. That left a "zombie"
+  state where the SPA queried `state_plugins`, saw the plugin as
+  installed, rendered its config page, and every admin route 404'd
+  with the confusing
+    `no [[admin_routes]] entry on plugin 'X' matching GET /…`
+  error. Recovery required a manual uninstall + reinstall via the
+  SPA.
+
+  Symptom: the factory-reset orphan-directory sweep added in
+  commit 3753e05 wipes `~/.execlaw/plugins/` as part of a clean
+  slate; if a `state_plugins` row from before the reset somehow
+  survived (or if the user ran a different code path that wiped
+  the stage tree without nuking the DB), the next server restart
+  hit this exact zombie state.
+
+  New behavior: hydrate now calls a single `evict_unrecoverable_plugin`
+  helper that disables the plugin in the registry AND deletes the
+  `state_plugins` row. The SPA's install-list query then correctly
+  reports the plugin as uninstalled, and the operator sees a clean
+  "Install plugin" affordance instead of a broken config page.
+  All four hydrate failure branches (manifest unparseable, missing
+  runtime.executable, missing runtime.source, runtime spawn failure)
+  go through the same eviction path so DB ↔ registry parity is the
+  rule, not the exception.
+
+  Two new regression tests pin the contract:
+  `hydrate_auto_purges_zombie_row_when_stage_dir_is_missing` (the
+  reported failure mode) and
+  `hydrate_auto_purges_zombie_row_when_manifest_is_unparseable`
+  (the corrupted-TOML cousin).
+
 - **Sidecar host-port allocation is now dynamic and self-healing.** The
   prior allocator was a naive monotonic counter starting at port 8501;
   when any pool member was occupied externally (a stale Docker veth, a
