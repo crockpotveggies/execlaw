@@ -357,6 +357,28 @@ impl PluginHost {
             return Err(PluginHostError::AlreadyInstalled(plugin_id));
         }
 
+        // 2026-05-14 — refuse the install if any `[[ui_panels]]`
+        // declaration in the manifest points at an `entry` file
+        // that doesn't actually exist in the staged ZIP. Pre-fix
+        // a plugin could declare `entry = "ui/panel.js"` and the
+        // host accepted it silently; the SPA's dynamic-import
+        // attempt at runtime would then 404 and the operator
+        // would see a broken settings page with no upstream signal
+        // about why. Validate at install time so the failure
+        // surfaces during plugin upload, where the operator can
+        // actually do something about it (fix the ZIP).
+        for panel in &manifest.ui_panels {
+            let entry_path = stage_path.join(&panel.entry);
+            if !entry_path.is_file() {
+                return Err(PluginHostError::Manifest(format!(
+                    "plugin '{plugin_id}' declares [[ui_panels]] entry '{}' \
+                     but the file is missing from the staged ZIP at {}",
+                    panel.entry,
+                    entry_path.display(),
+                )));
+            }
+        }
+
         // Step 1 — register hooks. Pass the stage path so any
         // declared `[[tools]].schema` files get loaded into the
         // registered tool's `schema_json` (the model needs the real
@@ -2776,5 +2798,81 @@ executable = "./bin"
             err.contains("trust >= KnownTrusted"),
             "expected trust violation — got {err:?}",
         );
+    }
+
+    /// Regression for the 2026-05-14 plugin-self-containment work.
+    /// A plugin manifest can declare `[[ui_panels]] entry = "ui/panel.js"`
+    /// but if the ZIP doesn't actually contain that file, the SPA's
+    /// runtime `import("…/ui/panel.js")` 404s and the operator sees
+    /// a broken settings page with no upstream signal about why.
+    /// Validate at install time so the failure surfaces during
+    /// plugin upload where it can be acted on.
+    #[tokio::test]
+    async fn install_rejects_when_ui_panel_entry_is_missing_from_stage() {
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
+
+        // Stage a plugin whose manifest declares a UI panel but
+        // DOES NOT ship the entry file.
+        let stage = stage_root.path().join("bad-ui-0.1.0");
+        std::fs::create_dir_all(&stage).unwrap();
+        let manifest = r#"
+[plugin]
+id = "bad-ui"
+name = "Bad UI"
+version = "0.1.0"
+
+[[ui_panels]]
+mount = "admin/plugins/bad-ui"
+entry = "ui/panel.js"
+"#;
+        std::fs::write(stage.join("plugin.toml"), manifest).unwrap();
+        // Intentionally NOT creating stage/ui/panel.js.
+
+        let err = host.install(&stage).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ui_panels") && msg.contains("missing"),
+            "error must mention ui_panels + missing entry; got: {msg}",
+        );
+        // And no DB row should have been written.
+        assert!(host.get_row("bad-ui").unwrap().is_none());
+    }
+
+    /// The opposite case: a manifest that declares a UI panel AND
+    /// ships the entry file must install cleanly.
+    #[tokio::test]
+    async fn install_accepts_when_ui_panel_entry_is_present() {
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
+
+        let stage = stage_root.path().join("good-ui-0.1.0");
+        std::fs::create_dir_all(stage.join("ui")).unwrap();
+        let manifest = r#"
+[plugin]
+id = "good-ui"
+name = "Good UI"
+version = "0.1.0"
+
+[[ui_panels]]
+mount = "admin/plugins/good-ui"
+entry = "ui/panel.js"
+"#;
+        std::fs::write(stage.join("plugin.toml"), manifest).unwrap();
+        std::fs::write(
+            stage.join("ui").join("panel.js"),
+            b"export default function panel() {}",
+        )
+        .unwrap();
+
+        let row = host
+            .install(&stage)
+            .await
+            .expect("install with present panel entry must succeed");
+        assert_eq!(row.plugin_id, "good-ui");
     }
 }
