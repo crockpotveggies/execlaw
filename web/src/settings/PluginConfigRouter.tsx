@@ -1,22 +1,31 @@
 // Per-plugin config page shell. URL: `/settings/plugins/:plugin_id`.
 //
-// Architecture:
+// Architecture (post-2026-05-14 self-containment refactor):
 //
 //   PluginConfigShell (THIS file — owns the chrome: header + danger zone)
-//     ├─ <Component {...PluginConfigProps} />   ← plugin's middle content
+//     ├─ <DynamicPluginPanel ... staticFallback={KNOWN_CONFIGS[id]} />
+//     │     └─ tries plugin's own ui/panel.js first; falls back to
+//     │        any hardcoded SPA page that hasn't migrated yet
 //     └─ DangerZone (Uninstall) — unconditional, plugin can't override
 //
-// Plugin authors implement a `(props: PluginConfigProps) => JSX.Element`
-// against the contract in `PluginConfigBase.tsx`. They render
-// whatever they want INSIDE the shell; they don't get to skip
-// the danger zone, render their own back button, or change the
-// "Uninstall" affordance. That keeps the plugin lifecycle UI
-// consistent across plugins and prevents a buggy/malicious
-// plugin from hiding its own uninstall.
+// Plugin authors ship `ui/panel.tsx` inside their ZIP — see
+// `web/src/plugins/types.ts` for the `PluginPanelComponent`
+// contract + `docs/plugins.md` for the authoring walkthrough.
+// The host's DynamicPluginPanel loads the plugin's `ui/panel.js`
+// at runtime (via authenticated fetch + Blob URL +
+// `import()`), passes the bridge (`globalThis.execlawHost`), and
+// renders the result.
 //
-// When the schema-driven `[[settings_fields]]` mechanism lands,
-// the fallback case here becomes a generic form renderer — the
-// shell stays unchanged.
+// Plugin authors cannot skip the Danger Zone — it's rendered
+// outside the plugin's panel in the shell below. Same goes for
+// the header (back button, plugin id, version, enabled badge).
+// That's the load-bearing containment invariant: every plugin
+// gets the same lifecycle UI, even if its own panel crashes.
+//
+// `KNOWN_CONFIGS` is a transitional fallback for plugins that
+// haven't yet migrated their config UI into the plugin ZIP. Each
+// entry is removed as the corresponding plugin is migrated; the
+// final state is an empty record (or the var deleted entirely).
 
 import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
@@ -30,6 +39,7 @@ import {
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
 import { DiscordConfigPage } from "./DiscordConfigPage";
+import { DynamicPluginPanel } from "./DynamicPluginPanel";
 import { GoogleAppsPage } from "./GoogleAppsPage";
 import { GoogleCalendarPage } from "./GoogleCalendarPage";
 import { GoogleContactsPage } from "./GoogleContactsPage";
@@ -42,10 +52,15 @@ import { SlackConfigPage } from "./SlackConfigPage";
 import { SmsSocketConfigPage } from "./SmsSocketConfigPage";
 import { WhatsAppConfigPage } from "./WhatsAppConfigPage";
 
-const KNOWN_CONFIGS: Record<string, PluginConfigComponent> = {
-    // Each new plugin with a custom config UI registers here.
-    // The component is wrapped by the shell below — it can't
-    // remove the danger zone or back button.
+/**
+ * Transitional fallback map. Each entry is a plugin whose UI has
+ * NOT yet been migrated into its own ZIP. The shell renders the
+ * fallback only when the dynamic load (from the plugin's
+ * `ui/panel.js`) 404s — i.e. when the plugin doesn't ship one yet.
+ * As each plugin is migrated, its entry is removed; the final
+ * state of this map is `{}` and the whole import block goes away.
+ */
+const STATIC_FALLBACKS: Record<string, PluginConfigComponent> = {
     discord: DiscordConfigPage,
     "google-apps": GoogleAppsPage,
     "google-contacts": GoogleContactsPage,
@@ -70,7 +85,7 @@ export function PluginConfigRouter() {
     // upstream) and would cause the inner component to fire
     // /api/admin/oauth/clients/undefined/controller requests.
     const idLooksValid = id.length > 0 && id !== "undefined" && id !== "null";
-    const Component = idLooksValid ? KNOWN_CONFIGS[id] : undefined;
+    const StaticFallback = idLooksValid ? STATIC_FALLBACKS[id] : undefined;
 
     const [summary, setSummary] = useState<PluginSummary | "loading" | null>(
         "loading",
@@ -159,27 +174,32 @@ export function PluginConfigRouter() {
                         again.
                     </div>
                 </div>
-            ) : Component ? (
-                <Component
+            ) : (
+                <DynamicPluginPanel
                     pluginId={id}
                     pluginVersion={
-                        summary && summary !== "loading" ? summary.version : ""
+                        summary && summary !== "loading"
+                            ? summary.version
+                            : ""
                     }
+                    pluginDisplayName={id}
                     onConfigChanged={refresh}
+                    staticFallback={
+                        StaticFallback
+                            ? () => (
+                                  <StaticFallback
+                                      pluginId={id}
+                                      pluginVersion={
+                                          summary && summary !== "loading"
+                                              ? summary.version
+                                              : ""
+                                      }
+                                      onConfigChanged={refresh}
+                                  />
+                              )
+                            : undefined
+                    }
                 />
-            ) : (
-                <div className="execlaw-card">
-                    <div className="execlaw-card__title">
-                        <i className="bi bi-info-circle me-2" aria-hidden />
-                        No configuration UI available
-                    </div>
-                    <div className="execlaw-muted small">
-                        The plugin <code>{id}</code> doesn't ship a custom
-                        configuration form. Future manifest-declared{" "}
-                        <code>[[settings_fields]]</code> will populate this
-                        view automatically.
-                    </div>
-                </div>
             )}
 
             {/* Danger zone — owned by the shell, always rendered. The
