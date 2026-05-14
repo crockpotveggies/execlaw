@@ -240,6 +240,69 @@ impl<'db> AttachmentStore<'db> {
         })
     }
 
+    /// Purge every artifact owned by `plugin_id` — both the DB row and,
+    /// when no other row still references the same on-disk path
+    /// (content-addressed dedupe), the file itself.
+    ///
+    /// Used by the plugin lifecycle's `purge` path (SPA uninstall +
+    /// factory reset) to make "remove this plugin" a true clean-slate
+    /// operation. Mirrors `sweep_expired_plugin_artifacts` but scoped by
+    /// `plugin_id` instead of `expires_at`; the dedupe-aware
+    /// "only delete the blob when refcount hits zero" logic is the same.
+    ///
+    /// Returns the number of `state_artifacts` rows removed. A plugin
+    /// that never minted any artifacts is a no-op `Ok(0)`. Idempotent —
+    /// calling twice for the same `plugin_id` returns 0 on the second
+    /// call.
+    pub fn purge_artifacts_for_plugin(&self, plugin_id: &str) -> Result<usize, DbError> {
+        let rows: Vec<(String, String)> = self.db.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, path FROM state_artifacts WHERE plugin_id = ?1",
+            )?;
+            let iter = stmt.query_map(params![plugin_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for row in iter {
+                out.push(row?);
+            }
+            Ok(out)
+        })?;
+        let mut removed = 0usize;
+        for (id, path) in rows {
+            let id_for_delete = id.clone();
+            self.db.with_conn(|c| {
+                c.execute(
+                    "DELETE FROM state_artifacts WHERE id = ?1",
+                    params![id_for_delete],
+                )?;
+                Ok(())
+            })?;
+            // Refcount-aware blob delete: only unlink the on-disk file
+            // when no surviving `state_artifacts` row points at the
+            // same `path`. Two plugins emitting identical chart bytes
+            // share one blob; uninstalling one must not break the
+            // other.
+            let still_used: i64 = self.db.with_conn(|c| {
+                let n: i64 = c
+                    .query_row(
+                        "SELECT COUNT(*) FROM state_artifacts WHERE path = ?1",
+                        params![path.clone()],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                Ok(n)
+            })?;
+            if still_used == 0 {
+                // Best-effort delete — missing file is fine (already
+                // GC'd, never written due to dedupe race, etc).
+                let _ = std::fs::remove_file(&path);
+            }
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
     /// Sweep expired plugin artifacts. Removes rows whose `expires_at`
     /// is in the past (relative to `now`) AND deletes the on-disk file
     /// for each — but only when no OTHER row still references the same
@@ -470,5 +533,99 @@ mod tests {
             .sweep_expired_plugin_artifacts(1_700_000_000 + 11)
             .unwrap();
         assert_eq!(again, 0);
+    }
+
+    /// The plugin-lifecycle `purge` path calls `purge_artifacts_for_plugin`
+    /// to wipe one plugin's artifacts. Other plugins' rows + blobs must
+    /// survive. The refcount-aware blob delete must NOT unlink a file
+    /// still pointed at by another row.
+    #[test]
+    fn purge_artifacts_for_plugin_wipes_only_that_plugin_and_respects_dedupe() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let store = AttachmentStore::new(&db);
+        let tmp = tempfile::tempdir().unwrap();
+
+        // open-meteo writes two distinct artifacts (different bytes).
+        // weather-station writes one artifact with IDENTICAL bytes to
+        // open-meteo's chart-a — dedupe shares the blob across plugins.
+        let chart_a = store
+            .insert_plugin_artifact(
+                tmp.path(),
+                "open-meteo",
+                "chart-a.png",
+                "image/png",
+                b"shared-chart-bytes",
+                None,
+                1,
+            )
+            .unwrap();
+        let chart_b = store
+            .insert_plugin_artifact(
+                tmp.path(),
+                "open-meteo",
+                "chart-b.png",
+                "image/png",
+                b"open-meteo-only-bytes",
+                None,
+                2,
+            )
+            .unwrap();
+        let other_plugin_share = store
+            .insert_plugin_artifact(
+                tmp.path(),
+                "weather-station",
+                "ws-chart.png",
+                "image/png",
+                b"shared-chart-bytes",
+                None,
+                3,
+            )
+            .unwrap();
+        // Confirm starting dedupe state.
+        let row_a = store.get_artifact(&chart_a.attachment_id).unwrap().unwrap();
+        let row_share = store
+            .get_artifact(&other_plugin_share.attachment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row_a.path, row_share.path,
+            "shared bytes must point at the same blob",
+        );
+        let shared_blob_path = row_a.path.clone();
+        let unique_blob_path = store
+            .get_artifact(&chart_b.attachment_id)
+            .unwrap()
+            .unwrap()
+            .path;
+        assert!(std::path::Path::new(&shared_blob_path).exists());
+        assert!(std::path::Path::new(&unique_blob_path).exists());
+
+        // Purge open-meteo. Expected:
+        //   * chart_a row gone, chart_b row gone, ws-chart row survives.
+        //   * unique_blob_path file gone (no surviving row).
+        //   * shared_blob_path file STAYS (ws-chart still references it).
+        let removed = store.purge_artifacts_for_plugin("open-meteo").unwrap();
+        assert_eq!(removed, 2);
+        assert!(store.get_artifact(&chart_a.attachment_id).unwrap().is_none());
+        assert!(store.get_artifact(&chart_b.attachment_id).unwrap().is_none());
+        assert!(
+            store
+                .get_artifact(&other_plugin_share.attachment_id)
+                .unwrap()
+                .is_some(),
+            "other plugins' rows must survive",
+        );
+        assert!(
+            !std::path::Path::new(&unique_blob_path).exists(),
+            "unique blob must be unlinked once refcount hits zero",
+        );
+        assert!(
+            std::path::Path::new(&shared_blob_path).exists(),
+            "shared blob must survive — weather-station still references it",
+        );
+
+        // Idempotent — second call returns 0.
+        assert_eq!(store.purge_artifacts_for_plugin("open-meteo").unwrap(), 0);
     }
 }

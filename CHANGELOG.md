@@ -12,6 +12,64 @@ this changelog is for operators and plugin authors who want to see the
 
 ## [Unreleased]
 
+### Added
+
+- **Plugin-lifecycle `purge` orchestration** —
+  `crates/server/src/plugin_lifecycle.rs` is a new module that chains
+  every per-plugin teardown step in one load-bearing order:
+
+    1. `PluginHost::disable` fires the plugin's `on_disable` Rhai hook
+       while its OAuth tokens, vault secrets, and transport bindings are
+       still readable — so a well-behaved plugin can revoke an upstream
+       OAuth grant or send a "going offline" message on its transport.
+    2. `SidecarSupervisor::remove_for_plugin` stops + `docker rm -f`'s
+       every container the plugin owns AND recursively deletes its
+       per-plugin state root at `~/.execlaw/sidecars/<plugin_id>/`. The
+       state-dir delete is the gap that earlier `stop_all` left behind:
+       a re-install silently inherited signal-cli's keystore /
+       wuzapi's session DB.
+    3. OAuth tokens + clients, plugin artifacts (with refcount-aware
+       blob delete), and vault secrets for the plugin are deleted by
+       their respective stores' new `delete_for_plugin` /
+       `purge_artifacts_for_plugin` methods.
+    4. `PluginHost::uninstall` archives plugin-shipped skills, deletes
+       the `state_plugins` row, and removes the staged plugin dir.
+
+  Two callers consume the orchestrator:
+
+    * `DELETE /api/admin/plugins/{id}` — the SPA's "Uninstall plugin"
+      button now produces a true clean slate instead of leaving orphan
+      Docker containers, state dirs, OAuth grants, vault secrets, and
+      artifact blobs behind. Response shape changed from `{"ok": true}`
+      to a `PluginPurgeReport` JSON body with per-resource counts.
+    * `POST /api/admin/factory-reset` — enumerates every installed
+      plugin via `PluginHost::list_rows`, runs `purge_plugin` for each,
+      then sweeps top-level orphan dirs (`~/.execlaw/sidecars`,
+      `~/.execlaw/plugin_artifacts`, `~/.execlaw/plugins`,
+      `~/.execlaw/research`) before the DB file is rebuilt. Response
+      body grew `plugins_purged: Vec<PluginPurgeReport>` and
+      `orphan_dirs_removed: Vec<String>`; the old opaque
+      `plugins_torn_down` / `sidecars_stopped` counters are replaced.
+
+- **`OauthClientStore::delete_for_plugin` + `OauthTokenStore::delete_for_plugin`**
+  (`crates/core/src/oauth.rs`) — bulk delete every OAuth grant owned by
+  a `plugin_id`. Tokens already cascade from clients via the FK; the
+  explicit token-delete is a defensive safety-net for hand-edited DBs.
+- **`AttachmentStore::purge_artifacts_for_plugin`**
+  (`crates/core/src/attachments.rs`) — wipe every `state_artifacts`
+  row for a plugin AND (refcount-aware) unlink the underlying blobs
+  on disk. Two plugins emitting identical chart bytes share one blob;
+  uninstalling one must not break the other — pinned by test.
+- **`VaultRowStore::delete_for_plugin`**
+  (`crates/core/src/vault_row.rs`) — drop a plugin's `vault_secrets`
+  rows. Core-scope rows (`plugin_id IS NULL`) are never touched —
+  pinned by test.
+- **`SidecarSupervisor::remove_for_plugin`**
+  (`crates/server/src/sidecar_supervisor.rs`) — per-plugin variant of
+  `stop_all`. Stops + removes every container matching the plugin
+  AND deletes `~/.execlaw/sidecars/<plugin_id>/`. Returns a
+  `SidecarRemovalReport`. Other plugins' state is untouched.
+
 ### Fixed
 
 - **Factory reset now produces an actual factory state.** The previous

@@ -2,44 +2,60 @@
 //!
 //! Surfaced as the "Danger zone" at the bottom of Settings → General. The
 //! operator types a literal confirmation string ("RESET") into the SPA;
-//! the SPA POSTs it here, the handler clears every non-system table in a
-//! single transaction, then re-seeds the singleton `config_general` row
-//! so the very next request still has its default state without a
-//! migration re-run.
+//! the SPA POSTs it here, the handler purges every installed plugin's
+//! resources (containers, state dirs, OAuth, vault, artifacts, stage
+//! dirs), sweeps any remaining orphan filesystem state, then deletes
+//! and re-creates the SQLite database file.
 //!
-//! Teardown ordering (2026-05-13 rework — was DB-wipe-only before):
+//! Teardown ordering (2026-05-14 rework — now per-plugin lifecycle):
 //!
-//!   1. **`fire_on_disable_for_all`** — every loaded script plugin gets a
-//!      last chance to run its own cleanup (revoke OAuth refresh tokens,
-//!      send a "going offline" notification on its transport, flush
-//!      in-memory state to vault). Best-effort; a misbehaving plugin
-//!      cannot block the reset.
-//!   2. **`SidecarSupervisor::stop_all`** — every running sidecar
-//!      container (signal-cli, wuzapi/whatsapp, …) is stopped via
-//!      docker. Without this step the wipe leaves orphaned containers
-//!      running under their pre-reset names/ports, which then collide
-//!      with the next install. This is the bug that prompted the
-//!      rework: WhatsApp's wuzapi container survived a factory reset
-//!      and refused to start fresh on the next install.
-//!   3. **DB wipe** — every non-system SQLite table is truncated in a
-//!      single transaction with `defer_foreign_keys = ON`. Re-seeds
-//!      `config_general` so the very next API request has its default
-//!      singleton row without waiting on a migration re-run.
+//!   1. **`purge_all_plugins`** — for every installed plugin, run the
+//!      full `purge` lifecycle (`plugin_lifecycle::purge_plugin`):
+//!
+//!        a. `PluginHost::disable` (fires `on_disable` hook while the
+//!           plugin still has access to its OAuth tokens + transport
+//!           bindings — lets a well-behaved plugin send a final
+//!           "going offline" message, revoke an upstream OAuth grant).
+//!        b. `SidecarSupervisor::remove_for_plugin` (stop + docker
+//!           rm -f every container the plugin owns AND `rm -rf` its
+//!           `~/.execlaw/sidecars/<plugin_id>/` state root).
+//!        c. Delete plugin-scoped DB rows: `state_oauth_tokens`,
+//!           `state_oauth_clients`, `state_artifacts`, `vault_secrets`
+//!           (with refcount-aware blob deletion for artifacts).
+//!        d. `PluginHost::uninstall` (archive skills, delete the
+//!           `state_plugins` row, remove the staged plugin dir).
+//!
+//!      This is the load-bearing step that closes the
+//!      "WhatsApp/Signal container + state survives factory reset"
+//!      class of bugs. The earlier `stop_all` path only stopped
+//!      containers; it didn't touch `~/.execlaw/sidecars/`, leaving
+//!      signal-cli's keystore + wuzapi's session DB in place for the
+//!      next install to silently inherit.
+//!
+//!   2. **Orphan-directory sweep** — `rm -rf` the on-disk directories
+//!      that no plugin claimed: `~/.execlaw/sidecars/`,
+//!      `~/.execlaw/plugin_artifacts/`, `~/.execlaw/plugins/`,
+//!      `~/.execlaw/research/`. Catches anything the per-plugin
+//!      purges missed (sidecar dir for a plugin whose state_plugins
+//!      row was hand-edited away, research workspaces from cancelled
+//!      jobs, partial uploads, etc.).
+//!
+//!   3. **DB rebuild** — `Database::rebuild_to_empty` closes the
+//!      connection, deletes the `.db` + `-wal` + `-shm` + `-journal`
+//!      files, opens a fresh empty file at the same path with the
+//!      same encryption posture. Then `MigrationRunner::apply_all`
+//!      re-creates schema + re-fires every migration-seeded singleton
+//!      (config_general, config_personality, config_research, ...).
 //!
 //! Scope:
 //!
-//!   * Wipes ONLY persistent SQLite state + sidecar containers + the
-//!     plugin lifecycle hook. In-memory caches (refresh tokens, plugin
-//!     host registry, runner / backend supervisors, mcp host, voice
-//!     sessions) are NOT touched — the operator should restart the
-//!     host service after a factory reset for full hygiene. The SPA
-//!     shows that recommendation alongside the success state.
-//!
-//!   * Filesystem artifacts (research workspaces, plugin staging dir,
-//!     attachments, sidecar bind-mounts) are NOT removed. A future
-//!     iteration can cover those, but a v1 wipe of DB + containers is
-//!     enough for a "go back to a clean slate" operator workflow —
-//!     the next setup wizard will happily reuse the same paths.
+//!   * In-memory caches (refresh tokens, plugin host registry, runner /
+//!     backend supervisors, mcp host, voice sessions) survive the
+//!     reset; the operator should restart the host service for full
+//!     hygiene. The SPA surfaces this in the post-reset toast.
+//!   * Sidecar Docker *images* (bbernhard/signal-cli-rest-api, …) are
+//!     left in the local Docker cache — re-pulling on next install
+//!     would waste bandwidth for no security benefit.
 //!
 //! The endpoint is Controller-only and idempotent — calling it twice
 //! is harmless. The first call destroys the caller's session (the
@@ -49,6 +65,7 @@
 //! /setup.
 
 use crate::auth_extract::AuthedUser;
+use crate::plugin_lifecycle::{PluginPurgeReport, purge_all_plugins};
 use crate::routes::ApiError;
 use crate::state::AppState;
 use axum::Router;
@@ -74,29 +91,27 @@ pub struct FactoryResetRequest {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FactoryResetResponse {
-    /// Number of user tables dropped + re-created during the reset.
-    /// Matches the count of non-`sqlite_*` tables present at the
-    /// moment the wipe ran; equivalent to "every table the migration
-    /// set declares."
+    /// Number of tables present in the rebuilt DB. Matches the count
+    /// of `CREATE TABLE` statements the migration set runs; equivalent
+    /// to "every table the migration set declares."
     pub tables_wiped: usize,
-    /// Number of migrations re-applied after the drop. On a healthy
+    /// Number of migrations re-applied after the rebuild. On a healthy
     /// install this equals the length of the embedded migration set
     /// (currently 2: baseline + plugin_artifacts). A different count
     /// here means either a partial migration history or a future
     /// addition not yet run — log it loudly.
     #[serde(default)]
     pub migrations_reapplied: usize,
-    /// Number of plugins whose `on_disable` lifecycle hook fired
-    /// without erroring. Excludes plugins that don't declare the
-    /// hook. Zero is fine — most plugins have nothing to tear down
-    /// beyond what the host's `shutdown()` backstop handles.
-    #[serde(default)]
-    pub plugins_torn_down: usize,
-    /// Number of sidecar containers stopped during the reset.
-    /// Operators with WhatsApp / Signal sidecars should see this
-    /// > 0; tool-only deployments see 0.
-    #[serde(default)]
-    pub sidecars_stopped: usize,
+    /// Per-plugin teardown reports — one entry per installed plugin.
+    /// Carries containers removed, on-disk state cleared, OAuth/vault
+    /// rows deleted, etc. so the SPA can show "wiped these N plugins:
+    /// signal (1 container, 12.4 MB), whatsapp (1 container, 4.1 MB)"
+    /// instead of just a count.
+    pub plugins_purged: Vec<PluginPurgeReport>,
+    /// On-disk directory paths the sweep step recursively removed (paths
+    /// that no plugin claimed: research workspaces from cancelled jobs,
+    /// stage dirs for plugins with hand-edited DB rows, etc.).
+    pub orphan_dirs_removed: Vec<String>,
     /// Operator-facing reminder — the in-memory caches are stale
     /// until the host service restarts, so we surface this in the
     /// response body too.
@@ -129,41 +144,44 @@ pub async fn factory_reset_handler(
         });
     }
 
-    // Step 1 — fire `on_disable` for every loaded script plugin so
-    // each one gets a last chance to revoke OAuth tokens, send
-    // farewell notifications on its transport, flush state, etc.
-    // BEFORE the rug-pull. Best-effort: a panicking hook is logged
-    // but doesn't block the reset.
-    let plugins_torn_down = state.plugin_host.fire_on_disable_for_all().await;
+    // Step 1 — run the per-plugin purge lifecycle against every
+    // installed plugin. This is the load-bearing step that gives an
+    // operator a *real* clean slate (containers, on-disk state
+    // dirs, OAuth grants, vault secrets, artifact blobs, stage dirs
+    // all gone — see plugin_lifecycle module docs for the ordering
+    // rationale). Tool-only plugins purge cleanly too; the
+    // sidecar-removal step is a no-op for them.
+    //
+    // We do this FIRST, before any DB nuke, because the per-plugin
+    // routines need `state_plugins.stage_path`, the OAuth/vault FKs,
+    // and the registry's `RegisteredSidecar.plugin_id` field — all
+    // gone after `rebuild_to_empty`. Best-effort by design: errors
+    // are captured in each `PluginPurgeReport.errors` and the loop
+    // continues.
+    let plugins_purged = purge_all_plugins(&state).await;
     tracing::info!(
         target: "factory_reset",
-        plugins_torn_down,
-        "fired on_disable for loaded script plugins",
+        plugin_count = plugins_purged.len(),
+        "plugin purges complete",
     );
 
-    // Step 2 — stop every running sidecar container. Without this
-    // the wipe leaves orphans (the WhatsApp wuzapi container survived
-    // factory reset and refused to start fresh on the next install —
-    // that's the bug this rework is fixing). `stop_all` returns the
-    // count actually stopped; missing supervisor (tests, no-docker
-    // dev builds) is OK — just skip the step.
-    let sidecars_stopped = match &state.sidecar_supervisor {
-        Some(sup) => sup.stop_all().await,
-        None => 0,
-    };
+    // Step 2 — orphan-directory sweep. Some on-disk state isn't
+    // attributed to a specific plugin (research workspaces, stage
+    // dirs for plugins with hand-edited state_plugins rows, partial
+    // uploads). Recursively `rm -rf` the parent dirs that the
+    // per-plugin purges may have left non-empty so the
+    // factory-reset response body can promise "nothing on disk
+    // survived."
+    let orphan_dirs_removed = sweep_orphan_directories();
     tracing::info!(
         target: "factory_reset",
-        sidecars_stopped,
-        "stopped sidecar containers",
+        dirs_removed = orphan_dirs_removed.len(),
+        "orphan directory sweep complete",
     );
 
-    // Step 3 — blow away the DB at the file level (close the
-    // connection, delete the .db / -wal / -shm / -journal files,
-    // re-open empty), then re-run migrations from scratch. Done last
-    // so the on_disable hooks above can still read vault rows /
-    // OAuth tokens / personality config while running their cleanup.
-    // Once this returns the row backing the caller's JWT is gone and
-    // the SPA must redirect to /login.
+    // Step 3 — rebuild the DB at the file level. After this returns
+    // Ok, the row backing the caller's JWT is gone and the SPA
+    // must redirect to /login.
     let (tables_wiped, migrations_reapplied) =
         wipe_and_remigrate(&state.db, &state.db_config).map_err(|e| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -174,10 +192,69 @@ pub async fn factory_reset_handler(
     Ok(Json(FactoryResetResponse {
         tables_wiped,
         migrations_reapplied,
-        plugins_torn_down,
-        sidecars_stopped,
+        plugins_purged,
+        orphan_dirs_removed,
         restart_recommended: true,
     }))
+}
+
+/// Recursively remove the top-level `~/.execlaw/` subdirectories that
+/// hold plugin / runtime / research state. Per-plugin purges (step 1
+/// of factory reset) already remove what they can attribute to a
+/// known `plugin_id`; this is the cleanup pass for everything else:
+///
+///   * `~/.execlaw/sidecars/`  — any sidecar state dir whose plugin
+///                               had its `state_plugins` row hand-
+///                               edited away (so the purge step
+///                               couldn't find it).
+///   * `~/.execlaw/plugins/`   — staged plugin ZIPs (future home,
+///                               currently unused but reserved).
+///   * `~/.execlaw/plugin_artifacts/` — content-addressed artifact
+///                               blobs whose `state_artifacts` row
+///                               survived a crash or hand-edit.
+///   * `~/.execlaw/research/`  — research-job workspaces (one dir
+///                               per job; cleaned by job lifecycle
+///                               normally but cancelled / orphaned
+///                               jobs leave dirs behind).
+///
+/// Returns the absolute paths actually removed (so the operator can
+/// verify what disappeared). A dir that didn't exist returns
+/// nothing; a dir that failed to delete is logged at WARN and
+/// omitted from the return value.
+fn sweep_orphan_directories() -> Vec<String> {
+    use directories::UserDirs;
+    let home = match UserDirs::new() {
+        Some(d) => d.home_dir().to_path_buf(),
+        None => return Vec::new(),
+    };
+    let base = home.join(".execlaw");
+    let candidates = ["sidecars", "plugins", "plugin_artifacts", "research"];
+    let mut removed = Vec::new();
+    for c in candidates {
+        let path = base.join(c);
+        if !path.exists() {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                tracing::info!(
+                    target: "factory_reset",
+                    path = %path.display(),
+                    "removed orphan directory",
+                );
+                removed.push(path.display().to_string());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "factory_reset",
+                    path = %path.display(),
+                    error = %e,
+                    "failed to remove orphan directory — manual cleanup may be needed",
+                );
+            }
+        }
+    }
+    removed
 }
 
 /// True factory reset: close the SQLite connection, delete the on-
@@ -403,17 +480,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_includes_teardown_counts_in_body() {
-        // Regression for the 2026-05-13 teardown rework: the
-        // response body must surface `plugins_torn_down` +
-        // `sidecars_stopped` so the SPA can show a meaningful
-        // "wiped X tables, stopped Y containers, fired Z plugin
-        // teardowns" toast instead of just "tables_wiped".
+    async fn response_includes_plugin_lifecycle_fields() {
+        // Regression for the 2026-05-14 per-plugin lifecycle rework:
+        // the response body must surface `plugins_purged` (Vec<...>)
+        // and `orphan_dirs_removed` (Vec<String>) so the SPA can show
+        // "wiped these plugins: signal (1 container, 12.4 MB),
+        // whatsapp (1 container, 4.1 MB) + cleaned 3 orphan dirs"
+        // instead of opaque counters.
         //
-        // In the test harness no plugins are installed and no
-        // sidecar supervisor is wired, so the counts are 0/0 —
-        // but the fields MUST exist in the JSON response (the
-        // SPA can't render them otherwise). This pins the contract.
+        // The test harness installs no plugins and wires no sidecar
+        // supervisor, so `plugins_purged` is an empty array and
+        // `orphan_dirs_removed` is an empty array (no real
+        // `~/.execlaw/*` paths exist in CI) — but the fields MUST
+        // exist in the JSON response (the SPA can't render them
+        // otherwise). This pins the contract.
         let state = test_app_state();
         let app = build_router(state.clone());
         let tok = setup_controller_token(&app).await;
@@ -432,16 +512,25 @@ mod tests {
         let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(
-            v.get("plugins_torn_down").is_some(),
-            "response must include plugins_torn_down: {v}",
+            v.get("plugins_purged").is_some(),
+            "response must include plugins_purged: {v}",
         );
         assert!(
-            v.get("sidecars_stopped").is_some(),
-            "response must include sidecars_stopped: {v}",
+            v["plugins_purged"].is_array(),
+            "plugins_purged must be a JSON array, got: {}",
+            v["plugins_purged"],
         );
-        // No supervisor + no plugins in the test harness → both 0.
-        assert_eq!(v["plugins_torn_down"], 0);
-        assert_eq!(v["sidecars_stopped"], 0);
+        assert!(
+            v.get("orphan_dirs_removed").is_some(),
+            "response must include orphan_dirs_removed: {v}",
+        );
+        assert!(
+            v["orphan_dirs_removed"].is_array(),
+            "orphan_dirs_removed must be a JSON array, got: {}",
+            v["orphan_dirs_removed"],
+        );
+        // No plugins installed in the harness → empty arrays.
+        assert_eq!(v["plugins_purged"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]

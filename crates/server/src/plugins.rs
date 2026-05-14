@@ -417,28 +417,35 @@ pub async fn uninstall_handler(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
 ) -> impl IntoResponse {
-    match state.plugin_host.uninstall(&plugin_id).await {
-        Ok(()) => {
-            // Same shape as disable: every owned tool gets
-            // `removed_at` so the SPA's tools panel + the dispatch
-            // gate both immediately reflect the removal.
-            let now = chrono::Utc::now().timestamp();
-            if let Err(e) = crate::tool_sync::mark_plugin_tools_removed(
-                &state.db,
-                &plugin_id,
-                &state.plugin_host,
-                now,
-            ) {
-                tracing::warn!(
-                    plugin_id = %plugin_id,
-                    error = %e,
-                    "mark_plugin_tools_removed failed on uninstall",
-                );
-            }
-            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
-        }
-        Err(e) => plugin_error_response(e),
+    // 2026-05-14 — switched from `plugin_host.uninstall` (DB-row +
+    // stage-dir only) to the full lifecycle `purge_plugin`. The
+    // previous path left orphan sidecar containers (WhatsApp
+    // wuzapi survived reinstall and refused to start because its
+    // container name + port were already taken), orphan OAuth
+    // grants, orphan vault secrets, and orphan artifact blobs.
+    // `purge_plugin` runs the full ordered teardown documented in
+    // `plugin_lifecycle` — fire on_disable → stop+remove sidecar
+    // containers → rm state dirs → delete OAuth/vault/artifact
+    // rows → uninstall (archive skills + delete state_plugins row +
+    // rm stage dir). The tool-sync `mark_plugin_tools_removed` is
+    // baked into `purge_plugin` after its uninstall step, so the
+    // SPA tools panel + dispatch gate still reflect the removal.
+    let report = crate::plugin_lifecycle::purge_plugin(&state, &plugin_id).await;
+    // The lifecycle orchestrator is best-effort: a missing plugin
+    // (already uninstalled) returns `uninstalled = false` with no
+    // errors and that's a valid idempotent 200. A true failure
+    // surfaces in `report.errors`; we still return 200 with the
+    // report so the SPA can show partial-teardown context, but log
+    // any error entries at WARN for ops visibility.
+    if !report.errors.is_empty() {
+        tracing::warn!(
+            target: "plugins::uninstall",
+            plugin_id = %plugin_id,
+            errors = ?report.errors,
+            "plugin uninstall completed with errors",
+        );
     }
+    (StatusCode::OK, Json(report)).into_response()
 }
 
 /// `GET /api/admin/plugins/tools` — union of all live plugin tools.

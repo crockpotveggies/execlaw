@@ -309,6 +309,126 @@ impl SidecarSupervisor {
         stopped
     }
 
+    /// Remove every sidecar belonging to `plugin_id`: stop + `docker
+    /// rm -f` each running container, clear the slot map entries, and
+    /// `rm -rf` the per-plugin state root at
+    /// `~/.execlaw/sidecars/<plugin_id>/`.
+    ///
+    /// Distinct from `stop_all`:
+    ///
+    ///   * Scoped to one plugin (uninstall / factory-reset-per-plugin),
+    ///     not "every sidecar on the host".
+    ///   * Deletes the on-disk state directory after stopping. Without
+    ///     this step a re-install would silently inherit the prior
+    ///     plugin's keystore, account DB, paired-device list, etc. —
+    ///     not "factory" semantics.
+    ///   * Also removes the slot entry from the registry-backed slot
+    ///     map so the next reconcile tick won't try to re-spawn it.
+    ///     `stop_all` does the same for the global case; this is the
+    ///     per-plugin variant.
+    ///
+    /// Caller contract: the plugin's `RegisteredSidecar` entries
+    /// should already have been pulled from `HookRegistry` (e.g. via
+    /// `registry.disable(plugin_id)`) before calling this — otherwise
+    /// the reconcile loop will re-create the sidecar on the next tick.
+    /// `PluginHost::disable` does that disable as its first step, and
+    /// the orchestrator (`plugin_lifecycle::purge_plugin`) chains the
+    /// two so order is correct by construction.
+    ///
+    /// All operations are best-effort: a failed `docker stop` or
+    /// `remove_dir_all` is logged at WARN but doesn't short-circuit
+    /// the remaining work. The returned `SidecarRemovalReport`
+    /// surfaces what actually happened so the caller can include it
+    /// in the operator-facing factory-reset / uninstall response.
+    pub async fn remove_for_plugin(&self, plugin_id: &str) -> SidecarRemovalReport {
+        let mut slots = self.slots.lock().await;
+        // Snapshot first so we don't mutate while iterating.
+        let owned: Vec<String> = slots
+            .iter()
+            .filter_map(|(name, slot)| {
+                (slot.registered.plugin_id == plugin_id).then(|| name.clone())
+            })
+            .collect();
+
+        let mut containers_removed = 0usize;
+        let mut sidecars_visited = 0usize;
+        for name in owned {
+            sidecars_visited += 1;
+            let Some(mut slot) = slots.remove(&name) else {
+                continue;
+            };
+            let was_running = slot.handle.is_some();
+            if let Some(handle) = slot.handle.take() {
+                info!(
+                    sidecar = %name,
+                    plugin_id = %plugin_id,
+                    "stopping + removing sidecar container for plugin teardown",
+                );
+                // ServiceController::stop is documented to "stop AND
+                // remove" the container — docker rm -f semantics. No
+                // separate remove step needed.
+                if let Err(e) = self.controller.stop(&handle).await {
+                    warn!(
+                        sidecar = %name,
+                        plugin_id = %plugin_id,
+                        error = %e,
+                        "controller.stop failed during remove_for_plugin — container may be orphaned",
+                    );
+                } else {
+                    containers_removed += 1;
+                }
+            }
+            if was_running && let Some(bus) = &self.bus {
+                bus.publish(UiEvent::SidecarStatusChanged {
+                    name: name.clone(),
+                    status: format!("{:?}", ServiceStatus::Stopped),
+                });
+            }
+        }
+        // Drop the mutex before any filesystem work — `rm -rf` of the
+        // state dir may take a beat for plugins with sizeable
+        // keystores (signal-cli's protocol-store can be hundreds of
+        // MB) and we'd rather not hold the slots lock against the
+        // reconcile loop while that happens.
+        drop(slots);
+
+        let state_root = plugin_state_root(plugin_id);
+        let state_dir_removed = if state_root.exists() {
+            match std::fs::remove_dir_all(&state_root) {
+                Ok(()) => {
+                    info!(
+                        plugin_id = %plugin_id,
+                        path = %state_root.display(),
+                        "removed plugin sidecar state root",
+                    );
+                    true
+                }
+                Err(e) => {
+                    warn!(
+                        plugin_id = %plugin_id,
+                        path = %state_root.display(),
+                        error = %e,
+                        "failed to remove plugin sidecar state root — manual cleanup may be needed",
+                    );
+                    false
+                }
+            }
+        } else {
+            // Plugin had no sidecars (tool-only plugin) or never
+            // reached spawn — the dir was never created. That's a
+            // valid clean state, not a failure.
+            false
+        };
+
+        SidecarRemovalReport {
+            plugin_id: plugin_id.to_owned(),
+            sidecars_visited,
+            containers_removed,
+            state_dir_removed,
+            state_dir_path: state_root.display().to_string(),
+        }
+    }
+
     /// Look up the published host port for a single supervised
     /// sidecar by name. Returns `Some(port)` only when the sidecar
     /// has been spawned at least once (the supervisor mints its
@@ -848,14 +968,52 @@ fn resolve_mounts(
 /// `~/.execlaw/sidecars/<plugin>/<sidecar>/` so an operator who
 /// uninstalls + reinstalls keeps their account state intact.
 fn state_dir_for(plugin_id: &str, sidecar_name: &str) -> std::path::PathBuf {
+    plugin_state_root(plugin_id).join(sidecar_name)
+}
+
+/// The per-plugin state root — one level above `state_dir_for`,
+/// containing every sidecar belonging to a single plugin. Used by
+/// `remove_for_plugin` to nuke the plugin's whole sidecar state in
+/// one `rm -rf` instead of walking each sidecar individually.
+///
+/// Layout reminder:
+///
+///   `~/.execlaw/sidecars/<plugin_id>/<sidecar_name>/...`
+///
+/// so `plugin_state_root("signal")` → `~/.execlaw/sidecars/signal/`
+/// and `rm -rf` of that path wipes signal-cli's keystore, account
+/// DB, paired-device list, attachment cache, everything.
+pub(crate) fn plugin_state_root(plugin_id: &str) -> std::path::PathBuf {
     use directories::UserDirs;
     let home = UserDirs::new()
         .map(|d| d.home_dir().to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    home.join(".execlaw")
-        .join("sidecars")
-        .join(plugin_id)
-        .join(sidecar_name)
+    home.join(".execlaw").join("sidecars").join(plugin_id)
+}
+
+/// Report of one `remove_for_plugin` call. Carried into the
+/// factory-reset / uninstall HTTP response so operators can verify
+/// the teardown actually did what the docs promise.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct SidecarRemovalReport {
+    /// The plugin whose sidecars were targeted.
+    pub plugin_id: String,
+    /// How many `RegisteredSidecar` slots matched the plugin (regardless
+    /// of whether their containers were actually running).
+    pub sidecars_visited: usize,
+    /// How many docker containers were successfully stopped+removed.
+    /// Lower than `sidecars_visited` when a sidecar was already
+    /// stopped or when `controller.stop` failed (the WARN-level log
+    /// has details).
+    pub containers_removed: usize,
+    /// True when `~/.execlaw/sidecars/<plugin_id>/` was successfully
+    /// recursively deleted. False when no sidecar state ever existed
+    /// (tool-only plugin) OR when the delete failed; the
+    /// `state_dir_path` field lets the operator follow up manually.
+    pub state_dir_removed: bool,
+    /// The exact filesystem path the supervisor tried to remove. Stable
+    /// across calls so operators / tests can reference it.
+    pub state_dir_path: String,
 }
 
 #[cfg(test)]
@@ -1034,6 +1192,135 @@ rpc_port = 8080
         let stopped_again = sup.stop_all().await;
         assert_eq!(stopped_again, 0);
         assert_eq!(mock.stop_count().await, 2, "second stop_all must not double-stop");
+    }
+
+    /// `remove_for_plugin` is the per-plugin variant of `stop_all`.
+    /// Scoped to a single plugin: containers OWNED by it are
+    /// stopped+removed, slots vanish from the slot map, and the
+    /// per-plugin state root at `~/.execlaw/sidecars/<plugin_id>/`
+    /// is recursively deleted. Other plugins' state is untouched.
+    ///
+    /// This is the load-bearing piece that closes the "WhatsApp
+    /// wuzapi container + session DB survives uninstall" class of
+    /// bugs.
+    #[tokio::test]
+    async fn remove_for_plugin_scopes_teardown_to_one_plugin_and_wipes_state_dir() {
+        // Use unique plugin ids per test run so the real
+        // ~/.execlaw/sidecars/ tree isn't molested. The IDs sit
+        // under a real path on disk; we create + assert against
+        // them explicitly.
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        );
+        let pid_target = format!("test-remove-target-{suffix}");
+        let pid_other = format!("test-remove-other-{suffix}");
+
+        let mock = Arc::new(MockServiceController::new());
+        let m_target = PluginManifest::parse(&format!(
+            r#"
+[plugin]
+id = "{pid_target}"
+name = "Tgt"
+version = "0.1.0"
+
+[[services]]
+name = "tgt-bus"
+image = "execlaw/test-tgt:0.1"
+
+[services.sidecar]
+rpc_port = 8080
+"#
+        ))
+        .unwrap();
+        let m_other = PluginManifest::parse(&format!(
+            r#"
+[plugin]
+id = "{pid_other}"
+name = "Oth"
+version = "0.1.0"
+
+[[services]]
+name = "oth-bus"
+image = "execlaw/test-oth:0.1"
+
+[services.sidecar]
+rpc_port = 8080
+"#
+        ))
+        .unwrap();
+        let reg = HookRegistry::new();
+        reg.enable(&m_target).unwrap();
+        reg.enable(&m_other).unwrap();
+        let sup = SidecarSupervisor::new(mock.clone(), reg);
+
+        // Spawn both. spawn_count → 2.
+        sup.reconcile_once().await;
+        assert_eq!(mock.spawn_count().await, 2);
+
+        // Pre-create a state dir for the target plugin so we can
+        // assert it disappears. The mock controller doesn't write
+        // here itself — production sidecars do via the
+        // `state://data` mount resolution path. We seed it manually
+        // for the test.
+        let target_root = plugin_state_root(&pid_target);
+        let target_marker = target_root.join("tgt-bus").join("keystore.db");
+        std::fs::create_dir_all(target_marker.parent().unwrap()).unwrap();
+        std::fs::write(&target_marker, b"fake-keystore").unwrap();
+        assert!(target_marker.exists(), "test setup: state dir must exist before remove");
+
+        // Likewise for the OTHER plugin, so we can assert it
+        // survives the targeted removal.
+        let other_root = plugin_state_root(&pid_other);
+        let other_marker = other_root.join("oth-bus").join("session.db");
+        std::fs::create_dir_all(other_marker.parent().unwrap()).unwrap();
+        std::fs::write(&other_marker, b"untouched").unwrap();
+
+        let report = sup.remove_for_plugin(&pid_target).await;
+
+        // The target plugin's container was running → it was stopped.
+        // The other plugin's container is untouched in the slot map.
+        assert_eq!(report.plugin_id, pid_target);
+        assert_eq!(report.sidecars_visited, 1);
+        assert_eq!(report.containers_removed, 1);
+        assert!(
+            report.state_dir_removed,
+            "report must record successful state dir removal; path={}",
+            report.state_dir_path,
+        );
+        assert!(
+            !target_root.exists(),
+            "target plugin's state root must be gone after remove_for_plugin",
+        );
+        assert!(
+            other_marker.exists(),
+            "OTHER plugin's state must be untouched",
+        );
+        // controller.stop was called once — for the target container.
+        // Other plugin still has its slot + handle.
+        assert_eq!(mock.stop_count().await, 1);
+        assert!(
+            sup.host_port_for("tgt-bus").await.is_none(),
+            "target sidecar slot must be gone",
+        );
+
+        // Idempotent — second call returns visited=0, state dir
+        // already gone so state_dir_removed=false (nothing to remove,
+        // not an error).
+        let second = sup.remove_for_plugin(&pid_target).await;
+        assert_eq!(second.sidecars_visited, 0);
+        assert_eq!(second.containers_removed, 0);
+        assert!(!second.state_dir_removed);
+        assert_eq!(
+            mock.stop_count().await,
+            1,
+            "second remove_for_plugin must not double-stop",
+        );
+
+        // Clean up the other plugin's dir so we don't leave test
+        // artifacts behind.
+        let _ = std::fs::remove_dir_all(&other_root);
     }
 
     #[tokio::test]

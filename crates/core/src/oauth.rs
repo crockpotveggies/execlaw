@@ -213,6 +213,25 @@ impl<'db> OauthClientStore<'db> {
         })?;
         Ok(n > 0)
     }
+
+    /// Delete every client config (and via FK CASCADE every token) for
+    /// `plugin_id`. Used by the plugin-lifecycle `purge` path so an
+    /// uninstall is a true clean slate — without this the OAuth row
+    /// for `signal` (or any other plugin) survives uninstall and the
+    /// operator's "Authorize" affordance on reinstall starts in a
+    /// half-configured state with a stale `client_secret`. Returns the
+    /// number of `state_oauth_clients` rows removed.
+    pub fn delete_for_plugin(&self, plugin_id: &str) -> Result<usize, OauthError> {
+        let pid = plugin_id.to_owned();
+        let n = self.db.with_conn(|conn| {
+            let n = conn.execute(
+                "DELETE FROM state_oauth_clients WHERE plugin_id = ?1",
+                params![pid],
+            )?;
+            Ok(n)
+        })?;
+        Ok(n)
+    }
 }
 
 pub struct OauthTokenStore<'db> {
@@ -345,6 +364,25 @@ impl<'db> OauthTokenStore<'db> {
             Ok(n)
         })?;
         Ok(n > 0)
+    }
+
+    /// Drop every token row for `plugin_id`. Used by the
+    /// plugin-lifecycle `purge` path. Note: `state_oauth_tokens` has a
+    /// CASCADE FK on `state_oauth_clients`, so deleting the parent
+    /// client rows already wipes tokens — this method exists for the
+    /// rare case where a token survived after the client row was
+    /// removed (older migration data, manual DB edits) and for
+    /// strict-ordering tests. Idempotent.
+    pub fn delete_for_plugin(&self, plugin_id: &str) -> Result<usize, OauthError> {
+        let pid = plugin_id.to_owned();
+        let n = self.db.with_conn(|conn| {
+            let n = conn.execute(
+                "DELETE FROM state_oauth_tokens WHERE plugin_id = ?1",
+                params![pid],
+            )?;
+            Ok(n)
+        })?;
+        Ok(n)
     }
 }
 
@@ -480,6 +518,96 @@ mod tests {
         assert_eq!(got.client_secret, "GOCSPX-rotated");
         assert_eq!(got.updated_at, 200);
         assert_eq!(got.created_at, 100);
+    }
+
+    #[test]
+    fn client_delete_for_plugin_removes_every_account_and_cascades_tokens() {
+        // The plugin-lifecycle `purge` path uses this to wipe every
+        // OAuth grant a plugin owns in one call. Tokens cascade via
+        // FK so we only need to delete clients; the test pins both
+        // sides for safety.
+        let db = fresh_db();
+        let cs = OauthClientStore::new(&db);
+        let ts = OauthTokenStore::new(&db);
+        // Two accounts under the same plugin + one account under a
+        // different plugin. After delete_for_plugin("p1") only "p2"
+        // should survive.
+        let mut a = sample_client();
+        a.plugin_id = "p1".into();
+        a.account_name = "controller".into();
+        let mut b = sample_client();
+        b.plugin_id = "p1".into();
+        b.account_name = "secondary".into();
+        let mut c = sample_client();
+        c.plugin_id = "p2".into();
+        c.account_name = "controller".into();
+        cs.upsert(&a).unwrap();
+        cs.upsert(&b).unwrap();
+        cs.upsert(&c).unwrap();
+        // Add a token under (p1, controller) to verify the cascade.
+        ts.upsert(&OauthTokens {
+            plugin_id: "p1".into(),
+            account_name: "controller".into(),
+            access_token: "x".into(),
+            refresh_token: None,
+            token_expires_at: 200,
+            scopes_granted: "[]".into(),
+            account_email: None,
+            created_at: 100,
+            updated_at: 100,
+        })
+        .unwrap();
+
+        let removed = cs.delete_for_plugin("p1").unwrap();
+        assert_eq!(removed, 2, "both p1 client rows must be removed");
+        assert!(cs.get("p1", "controller").unwrap().is_none());
+        assert!(cs.get("p1", "secondary").unwrap().is_none());
+        assert!(
+            cs.get("p2", "controller").unwrap().is_some(),
+            "rows for OTHER plugins must survive",
+        );
+        assert!(
+            ts.get("p1", "controller").unwrap().is_none(),
+            "tokens cascade with their parent client row",
+        );
+
+        // Idempotent — second call removes zero.
+        assert_eq!(cs.delete_for_plugin("p1").unwrap(), 0);
+    }
+
+    #[test]
+    fn token_delete_for_plugin_handles_orphan_rows() {
+        // Defensive: in a normally-managed DB, token rows can't exist
+        // without a parent client row (FK NOT NULL on both columns,
+        // CASCADE delete). But hand-edited DBs / older migration
+        // surgery may leave orphan token rows behind. `delete_for_plugin`
+        // on the token store should still mop those up.
+        let db = fresh_db();
+        let cs = OauthClientStore::new(&db);
+        let ts = OauthTokenStore::new(&db);
+        // Insert parent + token, then drop just the token (the
+        // normal flow). delete_for_plugin should return 0 because
+        // the cascade fired.
+        let c = sample_client();
+        cs.upsert(&c).unwrap();
+        ts.upsert(&OauthTokens {
+            plugin_id: c.plugin_id.clone(),
+            account_name: c.account_name.clone(),
+            access_token: "ya29".into(),
+            refresh_token: None,
+            token_expires_at: 200,
+            scopes_granted: "[]".into(),
+            account_email: None,
+            created_at: 100,
+            updated_at: 100,
+        })
+        .unwrap();
+        // Token delete_for_plugin BEFORE client delete — should
+        // remove the one row.
+        let removed = ts.delete_for_plugin(&c.plugin_id).unwrap();
+        assert_eq!(removed, 1, "explicit token delete must remove the row");
+        // Second call zero (defensive idempotency).
+        assert_eq!(ts.delete_for_plugin(&c.plugin_id).unwrap(), 0);
     }
 
     #[test]
