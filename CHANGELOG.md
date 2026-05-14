@@ -89,6 +89,57 @@ this changelog is for operators and plugin authors who want to see the
 
 ### Added
 
+- **Conversation history sliding-window truncation.** Pre-fix every
+  chat turn re-hydrated the entire `state_events` table from
+  `seq = 0` into the prompt, growing linearly with conversation
+  length and quadratically with operator usage. Observed 2026-05-14:
+  a long-lived Signal thread with ~83 KB of stored events took
+  ~24.5 s per turn vs ~657 ms on a fresh web chat with ~3 KB of
+  events on the same backend, same model, same code path. The cost
+  is entirely prompt-prefill on the larger history.
+
+  New `execlaw_core::history_budget` module + migration 0003
+  (`config_general.max_history_tokens`, default 8000). Both
+  `run_real_turn` and `run_tool_capable_turn` route their hydrated
+  history through `truncate_to_budget` before constructing
+  `ChatMessage`s. Walks backward from most-recent, drops oldest
+  past the budget, preserves pair coherence (Assistant always has
+  its preceding User), and guarantees the last 4 messages survive
+  any budget (anti-starvation). Char-to-token estimate is
+  `chars/4` — no tokenizer dependency. 11 unit tests pin the
+  invariants (monotone in budget, current-turn always lands at the
+  model, dedupe-aware blob delete is unchanged, etc.).
+
+- **Local principal cache + O(1) identifier lookup.** Pre-fix
+  `PrincipalStore::find_by_identifier` did
+  `list_all().into_iter().find(...)` — an O(N) scan over every
+  principal row (each loaded + JSON-deserialised) just to answer
+  "have we seen this (transport, handle) before?" Every external
+  inbound (Signal, WhatsApp, future bridges) hits this check via
+  `admit_external_principal`, and a 500-contact install paid a full
+  principal-table read per inbound message.
+
+  Migration 0004 adds `principal_identifiers (transport, handle,
+  principal_id)` with composite PK + supporting indexes + CASCADE
+  delete + a one-shot backfill from existing `identifiers_json`
+  (`json_each` over a `CAST AS TEXT` of the BLOB column).
+  `PrincipalStore::upsert` now resyncs the index inside a single
+  transaction (delete-then-insert; identifier sets are 1-4 rows
+  per principal, cheap). `find_by_identifier` becomes a PK probe;
+  `find_all_by_identifier` (used by reconcile to enumerate every
+  claimant of the same identifier) is a small filtered query.
+
+  Policy unchanged but now documented in code: the
+  `principal_admit::admit_external_principal` cache-first path
+  returns ANY previously-seen principal regardless of trust class
+  (Controller, KnownTrusted, KnownLimited, UnknownPending, Blocked)
+  without re-running the identity-provider plugin fanout. Plugin
+  fanout only runs for first-ever inbound from a `(transport,
+  handle)` pair. Six new tests pin the index sync (population
+  on upsert, resync on identifier-set change, CASCADE on principal
+  delete, single-claimant lookup, multi-claimant lookup for the
+  reconcile fixture, migration backfill).
+
 - **Plugin-lifecycle `purge` orchestration** —
   `crates/server/src/plugin_lifecycle.rs` is a new module that chains
   every per-plugin teardown step in one load-bearing order:

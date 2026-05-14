@@ -46,6 +46,16 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "plugin_artifacts",
         sql: include_str!("../migrations/0002_plugin_artifacts.sql"),
     },
+    Migration {
+        id: 3,
+        name: "max_history_tokens",
+        sql: include_str!("../migrations/0003_max_history_tokens.sql"),
+    },
+    Migration {
+        id: 4,
+        name: "principal_identifiers",
+        sql: include_str!("../migrations/0004_principal_identifiers.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -226,7 +236,7 @@ mod tests {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
         let runner = MigrationRunner::new(&db);
         let applied = runner.apply_all().unwrap();
-        assert_eq!(applied, vec![1, 2]);
+        assert_eq!(applied, vec![1, 2, 3, 4]);
 
         // Spot-check: every documented table exists.
         let tables = vec![
@@ -300,7 +310,7 @@ mod tests {
         let runner = MigrationRunner::new(&db);
         let first = runner.apply_all().unwrap();
         let second = runner.apply_all().unwrap();
-        assert_eq!(first, vec![1, 2]);
+        assert_eq!(first, vec![1, 2, 3, 4]);
         assert!(
             second.is_empty(),
             "rerun must not re-apply already-applied migrations"

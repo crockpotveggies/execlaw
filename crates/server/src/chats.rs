@@ -729,28 +729,73 @@ async fn run_real_turn(
         "",
         &turn_context,
     );
+    // Hydrate into role-tagged messages FIRST (without spotlighting),
+    // then run the sliding-window truncation, then convert into
+    // `ChatMessage` with spotlight applied to surviving user messages.
+    //
+    // Separating "build" from "truncate" lets the same truncation
+    // policy (`execlaw_core::history_budget::truncate_to_budget`) feed
+    // both turn paths without each having to know about spotlighting
+    // or ChatMessage construction.
+    //
+    // Spotlighting is applied AFTER truncation: the random delimiter
+    // overhead is a few characters per user message and not worth
+    // accounting for in the token budget (the heuristic is already
+    // ±50% per-message — these delimiters are within the noise).
+    let raw_history: Vec<execlaw_core::history_budget::HistoryMessage> = history
+        .iter()
+        .filter_map(|ev| match ev.kind {
+            EventKind::UserMsg => ev.decode_payload::<UserMessagePayload>().ok().map(|p| {
+                execlaw_core::history_budget::HistoryMessage {
+                    role: execlaw_core::history_budget::HistoryRole::User,
+                    text: p.text,
+                }
+            }),
+            EventKind::ModelTurn => ev
+                .decode_payload::<RealModelTurnPayload>()
+                .ok()
+                .map(|p| execlaw_core::history_budget::HistoryMessage {
+                    role: execlaw_core::history_budget::HistoryRole::Assistant,
+                    text: p.text,
+                })
+                .or_else(|| {
+                    ev.decode_payload::<StubModelTurnPayload>().ok().map(|p| {
+                        execlaw_core::history_budget::HistoryMessage {
+                            role: execlaw_core::history_budget::HistoryRole::Assistant,
+                            text: p.text,
+                        }
+                    })
+                }),
+            _ => None,
+        })
+        .collect();
+    let budget = execlaw_core::history_budget::load_max_history_tokens(&state.db)
+        .unwrap_or(execlaw_core::history_budget::DEFAULT_HISTORY_TOKENS);
+    let truncated = execlaw_core::history_budget::truncate_to_budget(raw_history, budget);
+    if truncated.dropped_count > 0 {
+        tracing::debug!(
+            target: "chats::run_real_turn",
+            conversation_id = %cid.as_str(),
+            dropped = truncated.dropped_count,
+            kept = truncated.kept.len(),
+            kept_tokens_estimate = truncated.kept_tokens_estimate,
+            budget,
+            "truncated conversation history to fit token budget",
+        );
+    }
     let mut messages: Vec<ChatMessage> = vec![ChatMessage::system(&composed_system)];
-    for ev in &history {
-        match ev.kind {
-            EventKind::UserMsg => {
-                if let Ok(p) = ev.decode_payload::<UserMessagePayload>() {
-                    let content = match &spotlight {
-                        Some(s) => s.wrap(&p.text),
-                        None => p.text,
-                    };
-                    messages.push(ChatMessage::user(content));
-                }
+    for m in truncated.kept {
+        match m.role {
+            execlaw_core::history_budget::HistoryRole::User => {
+                let content = match &spotlight {
+                    Some(s) => s.wrap(&m.text),
+                    None => m.text,
+                };
+                messages.push(ChatMessage::user(content));
             }
-            EventKind::ModelTurn => {
-                // The stub path writes `StubModelTurnPayload`; the real
-                // path (below) writes `RealModelTurnPayload`. Try both.
-                if let Ok(p) = ev.decode_payload::<RealModelTurnPayload>() {
-                    messages.push(ChatMessage::assistant(p.text));
-                } else if let Ok(p) = ev.decode_payload::<StubModelTurnPayload>() {
-                    messages.push(ChatMessage::assistant(p.text));
-                }
+            execlaw_core::history_budget::HistoryRole::Assistant => {
+                messages.push(ChatMessage::assistant(m.text));
             }
-            _ => {}
         }
     }
 
@@ -1100,30 +1145,72 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         &routing_prose,
         &turn_context,
     );
-    let mut hist_messages: Vec<ChatMessage> = Vec::new();
-    for ev in &history {
-        match ev.kind {
+    // Hydrate into role-tagged history first, run the sliding-window
+    // truncation, then convert to ChatMessage with spotlighting. See
+    // the matching block in `run_real_turn` for the rationale; the
+    // tool-capable path has one extra step — skipping the user_msg
+    // we just appended this turn (the runner receives that as
+    // `TurnRequest.user_text`, not as part of history).
+    let raw_history: Vec<execlaw_core::history_budget::HistoryMessage> = history
+        .iter()
+        .filter_map(|ev| match ev.kind {
             EventKind::UserMsg => {
-                if let Ok(p) = ev.decode_payload::<UserMessagePayload>() {
-                    let content = match &spotlight {
-                        Some(s) => s.wrap(&p.text),
-                        None => p.text,
-                    };
-                    // Don't include the user_msg we just appended
-                    // — the runner gets it via TurnRequest.user_text.
-                    if ev.seq != user_seq {
-                        hist_messages.push(ChatMessage::user(content));
+                if ev.seq == user_seq {
+                    // Current turn — runner gets it via `user_text`.
+                    return None;
+                }
+                ev.decode_payload::<UserMessagePayload>().ok().map(|p| {
+                    execlaw_core::history_budget::HistoryMessage {
+                        role: execlaw_core::history_budget::HistoryRole::User,
+                        text: p.text,
                     }
-                }
+                })
             }
-            EventKind::ModelTurn => {
-                if let Ok(p) = ev.decode_payload::<RealModelTurnPayload>() {
-                    hist_messages.push(ChatMessage::assistant(p.text));
-                } else if let Ok(p) = ev.decode_payload::<StubModelTurnPayload>() {
-                    hist_messages.push(ChatMessage::assistant(p.text));
-                }
+            EventKind::ModelTurn => ev
+                .decode_payload::<RealModelTurnPayload>()
+                .ok()
+                .map(|p| execlaw_core::history_budget::HistoryMessage {
+                    role: execlaw_core::history_budget::HistoryRole::Assistant,
+                    text: p.text,
+                })
+                .or_else(|| {
+                    ev.decode_payload::<StubModelTurnPayload>().ok().map(|p| {
+                        execlaw_core::history_budget::HistoryMessage {
+                            role: execlaw_core::history_budget::HistoryRole::Assistant,
+                            text: p.text,
+                        }
+                    })
+                }),
+            _ => None,
+        })
+        .collect();
+    let budget = execlaw_core::history_budget::load_max_history_tokens(&state.db)
+        .unwrap_or(execlaw_core::history_budget::DEFAULT_HISTORY_TOKENS);
+    let truncated = execlaw_core::history_budget::truncate_to_budget(raw_history, budget);
+    if truncated.dropped_count > 0 {
+        tracing::debug!(
+            target: "chats::run_tool_capable_turn",
+            conversation_id = %cid.as_str(),
+            dropped = truncated.dropped_count,
+            kept = truncated.kept.len(),
+            kept_tokens_estimate = truncated.kept_tokens_estimate,
+            budget,
+            "truncated conversation history to fit token budget",
+        );
+    }
+    let mut hist_messages: Vec<ChatMessage> = Vec::with_capacity(truncated.kept.len());
+    for m in truncated.kept {
+        match m.role {
+            execlaw_core::history_budget::HistoryRole::User => {
+                let content = match &spotlight {
+                    Some(s) => s.wrap(&m.text),
+                    None => m.text,
+                };
+                hist_messages.push(ChatMessage::user(content));
             }
-            _ => {}
+            execlaw_core::history_budget::HistoryRole::Assistant => {
+                hist_messages.push(ChatMessage::assistant(m.text));
+            }
         }
     }
 
