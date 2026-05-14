@@ -125,7 +125,14 @@ function PairingBlock({
     sidecarRunning: boolean;
     onPaired: () => void;
 }): JSX.Element {
-    const auth = useAuth();
+    // 2026-05-14 — destructure `getAccessToken` so this effect
+    // depends on a stable function reference, not the full `auth`
+    // object whose reference flips on every auth-context recompute.
+    // See `SignalConfigPage.tsx` for the full rationale — same
+    // failure mode applies here (every 3-second status poll caused
+    // a re-render which invalidated the displayed QR by minting a
+    // fresh wuzapi pairing token).
+    const { getAccessToken } = useAuth();
     const [generation, setGeneration] = useState(0);
     const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
     const [qrError, setQrError] = useState<string | null>(null);
@@ -136,8 +143,7 @@ function PairingBlock({
         let cancelled = false;
         setQrLoading(true);
         setQrError(null);
-        void generation;
-        void fetchWhatsAppQrCodeLink(auth.getAccessToken)
+        void fetchWhatsAppQrCodeLink(getAccessToken)
             .then((r) => {
                 if (cancelled) return;
                 if (r.error) {
@@ -164,7 +170,7 @@ function PairingBlock({
         return () => {
             cancelled = true;
         };
-    }, [auth, generation, sidecarRunning]);
+    }, [getAccessToken, generation, sidecarRunning]);
 
     // Refresh every 60s — WhatsApp's pairing QR rotates more
     // aggressively than Signal's; this stays inside the

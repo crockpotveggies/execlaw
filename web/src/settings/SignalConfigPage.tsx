@@ -146,7 +146,24 @@ function PairingBlock({
     sidecarRunning: boolean;
     onPaired: () => void;
 }): JSX.Element {
-    const auth = useAuth();
+    // 2026-05-14 — destructure `getAccessToken` instead of using
+    // `auth` whole. `useAuth()` returns a new `AuthContextValue`
+    // object reference whenever the auth state changes (token
+    // refresh, login phase transitions, …). The parent
+    // `SignalConfigPage` polls `/api/admin/plugins/signal/status`
+    // every 3 s and `setStatus(...)` triggers a re-render of
+    // PairingBlock; if the QR-fetch effect depended on the whole
+    // `auth` object, it would re-fire on every poll because the
+    // reference is unstable across context recomputes. Each fetch
+    // call to bbernhard's `/v1/qrcodelink` mints a NEW pairing
+    // UUID and invalidates the prior one, so the displayed QR
+    // would point at a UUID signal-cli no longer accepts —
+    // operator scans, phone reports success, but execlaw never
+    // gets the device-added event and the SPA never refreshes.
+    // The destructured `getAccessToken` is a stable function
+    // reference (memoised inside AuthContext); depending on it
+    // alone keeps the effect fire-once-per-mount.
+    const { getAccessToken } = useAuth();
     const [generation, setGeneration] = useState(0);
     const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
     const [qrError, setQrError] = useState<string | null>(null);
@@ -162,10 +179,7 @@ function PairingBlock({
         let cancelled = false;
         setQrLoading(true);
         setQrError(null);
-        // Generation suffix is unused by the handler but threaded
-        // through so we get a fresh request when it bumps.
-        void generation;
-        void fetchSignalQrCodeLink("execlaw", auth.getAccessToken)
+        void fetchSignalQrCodeLink("execlaw", getAccessToken)
             .then((r) => {
                 if (cancelled) return;
                 if (r.error) {
@@ -192,7 +206,10 @@ function PairingBlock({
         return () => {
             cancelled = true;
         };
-    }, [auth, generation, sidecarRunning]);
+        // `generation` IS in the deps — bumping it (every 60 s) is
+        // how we deliberately refresh the QR before signal-cli's
+        // pairing nonce expires.
+    }, [getAccessToken, generation, sidecarRunning]);
 
     // Refresh the QR src by bumping a generation suffix every
     // ~60s — signal-cli's pairing nonce expires after a window
