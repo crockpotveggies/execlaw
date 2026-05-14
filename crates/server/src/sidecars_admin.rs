@@ -312,7 +312,26 @@ rpc_port = 8080
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let arr = v["sidecars"].as_array().unwrap();
         assert_eq!(arr[0]["status"], "starting");
-        assert_eq!(arr[0]["rpc_url"], "http://127.0.0.1:8501");
+        // The probing port allocator skips externally-bound pool
+        // members, so the exact host port depends on test-machine
+        // state. Assert the rpc_url shape + that the port falls
+        // inside the documented sidecar pool — that's the actual
+        // SPA-facing contract.
+        let rpc_url = arr[0]["rpc_url"].as_str().unwrap();
+        assert!(
+            rpc_url.starts_with("http://127.0.0.1:"),
+            "rpc_url must be a 127.0.0.1 URL, got {rpc_url}",
+        );
+        let port: u16 = rpc_url
+            .trim_start_matches("http://127.0.0.1:")
+            .parse()
+            .expect("rpc_url tail must be a valid port number");
+        assert!(
+            (crate::sidecar_supervisor::SIDECAR_PORT_POOL_START
+                ..=crate::sidecar_supervisor::SIDECAR_PORT_POOL_END)
+                .contains(&port),
+            "sidecar host port must be in the documented pool, got {port}",
+        );
     }
 
     #[tokio::test]

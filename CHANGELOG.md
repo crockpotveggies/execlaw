@@ -12,6 +12,46 @@ this changelog is for operators and plugin authors who want to see the
 
 ## [Unreleased]
 
+### Fixed
+
+- **Sidecar host-port allocation is now dynamic and self-healing.** The
+  prior allocator was a naive monotonic counter starting at port 8501;
+  when any pool member was occupied externally (a stale Docker veth, a
+  competing dev server, a prior crashed sidecar holding the port), the
+  supervisor minted the busy port, the Docker spawn failed with
+  `Bind for 127.0.0.1:<p> failed: port is already allocated`, the slot
+  burned a restart attempt, and the supervisor pinned the same dead
+  port on every retry — parking the sidecar `CrashLooping` after
+  `MAX_RESTART_ATTEMPTS` for an entirely environmental, externally-
+  fixable problem. (Observed in production 2026-05-14 with signal-cli
+  blocked on port 8502.)
+
+  Two new layers in `crates/server/src/sidecar_supervisor.rs` close
+  the gap:
+
+    * **`port_is_free` OS probe.** `allocate_port` now walks the pool
+      from `next_host_port` toward `SIDECAR_PORT_POOL_END` and skips
+      any candidate that fails a `TcpListener::bind` probe. Common-
+      case fast path: the busy port is detected before Docker is
+      even called.
+    * **`is_port_conflict_error` spawn-failure classifier.** When a
+      Docker spawn does fail with a port-conflict signature (the
+      probe-vs-bind TOCTOU race that the probe can't catch), the
+      supervisor releases `slot.host_port` so the next reconcile
+      mints a fresh one, and crucially does **NOT** burn a restart
+      attempt — port conflicts are environmental, not plugin bugs,
+      and the retry is cheap. The supervisor also `kick()`s the
+      reconcile loop so the recovery spawn happens immediately
+      instead of waiting the full tick interval.
+
+  Four new tests pin the behavior: external-occupant skip (real
+  `TcpListener` binds a pool port → allocator must hand out a
+  different one), the `port_is_free` probe round-trip, the
+  `is_port_conflict_error` matcher across known Docker error
+  variants, and the end-to-end conflict-recovery flow (spawn fails
+  → port released → next spawn succeeds with no restart-attempt
+  burn).
+
 ### Added
 
 - **Plugin-lifecycle `purge` orchestration** —

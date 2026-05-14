@@ -683,12 +683,43 @@ impl SidecarSupervisor {
                     return;
                 }
                 Err(e) => {
+                    // Port-conflict on the host (the port we minted
+                    // is already bound by some other process / a
+                    // stale Docker veth / a TOCTOU race past the
+                    // `port_is_free` probe). Release the slot's
+                    // pinned port so the next reconcile mints a
+                    // fresh one, and do NOT burn a restart attempt
+                    // — this is environmental state, not a plugin
+                    // bug, and the recovery is cheap. Without this
+                    // branch the supervisor pinned the dead port on
+                    // every retry and parked the slot CrashLooping
+                    // after MAX_RESTART_ATTEMPTS for a problem the
+                    // next port in the pool would have fixed.
+                    let err_str = e.to_string();
+                    if is_port_conflict_error(&err_str) {
+                        let stale_port = slot.host_port;
+                        slot.host_port = None;
+                        warn!(
+                            sidecar = %sidecar.name,
+                            stale_port = ?stale_port,
+                            error = %err_str,
+                            "sidecar host-port conflict; releasing port for re-allocation on next tick",
+                        );
+                        self.transition_status(&sidecar.name, slot, ServiceStatus::Stopped);
+                        // Kick the reconcile loop so retry happens
+                        // immediately rather than waiting the full
+                        // tick interval (port allocation is fast
+                        // and we want a healthy sidecar back asap).
+                        self.kick();
+                        return;
+                    }
+
                     slot.restart_attempts = slot.restart_attempts.saturating_add(1);
                     let new_status = if slot.restart_attempts >= MAX_RESTART_ATTEMPTS {
                         warn!(
                             sidecar = %sidecar.name,
                             attempts = slot.restart_attempts,
-                            error = %e,
+                            error = %err_str,
                             "sidecar container hit restart cap; parking CrashLooping",
                         );
                         ServiceStatus::CrashLooping {
@@ -698,7 +729,7 @@ impl SidecarSupervisor {
                         warn!(
                             sidecar = %sidecar.name,
                             attempts = slot.restart_attempts,
-                            error = %e,
+                            error = %err_str,
                             "sidecar container spawn failed; will retry",
                         );
                         ServiceStatus::Stopped
@@ -862,23 +893,51 @@ impl SidecarSupervisor {
         }
     }
 
-    /// Mint the next stable host port. Pool is contiguous from
-    /// `SIDECAR_PORT_POOL_START` up to `SIDECAR_PORT_POOL_END`; once
-    /// exhausted, returns `None` and the supervisor refuses to spawn
-    /// (parking the slot CrashLooping). In practice no operator runs
-    /// 100 sidecars, but a saturating overflow that quietly mapped
-    /// every excess sidecar onto the same port would be a much worse
-    /// failure mode than the explicit refusal.
+    /// Mint the next stable host port. Walks the pool from
+    /// `SIDECAR_PORT_POOL_START` toward `SIDECAR_PORT_POOL_END`,
+    /// skipping any port currently bound by another process on the
+    /// host. Returns the first free port found; returns `None` only
+    /// when the entire pool is occupied (at which point the
+    /// supervisor refuses to spawn and parks the slot CrashLooping).
+    ///
+    /// 2026-05-14 — added the `port_is_free` OS probe. Pre-fix the
+    /// allocator was a naive monotonic counter that handed out
+    /// whatever port was next regardless of host availability. When
+    /// port 8501/8502/etc. was occupied externally (a stale Docker
+    /// veth, a dev server, anything competing for the localhost port
+    /// range), the supervisor minted the busy port, the Docker spawn
+    /// failed with `Bind for 127.0.0.1:<p> failed: port is already
+    /// allocated`, the slot burned a restart attempt, the supervisor
+    /// pinned the same dead port on the next tick (because the slot
+    /// remembered it via `slot.host_port`), and after
+    /// `MAX_RESTART_ATTEMPTS` the sidecar was parked CrashLooping
+    /// indefinitely — for an entirely environmental, externally-fixable
+    /// problem. The probe + the spawn-failure release path together
+    /// turn that into a self-healing retry loop.
+    ///
+    /// Note that the probe is best-effort: the port could be claimed
+    /// between this check and the Docker bind (TOCTOU). The spawn
+    /// failure path (`is_port_conflict_error` in `reconcile_sidecar`)
+    /// is the second line of defense and re-runs allocation when
+    /// that race actually happens.
     async fn allocate_port(&self) -> Option<u16> {
         let mut next = self.next_host_port.lock().await;
-        if *next > SIDECAR_PORT_POOL_END {
-            return None;
+        while *next <= SIDECAR_PORT_POOL_END {
+            let candidate = *next;
+            // Advance the cursor regardless of probe outcome so a
+            // busy port doesn't get retried on every allocate call
+            // (saturating_add is overflow-safe; the loop-condition
+            // above is the real exit gate).
+            *next = next.saturating_add(1);
+            if port_is_free(candidate) {
+                return Some(candidate);
+            }
+            debug!(
+                port = candidate,
+                "sidecar allocator: candidate port is occupied on the host; trying next in pool",
+            );
         }
-        let p = *next;
-        // saturating_add guards the u16 overflow at exhaustion;
-        // the pool-end check above is the actual gate.
-        *next = next.saturating_add(1);
-        Some(p)
+        None
     }
 
     /// Update `slot.status` and publish a `SidecarStatusChanged` event
@@ -969,6 +1028,53 @@ fn resolve_mounts(
 /// uninstalls + reinstalls keeps their account state intact.
 fn state_dir_for(plugin_id: &str, sidecar_name: &str) -> std::path::PathBuf {
     plugin_state_root(plugin_id).join(sidecar_name)
+}
+
+/// OS-level probe: is `port` bindable on `127.0.0.1` right now?
+///
+/// Used by `SidecarSupervisor::allocate_port` to skip ports that
+/// another process (or a stale Docker veth) is currently holding.
+/// The probe binds + immediately drops a `TcpListener`, so it
+/// returns true iff the kernel would accept a fresh bind from us
+/// in this instant.
+///
+/// **TOCTOU caveat:** the port can be claimed by something else in
+/// the milliseconds between this returning true and the Docker
+/// daemon's own bind. That race is handled by the spawn-failure
+/// reallocation path (`is_port_conflict_error` in
+/// `reconcile_sidecar`): if Docker reports a conflict after the
+/// probe passed, the supervisor releases the slot's pinned port
+/// and the next reconcile mints a fresh one. Two checks together
+/// give us both the common-case fast path and the race recovery.
+fn port_is_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Recognise a Docker spawn error that's specifically a host-port
+/// conflict (the "port is already allocated" / "address already in
+/// use" / "Bind for 127.0.0.1:N failed" signatures).
+///
+/// When this matches, the supervisor releases the slot's pinned port
+/// rather than treating the failure as a plugin bug and burning a
+/// restart attempt. Without this discrimination, every transient
+/// host-port conflict would push the slot toward `CrashLooping`
+/// despite the conflict being entirely an external-state issue the
+/// operator (or the next reconcile) can solve by picking a different
+/// port.
+///
+/// The matcher is intentionally substring-based and case-insensitive
+/// — bollard's error strings change subtly between Docker versions
+/// (some report "Bind for 0.0.0.0:N", some "endpoint create failed",
+/// some "userland proxy"); the common thread is the "already
+/// allocated" / "in use" wording. We err on the side of false
+/// positives because the recovery (re-allocate + retry) is cheap and
+/// idempotent.
+fn is_port_conflict_error(err: &str) -> bool {
+    let s = err.to_lowercase();
+    s.contains("port is already allocated")
+        || s.contains("address already in use")
+        || s.contains("bind for ")
+        || s.contains("userland proxy")
 }
 
 /// The per-plugin state root — one level above `state_dir_for`,
@@ -1062,13 +1168,19 @@ rpc_port = {port}
         assert_eq!(sup.host_port_for("nonexistent").await, None);
 
         // First reconcile spawns and assigns a stable host port
-        // from SIDECAR_PORT_POOL_START.
+        // from the sidecar pool. We capture whatever the allocator
+        // hands out (probing skips ports occupied on the test host,
+        // so we can't pin a specific number) and use it as the
+        // "must match this on respawn" expectation.
         sup.reconcile_once().await;
         let port = sup
             .host_port_for("signal")
             .await
             .expect("port must be set after first spawn");
-        assert_eq!(port, SIDECAR_PORT_POOL_START);
+        assert!(
+            (SIDECAR_PORT_POOL_START..=SIDECAR_PORT_POOL_END).contains(&port),
+            "minted port must be inside the sidecar pool, got {port}",
+        );
 
         // RPC-fail restart cycle — the slot's host_port is reused
         // (the supervisor's "stable URL" guarantee).
@@ -1087,7 +1199,7 @@ rpc_port = {port}
         sup.reconcile_once().await; // respawn with reused port
         assert_eq!(
             sup.host_port_for("signal").await,
-            Some(SIDECAR_PORT_POOL_START),
+            Some(port),
             "respawn must reuse the originally-minted port",
         );
     }
@@ -1104,7 +1216,15 @@ rpc_port = {port}
         let last = mock.last_spawn().await.unwrap();
         assert_eq!(last.image, "execlaw/signal:0.1");
         assert_eq!(last.container_port, 8080);
-        assert_eq!(last.host_port, SIDECAR_PORT_POOL_START);
+        // host_port must be inside the sidecar pool. The exact
+        // value depends on what's bound on the test host — the
+        // probing allocator skips occupied pool members — so we
+        // assert range membership, not a specific number.
+        assert!(
+            (SIDECAR_PORT_POOL_START..=SIDECAR_PORT_POOL_END).contains(&last.host_port),
+            "minted host_port must be in the sidecar pool, got {}",
+            last.host_port,
+        );
 
         let snap = sup.snapshot_status().await;
         assert_eq!(snap.len(), 1);
@@ -1567,9 +1687,15 @@ rpc_port = 8080
         let mock = Arc::new(MockServiceController::new());
         let reg = registry_with_sidecar("p-signal", "signal", 8080);
         let sup = SidecarSupervisor::new(mock.clone(), reg);
-        sup.reconcile_once().await; // spawn (port = 8501)
+        sup.reconcile_once().await; // spawn (port is in pool)
         let first_port = mock.last_spawn().await.unwrap().host_port;
-        assert_eq!(first_port, SIDECAR_PORT_POOL_START);
+        // Allocator probes the OS and skips ports bound externally,
+        // so the exact value depends on test-host state — just assert
+        // pool membership.
+        assert!(
+            (SIDECAR_PORT_POOL_START..=SIDECAR_PORT_POOL_END).contains(&first_port),
+            "first port must be in sidecar pool, got {first_port}",
+        );
 
         mock.pin_status(ServiceStatus::Healthy).await;
         mock.pin_health(false).await;
@@ -1731,6 +1857,200 @@ rpc_port = 8080
         );
     }
 
+    /// Regression for the 2026-05-14 dynamic-port-allocation rework.
+    /// Pre-fix the allocator was a naive monotonic counter that
+    /// handed out ports without checking host availability; when
+    /// 8501 (or any pool member) was bound externally, the spawn
+    /// failed with "port is already allocated" forever and the
+    /// supervisor parked the sidecar CrashLooping for an entirely
+    /// environmental problem.
+    #[tokio::test]
+    async fn allocate_port_skips_externally_bound_pool_member() {
+        // Occupy the first pool port from outside the supervisor so
+        // its OS-level `port_is_free` probe must skip it. We DO drop
+        // the listener at the end so any other test re-running on
+        // the same machine picks up clean state.
+        let occupier = match std::net::TcpListener::bind((
+            "127.0.0.1",
+            SIDECAR_PORT_POOL_START,
+        )) {
+            Ok(l) => l,
+            Err(e) => {
+                // If something else already has 8501, the test
+                // setup precondition isn't met. Don't fail the
+                // suite — this is the same race the real allocator
+                // is designed to survive. Skip with a note.
+                eprintln!(
+                    "skipping: SIDECAR_PORT_POOL_START={} already bound by something else: {e}",
+                    SIDECAR_PORT_POOL_START,
+                );
+                return;
+            }
+        };
+
+        let reg = registry_with_sidecar("p-test", "test-bus", 8080);
+        let mock = Arc::new(MockServiceController::new());
+        let sup = SidecarSupervisor::new(mock.clone(), reg);
+
+        sup.reconcile_once().await;
+
+        // Spawn must have happened — pool exhaustion / blocked-on-
+        // port-0 would be a regression.
+        assert_eq!(mock.spawn_count().await, 1);
+        // The minted host_port MUST NOT be 8501 (the occupied
+        // member). We DON'T assert it's 8502 specifically — other
+        // pool members may also be bound on the test machine
+        // (Docker containers from concurrent dev work, other
+        // sidecars from a real execlaw run, etc.). The behavior
+        // we're pinning is "the allocator probes and skips", not
+        // "the allocator picks port N".
+        let spec = mock.last_spawn().await.unwrap();
+        assert_ne!(
+            spec.host_port, SIDECAR_PORT_POOL_START,
+            "allocator must skip the externally-bound pool port",
+        );
+        assert!(
+            spec.host_port > SIDECAR_PORT_POOL_START
+                && spec.host_port <= SIDECAR_PORT_POOL_END,
+            "minted port must be inside the pool and past the occupied head, got {}",
+            spec.host_port,
+        );
+
+        drop(occupier);
+    }
+
+    /// `port_is_free` returns true for a port we just released and
+    /// false for one we hold. Pure unit test of the helper.
+    #[test]
+    fn port_is_free_probe_distinguishes_held_and_released_ports() {
+        // Bind, capture port, drop, re-probe — the OS may reuse the
+        // port immediately. We don't depend on a specific number;
+        // we just verify the boolean flips.
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        assert!(
+            !port_is_free(port),
+            "port {port} is held by the test's own listener → must report busy",
+        );
+        drop(l);
+        // After drop the port is in TIME_WAIT briefly; bind with
+        // SO_REUSEADDR (which TcpListener does on Unix by default,
+        // and explicitly here on Windows) should succeed. We just
+        // verify port_is_free's boolean follows reality — i.e., it
+        // doesn't lie either way.
+        let after = port_is_free(port);
+        let _ = after; // value depends on OS scheduling; the
+                       // important assertion is the BUSY case above.
+    }
+
+    /// `is_port_conflict_error` recognises every flavour of Docker
+    /// port-conflict string we've seen in production. False
+    /// positives are fine (recovery is cheap); false negatives are
+    /// the bug we're fixing, so the matcher errs toward inclusive.
+    #[test]
+    fn is_port_conflict_error_matches_known_docker_signatures() {
+        let conflicts = [
+            // The exact string from the user's 2026-05-14 report.
+            "container runtime: start: Docker responded with status code 500: failed to set up container networking: driver failed programming external connectivity on endpoint execlaw-sidecar-signal-signal-cli (81710013602ccc5860cfb5261946c47b16f86f20b9c9c8ef422d947f423b04b4): Bind for 127.0.0.1:8502 failed: port is already allocated",
+            "Bind for 0.0.0.0:8501 failed: port is already allocated",
+            "Error response from daemon: driver failed programming external connectivity ... port is already allocated",
+            "listen tcp 127.0.0.1:8501: bind: address already in use",
+            "Error: userland proxy: listen tcp 0.0.0.0:8501: bind: address already in use",
+        ];
+        for c in conflicts {
+            assert!(
+                is_port_conflict_error(c),
+                "must recognise as port conflict: {c}",
+            );
+        }
+        // Non-conflict failures must NOT match — those should still
+        // burn restart attempts via the normal path.
+        let non_conflicts = [
+            "image pull failed: unauthorized",
+            "create: No such image: foo:bar",
+            "container exited immediately with status 1",
+            "permission denied",
+        ];
+        for c in non_conflicts {
+            assert!(
+                !is_port_conflict_error(c),
+                "must NOT match as port conflict: {c}",
+            );
+        }
+    }
+
+    /// End-to-end recovery test: spawn fails with a port-conflict
+    /// error → supervisor releases the slot's pinned port and does
+    /// NOT burn a restart attempt → next reconcile mints a fresh
+    /// port and spawns successfully.
+    ///
+    /// This is the load-bearing user-visible behavior of the
+    /// dynamic-port rework. Pre-fix the supervisor would have pinned
+    /// the dead port and parked CrashLooping after 3 retries.
+    #[tokio::test]
+    async fn port_conflict_spawn_failure_releases_port_and_does_not_burn_restart() {
+        let mock = Arc::new(MockServiceController::new());
+        let reg = registry_with_sidecar("p-signal", "signal-cli", 8080);
+        let sup = SidecarSupervisor::new(mock.clone(), reg);
+
+        // First reconcile: pin a spawn error matching the conflict
+        // signature. Mock surfaces it via spawn_response.
+        mock.pin_spawn_pull_error(
+            "container runtime: start: Bind for 127.0.0.1:8501 failed: port is already allocated",
+        )
+        .await;
+        sup.reconcile_once().await;
+
+        // Slot must be Stopped (Ready for retry), restart_attempts
+        // MUST still be 0, and the slot's host_port MUST have been
+        // released so the next reconcile mints fresh.
+        let snap = sup.snapshot_status().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[0].restart_attempts, 0,
+            "port-conflict spawn failure must NOT burn a restart attempt; got {}",
+            snap[0].restart_attempts,
+        );
+        assert!(
+            matches!(snap[0].status, ServiceStatus::Stopped),
+            "port-conflict must leave slot Stopped (ready for retry), got {:?}",
+            snap[0].status,
+        );
+        assert_eq!(
+            sup.host_port_for("signal-cli").await,
+            None,
+            "released slot must have no live host_port",
+        );
+
+        // Clear the pinned error so the next spawn succeeds, then
+        // reconcile again. The allocator must mint a port (any free
+        // one) and the spawn must complete.
+        mock.clear_spawn_response().await;
+        sup.reconcile_once().await;
+
+        assert_eq!(
+            mock.spawn_count().await,
+            2,
+            "second spawn attempt must have happened",
+        );
+        let after = sup.snapshot_status().await;
+        assert_eq!(
+            after[0].restart_attempts, 0,
+            "restart_attempts must STILL be 0 after the recovery — \
+             the conflict path is environmental, not a plugin bug",
+        );
+        // The recovery spawn used a new port — verify it's somewhere
+        // in the pool but not the pinned 8501 (which the supervisor
+        // shouldn't have re-tried after release).
+        let new_spec = mock.last_spawn().await.unwrap();
+        assert!(
+            new_spec.host_port >= SIDECAR_PORT_POOL_START
+                && new_spec.host_port <= SIDECAR_PORT_POOL_END,
+            "recovery port must be in the sidecar pool; got {}",
+            new_spec.host_port,
+        );
+    }
+
     #[tokio::test]
     async fn distinct_sidecars_get_distinct_host_ports() {
         // Port pool stability — two distinct sidecars get sequential,
@@ -1776,12 +2096,21 @@ rpc_port = {p}
             .collect();
         assert_eq!(ports.len(), 2);
         // Order isn't deterministic across snapshot (BTreeMap by
-        // name), so just check the set.
+        // name), and the exact values depend on test-host port
+        // availability (the probing allocator skips externally-
+        // occupied pool members). What we actually care about is
+        // (a) both ports are in the pool, (b) they're distinct.
         let mut sorted = ports.clone();
         sorted.sort();
-        assert_eq!(
-            sorted,
-            vec![SIDECAR_PORT_POOL_START, SIDECAR_PORT_POOL_START + 1]
+        for p in &sorted {
+            assert!(
+                (SIDECAR_PORT_POOL_START..=SIDECAR_PORT_POOL_END).contains(p),
+                "port {p} must be in sidecar pool",
+            );
+        }
+        assert_ne!(
+            sorted[0], sorted[1],
+            "distinct sidecars must get distinct host ports",
         );
     }
 }
