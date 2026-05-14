@@ -1,62 +1,77 @@
-// Settings → Plugin → Signal config page (Phase 8).
+// Signal plugin self-contained config panel.
 //
-// Operator-facing pairing UX. Two states:
+// First plugin migrated to the dynamic-UI architecture (2026-05-14):
+// this file replaces the old hardcoded `web/src/settings/SignalConfigPage.tsx`
+// in the host SPA bundle. The host's `DynamicPluginPanel` loads this
+// file at runtime via authenticated fetch + Blob URL + `import()`;
+// the bridge passed in `props.bridge` exposes React + helpers +
+// shared components so we never ship a duplicate React copy.
 //
-//   * **Not paired** — sidecar is running but `/v1/accounts` is
-//     empty. We surface a "Link this execlaw install as a secondary
-//     device" workflow: generate a QR code from the supervised
-//     sidecar's `GET /v1/qrcodelink`, display it as an inline
-//     <img>. The operator opens Signal on their phone →
-//     Settings → Linked devices → Link new device → scans the QR.
-//     execlaw becomes a linked device of the operator's existing
-//     Signal account; the sidecar starts receiving messages
-//     immediately. Better than the SMS-verification flow because
-//     it doesn't require the operator to give up their primary
-//     Signal phone number to a sidecar.
+// Build it from this source:
+//   npm --prefix web run build-plugin -- signal
+// Watch mode for the plugin-author dev loop:
+//   npm --prefix web run build-plugin -- signal --watch
 //
-//   * **Paired** — `/v1/accounts` returned at least one E.164
-//     number. We render the number with an "Unlink" affordance
-//     (POST `DELETE /api/admin/signal/accounts/{number}`); the
-//     operator confirms before the unregister fires.
-//
-// The sidecar status chip shows live supervisor state so a stuck
-// "starting" sidecar surfaces here instead of leaving the operator
-// confused why the QR endpoint 503s.
+// The produced `panel.js` ships inside `dist/signal-X.Y.Z.zip`
+// alongside `plugin.toml` + `main.rhai`.
 
-import { useCallback, useEffect, useState, type JSX } from "react";
-import Button from "react-bootstrap/Button";
-import {
-    fetchSignalQrCodeLink,
-    getSignalStatus,
-    unregisterSignalAccount,
-    type SignalStatusResponse,
-} from "../api/endpoints";
-import { useAuth } from "../auth/AuthContext";
-import { ErrorBanner } from "../components/ErrorBanner";
-import { SidecarStatusBlock } from "../components/SidecarStatusBlock";
-import type { PluginConfigProps } from "./PluginConfigBase";
+import type {
+    PluginPanelComponent,
+    PluginPanelProps,
+} from "@execlaw/plugin-ui";
 
-/// Poll cadence while the operator is on-page. The QR-code scan
-/// flow needs the SPA to notice the new account binding within a
-/// few seconds; 3s is responsive without hammering the sidecar.
+// React is provided by the host bridge at runtime. The build script's
+// esbuild config marks `react` as external and uses the classic JSX
+// transform (`jsxFactory: "React.createElement"`), so this
+// module-scope const is what every JSX node resolves against.
+//
+// `globalThis.execlawHost` is guaranteed to be installed before the
+// dynamic loader imports this file — see web/src/plugins/BridgeInstaller.tsx.
+const React = globalThis.execlawHost!.React;
+const { useCallback, useEffect, useState } = React;
+
+// --- API types ------------------------------------------------------
+
+interface SignalStatusResponse {
+    sidecar_status: string;
+    sidecar_rpc_url: string | null;
+    registered_accounts: string[];
+    accounts_on_disk: string[];
+    fetch_error: string | null;
+}
+
+interface SignalQrCodeLinkResponse {
+    data_url?: string;
+    mime_type?: string;
+    error?: string;
+}
+
+// --- Top-level Panel ------------------------------------------------
+
+/** Poll cadence while the operator is on-page. 3s is responsive
+ *  without hammering the supervised sidecar. */
 const POLL_INTERVAL_MS = 3_000;
 
-export function SignalConfigPage(_props: PluginConfigProps): JSX.Element {
-    const auth = useAuth();
-    const { getAccessToken } = auth;
+const Panel: PluginPanelComponent = (props: PluginPanelProps) => {
+    const { bridge } = props;
+    const { ErrorBanner, SidecarStatusBlock, Button } = bridge.components;
+
     const [status, setStatus] = useState<SignalStatusResponse | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [busy, setBusy] = useState(false);
 
     const refresh = useCallback(async () => {
         try {
-            const r = await getSignalStatus(getAccessToken);
+            const r = await bridge.fetchJson<SignalStatusResponse>(
+                "GET",
+                "/api/admin/plugins/signal/status",
+            );
             setStatus(r);
             setError(null);
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e));
         }
-    }, [getAccessToken]);
+    }, [bridge]);
 
     useEffect(() => {
         void refresh();
@@ -65,14 +80,6 @@ export function SignalConfigPage(_props: PluginConfigProps): JSX.Element {
         }, POLL_INTERVAL_MS);
         return () => window.clearInterval(id);
     }, [refresh]);
-
-    // The auto-finalize-pairing path retired with the host-side
-    // signal_admin module. If the operator hits the upstream
-    // signal-cli `addManager` bug (account on disk but daemon
-    // hasn't loaded it), they restart the sidecar from
-    // Settings → Sidecars. The plugin doesn't have a binding to
-    // restart its own sidecar, and the drift detection that fed
-    // this needs host-filesystem access we no longer expose.
 
     const onUnregister = useCallback(
         async (number: string) => {
@@ -87,7 +94,10 @@ export function SignalConfigPage(_props: PluginConfigProps): JSX.Element {
             }
             setBusy(true);
             try {
-                await unregisterSignalAccount(number, getAccessToken);
+                await bridge.fetchJson<unknown>(
+                    "DELETE",
+                    `/api/admin/plugins/signal/unregister-account?number=${encodeURIComponent(number)}`,
+                );
                 await refresh();
             } catch (e) {
                 setError(e instanceof Error ? e.message : String(e));
@@ -95,7 +105,7 @@ export function SignalConfigPage(_props: PluginConfigProps): JSX.Element {
                 setBusy(false);
             }
         },
-        [getAccessToken, refresh],
+        [bridge, refresh],
     );
 
     return (
@@ -118,68 +128,74 @@ export function SignalConfigPage(_props: PluginConfigProps): JSX.Element {
                     />
                     {status.registered_accounts.length === 0 ? (
                         <PairingBlock
+                            bridge={bridge}
                             sidecarRunning={status.sidecar_rpc_url !== null}
-                            onPaired={refresh}
+                            onPaired={() => void refresh()}
+                            Button={Button}
                         />
                     ) : (
                         <PairedBlock
                             accounts={status.registered_accounts}
                             busy={busy}
                             onUnregister={onUnregister}
+                            Button={Button}
                         />
                     )}
                 </>
             )}
         </div>
     );
-}
+};
 
-// SidecarStatusBlock moved to ../components/SidecarStatusBlock.tsx
-// and shared with the WhatsApp config page. The status presentation
-// (chip color, "booting up" header with spinner, stage-appropriate
-// explainer) lives there.
+export default Panel;
 
-function PairingBlock({
-    sidecarRunning,
-    onPaired,
-}: {
+// --- PairingBlock --------------------------------------------------
+
+interface PairingBlockProps {
+    bridge: PluginPanelProps["bridge"];
     sidecarRunning: boolean;
     onPaired: () => void;
-}): JSX.Element {
-    // 2026-05-14 — destructure `getAccessToken` instead of using
-    // `auth` whole. `useAuth()` returns a new `AuthContextValue`
-    // object reference whenever the auth state changes (token
-    // refresh, login phase transitions, …). The parent
-    // `SignalConfigPage` polls `/api/admin/plugins/signal/status`
-    // every 3 s and `setStatus(...)` triggers a re-render of
-    // PairingBlock; if the QR-fetch effect depended on the whole
-    // `auth` object, it would re-fire on every poll because the
-    // reference is unstable across context recomputes. Each fetch
-    // call to bbernhard's `/v1/qrcodelink` mints a NEW pairing
-    // UUID and invalidates the prior one, so the displayed QR
-    // would point at a UUID signal-cli no longer accepts —
-    // operator scans, phone reports success, but execlaw never
-    // gets the device-added event and the SPA never refreshes.
-    // The destructured `getAccessToken` is a stable function
-    // reference (memoised inside AuthContext); depending on it
-    // alone keeps the effect fire-once-per-mount.
-    const { getAccessToken } = useAuth();
+    Button: ReturnType<typeof currentButton>;
+}
+
+/**
+ * Tiny helper to wire up the Button type once. The bridge exposes
+ * Button as a `PluginComponent<ButtonProps>`; this hoist lets the
+ * sub-component prop typing be derived from the bridge instance
+ * rather than imported separately.
+ */
+function currentButton() {
+    return globalThis.execlawHost!.components.Button;
+}
+
+function PairingBlock({
+    bridge,
+    sidecarRunning,
+    onPaired,
+    Button,
+}: PairingBlockProps) {
     const [generation, setGeneration] = useState(0);
     const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
     const [qrError, setQrError] = useState<string | null>(null);
     const [qrLoading, setQrLoading] = useState(false);
 
-    // The plugin admin handler returns JSON `{data_url, mime_type}`
-    // on success or `{error: "..."}` on failure (e.g. signal-cli
-    // bootstrap unreachable because of a TLS-intercepting proxy on
-    // the host network). The `data_url` is a `data:image/png;base64,…`
-    // URL we put directly into <img src>.
+    // QR fetch effect. Depends on:
+    //   * `generation` — the deliberate 60s refresh + the Retry
+    //     button bump it.
+    //   * `sidecarRunning` — re-fetch when the sidecar comes up.
+    //   * `bridge` is a stable reference (the bridge global doesn't
+    //     get reinstalled; same instance across renders); listing
+    //     it here keeps eslint happy without re-firing the effect.
     useEffect(() => {
         if (!sidecarRunning) return;
         let cancelled = false;
         setQrLoading(true);
         setQrError(null);
-        void fetchSignalQrCodeLink("execlaw", getAccessToken)
+        void bridge
+            .fetchJson<SignalQrCodeLinkResponse>(
+                "GET",
+                "/api/admin/plugins/signal/qrcodelink?device_name=execlaw",
+            )
             .then((r) => {
                 if (cancelled) return;
                 if (r.error) {
@@ -195,7 +211,7 @@ function PairingBlock({
                     setQrDataUrl(null);
                 }
             })
-            .catch((e) => {
+            .catch((e: unknown) => {
                 if (cancelled) return;
                 setQrError(e instanceof Error ? e.message : String(e));
                 setQrDataUrl(null);
@@ -206,15 +222,10 @@ function PairingBlock({
         return () => {
             cancelled = true;
         };
-        // `generation` IS in the deps — bumping it (every 60 s) is
-        // how we deliberately refresh the QR before signal-cli's
-        // pairing nonce expires.
-    }, [getAccessToken, generation, sidecarRunning]);
+    }, [bridge, generation, sidecarRunning]);
 
-    // Refresh the QR src by bumping a generation suffix every
-    // ~60s — signal-cli's pairing nonce expires after a window
-    // and serving a stale image past that point would silently
-    // fail.
+    // Auto-refresh the QR every 60s so signal-cli's pairing nonce
+    // doesn't time out behind a stale image.
     useEffect(() => {
         const id = window.setInterval(() => {
             setGeneration((n) => n + 1);
@@ -240,13 +251,16 @@ function PairingBlock({
             <ol className="small mb-3">
                 <li>Open Signal on your phone.</li>
                 <li>
-                    Go to <strong>Settings → Linked devices → Link new
-                    device</strong>.
+                    Go to{" "}
+                    <strong>
+                        Settings → Linked devices → Link new device
+                    </strong>
+                    .
                 </li>
                 <li>Scan the QR code below.</li>
                 <li>
-                    Name this device when prompted (e.g.{" "}
-                    <code>execlaw</code>) and confirm.
+                    Name this device when prompted (e.g. <code>execlaw</code>)
+                    and confirm.
                 </li>
             </ol>
             {!sidecarRunning ? (
@@ -299,7 +313,7 @@ function PairingBlock({
                     <Button
                         variant="outline-primary"
                         size="sm"
-                        onClick={() => setGeneration((n) => n + 1)}
+                        onClick={() => setGeneration((n: number) => n + 1)}
                         data-testid="signal-pairing-retry"
                     >
                         Retry
@@ -332,9 +346,7 @@ function PairingBlock({
                         variant="outline-primary"
                         size="sm"
                         onClick={() => {
-                            setGeneration((n) => n + 1);
-                            // Manually nudge the polling parent so a
-                            // freshly-scanned QR surfaces fast.
+                            setGeneration((n: number) => n + 1);
                             onPaired();
                         }}
                         data-testid="signal-pairing-refresh"
@@ -355,15 +367,21 @@ function PairingBlock({
     );
 }
 
+// --- PairedBlock ---------------------------------------------------
+
+interface PairedBlockProps {
+    accounts: string[];
+    busy: boolean;
+    onUnregister: (number: string) => void;
+    Button: ReturnType<typeof currentButton>;
+}
+
 function PairedBlock({
     accounts,
     busy,
     onUnregister,
-}: {
-    accounts: string[];
-    busy: boolean;
-    onUnregister: (number: string) => void;
-}): JSX.Element {
+    Button,
+}: PairedBlockProps) {
     return (
         <div className="execlaw-card mb-3" data-testid="signal-paired-block">
             <div className="execlaw-card__title mb-2">Paired</div>
@@ -379,7 +397,7 @@ function PairedBlock({
                 {accounts.length === 1 ? "this account" : "these accounts"}.
             </p>
             <ul className="list-unstyled mb-0">
-                {accounts.map((number) => (
+                {accounts.map((number: string) => (
                     <li
                         key={number}
                         className="d-flex align-items-baseline gap-2 mb-2"
@@ -404,13 +422,3 @@ function PairedBlock({
         </div>
     );
 }
-
-// `badgeClassForStatus` moved to the shared SidecarStatusBlock
-// component (see `presentationFor` in
-// `../components/SidecarStatusBlock.tsx`). The supervisor's wire
-// format is `crash_looping` (with the underscore — see
-// `crates/server/src/sidecars_admin.rs::view_from_status`); the old
-// local implementation here checked for `crashlooping` (without)
-// and so never matched, leaving crash-looping sidecars rendered in
-// neutral grey instead of red. The shared component handles both
-// spellings explicitly.

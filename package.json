@@ -1,0 +1,9 @@
+{
+    "name": "execlaw-monorepo",
+    "private": true,
+    "type": "module",
+    "description": "Top-level package manifest for repo-root scripts. The SPA itself lives under web/ with its own package.json.",
+    "devDependencies": {
+        "esbuild": "^0.28.0"
+    }
+}

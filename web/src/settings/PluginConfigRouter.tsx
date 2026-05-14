@@ -47,7 +47,9 @@ import { GooglePlacesConfigPage } from "./GooglePlacesConfigPage";
 import { OpenMeteoConfigPage } from "./OpenMeteoConfigPage";
 import type { PluginConfigComponent } from "./PluginConfigBase";
 import { PushoverConfigPage } from "./PushoverConfigPage";
-import { SignalConfigPage } from "./SignalConfigPage";
+// SignalConfigPage retired 2026-05-14 — Signal now ships its own
+// ui/panel.js inside the plugin ZIP (plugin v0.5.0+). The dynamic
+// loader resolves it via /api/admin/plugins/signal/ui/panel.js.
 import { SlackConfigPage } from "./SlackConfigPage";
 import { SmsSocketConfigPage } from "./SmsSocketConfigPage";
 import { WhatsAppConfigPage } from "./WhatsAppConfigPage";
@@ -68,7 +70,7 @@ const STATIC_FALLBACKS: Record<string, PluginConfigComponent> = {
     "google-places": GooglePlacesConfigPage,
     "open-meteo": OpenMeteoConfigPage,
     pushover: PushoverConfigPage,
-    signal: SignalConfigPage,
+    // signal: migrated 2026-05-14 — see plugins/signal/ui/panel.tsx.
     slack: SlackConfigPage,
     "sms-socket": SmsSocketConfigPage,
     whatsapp: WhatsAppConfigPage,
