@@ -144,7 +144,7 @@ Same shape as admin routes. The HTTP layer skips auth — the handler **must** v
 All optional; see `crates/plugin-sdk/src/manifest.rs` for full per-section schemas. The most commonly-used:
 
 - `[[oauth_accounts]]` declares an OAuth client the operator pairs from the SPA. The access token is auto-injected into every tool call as `params._oauth.<account_name>` (refresh tokens and client secrets are never exposed to plugin code).
-- `[[ui_panels]]` registers a SPA settings-page mount (`mount = "admin/plugins/myplugin"`, `entry = "ui/panel.js"`). The host serves the JS bundle from the staged ZIP.
+- `[[ui_panels]]` registers an operator-facing settings page. `mount = "admin/plugins/myplugin"` maps the panel to `/settings/plugins/myplugin` in the SPA; `entry = "ui/panel.js"` names the file inside the ZIP that the host serves at `GET /api/admin/plugins/{plugin_id}/ui/panel.js`. The SPA's `DynamicPluginPanel` fetches that JS, blob-URLs it, and `import()`s the module at runtime. **See section 11 for the full authoring walkthrough.** Install-time validation refuses any plugin whose `entry` file is missing from the staged ZIP.
 - `[[skills]]` registers operator-authored skill markdown files into the host's `SkillStore` namespaced as `<plugin_id>/<skill_name>`.
 
 ---
@@ -557,7 +557,229 @@ The script tier covers ~95 % of plugins in-tree. Subprocess is a real escape hat
 
 ---
 
-## 11. Reference plugins in tree
+## 11. Writing a UI panel
+
+Every plugin that declares `[[ui_panels]]` ships a self-contained
+React panel inside its ZIP. The host SPA loads it dynamically — the
+plugin's TypeScript/JSX never bleeds into the host bundle. This is the
+load-bearing containment invariant: **plugins are self-contained
+end-to-end, backend AND frontend**.
+
+### 11.1 What the host gives you
+
+When the operator navigates to `/settings/plugins/<your-id>` the host:
+
+1. Renders its own page chrome (back button, plugin id, version
+   badge, **Danger Zone with Uninstall button**). Plugins **cannot
+   override** the chrome — every plugin gets the same lifecycle UI
+   so an operator can always reach Uninstall, even if your panel
+   crashes.
+2. Authenticated-fetches `GET /api/admin/plugins/<id>/ui/panel.js`
+   from your staged ZIP and turns it into a Blob URL.
+3. Dynamic `import()`s the Blob URL.
+4. Calls your default export with one prop:
+
+   ```ts
+   interface PluginPanelProps {
+       readonly identity: PluginIdentity;   // { id, displayName, version }
+       readonly bridge: BridgeApi;          // see § 11.4
+   }
+   ```
+
+5. Renders the returned React element inside a `PluginErrorBoundary`
+   so a render-time throw from your panel can't take down the host's
+   Danger Zone.
+
+### 11.2 Skeleton
+
+```tsx
+// plugins/my-plugin/ui/panel.tsx
+import type { PluginPanelComponent, PluginPanelProps } from "@execlaw/plugin-ui";
+
+// React comes from the host bridge — DO NOT `import React from "react"`.
+// You'd ship a duplicate React copy and trigger the "Invalid hook
+// call" crash. The build's classic JSX transform compiles `<div>` to
+// `React.createElement('div', ...)` against this module-scope const.
+const React = globalThis.execlawHost!.React;
+const { useCallback, useEffect, useState } = React;
+
+const Panel: PluginPanelComponent = (props: PluginPanelProps) => {
+    const { identity, bridge } = props;
+    const { ErrorBanner, Button } = bridge.components;
+
+    const [status, setStatus] = useState<string>("loading…");
+    const [error, setError] = useState<string | null>(null);
+
+    const refresh = useCallback(async () => {
+        try {
+            const r = await bridge.fetchJson<{ status: string }>(
+                "GET",
+                `/api/admin/plugins/${identity.id}/status`,
+            );
+            setStatus(r.status);
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+        }
+    }, [bridge, identity.id]);
+
+    useEffect(() => { void refresh(); }, [refresh]);
+
+    return (
+        <div data-testid={`${identity.id}-config`}>
+            <ErrorBanner message={error} onDismiss={() => setError(null)} />
+            <p>Status: <code>{status}</code></p>
+            <Button onClick={refresh}>Refresh</Button>
+        </div>
+    );
+};
+export default Panel;
+```
+
+### 11.3 Building
+
+The repo ships a shared build script that uses esbuild to compile
+your TSX to a self-contained ES module:
+
+```bash
+# One-shot build:
+node scripts/build-plugin-ui.mjs my-plugin
+
+# Watch mode for hot-dev:
+node scripts/build-plugin-ui.mjs my-plugin --watch
+
+# Build every plugin in the tree:
+node scripts/build-plugin-ui.mjs --all
+```
+
+Or via the npm scripts in `web/package.json`:
+
+```bash
+cd web
+npm run build-plugin -- my-plugin
+npm run build-all-plugins
+```
+
+The output lands at `plugins/my-plugin/ui/panel.js`. Externals are
+configured so the build refuses to bundle `react`, `react-dom`, or
+`@execlaw/plugin-ui` — if you see esbuild complain about an
+unresolved external in your output, your panel source is importing
+something it shouldn't. Audit and remove.
+
+The shared TypeScript config at `plugins/_shared/tsconfig.plugin.json`
+gives you strict-mode type checking + IDE autocomplete against the
+bridge types. To wire it into your plugin, drop a tiny
+`plugins/my-plugin/tsconfig.json` next to your panel:
+
+```json
+{
+    "extends": "../_shared/tsconfig.plugin.json",
+    "include": ["ui/**/*"]
+}
+```
+
+### 11.4 The bridge API
+
+Everything your panel can reach from the host is on `props.bridge`
+(also available as `globalThis.execlawHost`, but use the prop —
+testable, makes the dependency explicit). Full TypeScript contract
+lives in `web/src/plugins/types.ts`:
+
+| Field                            | What it is                                                                                                                                            |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bridge.React`                   | The host's React instance. Use this for hooks (`useState`, `useEffect`, `useCallback`, `useRef`, etc.).                                              |
+| `bridge.ReactDOM`                | The host's ReactDOM (portals, `flushSync`).                                                                                                          |
+| `bridge.getAccessToken()`        | Sync: returns the operator's JWT or `null` if signed out. Already threaded into `fetchJson`; only call directly if you need to construct an `<img src>` with the token in a query string. |
+| `bridge.fetchJson(method, path, body?)` | Authenticated JSON helper. Throws on non-2xx with the response body in `.message`. The endpoint URL is whatever your plugin's `[[admin_routes]]` declared. |
+| `bridge.usePoll(fetcher, intervalMs)` | Convenience hook: poll a fetcher on an interval while the panel is mounted. Returns `{ value, error }`.                                  |
+| `bridge.components.ErrorBanner`  | Dismissable red banner. Props: `{ message, onDismiss, className? }`.                                                                                 |
+| `bridge.components.SidecarStatusBlock` | Health chip for sidecar-backed transport plugins. See Signal/WhatsApp panels for use.                                                          |
+| `bridge.components.Button`       | Bootstrap-styled button. Variants: `primary`, `secondary`, `danger`, `outline-primary`, `outline-secondary`, `outline-danger`. Sizes: `sm`, `lg`.       |
+
+If you need a UI component the bridge doesn't expose
+(`<Form>`, `<Spinner>`, `<Modal>`, etc.), **inline a plain HTML +
+Bootstrap-classes equivalent in your panel**. Don't `import` from
+`react-bootstrap` directly — esbuild's external rule will leave the
+import in the output and the dynamic loader will fail with a clear
+"cannot resolve module" error. Examples of inlined equivalents:
+
+```tsx
+{/* Spinner — replaces react-bootstrap's Spinner */}
+<div className="spinner-border spinner-border-sm" role="status" />
+
+{/* Form.Check switch — replaces react-bootstrap's <Form.Check type="switch">  */}
+<div className="form-check form-switch">
+    <input
+        type="checkbox"
+        role="switch"
+        className="form-check-input"
+        checked={value}
+        onChange={(e) => setValue(e.target.checked)}
+        id="my-toggle"
+    />
+    <label className="form-check-label" htmlFor="my-toggle">Enable X</label>
+</div>
+```
+
+### 11.5 Hot-reload during dev
+
+The dev loop for a plugin author:
+
+1. `node scripts/build-plugin-ui.mjs my-plugin --watch` (terminal A —
+   stays open, rebuilds on every save).
+2. Navigate to `/settings/plugins/my-plugin` in the SPA, edit your
+   `panel.tsx`, save.
+3. Reinstall the plugin (drag-drop the rebuilt ZIP into the SPA's
+   Install Plugin page, or repackage + use the Upgrade affordance)
+   to refresh the staged copy under `~/.execlaw/plugins/`.
+4. Navigate away + back to the settings page. The SPA's
+   `DynamicPluginPanel` re-fetches `ui/panel.js` and imports the
+   fresh module instance.
+
+No execlaw restart. No SPA rebuild. Backend `main.rhai` changes
+work the same way — repackage + reinstall picks them up live.
+
+### 11.6 What the SPA host owns vs. what your panel owns
+
+| Owned by host scaffold                                   | Owned by your panel.tsx                            |
+| --------------------------------------------------------- | -------------------------------------------------- |
+| URL routing (`/settings/plugins/<id>`)                    | Everything inside the panel body                  |
+| Back button + plugin id/version/enabled badge in header   | Plugin-specific status displays                   |
+| **Danger Zone with Uninstall button** (un-overridable)    | Plugin-specific actions (pair, disconnect, etc.)  |
+| Error boundary catching render-time crashes               | Your own error-banner for API-call failures       |
+| Loading state while `panel.js` is fetched                 | Loading state for your own API calls              |
+
+If a behaviour you need isn't in this list, propose it on the
+`BridgeApi` interface — adding helpers to the bridge is preferable
+to side-stepping the contract.
+
+### 11.7 Testing
+
+Plugin panels are testable in isolation by providing a mock
+`bridge` object that conforms to `BridgeApi`. There's no shared
+Vitest config under `plugins/` yet — drop a `plugins/<id>/ui/__tests__/`
+directory with your own `vitest.config.ts` if/when you want to
+ship tests inside your plugin ZIP.
+
+### 11.8 Common pitfalls
+
+- **Forgetting the `const React = globalThis.execlawHost!.React`** at
+  module top. JSX expands to `React.createElement(...)` which expects
+  a `React` identifier in scope; without it, you'll see a runtime
+  `ReferenceError`.
+- **Importing React** to use `useState` etc. You'd ship duplicate
+  React + cause "Invalid hook call" crashes. Always destructure
+  from the bridge: `const { useState } = bridge.React;` or
+  `const { useState } = React;` if you already have the module-scope const.
+- **Importing from `web/src/...` or `../../web`**. Plugin code must be
+  fully self-contained. Inline any helper you need or move it into
+  `plugins/<id>/ui/` as a sibling file (esbuild will bundle siblings).
+- **Forgetting to bump `plugin.toml` version after a panel change.**
+  The host's plugin upgrade flow keys on the version string —
+  same-version reinstalls take a different code path.
+
+---
+
+## 12. Reference plugins in tree
 
 Browse these for working examples. Each lives under `plugins/<id>/`.
 
@@ -584,7 +806,7 @@ When you start a new plugin, the closest cognate is your fastest path to a worki
 
 ---
 
-## 12. Common pitfalls
+## 13. Common pitfalls
 
 - **Module-level `const` is invisible inside `fn` bodies.** Rhai scopes constants to the file's top-level evaluation, not into function scopes. Inline literals at the call site or pass through args.
 - **Webhook handlers must validate caller identity.** `[[webhook_routes]]` are unauthenticated. Always compare a `?token=…` URL param against a vault-stored secret with constant-time comparison. See WhatsApp's `on_webhook_event` for the canonical pattern.
@@ -598,7 +820,7 @@ When you start a new plugin, the closest cognate is your fastest path to a worki
 
 ---
 
-## 13. Where to dig deeper
+## 14. Where to dig deeper
 
 - Manifest schema source of truth: [`crates/plugin-sdk/src/manifest.rs`](../crates/plugin-sdk/src/manifest.rs)
 - Hook registry + lifecycle: [`crates/plugin-host/src/host.rs`](../crates/plugin-host/src/host.rs), [`crates/plugin-host/src/hook_registry.rs`](../crates/plugin-host/src/hook_registry.rs)
