@@ -157,12 +157,15 @@ pub async fn factory_reset_handler(
         "stopped sidecar containers",
     );
 
-    // Step 3 — wipe the DB. Done last so the on_disable hooks above
-    // can still read vault rows / OAuth tokens / personality config
-    // while running their cleanup. Once this returns the row backing
-    // the caller's JWT is gone and the SPA must redirect to /login.
+    // Step 3 — blow away the DB at the file level (close the
+    // connection, delete the .db / -wal / -shm / -journal files,
+    // re-open empty), then re-run migrations from scratch. Done last
+    // so the on_disable hooks above can still read vault rows /
+    // OAuth tokens / personality config while running their cleanup.
+    // Once this returns the row backing the caller's JWT is gone and
+    // the SPA must redirect to /login.
     let (tables_wiped, migrations_reapplied) =
-        wipe_and_remigrate(&state.db).map_err(|e| ApiError {
+        wipe_and_remigrate(&state.db, &state.db_config).map_err(|e| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "factory_reset_failed",
             message: e.to_string(),
@@ -177,96 +180,91 @@ pub async fn factory_reset_handler(
     }))
 }
 
-/// True factory reset: DROP every user table, then re-run the
+/// True factory reset: close the SQLite connection, delete the on-
+/// disk file (plus `-wal` / `-shm` / `-journal` companions), re-open
+/// at the same path with the same encryption posture, then re-run the
 /// embedded migration set from scratch. Pulled out for direct
 /// unit-test access.
 ///
-/// Rationale (2026-05-13 rework). The previous implementation here
-/// did `DELETE FROM` every non-`schema_version` table and re-seeded
-/// **only** `config_general`. That broke every other migration-seeded
-/// singleton (`config_research`, `config_personality`,
-/// `config_search_providers`, `config_skills`, …) — they were emptied
-/// but never re-seeded, so downstream code reading them via
-/// `query_row(...)?` (without `.optional()`) blew up with
-/// `sqlite error: Query returned no rows`. Surfaced as "deep research
-/// stalls minutes after a fresh-account setup."
+/// Rationale (rework 2026-05-13, then 2026-05-14). Two earlier
+/// approaches failed in production:
 ///
-/// The right semantic for "factory reset" is **the DB equals what
-/// `execlaw install` would have produced**. Achieved by:
+/// 1. **`DELETE FROM` every row but keep `schema_version`.** Left
+///    migration-seeded singletons (`config_research`,
+///    `config_personality`, etc.) empty since the seed `INSERT OR
+///    IGNORE` statements only fire as part of the migration body.
+///    Downstream code reading them via `query_row(...)?` blew up
+///    with `sqlite error: Query returned no rows` — surfaced as
+///    "deep research stalls minutes after a fresh-account setup."
 ///
-///   1. DROP every table including `schema_version` so the migration
-///      runner sees a virgin DB.
-///   2. Run `MigrationRunner::apply_all()` which `CREATE TABLE`s every
-///      schema and re-fires every `INSERT OR IGNORE` seed in the
-///      migration bodies.
+/// 2. **`DROP TABLE` every table + re-run migrations.** Tripped on
+///    SQLite virtual tables (FTS5 `skill_search`, etc.) — `DROP
+///    TABLE` on a vtable invokes the module's destructor, and a
+///    mismatched module-registration state surfaces as
+///    `vtable constructor failed: skill_search`. Observed in
+///    production today.
 ///
-/// Implementation notes:
+/// Both failures share a root cause: trying to be clever about which
+/// rows / objects to remove while keeping the file handle open. The
+/// robust answer is to **close the connection, delete the file, and
+/// re-open empty** — the semantic an operator actually wants from a
+/// "factory reset" button. SQLite never opens its own vtable modules
+/// against a non-existent file, so the FTS5 destructor never runs
+/// against a stale shadow-table state. Schema-level FK ordering and
+/// `sqlite_master` enumeration both disappear as concerns.
 ///
-///   * Foreign-key constraints have to be OFF during DROP because
-///     SQLite refuses to drop a table that's currently a parent of an
-///     existing FK relationship even when both sides are about to be
-///     dropped. `PRAGMA foreign_keys = OFF` can only be set OUTSIDE
-///     a transaction (SQLite silently ignores it inside one), so we
-///     do it via `with_conn` rather than `transaction`. The wipe
-///     itself isn't transactional — a crash mid-drop leaves a
-///     partial DB, which is acceptable for a destructive operation
-///     the operator just confirmed.
-///   * The migration runner's `apply_all` is already idempotent
-///     against a virgin DB — it creates `schema_version` and walks
-///     every embedded migration.
-///   * Returns `(tables_dropped, migrations_reapplied)` for the
-///     response body. Test asserts both are > 0 and that singleton
-///     config rows actually exist post-reset.
+/// Flow:
+///
+///   1. `Database::rebuild_to_empty(config)` swaps in a temporary
+///      in-memory connection (releasing the file handle), deletes
+///      the `.db` + `.db-wal` + `.db-shm` + `.db-journal` files,
+///      then opens a fresh empty `.db` at the same path with the
+///      same encryption posture. `:memory:` DBs short-circuit to a
+///      new in-memory connection.
+///   2. `MigrationRunner::apply_all()` walks the embedded migration
+///      set against the now-empty DB — `CREATE TABLE` every schema,
+///      `INSERT OR IGNORE` every singleton seed.
+///
+/// Returns `(tables_wiped_proxy, migrations_reapplied)`. The
+/// `tables_wiped_proxy` value is the count of CREATE TABLE
+/// statements the migration set ran, which equals the count of
+/// tables in the resulting DB — a useful number for the SPA's
+/// post-reset toast even though no individual DROP happened (file
+/// delete is one shot).
 fn wipe_and_remigrate(
     db: &execlaw_core::Database,
+    config: &execlaw_core::DbConfig,
 ) -> Result<(usize, usize), execlaw_core::DbError> {
     use execlaw_core::migrations::MigrationRunner;
 
-    // Disable FK enforcement so DROP TABLE doesn't blow up on tables
-    // referenced by sibling FKs we're about to drop too. Re-enabled
-    // before the migration runner kicks in.
-    db.with_conn(|c| {
-        c.execute_batch("PRAGMA foreign_keys = OFF;")?;
-        Ok(())
-    })?;
+    // Close + delete + re-open. The single load-bearing operation:
+    // after this returns Ok, the DB exists at the same path, encrypted
+    // with the same key (if any), and contains zero schema.
+    db.rebuild_to_empty(config)?;
 
-    let dropped = db.with_conn(|c| {
-        let names: Vec<String> = {
-            let mut stmt = c.prepare(
-                "SELECT name FROM sqlite_master \
-                 WHERE type = 'table' \
-                   AND name NOT LIKE 'sqlite_%'",
-            )?;
-            stmt.query_map([], |row| row.get::<_, String>(0))?
-                .collect::<Result<_, _>>()?
-        };
-        for table in &names {
-            // Identifier quoting: double-up any embedded `"` per spec.
-            // Our migrations don't use exotic names but this is the
-            // standard hardening for sqlite-master-driven loops.
-            let quoted = table.replace('"', "\"\"");
-            c.execute(&format!("DROP TABLE IF EXISTS \"{quoted}\""), [])?;
-        }
-        Ok(names.len())
-    })?;
-
-    // Re-enable FKs before migrations so CREATE TABLE statements that
-    // declare FK constraints are validated. `MigrationRunner` opens
-    // its own `with_conn` blocks so this PRAGMA is applied for the
-    // life of the connection (Database holds one connection — see
-    // `db.rs` — so setting it once on the shared handle is enough).
-    db.with_conn(|c| {
-        c.execute_batch("PRAGMA foreign_keys = ON;")?;
-        Ok(())
-    })?;
-
+    // Apply migrations against the now-virgin DB. Re-creates schema
+    // and re-fires every `INSERT OR IGNORE` seed in the migration
+    // bodies — restores singleton config rows, default personality,
+    // search-provider seeds, etc.
     let applied = MigrationRunner::new(db).apply_all().map_err(|e| {
         execlaw_core::DbError::Migration(format!(
             "factory-reset: re-apply migrations failed: {e}"
         ))
     })?;
 
-    Ok((dropped, applied.len()))
+    // Count the resulting tables for the response body. Cheap one-
+    // round-trip read; matches what a `.tables` dump would show.
+    let table_count = db.with_conn(|c| {
+        let n: i64 = c.query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    })?;
+
+    Ok((table_count, applied.len()))
 }
 
 fn require_controller(state: &AppState, user: &AuthedUser) -> Result<(), ApiError> {

@@ -99,6 +99,17 @@ impl Default for ServerConfig {
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
+    /// The exact `DbConfig` that opened `db` at boot. Stored so the
+    /// factory-reset path (`crates/server/src/factory_reset.rs`) can
+    /// close the connection, delete the on-disk file, and re-open at
+    /// the same path with the same encryption posture without having
+    /// to round-trip through the OS keyring again. SQLCipher key
+    /// material is already in memory in the `Database`'s open
+    /// connection; carrying it here adds no incremental attack
+    /// surface. For `:memory:` test DBs the config is just the
+    /// in-memory unencrypted preset and the file-delete path is
+    /// short-circuited inside `Database::rebuild_to_empty`.
+    pub db_config: Arc<execlaw_core::db::DbConfig>,
     pub config: Arc<ServerConfig>,
     /// Ed25519 signing key used for JWT + capability tokens.
     pub signer: Arc<crate::auth::JwtSigner>,

@@ -407,6 +407,20 @@ fn default_db_path() -> PathBuf {
 }
 
 pub(crate) fn open_db(db_path: &Path, no_encrypt: bool) -> anyhow::Result<execlaw_core::Database> {
+    let (db, _cfg) = open_db_with_config(db_path, no_encrypt)?;
+    Ok(db)
+}
+
+/// Open the DB and ALSO return the `DbConfig` used to open it.
+/// Production callers that need to do file-level lifecycle ops on
+/// the DB (factory reset — close the connection, delete the file,
+/// re-open) stash the config in `AppState::db_config` so they can
+/// re-open at the same path with the same encryption posture
+/// without re-querying the OS keyring.
+pub(crate) fn open_db_with_config(
+    db_path: &Path,
+    no_encrypt: bool,
+) -> anyhow::Result<(execlaw_core::Database, execlaw_core::DbConfig)> {
     use execlaw_core::db::SqlCipherKey;
 
     let key = if no_encrypt {
@@ -420,7 +434,8 @@ pub(crate) fn open_db(db_path: &Path, no_encrypt: bool) -> anyhow::Result<execla
         path: db_path.to_path_buf(),
         key,
     };
-    Ok(execlaw_core::Database::open(&cfg)?)
+    let db = execlaw_core::Database::open(&cfg)?;
+    Ok((db, cfg))
 }
 
 /// Build the runner image when it's missing OR older than the
@@ -1196,7 +1211,7 @@ fn resolve_bind(cli: Option<String>, db: Option<String>) -> (String, &'static st
 }
 
 async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> anyhow::Result<()> {
-    let db = open_db(&db_path, no_encrypt)?;
+    let (db, db_config) = open_db_with_config(&db_path, no_encrypt)?;
     execlaw_core::MigrationRunner::new(&db).apply_all()?;
 
     // Bind address resolution (precedence: CLI flag > DB > default).
@@ -1719,6 +1734,11 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
 
     let state = execlaw_server::AppState {
         db: db.clone(),
+        // Stash the exact config we just opened with so the
+        // factory-reset endpoint can close-and-rebuild at the same
+        // path with the same encryption posture. See
+        // `crates/core/src/db.rs::Database::rebuild_to_empty`.
+        db_config: std::sync::Arc::new(db_config),
         config: config.clone(),
         signer,
         refresh_store,

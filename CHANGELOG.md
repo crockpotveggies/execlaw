@@ -25,16 +25,24 @@ this changelog is for operators and plugin authors who want to see the
   stalled / failed immediately after a fresh-account setup that
   followed a factory reset.
 
-  Rewrote `factory_reset.rs::wipe_and_remigrate` to DROP every user
-  table including `schema_version`, then re-run
-  `MigrationRunner::apply_all()`. The migration set's `CREATE TABLE`
-  + `INSERT OR IGNORE` statements take care of re-creating the schema
-  AND re-seeding every singleton. The response body now also reports
-  `migrations_reapplied`. Three new regression tests pin: (a) every
-  migration-seeded singleton is populated after reset, (b)
-  `ResearchConfigStore::get()` succeeds post-reset, (c) the
-  `tables_wiped` + `migrations_reapplied` counts both surface in the
-  response JSON.
+  Rewrote `factory_reset.rs::wipe_and_remigrate` to blow away the
+  on-disk database file entirely (`.db` + `-wal` + `-shm` +
+  `-journal`) via a new `Database::rebuild_to_empty(&DbConfig)`
+  method, then re-open at the same path with the same encryption
+  posture and re-run `MigrationRunner::apply_all()`. The migration
+  set's `CREATE TABLE` + `INSERT OR IGNORE` statements take care of
+  re-creating the schema AND re-seeding every singleton. An earlier
+  iteration tried DROP TABLE per user table, but that tripped on the
+  FTS5 `skill_search` virtual table's destructor
+  (`vtable constructor failed: skill_search`); file-level delete
+  bypasses vtable lifecycle entirely. `AppState` gained a
+  `db_config: Arc<DbConfig>` field so the reset path can re-open
+  without round-tripping through the OS keyring. The response body
+  now reports `migrations_reapplied`. Three new regression tests
+  pin: (a) every migration-seeded singleton is populated after
+  reset, (b) `ResearchConfigStore::get()` succeeds post-reset, (c)
+  the `tables_wiped` + `migrations_reapplied` counts both surface in
+  the response JSON.
 
 - **`ResearchConfigStore::get()` honors its docstring.** The
   docstring promised "returns the defaults on a fresh DB rather than

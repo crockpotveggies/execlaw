@@ -823,7 +823,8 @@ pub fn build_router(state: AppState) -> Router {
 pub fn test_app_state() -> AppState {
     use execlaw_core::MigrationRunner;
     use execlaw_plugin_host::{HookRegistry, PluginHost};
-    let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+    let db_config = DbConfig::in_memory_unencrypted();
+    let db = Database::open(&db_config).unwrap();
     MigrationRunner::new(&db).apply_all().unwrap();
     // Per-test temp dir for staged plugins. Tests that exercise the
     // install path create a TempDir explicitly; the default one is
@@ -833,6 +834,7 @@ pub fn test_app_state() -> AppState {
     let events = crate::events::EventBus::new();
     AppState {
         db: db.clone(),
+        db_config: Arc::new(db_config),
         config: Arc::new(ServerConfig::default()),
         signer: Arc::new(JwtSigner::generate("execlaw-test".into())),
         refresh_store: Arc::new(RefreshStore::new(db.clone())),
