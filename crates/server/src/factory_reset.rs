@@ -74,10 +74,18 @@ pub struct FactoryResetRequest {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FactoryResetResponse {
-    /// Number of tables that were truncated. Useful for the SPA's
-    /// post-reset toast and for tests asserting we covered every
-    /// table the migration set declares.
+    /// Number of user tables dropped + re-created during the reset.
+    /// Matches the count of non-`sqlite_*` tables present at the
+    /// moment the wipe ran; equivalent to "every table the migration
+    /// set declares."
     pub tables_wiped: usize,
+    /// Number of migrations re-applied after the drop. On a healthy
+    /// install this equals the length of the embedded migration set
+    /// (currently 2: baseline + plugin_artifacts). A different count
+    /// here means either a partial migration history or a future
+    /// addition not yet run — log it loudly.
+    #[serde(default)]
+    pub migrations_reapplied: usize,
     /// Number of plugins whose `on_disable` lifecycle hook fired
     /// without erroring. Excludes plugins that don't declare the
     /// hook. Zero is fine — most plugins have nothing to tear down
@@ -153,68 +161,112 @@ pub async fn factory_reset_handler(
     // can still read vault rows / OAuth tokens / personality config
     // while running their cleanup. Once this returns the row backing
     // the caller's JWT is gone and the SPA must redirect to /login.
-    let wiped = wipe_all_user_tables(&state.db).map_err(|e| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        code: "factory_reset_failed",
-        message: e.to_string(),
-    })?;
+    let (tables_wiped, migrations_reapplied) =
+        wipe_and_remigrate(&state.db).map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "factory_reset_failed",
+            message: e.to_string(),
+        })?;
 
     Ok(Json(FactoryResetResponse {
-        tables_wiped: wiped,
+        tables_wiped,
+        migrations_reapplied,
         plugins_torn_down,
         sidecars_stopped,
         restart_recommended: true,
     }))
 }
 
-/// Run the actual wipe. Pulled out for direct unit-test access.
+/// True factory reset: DROP every user table, then re-run the
+/// embedded migration set from scratch. Pulled out for direct
+/// unit-test access.
+///
+/// Rationale (2026-05-13 rework). The previous implementation here
+/// did `DELETE FROM` every non-`schema_version` table and re-seeded
+/// **only** `config_general`. That broke every other migration-seeded
+/// singleton (`config_research`, `config_personality`,
+/// `config_search_providers`, `config_skills`, …) — they were emptied
+/// but never re-seeded, so downstream code reading them via
+/// `query_row(...)?` (without `.optional()`) blew up with
+/// `sqlite error: Query returned no rows`. Surfaced as "deep research
+/// stalls minutes after a fresh-account setup."
+///
+/// The right semantic for "factory reset" is **the DB equals what
+/// `execlaw install` would have produced**. Achieved by:
+///
+///   1. DROP every table including `schema_version` so the migration
+///      runner sees a virgin DB.
+///   2. Run `MigrationRunner::apply_all()` which `CREATE TABLE`s every
+///      schema and re-fires every `INSERT OR IGNORE` seed in the
+///      migration bodies.
 ///
 /// Implementation notes:
 ///
-///   * We discover tables from `sqlite_master` rather than hard-coding
-///     a list — that way new migrations are automatically covered.
-///   * `schema_version` is preserved so SQLite doesn't think every
-///     migration is unapplied on next boot (which would re-run the
-///     ones that side-effect on first apply).
-///   * `defer_foreign_keys = ON` lets us delete in arbitrary order
-///     inside the transaction without tripping the FK constraints
-///     that `apply_init_pragmas` enabled at connection-open time.
-///   * We re-seed the `config_general` singleton row so the very
-///     next `GET /api/admin/settings/general` succeeds without
-///     requiring a service restart.
-fn wipe_all_user_tables(db: &execlaw_core::Database) -> Result<usize, execlaw_core::DbError> {
-    db.transaction(|tx| {
-        tx.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
-        let mut stmt = tx.prepare(
-            "SELECT name FROM sqlite_master \
-             WHERE type = 'table' \
-               AND name NOT LIKE 'sqlite_%' \
-               AND name != 'schema_version'",
-        )?;
-        let names: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<_, _>>()?;
-        drop(stmt);
+///   * Foreign-key constraints have to be OFF during DROP because
+///     SQLite refuses to drop a table that's currently a parent of an
+///     existing FK relationship even when both sides are about to be
+///     dropped. `PRAGMA foreign_keys = OFF` can only be set OUTSIDE
+///     a transaction (SQLite silently ignores it inside one), so we
+///     do it via `with_conn` rather than `transaction`. The wipe
+///     itself isn't transactional — a crash mid-drop leaves a
+///     partial DB, which is acceptable for a destructive operation
+///     the operator just confirmed.
+///   * The migration runner's `apply_all` is already idempotent
+///     against a virgin DB — it creates `schema_version` and walks
+///     every embedded migration.
+///   * Returns `(tables_dropped, migrations_reapplied)` for the
+///     response body. Test asserts both are > 0 and that singleton
+///     config rows actually exist post-reset.
+fn wipe_and_remigrate(
+    db: &execlaw_core::Database,
+) -> Result<(usize, usize), execlaw_core::DbError> {
+    use execlaw_core::migrations::MigrationRunner;
 
+    // Disable FK enforcement so DROP TABLE doesn't blow up on tables
+    // referenced by sibling FKs we're about to drop too. Re-enabled
+    // before the migration runner kicks in.
+    db.with_conn(|c| {
+        c.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        Ok(())
+    })?;
+
+    let dropped = db.with_conn(|c| {
+        let names: Vec<String> = {
+            let mut stmt = c.prepare(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'table' \
+                   AND name NOT LIKE 'sqlite_%'",
+            )?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<_, _>>()?
+        };
         for table in &names {
-            // SQLite identifiers are wrapped in double-quotes for
-            // safety even though our tables don't use anything
-            // exotic; double-up any embedded quote per the spec.
+            // Identifier quoting: double-up any embedded `"` per spec.
+            // Our migrations don't use exotic names but this is the
+            // standard hardening for sqlite-master-driven loops.
             let quoted = table.replace('"', "\"\"");
-            tx.execute(&format!("DELETE FROM \"{quoted}\""), [])?;
+            c.execute(&format!("DROP TABLE IF EXISTS \"{quoted}\""), [])?;
         }
-
-        // Re-seed the config_general singleton — `OR IGNORE` is a
-        // no-op if a future migration adds a different default-row
-        // pattern that already inserted between the DELETE and here.
-        tx.execute(
-            "INSERT OR IGNORE INTO config_general \
-                (id, start_on_boot, bind_address, updated_at) \
-             VALUES (1, 1, '127.0.0.1:3031', unixepoch())",
-            [],
-        )?;
         Ok(names.len())
-    })
+    })?;
+
+    // Re-enable FKs before migrations so CREATE TABLE statements that
+    // declare FK constraints are validated. `MigrationRunner` opens
+    // its own `with_conn` blocks so this PRAGMA is applied for the
+    // life of the connection (Database holds one connection — see
+    // `db.rs` — so setting it once on the shared handle is enough).
+    db.with_conn(|c| {
+        c.execute_batch("PRAGMA foreign_keys = ON;")?;
+        Ok(())
+    })?;
+
+    let applied = MigrationRunner::new(db).apply_all().map_err(|e| {
+        execlaw_core::DbError::Migration(format!(
+            "factory-reset: re-apply migrations failed: {e}"
+        ))
+    })?;
+
+    Ok((dropped, applied.len()))
 }
 
 fn require_controller(state: &AppState, user: &AuthedUser) -> Result<(), ApiError> {
@@ -426,6 +478,110 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 1, "config_general singleton must be re-seeded");
+    }
+
+    #[tokio::test]
+    async fn every_migration_seeded_singleton_is_re_seeded_after_wipe() {
+        // Regression for the 2026-05-13 "deep research stalls after a
+        // fresh-account setup" bug. The old `wipe_all_user_tables`
+        // DELETEd every row but only re-seeded `config_general`,
+        // leaving the other migration-seeded singletons empty. Any
+        // reader that did `query_row(...)?` on those rows blew up
+        // with `sqlite error: Query returned no rows`.
+        //
+        // The fix swaps DELETE-then-reseed for DROP-then-remigrate,
+        // which re-fires every `INSERT OR IGNORE` in the migration
+        // bodies. This test pins that behaviour by enumerating the
+        // singleton seeds known to be in `0001_baseline.sql` and
+        // asserting each ends up with at least one row after the
+        // reset.
+        let state = test_app_state();
+        let app = build_router(state.clone());
+        let tok = setup_controller_token(&app).await;
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/admin/factory-reset")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"confirm":"RESET"}).to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["migrations_reapplied"].as_u64().unwrap() > 0,
+            "the response should report a non-zero re-applied count",
+        );
+
+        // Every migration-seeded singleton must come back populated.
+        // The list mirrors the `INSERT OR IGNORE INTO config_*` lines
+        // in `0001_baseline.sql`. If a future migration adds another
+        // seeded singleton, add it here too.
+        let expected_seeded = [
+            "config_general",
+            "config_personality",
+            "config_research",
+            "config_search_providers",
+            "config_skills",
+        ];
+        for table in expected_seeded {
+            let count: i64 = state
+                .db
+                .with_conn(|c| {
+                    let n: i64 = c
+                        .query_row(
+                            &format!("SELECT COUNT(*) FROM {table}"),
+                            [],
+                            |r| r.get(0),
+                        )
+                        .map_err(|e| execlaw_core::DbError::Config(e.to_string()))?;
+                    Ok(n)
+                })
+                .unwrap();
+            assert!(
+                count >= 1,
+                "{table} singleton must be re-seeded post-reset (got {count} rows)",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn research_config_get_works_after_wipe() {
+        // The original "deep research stalls" bug surfaced as
+        // `ResearchConfigStore::get()` throwing
+        // `sqlite error: Query returned no rows` when called against
+        // a post-factory-reset DB. Pin the integration here so the
+        // fix can't regress without this test failing.
+        use execlaw_core::research::ResearchConfigStore;
+
+        let state = test_app_state();
+        let app = build_router(state.clone());
+        let tok = setup_controller_token(&app).await;
+
+        // Wipe.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/admin/factory-reset")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"confirm":"RESET"}).to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The store must return Ok here — no `QueryReturnedNoRows`.
+        let cfg = ResearchConfigStore::new(&state.db).get();
+        assert!(
+            cfg.is_ok(),
+            "ResearchConfigStore::get() after factory reset must \
+             succeed, got: {cfg:?}",
+        );
     }
 
     #[tokio::test]

@@ -1055,10 +1055,27 @@ impl<'db> ResearchConfigStore<'db> {
         Self { db }
     }
 
-    /// Read the singleton row. Migration 0027 seeds it, so this
-    /// returns the defaults on a fresh DB rather than `None`.
+    /// Read the singleton row. Migration 0001's baseline seed
+    /// (`INSERT OR IGNORE INTO config_research VALUES (1, ...)`) puts
+    /// the row in place on fresh installs, but operationally the row
+    /// CAN be missing — a buggy factory reset, an operator-side
+    /// `DELETE FROM config_research`, a partial restore from a
+    /// snapshot, etc. The docstring has always promised "returns the
+    /// defaults on a fresh DB rather than `None`"; this implementation
+    /// now honours that promise by routing `QueryReturnedNoRows`
+    /// through `ResearchConfig::default()` instead of bubbling
+    /// `sqlite error: Query returned no rows` up to the caller.
+    ///
+    /// The bug that motivated this hardening: in 2026-05-13 a
+    /// factory-reset deleted the row, the research runner called
+    /// `get()` for its config, hit `QueryReturnedNoRows`, and exited
+    /// with `sqlite error: Query returned no rows`. The runner had
+    /// no recovery path. Returning defaults keeps the agent loop
+    /// running even when the operator's DB has drifted; if defaults
+    /// are wrong the operator can edit them in Settings → Research.
     pub fn get(&self) -> Result<ResearchConfig, ResearchError> {
-        let row = self.db.with_conn(|c| {
+        use rusqlite::OptionalExtension;
+        let row: Option<ResearchConfig> = self.db.with_conn(|c| {
             let got = c.query_row(
                 "SELECT max_wall_clock_minutes, max_total_tokens, max_subqueries, \
                         parallel_workers, max_urls_per_subquery, max_pages_total, \
@@ -1082,10 +1099,11 @@ impl<'db> ResearchConfigStore<'db> {
                         updated_at: r.get(9)?,
                     })
                 },
-            )?;
+            )
+            .optional()?;
             Ok(got)
         })?;
-        Ok(row)
+        Ok(row.unwrap_or_default())
     }
 
     /// Apply a patch. Validates each numeric field's lower bound and
@@ -2322,6 +2340,55 @@ mod tests {
         assert_eq!(cfg.auto_cancel_after_idle_secs, 120);
         assert_eq!(cfg.phase_gates, PhaseGates::PlanOnly);
         assert!(cfg.default_search_provider.is_none());
+    }
+
+    #[test]
+    fn config_get_returns_defaults_when_row_missing() {
+        // Regression for the 2026-05-13 "deep research stalls after
+        // factory reset" bug. Before this fix, `get()` did
+        // `query_row(...)?` without `.optional()`, so a missing row
+        // bubbled `sqlite error: Query returned no rows` straight up
+        // to the runner. The docstring already promised "returns the
+        // defaults on a fresh DB"; this test pins the new
+        // implementation honouring that promise even when the row
+        // has been deleted out from under us.
+        let db = fresh_db();
+        // Sanity: the seed inserted one row. `with_conn` produces a
+        // `DbError`; rusqlite's `?` auto-converts via the
+        // `From<rusqlite::Error> for DbError` impl declared in db.rs.
+        let pre: i64 = db
+            .with_conn(|c| {
+                let n: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM config_research",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok(n)
+            })
+            .unwrap();
+        assert_eq!(pre, 1);
+
+        // Delete the row — simulates the post-factory-reset state
+        // bug (or any operator-side DELETE).
+        db.with_conn(|c| {
+            c.execute("DELETE FROM config_research", [])?;
+            Ok(())
+        })
+        .unwrap();
+
+        // The store must still return defaults, NOT
+        // `QueryReturnedNoRows`.
+        let cfg = ResearchConfigStore::new(&db).get();
+        assert!(
+            cfg.is_ok(),
+            "get() with no row must succeed, got: {cfg:?}",
+        );
+        let cfg = cfg.unwrap();
+        // Exact field values come from `ResearchConfig::default()`.
+        let defaults = ResearchConfig::default();
+        assert_eq!(cfg.max_wall_clock_minutes, defaults.max_wall_clock_minutes);
+        assert_eq!(cfg.max_subqueries, defaults.max_subqueries);
+        assert_eq!(cfg.phase_gates, defaults.phase_gates);
     }
 
     #[test]

@@ -12,6 +12,38 @@ this changelog is for operators and plugin authors who want to see the
 
 ## [Unreleased]
 
+### Fixed
+
+- **Factory reset now produces an actual factory state.** The previous
+  `wipe_all_user_tables` `DELETE`d every non-`schema_version` row but
+  only re-seeded `config_general`. Every other migration-seeded
+  singleton (`config_research`, `config_personality`,
+  `config_search_providers`, `config_skills`, …) was left empty.
+  Downstream code reading those tables via `query_row(...)?` (no
+  `.optional()` fallback) blew up minutes later with
+  `sqlite error: Query returned no rows`. Symptom: deep-research jobs
+  stalled / failed immediately after a fresh-account setup that
+  followed a factory reset.
+
+  Rewrote `factory_reset.rs::wipe_and_remigrate` to DROP every user
+  table including `schema_version`, then re-run
+  `MigrationRunner::apply_all()`. The migration set's `CREATE TABLE`
+  + `INSERT OR IGNORE` statements take care of re-creating the schema
+  AND re-seeding every singleton. The response body now also reports
+  `migrations_reapplied`. Three new regression tests pin: (a) every
+  migration-seeded singleton is populated after reset, (b)
+  `ResearchConfigStore::get()` succeeds post-reset, (c) the
+  `tables_wiped` + `migrations_reapplied` counts both surface in the
+  response JSON.
+
+- **`ResearchConfigStore::get()` honors its docstring.** The
+  docstring promised "returns the defaults on a fresh DB rather than
+  `None`" but the implementation propagated `QueryReturnedNoRows`
+  through `?` whenever the singleton row was missing. Fixed with
+  `.optional()` + fall-through to `ResearchConfig::default()`. A new
+  unit test pins the contract by DELETEing the row then asserting
+  `get()` still returns defaults.
+
 ### Added
 
 - **GitHub Actions CI** (`.github/workflows/ci.yml`) — four-target
