@@ -3,9 +3,8 @@
 // Architecture (post-2026-05-14 self-containment refactor):
 //
 //   PluginConfigShell (THIS file — owns the chrome: header + danger zone)
-//     ├─ <DynamicPluginPanel ... staticFallback={KNOWN_CONFIGS[id]} />
-//     │     └─ tries plugin's own ui/panel.js first; falls back to
-//     │        any hardcoded SPA page that hasn't migrated yet
+//     ├─ <DynamicPluginPanel ... />
+//     │     └─ loads the plugin's own ui/panel.js at runtime
 //     └─ DangerZone (Uninstall) — unconditional, plugin can't override
 //
 // Plugin authors ship `ui/panel.tsx` inside their ZIP — see
@@ -22,10 +21,12 @@
 // That's the load-bearing containment invariant: every plugin
 // gets the same lifecycle UI, even if its own panel crashes.
 //
-// `KNOWN_CONFIGS` is a transitional fallback for plugins that
-// haven't yet migrated their config UI into the plugin ZIP. Each
-// entry is removed as the corresponding plugin is migrated; the
-// final state is an empty record (or the var deleted entirely).
+// All built-in plugins were migrated to the self-contained
+// `ui/panel.tsx` shape between 2026-05-14 and 2026-05-15
+// (signal, then the remaining ten). The `STATIC_FALLBACKS` map
+// below is now empty; it's kept as the documented escape hatch
+// for any future plugin whose config UI hasn't been packaged
+// alongside its main.rhai yet.
 
 import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
@@ -38,43 +39,19 @@ import {
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
-import { DiscordConfigPage } from "./DiscordConfigPage";
 import { DynamicPluginPanel } from "./DynamicPluginPanel";
-import { GoogleAppsPage } from "./GoogleAppsPage";
-import { GoogleCalendarPage } from "./GoogleCalendarPage";
-import { GoogleContactsPage } from "./GoogleContactsPage";
-import { GooglePlacesConfigPage } from "./GooglePlacesConfigPage";
-import { OpenMeteoConfigPage } from "./OpenMeteoConfigPage";
 import type { PluginConfigComponent } from "./PluginConfigBase";
-import { PushoverConfigPage } from "./PushoverConfigPage";
-// SignalConfigPage retired 2026-05-14 — Signal now ships its own
-// ui/panel.js inside the plugin ZIP (plugin v0.5.0+). The dynamic
-// loader resolves it via /api/admin/plugins/signal/ui/panel.js.
-import { SlackConfigPage } from "./SlackConfigPage";
-import { SmsSocketConfigPage } from "./SmsSocketConfigPage";
-import { WhatsAppConfigPage } from "./WhatsAppConfigPage";
 
 /**
  * Transitional fallback map. Each entry is a plugin whose UI has
  * NOT yet been migrated into its own ZIP. The shell renders the
  * fallback only when the dynamic load (from the plugin's
  * `ui/panel.js`) 404s — i.e. when the plugin doesn't ship one yet.
- * As each plugin is migrated, its entry is removed; the final
- * state of this map is `{}` and the whole import block goes away.
+ * Empty as of 2026-05-15: every built-in plugin now ships its own
+ * panel.js. Add an entry here only if onboarding a new plugin
+ * whose UI hasn't been packaged yet.
  */
-const STATIC_FALLBACKS: Record<string, PluginConfigComponent> = {
-    discord: DiscordConfigPage,
-    "google-apps": GoogleAppsPage,
-    "google-contacts": GoogleContactsPage,
-    "google-calendar": GoogleCalendarPage,
-    "google-places": GooglePlacesConfigPage,
-    "open-meteo": OpenMeteoConfigPage,
-    pushover: PushoverConfigPage,
-    // signal: migrated 2026-05-14 — see plugins/signal/ui/panel.tsx.
-    slack: SlackConfigPage,
-    "sms-socket": SmsSocketConfigPage,
-    whatsapp: WhatsAppConfigPage,
-};
+const STATIC_FALLBACKS: Record<string, PluginConfigComponent> = {};
 
 export function PluginConfigRouter() {
     const { plugin_id } = useParams<{ plugin_id: string }>();

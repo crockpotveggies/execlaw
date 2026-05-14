@@ -1,29 +1,35 @@
-// Settings → Plugins → Pushover. Operator pastes their user_key
-// + app_token here; the plugin persists them via its per-plugin
-// vault scope and uses them at agent-tool dispatch time.
+// Pushover plugin self-contained config panel.
 //
-// Two affordances:
-//   * Save form — write the keys back to the plugin (server
-//     masks the values on read so refreshing the page doesn't
-//     leak the originals into the SPA).
-//   * Test button — fires a one-shot notification end-to-end so
-//     the operator confirms the keys actually work before the
-//     agent's first call.
+// Migrated from `web/src/settings/PushoverConfigPage.tsx` (2026-05-14).
+// Build: node scripts/build-plugin-ui.mjs pushover
 
-import { useCallback, useEffect, useState, type JSX } from "react";
-import { Alert, Badge, Button, Card, Form, Spinner } from "react-bootstrap";
-import {
-    getPushoverConfig,
-    setPushoverConfig,
-    testPushoverNotification,
-    type PushoverConfigResponse,
-} from "../api/endpoints";
-import { useAuth } from "../auth/AuthContext";
-import { ErrorBanner } from "../components/ErrorBanner";
-import type { PluginConfigProps } from "./PluginConfigBase";
+import type {
+    PluginPanelComponent,
+    PluginPanelProps,
+} from "@execlaw/plugin-ui";
 
-export function PushoverConfigPage(_props: PluginConfigProps): JSX.Element {
-    const { getAccessToken } = useAuth();
+const React = globalThis.execlawHost!.React;
+const { useCallback, useEffect, useState } = React;
+
+// --- API types ------------------------------------------------------
+
+interface PushoverConfigResponse {
+    user_key_set: boolean;
+    user_key_masked: string;
+    app_token_set: boolean;
+    app_token_masked: string;
+}
+
+interface PushoverTestResponse {
+    ok?: boolean;
+    request_id?: string;
+    error?: string;
+}
+
+const Panel: PluginPanelComponent = (props: PluginPanelProps) => {
+    const { bridge } = props;
+    const { ErrorBanner, Button } = bridge.components;
+
     const [config, setConfig] = useState<PushoverConfigResponse | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
@@ -41,14 +47,17 @@ export function PushoverConfigPage(_props: PluginConfigProps): JSX.Element {
         setLoading(true);
         setError(null);
         try {
-            const r = await getPushoverConfig(getAccessToken);
+            const r = await bridge.fetchJson<PushoverConfigResponse>(
+                "GET",
+                "/api/admin/plugins/pushover/config",
+            );
             setConfig(r);
         } catch (e) {
             setError(e instanceof Error ? e.message : "couldn't load config");
         } finally {
             setLoading(false);
         }
-    }, [getAccessToken]);
+    }, [bridge]);
 
     useEffect(() => {
         void reload();
@@ -60,8 +69,14 @@ export function PushoverConfigPage(_props: PluginConfigProps): JSX.Element {
         setSavedNotice(null);
         setTestStatus({ kind: "idle" });
         try {
-            await setPushoverConfig(userKey, appToken, getAccessToken);
-            setSavedNotice("Saved. Inputs are now empty — the keys live in the plugin's vault; the masked tail above is what the SPA reads back.");
+            await bridge.fetchJson<unknown>(
+                "POST",
+                "/api/admin/plugins/pushover/config",
+                { user_key: userKey, app_token: appToken },
+            );
+            setSavedNotice(
+                "Saved. Inputs are now empty — the keys live in the plugin's vault; the masked tail above is what the SPA reads back.",
+            );
             setUserKey("");
             setAppToken("");
             await reload();
@@ -70,14 +85,17 @@ export function PushoverConfigPage(_props: PluginConfigProps): JSX.Element {
         } finally {
             setBusy(false);
         }
-    }, [appToken, getAccessToken, reload, userKey]);
+    }, [appToken, bridge, reload, userKey]);
 
     const onTest = useCallback(async () => {
         setBusy(true);
         setTestStatus({ kind: "idle" });
         setError(null);
         try {
-            const r = await testPushoverNotification(getAccessToken);
+            const r = await bridge.fetchJson<PushoverTestResponse>(
+                "POST",
+                "/api/admin/plugins/pushover/test",
+            );
             if (r.ok) {
                 setTestStatus({
                     kind: "ok",
@@ -86,7 +104,8 @@ export function PushoverConfigPage(_props: PluginConfigProps): JSX.Element {
             } else {
                 setTestStatus({
                     kind: "err",
-                    message: r.error ?? "Pushover rejected the test notification.",
+                    message:
+                        r.error ?? "Pushover rejected the test notification.",
                 });
             }
         } catch (e) {
@@ -97,12 +116,16 @@ export function PushoverConfigPage(_props: PluginConfigProps): JSX.Element {
         } finally {
             setBusy(false);
         }
-    }, [getAccessToken]);
+    }, [bridge]);
 
     if (loading) {
         return (
             <div className="d-flex align-items-center execlaw-muted">
-                <Spinner animation="border" size="sm" className="me-2" />
+                <span
+                    className="spinner-border spinner-border-sm me-2"
+                    role="status"
+                    aria-hidden
+                />
                 Loading…
             </div>
         );
@@ -120,18 +143,24 @@ export function PushoverConfigPage(_props: PluginConfigProps): JSX.Element {
                 className="mb-3"
             />
 
-            <Card className="mb-3">
-                <Card.Body>
+            <div className="card mb-3">
+                <div className="card-body">
                     <div className="d-flex align-items-center mb-2 gap-2">
                         <h5 className="h6 mb-0">Pushover credentials</h5>
                         {fullyConfigured ? (
-                            <Badge bg="success" data-testid="pushover-status">
+                            <span
+                                className="badge bg-success"
+                                data-testid="pushover-status"
+                            >
                                 Configured
-                            </Badge>
+                            </span>
                         ) : (
-                            <Badge bg="warning" text="dark" data-testid="pushover-status">
+                            <span
+                                className="badge bg-warning text-dark"
+                                data-testid="pushover-status"
+                            >
                                 Incomplete
-                            </Badge>
+                            </span>
                         )}
                     </div>
                     <p className="execlaw-muted small mb-3">
@@ -158,13 +187,13 @@ export function PushoverConfigPage(_props: PluginConfigProps): JSX.Element {
                     </p>
 
                     {savedNotice && (
-                        <Alert variant="success" data-testid="pushover-saved">
+                        <div className="alert alert-success" data-testid="pushover-saved">
                             {savedNotice}
-                        </Alert>
+                        </div>
                     )}
 
-                    <Form.Group className="mb-2">
-                        <Form.Label className="execlaw-muted small mb-1">
+                    <div className="mb-2">
+                        <label className="form-label execlaw-muted small mb-1">
                             User key
                             {userKeySet && (
                                 <span className="ms-2 execlaw-muted">
@@ -172,22 +201,25 @@ export function PushoverConfigPage(_props: PluginConfigProps): JSX.Element {
                                     <code>{config?.user_key_masked}</code>)
                                 </span>
                             )}
-                        </Form.Label>
-                        <Form.Control
+                        </label>
+                        <input
                             type="password"
+                            className="form-control"
                             placeholder="u-..."
                             value={userKey}
-                            onChange={(e) => setUserKey(e.target.value)}
+                            onChange={(e: { target: { value: string } }) =>
+                                setUserKey(e.target.value)
+                            }
                             data-testid="pushover-user-key-input"
                         />
-                        <Form.Text className="execlaw-muted">
+                        <div className="form-text execlaw-muted">
                             30-char Pushover user identifier. Leave blank to keep the existing value;
                             paste anything to replace it.
-                        </Form.Text>
-                    </Form.Group>
+                        </div>
+                    </div>
 
-                    <Form.Group className="mb-3">
-                        <Form.Label className="execlaw-muted small mb-1">
+                    <div className="mb-3">
+                        <label className="form-label execlaw-muted small mb-1">
                             Application token
                             {tokenSet && (
                                 <span className="ms-2 execlaw-muted">
@@ -195,19 +227,22 @@ export function PushoverConfigPage(_props: PluginConfigProps): JSX.Element {
                                     <code>{config?.app_token_masked}</code>)
                                 </span>
                             )}
-                        </Form.Label>
-                        <Form.Control
+                        </label>
+                        <input
                             type="password"
+                            className="form-control"
                             placeholder="a-..."
                             value={appToken}
-                            onChange={(e) => setAppToken(e.target.value)}
+                            onChange={(e: { target: { value: string } }) =>
+                                setAppToken(e.target.value)
+                            }
                             data-testid="pushover-token-input"
                         />
-                        <Form.Text className="execlaw-muted">
+                        <div className="form-text execlaw-muted">
                             Per-application API token. Each app you build at
                             pushover.net gets its own token; one for execlaw is fine.
-                        </Form.Text>
-                    </Form.Group>
+                        </div>
+                    </div>
 
                     <div className="d-flex gap-2">
                         <Button
@@ -215,7 +250,8 @@ export function PushoverConfigPage(_props: PluginConfigProps): JSX.Element {
                             size="sm"
                             onClick={() => void onSave()}
                             disabled={
-                                busy || (userKey.trim() === "" && appToken.trim() === "")
+                                busy ||
+                                (userKey.trim() === "" && appToken.trim() === "")
                             }
                             data-testid="pushover-save"
                         >
@@ -231,19 +267,21 @@ export function PushoverConfigPage(_props: PluginConfigProps): JSX.Element {
                             Send test notification
                         </Button>
                     </div>
-                </Card.Body>
-            </Card>
+                </div>
+            </div>
 
             {testStatus.kind === "ok" && (
-                <Alert variant="success" data-testid="pushover-test-ok">
+                <div className="alert alert-success" data-testid="pushover-test-ok">
                     {testStatus.message}
-                </Alert>
+                </div>
             )}
             {testStatus.kind === "err" && (
-                <Alert variant="danger" data-testid="pushover-test-err">
+                <div className="alert alert-danger" data-testid="pushover-test-err">
                     {testStatus.message}
-                </Alert>
+                </div>
             )}
         </div>
     );
-}
+};
+
+export default Panel;

@@ -1,16 +1,20 @@
-// Settings → Google Contacts plugin config (Phase 9, plugin-google-contacts).
+// Google Contacts plugin self-contained config panel.
 //
-// Mounted by `PluginConfigRouter` inside `PluginConfigShell`,
-// which owns the page header (back button + title + version
-// badge) and the danger-zone footer (Uninstall) — this component
-// renders ONLY the middle slot.
+// Migrated from `web/src/settings/GoogleContactsPage.tsx` (2026-05-14).
+// Delegates to the local `OauthClientConfig` (sibling file) for the
+// shared OAuth-client + Connect/Disconnect machinery.
 //
-// All the heavy lifting (OAuth client form, Connect/Disconnect,
-// state machine) lives in the shared `OauthClientConfig`
-// component. This file just supplies the plugin-specific copy.
+// Build: node scripts/build-plugin-ui.mjs google-contacts
 
-import type { PluginConfigProps } from "./PluginConfigBase";
-import { OauthClientConfig } from "./OauthClientConfig";
+import type {
+    PluginPanelComponent,
+    PluginPanelProps,
+} from "@execlaw/plugin-ui";
+
+const React = globalThis.execlawHost!.React;
+void React; // module-scope React const used by the JSX factory below.
+
+import { OauthClientConfig } from "./oauth-client-config";
 
 const SCOPES = [
     "https://www.googleapis.com/auth/contacts.readonly",
@@ -18,20 +22,19 @@ const SCOPES = [
     "email",
 ];
 
-export function GoogleContactsPage({
-    pluginId,
-    onConfigChanged,
-}: PluginConfigProps) {
+const Panel: PluginPanelComponent = (props: PluginPanelProps) => {
+    const { identity, bridge } = props;
     return (
         <OauthClientConfig
-            pluginId={pluginId}
+            pluginId={identity.id}
+            bridge={bridge}
             provider="google"
             defaultScopes={SCOPES}
             title="Google Contacts"
             icon="bi-person-vcard"
             description={
                 <>
-                    Connects the <code>{pluginId}</code> plugin to your Google
+                    Connects the <code>{identity.id}</code> plugin to your Google
                     account. Saved contacts auto-trust as Contact-class
                     principals; the <code>contacts.list</code> tool becomes
                     available on chat turns.
@@ -66,7 +69,7 @@ export function GoogleContactsPage({
                         <strong>Web application</strong>.
                     </li>
                     <li>
-                        Under Authorized redirect URIs, add this server's
+                        Under Authorized redirect URIs, add this server&apos;s
                         callback URL (shown in the form above).
                     </li>
                     <li>
@@ -75,7 +78,8 @@ export function GoogleContactsPage({
                     </li>
                 </ol>
             }
-            onConfigChanged={onConfigChanged}
         />
     );
-}
+};
+
+export default Panel;

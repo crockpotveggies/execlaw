@@ -1,43 +1,59 @@
-// Settings → Plugin → WhatsApp config page.
+// WhatsApp plugin self-contained config panel.
 //
-// Mirrors SignalConfigPage's UX one-to-one: poll status, render
-// either a "Pair this install" QR-scan flow or a paired-state
-// "Unlink" affordance. The plugin's admin endpoints return the
-// same JSON shapes Signal uses, so the same SignalStatusResponse
-// / SignalQrCodeLinkResponse types are reused via type aliases
-// in api/endpoints.ts.
+// Migrated from `web/src/settings/WhatsAppConfigPage.tsx` to the
+// dynamic-UI architecture (2026-05-14): the host SPA no longer ships
+// this page; the panel here is bundled into the plugin ZIP and
+// loaded at runtime via `DynamicPluginPanel`.
+//
+// Build:
+//   node scripts/build-plugin-ui.mjs whatsapp
 
-import { useCallback, useEffect, useState, type JSX } from "react";
-import Button from "react-bootstrap/Button";
-import {
-    fetchWhatsAppQrCodeLink,
-    getWhatsAppStatus,
-    unregisterWhatsAppAccount,
-    type WhatsAppStatusResponse,
-} from "../api/endpoints";
-import { useAuth } from "../auth/AuthContext";
-import { ErrorBanner } from "../components/ErrorBanner";
-import { SidecarStatusBlock } from "../components/SidecarStatusBlock";
-import type { PluginConfigProps } from "./PluginConfigBase";
+import type {
+    PluginPanelComponent,
+    PluginPanelProps,
+} from "@execlaw/plugin-ui";
+
+const React = globalThis.execlawHost!.React;
+const { useCallback, useEffect, useState } = React;
+
+// --- API types ------------------------------------------------------
+
+interface WhatsAppStatusResponse {
+    sidecar_status: string;
+    sidecar_rpc_url: string | null;
+    registered_accounts: string[];
+    accounts_on_disk: string[];
+    fetch_error: string | null;
+}
+
+interface WhatsAppQrCodeLinkResponse {
+    data_url?: string;
+    mime_type?: string;
+    error?: string;
+}
 
 const POLL_INTERVAL_MS = 3_000;
 
-export function WhatsAppConfigPage(_props: PluginConfigProps): JSX.Element {
-    const auth = useAuth();
-    const { getAccessToken } = auth;
+const Panel: PluginPanelComponent = (props: PluginPanelProps) => {
+    const { bridge } = props;
+    const { ErrorBanner, SidecarStatusBlock, Button } = bridge.components;
+
     const [status, setStatus] = useState<WhatsAppStatusResponse | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [busy, setBusy] = useState(false);
 
     const refresh = useCallback(async () => {
         try {
-            const r = await getWhatsAppStatus(getAccessToken);
+            const r = await bridge.fetchJson<WhatsAppStatusResponse>(
+                "GET",
+                "/api/admin/plugins/whatsapp/status",
+            );
             setStatus(r);
             setError(null);
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e));
         }
-    }, [getAccessToken]);
+    }, [bridge]);
 
     useEffect(() => {
         void refresh();
@@ -58,14 +74,17 @@ export function WhatsAppConfigPage(_props: PluginConfigProps): JSX.Element {
         }
         setBusy(true);
         try {
-            await unregisterWhatsAppAccount(getAccessToken);
+            await bridge.fetchJson<unknown>(
+                "DELETE",
+                "/api/admin/plugins/whatsapp/unregister-account",
+            );
             await refresh();
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e));
         } finally {
             setBusy(false);
         }
-    }, [getAccessToken, refresh]);
+    }, [bridge, refresh]);
 
     return (
         <div data-testid="whatsapp-config-page">
@@ -97,42 +116,46 @@ export function WhatsAppConfigPage(_props: PluginConfigProps): JSX.Element {
                     />
                     {status.registered_accounts.length === 0 ? (
                         <PairingBlock
+                            bridge={bridge}
                             sidecarRunning={status.sidecar_rpc_url !== null}
-                            onPaired={refresh}
+                            onPaired={() => void refresh()}
+                            Button={Button}
                         />
                     ) : (
                         <PairedBlock
                             accounts={status.registered_accounts}
                             busy={busy}
                             onUnregister={onUnregister}
+                            Button={Button}
                         />
                     )}
                 </>
             )}
         </div>
     );
-}
+};
 
-// SidecarStatusBlock moved to ../components/SidecarStatusBlock.tsx
-// and shared with the Signal config page. The `awaiting_pairing`
-// follow-up copy is supplied to the shared block via the
-// `followupHint` prop above.
+export default Panel;
 
-function PairingBlock({
-    sidecarRunning,
-    onPaired,
-}: {
+// --- PairingBlock --------------------------------------------------
+
+interface PairingBlockProps {
+    bridge: PluginPanelProps["bridge"];
     sidecarRunning: boolean;
     onPaired: () => void;
-}): JSX.Element {
-    // 2026-05-14 — destructure `getAccessToken` so this effect
-    // depends on a stable function reference, not the full `auth`
-    // object whose reference flips on every auth-context recompute.
-    // See `SignalConfigPage.tsx` for the full rationale — same
-    // failure mode applies here (every 3-second status poll caused
-    // a re-render which invalidated the displayed QR by minting a
-    // fresh wuzapi pairing token).
-    const { getAccessToken } = useAuth();
+    Button: ReturnType<typeof currentButton>;
+}
+
+function currentButton() {
+    return globalThis.execlawHost!.components.Button;
+}
+
+function PairingBlock({
+    bridge,
+    sidecarRunning,
+    onPaired,
+    Button,
+}: PairingBlockProps) {
     const [generation, setGeneration] = useState(0);
     const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
     const [qrError, setQrError] = useState<string | null>(null);
@@ -143,7 +166,11 @@ function PairingBlock({
         let cancelled = false;
         setQrLoading(true);
         setQrError(null);
-        void fetchWhatsAppQrCodeLink(getAccessToken)
+        void bridge
+            .fetchJson<WhatsAppQrCodeLinkResponse>(
+                "GET",
+                "/api/admin/plugins/whatsapp/qrcodelink",
+            )
             .then((r) => {
                 if (cancelled) return;
                 if (r.error) {
@@ -159,7 +186,7 @@ function PairingBlock({
                     setQrDataUrl(null);
                 }
             })
-            .catch((e) => {
+            .catch((e: unknown) => {
                 if (cancelled) return;
                 setQrError(e instanceof Error ? e.message : String(e));
                 setQrDataUrl(null);
@@ -170,14 +197,14 @@ function PairingBlock({
         return () => {
             cancelled = true;
         };
-    }, [getAccessToken, generation, sidecarRunning]);
+    }, [bridge, generation, sidecarRunning]);
 
     // Refresh every 60s — WhatsApp's pairing QR rotates more
     // aggressively than Signal's; this stays inside the
     // refresh-window so the operator doesn't see "QR expired".
     useEffect(() => {
         const id = window.setInterval(() => {
-            setGeneration((n) => n + 1);
+            setGeneration((n: number) => n + 1);
         }, 60_000);
         return () => window.clearInterval(id);
     }, []);
@@ -222,7 +249,7 @@ function PairingBlock({
                     <Button
                         variant="outline-primary"
                         size="sm"
-                        onClick={() => setGeneration((n) => n + 1)}
+                        onClick={() => setGeneration((n: number) => n + 1)}
                         data-testid="whatsapp-pairing-retry"
                     >
                         Retry
@@ -255,7 +282,7 @@ function PairingBlock({
                         variant="outline-primary"
                         size="sm"
                         onClick={() => {
-                            setGeneration((n) => n + 1);
+                            setGeneration((n: number) => n + 1);
                             onPaired();
                         }}
                         data-testid="whatsapp-pairing-refresh"
@@ -276,15 +303,21 @@ function PairingBlock({
     );
 }
 
+// --- PairedBlock ---------------------------------------------------
+
+interface PairedBlockProps {
+    accounts: string[];
+    busy: boolean;
+    onUnregister: () => void;
+    Button: ReturnType<typeof currentButton>;
+}
+
 function PairedBlock({
     accounts,
     busy,
     onUnregister,
-}: {
-    accounts: string[];
-    busy: boolean;
-    onUnregister: () => void;
-}): JSX.Element {
+    Button,
+}: PairedBlockProps) {
     return (
         <div className="execlaw-card mb-3" data-testid="whatsapp-paired-block">
             <div className="execlaw-card__title mb-2">Paired</div>
@@ -296,7 +329,7 @@ function PairedBlock({
                 account.
             </p>
             <ul className="list-unstyled mb-0">
-                {accounts.map((number) => (
+                {accounts.map((number: string) => (
                     <li
                         key={number}
                         className="d-flex align-items-baseline gap-2 mb-2"
@@ -321,11 +354,3 @@ function PairedBlock({
         </div>
     );
 }
-
-// `badgeClassForStatus` moved to the shared SidecarStatusBlock
-// component (see `presentationFor` in
-// `../components/SidecarStatusBlock.tsx`). The shared mapping
-// also handles the `crash_looping` underscore-spelling that the
-// supervisor's wire format actually emits — the local table here
-// matched only `crashlooping` (no underscore) and so never fired
-// for real crash-looping sidecars.

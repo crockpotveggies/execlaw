@@ -1,7 +1,7 @@
 [plugin]
 id = "open-meteo"
 name = "Open-Meteo Weather"
-version = "0.1.0"
+version = "0.2.0"
 description = "Free, key-less weather, marine, air-quality, seasonal, ensemble, flood and climate data via the Open-Meteo public APIs. Covers forecast/historical/marine/air-quality/seasonal/ensemble/flood/climate/geocoding/elevation endpoints plus a generic chart renderer that produces inline SVG for the SPA and PNG attachments for transports that accept file uploads."
 author = "execlaw"
 license = "Apache-2.0"

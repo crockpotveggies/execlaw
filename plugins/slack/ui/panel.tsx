@@ -1,36 +1,61 @@
-// Settings → Plugins → Slack.
+// Slack plugin self-contained config panel.
 //
-// Multi-workspace from day 1. Form-style (no QR pairing) — operator
-// pastes a bot token (xoxb-) + app-level token (xapp-) per
-// workspace. The plugin's POST /workspaces handler probes
-// auth.test + apps.connections.open before saving so a bad token
-// surfaces immediately.
-//
-// After saving a workspace, the SPA also POSTs the controller
-// user id to /api/admin/me/identifiers (transport=slack, handle=U…)
-// so the host's principal-admit pipeline treats inbound messages
-// from that Slack user as Controller-class.
+// Migrated from `web/src/settings/SlackConfigPage.tsx` (2026-05-14).
+// Build: node scripts/build-plugin-ui.mjs slack
 
-import { useCallback, useEffect, useState, type JSX } from "react";
-import { Alert, Badge, Button, Card, Form, Spinner, Table } from "react-bootstrap";
-import {
-    addMyIdentifier,
-    addSlackWorkspace,
-    getSlackStatus,
-    listSlackWorkspaces,
-    removeSlackWorkspace,
-    sendSlackTestMessage,
-    type SlackStatusResponse,
-    type SlackWorkspaceView,
-} from "../api/endpoints";
-import { useAuth } from "../auth/AuthContext";
-import { ErrorBanner } from "../components/ErrorBanner";
-import type { PluginConfigProps } from "./PluginConfigBase";
+import type {
+    PluginPanelComponent,
+    PluginPanelProps,
+} from "@execlaw/plugin-ui";
 
-export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
-    const { getAccessToken } = useAuth();
-    const [status, setStatus] = useState<SlackStatusResponse | null>(null);
-    const [workspaces, setWorkspaces] = useState<SlackWorkspaceView[] | null>(null);
+const React = globalThis.execlawHost!.React;
+const { useCallback, useEffect, useState } = React;
+
+// --- API types ------------------------------------------------------
+
+interface SlackWorkspaceView {
+    team_id: string;
+    team_name: string;
+    bot_user_id: string;
+    controller_user_id: string;
+    bot_token_masked: string;
+    app_token_masked: string;
+}
+
+interface SlackWorkspacesResponse {
+    workspaces: SlackWorkspaceView[];
+}
+
+interface SlackStatusResponse {
+    sidecar_status: string;
+    sidecar_rpc_url: string | null;
+    registered_accounts: string[];
+    accounts_on_disk: string[];
+    fetch_error: string | null;
+    workspaces_configured: number;
+}
+
+interface SlackAddWorkspaceResponse {
+    team_id: string;
+    team_name: string;
+    bot_user_id: string;
+    controller_user_id: string;
+}
+
+interface SlackTestResponse {
+    ok?: boolean;
+    ts?: string;
+    error?: string;
+}
+
+const Panel: PluginPanelComponent = (props: PluginPanelProps) => {
+    const { bridge } = props;
+    const { ErrorBanner, Button } = bridge.components;
+
+    const [, setStatus] = useState<SlackStatusResponse | null>(null);
+    const [workspaces, setWorkspaces] = useState<SlackWorkspaceView[] | null>(
+        null,
+    );
     const [error, setError] = useState<string | null>(null);
     const [busy, setBusy] = useState(false);
     const [showAddForm, setShowAddForm] = useState(false);
@@ -49,8 +74,14 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
     const reload = useCallback(async () => {
         try {
             const [s, w] = await Promise.all([
-                getSlackStatus(getAccessToken),
-                listSlackWorkspaces(getAccessToken),
+                bridge.fetchJson<SlackStatusResponse>(
+                    "GET",
+                    "/api/admin/plugins/slack/status",
+                ),
+                bridge.fetchJson<SlackWorkspacesResponse>(
+                    "GET",
+                    "/api/admin/plugins/slack/workspaces",
+                ),
             ]);
             setStatus(s);
             setWorkspaces(w.workspaces);
@@ -58,7 +89,7 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e));
         }
-    }, [getAccessToken]);
+    }, [bridge]);
 
     useEffect(() => {
         void reload();
@@ -78,26 +109,28 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
         setError(null);
         setSavedNotice(null);
         try {
-            const added = await addSlackWorkspace(
-                botToken.trim(),
-                appToken.trim(),
-                trimmedController,
-                getAccessToken,
+            const added = await bridge.fetchJson<SlackAddWorkspaceResponse>(
+                "POST",
+                "/api/admin/plugins/slack/workspaces",
+                {
+                    bot_token: botToken.trim(),
+                    app_token: appToken.trim(),
+                    controller_user_id: trimmedController,
+                },
             );
-            // Auto-write the controller's slack-user identity to the
-            // shared My Identities list so principal-admit treats
-            // inbound DMs from this Slack user as Controller.
-            // Skipped when the operator left it blank — they can add
-            // it later via Settings → My Identities.
             if (trimmedController !== "") {
                 try {
-                    await addMyIdentifier("slack", trimmedController, getAccessToken);
+                    await bridge.fetchJson<unknown>(
+                        "POST",
+                        "/api/admin/me/identifiers",
+                        { transport: "slack", handle: trimmedController },
+                    );
                 } catch (idErr) {
-                    // Non-fatal — the workspace IS saved; the
-                    // identifier just wasn't auto-registered.
                     setError(
                         `Workspace saved, but couldn't register the controller identity: ${
-                            idErr instanceof Error ? idErr.message : String(idErr)
+                            idErr instanceof Error
+                                ? idErr.message
+                                : String(idErr)
                         }. Add it manually via Settings → My Identities.`,
                     );
                 }
@@ -118,7 +151,7 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
         } finally {
             setBusy(false);
         }
-    }, [appToken, botToken, controllerUserId, getAccessToken, reload]);
+    }, [appToken, botToken, controllerUserId, bridge, reload]);
 
     const onRemove = useCallback(
         async (team_id: string) => {
@@ -132,7 +165,11 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
             setBusy(true);
             setError(null);
             try {
-                await removeSlackWorkspace(team_id, getAccessToken);
+                const qs = new URLSearchParams({ team_id }).toString();
+                await bridge.fetchJson<unknown>(
+                    "DELETE",
+                    `/api/admin/plugins/slack/workspaces?${qs}`,
+                );
                 await reload();
             } catch (e) {
                 setError(e instanceof Error ? e.message : String(e));
@@ -140,7 +177,7 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
                 setBusy(false);
             }
         },
-        [getAccessToken, reload],
+        [bridge, reload],
     );
 
     const onTest = useCallback(async () => {
@@ -152,10 +189,10 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
         setBusy(true);
         setTestStatus({ kind: "idle" });
         try {
-            const r = await sendSlackTestMessage(
-                testTeamId,
-                testChannel.trim(),
-                getAccessToken,
+            const r = await bridge.fetchJson<SlackTestResponse>(
+                "POST",
+                "/api/admin/plugins/slack/test",
+                { team_id: testTeamId, channel: testChannel.trim() },
             );
             if (r.ok) {
                 setTestStatus({
@@ -176,18 +213,22 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
         } finally {
             setBusy(false);
         }
-    }, [getAccessToken, testChannel, testTeamId]);
+    }, [bridge, testChannel, testTeamId]);
 
-    if (status === null && workspaces === null) {
+    if (workspaces === null) {
         return (
             <div className="d-flex align-items-center execlaw-muted">
-                <Spinner animation="border" size="sm" className="me-2" />
+                <span
+                    className="spinner-border spinner-border-sm me-2"
+                    role="status"
+                    aria-hidden
+                />
                 Loading…
             </div>
         );
     }
 
-    const wsCount = workspaces?.length ?? 0;
+    const wsCount = workspaces.length;
     const statusBadgeClass =
         wsCount > 0 ? "bg-success" : "bg-warning text-dark";
     const statusLabel = wsCount > 0 ? "configured" : "unconfigured";
@@ -200,17 +241,16 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
                 className="mb-3"
             />
 
-            <Card className="mb-3">
-                <Card.Body>
+            <div className="card mb-3">
+                <div className="card-body">
                     <div className="d-flex align-items-center mb-2 gap-2">
                         <h5 className="h6 mb-0">Slack workspaces</h5>
-                        <Badge
-                            bg=""
-                            className={statusBadgeClass}
+                        <span
+                            className={`badge ${statusBadgeClass}`}
                             data-testid="slack-status-badge"
                         >
                             {statusLabel}
-                        </Badge>
+                        </span>
                         <span className="execlaw-muted small ms-2">
                             {wsCount} workspace{wsCount === 1 ? "" : "s"}
                         </span>
@@ -240,9 +280,9 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
                     </p>
 
                     {savedNotice && (
-                        <Alert variant="success" data-testid="slack-saved">
+                        <div className="alert alert-success" data-testid="slack-saved">
                             {savedNotice}
-                        </Alert>
+                        </div>
                     )}
 
                     {wsCount === 0 ? (
@@ -251,9 +291,8 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
                             Slack messages.
                         </div>
                     ) : (
-                        <Table
-                            size="sm"
-                            className="mb-3"
+                        <table
+                            className="table table-sm mb-3"
                             data-testid="slack-workspace-table"
                         >
                             <thead>
@@ -267,7 +306,7 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
                                 </tr>
                             </thead>
                             <tbody>
-                                {workspaces?.map((ws) => (
+                                {workspaces.map((ws: SlackWorkspaceView) => (
                                     <tr
                                         key={ws.team_id}
                                         data-testid={`slack-workspace-row-${ws.team_id}`}
@@ -322,7 +361,9 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
                                                 <Button
                                                     size="sm"
                                                     variant="outline-danger"
-                                                    onClick={() => void onRemove(ws.team_id)}
+                                                    onClick={() =>
+                                                        void onRemove(ws.team_id)
+                                                    }
                                                     disabled={busy}
                                                     data-testid={`slack-remove-${ws.team_id}`}
                                                 >
@@ -333,7 +374,7 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
                                     </tr>
                                 ))}
                             </tbody>
-                        </Table>
+                        </table>
                     )}
 
                     {!showAddForm ? (
@@ -351,52 +392,63 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
                             className="border-top pt-3 mt-2"
                             data-testid="slack-add-form"
                         >
-                            <Form.Group className="mb-2">
-                                <Form.Label className="execlaw-muted small mb-1">
+                            <div className="mb-2">
+                                <label className="form-label execlaw-muted small mb-1">
                                     Bot token
-                                </Form.Label>
-                                <Form.Control
+                                </label>
+                                <input
                                     type="password"
+                                    className="form-control"
                                     placeholder="xoxb-..."
                                     value={botToken}
-                                    onChange={(e) => setBotToken(e.target.value)}
+                                    onChange={(e: { target: { value: string } }) =>
+                                        setBotToken(e.target.value)
+                                    }
                                     data-testid="slack-bot-token-input"
                                 />
-                            </Form.Group>
-                            <Form.Group className="mb-2">
-                                <Form.Label className="execlaw-muted small mb-1">
+                            </div>
+                            <div className="mb-2">
+                                <label className="form-label execlaw-muted small mb-1">
                                     App-level token
-                                </Form.Label>
-                                <Form.Control
+                                </label>
+                                <input
                                     type="password"
+                                    className="form-control"
                                     placeholder="xapp-..."
                                     value={appToken}
-                                    onChange={(e) => setAppToken(e.target.value)}
+                                    onChange={(e: { target: { value: string } }) =>
+                                        setAppToken(e.target.value)
+                                    }
                                     data-testid="slack-app-token-input"
                                 />
-                            </Form.Group>
-                            <Form.Group className="mb-3">
-                                <Form.Label className="execlaw-muted small mb-1">
+                            </div>
+                            <div className="mb-3">
+                                <label className="form-label execlaw-muted small mb-1">
                                     Controller Slack user id
-                                    <span className="execlaw-muted ms-1">(optional)</span>
-                                </Form.Label>
-                                <Form.Control
+                                    <span className="execlaw-muted ms-1">
+                                        (optional)
+                                    </span>
+                                </label>
+                                <input
                                     type="text"
+                                    className="form-control"
                                     placeholder="U0A5GB3BJFL"
                                     value={controllerUserId}
-                                    onChange={(e) => setControllerUserId(e.target.value)}
+                                    onChange={(e: { target: { value: string } }) =>
+                                        setControllerUserId(e.target.value)
+                                    }
                                     data-testid="slack-controller-user-input"
                                 />
-                                <Form.Text className="execlaw-muted">
+                                <div className="form-text execlaw-muted">
                                     Your own Slack user id in this workspace
-                                    (different from the bot's id). Inbound
+                                    (different from the bot&apos;s id). Inbound
                                     DMs from this user resolve to the
                                     controller via My Identities, skipping
                                     the cold-contact ladder. Find it: click
                                     your avatar in Slack → View profile → ⋮ →
                                     Copy member ID.
-                                </Form.Text>
-                            </Form.Group>
+                                </div>
+                            </div>
                             <div className="d-flex gap-2">
                                 <Button
                                     size="sm"
@@ -427,12 +479,12 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
                             </div>
                         </div>
                     )}
-                </Card.Body>
-            </Card>
+                </div>
+            </div>
 
             {testTeamId && (
-                <Card className="mb-3" data-testid="slack-test-card">
-                    <Card.Body>
+                <div className="card mb-3" data-testid="slack-test-card">
+                    <div className="card-body">
                         <h5 className="h6 mb-2">Test message</h5>
                         <p className="execlaw-muted small mb-2">
                             Send a one-shot message to confirm the bot is
@@ -441,16 +493,22 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
                             (right-click channel → View channel details →
                             Integrations → Add apps).
                         </p>
-                        <Form.Group className="mb-2">
-                            <Form.Label className="execlaw-muted small mb-1">
+                        <div className="mb-2">
+                            <label className="form-label execlaw-muted small mb-1">
                                 Channel id (workspace: <code>{testTeamId}</code>)
-                            </Form.Label>
-                            <Form.Control
+                            </label>
+                            <input
                                 type="text"
+                                className="form-control"
                                 placeholder="C0123456789"
                                 value={testChannel}
-                                onChange={(e) => setTestChannel(e.target.value)}
-                                onKeyDown={(e) => {
+                                onChange={(e: { target: { value: string } }) =>
+                                    setTestChannel(e.target.value)
+                                }
+                                onKeyDown={(e: {
+                                    key: string;
+                                    preventDefault: () => void;
+                                }) => {
                                     if (e.key === "Enter") {
                                         e.preventDefault();
                                         void onTest();
@@ -459,7 +517,7 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
                                 autoFocus
                                 data-testid="slack-test-channel-input"
                             />
-                        </Form.Group>
+                        </div>
                         <div className="d-flex gap-2">
                             <Button
                                 size="sm"
@@ -484,26 +542,26 @@ export function SlackConfigPage(_props: PluginConfigProps): JSX.Element {
                             </Button>
                         </div>
                         {testStatus.kind === "ok" && (
-                            <Alert
-                                variant="success"
-                                className="mt-2"
+                            <div
+                                className="alert alert-success mt-2"
                                 data-testid="slack-test-ok"
                             >
                                 {testStatus.message}
-                            </Alert>
+                            </div>
                         )}
                         {testStatus.kind === "err" && (
-                            <Alert
-                                variant="danger"
-                                className="mt-2"
+                            <div
+                                className="alert alert-danger mt-2"
                                 data-testid="slack-test-err"
                             >
                                 {testStatus.message}
-                            </Alert>
+                            </div>
                         )}
-                    </Card.Body>
-                </Card>
+                    </div>
+                </div>
             )}
         </div>
     );
-}
+};
+
+export default Panel;

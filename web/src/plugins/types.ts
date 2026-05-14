@@ -213,6 +213,11 @@ export interface SidecarStatusBlockProps {
     rpcUrl: string | null;
     /** Last error from the host's RPC probe, if any. */
     fetchError?: string | null;
+    /** Optional plugin-specific hint to render INSTEAD of the default
+     *  explainer for the current status. WhatsApp uses this for the
+     *  `awaiting_pairing` state where the sidecar is up but the
+     *  per-user wuzapi auth hasn't been provisioned. */
+    followupHint?: ReactNode;
     /** Prefix for `data-testid` attributes inside the block. */
     testidPrefix: string;
 }

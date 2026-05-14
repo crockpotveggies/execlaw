@@ -1,7 +1,7 @@
 [plugin]
 id = "google-apps"
 name = "Google Apps"
-version = "0.1.1"
+version = "0.2.0"
 description = "Consolidated Google plugin — Gmail, Calendar, Contacts, Tasks, and Drive in one OAuth grant. Replaces the separate google-calendar + google-contacts plugins. Individual modules can be toggled on/off without re-running the consent flow."
 author = "execlaw"
 license = "Apache-2.0"

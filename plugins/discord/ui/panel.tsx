@@ -1,36 +1,54 @@
-// Settings → Plugins → Discord.
+// Discord plugin self-contained config panel.
 //
-// The operator creates a bot in the Discord Developer Portal,
-// enables the `MESSAGE_CONTENT` privileged gateway intent (Bot →
-// Privileged Gateway Intents → MESSAGE CONTENT INTENT), copies the
-// bot token, and pastes it here. On save the plugin validates the
-// token against `GET /users/@me`, persists it to the per-plugin
-// vault, then hot-reloads the gateway connection.
-//
-// Three affordances (mirrors SmsSocketConfigPage shape):
-//   * Save form — single bot_token input. Server masks the token
-//     on read so refreshing doesn't leak the original.
-//   * Status card — surfaces the bot identity (id + username) and
-//     how many guilds the gateway has reported (via GUILD_CREATE).
-//   * Test send — invites the operator to paste a channel id and
-//     queue a one-shot message to confirm end-to-end wiring.
+// Migrated from `web/src/settings/DiscordConfigPage.tsx` (2026-05-14).
+// Build: node scripts/build-plugin-ui.mjs discord
 
-import { useCallback, useEffect, useState, type JSX } from "react";
-import { Alert, Badge, Button, Card, Form, Spinner } from "react-bootstrap";
-import {
-    getDiscordConfig,
-    getDiscordStatus,
-    setDiscordConfig,
-    testDiscordMessage,
-    type DiscordConfigResponse,
-    type DiscordStatusResponse,
-} from "../api/endpoints";
-import { useAuth } from "../auth/AuthContext";
-import { ErrorBanner } from "../components/ErrorBanner";
-import type { PluginConfigProps } from "./PluginConfigBase";
+import type {
+    PluginPanelComponent,
+    PluginPanelProps,
+} from "@execlaw/plugin-ui";
 
-export function DiscordConfigPage(_props: PluginConfigProps): JSX.Element {
-    const { getAccessToken } = useAuth();
+const React = globalThis.execlawHost!.React;
+const { useCallback, useEffect, useState } = React;
+
+// --- API types ------------------------------------------------------
+
+interface DiscordConfigResponse {
+    bot_token_masked: string;
+    configured: boolean;
+    bot_user_id?: string | null;
+    bot_username?: string | null;
+}
+
+interface DiscordStatusResponse {
+    sidecar_status: string;
+    sidecar_rpc_url: string | null;
+    registered_accounts: unknown[];
+    accounts_on_disk: unknown[];
+    fetch_error: string | null;
+    configured?: boolean;
+    bot_user_id?: string | null;
+    bot_username?: string | null;
+    guilds_known?: number;
+    token_masked?: string;
+}
+
+interface DiscordTestResponse {
+    ok?: boolean;
+    message_id?: string;
+    error?: string;
+}
+
+interface DiscordSetConfigResponse {
+    ok: boolean;
+    bot_user_id?: string;
+    bot_username?: string;
+}
+
+const Panel: PluginPanelComponent = (_props: PluginPanelProps) => {
+    const { bridge } = _props;
+    const { ErrorBanner, Button } = bridge.components;
+
     const [config, setConfig] = useState<DiscordConfigResponse | null>(null);
     const [status, setStatus] = useState<DiscordStatusResponse | null>(null);
     const [loading, setLoading] = useState(true);
@@ -50,8 +68,14 @@ export function DiscordConfigPage(_props: PluginConfigProps): JSX.Element {
         setError(null);
         try {
             const [c, s] = await Promise.all([
-                getDiscordConfig(getAccessToken),
-                getDiscordStatus(getAccessToken),
+                bridge.fetchJson<DiscordConfigResponse>(
+                    "GET",
+                    "/api/admin/plugins/discord/config",
+                ),
+                bridge.fetchJson<DiscordStatusResponse>(
+                    "GET",
+                    "/api/admin/plugins/discord/status",
+                ),
             ]);
             setConfig(c);
             setStatus(s);
@@ -60,7 +84,7 @@ export function DiscordConfigPage(_props: PluginConfigProps): JSX.Element {
         } finally {
             setLoading(false);
         }
-    }, [getAccessToken]);
+    }, [bridge]);
 
     useEffect(() => {
         void reload();
@@ -77,16 +101,17 @@ export function DiscordConfigPage(_props: PluginConfigProps): JSX.Element {
         setSavedNotice(null);
         setTestStatus({ kind: "idle" });
         try {
-            const r = await setDiscordConfig(trimmed, getAccessToken);
+            const r = await bridge.fetchJson<DiscordSetConfigResponse>(
+                "POST",
+                "/api/admin/plugins/discord/config",
+                { bot_token: trimmed },
+            );
             const who = r.bot_username
                 ? `${r.bot_username} (id ${r.bot_user_id ?? "?"})`
                 : "the bot";
             setSavedNotice(
                 `Saved. Discord accepted the token for ${who}; the plugin tore down its old gateway connection and is reconnecting now — guild count below will populate as GUILD_CREATE dispatches arrive.`,
             );
-            // Don't keep the cleartext token in the input after a
-            // successful save — server-side masking is the source
-            // of truth from this point on.
             setBotToken("");
             await reload();
         } catch (e) {
@@ -94,7 +119,7 @@ export function DiscordConfigPage(_props: PluginConfigProps): JSX.Element {
         } finally {
             setBusy(false);
         }
-    }, [botToken, getAccessToken, reload]);
+    }, [botToken, bridge, reload]);
 
     const onTest = useCallback(async () => {
         const channelId = testChannel.trim();
@@ -110,7 +135,11 @@ export function DiscordConfigPage(_props: PluginConfigProps): JSX.Element {
         setTestStatus({ kind: "idle" });
         setError(null);
         try {
-            const r = await testDiscordMessage(channelId, getAccessToken);
+            const r = await bridge.fetchJson<DiscordTestResponse>(
+                "POST",
+                "/api/admin/plugins/discord/test",
+                { channel_id: channelId },
+            );
             if (r.ok === false) {
                 setTestStatus({
                     kind: "err",
@@ -133,12 +162,16 @@ export function DiscordConfigPage(_props: PluginConfigProps): JSX.Element {
         } finally {
             setBusy(false);
         }
-    }, [getAccessToken, reload, testChannel]);
+    }, [bridge, reload, testChannel]);
 
     if (loading) {
         return (
             <div className="d-flex align-items-center execlaw-muted">
-                <Spinner animation="border" size="sm" className="me-2" />
+                <span
+                    className="spinner-border spinner-border-sm me-2"
+                    role="status"
+                    aria-hidden
+                />
                 Loading…
             </div>
         );
@@ -157,22 +190,24 @@ export function DiscordConfigPage(_props: PluginConfigProps): JSX.Element {
                 className="mb-3"
             />
 
-            <Card className="mb-3">
-                <Card.Body>
+            <div className="card mb-3">
+                <div className="card-body">
                     <div className="d-flex align-items-center mb-2 gap-2">
                         <h5 className="h6 mb-0">Bot token</h5>
                         {configured ? (
-                            <Badge bg="success" data-testid="discord-status">
+                            <span
+                                className="badge bg-success"
+                                data-testid="discord-status"
+                            >
                                 Configured
-                            </Badge>
+                            </span>
                         ) : (
-                            <Badge
-                                bg="warning"
-                                text="dark"
+                            <span
+                                className="badge bg-warning text-dark"
                                 data-testid="discord-status"
                             >
                                 Unconfigured
-                            </Badge>
+                            </span>
                         )}
                     </div>
                     <p className="execlaw-muted small mb-2">
@@ -186,11 +221,10 @@ export function DiscordConfigPage(_props: PluginConfigProps): JSX.Element {
                         </a>
                         , go to <strong>Bot</strong>, click{" "}
                         <em>Reset Token</em> (or <em>Add Bot</em> on a new app)
-                        and copy the resulting token — it's shown exactly once.
+                        and copy the resulting token — it&apos;s shown exactly once.
                     </p>
-                    <Alert
-                        variant="warning"
-                        className="small py-2"
+                    <div
+                        className="alert alert-warning small py-2"
                         data-testid="discord-intent-warning"
                     >
                         <strong>Privileged intent required.</strong> On the
@@ -199,17 +233,17 @@ export function DiscordConfigPage(_props: PluginConfigProps): JSX.Element {
                         <code>MESSAGE CONTENT INTENT</code>. Without it the
                         plugin will connect, but every inbound message will
                         arrive with an empty <code>content</code> field and the
-                        agent won't see what users typed.
-                    </Alert>
+                        agent won&apos;t see what users typed.
+                    </div>
 
                     {savedNotice && (
-                        <Alert variant="success" data-testid="discord-saved">
+                        <div className="alert alert-success" data-testid="discord-saved">
                             {savedNotice}
-                        </Alert>
+                        </div>
                     )}
 
-                    <Form.Group className="mb-3">
-                        <Form.Label className="execlaw-muted small mb-1">
+                    <div className="mb-3">
+                        <label className="form-label execlaw-muted small mb-1">
                             Bot token
                             {configured && config?.bot_token_masked && (
                                 <span className="ms-2 execlaw-muted">
@@ -217,23 +251,26 @@ export function DiscordConfigPage(_props: PluginConfigProps): JSX.Element {
                                     <code>{config.bot_token_masked}</code>)
                                 </span>
                             )}
-                        </Form.Label>
-                        <Form.Control
+                        </label>
+                        <input
                             type="password"
+                            className="form-control"
                             placeholder="paste the bot token from the developer portal"
                             value={botToken}
-                            onChange={(e) => setBotToken(e.target.value)}
+                            onChange={(e: { target: { value: string } }) =>
+                                setBotToken(e.target.value)
+                            }
                             data-testid="discord-token-input"
                             autoComplete="off"
                         />
-                        <Form.Text className="execlaw-muted">
+                        <div className="form-text execlaw-muted">
                             Sent as <code>Authorization: Bot &lt;token&gt;</code>{" "}
                             against the Discord REST API. Validated via{" "}
                             <code>GET /users/@me</code> before save —
                             invalid tokens are rejected without writing to
                             the vault.
-                        </Form.Text>
-                    </Form.Group>
+                        </div>
+                    </div>
 
                     <div className="d-flex gap-2">
                         <Button
@@ -246,11 +283,11 @@ export function DiscordConfigPage(_props: PluginConfigProps): JSX.Element {
                             Save
                         </Button>
                     </div>
-                </Card.Body>
-            </Card>
+                </div>
+            </div>
 
-            <Card className="mb-3">
-                <Card.Body>
+            <div className="card mb-3">
+                <div className="card-body">
                     <h5 className="h6 mb-2">Gateway status</h5>
                     {!configured ? (
                         <p className="execlaw-muted small mb-0">
@@ -281,20 +318,25 @@ export function DiscordConfigPage(_props: PluginConfigProps): JSX.Element {
                             </span>
                             <span>
                                 Guilds known:{" "}
-                                <Badge
-                                    bg={guildsKnown > 0 ? "info" : "secondary"}
+                                <span
+                                    className={
+                                        "badge " +
+                                        (guildsKnown > 0
+                                            ? "bg-info"
+                                            : "bg-secondary")
+                                    }
                                     data-testid="discord-guild-count"
                                 >
                                     {guildsKnown}
-                                </Badge>
+                                </span>
                             </span>
                         </div>
                     )}
-                </Card.Body>
-            </Card>
+                </div>
+            </div>
 
-            <Card className="mb-3">
-                <Card.Body>
+            <div className="card mb-3">
+                <div className="card-body">
                     <h5 className="h6 mb-2">Test message</h5>
                     <p className="execlaw-muted small mb-2">
                         Sends a one-shot message to a Discord channel so you
@@ -303,16 +345,22 @@ export function DiscordConfigPage(_props: PluginConfigProps): JSX.Element {
                         gateway — useful even before the gateway WebSocket
                         comes up.
                     </p>
-                    <Form.Group className="mb-2">
-                        <Form.Label className="execlaw-muted small mb-1">
+                    <div className="mb-2">
+                        <label className="form-label execlaw-muted small mb-1">
                             Channel id
-                        </Form.Label>
-                        <Form.Control
+                        </label>
+                        <input
                             type="text"
+                            className="form-control"
                             placeholder="e.g. 1234567890123456789"
                             value={testChannel}
-                            onChange={(e) => setTestChannel(e.target.value)}
-                            onKeyDown={(e) => {
+                            onChange={(e: { target: { value: string } }) =>
+                                setTestChannel(e.target.value)
+                            }
+                            onKeyDown={(e: {
+                                key: string;
+                                preventDefault: () => void;
+                            }) => {
                                 if (e.key === "Enter") {
                                     e.preventDefault();
                                     void onTest();
@@ -320,12 +368,12 @@ export function DiscordConfigPage(_props: PluginConfigProps): JSX.Element {
                             }}
                             data-testid="discord-test-channel-input"
                         />
-                        <Form.Text className="execlaw-muted">
+                        <div className="form-text execlaw-muted">
                             Enable Developer Mode in Discord (User Settings →
                             Advanced) to expose <em>Copy Channel ID</em> on
                             the right-click menu.
-                        </Form.Text>
-                    </Form.Group>
+                        </div>
+                    </div>
                     <Button
                         size="sm"
                         variant="outline-secondary"
@@ -336,25 +384,25 @@ export function DiscordConfigPage(_props: PluginConfigProps): JSX.Element {
                         Send test message
                     </Button>
                     {testStatus.kind === "ok" && (
-                        <Alert
-                            variant="success"
-                            className="mt-2"
+                        <div
+                            className="alert alert-success mt-2"
                             data-testid="discord-test-ok"
                         >
                             {testStatus.message}
-                        </Alert>
+                        </div>
                     )}
                     {testStatus.kind === "err" && (
-                        <Alert
-                            variant="danger"
-                            className="mt-2"
+                        <div
+                            className="alert alert-danger mt-2"
                             data-testid="discord-test-err"
                         >
                             {testStatus.message}
-                        </Alert>
+                        </div>
                     )}
-                </Card.Body>
-            </Card>
+                </div>
+            </div>
         </div>
     );
-}
+};
+
+export default Panel;

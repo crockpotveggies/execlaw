@@ -1,21 +1,21 @@
-// Settings → Google Calendar plugin config (Phase 9, plugin-google-calendar).
+// Google Calendar plugin self-contained config panel.
 //
-// Same shape as GoogleContactsPage — both delegate to the shared
-// OauthClientConfig component. Plugin-specific differences:
-// scopes, title/icon, description copy, Cloud Console setup
-// steps (Calendar API, not People API).
+// Migrated from `web/src/settings/GoogleCalendarPage.tsx` (2026-05-14).
+// Delegates to the local `OauthClientConfig` (sibling file) for the
+// shared OAuth-client + Connect/Disconnect machinery.
+//
+// Build: node scripts/build-plugin-ui.mjs google-calendar
 
-import type { PluginConfigProps } from "./PluginConfigBase";
-import { OauthClientConfig } from "./OauthClientConfig";
+import type {
+    PluginPanelComponent,
+    PluginPanelProps,
+} from "@execlaw/plugin-ui";
 
-// Mirror plugins/google-calendar/plugin.toml's [[oauth_accounts]]
-// scopes. `calendar.events` is required for create/update/delete
-// (the plugin lost write access in v0.1 because it shipped with
-// `calendar.readonly` only). Keep this list in sync with the manifest;
-// the connect handler also reconciles persisted scopes against the
-// manifest as a defence in depth, but the SPA's Save still has to
-// post the right list so the visible OAuth client config doesn't
-// claim "read-only".
+const React = globalThis.execlawHost!.React;
+void React; // satisfy `verbatimModuleSyntax` — React is used by the JSX factory below.
+
+import { OauthClientConfig } from "./oauth-client-config";
+
 const SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/calendar.events",
@@ -23,20 +23,19 @@ const SCOPES = [
     "email",
 ];
 
-export function GoogleCalendarPage({
-    pluginId,
-    onConfigChanged,
-}: PluginConfigProps) {
+const Panel: PluginPanelComponent = (props: PluginPanelProps) => {
+    const { identity, bridge } = props;
     return (
         <OauthClientConfig
-            pluginId={pluginId}
+            pluginId={identity.id}
+            bridge={bridge}
             provider="google"
             defaultScopes={SCOPES}
             title="Google Calendar"
             icon="bi-calendar3"
             description={
                 <>
-                    Connects the <code>{pluginId}</code> plugin to your Google
+                    Connects the <code>{identity.id}</code> plugin to your Google
                     account. Exposes seven calendar tools to the agent —{" "}
                     <code>list_calendars</code>, <code>list_events</code>,{" "}
                     <code>check_availability</code>, <code>get_event</code>,{" "}
@@ -77,7 +76,7 @@ export function GoogleCalendarPage({
                         accumulate per OAuth client.)
                     </li>
                     <li>
-                        Under Authorized redirect URIs, add this server's
+                        Under Authorized redirect URIs, add this server&apos;s
                         callback URL (shown in the form above).
                     </li>
                     <li>
@@ -93,7 +92,8 @@ export function GoogleCalendarPage({
                     </li>
                 </ol>
             }
-            onConfigChanged={onConfigChanged}
         />
     );
-}
+};
+
+export default Panel;
