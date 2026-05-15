@@ -4,11 +4,15 @@
 // already at the bottom. When the operator has scrolled up to read
 // history, incoming messages no longer yank the viewport — instead
 // a small ↓ button surfaces above the composer; clicking it snaps
-// to the latest. Long messages get a fixed-height clamp +
-// "Read more…" affordance per the Phase-6 truncation spec. Each
-// bubble also renders a subtle channel-origin icon (signal / email
-// / voice) so the controller can see at a glance which transport
-// delivered the message.
+// to the latest. Long messages render in full — no clamp, no
+// "Read more…" affordance (the Phase-6 truncation spec was reverted
+// 2026-05-15: in practice, a click-to-expand hides important
+// context behind a friction the operator never asked for, and the
+// drafted long-form replies the agent produces are exactly the
+// content the operator wants to read inline). Each bubble also
+// renders a subtle channel-origin icon (signal / email / voice) so
+// the controller can see at a glance which transport delivered the
+// message.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { MessageView } from "../api/endpoints";
@@ -34,11 +38,6 @@ import { useChatState } from "./store";
 interface Props {
     conversationId: string;
 }
-
-/** Lines past which the bubble truncates with a "Read more…" toggle. */
-const TRUNCATE_LINES = 12;
-/** Char heuristic — fall back to length when the line count is hard to gauge. */
-const TRUNCATE_CHARS = 1200;
 
 /** Pixel slack on the at-bottom check. Browsers can leave a fractional
  *  gap between scrollTop+clientHeight and scrollHeight even when the
@@ -237,11 +236,9 @@ function MessageBubble({ message }: { message: MessageView }) {
     const role = roleFor(message);
     const text = message.text ?? renderToolFallback(message);
     const channelOrigin = readChannelOrigin(message);
-    const lines = text.split("\n").length;
-    const isLong = lines > TRUNCATE_LINES || text.length > TRUNCATE_CHARS;
-    const [expanded, setExpanded] = useState(false);
 
-    const display = isLong && !expanded ? clamp(text, TRUNCATE_LINES, TRUNCATE_CHARS) : text;
+    // Long messages render in full — see the file-header note for
+    // why we dropped the Phase-6 clamp + "Read more" affordance.
 
     // Rich tool-result rendering: if a tool_result message's payload
     // is JSON carrying a `chat_component_kind` marker and a renderer
@@ -296,10 +293,8 @@ function MessageBubble({ message }: { message: MessageView }) {
                     "execlaw-msg__bubble" +
                     (isUserMessage ? " is-user" : "") +
                     (isToolKind(message.kind) ? " is-tool" : "") +
-                    (isLong && !expanded ? " is-clamped" : "") +
                     (ChatComponentRenderer ? " is-rich-component" : "")
                 }
-                data-testid={isLong ? "msg-truncated" : undefined}
             >
                 {/* Tool messages are JSON / monospace dumps by default —
                     render as raw text. Exception: when the payload
@@ -311,34 +306,13 @@ function MessageBubble({ message }: { message: MessageView }) {
                 {ChatComponentRenderer && chatComponent ? (
                     <ChatComponentRenderer data={chatComponent.data} />
                 ) : isToolKind(message.kind) ? (
-                    display
+                    text
                 ) : (
-                    <MarkdownContent text={display} />
-                )}
-                {isLong && !ChatComponentRenderer && (
-                    <div className="mt-2">
-                        <button
-                            type="button"
-                            className="btn btn-link btn-sm p-0 execlaw-muted"
-                            onClick={() => setExpanded((v) => !v)}
-                            data-testid="msg-read-more"
-                        >
-                            {expanded ? "Show less" : "Read more…"}
-                        </button>
-                    </div>
+                    <MarkdownContent text={text} />
                 )}
             </div>
         </div>
     );
-}
-
-function clamp(text: string, lineLimit: number, charLimit: number): string {
-    const lines = text.split("\n");
-    let out = lines.slice(0, lineLimit).join("\n");
-    if (out.length > charLimit) {
-        out = out.slice(0, charLimit);
-    }
-    return out + "…";
 }
 
 function readChannelOrigin(m: MessageView): ChannelOrigin {

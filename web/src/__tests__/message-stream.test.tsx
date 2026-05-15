@@ -134,22 +134,28 @@ describe("MessageStream", () => {
         ).toBeTruthy();
     });
 
-    it("clamps long messages and reveals them on Read more", () => {
+    it("renders long messages in full — no clamp, no Read-more affordance", () => {
+        // The Phase-6 truncation spec was reverted 2026-05-15. Long
+        // agent replies and drafted long-form content are exactly what
+        // the operator wants to read inline; hiding them behind a
+        // click was friction. Pin the new contract: the full text
+        // reaches the DOM and no Read-more button is ever rendered.
         const longText = Array.from(
             { length: 30 },
             (_, i) => `line-${i + 1}`,
         ).join("\n");
         setMessages("conv-long", [baseMsg(1, longText)]);
         render(<MessageStream conversationId="conv-long" />);
-        expect(screen.getByTestId("msg-truncated")).toBeInTheDocument();
-        const button = screen.getByTestId("msg-read-more");
-        expect(button).toHaveTextContent(/Read more/);
-        // Click expands → button label flips to Show less.
-        fireEvent.click(button);
-        expect(button).toHaveTextContent(/Show less/);
+        // No truncation marker / button.
+        expect(screen.queryByTestId("msg-truncated")).toBeNull();
+        expect(screen.queryByTestId("msg-read-more")).toBeNull();
+        // Both ends of the text are present in the DOM — proves we're
+        // not silently slicing.
+        expect(screen.getByText(/line-1\b/)).toBeInTheDocument();
+        expect(screen.getByText(/line-30\b/)).toBeInTheDocument();
     });
 
-    it("doesn't render Read more on short messages", () => {
+    it("doesn't render Read more on short messages either", () => {
         setMessages("conv-short", [baseMsg(1, "just a tiny note")]);
         render(<MessageStream conversationId="conv-short" />);
         expect(screen.queryByTestId("msg-read-more")).toBeNull();

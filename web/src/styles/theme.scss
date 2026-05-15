@@ -1037,21 +1037,10 @@ body {
         border-top: 1px solid $border-subtle;
     }
 
-    &.is-clamped {
-        position: relative;
-        // Soft fade at the bottom of clamped messages cues that
-        // there's more content under the "Read more…" button.
-        mask-image: linear-gradient(
-            to bottom,
-            #000 60%,
-            rgba(0, 0, 0, 0.65) 100%
-        );
-        -webkit-mask-image: linear-gradient(
-            to bottom,
-            #000 60%,
-            rgba(0, 0, 0, 0.65) 100%
-        );
-    }
+    // (.is-clamped removed 2026-05-15 — long messages now render in
+    // full; the Phase-6 truncation spec was reverted because hiding
+    // long-form replies behind a click was friction the operator
+    // never asked for.)
 }
 
 .execlaw-streaming-cursor {
