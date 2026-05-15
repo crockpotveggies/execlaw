@@ -21,7 +21,9 @@ use execlaw_core::backends::BackendPurpose;
 use execlaw_core::conversation::{
     ConversationKind, ConversationRow, ConversationStore, Modality, Phase, ThreadSummary,
 };
-use execlaw_core::events::{EventKind, EventLog, EventRecord, PendingEvent};
+use execlaw_core::events::{
+    EventKind, EventLog, EventRecord, PendingEvent, ToolResultPayload, ToolUsePayload,
+};
 use execlaw_core::ids::{ConversationId, EventSeq};
 use execlaw_core::principal::{Principal, PrincipalStore, TrustLevel as CoreTrustLevel};
 use execlaw_inference_api::ModelId;
@@ -5378,6 +5380,36 @@ fn extract_text(e: &EventRecord) -> Option<String> {
                     .ok()
                     .map(|p| p.text)
             }),
+        // 2026-05-15 — surface ToolUse + ToolResult payloads as JSON
+        // strings so the SPA's MessageStream can:
+        //   * dispatch tool_result events to the chat-component
+        //     registry (`detectChatComponent` parses this JSON
+        //     looking for `chat_component_kind: "<kind>"`); and
+        //   * fall back to a readable `renderToolFallback` for
+        //     unknown kinds (better than the empty-text view that
+        //     shipped before — was the bug behind "agent ran
+        //     chart.render but the chart never appeared").
+        //
+        // For ToolResult, prefer the inner Ok(...) value when
+        // success — that's the JSON the tool actually emitted (and
+        // what the chat-component dispatcher needs). Errors get
+        // wrapped in a small envelope so the SPA's fallback shows
+        // "tool failed: <reason>" rather than dumping the raw Result
+        // discriminant.
+        EventKind::ToolUse => e
+            .decode_payload::<ToolUsePayload>()
+            .ok()
+            .and_then(|p| serde_json::to_string(&p.args_json).ok()),
+        EventKind::ToolResult => e
+            .decode_payload::<ToolResultPayload>()
+            .ok()
+            .and_then(|p| match p.outcome {
+                Ok(value) => serde_json::to_string(&value).ok(),
+                Err(reason) => serde_json::to_string(&serde_json::json!({
+                    "error": reason,
+                }))
+                .ok(),
+            }),
         _ => None,
     }
 }
@@ -5724,6 +5756,90 @@ mod tests {
     async fn send_message_rejects_empty_text() {
         let (status, _) = send(build_app(), "   ").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Regression for the "agent ran chart.render but the chart
+    /// never appeared" bug. `extract_text` only handled UserMsg +
+    /// ModelTurn before 2026-05-15; ToolResult fell through to
+    /// `None`. The SPA's MessageStream then had no JSON to scan
+    /// for `chat_component_kind`, so `detectChatComponent` always
+    /// returned null and the chart-renderer was never dispatched.
+    /// The agent's text reply ("Here's the chart...") rendered fine
+    /// but the chart itself was missing.
+    ///
+    /// This test pins both sides:
+    ///   * A successful tool_result event's `extract_text` returns
+    ///     the inner Ok-value JSON verbatim, including any
+    ///     `chat_component_kind` marker the tool emitted.
+    ///   * A failed tool_result returns a small error envelope so
+    ///     the SPA's renderToolFallback shows something useful
+    ///     instead of an empty bubble.
+    ///   * tool_use events return their args_json (lower-priority
+    ///     surface but useful for the planner-trace view).
+    #[test]
+    fn extract_text_surfaces_tool_result_json_for_spa_dispatcher() {
+        use execlaw_core::events::{ToolResultPayload, ToolUsePayload};
+        use execlaw_core::ids::{ConversationId, EventSeq};
+        // Success: chart.render's typical output. The SPA's
+        // detectChatComponent expects chat_component_kind in the
+        // JSON; the unit-level assertion is just that the field
+        // round-trips.
+        let success = EventRecord::new(
+            ConversationId::from("c-extract-test"),
+            EventSeq(1),
+            EventKind::ToolResult,
+            &ToolResultPayload {
+                ordinal: 1,
+                outcome: Ok(serde_json::json!({
+                    "attachment_id": "art_abc",
+                    "svg": "<svg>...</svg>",
+                    "chat_component_kind": "chart",
+                })),
+            },
+            Some("agent".into()),
+        )
+        .unwrap();
+        let text = extract_text(&success).expect("ToolResult must surface text");
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("must be JSON");
+        assert_eq!(
+            parsed["chat_component_kind"], "chart",
+            "chat_component_kind MUST round-trip through extract_text — the SPA's \
+             dispatcher reads it to pick a renderer (this is what was broken)",
+        );
+        assert_eq!(parsed["attachment_id"], "art_abc");
+
+        // Failure path: small error envelope, no panic.
+        let failure = EventRecord::new(
+            ConversationId::from("c-extract-test"),
+            EventSeq(2),
+            EventKind::ToolResult,
+            &ToolResultPayload {
+                ordinal: 2,
+                outcome: Err("vega-lite spec invalid".into()),
+            },
+            Some("agent".into()),
+        )
+        .unwrap();
+        let text = extract_text(&failure).expect("failed ToolResult still surfaces text");
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["error"], "vega-lite spec invalid");
+
+        // ToolUse: args_json is what the planner-trace view wants.
+        let usage = EventRecord::new(
+            ConversationId::from("c-extract-test"),
+            EventSeq(3),
+            EventKind::ToolUse,
+            &ToolUsePayload {
+                ordinal: 1,
+                tool_name: "chart.render".into(),
+                args_json: serde_json::json!({"title": "Test"}),
+            },
+            Some("agent".into()),
+        )
+        .unwrap();
+        let text = extract_text(&usage).expect("ToolUse must surface text");
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["title"], "Test");
     }
 
     #[tokio::test]
