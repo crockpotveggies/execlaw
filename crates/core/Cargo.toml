@@ -43,6 +43,10 @@ hex.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 schemars.workspace = true
+# 2026-05-15 — needed by the chart.render built-in tool. The
+# charting crate is pure Rust (plotters) so it builds in core
+# without pulling in any heavy native deps.
+execlaw-charting = { path = "../charting" }
 
 [dev-dependencies]
 tempfile.workspace = true

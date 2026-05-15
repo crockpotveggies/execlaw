@@ -156,41 +156,11 @@ async fn numbers_to_csv_handles_scalar_and_array() {
     assert_eq!(r.as_str().unwrap(), "64.146,-12.345");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chart_filename_slugifies_titles() {
-    let p = open_meteo_plugin(None);
-    let r = p
-        .invoke_async(
-            "_test_chart_filename",
-            vec![Dynamic::from("Reykjavík — 7-day forecast!")],
-        )
-        .await
-        .unwrap();
-    let s = r.as_str().unwrap();
-    // Non-ASCII characters drop; runs of separators collapse to one dash.
-    assert!(s.ends_with(".png"), "expected .png suffix, got: {s}");
-    assert!(
-        s.starts_with("reykjav") || s.starts_with("7-day") || s.starts_with("day"),
-        "slugified prefix: {s}"
-    );
-    assert!(!s.contains("—"), "non-ascii must be dropped: {s}");
-    assert!(!s.contains("!"), "punctuation must be dropped: {s}");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chart_filename_falls_back_for_blank_titles() {
-    let p = open_meteo_plugin(None);
-    let r = p
-        .invoke_async("_test_chart_filename", vec![Dynamic::from("")])
-        .await
-        .unwrap();
-    assert_eq!(r.as_str().unwrap(), "chart.png");
-    let r = p
-        .invoke_async("_test_chart_filename", vec![Dynamic::UNIT])
-        .await
-        .unwrap();
-    assert_eq!(r.as_str().unwrap(), "chart.png");
-}
+// 2026-05-15 — `chart_filename_slugifies_titles` /
+// `chart_filename_falls_back_for_blank_titles` removed alongside the
+// `render_chart_impl` / `chart_default_filename` Rhai helpers. Chart
+// rendering is now the native `chart.render` built-in tool; its
+// filename handling lives in `crates/core/src/builtin_tools.rs::RenderChartTool`.
 
 /// Regression for the 2026-05-14 default-location bug. Pre-rework
 /// the agent kept asking the user for their current location even

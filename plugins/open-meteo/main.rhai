@@ -65,7 +65,6 @@ fn tool_call(name, args, oauth) {
     if name == "open_meteo.ensemble"     { return ensemble_impl(args); }
     if name == "open_meteo.flood"        { return flood_impl(args); }
     if name == "open_meteo.climate"      { return climate_impl(args); }
-    if name == "open_meteo.render_chart" { return render_chart_impl(args); }
     throw "unknown tool '" + name + "'";
 }
 
@@ -429,84 +428,14 @@ fn climate_impl(args) {
 
 
 // =====================================================================
-// open_meteo.render_chart
+// 2026-05-15 — `open_meteo.render_chart` removed in favour of the
+// native `chart.render` built-in tool. Agents that previously called
+// `open_meteo.render_chart` should call `chart.render` instead — the
+// arg shape is identical (title / kind / series / band / width / height
+// / filename / ttl_seconds). The migration was the user-flagged
+// follow-up to "exposing a native tool through a plugin is an
+// antipattern." See `crates/core/src/builtin_tools.rs::RenderChartTool`.
 // =====================================================================
-//
-// The agent typically builds a ChartSpec directly from a prior tool's
-// result and passes it here. The Rhai-side helper does light shape
-// validation, then calls host_render_chart which:
-//   1. parses the JSON spec into execlaw_charting::ChartSpec
-//   2. renders SVG + PNG via plotters (pure-Rust)
-//   3. stores PNG as a plugin artifact (TTL = ttl_seconds, default 7d)
-//   4. returns { attachment_id, svg, png_data_url, ... }
-//
-// The plugin echoes the inline SVG in the tool_result so the SPA's
-// chat-component dispatcher renders the chart inline; the
-// attachment_id flows to the agent for {transport}.send_with_attachments.
-
-fn render_chart_impl(args) {
-    let spec = #{};
-    spec["title"]     = if args["title"] != ()     { args["title"] }     else { "Chart" };
-    spec["kind"]      = if args["kind"] != ()      { args["kind"] }      else { "line" };
-    spec["x_label"]   = if args["x_label"] != ()   { args["x_label"] }   else { () };
-    spec["y_label"]   = if args["y_label"] != ()   { args["y_label"] }   else { () };
-    spec["y_unit"]    = if args["y_unit"] != ()    { args["y_unit"] }    else { () };
-    spec["time_axis"] = if args["time_axis"] != () { args["time_axis"] == true } else { false };
-    spec["series"]    = if args["series"] != ()    { args["series"] }    else { [] };
-    if args["band"] != () {
-        spec["band"] = args["band"];
-    }
-
-    let width  = if args["width"] != ()  { args["width"]  } else { 720 };
-    let height = if args["height"] != () { args["height"] } else { 400 };
-    let filename = if args["filename"] != () && args["filename"] != "" {
-        args["filename"]
-    } else {
-        chart_default_filename(spec["title"])
-    };
-    let ttl = if args["ttl_seconds"] != () { args["ttl_seconds"] } else { 7 * 86400 };
-
-    let spec_json = to_json_string(spec);
-    let result = host_render_chart(spec_json, width, height, filename, ttl);
-
-    #{
-        "chat_component_kind": "chart",
-        "title":          spec["title"],
-        "attachment_id":  result["attachment_id"],
-        "svg":            result["svg"],
-        "png_data_url":   result["png_data_url"],
-        "width":          result["width"],
-        "height":         result["height"],
-        "size_bytes":     result["size_bytes"],
-    }
-}
-
-fn chart_default_filename(title) {
-    // Sanitize title → lowercase, replace non-alnum runs with `-`,
-    // strip leading/trailing dashes, append .png. Falls back to
-    // "chart.png" for blank titles.
-    if title == () || title == "" { return "chart.png"; }
-    let s = lower(title);
-    let out = "";
-    let in_dash = false;
-    for c in s {
-        let ord = c.to_int();
-        let is_lower = ord >= 97 && ord <= 122;
-        let is_digit = ord >= 48 && ord <= 57;
-        if is_lower || is_digit {
-            out += "" + c;
-            in_dash = false;
-        } else {
-            if !in_dash && out != "" {
-                out += "-";
-                in_dash = true;
-            }
-        }
-    }
-    while out.ends_with("-") { out.truncate(out.len() - 1); }
-    if out == "" { return "chart.png"; }
-    out + ".png"
-}
 
 
 // =====================================================================
@@ -774,7 +703,9 @@ fn clamp_int(value, lo, hi, fallback) {
 // us pin the helper functions' behavior without standing up a real
 // HTTP endpoint.
 
-fn _test_chart_filename(title)            { chart_default_filename(title) }
+// 2026-05-15 — `_test_chart_filename` removed alongside
+// `render_chart_impl`; the equivalent slugifier test now lives next
+// to the built-in `chart.render` tool in core if needed.
 fn _test_csv(arr)                          { csv(arr) }
 fn _test_clamp_int(v, lo, hi, fb)          { clamp_int(v, lo, hi, fb) }
 fn _test_numbers_to_csv(v, label)          { numbers_to_csv(v, label) }

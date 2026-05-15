@@ -28,7 +28,8 @@ use execlaw_core::attachments::AttachmentStore;
 use execlaw_core::cards::{CardAction, CardClosedPayload, CardKind, CardOpenedPayload, CardState};
 // CardAction includes only its enum variants; no separate Kind type.
 use execlaw_core::ids::{AttachmentId, ConversationId};
-use execlaw_core::tool::{ApiError, AttachmentApi, DeliveredAttachmentView};
+use execlaw_core::tool::{ApiError, AttachmentApi, CreatedArtifactView, DeliveredAttachmentView};
+use std::path::PathBuf;
 
 pub struct ServerAttachmentApi {
     db: Database,
@@ -45,6 +46,14 @@ pub struct ServerAttachmentApi {
     /// tool calls. Required alongside `transports` for the auto-
     /// bridge fan-out.
     plugin_host: Option<execlaw_plugin_host::PluginHost>,
+    /// Filesystem root where `create_artifact` writes its content-
+    /// addressed blob files. `None` means `create_artifact` is
+    /// disabled (errors with `ApiError::Storage`); set explicitly
+    /// in production via `with_artifacts_root` so tests can't
+    /// accidentally write under the developer's real
+    /// `~/.execlaw/plugin_artifacts/`. The `send` method works
+    /// regardless of this field.
+    artifacts_root: Option<PathBuf>,
 }
 
 impl ServerAttachmentApi {
@@ -55,6 +64,7 @@ impl ServerAttachmentApi {
             caller_conversation_id,
             transports: None,
             plugin_host: None,
+            artifacts_root: None,
         }
     }
 
@@ -71,6 +81,17 @@ impl ServerAttachmentApi {
 
     pub fn with_plugin_host(mut self, plugin_host: execlaw_plugin_host::PluginHost) -> Self {
         self.plugin_host = Some(plugin_host);
+        self
+    }
+
+    /// Enable `create_artifact` by pinning the on-disk root used
+    /// for content-addressed blob writes. Production wires this to
+    /// the same `~/.execlaw/plugin_artifacts/` (or
+    /// `EXECLAW_PLUGIN_ARTIFACTS_DIR` override) the host_caps impl
+    /// uses, so a built-in tool's artifact lands in the same tree
+    /// a script-tier `host_render_chart` would.
+    pub fn with_artifacts_root(mut self, root: PathBuf) -> Self {
+        self.artifacts_root = Some(root);
         self
     }
 }
@@ -192,6 +213,66 @@ impl AttachmentApi for ServerAttachmentApi {
             byte_size,
             download_url,
             caption: title_caption,
+        })
+    }
+
+    async fn create_artifact(
+        &self,
+        filename: &str,
+        mime_type: &str,
+        bytes: Vec<u8>,
+        ttl_seconds: Option<i64>,
+    ) -> Result<CreatedArtifactView, ApiError> {
+        // 2026-05-15 — built-in tools that produce attachments (the
+        // chart renderer is the v1 caller) land their bytes here.
+        // Mirrors the script-tier `host_caps.create_artifact_attachment`
+        // path so an artifact produced by a built-in is
+        // indistinguishable from one produced by a Rhai plugin —
+        // same DB shape, same on-disk layout, same TTL story.
+        //
+        // Refuses cleanly when `artifacts_root` wasn't configured
+        // (test fixtures that don't opt in) — no UserDirs fallback
+        // here, deliberately. Tests that accidentally call
+        // create_artifact MUST get an error rather than silently
+        // writing to the developer's real ~/.execlaw/.
+        let root = match &self.artifacts_root {
+            Some(r) => r.clone(),
+            None => {
+                return Err(ApiError::Storage(
+                    "create_artifact called but ServerAttachmentApi has no artifacts_root \
+                     configured (only `send` is available). Production wires this via \
+                     `with_artifacts_root` in tool_dispatch."
+                        .into(),
+                ));
+            }
+        };
+        let db = self.db.clone();
+        let filename_owned = filename.to_owned();
+        let mime_owned = mime_type.to_owned();
+        // We attribute built-in artifacts to the "core" plugin id —
+        // gives ops + the artifact-cleanup sweeper a stable handle
+        // for "artifacts produced by the host itself, not by a
+        // user-installed plugin."
+        const BUILTIN_PLUGIN_ID: &str = "core";
+        let now = chrono::Utc::now().timestamp();
+        let created = tokio::task::spawn_blocking(move || {
+            AttachmentStore::new(&db).insert_plugin_artifact(
+                &root,
+                BUILTIN_PLUGIN_ID,
+                &filename_owned,
+                &mime_owned,
+                &bytes,
+                ttl_seconds,
+                now,
+            )
+        })
+        .await
+        .map_err(|e| ApiError::Storage(format!("artifact write join: {e}")))?
+        .map_err(|e| ApiError::Storage(format!("artifact write: {e}")))?;
+        Ok(CreatedArtifactView {
+            attachment_id: created.attachment_id,
+            sha256: created.sha256,
+            size_bytes: created.size_bytes,
         })
     }
 }

@@ -20,6 +20,7 @@
 //!    `commit_turn`'s enforce_tool_pairing, so the log stays
 //!    well-formed even when the model hallucinates a tool name.
 
+use crate::host_caps_impl::builtin_artifacts_root_path as builtin_artifacts_root;
 use crate::mcp_host::{MCP_TOOL_PREFIX, McpHost};
 use crate::tool_apis_http::HttpWebFetchApi;
 use crate::tool_apis_search::DuckDuckGoSearchApi;
@@ -420,13 +421,26 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
                 // — a Telegram/email/etc. plugin that registers a
                 // factory at boot is auto-included with no edits to
                 // the attachment API.
+                //
+                // 2026-05-15 — also wire `artifacts_root` so the
+                // chart.render built-in can persist its rendered PNG
+                // through `ctx.attachments.create_artifact`. Same
+                // root the script-tier `host_caps.create_artifact_attachment`
+                // path uses (`EXECLAW_PLUGIN_ARTIFACTS_DIR` env
+                // override → `~/.execlaw/plugin_artifacts/` default
+                // → `./.execlaw/plugin_artifacts/` last-ditch
+                // fallback). Tests that don't opt in get an
+                // explicit error from create_artifact instead of
+                // silently writing under the developer's real home.
+                let artifacts_root = builtin_artifacts_root();
                 ctx.attachments = Some(Arc::new(
                     crate::attachment_api::ServerAttachmentApi::new(
                         self.host.db().clone(),
                         events.clone(),
                         ctx.conversation_id.clone(),
                     )
-                    .with_transports(self.host_transports.clone()),
+                    .with_transports(self.host_transports.clone())
+                    .with_artifacts_root(artifacts_root),
                 ));
             }
             // No bus → capability stays dormant. The tool body's

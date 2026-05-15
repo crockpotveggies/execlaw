@@ -299,6 +299,15 @@ impl HostCapabilities for AppStateHostCapabilities {
 ///
 /// The directory is created lazily by `insert_plugin_artifact`.
 fn plugin_artifacts_root(_state: &AppState) -> PathBuf {
+    builtin_artifacts_root_path()
+}
+
+/// 2026-05-15 — pulled out as a free function so the built-in
+/// `chart.render` tool's dispatch wiring (in `tool_dispatch.rs`)
+/// can reach the same path without an `&AppState` borrow. Same
+/// resolution chain as `plugin_artifacts_root`: env override →
+/// `~/.execlaw/plugin_artifacts/` → cwd-relative fallback.
+pub(crate) fn builtin_artifacts_root_path() -> PathBuf {
     if let Ok(p) = std::env::var("EXECLAW_PLUGIN_ARTIFACTS_DIR") {
         if !p.is_empty() {
             return PathBuf::from(p);

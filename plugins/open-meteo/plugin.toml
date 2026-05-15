@@ -1,8 +1,8 @@
 [plugin]
 id = "open-meteo"
 name = "Open-Meteo Weather"
-version = "0.3.0"
-description = "Free, key-less weather, marine, air-quality, seasonal, ensemble, flood and climate data via the Open-Meteo public APIs. Covers forecast/historical/marine/air-quality/seasonal/ensemble/flood/climate/geocoding/elevation endpoints plus a generic chart renderer that produces inline SVG for the SPA and PNG attachments for transports that accept file uploads."
+version = "0.4.0"
+description = "Free, key-less weather, marine, air-quality, seasonal, ensemble, flood and climate data via the Open-Meteo public APIs. Covers forecast/historical/marine/air-quality/seasonal/ensemble/flood/climate/geocoding/elevation endpoints. Chart rendering is provided by the host's native `chart.render` built-in tool (was `open_meteo.render_chart` before 2026-05-15)."
 author = "execlaw"
 license = "Apache-2.0"
 
@@ -103,12 +103,10 @@ schema = "schemas/climate.json"
 trust_floor = "KnownLimited"
 latency = "high"
 
-[[tools]]
-name = "open_meteo.render_chart"
-description = """Render a chart from any open-meteo result (or arbitrary x/y data). Produces both inline SVG (for the SPA chat card) and a PNG attachment (id returned for transports that accept file uploads — Discord/Signal/etc.). Pass the chart spec directly OR pass `from_tool: "forecast"|"historical"|...` plus the tool's raw result for the helper to derive a sensible spec. Args: { title?: string, kind?: "line"|"bar"|"area"|"scatter" (default line), x_label?: string, y_label?: string, y_unit?: string, time_axis?: bool, series?: [{name, points:[{x,y}], color?:[r,g,b]}], band?: {low,high}, width?: int (240-2400, default 720), height?: int (240-2400, default 400), filename?: string }."""
-schema = "schemas/render_chart.json"
-trust_floor = "KnownLimited"
-latency = "medium"
+# 2026-05-15 — `open_meteo.render_chart` removed in favour of the
+# native `chart.render` built-in. Same arg shape; agents migrate by
+# changing the tool name. The host registers `chart.render` at boot
+# from `core_builtin_tools()`, so no manifest entry is needed here.
 
 # ===== Admin routes =============================================
 

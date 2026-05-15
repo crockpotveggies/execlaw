@@ -1921,6 +1921,273 @@ impl ToolImpl for SendAttachmentTool {
 }
 
 // ---------------------------------------------------------------
+// chart.render — pure-Rust Vega-Lite-ish chart renderer.
+//
+// 2026-05-15 — promoted from the open-meteo plugin's
+// `open_meteo.render_chart` to a native built-in. The
+// implementation was already 100% native (the plugin just called
+// `host_render_chart` which lived in the script-tier); the only
+// reason it lived as a plugin tool was that built-ins had no way
+// to produce attachments. With `AttachmentApi::create_artifact`
+// (added the same day) that gap closes and the tool moves where
+// it belongs — every plugin that wants to chart its data can now
+// route through one tool name (`chart.render`) instead of
+// re-exposing it under a per-plugin namespace.
+//
+// The renderer accepts a structured spec (line / bar / area /
+// scatter, optional band overlay, optional time axis) and
+// produces both an inline SVG (for the SPA's chat-component
+// dispatcher) and a PNG attachment (for transport fan-out via
+// `send_attachment` or a channel's `send_with_attachments`). The
+// SVG is returned in the tool result; the PNG is persisted as a
+// state_artifacts row whose `attachment_id` flows into downstream
+// tool calls.
+// ---------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct RenderChartArgs {
+    /// Operator-friendly spec — flattened from the open-meteo
+    /// `render_chart_impl` shape so plugin authors can copy-paste
+    /// their existing builders. Forwarded verbatim to the
+    /// charting crate's `serde_json::from_value::<ChartSpec>`.
+    #[serde(flatten)]
+    spec: serde_json::Value,
+    /// Canvas width in px. Clamped to [240, 2400]; 0 / missing
+    /// uses the renderer's default (720).
+    #[serde(default)]
+    width: Option<u32>,
+    /// Canvas height in px. Clamped to [240, 2400]; 0 / missing
+    /// uses the renderer's default (400).
+    #[serde(default)]
+    height: Option<u32>,
+    /// Filename for the PNG attachment (operator's save-as
+    /// dialog). Default `"chart.png"`.
+    #[serde(default)]
+    filename: Option<String>,
+    /// How long the PNG artifact lives before the ephemeral
+    /// sweeper removes it. `None` / 0 = keep forever; positive =
+    /// seconds. Default 7 days.
+    #[serde(default)]
+    ttl_seconds: Option<i64>,
+}
+
+const RENDER_CHART_MIN_DIM: u32 = 240;
+const RENDER_CHART_MAX_DIM: u32 = 2400;
+const RENDER_CHART_DEFAULT_TTL_SECS: i64 = 7 * 86400;
+
+fn clamp_render_chart_dim(value: Option<u32>, default: u32) -> u32 {
+    let v = value.unwrap_or(0);
+    if v == 0 {
+        default
+    } else {
+        v.clamp(RENDER_CHART_MIN_DIM, RENDER_CHART_MAX_DIM)
+    }
+}
+
+pub struct RenderChartTool {
+    descriptor: ToolDescriptor,
+}
+
+impl Default for RenderChartTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RenderChartTool {
+    pub fn new() -> Self {
+        // Schema mirrors the original `plugins/open-meteo/schemas/render_chart.json`.
+        // Kept here in code rather than as a sidecar JSON file so the
+        // built-in catalog stays self-contained (the same pattern
+        // the other built-ins follow).
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Chart title rendered at the top of the SVG/PNG."
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["line", "bar", "area", "scatter"],
+                    "description": "Default \"line\"."
+                },
+                "x_label": { "type": "string" },
+                "y_label": { "type": "string" },
+                "y_unit": {
+                    "type": "string",
+                    "description": "Suffix appended to y-axis tick labels (e.g. \"°C\", \" mm\")."
+                },
+                "time_axis": {
+                    "type": "boolean",
+                    "description": "When true, x-values are interpreted as Unix-milliseconds and the axis renders as HH:MM / MMM-DD."
+                },
+                "series": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "points": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "x": { "type": "number" },
+                                        "y": { "type": "number" }
+                                    },
+                                    "required": ["x", "y"]
+                                }
+                            },
+                            "color": {
+                                "type": "array",
+                                "items": { "type": "integer", "minimum": 0, "maximum": 255 },
+                                "minItems": 3,
+                                "maxItems": 3
+                            }
+                        },
+                        "required": ["name", "points"]
+                    }
+                },
+                "band": {
+                    "type": "object",
+                    "description": "Optional probability / range overlay (ensemble fans).",
+                    "properties": {
+                        "low":  { "type": "array" },
+                        "high": { "type": "array" },
+                        "color": {
+                            "type": "array",
+                            "items": { "type": "integer", "minimum": 0, "maximum": 255 },
+                            "minItems": 3,
+                            "maxItems": 3
+                        }
+                    },
+                    "required": ["low", "high"]
+                },
+                "width":  { "type": "integer", "minimum": 240, "maximum": 2400 },
+                "height": { "type": "integer", "minimum": 240, "maximum": 2400 },
+                "filename": { "type": "string" },
+                "ttl_seconds": { "type": "integer", "minimum": 0 }
+            }
+        });
+        Self {
+            descriptor: ToolDescriptor {
+                name: "chart.render".into(),
+                description: concat!(
+                    "Render a chart from a structured spec (line / bar / area / scatter, ",
+                    "with optional band overlay for ensemble fans). Returns BOTH an inline ",
+                    "SVG string (for the SPA chat card to render directly) AND a PNG ",
+                    "attachment_id (for delivery via `send_attachment` or a channel's ",
+                    "`send_with_attachments`). Use this whenever the user asks for a chart, ",
+                    "graph, or visualisation — pass the data as `series: [{name, points: ",
+                    "[{x, y}]}]`. Set `time_axis: true` when x-values are Unix-milliseconds. ",
+                    "Width/height in px (clamped 240-2400, default 720x400). The PNG ",
+                    "attachment expires after `ttl_seconds` (default 7 days)."
+                ).into(),
+                schema,
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Low,
+                capabilities: vec![Capability::AttachmentSend],
+                default_allowed_classes: default_allowed_for_attachment_send(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for RenderChartTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, args: Value) -> ToolOutcome {
+        let parsed: RenderChartArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolOutcome::err("invalid_argument", e.to_string()),
+        };
+        let api = match ctx.attachments.as_ref() {
+            Some(a) => a,
+            None => {
+                return ToolOutcome::denied(
+                    "attachment_send capability not granted to this tool",
+                );
+            }
+        };
+        // Decode the spec via the charting crate's own ChartSpec
+        // shape — flattening the operator-supplied JSON into the
+        // renderer's struct so unsupported fields surface a clear
+        // error instead of being silently dropped.
+        let spec: execlaw_charting::ChartSpec =
+            match serde_json::from_value(parsed.spec.clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    return ToolOutcome::err(
+                        "invalid_spec",
+                        format!("chart.render: invalid spec: {e}"),
+                    );
+                }
+            };
+        let width = clamp_render_chart_dim(parsed.width, execlaw_charting::DEFAULT_WIDTH);
+        let height = clamp_render_chart_dim(parsed.height, execlaw_charting::DEFAULT_HEIGHT);
+        // Plotters renders are 1-20ms in practice; keep it inline.
+        let svg = match execlaw_charting::render_to_svg(&spec, width, height) {
+            Ok(s) => s,
+            Err(e) => {
+                return ToolOutcome::err(
+                    "render_failed",
+                    format!("chart.render: svg: {e}"),
+                );
+            }
+        };
+        let png = match execlaw_charting::render_to_png(&spec, width, height) {
+            Ok(p) => p,
+            Err(e) => {
+                return ToolOutcome::err(
+                    "render_failed",
+                    format!("chart.render: png: {e}"),
+                );
+            }
+        };
+        let filename = parsed
+            .filename
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("chart.png")
+            .to_owned();
+        // TTL: None / 0 = renderer's default (7d). Positive = explicit seconds.
+        let ttl = match parsed.ttl_seconds {
+            None => Some(RENDER_CHART_DEFAULT_TTL_SECS),
+            Some(0) => None,
+            Some(n) if n > 0 => Some(n),
+            Some(neg) => {
+                return ToolOutcome::err(
+                    "invalid_argument",
+                    format!("chart.render: ttl_seconds must be >= 0 (got {neg})"),
+                );
+            }
+        };
+        match api.create_artifact(&filename, "image/png", png, ttl).await {
+            Ok(view) => ToolOutcome::Ok(json!({
+                "attachment_id": view.attachment_id,
+                "sha256": view.sha256,
+                "size_bytes": view.size_bytes,
+                "filename": filename,
+                "mime_type": "image/png",
+                "width": width,
+                "height": height,
+                // The SPA's chat-component dispatcher reads `svg` to
+                // render inline without a follow-up fetch.
+                "svg": svg,
+                // Hint the SPA on which chat-component to mount —
+                // the existing convention for plugin tool results.
+                "chat_component_kind": "chart",
+            })),
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------
 // research_clarify — resume an awaiting_input job with the user's
 // answer. Per project-locked-decisions 2026-04-23, the agent is the
 // primary interface for the clarification path; this tool is the
@@ -2447,6 +2714,7 @@ pub fn core_builtin_tools() -> Vec<Arc<dyn ToolImpl>> {
         Arc::new(ResearchListTool::new()),
         Arc::new(ResearchGetReportTool::new()),
         Arc::new(SendAttachmentTool::new()),
+        Arc::new(RenderChartTool::new()),
         Arc::new(McpListServersTool::new()),
         Arc::new(McpAddServerTool::new()),
         Arc::new(McpRemoveServerTool::new()),
@@ -2587,10 +2855,14 @@ mod tests {
         assert!(names.contains(&"research_list"));
         assert!(names.contains(&"research_get_report"));
         assert!(names.contains(&"send_attachment"));
+        assert!(
+            names.contains(&"chart.render"),
+            "chart.render built-in must be registered (replaces the old plugin tool open_meteo.render_chart)",
+        );
         assert!(names.contains(&"mcp_list_servers"));
         assert!(names.contains(&"mcp_add_server"));
         assert!(names.contains(&"mcp_remove_server"));
-        assert_eq!(names.len(), 27);
+        assert_eq!(names.len(), 28);
     }
 
     #[test]

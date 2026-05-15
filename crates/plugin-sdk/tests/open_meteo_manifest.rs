@@ -33,7 +33,9 @@ fn open_meteo_manifest_parses_with_expected_tools() {
         "open_meteo.ensemble",
         "open_meteo.flood",
         "open_meteo.climate",
-        "open_meteo.render_chart",
+        // 2026-05-15 — `open_meteo.render_chart` removed in favour
+        // of the native `chart.render` built-in. The manifest no
+        // longer declares it.
     ];
     for w in &want {
         assert!(
