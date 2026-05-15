@@ -22,6 +22,7 @@
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use execlaw_script::{ScriptEngine, ScriptPlugin};
+use rhai::Dynamic;
 use std::path::PathBuf;
 
 /// Tiny script that exercises the realistic shape of an
@@ -113,10 +114,101 @@ fn bench_dispatch_null_match(c: &mut Criterion) {
     });
 }
 
+/// finance-yahoo's hot-path: symbol normalization + quote shape
+/// projection. Both are pure Rhai (no HTTP), invoked from every
+/// quote / index_quote / crypto_quote / fx_quote tool call. If the
+/// agent fires off a dozen quote checks in a turn this is the
+/// per-call overhead.
+///
+/// Budgets:
+///   normalize_symbol_index_alias  ≤ 100 µs p99 (string match + alias lookup)
+///   extract_quote_happy_path      ≤ 300 µs p99 (map walk + arithmetic)
+fn bench_finance_yahoo_hot_paths(c: &mut Criterion) {
+    let workspace_root = {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.pop();
+        p.pop();
+        p
+    };
+    let path = workspace_root.join("plugins/finance-yahoo/main.rhai");
+    let source = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return, // plugin absent — skip
+    };
+    let factory = ScriptEngine::with_loopback_allowed_for_tests();
+    let plugin = ScriptPlugin::from_source("finance-yahoo", &source, &factory)
+        .expect("finance-yahoo must parse for bench");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    c.bench_function("finance_yahoo_normalize_symbol_index_alias", |b| {
+        let plugin = plugin.clone();
+        b.iter(|| {
+            rt.block_on(async {
+                let _ = plugin
+                    .invoke_async(
+                        "_test_normalize_symbol",
+                        vec![
+                            black_box(Dynamic::from("dow jones")),
+                            black_box(Dynamic::from("any")),
+                        ],
+                    )
+                    .await
+                    .unwrap();
+            });
+        });
+    });
+
+    // Build a canonical Yahoo /v8/chart envelope once; the bench
+    // exercises the extractor only.
+    let body_json = serde_json::json!({
+        "chart": {
+            "error": null,
+            "result": [{
+                "meta": {
+                    "regularMarketPrice": 193.42,
+                    "chartPreviousClose": 190.00,
+                    "regularMarketDayHigh": 194.50,
+                    "regularMarketDayLow": 189.10,
+                    "regularMarketVolume": 52_341_200_i64,
+                    "currency": "USD",
+                    "exchangeName": "NMS",
+                    "marketState": "REGULAR",
+                    "regularMarketTime": 1_715_786_400_i64,
+                }
+            }]
+        }
+    });
+    let body_dyn = execlaw_script::primitives_glue::json_to_rhai(&body_json);
+
+    c.bench_function("finance_yahoo_extract_quote_happy_path", |b| {
+        let plugin = plugin.clone();
+        b.iter(|| {
+            rt.block_on(async {
+                let _ = plugin
+                    .invoke_async(
+                        "_test_extract_quote",
+                        vec![
+                            black_box(body_dyn.clone()),
+                            black_box(Dynamic::from("AAPL")),
+                            black_box(Dynamic::from("equity")),
+                        ],
+                    )
+                    .await
+                    .unwrap();
+            });
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_engine_construct,
     bench_script_parse,
     bench_dispatch_null_match,
+    bench_finance_yahoo_hot_paths,
 );
 criterion_main!(benches);

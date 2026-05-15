@@ -1,0 +1,12 @@
+{
+    "type": "object",
+    "properties": {
+        "symbol": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Ticker symbol for a US equity or ETF (e.g. `AAPL`, `MSFT`, `SPY`, `QQQ`). Bare tickers only — use `yahoo_finance.index_quote` for `^DJI`/`^IXIC`/`^GSPC`, `yahoo_finance.crypto_quote` for crypto, `yahoo_finance.fx_quote` for currency pairs."
+        }
+    },
+    "required": ["symbol"],
+    "additionalProperties": false
+}

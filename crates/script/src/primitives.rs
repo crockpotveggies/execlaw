@@ -291,6 +291,50 @@ pub(crate) fn register(
         );
     }
 
+    // http_get_envelope(url, query, bearer, headers) -> {
+    //     status:    i64,        — HTTP status code (including 4xx/5xx;
+    //                              the envelope variant does NOT throw
+    //                              on non-2xx so the plugin can inspect
+    //                              error responses)
+    //     headers:   Map,        — response headers, keys lowercased,
+    //                              multi-valued (Set-Cookie) returned
+    //                              as an Array of strings
+    //     body:      Dynamic,    — JSON-parsed if Content-Type is JSON-
+    //                              ish OR the bytes parse as JSON; raw
+    //                              String otherwise; Unit on empty body
+    //     body_text: String      — raw body bytes as UTF-8 (always
+    //                              present, useful for plain-text APIs
+    //                              like Yahoo Finance's /v1/test/getcrumb)
+    // }
+    //
+    // Slow path: every call is uncached and forces the SSRF + URL parse
+    // every time. Use only when a plugin needs response metadata that
+    // `http_get` strips — Set-Cookie capture for session/crumb flows,
+    // Retry-After parsing on 429 backoff, status-code branching on
+    // upstreams that abuse 4xx as data.
+    {
+        let agent = http_agent.clone();
+        let pid = plugin_id.to_owned();
+        engine.register_fn(
+            "http_get_envelope",
+            move |url: ImmutableString,
+                  query: Map,
+                  bearer: ImmutableString,
+                  headers: Map|
+                  -> Result<Dynamic, Box<EvalAltResult>> {
+                http_get_envelope_impl(
+                    &agent,
+                    &pid,
+                    &url,
+                    &query,
+                    &bearer,
+                    Some(&headers),
+                    allow_loopback,
+                )
+            },
+        );
+    }
+
     // ---- String ---------------------------------------------------
 
     engine.register_fn("digits_only", |s: ImmutableString| -> ImmutableString {
@@ -2853,6 +2897,93 @@ fn decode_response(
         )
     })?;
     Ok(json_to_rhai(&parsed))
+}
+
+fn http_get_envelope_impl(
+    agent: &ureq::Agent,
+    plugin_id: &str,
+    url: &str,
+    query: &Map,
+    bearer: &str,
+    headers: Option<&Map>,
+    allow_loopback: bool,
+) -> Result<Dynamic, Box<EvalAltResult>> {
+    validate_url(plugin_id, "http_get_envelope", url, allow_loopback)?;
+    let mut req = agent.get(url);
+    for (k, v) in map_to_query_iter(query) {
+        req = req.query(&k, &v);
+    }
+    if !bearer.is_empty() {
+        req = req.set("Authorization", &format!("Bearer {bearer}"));
+    }
+    if let Some(h) = headers {
+        req = apply_headers(req, h);
+    }
+    // Unlike `http_get`, the envelope variant must hand 4xx/5xx
+    // responses back to the plugin as data — many session/crumb flows
+    // hinge on cookies set on a 404 (yahoo.com/fc) or 302. Transport
+    // errors still bubble up as an Err.
+    let resp = match req.call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(e @ ureq::Error::Transport(_)) => {
+            return Err(ureq_to_eval_err(plugin_id, "http_get_envelope", url, e));
+        }
+    };
+    decode_envelope(plugin_id, url, resp)
+}
+
+fn decode_envelope(
+    plugin_id: &str,
+    url: &str,
+    resp: ureq::Response,
+) -> Result<Dynamic, Box<EvalAltResult>> {
+    let status = resp.status() as i64;
+    // Headers MUST be read before `into_string()` consumes the
+    // response. Names lowercased so plugins can lookup with a
+    // single canonical form rather than guessing case.
+    let header_names: Vec<String> = resp
+        .headers_names()
+        .into_iter()
+        .map(|n| n.to_string())
+        .collect();
+    let mut headers_map = rhai::Map::new();
+    for name in &header_names {
+        let lower = name.to_ascii_lowercase();
+        let all: Vec<&str> = resp.all(name);
+        if all.len() == 1 {
+            headers_map.insert(lower.into(), Dynamic::from(all[0].to_string()));
+        } else {
+            let mut arr = rhai::Array::new();
+            for v in all {
+                arr.push(Dynamic::from(v.to_string()));
+            }
+            headers_map.insert(lower.into(), Dynamic::from(arr));
+        }
+    }
+    let body_text = resp.into_string().map_err(|e| {
+        EvalAltResult::ErrorRuntime(
+            format!("[{plugin_id}] read body {url}: {e}").into(),
+            rhai::Position::NONE,
+        )
+    })?;
+    let body: Dynamic = if body_text.trim().is_empty() {
+        Dynamic::UNIT
+    } else {
+        match serde_json::from_str::<serde_json::Value>(&body_text) {
+            Ok(v) => json_to_rhai(&v),
+            // Not JSON — fall back to the raw string so callers like
+            // the Yahoo Finance crumb endpoint (returns a bare token)
+            // get something useful in `body`.
+            Err(_) => Dynamic::from(body_text.clone()),
+        }
+    };
+    let mut envelope = rhai::Map::new();
+    envelope.insert("status".into(), Dynamic::from(status));
+    envelope.insert("headers".into(), Dynamic::from(headers_map));
+    envelope.insert("body".into(), body);
+    envelope.insert("body_text".into(), Dynamic::from(body_text));
+    Ok(Dynamic::from(envelope))
 }
 
 fn ureq_to_eval_err(plugin_id: &str, op: &str, url: &str, e: ureq::Error) -> Box<EvalAltResult> {
