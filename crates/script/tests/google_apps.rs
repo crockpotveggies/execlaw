@@ -384,10 +384,11 @@ async fn contacts_list_returns_normalised_shape() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn contacts_search_returns_google_results_when_index_is_warm() {
-    // Happy path — searchContacts returns matches, plugin surfaces them
-    // with the "google" source tag so the caller can tell which path
-    // resolved the lookup. This is the path that fixes the silent-miss
-    // bug for operators with >200 contacts.
+    // Happy path — searchContacts returns the match; the local scan
+    // also runs (per the always-merge contract) but the test's
+    // connections endpoint is unmocked, so the local pass finds 0
+    // and the Google hit stands alone. The per-contact `matched_by`
+    // tag tells the caller which path resolved the row.
     let (url, _) = spawn_mock_recording(&[(
         "/v1/people:searchContacts",
         r#"{"results":[
@@ -408,25 +409,37 @@ async fn contacts_search_returns_google_results_when_index_is_warm() {
     let contacts = r["contacts"].as_array().unwrap();
     assert_eq!(contacts.len(), 1);
     assert_eq!(contacts[0]["display_name"], "Justin Long");
-    assert_eq!(r["source"], "google");
+    assert_eq!(contacts[0]["matched_by"], "google");
+    assert_eq!(r["sources_queried"][0], "google");
+    assert_eq!(r["sources_queried"][1], "local");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn contacts_search_falls_back_to_local_scan_when_google_returns_empty() {
-    // The "cold cache" failure mode: searchContacts returns no results
-    // (Google's index hasn't primed yet), but the connections list
-    // clearly contains the target. The fallback substring-matches the
-    // display name and surfaces the contact with the "fallback" source
-    // tag. Without this, the silent-miss bug we just fixed would
-    // reappear whenever Google's search index was cold.
+async fn contacts_search_local_scan_catches_what_google_misses() {
+    // The user-reported bug: Google's searchContacts returns
+    // unrelated near-matches ("Jay Smith") but misses the actual
+    // target ("Justin Long") that's clearly in the address book.
+    // The previous "fallback only on Google-empty" logic returned
+    // Jay and never reached the local scan.
+    //
+    // With always-merge: Google's hit is preserved (might still be
+    // useful context), AND the local scan finds Justin. Result has
+    // both, ordered Google-first, each tagged with how it was found.
     let (url, _) = spawn_mock_recording(&[
-        ("/v1/people:searchContacts", r#"{"results":[]}"#),
+        (
+            "/v1/people:searchContacts",
+            r#"{"results":[
+                {"person":{"resourceName":"people/c99",
+                 "names":[{"displayName":"Jay Smith"}],
+                 "emailAddresses":[{"value":"jay@x"}]}}
+            ]}"#,
+        ),
         (
             "/v1/people/me/connections",
             r#"{"connections":[
-                {"resourceName":"people/c1","names":[{"displayName":"Bob Smith"}],
-                 "emailAddresses":[{"value":"bob@x"}]},
-                {"resourceName":"people/c2","names":[{"displayName":"Justin Long"}],
+                {"resourceName":"people/c99","names":[{"displayName":"Jay Smith"}],
+                 "emailAddresses":[{"value":"jay@x"}]},
+                {"resourceName":"people/c42","names":[{"displayName":"Justin Long"}],
                  "emailAddresses":[{"value":"justin@x"}]}
             ]}"#,
         ),
@@ -441,13 +454,62 @@ async fn contacts_search_falls_back_to_local_scan_when_google_returns_empty() {
         .await
         .unwrap();
     let contacts = r["contacts"].as_array().unwrap();
-    assert_eq!(contacts.len(), 1, "fallback must skip non-matching contacts");
-    assert_eq!(contacts[0]["display_name"], "Justin Long");
-    assert_eq!(r["source"], "fallback");
+    // Justin must be in there; Jay must NOT be (he doesn't substring-
+    // match "justin"). Google's noisy hit is filtered by the local
+    // pass's deduper, not by the Google pass.
+    let names: Vec<String> = contacts
+        .iter()
+        .map(|c| c["display_name"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "Justin Long"),
+        "Justin Long must surface via local scan; got: {names:?}",
+    );
+    let justin = contacts
+        .iter()
+        .find(|c| c["display_name"] == "Justin Long")
+        .unwrap();
+    assert_eq!(justin["matched_by"], "local");
+    assert_eq!(r["total_scanned"], 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn contacts_search_fallback_matches_by_phone_digits() {
+async fn contacts_search_dedupes_google_and_local_hits() {
+    // When both passes find the same contact (matching resourceName),
+    // the contact appears exactly once and gets tagged with the
+    // Google pass — Google ran first so the dedupe favours its
+    // (cheaper, server-side) attribution.
+    let (url, _) = spawn_mock_recording(&[
+        (
+            "/v1/people:searchContacts",
+            r#"{"results":[
+                {"person":{"resourceName":"people/c42",
+                 "names":[{"displayName":"Justin Long"}]}}
+            ]}"#,
+        ),
+        (
+            "/v1/people/me/connections",
+            r#"{"connections":[
+                {"resourceName":"people/c42","names":[{"displayName":"Justin Long"}]}
+            ]}"#,
+        ),
+    ]);
+    let plugin = build_plugin(&url);
+    let r = plugin
+        .tool_call(
+            "contacts.search",
+            serde_json::json!({"query": "justin"}),
+            oauth("t"),
+        )
+        .await
+        .unwrap();
+    let contacts = r["contacts"].as_array().unwrap();
+    assert_eq!(contacts.len(), 1, "dedupe by resourceName must eliminate dup");
+    assert_eq!(contacts[0]["matched_by"], "google");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn contacts_search_local_finds_by_phone_digits() {
     // Phone substring match. The needle "5551234" must hit
     // "+1 (555) 123-4567" via digits_only normalisation. Pins the
     // contract that phone-number lookup works even when the stored
@@ -474,6 +536,69 @@ async fn contacts_search_fallback_matches_by_phone_digits() {
     let contacts = r["contacts"].as_array().unwrap();
     assert_eq!(contacts.len(), 1);
     assert_eq!(contacts[0]["display_name"], "Alice");
+    assert_eq!(contacts[0]["matched_by"], "local");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn contacts_search_local_finds_by_nickname() {
+    // Operator-saved nicknames live in `nicknames[].value`, NOT in
+    // names. A contact saved as displayName="Justin Long" with
+    // nicknames=[{value:"Justy"}] must surface when the operator
+    // searches for "Justy" — the agent shouldn't have to know that
+    // distinction.
+    let (url, _) = spawn_mock_recording(&[
+        ("/v1/people:searchContacts", r#"{"results":[]}"#),
+        (
+            "/v1/people/me/connections",
+            r#"{"connections":[
+                {"resourceName":"people/c1",
+                 "names":[{"displayName":"Justin Long"}],
+                 "nicknames":[{"value":"Justy"}]}
+            ]}"#,
+        ),
+    ]);
+    let plugin = build_plugin(&url);
+    let r = plugin
+        .tool_call(
+            "contacts.search",
+            serde_json::json!({"query": "justy"}),
+            oauth("t"),
+        )
+        .await
+        .unwrap();
+    let contacts = r["contacts"].as_array().unwrap();
+    assert_eq!(contacts.len(), 1, "nickname match must succeed");
+    assert_eq!(contacts[0]["display_name"], "Justin Long");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn contacts_search_local_finds_by_organization() {
+    // "The guy at Acme" — when the contact's personal name fields are
+    // empty but `organizations[].name` carries the company, a query
+    // for the company name must still find the contact.
+    let (url, _) = spawn_mock_recording(&[
+        ("/v1/people:searchContacts", r#"{"results":[]}"#),
+        (
+            "/v1/people/me/connections",
+            r#"{"connections":[
+                {"resourceName":"people/c1",
+                 "names":[{"displayName":"Jordan"}],
+                 "organizations":[{"name":"Acme Corp","title":"CTO"}]}
+            ]}"#,
+        ),
+    ]);
+    let plugin = build_plugin(&url);
+    let r = plugin
+        .tool_call(
+            "contacts.search",
+            serde_json::json!({"query": "acme"}),
+            oauth("t"),
+        )
+        .await
+        .unwrap();
+    let contacts = r["contacts"].as_array().unwrap();
+    assert_eq!(contacts.len(), 1);
+    assert_eq!(contacts[0]["display_name"], "Jordan");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -899,6 +899,15 @@ fn cal_normalise_when(block) {
 // certainly want `contacts.search` instead of dumping the whole
 // list; the cap exists so a runaway pagination loop can't burn the
 // rate limit / blow up memory.
+//
+// personFields covers everywhere a human name might be stashed:
+// `names` is the obvious one (displayName/givenName/familyName),
+// but contacts imported from other apps frequently end up with the
+// name only in `nicknames` (e.g. "Justy" with no displayName) or
+// `organizations` (e.g. a coworker stored as the company name with
+// no personal-name fields). Without these, `contacts.search`'s
+// local-scan fallback would silently miss those contacts even
+// though they're sitting right there in connections.list.
 fn contacts_fetch_connections(token) {
     let HARD_CAP = 5000;
     let acc = [];
@@ -907,7 +916,7 @@ fn contacts_fetch_connections(token) {
     while pages < 10 {
         pages += 1;
         let query = #{
-            "personFields": "names,emailAddresses,phoneNumbers",
+            "personFields": "names,nicknames,organizations,emailAddresses,phoneNumbers",
             "pageSize": "1000",
         };
         if next != "" {
@@ -1059,18 +1068,45 @@ fn contacts_list_impl(token, args) {
     #{ "contacts": out, "total": total, "limit": limit }
 }
 
-// Server-side search via People API `searchContacts`. Falls back to
-// a local substring scan against the paginated `contacts.list`
-// result when Google returns empty — Google's search index has a
-// known "cold cache" failure mode where the first call after a long
-// idle returns no results even though the contacts exist. The
-// fallback makes lookup reliable in that case.
+// Server-side search via People API `searchContacts`, ALWAYS merged
+// with a local paginated substring scan. The merge (vs. "use one,
+// fall back to the other") matters because Google's search index
+// has two known failure modes:
 //
-// Match semantics for the fallback (case-insensitive substring on
-// display_name, any email, any phone digits):
-//   * "alice"       → matches "Alice Wong"
+//   1. Cold cache: first call after a long idle returns empty even
+//      though the contacts exist.
+//   2. Incomplete coverage: returns some results but misses the
+//      target — typically when the contact's name lives in
+//      nicknames/organizations rather than displayName, or was
+//      added/edited recently and isn't indexed yet.
+//
+// Failure mode #2 is the one operators notice in practice ("the
+// agent found contacts with similar names but not the one I asked
+// for"). If we only ran the local fallback on Google-returns-empty,
+// we'd never reach the local scan in case #2 and the silent miss
+// would persist. So we always run both and dedupe by resourceName.
+//
+// Match semantics for the local scan (case-insensitive substring,
+// hit any of: displayName / givenName / familyName / nickname /
+// organization.name / email / phone digits):
+//   * "alice"       → matches "Alice Wong" by displayName
+//   * "ali"         → matches "Alice Wong" by displayName substring
+//   * "justy"       → matches a contact whose `nicknames[].value` is "Justy"
+//   * "acme"        → matches a contact whose `organizations[].name` is "Acme Corp"
 //   * "alice@x"     → matches by email
 //   * "5551234"     → matches by phone (digits-only compare)
+//
+// Returns:
+//   * `contacts`         — merged + deduped list (Google results first,
+//                          then any local-scan hits not already covered)
+//   * `total`            — len(contacts)
+//   * `query`            — echoed query string
+//   * `sources_queried`  — ["google", "local"]
+//   * `total_scanned`    — number of saved contacts the local pass
+//                          examined. Useful diagnostic: a low value
+//                          here when you expected more is the signal
+//                          that pagination didn't reach the contact
+//                          (we cap at 5000 connections).
 fn contacts_search_impl(token, args) {
     let query = if args["query"] != () { args["query"] } else { "" };
     if "" + query == "" {
@@ -1083,82 +1119,125 @@ fn contacts_search_impl(token, args) {
         25
     };
 
-    // 1) Google server-side search. readMask must be CSV; sources
-    //    defaults to READ_SOURCE_TYPE_CONTACT which is what we want
-    //    (the operator's own contacts, not directory/profile rows).
-    let resp = http_get(
+    // Track which contacts we've already emitted so the local pass
+    // doesn't add a duplicate row Google already returned. Keyed on
+    // resourceName ("people/c42") which Google guarantees stable +
+    // unique per contact.
+    let seen = #{};
+    let out = [];
+
+    // ---- 1) Google server-side search ---------------------------
+    // readMask matches what contacts_fetch_connections pulls so
+    // every contact normalises through the same summarize helper.
+    let g_resp = http_get(
         "https://people.googleapis.com/v1/people:searchContacts",
         #{
             "query": "" + query,
-            "readMask": "names,emailAddresses,phoneNumbers",
+            "readMask": "names,nicknames,organizations,emailAddresses,phoneNumbers",
             "pageSize": "" + max_results,
         },
         token,
     );
-
-    let out = [];
-    if resp != () && resp["results"] != () {
-        for r in resp["results"] {
+    if g_resp != () && g_resp["results"] != () {
+        for r in g_resp["results"] {
             if r["person"] != () {
-                out.push(contacts_summarize_person(r["person"]));
+                let p = r["person"];
+                let key = if p["resourceName"] != () { "" + p["resourceName"] } else { "" };
+                if key != "" && seen[key] != true {
+                    seen[key] = true;
+                    let row = contacts_summarize_person(p);
+                    row["matched_by"] = "google";
+                    out.push(row);
+                }
             }
         }
     }
-    if out.len() > 0 {
-        return #{ "contacts": out, "total": out.len(), "query": "" + query, "source": "google" };
-    }
 
-    // 2) Fallback: paginated full-list scan with case-insensitive
-    //    substring match. Hits when Google's index is cold or the
-    //    contact's display name contains odd characters Google's
-    //    fuzzy matcher misses (e.g. nicknames stored under "Notes").
+    // ---- 2) Local paginated substring scan ----------------------
+    // Always runs. Hits both the cold-cache case (Google returned
+    // nothing) and the "Google missed it" case (Google returned
+    // unrelated near-matches). Deduped against `seen` above.
     let connections = contacts_fetch_connections(token);
-    if connections == () {
-        return #{ "contacts": [], "total": 0, "query": "" + query, "source": "fallback" };
-    }
-    let needle = lower(trim("" + query));
-    let needle_digits = digits_only("" + query);
-    for c in connections {
-        if contacts_local_match(c, needle, needle_digits) {
-            out.push(contacts_summarize_person(c));
+    let scanned = if connections == () { 0 } else { connections.len() };
+    if connections != () {
+        let needle = lower(trim("" + query));
+        let needle_digits = digits_only("" + query);
+        for c in connections {
             if out.len() >= max_results {
                 break;
             }
+            let key = if c["resourceName"] != () { "" + c["resourceName"] } else { "" };
+            if key != "" && seen[key] == true {
+                continue;
+            }
+            if contacts_local_match(c, needle, needle_digits) {
+                seen[key] = true;
+                let row = contacts_summarize_person(c);
+                row["matched_by"] = "local";
+                out.push(row);
+            }
         }
     }
-    #{ "contacts": out, "total": out.len(), "query": "" + query, "source": "fallback" }
+
+    #{
+        "contacts": out,
+        "total": out.len(),
+        "query": "" + query,
+        "sources_queried": ["google", "local"],
+        "total_scanned": scanned,
+    }
 }
 
-// True when `person` matches the search needle on display name (case-
-// insensitive substring), any email (case-insensitive substring), or
-// any phone (digit-only substring). The digits-only check is skipped
-// when the needle has no digits, so a "smith" query doesn't spuriously
-// match phone numbers.
+// True when `person` matches the search needle. Case-insensitive
+// substring across every name-bearing field Google exposes plus
+// emails; phones use digit-only substring matching. The needle is
+// pre-normalised by the caller (lowercased + trimmed) so we don't
+// repeat the work per-field.
 fn contacts_local_match(person, needle, needle_digits) {
-    // Display name.
+    // 1) names — displayName, givenName, familyName.
     if person["names"] != () {
         for n in person["names"] {
-            if n["displayName"] != () {
-                let lc = lower("" + n["displayName"]);
-                if lc.contains(needle) {
-                    return true;
+            for field in ["displayName", "givenName", "familyName"] {
+                if n[field] != () {
+                    let lc = lower("" + n[field]);
+                    if lc.contains(needle) {
+                        return true;
+                    }
                 }
             }
-            if n["givenName"] != () {
-                let lc = lower("" + n["givenName"]);
-                if lc.contains(needle) {
-                    return true;
-                }
-            }
-            if n["familyName"] != () {
-                let lc = lower("" + n["familyName"]);
+        }
+    }
+    // 2) nicknames — common for "Justy" -> "Justin Long" lookups
+    //    where the contact is saved under their nickname but the
+    //    operator searches the full name (or vice versa).
+    if person["nicknames"] != () {
+        for nk in person["nicknames"] {
+            if nk["value"] != () {
+                let lc = lower("" + nk["value"]);
                 if lc.contains(needle) {
                     return true;
                 }
             }
         }
     }
-    // Emails.
+    // 3) organizations — "the guy at Acme" -> the company name field.
+    if person["organizations"] != () {
+        for org in person["organizations"] {
+            if org["name"] != () {
+                let lc = lower("" + org["name"]);
+                if lc.contains(needle) {
+                    return true;
+                }
+            }
+            if org["title"] != () {
+                let lc = lower("" + org["title"]);
+                if lc.contains(needle) {
+                    return true;
+                }
+            }
+        }
+    }
+    // 4) emails.
     if person["emailAddresses"] != () {
         for e in person["emailAddresses"] {
             if e["value"] != () {
@@ -1169,7 +1248,8 @@ fn contacts_local_match(person, needle, needle_digits) {
             }
         }
     }
-    // Phones — only when the needle contains digits.
+    // 5) phones — only when the needle contains digits, so a "smith"
+    //    query doesn't spuriously match phone numbers.
     if needle_digits != "" && person["phoneNumbers"] != () {
         for p in person["phoneNumbers"] {
             if p["value"] != () {
