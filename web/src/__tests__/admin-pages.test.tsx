@@ -302,6 +302,147 @@ describe("ContactsPage", () => {
         // is not revokable yet (the controller hasn't promoted it).
         expect(screen.queryAllByTestId("principal-revoke")).toHaveLength(2);
     });
+
+    it("offers Change-trust on every contact-tier row (including UnknownPending)", async () => {
+        // The edit-trust path lets the operator elevate an unknown
+        // contact directly from the address book — same outcome as
+        // the cold-contact approval flow, but available out-of-band
+        // for contacts who slipped past it.
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/admin/me") return meResponse();
+            return new Response(
+                JSON.stringify({ principals: principalsFixture }),
+                { status: 200 },
+            );
+        });
+        mountWithAuth(<ContactsPage />);
+        await waitFor(() => {
+            expect(screen.getByText("Marge")).toBeInTheDocument();
+        });
+        // KnownTrusted, KnownLimited, UnknownPending — three rows in
+        // the contacts filter, all editable. Blocked sits on the
+        // Principals page so isn't counted here.
+        expect(
+            screen.queryAllByTestId("principal-edit-trust"),
+        ).toHaveLength(3);
+    });
+
+    it("opens the inline edit panel and POSTs the new trust class on submit", async () => {
+        const calls: { url: string; init?: RequestInit }[] = [];
+        fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+            calls.push({ url, init });
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/principals") {
+                return new Response(
+                    JSON.stringify({ principals: principalsFixture }),
+                    { status: 200 },
+                );
+            }
+            if (url.endsWith("/trust")) {
+                return new Response(
+                    JSON.stringify({
+                        principal_id: "lim-1",
+                        new_trust_class: "KnownTrusted",
+                        outcome: "trust_changed",
+                    }),
+                    { status: 200 },
+                );
+            }
+            return new Response("{}", { status: 200 });
+        });
+        mountWithAuth(<ContactsPage />);
+        await waitFor(() => {
+            expect(screen.getByText("Bart")).toBeInTheDocument();
+        });
+        // Click "Change trust" on Bart (the KnownLimited row). The
+        // inline panel mounts; pre-checked at KnownLimited because
+        // that's his current class.
+        const editButtons = screen.getAllByTestId("principal-edit-trust");
+        // Index 1 = Bart in fixture order (Marge / Bart / Stranger).
+        fireEvent.click(editButtons[1]);
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("principal-edit-trust-panel"),
+            ).toBeInTheDocument();
+        });
+        // Flip to KnownTrusted, submit.
+        fireEvent.click(
+            screen.getByTestId("principal-edit-trust-radio-KnownTrusted"),
+        );
+        fireEvent.click(screen.getByTestId("principal-edit-trust-submit"));
+
+        await waitFor(() => {
+            const trustCall = calls.find((c) =>
+                c.url.endsWith("/api/admin/principals/lim-1/trust"),
+            );
+            expect(trustCall).toBeDefined();
+            // Body must be JSON-encoded { class: "KnownTrusted" }.
+            const body = JSON.parse(trustCall!.init!.body as string);
+            expect(body.class).toBe("KnownTrusted");
+            // No topics, no reason → those fields omitted from the
+            // payload by `setPrincipalTrust`.
+            expect(body.allowed_topics).toBeUndefined();
+            expect(body.reason).toBeUndefined();
+        });
+    });
+
+    it("includes allowed_topics when demoting to KnownLimited", async () => {
+        const calls: { url: string; init?: RequestInit }[] = [];
+        fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+            calls.push({ url, init });
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/principals") {
+                return new Response(
+                    JSON.stringify({ principals: principalsFixture }),
+                    { status: 200 },
+                );
+            }
+            if (url.endsWith("/trust")) {
+                return new Response(
+                    JSON.stringify({
+                        principal_id: "knwn-1",
+                        new_trust_class: "KnownLimited",
+                        outcome: "trust_changed",
+                    }),
+                    { status: 200 },
+                );
+            }
+            return new Response("{}", { status: 200 });
+        });
+        mountWithAuth(<ContactsPage />);
+        await waitFor(() => {
+            expect(screen.getByText("Marge")).toBeInTheDocument();
+        });
+        // Marge is index 0 (KnownTrusted, first contact in fixture).
+        const editButtons = screen.getAllByTestId("principal-edit-trust");
+        fireEvent.click(editButtons[0]);
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("principal-edit-trust-panel"),
+            ).toBeInTheDocument();
+        });
+        // Pick KnownLimited; topics field appears.
+        fireEvent.click(
+            screen.getByTestId("principal-edit-trust-radio-KnownLimited"),
+        );
+        const topicsInput = screen.getByTestId(
+            "principal-edit-trust-topics",
+        ) as HTMLInputElement;
+        fireEvent.change(topicsInput, {
+            target: { value: "scheduling, logistics" },
+        });
+        fireEvent.click(screen.getByTestId("principal-edit-trust-submit"));
+
+        await waitFor(() => {
+            const trustCall = calls.find((c) =>
+                c.url.endsWith("/api/admin/principals/knwn-1/trust"),
+            );
+            expect(trustCall).toBeDefined();
+            const body = JSON.parse(trustCall!.init!.body as string);
+            expect(body.class).toBe("KnownLimited");
+            expect(body.allowed_topics).toEqual(["scheduling", "logistics"]);
+        });
+    });
 });
 
 // ---- AuditPage -----------------------------------------------------

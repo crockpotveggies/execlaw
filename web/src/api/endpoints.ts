@@ -1682,6 +1682,46 @@ export async function revokePrincipal(
     );
 }
 
+/// The trust classes the operator can elevate or demote a contact
+/// to via Settings → Contacts. Maps 1-1 with the server-side
+/// `SetTrustRequest::class` allowlist — Controller / Delegated /
+/// UnknownPending are deliberately omitted (see the server handler's
+/// doc comment for why).
+export type SettableTrustClass = "KnownTrusted" | "KnownLimited" | "Blocked";
+
+export interface SetTrustOptions {
+    /** Topic allowlist; only meaningful when `class === "KnownLimited"`. */
+    allowed_topics?: string[];
+    /** Free-form note; persisted on Blocked rows. */
+    reason?: string;
+}
+
+export interface SetTrustResponse {
+    principal_id: string;
+    new_trust_class: string;
+    outcome: string;
+}
+
+export async function setPrincipalTrust(
+    principalId: string,
+    klass: SettableTrustClass,
+    opts: SetTrustOptions,
+    tokenAccessor: () => string | null,
+): Promise<SetTrustResponse> {
+    const body: Record<string, unknown> = { class: klass };
+    if (opts.allowed_topics && opts.allowed_topics.length > 0) {
+        body.allowed_topics = opts.allowed_topics;
+    }
+    if (opts.reason) {
+        body.reason = opts.reason;
+    }
+    return apiFetch<SetTrustResponse>(
+        `/api/admin/principals/${encodeURIComponent(principalId)}/trust`,
+        { method: "POST", body },
+        tokenAccessor,
+    );
+}
+
 export interface PendingApprovalSummary {
     approval_id: string;
     conversation_id: string;
