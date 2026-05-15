@@ -16,7 +16,10 @@
 //
 //   * Multi-workspace from day 1. The vault holds a JSON array
 //     of workspace records; on_enable iterates each and opens a
-//     Socket Mode connection per workspace.
+//     Socket Mode connection per workspace. v0.3.0+:
+//     admin_add_workspace also connects inline so a fresh
+//     workspace starts receiving immediately, without the
+//     disable+enable dance the v0.2.0 flow required.
 //
 // Vault keys
 // ----------
@@ -771,12 +774,53 @@ fn admin_add_workspace(req) {
     save_workspaces(updated);
     log_info("slack: workspace " + team_id + " (" + team_name + ") saved");
 
-    #{
+    // v0.3.0: open the Socket Mode subscription inline so the
+    // operator doesn't have to disable+re-enable the plugin to
+    // start receiving messages on a freshly-saved workspace. The
+    // old behaviour was a "saved but silent" footgun — tokens
+    // landed in vault but on_enable() had already run with zero
+    // workspaces and never re-fired.
+    //
+    // Find the row we just upserted in `updated` (auth.test wrote
+    // the canonical team_id / bot_user_id, so prefer that copy over
+    // the request body) and connect. Failure to connect doesn't
+    // unwind the save — the tokens are valid (we just probed
+    // apps.connections.open above), so a transient WS failure
+    // should leave the persisted workspace intact and surface as a
+    // `connection_warning` the SPA can show. on_enable() at next
+    // plugin reload will retry.
+    //
+    // Replacing an existing workspace (token rotation): the old
+    // workspace's WS subscription stays alive in the script
+    // engine's subscription registry. Slack's server side will
+    // close it shortly after we stop ACKing on a fresh URL;
+    // accepting that minor overlap is fine for the rare token-
+    // rotation case.
+    let saved_ws = #{};
+    for ws in updated {
+        if ws.team_id == team_id {
+            saved_ws = ws;
+            break;
+        }
+    }
+    let connection_warning = ();
+    try {
+        connect_workspace(saved_ws);
+    } catch (e) {
+        log_warn("slack: connect_workspace(" + team_id + ") after save failed: " + e);
+        connection_warning = "" + e;
+    }
+
+    let resp = #{
         "team_id": team_id,
         "team_name": team_name,
         "bot_user_id": bot_user_id,
         "controller_user_id": controller_user_id,
+    };
+    if connection_warning != () {
+        resp["connection_warning"] = connection_warning;
     }
+    resp
 }
 
 fn admin_remove_workspace(req) {
