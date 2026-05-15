@@ -815,10 +815,9 @@ impl NativeServiceController {
     /// operator sees "install Ollama" rather than a generic spawn
     /// failure.
     pub fn discover_ollama() -> Result<PathBuf, ServiceError> {
-        Self::discover_ollama_with(
-            std::env::var("OLLAMA_BINARY").ok(),
-            |name| find_on_path(name),
-        )
+        Self::discover_ollama_with(std::env::var("OLLAMA_BINARY").ok(), |name| {
+            find_on_path(name)
+        })
     }
 
     /// Test-injectable form of [`discover_ollama`]. Production calls
@@ -955,9 +954,9 @@ impl ServiceController for NativeServiceController {
             ))
         })?;
 
-        let logs = Arc::new(Mutex::new(std::collections::VecDeque::<String>::with_capacity(
-            NATIVE_LOG_RING_CAP,
-        )));
+        let logs = Arc::new(Mutex::new(
+            std::collections::VecDeque::<String>::with_capacity(NATIVE_LOG_RING_CAP),
+        ));
 
         // Spawn log-reaper tasks. They run until the child closes its
         // stdout/stderr — which it only does on exit — so they
@@ -1163,10 +1162,7 @@ enum ControllerKind {
 }
 
 impl MultiplexedServiceController {
-    pub fn new(
-        docker: Arc<dyn ServiceController>,
-        native: Arc<dyn ServiceController>,
-    ) -> Self {
+    pub fn new(docker: Arc<dyn ServiceController>, native: Arc<dyn ServiceController>) -> Self {
         Self {
             docker,
             native,
@@ -1612,7 +1608,8 @@ mod tests {
         match err {
             ServiceError::Invalid(msg) => {
                 assert!(
-                    msg.contains("does not exist") && msg.contains("/definitely/not/a/real/path/ollama"),
+                    msg.contains("does not exist")
+                        && msg.contains("/definitely/not/a/real/path/ollama"),
                     "error must echo the bad path, got '{msg}'"
                 );
             }
@@ -1662,15 +1659,14 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().expect("temp file");
         let p = tmp.path().to_owned();
         let p_for_closure = p.clone();
-        let found =
-            NativeServiceController::discover_ollama_with(None, move |name| {
-                if name == "ollama" {
-                    Some(p_for_closure.clone())
-                } else {
-                    None
-                }
-            })
-            .expect("found");
+        let found = NativeServiceController::discover_ollama_with(None, move |name| {
+            if name == "ollama" {
+                Some(p_for_closure.clone())
+            } else {
+                None
+            }
+        })
+        .expect("found");
         assert_eq!(found, p);
     }
 

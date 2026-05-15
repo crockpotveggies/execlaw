@@ -483,12 +483,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = ResearchWorkspace::new(tmp.path());
         let resolver = Arc::new(InferenceResolver::new(None));
-        let sup = ResearchSupervisor::new(
-            db.clone(),
-            resolver,
-            workspace,
-            EventBus::new(),
-        );
+        let sup = ResearchSupervisor::new(db.clone(), resolver, workspace, EventBus::new());
         sup.tick_once().await.unwrap();
 
         // Poll the row up to ~1s for the runner task to land.
@@ -530,12 +525,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = ResearchWorkspace::new(tmp.path());
         let resolver = Arc::new(InferenceResolver::new(None));
-        let sup = ResearchSupervisor::new(
-            db.clone(),
-            resolver,
-            workspace,
-            EventBus::new(),
-        );
+        let sup = ResearchSupervisor::new(db.clone(), resolver, workspace, EventBus::new());
         sup.tick_once().await.unwrap();
 
         // After the tick, every row should have been claimed (status
@@ -565,12 +555,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = ResearchWorkspace::new(tmp.path());
         let resolver = Arc::new(InferenceResolver::new(None));
-        let sup = ResearchSupervisor::new(
-            db.clone(),
-            resolver,
-            workspace,
-            EventBus::new(),
-        );
+        let sup = ResearchSupervisor::new(db.clone(), resolver, workspace, EventBus::new());
         sup.tick_once().await.unwrap();
         // Poll up to ~1s for the runner to exit (no inference =
         // immediate Failed) and clean up its registry entry.
@@ -607,12 +592,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = ResearchWorkspace::new(tmp.path());
         let resolver = Arc::new(InferenceResolver::new(None));
-        let sup = ResearchSupervisor::new(
-            db.clone(),
-            resolver,
-            workspace,
-            EventBus::new(),
-        );
+        let sup = ResearchSupervisor::new(db.clone(), resolver, workspace, EventBus::new());
         // Pre-claim check: registry is empty.
         assert!(sup.cancel_token_for(id.as_str()).is_none());
         // After tick, registry contains an entry (briefly — the

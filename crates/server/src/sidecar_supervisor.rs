@@ -1311,7 +1311,11 @@ rpc_port = 8080
         // call sees no slots and stops nothing extra.
         let stopped_again = sup.stop_all().await;
         assert_eq!(stopped_again, 0);
-        assert_eq!(mock.stop_count().await, 2, "second stop_all must not double-stop");
+        assert_eq!(
+            mock.stop_count().await,
+            2,
+            "second stop_all must not double-stop"
+        );
     }
 
     /// `remove_for_plugin` is the per-plugin variant of `stop_all`.
@@ -1388,7 +1392,10 @@ rpc_port = 8080
         let target_marker = target_root.join("tgt-bus").join("keystore.db");
         std::fs::create_dir_all(target_marker.parent().unwrap()).unwrap();
         std::fs::write(&target_marker, b"fake-keystore").unwrap();
-        assert!(target_marker.exists(), "test setup: state dir must exist before remove");
+        assert!(
+            target_marker.exists(),
+            "test setup: state dir must exist before remove"
+        );
 
         // Likewise for the OTHER plugin, so we can assert it
         // survives the targeted removal.
@@ -1870,10 +1877,7 @@ rpc_port = 8080
         // its OS-level `port_is_free` probe must skip it. We DO drop
         // the listener at the end so any other test re-running on
         // the same machine picks up clean state.
-        let occupier = match std::net::TcpListener::bind((
-            "127.0.0.1",
-            SIDECAR_PORT_POOL_START,
-        )) {
+        let occupier = match std::net::TcpListener::bind(("127.0.0.1", SIDECAR_PORT_POOL_START)) {
             Ok(l) => l,
             Err(e) => {
                 // If something else already has 8501, the test
@@ -1910,8 +1914,7 @@ rpc_port = 8080
             "allocator must skip the externally-bound pool port",
         );
         assert!(
-            spec.host_port > SIDECAR_PORT_POOL_START
-                && spec.host_port <= SIDECAR_PORT_POOL_END,
+            spec.host_port > SIDECAR_PORT_POOL_START && spec.host_port <= SIDECAR_PORT_POOL_END,
             "minted port must be inside the pool and past the occupied head, got {}",
             spec.host_port,
         );
@@ -1940,7 +1943,7 @@ rpc_port = 8080
         // doesn't lie either way.
         let after = port_is_free(port);
         let _ = after; // value depends on OS scheduling; the
-                       // important assertion is the BUSY case above.
+        // important assertion is the BUSY case above.
     }
 
     /// `is_port_conflict_error` recognises every flavour of Docker

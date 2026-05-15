@@ -136,13 +136,12 @@ pub async fn get_attachment_handler(
     {
         let is_controller = matches!(user_role(&state, &user), Some(UserRole::Controller));
         if !is_controller {
-            let caller_owns = caller_owns_conversation(&state, &user, conversation_id).map_err(
-                |e| ApiError {
+            let caller_owns =
+                caller_owns_conversation(&state, &user, conversation_id).map_err(|e| ApiError {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     code: "db_error",
                     message: e.to_string(),
-                },
-            )?;
+                })?;
             if !caller_owns {
                 return Err(ApiError {
                     status: StatusCode::NOT_FOUND,

@@ -96,7 +96,12 @@ pub(crate) fn first_choice(
     let model_id = resp.model.clone();
     let _ = model_id;
     if let Some(choice) = resp.choices.first() {
-        let text = choice.message.content.clone().unwrap_or_default();
+        let text = choice
+            .message
+            .content
+            .as_ref()
+            .map(|c| c.as_text())
+            .unwrap_or_default();
         let finish = choice.finish_reason.clone();
         let tools = choice.message.tool_calls.clone();
         (text, finish, tools)

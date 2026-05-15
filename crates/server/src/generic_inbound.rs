@@ -151,59 +151,96 @@ pub async fn route_inbound(
         return Ok(RouteOutcome::ColdContact);
     }
 
-    // 5. Group address filter + group-context resolution. For DMs
+    // 5. Inbound image attachments. Fetch + persist BEFORE the
+    // group-addressing check so:
+    //   (a) silent-commit paths (unaddressed group messages) still
+    //       carry the attachment refs through to the SPA's bubble —
+    //       operator sees the photo even though no turn ran;
+    //   (b) the agent dispatch path has the same `attachment_ids`
+    //       handle the web composer's `+` flow produces.
+    //
+    // Non-image attachments (PDFs, audio, video, etc.) are skipped
+    // by `persist_inbound_attachments`; vision models can't see
+    // them and a follow-up PR will add per-kind preprocessors
+    // (whisper for audio, text extraction for PDFs).
+    //
+    // Failure to fetch any single attachment doesn't fail the
+    // turn — the helper logs at WARN and continues.
+    let attachment_ids: Vec<String> =
+        crate::chats::persist_inbound_attachments(state, &cid, channel, &msg.attachments).await;
+
+    // 6. Group address filter + group-context resolution. For DMs
     // we leave `group_context = None` and dispatch directly. For
     // groups we consult the addressing classifier; on Skip we
     // silent-commit; on Dispatch we build the per-turn group
     // context (name + member count + addressed reason) so the
     // agent's system prompt knows it's in a group AND why this
     // message reached it.
+    //
+    // 2026-05-15 — image attachments shortcut the classifier: a
+    // group member sending the agent a photo is almost always
+    // intentionally addressing the agent (text-only banter
+    // doesn't normally include media), and image-only messages
+    // have empty text the classifier would otherwise filter out
+    // every time.
+    let has_image_attachment = !attachment_ids.is_empty();
     let group_context: Option<crate::chats::GroupTurnContext> = if msg.group_id.is_some() {
-        let decision = crate::group_addressing::should_dispatch_to_agent(
-            state,
-            &cid,
-            &msg.text,
-            msg.mention_of_self,
-        )
-        .await;
-        match decision {
-            crate::group_addressing::DispatchDecision::Skip => {
-                // Persist for context; skip dispatch.
-                if let Err(e) = crate::chats::commit_inbound_user_msg_silently(
-                    state,
-                    &cid,
-                    sender.id.as_str(),
-                    &msg.text,
-                    channel,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        target: "generic_inbound",
-                        error = %e,
-                        conversation_id = %cid.as_str(),
-                        "silent commit of unaddressed group message failed",
-                    );
+        if has_image_attachment {
+            // Skip the classifier; treat as addressed via the
+            // attachment signal.
+            crate::chats::resolve_group_turn_context(
+                state,
+                &cid,
+                crate::group_addressing::AddressedReason::AttachmentDirected,
+            )
+        } else {
+            let decision = crate::group_addressing::should_dispatch_to_agent(
+                state,
+                &cid,
+                &msg.text,
+                msg.mention_of_self,
+            )
+            .await;
+            match decision {
+                crate::group_addressing::DispatchDecision::Skip => {
+                    // Persist for context; skip dispatch.
+                    if let Err(e) = crate::chats::commit_inbound_user_msg_silently(
+                        state,
+                        &cid,
+                        sender.id.as_str(),
+                        &msg.text,
+                        channel,
+                        attachment_ids.clone(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            target: "generic_inbound",
+                            error = %e,
+                            conversation_id = %cid.as_str(),
+                            "silent commit of unaddressed group message failed",
+                        );
+                    }
+                    return Ok(RouteOutcome::GroupNotAddressed);
                 }
-                return Ok(RouteOutcome::GroupNotAddressed);
-            }
-            crate::group_addressing::DispatchDecision::Dispatch(reason) => {
-                // The classifier already ran the eligibility +
-                // members lookups internally. The resolver here
-                // re-runs the cheap members/name lookups to build
-                // the per-turn context — duplicate cost is small
-                // (two SQLite reads on indexed tables) and keeping
-                // the resolver self-contained simplifies the
-                // approval-replay paths that don't have a verdict
-                // to thread.
-                crate::chats::resolve_group_turn_context(state, &cid, reason)
+                crate::group_addressing::DispatchDecision::Dispatch(reason) => {
+                    // The classifier already ran the eligibility +
+                    // members lookups internally. The resolver here
+                    // re-runs the cheap members/name lookups to build
+                    // the per-turn context — duplicate cost is small
+                    // (two SQLite reads on indexed tables) and keeping
+                    // the resolver self-contained simplifies the
+                    // approval-replay paths that don't have a verdict
+                    // to thread.
+                    crate::chats::resolve_group_turn_context(state, &cid, reason)
+                }
             }
         }
     } else {
         None
     };
 
-    // 6. Dispatch the turn through the standard pipeline.
+    // 7. Dispatch the turn through the standard pipeline.
     crate::chats::dispatch_external_turn(
         state,
         &cid,
@@ -212,6 +249,7 @@ pub async fn route_inbound(
         &msg.text,
         Some(channel),
         group_context,
+        attachment_ids,
     )
     .await
     .map_err(|e| HostCapError::new(format!("dispatch_external_turn: {e}")))?;

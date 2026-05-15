@@ -458,8 +458,7 @@ pub fn materialise_spec(
     // Track every field's resolved value so the native-runtime
     // envelope can surface non-arg fields (model name for Ollama)
     // without re-walking the preset.
-    let mut resolved: std::collections::HashMap<&str, String> =
-        std::collections::HashMap::new();
+    let mut resolved: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
     for field in &preset.fields {
         let value = field_values
             .get(&field.kind)
@@ -818,7 +817,10 @@ mod tests {
         // must NOT win in this case (we don't want a Linux host with
         // no GPU to suddenly recommend Ollama-Apple).
         let presets = presets_for(BackendPurpose::Standard, &[]);
-        let apple = presets.iter().find(|p| p.preset.id == "ollama-apple").unwrap();
+        let apple = presets
+            .iter()
+            .find(|p| p.preset.id == "ollama-apple")
+            .unwrap();
         let cpu = presets.iter().find(|p| p.preset.id == "vllm-cpu").unwrap();
         assert!(!apple.recommended);
         assert!(cpu.recommended);

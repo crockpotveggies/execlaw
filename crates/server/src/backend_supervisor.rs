@@ -355,11 +355,7 @@ fn spec_from_row(row: &BackendRow) -> Result<ServiceSpec, String> {
     // `NativeServiceController` instead of bollard. Other rows omit
     // the field and default to Docker (matches every existing
     // managed-mode preset).
-    let (runtime, binary_hint) = match row
-        .model_spec_json
-        .get("runtime")
-        .and_then(|v| v.as_str())
-    {
+    let (runtime, binary_hint) = match row.model_spec_json.get("runtime").and_then(|v| v.as_str()) {
         Some("native") => {
             let hint = row
                 .model_spec_json
@@ -367,10 +363,7 @@ fn spec_from_row(row: &BackendRow) -> Result<ServiceSpec, String> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_owned();
-            (
-                execlaw_container_manager::ServiceRuntime::Native,
-                hint,
-            )
+            (execlaw_container_manager::ServiceRuntime::Native, hint)
         }
         _ => (
             execlaw_container_manager::ServiceRuntime::Docker,
@@ -1488,14 +1481,8 @@ mod tests {
 
     #[test]
     fn parse_gpu_vendor_recognises_apple() {
-        assert_eq!(
-            parse_gpu_vendor("apple"),
-            Some(GpuVendor::Apple)
-        );
-        assert_eq!(
-            parse_gpu_vendor("Apple"),
-            Some(GpuVendor::Apple)
-        );
+        assert_eq!(parse_gpu_vendor("apple"), Some(GpuVendor::Apple));
+        assert_eq!(parse_gpu_vendor("Apple"), Some(GpuVendor::Apple));
     }
 
     #[test]
@@ -1555,11 +1542,7 @@ mod tests {
         ] {
             let original = vec![model.into()];
             let mut out = original.clone();
-            inject_required_vllm_tool_args(
-                "vllm/vllm-openai:v0.20.2",
-                &original,
-                &mut out,
-            );
+            inject_required_vllm_tool_args("vllm/vllm-openai:v0.20.2", &original, &mut out);
             assert!(
                 out.contains(&"--tool-call-parser=qwen3_coder".into()),
                 "expected qwen3_coder parser for {model}, got: {out:?}"

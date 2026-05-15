@@ -266,9 +266,7 @@ pub fn parse_macos_system_profiler(json: &str, memsize_bytes: u64) -> HardwarePr
             .clone()
             .or_else(|| d.name.clone())
             .filter(|s| !s.is_empty());
-        let id_seed = model
-            .clone()
-            .unwrap_or_else(|| format!("apple-gpu-{idx}"));
+        let id_seed = model.clone().unwrap_or_else(|| format!("apple-gpu-{idx}"));
         gpus.push(GpuDevice {
             id: GpuId(format!("0x106b:{id_seed}")),
             vendor: GpuVendor::Apple,
@@ -809,9 +807,15 @@ mod tests {
         // 36 GB * 2/3 ≈ 24 GB budget. Allow ±1 MiB for integer rounding.
         let mb = gpu.memory_mb.expect("memory budget should be populated");
         let expected = (36 * 1024 * 1024 * 1024u64 / 1024 / 1024) * 2 / 3;
-        assert!((mb as i64 - expected as i64).abs() <= 1, "got {mb}, expected ~{expected}");
+        assert!(
+            (mb as i64 - expected as i64).abs() <= 1,
+            "got {mb}, expected ~{expected}"
+        );
         // Should be a number close to 24576 MiB.
-        assert!(mb > 23_000 && mb < 25_000, "budget {mb} MiB outside expected 36GB×2/3 band");
+        assert!(
+            mb > 23_000 && mb < 25_000,
+            "budget {mb} MiB outside expected 36GB×2/3 band"
+        );
     }
 
     #[test]
@@ -870,9 +874,7 @@ mod tests {
                 .gpus
                 .is_empty()
         );
-        assert!(
-            parse_macos_system_profiler("{}", 0).gpus.is_empty()
-        );
+        assert!(parse_macos_system_profiler("{}", 0).gpus.is_empty());
         assert!(
             parse_macos_system_profiler(r#"{"SPDisplaysDataType":"unexpected"}"#, 0)
                 .gpus

@@ -210,10 +210,7 @@ impl<'db> AttachmentStore<'db> {
         }
         if !path.exists() {
             std::fs::write(&path, bytes).map_err(|e| {
-                DbError::Migration(format!(
-                    "plugin artifact: write {}: {e}",
-                    path.display()
-                ))
+                DbError::Migration(format!("plugin artifact: write {}: {e}", path.display()))
             })?;
         }
 
@@ -256,9 +253,8 @@ impl<'db> AttachmentStore<'db> {
     /// call.
     pub fn purge_artifacts_for_plugin(&self, plugin_id: &str) -> Result<usize, DbError> {
         let rows: Vec<(String, String)> = self.db.with_conn(|c| {
-            let mut stmt = c.prepare(
-                "SELECT id, path FROM state_artifacts WHERE plugin_id = ?1",
-            )?;
+            let mut stmt =
+                c.prepare("SELECT id, path FROM state_artifacts WHERE plugin_id = ?1")?;
             let iter = stmt.query_map(params![plugin_id], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })?;
@@ -524,7 +520,12 @@ mod tests {
             .unwrap();
         assert_eq!(removed, 1);
 
-        assert!(store.get_artifact(&expired.attachment_id).unwrap().is_none());
+        assert!(
+            store
+                .get_artifact(&expired.attachment_id)
+                .unwrap()
+                .is_none()
+        );
         assert!(store.get_artifact(&fresh.attachment_id).unwrap().is_some());
         assert!(store.get_artifact(&no_ttl.attachment_id).unwrap().is_some());
 
@@ -607,8 +608,18 @@ mod tests {
         //   * shared_blob_path file STAYS (ws-chart still references it).
         let removed = store.purge_artifacts_for_plugin("open-meteo").unwrap();
         assert_eq!(removed, 2);
-        assert!(store.get_artifact(&chart_a.attachment_id).unwrap().is_none());
-        assert!(store.get_artifact(&chart_b.attachment_id).unwrap().is_none());
+        assert!(
+            store
+                .get_artifact(&chart_a.attachment_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_artifact(&chart_b.attachment_id)
+                .unwrap()
+                .is_none()
+        );
         assert!(
             store
                 .get_artifact(&other_plugin_share.attachment_id)

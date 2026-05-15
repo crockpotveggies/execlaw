@@ -1409,15 +1409,7 @@ fn register_host_cap_bindings(
                   interval_ms: i64,
                   callback: ImmutableString|
                   -> Result<bool, Box<EvalAltResult>> {
-                ws_set_keepalive_impl(
-                    &pid,
-                    &caps,
-                    &owning,
-                    h,
-                    interval_ms,
-                    &callback,
-                    true,
-                )
+                ws_set_keepalive_impl(&pid, &caps, &owning, h, interval_ms, &callback, true)
             },
         );
     }
@@ -1883,11 +1875,7 @@ fn register_host_create_attachment(
 ///
 /// width / height are clamped to a sensible range. Setting either to
 /// zero requests the renderer's defaults (720×400).
-fn register_host_render_chart(
-    engine: &mut Engine,
-    plugin_id: &str,
-    host_caps: HostCapsHandle,
-) {
+fn register_host_render_chart(engine: &mut Engine, plugin_id: &str, host_caps: HostCapsHandle) {
     /// Minimum and maximum canvas dimensions. The minimum keeps
     /// axes legible; the maximum stops a runaway script from asking
     /// for an 8K image and pinning the renderer for seconds.
@@ -1984,7 +1972,10 @@ fn register_host_render_chart(
                 "sha256".into(),
                 Dynamic::from(ImmutableString::from(created.sha256)),
             );
-            m.insert("size_bytes".into(), Dynamic::from(created.size_bytes as i64));
+            m.insert(
+                "size_bytes".into(),
+                Dynamic::from(created.size_bytes as i64),
+            );
             m.insert("svg".into(), Dynamic::from(ImmutableString::from(svg)));
             m.insert(
                 "png_data_url".into(),

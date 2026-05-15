@@ -1433,30 +1433,29 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     // error rather than silently disappearing.
     let native_ctrl: std::sync::Arc<dyn execlaw_container_manager::ServiceController> =
         std::sync::Arc::new(execlaw_container_manager::NativeServiceController::new());
-    let backend_ctrl: Option<
-        std::sync::Arc<dyn execlaw_container_manager::ServiceController>,
-    > = match &docker_ctrl {
-        Some(d) => Some(std::sync::Arc::new(
-            execlaw_container_manager::MultiplexedServiceController::new(
-                d.clone(),
-                native_ctrl.clone(),
-            ),
-        )),
-        None => {
-            // Native-only path. Useful on Macs without Docker Desktop
-            // installed — the operator can still configure the
-            // Apple-Silicon Ollama preset and the supervisor will
-            // spawn it. Sidecar supervisor (signal-cli etc.) stays
-            // gated on `docker_ctrl` below so it correctly reports
-            // "Docker unreachable" without affecting the inference
-            // path.
-            tracing::info!(
-                "backend supervisor falling back to native-only controller — Docker is \
+    let backend_ctrl: Option<std::sync::Arc<dyn execlaw_container_manager::ServiceController>> =
+        match &docker_ctrl {
+            Some(d) => Some(std::sync::Arc::new(
+                execlaw_container_manager::MultiplexedServiceController::new(
+                    d.clone(),
+                    native_ctrl.clone(),
+                ),
+            )),
+            None => {
+                // Native-only path. Useful on Macs without Docker Desktop
+                // installed — the operator can still configure the
+                // Apple-Silicon Ollama preset and the supervisor will
+                // spawn it. Sidecar supervisor (signal-cli etc.) stays
+                // gated on `docker_ctrl` below so it correctly reports
+                // "Docker unreachable" without affecting the inference
+                // path.
+                tracing::info!(
+                    "backend supervisor falling back to native-only controller — Docker is \
                  unreachable, but managed-mode Apple-Silicon Ollama presets will still spawn"
-            );
-            Some(native_ctrl.clone())
-        }
-    };
+                );
+                Some(native_ctrl.clone())
+            }
+        };
 
     let backend_supervisor = backend_ctrl.as_ref().map(|ctrl| {
         // Resolve the host's primary HF cache directory.

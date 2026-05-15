@@ -97,6 +97,14 @@ pub enum AddressedReason {
     /// with.
     EligibilityBypass,
 
+    /// The message carries an image attachment, which is treated
+    /// as a strong "addressed" signal regardless of message text.
+    /// Group members sending the agent a photo are almost always
+    /// intentionally pulling it in (text-only banter rarely carries
+    /// media), and image-only inbounds have empty text the
+    /// classifier would otherwise filter out every time.
+    AttachmentDirected,
+
     /// The classifier couldn't be consulted (no inference backend
     /// resolved, missing display_name, principal lookup failed). We
     /// dispatched anyway because silencing the agent on a config
@@ -128,6 +136,9 @@ impl AddressedReason {
             }
             AddressedReason::ClassifierDirected => {
                 "a small classifier guessed this was for you, with no name match — weak signal, treat as likely-not-for-you unless the message body clearly says otherwise"
+            }
+            AddressedReason::AttachmentDirected => {
+                "the sender included an image attachment — group members rarely share photos as ambient banter, so this is a strong signal they want you to look at it (still apply the hard rules)"
             }
             AddressedReason::EligibilityBypass => {
                 "this conversation isn't a multi-human group from the addressing layer's perspective — the hard rules still apply, but ambient chatter is unlikely"
@@ -477,11 +488,12 @@ async fn classify_via_llm(
         }
     };
 
-    let text = resp
+    let text_owned = resp
         .choices
         .first()
-        .and_then(|c| c.message.content.as_deref())
-        .unwrap_or("");
+        .and_then(|c| c.message.content.as_ref().map(|mc| mc.as_text()))
+        .unwrap_or_default();
+    let text = text_owned.as_str();
     match parse_directed_verdict(text) {
         Some(true) => DispatchDecision::Dispatch(AddressedReason::ClassifierDirected),
         Some(false) => DispatchDecision::Skip,

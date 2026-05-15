@@ -1315,7 +1315,10 @@ mod tests {
         assert_eq!(m.admin_routes.len(), 4);
 
         // No sidecar — gateway is public WSS.
-        assert!(m.services.is_empty(), "discord plugin must not declare any sidecar in v0.1");
+        assert!(
+            m.services.is_empty(),
+            "discord plugin must not declare any sidecar in v0.1"
+        );
 
         // UI panel mount.
         assert_eq!(m.ui_panels.len(), 1);

@@ -1076,31 +1076,32 @@ impl<'db> ResearchConfigStore<'db> {
     pub fn get(&self) -> Result<ResearchConfig, ResearchError> {
         use rusqlite::OptionalExtension;
         let row: Option<ResearchConfig> = self.db.with_conn(|c| {
-            let got = c.query_row(
-                "SELECT max_wall_clock_minutes, max_total_tokens, max_subqueries, \
+            let got = c
+                .query_row(
+                    "SELECT max_wall_clock_minutes, max_total_tokens, max_subqueries, \
                         parallel_workers, max_urls_per_subquery, max_pages_total, \
                         auto_cancel_after_idle_secs, phase_gates, \
                         default_search_provider, updated_at \
                  FROM config_research WHERE id = 1",
-                [],
-                |r| {
-                    let phase_gates_str: String = r.get(7)?;
-                    Ok(ResearchConfig {
-                        max_wall_clock_minutes: r.get::<_, i64>(0)?.max(0) as u32,
-                        max_total_tokens: r.get::<_, i64>(1)?.max(0) as u32,
-                        max_subqueries: r.get::<_, i64>(2)?.max(0) as u32,
-                        parallel_workers: r.get::<_, i64>(3)?.max(1) as u32,
-                        max_urls_per_subquery: r.get::<_, i64>(4)?.max(0) as u32,
-                        max_pages_total: r.get::<_, i64>(5)?.max(0) as u32,
-                        auto_cancel_after_idle_secs: r.get::<_, i64>(6)?.max(0) as u32,
-                        phase_gates: PhaseGates::parse(&phase_gates_str)
-                            .unwrap_or(PhaseGates::PlanOnly),
-                        default_search_provider: r.get(8)?,
-                        updated_at: r.get(9)?,
-                    })
-                },
-            )
-            .optional()?;
+                    [],
+                    |r| {
+                        let phase_gates_str: String = r.get(7)?;
+                        Ok(ResearchConfig {
+                            max_wall_clock_minutes: r.get::<_, i64>(0)?.max(0) as u32,
+                            max_total_tokens: r.get::<_, i64>(1)?.max(0) as u32,
+                            max_subqueries: r.get::<_, i64>(2)?.max(0) as u32,
+                            parallel_workers: r.get::<_, i64>(3)?.max(1) as u32,
+                            max_urls_per_subquery: r.get::<_, i64>(4)?.max(0) as u32,
+                            max_pages_total: r.get::<_, i64>(5)?.max(0) as u32,
+                            auto_cancel_after_idle_secs: r.get::<_, i64>(6)?.max(0) as u32,
+                            phase_gates: PhaseGates::parse(&phase_gates_str)
+                                .unwrap_or(PhaseGates::PlanOnly),
+                            default_search_provider: r.get(8)?,
+                            updated_at: r.get(9)?,
+                        })
+                    },
+                )
+                .optional()?;
             Ok(got)
         })?;
         Ok(row.unwrap_or_default())
@@ -2358,11 +2359,8 @@ mod tests {
         // `From<rusqlite::Error> for DbError` impl declared in db.rs.
         let pre: i64 = db
             .with_conn(|c| {
-                let n: i64 = c.query_row(
-                    "SELECT COUNT(*) FROM config_research",
-                    [],
-                    |r| r.get(0),
-                )?;
+                let n: i64 =
+                    c.query_row("SELECT COUNT(*) FROM config_research", [], |r| r.get(0))?;
                 Ok(n)
             })
             .unwrap();
@@ -2379,10 +2377,7 @@ mod tests {
         // The store must still return defaults, NOT
         // `QueryReturnedNoRows`.
         let cfg = ResearchConfigStore::new(&db).get();
-        assert!(
-            cfg.is_ok(),
-            "get() with no row must succeed, got: {cfg:?}",
-        );
+        assert!(cfg.is_ok(), "get() with no row must succeed, got: {cfg:?}",);
         let cfg = cfg.unwrap();
         // Exact field values come from `ResearchConfig::default()`.
         let defaults = ResearchConfig::default();

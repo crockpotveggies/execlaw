@@ -500,8 +500,7 @@ entry = "ui/panel.js"
         // acceptable; the invariant is "never 200 leaking external
         // file contents".
         assert!(
-            resp.status() == StatusCode::NOT_FOUND
-                || resp.status() == StatusCode::BAD_REQUEST,
+            resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::BAD_REQUEST,
             "path-traversal attempt must NOT succeed; got {}",
             resp.status(),
         );

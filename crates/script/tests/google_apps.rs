@@ -504,7 +504,11 @@ async fn contacts_search_dedupes_google_and_local_hits() {
         .await
         .unwrap();
     let contacts = r["contacts"].as_array().unwrap();
-    assert_eq!(contacts.len(), 1, "dedupe by resourceName must eliminate dup");
+    assert_eq!(
+        contacts.len(),
+        1,
+        "dedupe by resourceName must eliminate dup"
+    );
     assert_eq!(contacts[0]["matched_by"], "google");
 }
 

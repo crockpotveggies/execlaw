@@ -11,8 +11,22 @@ import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 
 import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
 import Spinner from "react-bootstrap/Spinner";
+import type { InlineAttachment } from "../api/endpoints";
 import type { VoiceReadiness } from "./useVoiceReadiness";
 import { VoiceCaptureButton } from "./VoiceCaptureButton";
+
+/// One image staged in the composer before send. The component
+/// holds the data URL inline; on submit it's handed to `onSend` as
+/// an `InlineAttachment` and the server persists. A local-only
+/// `localId` lets the preview chip render before the file is even
+/// finished reading; `dataUrl` lands the moment `FileReader` resolves.
+interface PendingAttachment {
+    localId: string;
+    name: string;
+    mime: string;
+    dataUrl: string;
+    sizeBytes: number;
+}
 
 interface Props {
     disabled?: boolean;
@@ -26,7 +40,26 @@ interface Props {
      * `null` / `undefined` for normal web threads.
      */
     bridgedChannel?: string | null;
-    onSend: (text: string) => Promise<void> | void;
+    onSend: (text: string, attachments: InlineAttachment[]) => Promise<void> | void;
+    /**
+     * 2026-05-15 — gates the image-attach affordance ( + button +
+     * popup menu). When false (text-only backend / probe hasn't
+     * landed / backend unreachable), the + button is hidden and
+     * pasting an image into the textarea does nothing. The chat
+     * shell sources this from `useBackendCapabilities`.
+     */
+    multimodal?: boolean;
+    /**
+     * 2026-05-15 — target long-edge dimension for client-side
+     * downscale before base64 encode. 0 / undefined ships the bytes
+     * as-is. Sourced from the same backend-capability probe as
+     * `multimodal`; the server picks the value from detected GPU
+     * VRAM (24 GB → 1024, 32–64 GB → 1536, 64+ GB → 2048). Resizing
+     * in the browser saves network + base64 overhead without
+     * affecting model output, since vLLM's vision pipeline would
+     * downsample anything larger anyway.
+     */
+    recommendedImageEdge?: number;
     /**
      * Phase 13.A — voice-mode wire. Returns true when the bytes
      * were queued on the WebSocket; false drops the chunk. Pass
@@ -76,6 +109,8 @@ export function Composer({
     voiceReadiness,
     busy,
     onStop,
+    multimodal,
+    recommendedImageEdge,
 }: Props) {
     // Bridged-channel short-circuit. Render a flat, non-interactive
     // notice in place of the composer chip. Mirrors the chip's
@@ -110,7 +145,11 @@ export function Composer({
     }
     const [text, setText] = useState("");
     const [submitting, setSubmitting] = useState(false);
+    const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+    const [attachMenuOpen, setAttachMenuOpen] = useState(false);
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+    const fileInputRef = useRef<HTMLInputElement | null>(null);
+    const attachMenuRef = useRef<HTMLDivElement | null>(null);
 
     // Auto-grow.
     useEffect(() => {
@@ -120,24 +159,84 @@ export function Composer({
         ta.style.height = `${Math.min(ta.scrollHeight, 192)}px`;
     }, [text]);
 
+    // Click-outside / Escape closes the + menu. Tracked here (not on
+    // the trigger) so the menu stays open while the operator hovers
+    // its items.
+    useEffect(() => {
+        if (!attachMenuOpen) return;
+        const onPointer = (ev: MouseEvent) => {
+            const root = attachMenuRef.current;
+            if (root && !root.contains(ev.target as Node)) {
+                setAttachMenuOpen(false);
+            }
+        };
+        const onKey = (ev: globalThis.KeyboardEvent) => {
+            if (ev.key === "Escape") setAttachMenuOpen(false);
+        };
+        document.addEventListener("mousedown", onPointer);
+        document.addEventListener("keydown", onKey);
+        return () => {
+            document.removeEventListener("mousedown", onPointer);
+            document.removeEventListener("keydown", onKey);
+        };
+    }, [attachMenuOpen]);
+
+    const onPickPhoto = () => {
+        setAttachMenuOpen(false);
+        fileInputRef.current?.click();
+    };
+
+    const onFilesPicked = async (files: FileList | null) => {
+        if (!files) return;
+        const next: PendingAttachment[] = [];
+        for (let i = 0; i < files.length; i++) {
+            const f = files[i];
+            if (!f.type.startsWith("image/")) continue;
+            // 2026-05-15 — downscale before base64 when the backend
+            // told us an edge target. Skipped for GIFs (preserve
+            // animation; Canvas would flatten to first frame) and
+            // when the image is already smaller than the target.
+            const result = await prepareImageForUpload(
+                f,
+                recommendedImageEdge ?? 0,
+            );
+            next.push({
+                localId: `${Date.now()}-${i}-${f.name}`,
+                name: f.name,
+                mime: result.mime,
+                dataUrl: result.dataUrl,
+                sizeBytes: result.sizeBytes,
+            });
+        }
+        setAttachments((prev) => [...prev, ...next]);
+        // Reset the input so picking the same file twice in a row
+        // re-fires onChange (browsers suppress duplicate selections
+        // otherwise).
+        if (fileInputRef.current) fileInputRef.current.value = "";
+    };
+
+    const removeAttachment = (localId: string) => {
+        setAttachments((prev) => prev.filter((a) => a.localId !== localId));
+    };
+
     const submit = async (e?: FormEvent | KeyboardEvent) => {
         e?.preventDefault();
         const trimmed = text.trim();
-        if (trimmed.length === 0 || submitting) return;
+        // Allow image-only sends — vision models handle a bare image
+        // fine with the implicit "describe this" framing.
+        if ((trimmed.length === 0 && attachments.length === 0) || submitting) return;
         setSubmitting(true);
-        // 2026-04-28 — clear the textarea synchronously, BEFORE
-        // awaiting `onSend`. With local-model streaming, `onSend`
-        // (= postMessage) doesn't resolve until the agent's full
-        // reply has finished generating — so a post-await clear
-        // left the user's text sitting in the input for tens of
-        // seconds, looking like the send button hadn't worked. The
-        // optimistic message already lands in the transcript via
-        // `appendMessage` inside onSend, so clearing eagerly is
-        // safe even if the server later errors (the operator can
-        // re-type from the rejected message in the transcript).
+        // Snapshot the staged attachments + clear the input
+        // synchronously so the operator sees the send committed even
+        // while `onSend` is still streaming the reply.
+        const wire: InlineAttachment[] = attachments.map((a) => ({
+            mime: a.mime,
+            data_url: a.dataUrl,
+        }));
         setText("");
+        setAttachments([]);
         try {
-            await onSend(trimmed);
+            await onSend(trimmed, wire);
         } finally {
             setSubmitting(false);
         }
@@ -151,6 +250,10 @@ export function Composer({
 
     const isBusy = !!submitting || !!disabled;
     const trimmedEmpty = text.trim().length === 0;
+    // The send button is enabled when there's either typed text or
+    // at least one staged image. Image-only sends are valid against
+    // a multimodal backend.
+    const sendDisabled = isBusy || (trimmedEmpty && attachments.length === 0);
 
     // ChatGPT-style composer:
     //   * The visible "chip" is the outer `<div>`. It owns the
@@ -168,6 +271,36 @@ export function Composer({
     return (
         <form onSubmit={submit} className="execlaw-composer__form">
             <div className="execlaw-composer__shell" data-testid="composer-shell">
+                {attachments.length > 0 && (
+                    <div
+                        className="execlaw-composer__attachments"
+                        data-testid="composer-attachments"
+                    >
+                        {attachments.map((a) => (
+                            <div
+                                key={a.localId}
+                                className="execlaw-composer__attachment-chip"
+                                data-testid="composer-attachment-chip"
+                                title={`${a.name} · ${formatBytes(a.sizeBytes)}`}
+                            >
+                                <img
+                                    className="execlaw-composer__attachment-thumb"
+                                    src={a.dataUrl}
+                                    alt={a.name}
+                                />
+                                <button
+                                    type="button"
+                                    className="execlaw-composer__attachment-remove"
+                                    onClick={() => removeAttachment(a.localId)}
+                                    aria-label={`Remove ${a.name}`}
+                                    data-testid="composer-attachment-remove"
+                                >
+                                    <i className="bi bi-x" aria-hidden />
+                                </button>
+                            </div>
+                        ))}
+                    </div>
+                )}
                 <Form.Control
                     ref={textareaRef}
                     as="textarea"
@@ -194,14 +327,60 @@ export function Composer({
                 />
                 <div className="execlaw-composer__tools">
                     <div className="execlaw-composer__tools-left">
-                        {/*
-                          Reserved for future attach / web-search /
-                          tool-picker affordances. Keeping the slot
-                          empty (rather than absent) preserves the
-                          flex `space-between` alignment so the
-                          send button stays right-anchored even
-                          before tools land.
-                        */}
+                        {multimodal && (
+                            <div
+                                ref={attachMenuRef}
+                                className="execlaw-composer__attach-anchor"
+                            >
+                                <Button
+                                    type="button"
+                                    variant="link"
+                                    className="execlaw-composer__attach-btn"
+                                    onClick={() =>
+                                        setAttachMenuOpen((v) => !v)
+                                    }
+                                    aria-label="Attach"
+                                    aria-haspopup="menu"
+                                    aria-expanded={attachMenuOpen}
+                                    disabled={isBusy}
+                                    data-testid="composer-attach-trigger"
+                                >
+                                    <i className="bi bi-plus-lg" aria-hidden />
+                                </Button>
+                                {attachMenuOpen && (
+                                    <div
+                                        className="execlaw-composer__attach-menu"
+                                        role="menu"
+                                        data-testid="composer-attach-menu"
+                                    >
+                                        <button
+                                            type="button"
+                                            role="menuitem"
+                                            className="execlaw-composer__attach-menu-item"
+                                            onClick={onPickPhoto}
+                                            data-testid="composer-attach-photo"
+                                        >
+                                            <i
+                                                className="bi bi-image"
+                                                aria-hidden
+                                            />
+                                            <span>Attach photo</span>
+                                        </button>
+                                    </div>
+                                )}
+                                <input
+                                    ref={fileInputRef}
+                                    type="file"
+                                    accept="image/png,image/jpeg,image/webp,image/gif"
+                                    multiple
+                                    style={{ display: "none" }}
+                                    onChange={(e) =>
+                                        void onFilesPicked(e.target.files)
+                                    }
+                                    data-testid="composer-file-input"
+                                />
+                            </div>
+                        )}
                     </div>
                     <div className="execlaw-composer__tools-right">
                         {/*
@@ -259,7 +438,7 @@ export function Composer({
                             <Button
                                 type="submit"
                                 variant="primary"
-                                disabled={isBusy || trimmedEmpty}
+                                disabled={sendDisabled}
                                 data-testid="composer-send"
                                 aria-label="Send"
                                 className="execlaw-composer__send"
@@ -276,4 +455,107 @@ export function Composer({
             </div>
         </form>
     );
+}
+
+interface PreparedImage {
+    dataUrl: string;
+    mime: string;
+    sizeBytes: number;
+}
+
+/// Prepare a picked image for upload. When `maxEdge > 0` and the
+/// image is larger on its long edge, resize via Canvas before
+/// base64-encoding. The output mime is set to JPEG for resized photos
+/// (saves ~3-5× over PNG for typical phone shots) UNLESS the source
+/// is a GIF (preserve animation by skipping resize and passing the
+/// original bytes through) or PNG with transparency (PNG bytes
+/// passed through to avoid losing the alpha channel).
+///
+/// Returned `dataUrl` is the wire form the server's
+/// `persist_inline_attachments` decodes; `mime` MUST match the
+/// `data:` prefix inside it. `sizeBytes` is the post-encode payload
+/// size used only for the chip's tooltip — it's the decoded byte
+/// count, not the base64-inflated wire length.
+async function prepareImageForUpload(
+    file: File,
+    maxEdge: number,
+): Promise<PreparedImage> {
+    // No edge target / animated GIF / very small image → ship the
+    // original bytes unchanged.
+    if (maxEdge <= 0 || file.type === "image/gif") {
+        const dataUrl = await readAsDataUrl(file);
+        return { dataUrl, mime: file.type, sizeBytes: file.size };
+    }
+    // Read once into an ImageBitmap so we can measure before deciding
+    // whether to resize. createImageBitmap rejects on non-image MIME
+    // types; the caller has already filtered to image/* so any
+    // rejection here means the file is corrupt — propagate.
+    const bmp = await createImageBitmap(file);
+    const longEdge = Math.max(bmp.width, bmp.height);
+    if (longEdge <= maxEdge) {
+        bmp.close();
+        const dataUrl = await readAsDataUrl(file);
+        return { dataUrl, mime: file.type, sizeBytes: file.size };
+    }
+    const scale = maxEdge / longEdge;
+    const w = Math.max(1, Math.round(bmp.width * scale));
+    const h = Math.max(1, Math.round(bmp.height * scale));
+    // OffscreenCanvas is widely supported (Chrome 69+ / Firefox 105+
+    // / Safari 16.4+); fall back to a regular <canvas> when it isn't
+    // available so the resize still works on slightly older browsers.
+    let blob: Blob;
+    const outMime =
+        file.type === "image/png" ? "image/png" : "image/jpeg";
+    const quality = outMime === "image/jpeg" ? 0.85 : 1.0;
+    if (typeof OffscreenCanvas !== "undefined") {
+        const canvas = new OffscreenCanvas(w, h);
+        const ctx = canvas.getContext("2d");
+        if (!ctx) throw new Error("2D canvas context unavailable");
+        ctx.drawImage(bmp, 0, 0, w, h);
+        bmp.close();
+        blob = await canvas.convertToBlob({ type: outMime, quality });
+    } else {
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) throw new Error("2D canvas context unavailable");
+        ctx.drawImage(bmp, 0, 0, w, h);
+        bmp.close();
+        blob = await new Promise<Blob>((resolve, reject) => {
+            canvas.toBlob(
+                (b) =>
+                    b ? resolve(b) : reject(new Error("canvas toBlob failed")),
+                outMime,
+                quality,
+            );
+        });
+    }
+    const dataUrl = await readAsDataUrl(blob);
+    return { dataUrl, mime: outMime, sizeBytes: blob.size };
+}
+
+/// Read a File / Blob into a base64 data URL via FileReader. The
+/// server expects `data:<mime>;base64,<bytes>` and decodes verbatim,
+/// so the browser's native encoding is exactly what we want.
+function readAsDataUrl(file: Blob): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => {
+            const result = r.result;
+            if (typeof result === "string") {
+                resolve(result);
+            } else {
+                reject(new Error("FileReader returned non-string"));
+            }
+        };
+        r.onerror = () => reject(r.error ?? new Error("FileReader error"));
+        r.readAsDataURL(file);
+    });
+}
+
+function formatBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }

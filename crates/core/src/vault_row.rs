@@ -137,8 +137,16 @@ mod tests {
 
         let removed = s.delete_for_plugin("signal").unwrap();
         assert_eq!(removed, 2, "both signal rows must be removed");
-        assert!(s.get(Some("signal"), "linked_device_token").unwrap().is_none());
-        assert!(s.get(Some("signal"), "registration_lock_pin").unwrap().is_none());
+        assert!(
+            s.get(Some("signal"), "linked_device_token")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            s.get(Some("signal"), "registration_lock_pin")
+                .unwrap()
+                .is_none()
+        );
         // Other plugin and core-scope rows must be untouched.
         assert_eq!(
             s.get(Some("whatsapp"), "session").unwrap().as_deref(),

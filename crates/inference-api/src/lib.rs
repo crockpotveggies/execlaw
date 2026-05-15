@@ -39,11 +39,61 @@ pub enum Role {
     Tool,
 }
 
+/// Body of a chat message. OpenAI's chat schema accepts EITHER a plain
+/// string OR an array of typed content parts (text + image_url for
+/// vision-enabled models like Qwen3-VL / Qwen3.6 / LLaVA / Pixtral).
+/// The untagged enum serialises to whichever shape matches the input
+/// so existing text-only call sites are byte-identical on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl MessageContent {
+    /// Extract the plain-text portion for logging / history projection.
+    /// Concatenates the text parts of a parts-array with newlines; an
+    /// image-only message returns the empty string.
+    pub fn as_text(&self) -> String {
+        match self {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::ImageUrl { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+}
+
+/// One typed content part inside a parts-array `MessageContent`. The
+/// `image_url` variant follows OpenAI's vision schema verbatim — Qwen
+/// VL, LLaVA, Llama-3.2-Vision, Pixtral, and Phi-3.5-Vision all accept
+/// it via the OpenAI-compatible bridge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUrl {
+    /// Either an https:// URL or a `data:image/<mime>;base64,<bytes>`
+    /// data URL. execlaw uses the data-URL form so the inference
+    /// backend doesn't need network access to fetch attachments.
+    pub url: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<MessageContent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -57,7 +107,7 @@ impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: Role::System,
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
             tool_call_id: None,
             name: None,
             tool_calls: Vec::new(),
@@ -66,7 +116,33 @@ impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: Role::User,
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
+            tool_call_id: None,
+            name: None,
+            tool_calls: Vec::new(),
+        }
+    }
+    /// Build a user message with attached images. Each `images` entry
+    /// is a data URL (e.g. `data:image/png;base64,...`). The text is
+    /// emitted as the first content part; images follow in the order
+    /// provided. An empty `text` is allowed (image-only message).
+    pub fn user_with_images(
+        text: impl Into<String>,
+        images: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let mut parts: Vec<ContentPart> = Vec::new();
+        let text = text.into();
+        if !text.is_empty() {
+            parts.push(ContentPart::Text { text });
+        }
+        for url in images {
+            parts.push(ContentPart::ImageUrl {
+                image_url: ImageUrl { url },
+            });
+        }
+        Self {
+            role: Role::User,
+            content: Some(MessageContent::Parts(parts)),
             tool_call_id: None,
             name: None,
             tool_calls: Vec::new(),
@@ -75,7 +151,7 @@ impl ChatMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
             tool_call_id: None,
             name: None,
             tool_calls: Vec::new(),
@@ -84,7 +160,7 @@ impl ChatMessage {
     pub fn tool_result(tool_call_id: impl Into<String>, result_json: impl Into<String>) -> Self {
         Self {
             role: Role::Tool,
-            content: Some(result_json.into()),
+            content: Some(MessageContent::Text(result_json.into())),
             tool_call_id: Some(tool_call_id.into()),
             name: None,
             tool_calls: Vec::new(),
@@ -162,6 +238,97 @@ pub struct ChatRequest {
     /// the field, so passing it unconditionally is safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
+}
+
+/// `GET /v1/models` response shape (OpenAI list endpoint). vLLM,
+/// llama.cpp server, Ollama, OpenArc all return this envelope; the
+/// only field the SPA reads is `data[].id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelListResponse {
+    #[serde(default)]
+    pub object: Option<String>,
+    #[serde(default)]
+    pub data: Vec<ModelEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelEntry {
+    pub id: String,
+    #[serde(default)]
+    pub object: Option<String>,
+    #[serde(default)]
+    pub owned_by: Option<String>,
+}
+
+/// Heuristic check — does the given model id name a known
+/// multimodal (vision-capable) family? Returns true on a match
+/// against the curated pattern set; false otherwise.
+///
+/// Curated list (case-insensitive substring match):
+///   * Qwen vision: `qwen2-vl`, `qwen2.5-vl`, `qwen3-vl`, `qwen3.6`
+///   * LLaVA: `llava`, `llava-onevision`
+///   * Llama 3.2 Vision: `llama-3.2-11b-vision`, `llama-3.2-90b-vision`
+///   * Pixtral: `pixtral`
+///   * Phi-3.5/Phi-4 vision: `phi-3.5-vision`, `phi-4-multimodal`
+///   * MiniCPM-V: `minicpm-v`
+///   * InternVL: `internvl`
+///   * Generic suffixes operators commonly use: `-vision`, `-vl`,
+///     `-multimodal`, `-mm`
+///
+/// New families land here as they ship. The probe is heuristic by
+/// design — vLLM / llama.cpp's /v1/models response doesn't carry an
+/// explicit multimodal flag, so id-pattern matching is the most
+/// reliable signal available short of an actual image probe (which
+/// would cost a real inference round-trip).
+pub fn is_known_multimodal_model(model_id: &str) -> bool {
+    let id = model_id.to_lowercase();
+    const PATTERNS: &[&str] = &[
+        // Qwen
+        "qwen2-vl",
+        "qwen2.5-vl",
+        "qwen2_5-vl",
+        "qwen3-vl",
+        "qwen3.5-vl",
+        "qwen3_5-vl",
+        "qwen3.6",
+        "qwen3_6",
+        // LLaVA
+        "llava",
+        // Llama 3.2 vision
+        "llama-3.2-11b-vision",
+        "llama-3.2-90b-vision",
+        "llama-3-vision",
+        // Pixtral
+        "pixtral",
+        // Phi vision
+        "phi-3.5-vision",
+        "phi-3-vision",
+        "phi-4-multimodal",
+        // MiniCPM-V
+        "minicpm-v",
+        // InternVL
+        "internvl",
+        // Generic suffixes
+        "-vision",
+        "-multimodal",
+    ];
+    for p in PATTERNS {
+        if id.contains(p) {
+            return true;
+        }
+    }
+    // Cheaper standalone token matches that benefit from word-boundary
+    // checks to avoid false positives like "qwen2-7b" → matching "vl"
+    // anywhere. Use suffix/segment guards.
+    for tail in ["-vl", "_vl", "-mm"] {
+        if id.ends_with(tail)
+            || id.contains(&format!("{tail}-"))
+            || id.contains(&format!("{tail}_"))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Non-streaming response shape.
@@ -338,6 +505,35 @@ impl InferenceClient {
             InferenceError::Decode(format!(
                 "bad /v1/chat/completions response: {e} — body: {text}"
             ))
+        })
+    }
+
+    /// Fetch the model list from `GET /v1/models` on the configured
+    /// backend. Used by the SPA's multimodal-capability probe — the
+    /// model id loaded into vLLM / Ollama / llama.cpp drives whether
+    /// the chat composer surfaces an image-attach affordance.
+    ///
+    /// Returns the first model entry's id when present, alongside the
+    /// raw JSON so future probes (e.g. context length) can read it
+    /// without a second round-trip.
+    pub async fn list_models(&self) -> Result<ModelListResponse, InferenceError> {
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let mut r = self.http.get(&url);
+        if let Some(key) = &self.api_key {
+            r = r.bearer_auth(key);
+        }
+        let resp = r.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(InferenceError::BadStatus {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let text = resp.text().await?;
+        serde_json::from_str::<ModelListResponse>(&text).map_err(|e| {
+            InferenceError::Decode(format!("bad /v1/models response: {e} — body: {text}"))
         })
     }
 
@@ -837,9 +1033,99 @@ mod tests {
         let resp = client.chat_completions(&req).await.unwrap();
         assert_eq!(resp.id, "test-1");
         assert_eq!(
-            resp.choices[0].message.content.as_deref(),
-            Some("hello back")
+            resp.choices[0]
+                .message
+                .content
+                .as_ref()
+                .map(|c| c.as_text()),
+            Some("hello back".to_owned())
         );
         let _ = handle.await;
+    }
+
+    /// `MessageContent::Text` serialises as a plain string; the wire
+    /// is byte-identical to the pre-vision shape so every existing
+    /// backend keeps working.
+    #[test]
+    fn text_content_serialises_as_a_plain_string() {
+        let m = ChatMessage::user("hi");
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"content\":\"hi\""), "got {s}");
+        assert!(!s.contains("\"type\":\"text\""));
+    }
+
+    /// `MessageContent::Parts` serialises as OpenAI's vision content
+    /// array — `[{type:"text",text:"..."},{type:"image_url",image_url:{url:"..."}}]`.
+    /// This is what Qwen3-VL / Qwen3.6 / LLaVA / Pixtral expect.
+    #[test]
+    fn parts_content_serialises_as_openai_vision_array() {
+        let m = ChatMessage::user_with_images(
+            "describe this",
+            vec!["data:image/png;base64,iVBOR".to_owned()],
+        );
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"type\":\"text\""));
+        assert!(s.contains("\"type\":\"image_url\""));
+        assert!(s.contains("data:image/png;base64,iVBOR"));
+    }
+
+    #[test]
+    fn known_multimodal_models_match() {
+        for id in [
+            "Qwen/Qwen2.5-VL-7B-Instruct",
+            "Qwen/Qwen2-VL-72B-Instruct-AWQ",
+            "Qwen/Qwen3-VL-32B",
+            "Qwen3.6-27B-AWQ",
+            "liuhaotian/llava-v1.6-mistral-7b",
+            "meta-llama/Llama-3.2-11B-Vision-Instruct",
+            "mistralai/Pixtral-12B-2409",
+            "microsoft/Phi-3.5-vision-instruct",
+            "microsoft/Phi-4-Multimodal-Instruct",
+            "openbmb/MiniCPM-V-2_6",
+            "OpenGVLab/InternVL2-26B",
+        ] {
+            assert!(
+                is_known_multimodal_model(id),
+                "expected {id} to be classified multimodal"
+            );
+        }
+    }
+
+    #[test]
+    fn known_text_only_models_do_not_match() {
+        for id in [
+            "Qwen/Qwen3.5-27B-AWQ",
+            "QuantTrio/Qwen3.5-27B-AWQ",
+            "meta-llama/Llama-3.1-70B-Instruct",
+            "mistralai/Mistral-7B-Instruct-v0.3",
+            "google/gemma-2-27b-it",
+            "openai/gpt-oss-20b",
+        ] {
+            assert!(
+                !is_known_multimodal_model(id),
+                "did not expect {id} to be classified multimodal"
+            );
+        }
+    }
+
+    /// Round-trip: an inbound parts-array deserialises back into a
+    /// `Parts` variant (covers replay paths that feed assistant
+    /// messages back into the LLM).
+    #[test]
+    fn parts_content_round_trips_through_serde() {
+        let wire = serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type":"text","text":"hi"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,xyz"}},
+            ],
+        });
+        let m: ChatMessage = serde_json::from_value(wire).unwrap();
+        match m.content {
+            Some(MessageContent::Parts(parts)) => {
+                assert_eq!(parts.len(), 2);
+            }
+            other => panic!("expected Parts, got {other:?}"),
+        }
     }
 }

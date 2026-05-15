@@ -87,6 +87,13 @@ pub struct UserMessagePayload {
     /// per-message channel icon in the chat view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_origin: Option<String>,
+    /// 2026-05-15 — IDs into `state_attachments` for images the
+    /// operator/contact attached to this turn. Must match the
+    /// field name + shape on the server-side `UserMessagePayload`
+    /// in `crates/server/src/chats.rs` so a turn written by either
+    /// code path round-trips consistently when replayed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachment_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +211,46 @@ impl TurnExecutor {
         sender_principal_id: Option<String>,
         cfg: &TurnConfig,
     ) -> Result<TurnSummary, TurnError> {
+        // Backward-compatible call site: no attachments. Internally
+        // routes to `run_turn_with_attachments` with empty vecs.
+        self.run_turn_with_attachments(
+            db,
+            conversation_id,
+            user_text,
+            sender_principal_id,
+            cfg,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Vision-aware turn driver. Same shape as `run_turn` but the
+    /// caller can supply:
+    ///   * `attachment_ids` — id references into `state_attachments`
+    ///     stamped onto the `user_msg` event payload so subsequent
+    ///     history replays know this turn carried images.
+    ///   * `user_image_urls` — pre-encoded `data:<mime>;base64,...`
+    ///     URLs the caller built from those attachments. When
+    ///     non-empty, the trailing user message in the chat array
+    ///     gets replaced with an OpenAI vision content array
+    ///     (`ChatMessage::user_with_images`) so the inference
+    ///     backend sees the images.
+    ///
+    /// The two are passed separately so the executor doesn't need
+    /// access to `AttachmentStore` (it lives in execlaw-core, which
+    /// runner-local can't depend on by design — runners run in a
+    /// separate container with no DB).
+    pub async fn run_turn_with_attachments(
+        &self,
+        db: &Database,
+        conversation_id: &ConversationId,
+        user_text: &str,
+        sender_principal_id: Option<String>,
+        cfg: &TurnConfig,
+        attachment_ids: Vec<String>,
+        user_image_urls: Vec<String>,
+    ) -> Result<TurnSummary, TurnError> {
         // 1. Record the inbound user message as its own event so it's in
         //    the log before we ask the model anything. The log is keyed
         //    with the same HMAC as the server-side append path, so all
@@ -221,6 +268,7 @@ impl TurnExecutor {
                 text: user_text.to_owned(),
                 sender_principal_id: sender_principal_id.clone(),
                 channel_origin: cfg.inbound_channel_origin.clone(),
+                attachment_ids: attachment_ids.clone(),
             },
             sender_principal_id,
         )?;
@@ -230,6 +278,33 @@ impl TurnExecutor {
         let history = log.replay_since(conversation_id, EventSeq(0))?;
         let mut messages: Vec<ChatMessage> = vec![ChatMessage::system(&cfg.system_prompt)];
         messages.extend(hydrate_messages(&history));
+
+        // 2026-05-15 — when the caller supplied image data URLs for
+        // THIS turn, replace the trailing text-only user ChatMessage
+        // with an OpenAI vision content array so the inference
+        // backend sees the images. Mirrors the equivalent block in
+        // `chats.rs::run_real_turn`. Prior turns' images are not
+        // re-encoded here (the hydrate_messages path is text-only);
+        // multi-turn vision is a known follow-up.
+        if !user_image_urls.is_empty() {
+            // Pull the previously-pushed text-only user message
+            // (the current turn's content). Fall back to the raw
+            // `user_text` if the history projection somehow elided
+            // it (defensive — hydrate_messages always emits a
+            // ChatMessage for the user_msg we just appended).
+            let last_user_text = match messages.last() {
+                Some(m) if matches!(m.role, Role::User) => {
+                    let text = m.content.as_ref().map(|c| c.as_text()).unwrap_or_default();
+                    messages.pop();
+                    text
+                }
+                _ => user_text.to_owned(),
+            };
+            messages.push(ChatMessage::user_with_images(
+                last_user_text,
+                user_image_urls,
+            ));
+        }
 
         // 3. Tool-call loop.
         let mut pending: Vec<PendingEvent> = Vec::new();
@@ -294,8 +369,7 @@ impl TurnExecutor {
             let inference_messages_count = messages.len();
             let inference_tools_count = cfg.tools.len();
             let resp = self.inference.chat_completions(&req).await?;
-            let inference_elapsed_ms =
-                inference_started_at.elapsed().as_millis() as u64;
+            let inference_elapsed_ms = inference_started_at.elapsed().as_millis() as u64;
             let choice = match resp.choices.first() {
                 Some(c) => c.clone(),
                 None => {
@@ -330,7 +404,12 @@ impl TurnExecutor {
 
             // Append the assistant message to our working transcript for
             // any subsequent rounds.
-            let assistant_content = choice.message.content.clone().unwrap_or_default();
+            let assistant_content = choice
+                .message
+                .content
+                .as_ref()
+                .map(|c| c.as_text())
+                .unwrap_or_default();
             last_text = assistant_content.clone();
             messages.push(ChatMessage {
                 role: Role::Assistant,

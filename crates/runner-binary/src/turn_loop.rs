@@ -90,13 +90,25 @@ pub async fn run_turn(
         Some(delim) => format!("{delim}\n{}\n{delim}", req.user_text),
         None => req.user_text.clone(),
     };
-    messages.push(ChatMessage {
-        role: Role::User,
-        content: Some(user_text),
-        tool_call_id: None,
-        name: None,
-        tool_calls: vec![],
-    });
+    // 2026-05-15 — vision support. When the supervisor passed image
+    // data URLs in `user_image_urls`, build an OpenAI vision content
+    // array via `ChatMessage::user_with_images`. Otherwise fall
+    // through to the text-only path (the historical shape; every
+    // text-only turn keeps an identical wire encoding).
+    if req.user_image_urls.is_empty() {
+        messages.push(ChatMessage {
+            role: Role::User,
+            content: Some(execlaw_inference_api::MessageContent::Text(user_text)),
+            tool_call_id: None,
+            name: None,
+            tool_calls: vec![],
+        });
+    } else {
+        messages.push(ChatMessage::user_with_images(
+            user_text,
+            req.user_image_urls.iter().cloned(),
+        ));
+    }
 
     // Notify "thinking" so the SPA's typing indicator lights up.
     tx.send(RunnerToServer::Phase {
@@ -274,7 +286,9 @@ pub async fn run_turn(
                 content: if text_acc.is_empty() {
                     None
                 } else {
-                    Some(text_acc.clone())
+                    Some(execlaw_inference_api::MessageContent::Text(
+                        text_acc.clone(),
+                    ))
                 },
                 tool_call_id: None,
                 name: None,

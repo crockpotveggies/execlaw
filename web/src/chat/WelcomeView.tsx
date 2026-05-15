@@ -30,8 +30,10 @@ const SUGGESTIONS: ReadonlyArray<{ title: string; sub: string; prompt: string }>
     },
 ];
 
+import type { InlineAttachment } from "../api/endpoints";
+
 interface Props {
-    onSend: (text: string) => Promise<void> | void;
+    onSend: (text: string, attachments: InlineAttachment[]) => Promise<void> | void;
     /**
      * Phase 13.A — voice mic button surfaces here too so the
      * operator can start a voice conversation without typing
@@ -63,6 +65,18 @@ interface Props {
      */
     incognito?: boolean;
     onToggleIncognito?: () => void;
+    /**
+     * 2026-05-15 — gates the composer's image-attach affordance.
+     * Threaded down from the chat shell's `useBackendCapabilities`
+     * probe. When undefined (e.g. tests, settings shell), defaults
+     * to text-only.
+     */
+    multimodal?: boolean;
+    /**
+     * 2026-05-15 — target long-edge dimension for client-side
+     * downscale. See `Composer.recommendedImageEdge`.
+     */
+    recommendedImageEdge?: number;
 }
 
 export function WelcomeView({
@@ -73,6 +87,8 @@ export function WelcomeView({
     busy,
     incognito,
     onToggleIncognito,
+    multimodal,
+    recommendedImageEdge,
 }: Props) {
     const auth = useAuth();
     // Stable accessor — passing a fresh `() => auth.getAccessToken()`
@@ -141,6 +157,8 @@ export function WelcomeView({
                     voiceReadiness={voiceReadiness}
                     onStop={onStop}
                     busy={busy}
+                    multimodal={multimodal}
+                    recommendedImageEdge={recommendedImageEdge}
                 />
             </div>
 
@@ -155,7 +173,7 @@ export function WelcomeView({
                         type="button"
                         className="execlaw-welcome__suggestion"
                         data-testid="welcome-suggestion"
-                        onClick={() => void onSend(s.prompt)}
+                        onClick={() => void onSend(s.prompt, [])}
                     >
                         <span className="execlaw-welcome__suggestion-title">
                             {s.title}

@@ -189,6 +189,17 @@ export interface MessageView {
      * via Signal" / "the agent replied via Signal".
      */
     channel_origin?: "signal" | "email" | "voice" | "sms" | null;
+    /**
+     * 2026-05-15 — image attachments included on a user_msg via the
+     * composer's `+` menu. Each entry resolves to a download via
+     * `/api/attachments/<id>`. Empty/absent for every other kind.
+     */
+    attachments?: MessageAttachment[];
+}
+
+export interface MessageAttachment {
+    id: string;
+    mime: string;
 }
 
 export interface MessagesListResponse {
@@ -273,6 +284,19 @@ export interface SendMessageRequest {
     /// emitted as `T18:00:00Z` and surfaced 7 hours shifted in
     /// Google Calendar.
     timezone?: string;
+    /// 2026-05-15 — inline image attachments from the composer's
+    /// `+` menu. Each entry carries the bytes as a `data:` URL the
+    /// SPA built locally via `FileReader.readAsDataURL`. Server
+    /// decodes, content-addresses under `<data_dir>/blobs/`, and
+    /// stamps the resulting attachment ids onto the user_msg event
+    /// so subsequent history hydration can re-encode them as
+    /// OpenAI vision content parts when the backend is multimodal.
+    attachments?: InlineAttachment[];
+}
+
+export interface InlineAttachment {
+    mime: string;
+    data_url: string;
 }
 
 export interface SendMessageResponse {
@@ -926,6 +950,45 @@ export async function getBackendStatus(
 ): Promise<BackendStatusResponse> {
     return apiFetch<BackendStatusResponse>(
         `/api/admin/backends/${encodeURIComponent(purpose)}/status`,
+        {},
+        tokenAccessor,
+    );
+}
+
+/// 2026-05-15 — runtime capability probe for a backend purpose.
+/// The chat shell polls this on mount to decide whether to surface
+/// the composer's image-attach affordance. The server probes
+/// `GET /v1/models` on the resolved endpoint and applies a curated
+/// known-vision-model matcher (Qwen-VL / Qwen3.6 / LLaVA / Pixtral
+/// / etc). A probe that doesn't reach the backend falls through as
+/// `reachable: false, multimodal: false` so the SPA hides the
+/// affordance rather than offering an action it can't fulfil.
+export interface BackendCapabilitiesResponse {
+    purpose: BackendPurpose;
+    endpoint: string | null;
+    reachable: boolean;
+    model_id: string | null;
+    multimodal: boolean;
+    /**
+     * 2026-05-15 — SPA target for the long-edge dimension after
+     * client-side downscale (Canvas resize before base64 encode).
+     * Picked by the server from detected GPU VRAM:
+     *   * 24 GB-class card → 1024
+     *   * 32–64 GB → 1536
+     *   * 64 GB+ → 2048
+     * Non-multimodal backends always return 0 (composer hides the
+     * affordance and never resizes).
+     */
+    recommended_image_edge: number;
+    error: string;
+}
+
+export async function getBackendCapabilities(
+    purpose: BackendPurpose,
+    tokenAccessor: () => string | null,
+): Promise<BackendCapabilitiesResponse> {
+    return apiFetch<BackendCapabilitiesResponse>(
+        `/api/admin/backends/${encodeURIComponent(purpose)}/capabilities`,
         {},
         tokenAccessor,
     );

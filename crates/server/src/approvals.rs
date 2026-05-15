@@ -410,6 +410,15 @@ pub async fn respond_handler(
             &original_text,
             origin_channel.as_deref(),
             replay_group_ctx,
+            // Approval-replay paths don't carry attachments — the
+            // cold-contact's first message arrived before the
+            // trust upgrade, attachments (if any) weren't fetched
+            // back then, and re-fetching here would require
+            // re-running the plugin's `fetch_attachment` from a
+            // stored bridge_id that we don't currently persist.
+            // Future: stash the bridge_ids on the parked event so
+            // approval replay can re-hydrate images too.
+            Vec::new(),
         )
         .await
         {
@@ -595,6 +604,9 @@ async fn claim_as_me(
         &original_text,
         origin_channel.as_deref(),
         claim_group_ctx,
+        // claim_as_me replay path doesn't carry attachments — see
+        // the comment in the cold-contact branch above.
+        Vec::new(),
     )
     .await
     {

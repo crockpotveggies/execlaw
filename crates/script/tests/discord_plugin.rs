@@ -243,7 +243,9 @@ async fn decode_passes_attachments_with_cdn_url_as_bridge_id() {
     }"#;
     let r = invoke_str_str(&plugin, "_test_decode_message_create", raw, "").await;
     let r: serde_json::Value = serde_json::from_str(r.as_str().unwrap()).unwrap();
-    let atts = r["attachments"].as_array().expect("attachments must be array");
+    let atts = r["attachments"]
+        .as_array()
+        .expect("attachments must be array");
     assert_eq!(atts.len(), 1);
     assert_eq!(
         atts[0]["bridge_id"], "https://cdn.discordapp.com/attachments/555/att1/file.png",
@@ -302,13 +304,23 @@ async fn parse_timestamp_matches_known_epoch_ms() {
     //     system; pinned literally so the test is independent of
     //     any external date tool)
     let plugin = discord_plugin();
-    let r = invoke_str(&plugin, "_test_parse_timestamp", "2026-05-10T12:00:00.000000+00:00").await;
+    let r = invoke_str(
+        &plugin,
+        "_test_parse_timestamp",
+        "2026-05-10T12:00:00.000000+00:00",
+    )
+    .await;
     assert_eq!(r.as_i64(), Some(1778414400000));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parse_timestamp_carries_fractional_milliseconds() {
     let plugin = discord_plugin();
-    let r = invoke_str(&plugin, "_test_parse_timestamp", "2026-05-10T12:00:00.123000+00:00").await;
+    let r = invoke_str(
+        &plugin,
+        "_test_parse_timestamp",
+        "2026-05-10T12:00:00.123000+00:00",
+    )
+    .await;
     assert_eq!(r.as_i64(), Some(1778414400123));
 }

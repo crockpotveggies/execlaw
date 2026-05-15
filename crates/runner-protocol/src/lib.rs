@@ -170,6 +170,17 @@ pub struct TurnRequest {
     /// §7.4 spotlighting delimiter for wrapping untrusted-content
     /// user messages. None = spotlighting off for this turn.
     pub spotlight: Option<String>,
+    /// 2026-05-15 — image attachments on the just-arrived user turn,
+    /// encoded as `data:<mime>;base64,<bytes>` URLs by the supervisor.
+    /// When non-empty, the runner builds the final user message via
+    /// `ChatMessage::user_with_images(user_text, user_image_urls)`
+    /// instead of a plain-text `ChatMessage::user(user_text)` so the
+    /// inference backend receives an OpenAI vision content array.
+    /// Backward-compatible default: an older supervisor that doesn't
+    /// send the field deserialises as `Vec::new()` and the runner
+    /// uses the prior text-only path.
+    #[serde(default)]
+    pub user_image_urls: Vec<String>,
 }
 
 /// Server → runner reply to a `ToolCallRequest`.
@@ -315,7 +326,7 @@ mod tests {
             system_prompt: "you are execlaw".into(),
             history: vec![ChatMessage {
                 role: Role::User,
-                content: Some("prior".into()),
+                content: Some(execlaw_inference_api::MessageContent::Text("prior".into())),
                 tool_call_id: None,
                 name: None,
                 tool_calls: vec![],
@@ -327,6 +338,7 @@ mod tests {
             max_tokens: None,
             reasoning_enabled: false,
             spotlight: None,
+            user_image_urls: Vec::new(),
         };
         let s1 = serde_json::to_string(&req).unwrap();
         let back: TurnRequest = serde_json::from_str(&s1).unwrap();

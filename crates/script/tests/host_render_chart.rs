@@ -12,8 +12,8 @@
 
 use async_trait::async_trait;
 use execlaw_script::{
-    AttachmentBytes, CreatedArtifact, HostCapError, HostCapabilities, InboundMessage,
-    RouteOutcome, ScriptEngine, ScriptPlugin, WsFrameHandler, WsSubscriptionHandle,
+    AttachmentBytes, CreatedArtifact, HostCapError, HostCapabilities, InboundMessage, RouteOutcome,
+    ScriptEngine, ScriptPlugin, WsFrameHandler, WsSubscriptionHandle,
 };
 use rhai::Dynamic;
 use std::sync::{Arc, Mutex};
@@ -83,8 +83,8 @@ async fn renders_chart_to_svg_and_png_attachment() {
     });
     let factory = ScriptEngine::new();
     factory.set_host_capabilities(caps).ok();
-    let plugin = ScriptPlugin::from_source("test-plugin", SCRIPT, &factory)
-        .expect("script must parse");
+    let plugin =
+        ScriptPlugin::from_source("test-plugin", SCRIPT, &factory).expect("script must parse");
 
     // Build a simple 6-point line-chart spec in Rust, hand the JSON
     // string to the Rhai-side `render(...)` helper. We use Rust here
@@ -128,7 +128,11 @@ async fn renders_chart_to_svg_and_png_attachment() {
 
     assert_eq!(r["attachment_id"], "att-chart-1");
     let svg = r["svg"].as_str().expect("svg must be a string");
-    assert!(svg.starts_with("<svg"), "svg must start with <svg, got: {}", &svg[..40.min(svg.len())]);
+    assert!(
+        svg.starts_with("<svg"),
+        "svg must start with <svg, got: {}",
+        &svg[..40.min(svg.len())]
+    );
     assert!(svg.contains("Test temperature"), "svg must contain title");
     let data_url = r["png_data_url"]
         .as_str()
@@ -140,7 +144,11 @@ async fn renders_chart_to_svg_and_png_attachment() {
     );
 
     // Verify the host received real PNG bytes (not the SVG string).
-    let bytes = last_bytes.lock().unwrap().clone().expect("caps received bytes");
+    let bytes = last_bytes
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("caps received bytes");
     assert_eq!(&bytes[..4], &[0x89, 0x50, 0x4e, 0x47], "PNG magic header");
     assert_eq!(
         r["size_bytes"].as_i64().unwrap() as usize,
@@ -199,13 +207,19 @@ async fn clamps_oversize_dimensions() {
         .invoke_async(
             "render",
             vec![
-                Dynamic::from(rhai::ImmutableString::from(serde_json::to_string(&spec).unwrap())),
+                Dynamic::from(rhai::ImmutableString::from(
+                    serde_json::to_string(&spec).unwrap(),
+                )),
                 Dynamic::from(99_999_i64), // clamps to 2400
-                Dynamic::from(0_i64),       // clamps to default 400
+                Dynamic::from(0_i64),      // clamps to default 400
             ],
         )
         .await
         .expect("render should succeed");
-    assert_eq!(r["width"].as_i64().unwrap(), 2400, "width clamped to MAX_DIM");
+    assert_eq!(
+        r["width"].as_i64().unwrap(),
+        2400,
+        "width clamped to MAX_DIM"
+    );
     assert_eq!(r["height"].as_i64().unwrap(), 400, "height = default");
 }

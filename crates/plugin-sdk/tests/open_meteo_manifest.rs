@@ -15,10 +15,10 @@ fn open_meteo_manifest_parses_with_expected_tools() {
     path.pop(); // crates/
     path.pop(); // workspace root
     path.push("plugins/open-meteo/plugin.toml");
-    let source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("could not read {path:?}: {e}"));
-    let manifest: PluginManifest = toml::from_str(&source)
-        .unwrap_or_else(|e| panic!("plugin.toml must parse: {e}"));
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("could not read {path:?}: {e}"));
+    let manifest: PluginManifest =
+        toml::from_str(&source).unwrap_or_else(|e| panic!("plugin.toml must parse: {e}"));
 
     assert_eq!(manifest.plugin.id, "open-meteo");
     let tool_names: Vec<&str> = manifest.tools.iter().map(|t| t.name.as_str()).collect();

@@ -149,10 +149,7 @@ impl InferenceResolver {
         };
         match row {
             Some(r) => {
-                let endpoint = r
-                    .endpoint
-                    .clone()
-                    .filter(|s| !s.trim().is_empty());
+                let endpoint = r.endpoint.clone().filter(|s| !s.trim().is_empty());
                 let row_model = extract_model_arg(&r.model_spec_json);
                 let reasoning_enabled = r.reasoning_enabled;
                 match endpoint {
@@ -410,10 +407,7 @@ mod tests {
             super::extract_model_arg(&serde_json::json!({ "args": [] })),
             None
         );
-        assert_eq!(
-            super::extract_model_arg(&serde_json::json!({})),
-            None
-        );
+        assert_eq!(super::extract_model_arg(&serde_json::json!({})), None);
         // `--model=` with empty value → None, not Some("").
         assert_eq!(
             super::extract_model_arg(&serde_json::json!({
@@ -449,7 +443,10 @@ mod tests {
             .unwrap();
         let resolver = InferenceResolver::new(None);
         let got = resolver.resolve(&db, BackendPurpose::Standard).unwrap();
-        assert!(got.reasoning_enabled, "row reasoning_enabled = true must reach the resolved struct");
+        assert!(
+            got.reasoning_enabled,
+            "row reasoning_enabled = true must reach the resolved struct"
+        );
 
         // And toggle off: same flow, false comes through.
         store
@@ -468,7 +465,10 @@ mod tests {
             )
             .unwrap();
         let got = resolver.resolve(&db, BackendPurpose::Standard).unwrap();
-        assert!(!got.reasoning_enabled, "row reasoning_enabled = false must reach the resolved struct");
+        assert!(
+            !got.reasoning_enabled,
+            "row reasoning_enabled = false must reach the resolved struct"
+        );
     }
 
     #[test]

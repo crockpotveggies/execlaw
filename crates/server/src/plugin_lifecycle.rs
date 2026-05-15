@@ -74,8 +74,8 @@
 //! operator can spot a partial teardown and decide whether to retry,
 //! `docker rm` by hand, or accept the residue.
 
-use crate::state::AppState;
 use crate::sidecar_supervisor::SidecarRemovalReport;
+use crate::state::AppState;
 use execlaw_core::attachments::AttachmentStore;
 use execlaw_core::oauth::{OauthClientStore, OauthTokenStore};
 use execlaw_core::vault_row::VaultRowStore;

@@ -356,7 +356,9 @@ mod tests {
     #[test]
     fn load_max_history_tokens_reads_migrated_seed() {
         let db = Database::open(&crate::db::DbConfig::in_memory_unencrypted()).unwrap();
-        crate::migrations::MigrationRunner::new(&db).apply_all().unwrap();
+        crate::migrations::MigrationRunner::new(&db)
+            .apply_all()
+            .unwrap();
         let n = load_max_history_tokens(&db).unwrap();
         assert_eq!(n, DEFAULT_HISTORY_TOKENS);
     }
@@ -366,7 +368,9 @@ mod tests {
         // Operator hand-edits a tiny value — we clamp it up so the
         // prompt builder never silently obliterates the conversation.
         let db = Database::open(&crate::db::DbConfig::in_memory_unencrypted()).unwrap();
-        crate::migrations::MigrationRunner::new(&db).apply_all().unwrap();
+        crate::migrations::MigrationRunner::new(&db)
+            .apply_all()
+            .unwrap();
         db.with_conn(|c| {
             c.execute(
                 "UPDATE config_general SET max_history_tokens = 100 WHERE id = 1",
@@ -383,7 +387,9 @@ mod tests {
     fn load_max_history_tokens_honors_large_operator_override() {
         // Operator with a big-context model sets 40K — we honor it.
         let db = Database::open(&crate::db::DbConfig::in_memory_unencrypted()).unwrap();
-        crate::migrations::MigrationRunner::new(&db).apply_all().unwrap();
+        crate::migrations::MigrationRunner::new(&db)
+            .apply_all()
+            .unwrap();
         db.with_conn(|c| {
             c.execute(
                 "UPDATE config_general SET max_history_tokens = 40000 WHERE id = 1",

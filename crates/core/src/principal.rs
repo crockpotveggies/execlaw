@@ -789,11 +789,14 @@ mod tests {
     fn find_by_identifier_returns_known_principal_via_index() {
         let db = fresh_db();
         let store = PrincipalStore::new(&db);
-        let mut p = mk_principal("p-lookup", TrustLevel::KnownLimited {
-            resolvers: vec![],
-            allowed_topics: vec![],
-            allowed_tools: None,
-        });
+        let mut p = mk_principal(
+            "p-lookup",
+            TrustLevel::KnownLimited {
+                resolvers: vec![],
+                allowed_topics: vec![],
+                allowed_tools: None,
+            },
+        );
         p.identifiers = vec![Identifier {
             transport: "signal".into(),
             handle: "+13334445555".into(),
@@ -834,10 +837,13 @@ mod tests {
         // logic can pick the winner and clean up the loser.
         let db = fresh_db();
         let store = PrincipalStore::new(&db);
-        let mut stale = mk_principal("stale", TrustLevel::UnknownPending {
-            first_seen: 100,
-            notification_event_seq: None,
-        });
+        let mut stale = mk_principal(
+            "stale",
+            TrustLevel::UnknownPending {
+                first_seen: 100,
+                notification_event_seq: None,
+            },
+        );
         stale.identifiers = vec![Identifier {
             transport: "signal".into(),
             handle: "+14155551212".into(),

@@ -175,9 +175,7 @@ impl HostCapabilities for AppStateHostCapabilities {
                 let art = store
                     .get_artifact(attachment_id)
                     .map_err(|e| HostCapError::new(format!("artifact lookup: {e}")))?
-                    .ok_or_else(|| {
-                        HostCapError::new(format!("no attachment '{attachment_id}'"))
-                    })?;
+                    .ok_or_else(|| HostCapError::new(format!("no attachment '{attachment_id}'")))?;
                 (art.path, art.mime_type)
             }
         };

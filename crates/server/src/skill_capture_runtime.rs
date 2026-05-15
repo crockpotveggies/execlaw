@@ -37,10 +37,7 @@ pub struct InferenceSummarizer {
 }
 
 impl InferenceSummarizer {
-    pub fn new(
-        inference: Arc<crate::inference_resolver::InferenceResolver>,
-        db: Database,
-    ) -> Self {
+    pub fn new(inference: Arc<crate::inference_resolver::InferenceResolver>, db: Database) -> Self {
         Self { inference, db }
     }
 }

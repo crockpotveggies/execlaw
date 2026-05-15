@@ -10,8 +10,8 @@
 //! comfortable headroom for the open-meteo plugin's typical render
 //! cadence (a few charts per agent turn at most).
 
-use criterion::{criterion_group, criterion_main, Criterion};
-use execlaw_charting::{render_to_png, render_to_svg, ChartKind, ChartSpec, Point, Series};
+use criterion::{Criterion, criterion_group, criterion_main};
+use execlaw_charting::{ChartKind, ChartSpec, Point, Series, render_to_png, render_to_svg};
 
 fn week_hourly() -> ChartSpec {
     // 168 points = 7 days × 24 hours.

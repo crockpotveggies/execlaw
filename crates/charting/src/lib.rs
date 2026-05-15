@@ -229,7 +229,10 @@ fn series_color(index: usize, explicit: Option<[u8; 3]>) -> RGBColor {
     PALETTE[index % PALETTE.len()]
 }
 
-fn draw<DB>(spec: &ChartSpec, root: &DrawingArea<DB, plotters::coord::Shift>) -> Result<(), ChartError>
+fn draw<DB>(
+    spec: &ChartSpec,
+    root: &DrawingArea<DB, plotters::coord::Shift>,
+) -> Result<(), ChartError>
 where
     DB: DrawingBackend,
     DB::ErrorType: 'static,
@@ -287,13 +290,8 @@ where
         chart
             .draw_series(
                 AreaSeries::new(
-                    band_points
-                        .iter()
-                        .map(|(x, _l, h)| (*x, *h)),
-                    band_points
-                        .first()
-                        .map(|(_, l, _)| *l)
-                        .unwrap_or(y_lo),
+                    band_points.iter().map(|(x, _l, h)| (*x, *h)),
+                    band_points.first().map(|(_, l, _)| *l).unwrap_or(y_lo),
                     color,
                 )
                 .border_style(color),
@@ -321,7 +319,11 @@ where
             }
             ChartKind::Scatter => {
                 chart
-                    .draw_series(s.points.iter().map(|p| Circle::new((p.x, p.y), 3, color.filled())))
+                    .draw_series(
+                        s.points
+                            .iter()
+                            .map(|p| Circle::new((p.x, p.y), 3, color.filled())),
+                    )
                     .map_err(|e| ChartError::Render(format!("scatter '{}': {e}", s.name)))?
                     .label(&s.name)
                     .legend(move |(x, y)| Circle::new((x + 9, y), 3, color.filled()));
@@ -491,7 +493,11 @@ mod tests {
     #[test]
     fn renders_svg_with_root_element() {
         let svg = render_to_svg(&temp_chart(), 600, 400).unwrap();
-        assert!(svg.contains("<svg"), "expected <svg> root, got: {}", &svg[..80]);
+        assert!(
+            svg.contains("<svg"),
+            "expected <svg> root, got: {}",
+            &svg[..80]
+        );
         assert!(svg.contains("Temperature"), "title must appear in SVG");
     }
 
@@ -532,7 +538,10 @@ mod tests {
             time_axis: false,
             series: vec![Series {
                 name: "NaN".into(),
-                points: vec![Point { x: 0.0, y: f64::NAN }],
+                points: vec![Point {
+                    x: 0.0,
+                    y: f64::NAN,
+                }],
                 color: None,
             }],
             band: None,
@@ -633,16 +642,25 @@ mod tests {
             series: vec![Series {
                 name: "Mean".into(),
                 points: (0..24)
-                    .map(|i| Point { x: i as f64, y: 15.0 + (i as f64).sin() })
+                    .map(|i| Point {
+                        x: i as f64,
+                        y: 15.0 + (i as f64).sin(),
+                    })
                     .collect(),
                 color: None,
             }],
             band: Some(Band {
                 low: (0..24)
-                    .map(|i| Point { x: i as f64, y: 13.0 + (i as f64).sin() })
+                    .map(|i| Point {
+                        x: i as f64,
+                        y: 13.0 + (i as f64).sin(),
+                    })
                     .collect(),
                 high: (0..24)
-                    .map(|i| Point { x: i as f64, y: 17.0 + (i as f64).sin() })
+                    .map(|i| Point {
+                        x: i as f64,
+                        y: 17.0 + (i as f64).sin(),
+                    })
                     .collect(),
                 color: None,
             }),

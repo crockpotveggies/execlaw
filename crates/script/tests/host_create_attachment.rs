@@ -8,8 +8,8 @@
 
 use async_trait::async_trait;
 use execlaw_script::{
-    AttachmentBytes, CreatedArtifact, HostCapError, HostCapabilities, InboundMessage,
-    RouteOutcome, ScriptEngine, ScriptPlugin, WsFrameHandler, WsSubscriptionHandle,
+    AttachmentBytes, CreatedArtifact, HostCapError, HostCapabilities, InboundMessage, RouteOutcome,
+    ScriptEngine, ScriptPlugin, WsFrameHandler, WsSubscriptionHandle,
 };
 use rhai::Dynamic;
 use std::sync::{Arc, Mutex};
@@ -98,8 +98,7 @@ fn create_oversize(payload, mime, filename, ttl) {
 "#;
 
 fn load(engine: &ScriptEngine) -> ScriptPlugin {
-    ScriptPlugin::from_source("test-plugin", SCRIPT, engine)
-        .expect("test script must parse")
+    ScriptPlugin::from_source("test-plugin", SCRIPT, engine).expect("test script must parse")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -179,7 +178,10 @@ async fn oversize_payload_errors_before_touching_caps() {
         msg.contains("exceeds max"),
         "expected size-cap error, got: {msg}"
     );
-    assert!(log.lock().unwrap().is_empty(), "caps must not have been called");
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "caps must not have been called"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

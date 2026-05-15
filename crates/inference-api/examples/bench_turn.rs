@@ -36,9 +36,7 @@
 //! Released-binary required — debug builds add ~1-2s of overhead to
 //! every iteration that masks the signal we're hunting.
 
-use execlaw_inference_api::{
-    ChatMessage, ChatRequest, InferenceClient, ModelId, ToolDeclaration,
-};
+use execlaw_inference_api::{ChatMessage, ChatRequest, InferenceClient, ModelId, ToolDeclaration};
 use rusqlite::{Connection, OpenFlags};
 use std::time::{Duration, Instant};
 
@@ -47,8 +45,7 @@ const DEFAULT_URL: &str = "http://127.0.0.1:8101/v1";
 const DEFAULT_ITERS: usize = 3;
 const DEFAULT_MAX_TOKENS: u32 = 16;
 
-const SYSTEM_PROMPT_SHORT: &str =
-    "You are execlaw, the controller's local agent. Reply concisely.";
+const SYSTEM_PROMPT_SHORT: &str = "You are execlaw, the controller's local agent. Reply concisely.";
 
 /// Result of one inference call.
 #[derive(Debug, Clone)]
@@ -79,11 +76,7 @@ impl ScenarioReport {
     fn median_total_ms(&self) -> u64 {
         let mut v: Vec<u64> = self.samples.iter().map(|s| s.total_ms).collect();
         v.sort_unstable();
-        if v.is_empty() {
-            0
-        } else {
-            v[v.len() / 2]
-        }
+        if v.is_empty() { 0 } else { v[v.len() / 2] }
     }
     fn p95_total_ms(&self) -> u64 {
         let mut v: Vec<u64> = self.samples.iter().map(|s| s.total_ms).collect();
@@ -118,10 +111,8 @@ impl ScenarioReport {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let url = std::env::var("EXECLAW_INFERENCE_URL")
-        .unwrap_or_else(|_| DEFAULT_URL.into());
-    let model = std::env::var("EXECLAW_BENCH_MODEL")
-        .unwrap_or_else(|_| DEFAULT_MODEL.into());
+    let url = std::env::var("EXECLAW_INFERENCE_URL").unwrap_or_else(|_| DEFAULT_URL.into());
+    let model = std::env::var("EXECLAW_BENCH_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
     let iters = std::env::var("EXECLAW_BENCH_ITERS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -450,15 +441,15 @@ async fn run_one(
         let total_ms = started_at.elapsed().as_millis() as u64;
         let choice = resp.choices.first();
         let content = choice
-            .and_then(|c| c.message.content.as_deref())
-            .unwrap_or("");
+            .and_then(|c| c.message.content.as_ref().map(|mc| mc.as_text()))
+            .unwrap_or_default();
         let finish = choice.and_then(|c| c.finish_reason.clone());
         Ok(Sample {
             total_ms,
             prompt_tokens: resp.usage.as_ref().map(|u| u.prompt_tokens),
             completion_tokens: resp.usage.as_ref().map(|u| u.completion_tokens),
             finish_reason: finish,
-            content_preview: short(content, 80),
+            content_preview: short(&content, 80),
         })
     }
 }

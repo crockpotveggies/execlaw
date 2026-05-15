@@ -510,7 +510,10 @@ mod tests {
         // Ollama detection added in Phase 14.G — the wizard's
         // Apple-Silicon panel gates on this. Like docker, it's a
         // real shell-out so we only assert schema, not host state.
-        assert!(v["ollama"].is_object(), "preflight must carry an `ollama` object");
+        assert!(
+            v["ollama"].is_object(),
+            "preflight must carry an `ollama` object"
+        );
         assert!(v["ollama"]["available"].is_boolean());
         // `version` and `path` are nullable when the binary isn't
         // present (or `--version` failed) — the SPA renders the

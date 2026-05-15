@@ -31,8 +31,8 @@ fn open_meteo_plugin(base_rewrite: Option<(&str, &str)>) -> ScriptPlugin {
     path.pop(); // crates/
     path.pop(); // workspace root
     path.push("plugins/open-meteo/main.rhai");
-    let mut source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("could not read {path:?}: {e}"));
+    let mut source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("could not read {path:?}: {e}"));
     if let Some((from, to)) = base_rewrite {
         source = source.replace(from, to);
     }
@@ -59,7 +59,10 @@ async fn csv_joins_array_with_commas() {
         )
         .await
         .unwrap();
-    assert_eq!(r.as_str(), Some("temperature_2m,weather_code,wind_speed_10m"));
+    assert_eq!(
+        r.as_str(),
+        Some("temperature_2m,weather_code,wind_speed_10m")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -166,8 +169,10 @@ async fn chart_filename_slugifies_titles() {
     let s = r.as_str().unwrap();
     // Non-ASCII characters drop; runs of separators collapse to one dash.
     assert!(s.ends_with(".png"), "expected .png suffix, got: {s}");
-    assert!(s.starts_with("reykjav") || s.starts_with("7-day") || s.starts_with("day"),
-        "slugified prefix: {s}");
+    assert!(
+        s.starts_with("reykjav") || s.starts_with("7-day") || s.starts_with("day"),
+        "slugified prefix: {s}"
+    );
     assert!(!s.contains("—"), "non-ascii must be dropped: {s}");
     assert!(!s.contains("!"), "punctuation must be dropped: {s}");
 }
@@ -382,10 +387,7 @@ async fn forecast_tool_dispatches_to_mock_and_annotates_payload() {
         .to_string(),
     )]);
 
-    let plugin = open_meteo_plugin(Some((
-        "https://api.open-meteo.com",
-        mock.url(),
-    )));
+    let plugin = open_meteo_plugin(Some(("https://api.open-meteo.com", mock.url())));
     let r = plugin
         .invoke_async(
             "tool_call",
@@ -479,10 +481,7 @@ async fn geocode_tool_returns_summarized_results() {
         })
         .to_string(),
     )]);
-    let plugin = open_meteo_plugin(Some((
-        "https://geocoding-api.open-meteo.com",
-        mock.url(),
-    )));
+    let plugin = open_meteo_plugin(Some(("https://geocoding-api.open-meteo.com", mock.url())));
     let r = plugin
         .invoke_async(
             "tool_call",

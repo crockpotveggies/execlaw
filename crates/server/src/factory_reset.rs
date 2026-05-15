@@ -196,8 +196,8 @@ pub async fn factory_reset_handler(
     // Step 3 — rebuild the DB at the file level. After this returns
     // Ok, the row backing the caller's JWT is gone and the SPA
     // must redirect to /login.
-    let (tables_wiped, migrations_reapplied) =
-        wipe_and_remigrate(&state.db, &state.db_config).map_err(|e| ApiError {
+    let (tables_wiped, migrations_reapplied) = wipe_and_remigrate(&state.db, &state.db_config)
+        .map_err(|e| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "factory_reset_failed",
             message: e.to_string(),
@@ -373,9 +373,7 @@ fn wipe_and_remigrate(
     // bodies — restores singleton config rows, default personality,
     // search-provider seeds, etc.
     let applied = MigrationRunner::new(db).apply_all().map_err(|e| {
-        execlaw_core::DbError::Migration(format!(
-            "factory-reset: re-apply migrations failed: {e}"
-        ))
+        execlaw_core::DbError::Migration(format!("factory-reset: re-apply migrations failed: {e}"))
     })?;
 
     // Count the resulting tables for the response body. Cheap one-
@@ -669,11 +667,7 @@ mod tests {
                 .db
                 .with_conn(|c| {
                     let n: i64 = c
-                        .query_row(
-                            &format!("SELECT COUNT(*) FROM {table}"),
-                            [],
-                            |r| r.get(0),
-                        )
+                        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                         .map_err(|e| execlaw_core::DbError::Config(e.to_string()))?;
                     Ok(n)
                 })

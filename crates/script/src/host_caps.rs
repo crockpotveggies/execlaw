@@ -635,27 +635,16 @@ mod ws_set_keepalive_default_impl_tests {
         ) -> Result<WsSubscriptionHandle, HostCapError> {
             unreachable!("test stub")
         }
-        async fn route_inbound(
-            &self,
-            _: InboundMessage,
-        ) -> Result<RouteOutcome, HostCapError> {
+        async fn route_inbound(&self, _: InboundMessage) -> Result<RouteOutcome, HostCapError> {
             unreachable!("test stub")
         }
-        async fn get_attachment_bytes_b64(
-            &self,
-            _: &str,
-        ) -> Result<AttachmentBytes, HostCapError> {
+        async fn get_attachment_bytes_b64(&self, _: &str) -> Result<AttachmentBytes, HostCapError> {
             unreachable!("test stub")
         }
         async fn vault_get(&self, _: &str, _: &str) -> Result<Option<String>, HostCapError> {
             Ok(None)
         }
-        async fn vault_put(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<(), HostCapError> {
+        async fn vault_put(&self, _: &str, _: &str, _: &str) -> Result<(), HostCapError> {
             Ok(())
         }
         async fn vault_delete(&self, _: &str, _: &str) -> Result<bool, HostCapError> {
@@ -701,7 +690,10 @@ mod ws_set_keepalive_default_impl_tests {
             .expect("outbox closed");
         assert_eq!(f1, "tick");
         assert_eq!(f2, "tick");
-        assert!(handle.has_keepalive(), "handle should report keepalive installed");
+        assert!(
+            handle.has_keepalive(),
+            "handle should report keepalive installed"
+        );
         handle.close();
     }
 
@@ -746,7 +738,10 @@ mod ws_set_keepalive_default_impl_tests {
                 .await
                 .unwrap_or_else(|_| panic!("tick {i} timed out after replace"))
                 .expect("outbox closed");
-            assert_eq!(f, "B", "tick {i}: only B frames should arrive after replace");
+            assert_eq!(
+                f, "B",
+                "tick {i}: only B frames should arrive after replace"
+            );
         }
         handle.close();
     }

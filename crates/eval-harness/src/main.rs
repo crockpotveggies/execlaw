@@ -177,7 +177,7 @@ async fn run_one(
     let text = resp
         .choices
         .first()
-        .and_then(|c| c.message.content.clone())
+        .and_then(|c| c.message.content.as_ref().map(|mc| mc.as_text()))
         .unwrap_or_default();
     Ok(text)
 }

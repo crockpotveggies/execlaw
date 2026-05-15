@@ -14,8 +14,16 @@
 // the controller can see at a glance which transport delivered the
 // message.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+    useCallback,
+    useContext,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+} from "react";
 import type { MessageView } from "../api/endpoints";
+import { AuthContext } from "../auth/AuthContext";
 import { getCardRenderer } from "../cards/CardRenderer";
 import { useCardsForConversation } from "../cards/cardStore";
 import type { Card } from "../cards/types";
@@ -233,6 +241,14 @@ export function MessageStream({ conversationId }: Props) {
 }
 
 function MessageBubble({ message }: { message: MessageView }) {
+    // 2026-05-15 — read AuthContext directly (not via the `useAuth()`
+    // wrapper that throws when there's no provider). MessageStream
+    // unit tests render the component in isolation without an
+    // `<AuthProvider>`; gracefully degrading to `null` keeps those
+    // tests passing — the only consequence is that the access-token
+    // query param on `<img>` attachment URLs is absent, which would
+    // 401 against the live server but doesn't affect those tests.
+    const auth = useContext(AuthContext);
     const role = roleFor(message);
     const text = message.text ?? renderToolFallback(message);
     const channelOrigin = readChannelOrigin(message);
@@ -275,6 +291,17 @@ function MessageBubble({ message }: { message: MessageView }) {
     const isUserMessage = message.kind === "user_msg";
     const showMeta = !isUserMessage || channelOrigin !== "web";
 
+    // 2026-05-15 — image attachments. The server emits these on
+    // user_msg events the operator submitted through the composer's
+    // `+` menu. Each entry has an `id` and `mime`; the id is either:
+    //   * a persisted attachment id (server-minted) → served via
+    //     `/api/attachments/<id>` and gated by the auth cookie /
+    //     bearer the SPA already holds, OR
+    //   * a `data:` URL when the entry is still optimistic (the SPA
+    //     just sent it; canonical id arrives once listMessages
+    //     refetches). The `<img>` accepts both verbatim.
+    const attachments = message.attachments ?? [];
+
     return (
         <div
             className={"execlaw-msg" + (isUserMessage ? " is-user" : "")}
@@ -296,6 +323,40 @@ function MessageBubble({ message }: { message: MessageView }) {
                     (ChatComponentRenderer ? " is-rich-component" : "")
                 }
             >
+                {attachments.length > 0 && (
+                    <div
+                        className="execlaw-msg__attachments"
+                        data-testid="message-attachments"
+                    >
+                        {attachments.map((a) => {
+                            // 2026-05-15 — `<img>` tags can't attach
+                            // the SPA's Authorization: Bearer header,
+                            // so a plain `/api/attachments/{id}` src
+                            // gets blocked by `AuthedUser` and the
+                            // browser falls back to the alt text.
+                            // The auth extractor supports a
+                            // `?access_token=<jwt>` query fallback
+                            // specifically for browser-direct GETs;
+                            // we use it here for persisted ids.
+                            // Optimistic data URLs (in-flight upload)
+                            // are still rendered verbatim.
+                            const src = a.id.startsWith("data:")
+                                ? a.id
+                                : buildAttachmentSrc(
+                                      a.id,
+                                      auth?.getAccessToken() ?? null,
+                                  );
+                            return (
+                                <img
+                                    key={a.id}
+                                    src={src}
+                                    alt="attached image"
+                                    className="execlaw-msg__attachment-image"
+                                />
+                            );
+                        })}
+                    </div>
+                )}
                 {/* Tool messages are JSON / monospace dumps by default —
                     render as raw text. Exception: when the payload
                     carries a `chat_component_kind` marker AND a
@@ -303,13 +364,14 @@ function MessageBubble({ message }: { message: MessageView }) {
                     weather / chart components), dispatch to the
                     component instead. Everything else (agent + user)
                     goes through the markdown pipeline. */}
-                {ChatComponentRenderer && chatComponent ? (
-                    <ChatComponentRenderer data={chatComponent.data} />
-                ) : isToolKind(message.kind) ? (
-                    text
-                ) : (
-                    <MarkdownContent text={text} />
-                )}
+                {text.length > 0 &&
+                    (ChatComponentRenderer && chatComponent ? (
+                        <ChatComponentRenderer data={chatComponent.data} />
+                    ) : isToolKind(message.kind) ? (
+                        text
+                    ) : (
+                        <MarkdownContent text={text} />
+                    ))}
             </div>
         </div>
     );
@@ -362,4 +424,17 @@ function isToolKind(kind: string): boolean {
 
 function renderToolFallback(m: MessageView): string {
     return `[${m.kind} (no text payload)]`;
+}
+
+/// Build an `/api/attachments/<id>` URL with the access token in the
+/// query string. The auth extractor (`AuthedUser`) accepts
+/// `?access_token=<jwt>` as a fallback for browser-direct GETs like
+/// `<img>` tags, which can't carry an Authorization: Bearer header.
+/// A null token (e.g. just-rotated, render before refresh lands)
+/// falls back to the bare URL — the request will 401, the `<img>`
+/// shows alt text briefly, and the next render after token rotation
+/// re-renders with the new token.
+function buildAttachmentSrc(id: string, token: string | null): string {
+    const path = `/api/attachments/${encodeURIComponent(id)}`;
+    return token ? `${path}?access_token=${encodeURIComponent(token)}` : path;
 }

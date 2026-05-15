@@ -920,10 +920,7 @@ impl PluginHost {
                     // reinstall: <reason>" badge instead of making
                     // the plugin disappear from the install list.
                     warn!(plugin_id = %row.plugin_id, error = %e, "unparseable manifest on hydrate; quarantining (state_plugins row preserved)");
-                    self.quarantine_plugin(
-                        &row.plugin_id,
-                        &format!("manifest unparseable: {e}"),
-                    );
+                    self.quarantine_plugin(&row.plugin_id, &format!("manifest unparseable: {e}"));
                     continue;
                 }
             };
@@ -2545,8 +2542,7 @@ latency = "low"
 
         // Plugin A defines `on_disable` — fire_on_disable_for_all
         // must invoke it.
-        let (_keep_a, stage_a) =
-            stage_script_plugin_with_on_disable("plugin-with-hook", "0.1.0");
+        let (_keep_a, stage_a) = stage_script_plugin_with_on_disable("plugin-with-hook", "0.1.0");
         host.install(&stage_a).await.unwrap();
         // Plugin B does NOT define `on_disable` — the call must
         // silently succeed (`MissingFunction` collapse). Counted
@@ -2560,7 +2556,10 @@ latency = "low"
         // ran, one because MissingFunction collapsed). The return
         // value is "no hook errored," not "every plugin defined
         // a hook" — that's the contract.
-        assert_eq!(fired, 2, "both plugins must complete on_disable without error");
+        assert_eq!(
+            fired, 2,
+            "both plugins must complete on_disable without error"
+        );
     }
 
     /// Regression: PluginHost::disable() must fire on_disable
@@ -2664,8 +2663,14 @@ latency = "low"
         // the quarantine branch we're testing.
         let (_tmp, stage) = stage_script_plugin_with_on_disable("zombie-test", "0.1.0");
         host.install(&stage).await.unwrap();
-        let installed = host.get_row("zombie-test").unwrap().expect("install must succeed");
-        assert_eq!(installed.health_status, "healthy", "fresh install must be healthy");
+        let installed = host
+            .get_row("zombie-test")
+            .unwrap()
+            .expect("install must succeed");
+        assert_eq!(
+            installed.health_status, "healthy",
+            "fresh install must be healthy"
+        );
 
         // Simulate the stage-dir loss (factory-reset orphan sweep,
         // manual rm, Windows file-handle race during cargo restart, etc.).
@@ -2689,7 +2694,9 @@ latency = "low"
             row.health_status, "quarantined",
             "missing stage dir must mark the row quarantined, not healthy",
         );
-        let msg = row.health_message.expect("quarantined row must carry a reason");
+        let msg = row
+            .health_message
+            .expect("quarantined row must carry a reason");
         assert!(
             msg.contains("script load failed"),
             "health_message must explain the failure (got: {msg})",
@@ -2750,7 +2757,9 @@ latency = "low"
             .unwrap()
             .expect("hydrate must NOT delete the row");
         assert_eq!(row.health_status, "quarantined");
-        let msg = row.health_message.expect("quarantined row must carry a reason");
+        let msg = row
+            .health_message
+            .expect("quarantined row must carry a reason");
         assert!(
             msg.contains("manifest unparseable"),
             "health_message must explain the failure (got: {msg})",
@@ -2798,8 +2807,14 @@ latency = "low"
             row.health_status, "healthy",
             "reinstall must clear the quarantine — that's the recovery path",
         );
-        assert!(row.health_message.is_none(), "healthy row must have no error message");
-        assert!(row.quarantined_at.is_none(), "healthy row must have no quarantined_at");
+        assert!(
+            row.health_message.is_none(),
+            "healthy row must have no error message"
+        );
+        assert!(
+            row.quarantined_at.is_none(),
+            "healthy row must have no quarantined_at"
+        );
     }
 
     // === trust_floor enforcement ===

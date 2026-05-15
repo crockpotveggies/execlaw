@@ -715,7 +715,23 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/logout/all", post(logout_all))
         .route(
             "/api/chats/{conversation_id}/messages",
-            post(crate::chats::send_message).get(crate::chats::list_messages),
+            // 2026-05-15 — raise the per-request body cap on this
+            // route from axum's default 2 MiB to 32 MiB. The
+            // composer's `+` attach-photo path inlines base64 data
+            // URLs in `SendMessageRequest.attachments`; a single
+            // 8 MiB JPEG base64-encodes to ~10.7 MiB, and the
+            // operator may attach several at once. 32 MiB gives
+            // headroom for 2-3 typical photos. Per-attachment size
+            // is still enforced inside the handler at
+            // MAX_ATTACHMENT_BYTES (20 MiB) so a single malicious
+            // blob can't dominate the body budget. The limit is
+            // attached to the MethodRouter so it scopes to THIS
+            // route only — adding it via `.layer()` on the outer
+            // Router would apply to every route registered before
+            // the call, which is not what we want.
+            post(crate::chats::send_message)
+                .get(crate::chats::list_messages)
+                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .route(
             "/api/chats/{conversation_id}/cards",

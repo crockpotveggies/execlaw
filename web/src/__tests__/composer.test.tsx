@@ -15,7 +15,7 @@ describe("Composer", () => {
         const input = screen.getByTestId("composer-input") as HTMLTextAreaElement;
         fireEvent.change(input, { target: { value: "  hello  " } });
         fireEvent.submit(input.closest("form")!);
-        expect(onSend).toHaveBeenCalledWith("hello");
+        expect(onSend).toHaveBeenCalledWith("hello", []);
     });
 
     it("Enter submits, Shift+Enter does not", () => {
@@ -26,7 +26,7 @@ describe("Composer", () => {
         fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
         expect(onSend).not.toHaveBeenCalled();
         fireEvent.keyDown(input, { key: "Enter", shiftKey: false });
-        expect(onSend).toHaveBeenCalledWith("msg");
+        expect(onSend).toHaveBeenCalledWith("msg", []);
     });
 
     it("respects an external `disabled` prop", () => {
@@ -62,7 +62,7 @@ describe("Composer", () => {
 
         fireEvent.change(input, { target: { value: "first" } });
         fireEvent.keyDown(input, { key: "Enter", shiftKey: false });
-        expect(onSend).toHaveBeenCalledWith("first");
+        expect(onSend).toHaveBeenCalledWith("first", []);
 
         // Mid-await: textarea should still be focused AND editable
         // so the operator can compose the next thought while the
