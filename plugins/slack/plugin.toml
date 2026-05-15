@@ -6,7 +6,12 @@ name = "Slack"
 #        (or a replacement) workspace no longer leaves the plugin
 #        stuck "configured but not listening" until the operator
 #        disables + re-enables.
-version = "0.3.0"
+# 0.3.1: inline SLACK_API at every call site — Rhai's top-level
+#        `const` declarations aren't visible inside `fn` bodies,
+#        so the previous `SLACK_API + "/chat.postMessage"` form
+#        threw "Variable not found: SLACK_API" at runtime. Same
+#        gotcha the google-* plugins document.
+version = "0.3.1"
 description = "Slack transport via Socket Mode (no public URL needed). Multi-workspace from day 1: each workspace contributes its own bot+app token pair and runs its own Socket Mode connection. Mirrors the Signal/WhatsApp tool surface but is sidecar-free — pure-Rhai over the host's http_post + ws_subscribe + ws_send bindings."
 author = "execlaw"
 license = "Apache-2.0"

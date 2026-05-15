@@ -35,8 +35,15 @@
 //     thread_ts so threaded replies stay in-thread without
 //     touching the host's InboundMessage struct.
 
-const SLACK_API = "https://slack.com/api";
-const MAX_SLACK_MESSAGE_CHARS = 3500;
+// Note on Rhai scope: top-level `const` declarations aren't visible
+// inside `fn` bodies. The Slack REST base URL and message size cap
+// are therefore inlined as string/int literals at every call site
+// below — same gotcha the google-* plugins document. If you change
+// these, grep "slack.com/api" and "3500" together. The references
+// here exist as documentation only.
+//
+//   SLACK_API               = "https://slack.com/api"
+//   MAX_SLACK_MESSAGE_CHARS = 3500
 
 // =====================================================================
 // LIFECYCLE
@@ -304,7 +311,7 @@ fn send_message_impl(args) {
     for chunk in chunks {
         let body = #{ "channel": channel, "text": chunk };
         if thread_ts != () && thread_ts != "" { body.thread_ts = thread_ts; }
-        last = http_post(SLACK_API + "/chat.postMessage", body, bot_token);
+        last = http_post("https://slack.com/api/chat.postMessage", body, bot_token);
         if last == () || last.ok != true {
             throw "chat.postMessage failed: " + last;
         }
@@ -327,7 +334,7 @@ fn list_channels_impl() {
         let body = #{ "types": "public_channel,private_channel,mpim,im", "limit": 200 };
         let resp = ();
         try {
-            resp = http_post(SLACK_API + "/conversations.list", body, ws.bot_token);
+            resp = http_post("https://slack.com/api/conversations.list", body, ws.bot_token);
         } catch (e) {
             log_warn("slack: conversations.list failed for team " + ws.team_id + ": " + e);
             continue;
@@ -399,7 +406,7 @@ fn send_with_attachments_impl(args) {
                 + a.data_url.sub_string(0, 80) + "…",
         };
         if thread_ts != () && thread_ts != "" { body.thread_ts = thread_ts; }
-        http_post(SLACK_API + "/chat.postMessage", body, bot_token);
+        http_post("https://slack.com/api/chat.postMessage", body, bot_token);
         i += 1;
     }
     "ok"
@@ -850,7 +857,7 @@ fn admin_test_message(req) {
     if bot_token == () || bot_token == "" {
         throw "no bot_token for team '" + team_id + "'";
     }
-    let resp = http_post(SLACK_API + "/chat.postMessage", #{
+    let resp = http_post("https://slack.com/api/chat.postMessage", #{
         "channel": strip_slack_prefix(channel),
         "text": "execlaw test message — Slack plugin v0.1.0 wiring confirmed.",
     }, bot_token);
