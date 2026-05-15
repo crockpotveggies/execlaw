@@ -21,6 +21,8 @@ hardware.
 | [`docs/agent-model.md`](docs/agent-model.md) | TurnExecutor, memory layers, reflection loop, planner/executor split — the **how** of one turn. |
 | [`docs/plugins.md`](docs/plugins.md) | Plugin manifest schema, runtime tiers, sidecar model, Rhai primitives, and a step-by-step guide for writing a custom plugin. |
 | [`docs/setup-walkthroughs.md`](docs/setup-walkthroughs.md) | Operator-facing pairing flows for Signal QR, WhatsApp wuzapi, Slack OAuth, Google OAuth + API-key. |
+| [`docs/setup-mac.md`](docs/setup-mac.md) | Apple Silicon first-run notes — native Ollama subprocess, model sizing, brand indicator. |
+| [`desktop-macos/README.md`](desktop-macos/README.md) | macOS `.app` bundle internals — Tauri 2, SMAppService, build script. |
 | [`docs/security.md`](docs/security.md) | Disclosure path, threat model, cryptography, trust assumptions, known limitations, hardening checklist. |
 | [`docs/sidecar-supervisor-design.md`](docs/sidecar-supervisor-design.md) | Supervised-container layer plugins compose against. |
 | [`docs/runner-design.md`](docs/runner-design.md) | Per-conversation runner container model. |
@@ -35,24 +37,35 @@ hardware.
 - **Trust ladder + Rule of Two**: `Controller / Delegated / KnownTrusted / KnownLimited / UnknownPending / Blocked` with cold-contact escalation, signed approval-token JWTs, sideband HITL.
 - **HMAC-chained event log**: every committed row is tamper-evident; replay rebuilds state deterministically.
 - **Outbox + idempotency**: framework-minted `(conversation_id, turn_seq, tool_call_ordinal)` keys, retries with backoff, dead-letter queue.
-- **Plugin framework** (10 in-tree plugins): script-tier (Rhai) + subprocess-tier (JSON-RPC), full manifest schema (tools / transports / identity providers / OAuth / sidecars / admin routes / webhook routes / UI panels / skills).
-- **Shipped transports**: Signal (signal-cli sidecar), WhatsApp (wuzapi sidecar), Slack (multi-workspace OAuth), SMS (Android-gateway WebSocket).
-- **Shipped HTTP integrations**: Google Calendar, Google Contacts (also identity provider), Google Places, Pushover.
+- **Plugin framework** (12 in-tree plugins — see [Plugins shipped](#plugins-shipped)): script-tier (Rhai) + subprocess-tier (JSON-RPC), full manifest schema (tools / transports / identity providers / OAuth / sidecars / admin routes / webhook routes / UI panels / skills).
+- **Five shipped transports**: Signal (signal-cli sidecar), WhatsApp (wuzapi sidecar), Slack (multi-workspace Socket Mode OAuth), Discord (multi-guild Gateway WebSocket), SMS (Android-gateway WebSocket).
+- **HTTP integrations**: Google Apps (Gmail/Calendar/Contacts/Tasks/Drive in one OAuth), Google Places, Open-Meteo (key-less weather), Yahoo Finance (market data), Pushover.
 - **Research subsystem**: deep-research plan/gather/synthesize pipeline with retention and per-phase event flow.
 - **SPA**: chat-first sidebar, pinned Control thread (every controller-channel message collapses here), token streaming, approval queue, per-plugin admin panels, settings.
+- **Native macOS app** (Apple Silicon): menu bar `.app` bundle, SMAppService-managed LaunchAgent, drag-to-Trash uninstall — see [Install on macOS](#install-on-macos-apple-silicon--menu-bar-app).
 
 See [`docs/architecture.md` §18](docs/architecture.md) for the full milestone breakdown.
 
-## Screenshots
+## Plugins shipped
 
-Drop UI screenshots into [`docs/screenshots/`](docs/screenshots/) and reference them inline below as the SPA evolves.
+All 12 in-tree plugins ship as ZIPs under [`dist/`](dist/) and install via the SPA's Settings → Plugins page (or `POST /api/admin/plugins/install`). Source under [`plugins/`](plugins/).
 
-```markdown
-![Control thread](docs/screenshots/control-thread.png)
-![Plugin install flow](docs/screenshots/plugin-install.png)
-```
+| Plugin | Version | Tier | Kind | What it does |
+|---|---|---|---|---|
+| [`signal`](plugins/signal/) | 0.5.0 | script | transport | Signal Messenger via a supervised [`signal-cli`](https://github.com/AsamK/signal-cli) sidecar. Inbound consumer + outbound + group ops + QR/number pairing. |
+| [`whatsapp`](plugins/whatsapp/) | 0.2.0 | script | transport | WhatsApp Multi-Device via a supervised [wuzapi](https://github.com/asternic/wuzapi) (whatsmeow-backed) sidecar. QR pairing, group ops, attachments, read receipts. |
+| [`slack`](plugins/slack/) | 0.3.2 | script | transport | Multi-workspace Slack via Socket Mode (no public URL). Sidecar-free — pure-Rhai over `http_post` + `ws_subscribe` + `ws_send`. |
+| [`discord`](plugins/discord/) | 0.2.0 | script | transport | Discord bot via the Gateway WebSocket. Multi-guild from one bot token, sidecar-free, gateway heartbeats over `ws_set_keepalive`. |
+| [`sms-socket`](plugins/sms-socket/) | 0.2.0 | script | transport | SMS / MMS via the [Android SMS Socket app](https://github.com/crockpotveggies/sms-socket-app) — WebSocket to the operator's phone on LAN. |
+| [`google-apps`](plugins/google-apps/) | 0.3.0 | script | integration + identity | Gmail + Calendar + Contacts + Tasks + Drive in one OAuth grant. Per-module toggle. Identity provider for email/phone via the People API. |
+| [`google-places`](plugins/google-places/) | 0.2.0 | script | integration | Google Places (New) API — text search, nearby search, place details. API-key only, no OAuth. |
+| [`open-meteo`](plugins/open-meteo/) | 0.4.0 | script | integration | Key-less weather, marine, air-quality, seasonal, ensemble, flood, climate, geocoding, elevation via the public [Open-Meteo](https://open-meteo.com/) APIs. |
+| [`finance-yahoo`](plugins/finance-yahoo/) | 0.1.0 | script | integration | Real-time + historical market data via Yahoo Finance's public quote / chart endpoints. No API key. |
+| [`pushover`](plugins/pushover/) | 0.2.0 | script | notifier | One-way [Pushover](https://pushover.net/) push notifications to the operator's phone. |
+| [`identity-local-address-book`](plugins/identity-local-address-book/) | 0.1.0 | subprocess | identity | Local JSON contact list at `~/.execlaw/contacts.json` — auto-trusts saved contacts as `KnownTrusted`. |
+| [`hello`](plugins/hello/) | 0.1.0 | subprocess | reference | Echo tool exercising the subprocess JSON-RPC tier. Template for new plugin authors. |
 
-`docs/screenshots/.gitkeep` keeps the directory tracked even when empty. PNG / SVG / WebP all work; keep them under ~500 KB each. The doc's existing inline examples cite `docs/screenshots/*` paths, so new shots only need to drop in.
+Tools, host-side built-ins, and the manifest schema are documented in [`docs/plugins.md`](docs/plugins.md). Chart rendering (`chart.render`) is a host-side built-in as of 2026-05-15 — it was previously inside `open-meteo`.
 
 ---
 
@@ -65,16 +78,14 @@ floor is set by the LLM you choose to run, not by execlaw itself.
 
 ### Operating system
 
-| Platform | Status | Service backend |
-|---|---|---|
-| Linux x86_64 (Ubuntu 22.04+, Debian 12+, Fedora 39+, Arch, …) | Supported | systemd |
-| macOS x86_64 (Intel) | Supported | launchd |
-| macOS arm64 (Apple Silicon, M1+) | Supported | launchd |
-| Windows 10 / 11 (x86_64, MSVC toolchain) | Supported | Service Control Manager |
+| Platform | Status | Recommended install | Service backend |
+|---|---|---|---|
+| Linux x86_64 (Ubuntu 22.04+, Debian 12+, Fedora 39+, Arch, …) | Supported | `execlaw install` (CLI) | systemd |
+| macOS arm64 (Apple Silicon, M1+) | Supported | **`execlaw.app` menu bar bundle** | launchd via SMAppService |
+| macOS x86_64 (Intel) | Supported | `execlaw install` (CLI) | launchd |
+| Windows 10 / 11 (x86_64, MSVC toolchain) | Supported | `execlaw install` (CLI) | Service Control Manager |
 
-Service registration is handled by the
-[`service-manager`](https://crates.io/crates/service-manager) crate —
-`execlaw install` picks the right backend per platform.
+The CLI path uses the [`service-manager`](https://crates.io/crates/service-manager) crate. On Apple Silicon the recommended path is the [menu bar `.app`](#install-on-macos-apple-silicon--menu-bar-app), which registers the LaunchAgent via Apple's `SMAppService` API so dragging the app to Trash automatically cleans up the service. The CLI install still works for headless Macs.
 
 ### GPU / inference acceleration
 
@@ -119,6 +130,12 @@ can pin each backend per-card via Settings → Runners.
   Docker the agent loop runs text-only with the runner in-process;
   sidecars and managed inference are unavailable** — usable for plain
   chat but not for the bridged-transport plugins.
+  *Apple Silicon exception:* Docker Desktop on a Mac runs Linux in a
+  microVM with no Metal access, so containerised inference on M-series
+  GPUs falls back to CPU and is unusable. execlaw spawns **Ollama as
+  a native subprocess** on Apple Silicon instead — see
+  [`docs/setup-mac.md`](docs/setup-mac.md). Docker is still needed for
+  the bridged-transport sidecars (signal-cli, wuzapi).
 - **An NVIDIA or Intel GPU driver stack** matching the inference path
   you choose — CUDA 12+ runtime for NVIDIA, the OpenVINO drivers for
   Intel. Both are normally installed alongside the GPU; `execlaw doctor`
@@ -355,30 +372,38 @@ warm dev box). If `cargo-watch` rebuilds start failing with
 
 | Path | Purpose |
 |---|---|
-| `crates/core/` | Event log, FSM, migrations (35+ incremental), SQLCipher-encrypted storage, principal store, memory lifecycle. |
+| `crates/core/` | Event log, FSM, migrations (flattened baseline + incremental), SQLCipher-encrypted storage, principal store, memory lifecycle. |
 | `crates/session/` | Per-conversation pipeline composition (text vs voice). |
 | `crates/inference-api/` | OpenAI-compatible LLM client. **No cloud SDKs.** |
+| `crates/model-adapter/` | Provider-specific prompt + tool-call shape adapters (Qwen, Llama, OpenAI-compatible variants). |
 | `crates/runner-local/` | TurnExecutor — full tool-loop turn path. |
+| `crates/runner-protocol/` | Wire types for the per-conversation runner-container RPC. |
+| `crates/runner-binary/` | Static-musl `execlaw-runner` binary baked into `Dockerfile.runner`. |
 | `crates/voice-pipeline/` | STT → LLM → TTS two-lane Tokio graph. |
 | `crates/plugin-sdk/` | `plugin.toml` manifest parser + ZIP staging. |
-| `crates/plugin-host/` | Plugin registry + lifecycle (install / enable / disable / hydrate). |
+| `crates/plugin-host/` | Plugin registry + lifecycle (install / enable / disable / hydrate / purge). |
 | `crates/script/` | Embedded Rhai engine + primitive bindings (HTTP, sidecar, vault, OAuth, WS, routing, JSON, time). |
+| `crates/skills/` | Skills runtime (capture, retrieve, surface in prompt). |
+| `crates/charting/` | Server-side chart rendering for the `chart.render` host built-in. |
 | `crates/container-manager/` | bollard client + tiered hardware detection. |
 | `crates/policy/` | Rule of Two, capability tokens, input guards, spotlighting. |
 | `crates/vault/` | OS-keyring master key + Argon2id admin password. |
 | `crates/transport-api/` | Trait a transport plugin implements. |
 | `crates/identity-api/` | Trait an identity-provider plugin implements. |
 | `crates/outbox/` | Outbox relay primitives (idempotency, retry, dead-letter). |
-| `crates/server/` | Axum HTTP + WebSocket surface, sidecar supervisor, admin/webhook routers, chat path. |
+| `crates/server/` | Axum HTTP + WebSocket surface, sidecar supervisor, admin/webhook routers, chat path, SPA-embed via `rust-embed`. |
 | `crates/mcp-client/` | MCP server registration + tool dispatch (alternative to plugin tools). |
 | `crates/cli/` | `execlaw` binary (install, service, doctor, serve, replay, eval, …). |
 | `crates/eval-harness/` | LLM-judge harness against local Qwen. |
-| `plugins/` | In-tree reference + first-party plugins (signal, whatsapp, slack, sms-socket, google-*, pushover, hello, identity-local-address-book). |
+| `plugins/` | In-tree reference + first-party plugins (see [Plugins shipped](#plugins-shipped)). |
 | `web/` | React + react-bootstrap SPA. Vite + Vitest. |
-| `scripts/` | `dev-server.sh` / `dev-server.ps1` — cargo-watch wrappers. |
-| `docs/` | Architecture + agent-model + plugins + screenshots. |
+| `desktop-macos/` | Tauri 2 menu bar app for Apple Silicon. SMAppService LaunchAgent + WebView. Out-of-workspace cargo crate. |
+| `scripts/` | `dev-server.{sh,ps1}` (cargo-watch wrappers), `build-mac.sh` (Tauri release), `trace-turn.{sh,ps1}` (turn replay). |
+| `docs/` | Architecture + agent-model + plugins + setup walkthroughs + screenshots. |
 | `evals/` | Rubric TOML files for the LLM-judge harness. |
 | `spec/` | OpenAPI + AsyncAPI specs. |
+| `dist/` | Built plugin install ZIPs (one per plugin / version). |
+| `.github/workflows/` | CI (per-push), `macos-bundle.yml` (tag-driven `.app` + `.dmg` → GitHub Releases). |
 
 ## License
 

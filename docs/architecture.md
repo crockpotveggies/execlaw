@@ -869,7 +869,7 @@ Last refreshed: 2026-05-08. The phase tags below reflect implementation mileston
 - Streaming SSE (`chat_completions_stream`) + `ChatTokenDelta` on the WS bus
 - Crash-safety tests (kill mid-turn, replay-after-restart, post-commit tamper)
 
-**Phase 2 — Plugin framework.** Complete and exercised in production by 10 in-tree plugins.
+**Phase 2 — Plugin framework.** Complete and exercised in production by 12 in-tree plugins.
 - `PluginHost` lifecycle (install/enable/disable/uninstall/hydrate) with SQLite persistence via migration 0003
 - `POST /api/admin/plugins/install` + list / enable / disable / uninstall / tools routes
 - Manifest schema: `[plugin]`, `[runtime]` (script + subprocess tiers), `[[tools]]` (with `host_internal`, `trust_floor`, `latency`), `[transport]`, `[identity_provider]`, `[[services]]` + `[services.sidecar]`, `[[admin_routes]]`, `[[webhook_routes]]` (unauthenticated, plugin validates), `[[oauth_accounts]]`, `[[ui_panels]]`, `[[skills]]`, `[[health_checks]]`, `[[event_subscriptions]]`, `[[alert_sources]]`
@@ -936,12 +936,13 @@ Last refreshed: 2026-05-08. The phase tags below reflect implementation mileston
 - Eval-flag dashboard
 - Trace viewer embedded in the chat UI
 
-**Phase 6 — UI port (chat-first SPA + Tauri Desktop).** In progress (sub-phases 6a–6c partially landed; 6d Tauri pending).
+**Phase 6 — UI port (chat-first SPA + Tauri Desktop).** Sub-phases 6a–6d landed; full incognito-thread UI polish and voice UI still pending.
 - Chat-first SPA scaffolding under `web/` is live: pinned Control thread, thread list, inbound messages from external transports collapse into the controller thread per the `ConversationResolver` rule, OpenAI-style streaming token render.
 - Settings → Plugins page drives install / enable / disable / uninstall + per-plugin admin panels (each plugin's `[[ui_panels]]` mounts a SPA route).
 - Research subsystem (C3–C6) shipped: deep-research plan/gather/synthesize pipeline, retention policy, `/research` page, every-phase event flow.
 - Approval queue infrastructure: cold-contact alerts, sensitive-tool approvals, OAuth-grant proposals all flow through one SPA dropdown.
-- Pending: Tauri Desktop wrapper (6d), full incognito-thread UI polish, voice UI (lands with Phase 8 audio plugins).
+- **6d Tauri Desktop wrapper** shipped 2026-05-15: `desktop-macos/src-tauri/` produces `execlaw.app` for Apple Silicon. Menu bar app with no Dock icon (NSApplication `Accessory` activation policy), registers the bundled LaunchAgent via Apple's `SMAppService` (macOS 13+) so drag-to-Trash auto-disables the service. SPA embedded in the server binary via `rust-embed`; the webview navigates to `http://127.0.0.1:3031` for same-origin API + SPA. Build via `scripts/build-mac.sh`; release via tag push (see `.github/workflows/macos-bundle.yml`).
+- Pending: full incognito-thread UI polish, voice UI (lands with Phase 8 audio plugins).
 
 Stack (locked in 2026-04-25):
 - **React Native** + **react-native-web** as the cross-platform component layer.
@@ -949,7 +950,7 @@ Stack (locked in 2026-04-25):
 - **Vite** (web) / **Metro** (native).
 - **TanStack Query** for REST, **Zustand** for the WS event store.
 - **Plugins are trusted** — UI panels load via dynamic ESM `import()`; no sandboxing.
-- Built static assets embedded in the Rust binary via `rust-embed` so the production artifact stays a single Docker image.
+- Built static assets embedded in the Rust binary via `rust-embed` (shipped 2026-05-15 alongside Phase 6d) so the production artifact stays a single binary serving SPA + API on one origin — both the Docker image and the Tauri `.app` bundle rely on this.
 
 UX (locked):
 - Chat-first landing; OpenWebUI-shaped sidebar with `New chat`, nav (Routines / Contacts / More → Tools, Skills, plugin panels), thread list, settings + user at the bottom.
