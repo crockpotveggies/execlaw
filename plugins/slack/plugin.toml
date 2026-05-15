@@ -11,7 +11,13 @@ name = "Slack"
 #        so the previous `SLACK_API + "/chat.postMessage"` form
 #        threw "Variable not found: SLACK_API" at runtime. Same
 #        gotcha the google-* plugins document.
-version = "0.3.1"
+# 0.3.2: populate display_name / group_name on inbound so the
+#        sidebar shows "<workspace> #<channel-or-DM-username>"
+#        instead of "New chat · <id-prefix>". Resolves via
+#        conversations.info (channels) or users.info (DMs) on
+#        first inbound; result is cached in vault under
+#        `channel_labels`.
+version = "0.3.2"
 description = "Slack transport via Socket Mode (no public URL needed). Multi-workspace from day 1: each workspace contributes its own bot+app token pair and runs its own Socket Mode connection. Mirrors the Signal/WhatsApp tool surface but is sidecar-free — pure-Rhai over the host's http_post + ws_subscribe + ws_send bindings."
 author = "execlaw"
 license = "Apache-2.0"

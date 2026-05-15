@@ -260,12 +260,25 @@ fn decode_event(team_id, event, payload) {
         // question; the host's eligibility gate already exempts them).
         let mention_of_self = if is_group { true } else { () };
 
+        // v0.3.2: seed the conversation's sidebar title with
+        // "<workspace> #<channel-or-DM-username>". For groups it
+        // flows through `group_name`; for DMs through `display_name`
+        // (the host's apply_auto_display_name picks the right one
+        // per generic_inbound.rs:70-75). Cached after first miss so
+        // we don't burn API calls on every subsequent inbound.
+        let conv_label = resolve_channel_label(
+            team_id,
+            event.channel,
+            is_dm,
+            event.user,
+        );
+
         return #{
             "channel": "slack",
             "native_id": event.user,
-            "display_name": (), // resolved server-side via users.info; skip for v0.1
+            "display_name": if is_dm { conv_label } else { () },
             "group_id": group_id,
-            "group_name": (),
+            "group_name": if is_group { conv_label } else { () },
             "text": normalized,
             "timestamp_ms": parse_slack_ts_ms(event.ts),
             "attachments": attachments,
@@ -623,6 +636,136 @@ fn bot_user_id_for_team(team_id) {
         if ws.team_id == team_id { return ws.bot_user_id; }
     }
     ()
+}
+
+fn team_name_for_team(team_id) {
+    let all = load_workspaces();
+    for ws in all {
+        if ws.team_id == team_id { return ws.team_name; }
+    }
+    ()
+}
+
+// =====================================================================
+// Channel/DM label cache + resolver (v0.3.2)
+// =====================================================================
+//
+// The sidebar's thread title comes from the conversation's
+// display_name, which the host seeds from InboundMessage.display_name
+// (DMs) or .group_name (channels) on the first inbound. Previously
+// both fields were `()` so Slack threads showed as "New chat ·
+// <prefix>". v0.3.2 fills them with "<workspace> #<channel-or-user>".
+//
+// Resolution path on first inbound from a given channel id:
+//   * Channel message → conversations.info?channel=<id> → channel.name
+//   * DM             → users.info?user=<sender> → real_name / display_name
+//
+// conversations.info works against public + private channels via
+// the `channels:read` / `groups:read` scopes the operator already
+// granted; users.info works via `users:read`. No new scopes
+// required. Result is cached in vault under the `channel_labels`
+// map so the API calls only fire once per channel — entries only
+// stale if a channel/user is renamed, which is rare and self-heals
+// on plugin reload (cache clear) if it matters.
+
+fn load_channel_labels() {
+    let raw = ();
+    try { raw = vault_get("channel_labels"); } catch (e) { return #{}; }
+    if raw == () || raw == "" { return #{}; }
+    try {
+        let m = parse_json(raw);
+        if type_of(m) != "map" { return #{}; }
+        return m;
+    } catch (e) {
+        return #{};
+    }
+}
+
+fn save_channel_label(channel_id, label) {
+    let m = load_channel_labels();
+    m[channel_id] = label;
+    try { vault_put("channel_labels", to_json_string(m)); } catch (e) {
+        log_warn("slack: vault_put channel_labels failed: " + e);
+    }
+}
+
+fn cached_channel_label(channel_id) {
+    let m = load_channel_labels();
+    if m[channel_id] != () { return m[channel_id]; }
+    ()
+}
+
+// Resolve "<team_name> #<channel-or-DM-username>" for a Slack
+// channel id. Caches on success. Falls back to the channel id's
+// trailing 6 characters when the lookup fails (missing scope,
+// network blip, etc.) so the sidebar still gets *something*
+// useful and we don't burn an API call on every subsequent
+// message in the same conversation.
+fn resolve_channel_label(team_id, channel_id, is_dm, sender_user_id) {
+    let team_name = team_name_for_team(team_id);
+    let team_label = if team_name != () && team_name != "" { "" + team_name } else { "" + team_id };
+
+    if channel_id == () || channel_id == "" {
+        return team_label;
+    }
+    let cached = cached_channel_label(channel_id);
+    if cached != () { return cached; }
+
+    let bot_token = bot_token_for_team(team_id);
+    let resolved_name = ();
+
+    if is_dm {
+        if sender_user_id != () && sender_user_id != "" {
+            try {
+                let resp = http_get(
+                    "https://slack.com/api/users.info",
+                    #{ "user": "" + sender_user_id },
+                    bot_token,
+                );
+                if resp != () && resp.ok == true && resp.user != () {
+                    let u = resp.user;
+                    if u.real_name != () && u.real_name != "" {
+                        resolved_name = "" + u.real_name;
+                    } else if u.profile != () && u.profile.real_name != () && u.profile.real_name != "" {
+                        resolved_name = "" + u.profile.real_name;
+                    } else if u.name != () && u.name != "" {
+                        resolved_name = "" + u.name;
+                    }
+                }
+            } catch (e) {
+                log_warn("slack: users.info(" + sender_user_id + ") failed: " + e);
+            }
+        }
+    } else {
+        try {
+            let resp = http_get(
+                "https://slack.com/api/conversations.info",
+                #{ "channel": "" + channel_id },
+                bot_token,
+            );
+            if resp != () && resp.ok == true && resp.channel != () {
+                let c = resp.channel;
+                if c.name != () && c.name != "" {
+                    resolved_name = "" + c.name;
+                }
+            }
+        } catch (e) {
+            log_warn("slack: conversations.info(" + channel_id + ") failed: " + e);
+        }
+    }
+
+    if resolved_name == () || resolved_name == "" {
+        let cid_str = "" + channel_id;
+        resolved_name = if cid_str.len() > 6 {
+            cid_str.sub_string(cid_str.len() - 6)
+        } else {
+            cid_str
+        };
+    }
+
+    let label = team_label + " #" + resolved_name;
+    save_channel_label(channel_id, label);
+    label
 }
 
 fn cache_channel_workspace(channel, team_id) {
