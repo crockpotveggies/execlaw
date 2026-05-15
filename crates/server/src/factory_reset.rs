@@ -172,7 +172,21 @@ pub async fn factory_reset_handler(
     // per-plugin purges may have left non-empty so the
     // factory-reset response body can promise "nothing on disk
     // survived."
-    let orphan_dirs_removed = sweep_orphan_directories();
+    //
+    // 2026-05-15 — derive the sweep base from `state.db_config`
+    // instead of `directories::UserDirs::new()`. Pre-rework, every
+    // `cargo test` invocation that exercised this handler with an
+    // in-memory test DB silently nuked the OPERATOR'S real
+    // `~/.execlaw/plugins/` tree (uncovered after operators
+    // repeatedly lost their plugin installs during dev cycles).
+    // The DB path's parent IS the right anchor — it's the same
+    // value `cli/main.rs` derives `stage_root` from.
+    let sweep_base = state
+        .db_config
+        .path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty());
+    let orphan_dirs_removed = sweep_orphan_directories(sweep_base);
     tracing::info!(
         target: "factory_reset",
         dirs_removed = orphan_dirs_removed.len(),
@@ -198,36 +212,71 @@ pub async fn factory_reset_handler(
     }))
 }
 
-/// Recursively remove the top-level `~/.execlaw/` subdirectories that
+/// Recursively remove the top-level execlaw-base subdirectories that
 /// hold plugin / runtime / research state. Per-plugin purges (step 1
 /// of factory reset) already remove what they can attribute to a
 /// known `plugin_id`; this is the cleanup pass for everything else:
 ///
-///   * `~/.execlaw/sidecars/`  — any sidecar state dir whose plugin
-///                               had its `state_plugins` row hand-
-///                               edited away (so the purge step
-///                               couldn't find it).
-///   * `~/.execlaw/plugins/`   — staged plugin ZIPs (future home,
-///                               currently unused but reserved).
-///   * `~/.execlaw/plugin_artifacts/` — content-addressed artifact
-///                               blobs whose `state_artifacts` row
-///                               survived a crash or hand-edit.
-///   * `~/.execlaw/research/`  — research-job workspaces (one dir
-///                               per job; cleaned by job lifecycle
-///                               normally but cancelled / orphaned
-///                               jobs leave dirs behind).
+///   * `<base>/sidecars/`         — sidecar state dirs whose plugin
+///                                  had its `state_plugins` row
+///                                  hand-edited away (so the purge
+///                                  step couldn't find them).
+///   * `<base>/plugins/`          — staged plugin ZIPs.
+///   * `<base>/plugin_artifacts/` — content-addressed artifact blobs
+///                                  whose `state_artifacts` row
+///                                  survived a crash or hand-edit.
+///   * `<base>/research/`         — research-job workspaces (one dir
+///                                  per job; normally cleaned by job
+///                                  lifecycle but cancelled /
+///                                  orphaned jobs leave dirs behind).
+///
+/// `base` is the `<DB-file-parent>` directory — i.e. for the default
+/// production setup (`~/.execlaw/execlaw.db`) it's `~/.execlaw/`.
+/// Callers derive it from `state.db_config.path.parent()` so a custom
+/// `--db <path>` lands the sweep against the right tree.
+///
+/// **Critical** (2026-05-15): pre-rework this function used
+/// `directories::UserDirs::new()` to find the home dir directly,
+/// which meant every `cargo test` run that exercised
+/// `factory_reset_handler` (the test fixtures call it with an
+/// in-memory DB) silently `rm -rf`-ed the operator's REAL
+/// `~/.execlaw/{plugins,sidecars,research,plugin_artifacts}/`
+/// trees. Operators developing locally lost their entire plugin
+/// install state every time they ran `cargo test`. The fix is
+/// strict: the sweep refuses to run when `base` doesn't look like a
+/// real on-disk DB parent (`:memory:` test DBs return None from
+/// `path.parent()` on the file component, and we double-guard by
+/// rejecting any `base` that contains `:memory:` or doesn't exist).
 ///
 /// Returns the absolute paths actually removed (so the operator can
 /// verify what disappeared). A dir that didn't exist returns
 /// nothing; a dir that failed to delete is logged at WARN and
-/// omitted from the return value.
-fn sweep_orphan_directories() -> Vec<String> {
-    use directories::UserDirs;
-    let home = match UserDirs::new() {
-        Some(d) => d.home_dir().to_path_buf(),
-        None => return Vec::new(),
+/// omitted from the return value. An invalid `base` (None /
+/// `:memory:` / nonexistent) returns Vec::new() with a debug log.
+fn sweep_orphan_directories(base: Option<&std::path::Path>) -> Vec<String> {
+    let base = match base {
+        Some(p) => p,
+        None => {
+            tracing::debug!(
+                target: "factory_reset",
+                "skipping orphan-directory sweep: no on-disk DB base path (in-memory DB?)",
+            );
+            return Vec::new();
+        }
     };
-    let base = home.join(".execlaw");
+    // Defense in depth: refuse to recursively delete if `base` looks
+    // like an in-memory DB sentinel or doesn't exist on disk. This
+    // catches both the `:memory:` case and any future test fixture
+    // that accidentally constructs a fake parent path.
+    let base_str = base.to_string_lossy();
+    if base_str.contains(":memory:") || !base.is_dir() {
+        tracing::debug!(
+            target: "factory_reset",
+            base = %base.display(),
+            "skipping orphan-directory sweep: base is not an on-disk directory",
+        );
+        return Vec::new();
+    }
     let candidates = ["sidecars", "plugins", "plugin_artifacts", "research"];
     let mut removed = Vec::new();
     for c in candidates {
@@ -668,6 +717,78 @@ mod tests {
             cfg.is_ok(),
             "ResearchConfigStore::get() after factory reset must \
              succeed, got: {cfg:?}",
+        );
+    }
+
+    /// Regression for the 2026-05-15 "cargo test deletes the
+    /// operator's real ~/.execlaw/plugins/ dir" bug.
+    ///
+    /// Pre-fix, `sweep_orphan_directories` used
+    /// `directories::UserDirs::new()` to find $HOME directly and
+    /// `rm -rf`-ed `<HOME>/.execlaw/{sidecars,plugins,plugin_artifacts,research}`
+    /// every time it ran — INCLUDING from inside test fixtures
+    /// using an in-memory DB. Operators developing the workspace
+    /// locally lost their entire plugin install state every
+    /// `cargo test` cycle. The fix anchors the sweep on the DB
+    /// file's parent, with a hard guard against `:memory:` DBs.
+    ///
+    /// This test pins both halves: (a) the function returns an
+    /// empty list when called with `None` (the in-memory case), and
+    /// (b) the live factory_reset handler against the test fixture
+    /// returns an empty `orphan_dirs_removed` even if the
+    /// operator's real `~/.execlaw/plugins/` dir exists.
+    #[test]
+    fn sweep_orphan_directories_returns_empty_for_in_memory_db() {
+        // (a) None path — returns nothing, logs at debug.
+        assert!(super::sweep_orphan_directories(None).is_empty());
+        // (b) Path containing the `:memory:` sentinel — same.
+        let mem = std::path::Path::new(":memory:");
+        assert!(super::sweep_orphan_directories(Some(mem)).is_empty());
+        // (c) A nonexistent base path — also nothing (defense in depth).
+        let bogus = std::path::Path::new("/nonexistent/path/that/does/not/exist/at/all");
+        assert!(super::sweep_orphan_directories(Some(bogus)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn factory_reset_handler_does_not_touch_real_user_directories() {
+        // Run the full handler against the in-memory test fixture
+        // and assert `orphan_dirs_removed` is empty. The fixture's
+        // DB has `path = ":memory:"`, so `db_config.path.parent()`
+        // is `Some("")` (empty path) — our `.filter(non-empty)`
+        // converts that to None, and the sweep skips entirely.
+        //
+        // If a future refactor accidentally re-introduces the
+        // UserDirs-direct lookup, this test catches it: the
+        // `orphan_dirs_removed` field would suddenly populate
+        // with paths under the test runner's $HOME, blowing the
+        // assertion below AND silently destroying the developer's
+        // real plugins dir at the same time. Belt + suspenders.
+        let state = test_app_state();
+        let app = build_router(state.clone());
+        let tok = setup_controller_token(&app).await;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/admin/factory-reset")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"confirm":"RESET"}).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let removed = v["orphan_dirs_removed"]
+            .as_array()
+            .expect("orphan_dirs_removed must be a JSON array");
+        assert!(
+            removed.is_empty(),
+            "factory_reset against an in-memory DB MUST NOT touch any real \
+             on-disk directories. Got: {removed:?}. If you see paths under \
+             your real $HOME here, the sweep is back to UserDirs-direct \
+             lookup and is silently destroying operators' ~/.execlaw/ trees \
+             on every cargo test run.",
         );
     }
 
