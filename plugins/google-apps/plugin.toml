@@ -1,7 +1,7 @@
 [plugin]
 id = "google-apps"
 name = "Google Apps"
-version = "0.2.0"
+version = "0.3.0"
 description = "Consolidated Google plugin — Gmail, Calendar, Contacts, Tasks, and Drive in one OAuth grant. Replaces the separate google-calendar + google-contacts plugins. Individual modules can be toggled on/off without re-running the consent flow."
 author = "execlaw"
 license = "Apache-2.0"
@@ -139,15 +139,22 @@ description = "List events on a calendar within a time window. Args: { calendar_
 trust_floor = "Controller"
 latency = "medium"
 
-# calendar.check_availability is the ONLY tool without a trust floor —
-# outside-class principals (Signal contacts trying to schedule a
-# meeting with the operator, etc.) legitimately need to query
-# free/busy to propose times. The freeBusy response is opaque
-# busy/free intervals, NOT event details, so the leak surface is
-# minimal compared to list_events / get_event.
+# calendar.check_availability now also pins Controller (v0.3.0).
+# The earlier carve-out reasoned that freeBusy was "opaque
+# busy/free intervals" and thus safe for outside contacts to query
+# for scheduling — but those intervals are themselves a
+# surveillance + social-engineering primitive: an outside caller
+# repeatedly probing free/busy can map the operator's daily
+# schedule, identify travel windows, and time follow-on attacks.
+# Per the v0.3.0 tightening: every google-apps tool requires
+# Controller. If a "schedule with me" workflow for external
+# contacts is needed later, it lives in a dedicated booking tool
+# with explicit scope, not as a side effect of leaving freeBusy
+# unguarded.
 [[tools]]
 name = "calendar.check_availability"
 description = "Free/busy lookup across one or more calendars. Args: { time_min: RFC3339, time_max: RFC3339, calendar_ids?: string[] (default ['primary']) }. Returns the freeBusy response keyed by calendar id."
+trust_floor = "Controller"
 latency = "medium"
 
 [[tools]]

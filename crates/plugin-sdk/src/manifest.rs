@@ -1346,7 +1346,7 @@ mod tests {
         let m = PluginManifest::parse(GOOGLE_APPS_MANIFEST)
             .expect("plugins/google-apps/plugin.toml must parse cleanly");
         assert_eq!(m.plugin.id, "google-apps");
-        assert_eq!(m.plugin.version, "0.2.0");
+        assert_eq!(m.plugin.version, "0.3.0");
 
         // Identity provider survives the consolidation — same shape
         // as google-contacts had.
@@ -1384,16 +1384,16 @@ mod tests {
         // here and the dispatch table in main.rhai.
         assert_eq!(m.tools.len(), 31);
 
-        // EVERY tool except `calendar.check_availability` pins
-        // Controller. This is the v1 trust contract — the plugin's
-        // tools all touch the operator's personal Google account
-        // (mailbox, contacts, files, calendar, tasks), and outside
-        // principals (Signal/Discord/WhatsApp contacts reaching the
-        // agent over a bridged transport) MUST NOT be able to read
-        // or mutate any of that. The single exception is free/busy,
-        // which returns opaque busy intervals (NOT event details)
-        // and is needed for legitimate "find a meeting time with
-        // the operator" workflows from outside contacts.
+        // EVERY tool pins Controller (v0.3.0). The earlier carve-out
+        // for `calendar.check_availability` reasoned that freeBusy
+        // was opaque busy/free intervals and thus safe for outside
+        // contacts to query — but those intervals are themselves a
+        // surveillance + social-engineering primitive. Tightening:
+        // every google-apps tool requires Controller, no exceptions.
+        // If a "let outside contacts schedule with me" workflow is
+        // needed later, it lives in a dedicated booking tool with
+        // explicit scope, not as a side effect of leaving freeBusy
+        // unguarded.
         const CONTROLLER_FLOOR_TOOLS: &[&str] = &[
             // Gmail — all tools (read AND write touch the mailbox).
             "gmail.list_messages",
@@ -1406,9 +1406,11 @@ mod tests {
             "gmail.add_label",
             "gmail.remove_label",
             "gmail.trash",
-            // Calendar — everything except check_availability.
+            // Calendar — every tool, including check_availability
+            // (the v0.2.0 carve-out was removed in v0.3.0).
             "calendar.list_calendars",
             "calendar.list_events",
+            "calendar.check_availability",
             "calendar.get_event",
             "calendar.create_event",
             "calendar.update_event",
@@ -1444,28 +1446,24 @@ mod tests {
             );
         }
 
-        // The single intentional exception. If you're adding another
-        // tool that can safely be called from outside principals,
-        // add it here and document why — the default for this
-        // plugin is "Controller-only".
-        const NO_FLOOR_TOOLS: &[&str] = &["calendar.check_availability"];
-        for name in NO_FLOOR_TOOLS {
-            let t = m
-                .tools
-                .iter()
-                .find(|t| t.name == *name)
-                .unwrap_or_else(|| panic!("{name} must be declared"));
-            assert!(t.trust_floor.is_none(), "{name} must NOT pin a trust floor",);
-        }
-
-        // Sanity check: every tool is accounted for in exactly one of
-        // the two lists above. Adding a tool to the manifest without
-        // categorising it would otherwise pass this test.
+        // No carve-outs in v0.3.0 — every declared tool must pin
+        // Controller. If you're adding a new tool that can SAFELY be
+        // called from outside principals (rare; needs explicit
+        // justification), add it to a new NO_FLOOR_TOOLS list here
+        // AND document why in the manifest comment.
         assert_eq!(
-            CONTROLLER_FLOOR_TOOLS.len() + NO_FLOOR_TOOLS.len(),
+            CONTROLLER_FLOOR_TOOLS.len(),
             m.tools.len(),
-            "every declared tool must appear in CONTROLLER_FLOOR_TOOLS or NO_FLOOR_TOOLS",
+            "every declared tool must pin a Controller trust floor in v0.3.0+",
         );
+        for t in &m.tools {
+            assert_eq!(
+                t.trust_floor.as_deref(),
+                Some("Controller"),
+                "{} must pin Controller floor (no carve-outs in v0.3.0+)",
+                t.name,
+            );
+        }
 
         // Runtime tier — script, source = main.rhai.
         let rt = m.runtime.as_ref().expect("[runtime] must be declared");

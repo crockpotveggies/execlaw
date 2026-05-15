@@ -427,20 +427,24 @@ async fn enabled_modules_setting_gates_dispatch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn check_availability_is_the_only_tool_callable_from_outside_principals() {
-    // Trust-contract carve-out: `calendar.check_availability` is the
-    // single tool reachable by sub-Controller principals (e.g. a
-    // Signal contact asking "when can we meet?"). Every other tool
-    // touches the operator's mailbox / contacts / files / calendar
-    // event details and MUST refuse. freeBusy is opaque busy/free
-    // intervals — no event titles, descriptions, or attendees — so
-    // the leak surface is acceptable.
+async fn every_google_apps_tool_rejects_sub_controller_callers() {
+    // v0.3.0 trust contract: NO carve-outs. Every google-apps tool
+    // touches the operator's personal Google account in some way —
+    // mailbox, files, calendar (even freeBusy leaks the operator's
+    // daily schedule, which is itself a surveillance primitive),
+    // contacts, tasks. Outside principals (KnownTrusted at best
+    // when they're a saved contact reaching the agent over a
+    // bridged transport) must NOT be able to read or mutate any of
+    // it, full stop.
     //
-    // This test pins the carve-out: a KnownTrusted caller reaches
-    // `check_availability` (it hits the script and tries to fetch
-    // freeBusy from the mock; we just assert dispatch crossed the
-    // trust gate without rejection), and every read-only tool from
-    // the other modules is rejected at the gate.
+    // This test was previously named
+    // `check_availability_is_the_only_tool_callable_from_outside_principals`
+    // and pinned the v0.2.0 freeBusy carve-out. The carve-out was
+    // removed in v0.3.0 after observing that scheduled-time
+    // intervals are an attack primitive (you can map travel
+    // windows, daily routines, etc.). Now we pin the inverse:
+    // every tool, including check_availability, must reject
+    // sub-Controller callers at the trust-floor gate.
     let (mock_url, _calls) = spawn_mock_api();
     let stage_dir = tempfile::tempdir().unwrap();
     let (app, state) = build_app(stage_dir.path().to_path_buf());
@@ -454,45 +458,13 @@ async fn check_availability_is_the_only_tool_callable_from_outside_principals() 
     assert_eq!(status, StatusCode::OK);
     seed_oauth(&state.db, "ya29.fake");
 
-    // The carve-out tool must clear the trust gate. We don't care
-    // about the HTTP result — the script's freeBusy URL isn't
-    // intercepted by our mock so the actual call will fail with a
-    // 401 from real Google. What we DO care about is the failure
-    // mode: it must come from inside the script (Rhai runtime error
-    // / http_post), NOT from the trust-floor gate. Anything
-    // mentioning "Controller" or "trust" in the error would mean
-    // the gate slammed shut and the test must fail.
-    let outcome = state
-        .plugin_host
-        .call_tool(
-            "calendar.check_availability",
-            serde_json::json!({
-                "time_min": "2026-05-11T00:00:00Z",
-                "time_max": "2026-05-12T00:00:00Z",
-            }),
-            &["*"],
-            Some("KnownTrusted"),
-        )
-        .await;
-    match outcome {
-        Ok(_) => {}
-        Err(e) => {
-            assert!(
-                !e.to_lowercase().contains("trust") && !e.contains("Controller"),
-                "calendar.check_availability must clear the trust gate for KnownTrusted; \
-                 got trust-floor rejection: {e}",
-            );
-            // Any other failure (http_post 401 from the unmocked URL,
-            // rhai-side decode error) means the gate opened — that's
-            // the contract this test pins.
-        }
-    }
-
-    // Every other read-only tool must be rejected for the same caller.
+    // Every google-apps tool — including the previously-carved-out
+    // check_availability — must be rejected for a KnownTrusted caller.
     for tool in [
         "gmail.list_labels",
         "calendar.list_calendars",
         "calendar.list_events",
+        "calendar.check_availability",
         "contacts.list",
         "tasks.list_lists",
         "drive.search",
@@ -501,7 +473,11 @@ async fn check_availability_is_the_only_tool_callable_from_outside_principals() 
             .plugin_host
             .call_tool(
                 tool,
-                serde_json::json!({"query": "x"}),
+                serde_json::json!({
+                    "query": "x",
+                    "time_min": "2026-05-11T00:00:00Z",
+                    "time_max": "2026-05-12T00:00:00Z",
+                }),
                 &["*"],
                 Some("KnownTrusted"),
             )
