@@ -26,6 +26,6 @@
             "description": "Longitude in decimal degrees (or array — must be the same length as the latitude array)."
         }
     },
-    "required": ["latitude", "longitude"],
+    "required": [],
     "additionalProperties": false
 }

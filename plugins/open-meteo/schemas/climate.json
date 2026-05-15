@@ -33,6 +33,6 @@
             "enum": ["kmh", "ms", "mph", "kn"]
         }
     },
-    "required": ["latitude", "longitude", "start_date", "end_date", "models"],
+    "required": ["start_date", "end_date", "models"],
     "additionalProperties": false
 }

@@ -789,9 +789,9 @@ Browse these for working examples. Each lives under `plugins/<id>/`.
 | `whatsapp`                     | script     | wuzapi        | —            | yes     | —                 | Transport. Webhook-driven inbound. QR pairing.                                              |
 | `slack`                        | script     | —             | yes          | yes     | —                 | Transport. OAuth + Slack Web API. Multi-workspace.                                          |
 | `sms-socket`                   | script     | —             | —            | —       | —                 | Transport. Talks to an Android-side gateway over WebSocket.                                 |
-| `google-calendar`              | script     | —             | yes          | —       | —                 | HTTP-only. 7 tools against Google Calendar v3.                                              |
-| `google-contacts`              | script     | —             | yes          | —       | yes               | Identity provider that resolves email/phone via Google People API.                          |
+| `google-apps`                  | script     | —             | yes          | —       | yes               | One OAuth grant covering Gmail / Calendar / Contacts / Tasks / Drive. Per-module toggles. Identity provider for email/phone via People API. Replaced separate google-calendar + google-contacts plugins (2026-05-14). |
 | `google-places`                | script     | —             | API-key only | —       | —                 | Public Places (New) API. No OAuth — uses 4-arg `http_get`/`http_post` with custom headers.  |
+| `open-meteo`                   | script     | —             | —            | —       | —                 | Free, key-less weather/marine/air-quality/seasonal/ensemble/flood/climate/geocoding/elevation tools + chart renderer. |
 | `pushover`                     | script     | —             | —            | —       | —                 | One-way outbound notification.                                                              |
 | `identity-local-address-book` | subprocess | —             | —            | —       | yes               | Resolves identifiers from an operator-curated address book.                                 |
 | `hello`                        | subprocess | —             | —            | —       | —                 | Reference subprocess plugin. Used by integration tests.                                     |
@@ -799,9 +799,9 @@ Browse these for working examples. Each lives under `plugins/<id>/`.
 When you start a new plugin, the closest cognate is your fastest path to a working bundle:
 
 - New transport with a Go/Java sidecar → copy `whatsapp/` (webhook flavour) or `signal/` (WS flavour).
-- New HTTP-only OAuth integration → copy `google-calendar/`.
+- New HTTP-only OAuth integration → copy `google-apps/`.
 - New API-key HTTP integration → copy `google-places/`.
-- New identity provider → copy `google-contacts/`.
+- New identity provider → copy `google-apps/` (look at the `[identity_provider]` block).
 - New subprocess plugin → copy `hello/`.
 
 ---

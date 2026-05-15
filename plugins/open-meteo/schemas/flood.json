@@ -24,6 +24,6 @@
             "description": "When true, return all 50 ensemble members alongside the deterministic forecast. Default false."
         }
     },
-    "required": ["latitude", "longitude"],
+    "required": [],
     "additionalProperties": false
 }

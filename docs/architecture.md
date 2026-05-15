@@ -143,7 +143,7 @@ Thin Rust binary (`runner-local`). Speaks OpenAI-compatible API to whichever loc
 
 ### 4.4 Plugins (ZIP-installed extensions)
 
-Plugins are how every non-core capability lights up — transports, third-party integrations, identity providers, OAuth-using HTTP bridges, sidecar-backed services. Operator uploads a ZIP via the SPA; the host parses `plugin.toml`, registers all declared hooks atomically, and from that moment the plugin's tools appear in the agent's catalog (subject to capability + trust gating). Two runtime tiers: **script** (Rhai source loaded into an embedded interpreter — the dominant tier; used by signal, whatsapp, slack, sms-socket, google-calendar, google-contacts, google-places, pushover) and **subprocess** (native binary, JSON-RPC over stdio — used by hello reference plugin and identity-local-address-book). Transport-class plugins additionally implement the conversation-routing contract: receive inbound events, push them to the event log with stable `(plugin_id, source_event_id)` identifiers, drain outbox rows, deliver to the external surface. Full reference in [`plugins.md`](plugins.md).
+Plugins are how every non-core capability lights up — transports, third-party integrations, identity providers, OAuth-using HTTP bridges, sidecar-backed services. Operator uploads a ZIP via the SPA; the host parses `plugin.toml`, registers all declared hooks atomically, and from that moment the plugin's tools appear in the agent's catalog (subject to capability + trust gating). Two runtime tiers: **script** (Rhai source loaded into an embedded interpreter — the dominant tier; used by signal, whatsapp, slack, discord, sms-socket, google-apps, google-places, open-meteo, pushover) and **subprocess** (native binary, JSON-RPC over stdio — used by hello reference plugin and identity-local-address-book). Transport-class plugins additionally implement the conversation-routing contract: receive inbound events, push them to the event log with stable `(plugin_id, source_event_id)` identifiers, drain outbox rows, deliver to the external surface. Full reference in [`plugins.md`](plugins.md).
 
 ### 4.5 Outbox relay
 
@@ -830,7 +830,7 @@ For the reader who wants to jump into code:
 | [`spec/asyncapi.yaml`](../spec/asyncapi.yaml) | WebSocket event vocabulary |
 | [`plugins/hello/`](../plugins/hello/) | In-tree reference subprocess plugin |
 | [`plugins/signal/`, `plugins/whatsapp/`, `plugins/slack/`, `plugins/sms-socket/`](../plugins/) | Transport plugins — sidecar / webhook / WS variants |
-| [`plugins/google-calendar/`, `plugins/google-contacts/`, `plugins/google-places/`](../plugins/) | OAuth + API-key reference HTTP plugins |
+| [`plugins/google-apps/`, `plugins/google-places/`](../plugins/) | OAuth + API-key reference HTTP plugins |
 | [`docs/plugins.md`](plugins.md) | Plugin-author reference: when to use plugins vs MCP, manifest schema, sidecar model, primitives, walkthroughs |
 | [`crates/core/src/eval.rs`](../crates/core/src/eval.rs) | `EvalFlaggedStore` for regression-target event ranges (Phase 5) |
 | [`crates/server/src/observability.rs`](../crates/server/src/observability.rs) | `GET /api/admin/logs` + `GET /api/admin/eval/flags` (Phase 5) |
@@ -878,7 +878,7 @@ Last refreshed: 2026-05-08. The phase tags below reflect implementation mileston
 - Subprocess-tier engine — JSON-RPC over stdio; reference at `plugins/hello/`
 - Authenticated admin router at `/api/admin/plugins/{id}/...`; unauthenticated webhook router at `/api/webhooks/{id}/...` accepting both `application/json` and `application/x-www-form-urlencoded` bodies
 - Sidecar supervisor (`crates/server/src/sidecar_supervisor.rs`) with 5 s reconcile, health probes, crash-loop guard, stable per-`(plugin_id, sidecar_name)` host port allocation
-- Shipped plugins: `signal` (Signal-Messenger transport, supervised `signal-cli` sidecar), `whatsapp` (WhatsApp transport, supervised `wuzapi` sidecar, webhook inbound, `markread` read receipts), `slack` (multi-workspace OAuth transport), `sms-socket` (Android-gateway WS transport), `google-calendar` / `google-contacts` / `google-places` (OAuth or API-key HTTP integrations; `google-contacts` is also an identity provider), `pushover` (one-way notifier), `hello` (subprocess reference), `identity-local-address-book` (subprocess identity provider)
+- Shipped plugins: `signal` (Signal-Messenger transport, supervised `signal-cli` sidecar), `whatsapp` (WhatsApp transport, supervised `wuzapi` sidecar, webhook inbound, `markread` read receipts), `slack` (multi-workspace OAuth transport), `discord` (multi-guild gateway-WS transport), `sms-socket` (Android-gateway WS transport), `google-apps` (consolidated Gmail/Calendar/Contacts/Tasks/Drive OAuth integration; also an identity provider — replaced separate google-calendar + google-contacts plugins 2026-05-14), `google-places` (Places API key-only HTTP integration), `open-meteo` (key-less weather/marine/air-quality/seasonal/ensemble/flood/climate/geocoding/elevation tools + chart renderer), `pushover` (one-way notifier), `hello` (subprocess reference), `identity-local-address-book` (subprocess identity provider)
 - Plugin-author reference: [`docs/plugins.md`](plugins.md)
 
 **Phase 3 — Participants, trust, policy engine, Rule of Two.** Complete.

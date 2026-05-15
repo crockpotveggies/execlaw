@@ -25,6 +25,6 @@
             "description": "Default \"cams_global\". Use cams_europe inside Europe for higher-resolution data."
         }
     },
-    "required": ["latitude", "longitude"],
+    "required": [],
     "additionalProperties": false
 }

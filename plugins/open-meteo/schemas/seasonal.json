@@ -25,6 +25,6 @@
             "enum": ["celsius", "fahrenheit"]
         }
     },
-    "required": ["latitude", "longitude"],
+    "required": [],
     "additionalProperties": false
 }

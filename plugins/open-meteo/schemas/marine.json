@@ -29,6 +29,6 @@
             "maximum": 7
         }
     },
-    "required": ["latitude", "longitude"],
+    "required": [],
     "additionalProperties": false
 }

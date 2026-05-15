@@ -69,6 +69,6 @@
             "description": "Specific forecast models to use (e.g. [\"gfs_seamless\"], [\"icon_seamless\",\"ecmwf_ifs04\"]). Omit for Open-Meteo's default best-fit."
         }
     },
-    "required": ["latitude", "longitude"],
+    "required": [],
     "additionalProperties": false
 }

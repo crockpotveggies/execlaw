@@ -126,10 +126,18 @@ fn geocode_impl(args) {
 // =====================================================================
 
 fn elevation_impl(args) {
-    let lat_raw = args.latitude;
-    let lng_raw = args.longitude;
-    if lat_raw == () { throw "open_meteo.elevation: `latitude` is required"; }
-    if lng_raw == () { throw "open_meteo.elevation: `longitude` is required"; }
+    // 2026-05-14 — fall back to the operator's default location.
+    // Elevation accepts arrays of points too (open-meteo's API
+    // supports batch lookup), so we only patch the scalar case;
+    // an explicit array always wins.
+    let merged = merge_with_defaults(args);
+    let lat_raw = merged["latitude"];
+    let lng_raw = merged["longitude"];
+    if lat_raw == () || lng_raw == () {
+        throw "open_meteo.elevation: no coordinates supplied and no default location configured. " +
+              "Pass `latitude` + `longitude`, call `open_meteo.geocode` first, or set a default " +
+              "in Settings → Plugins → Open-Meteo.";
+    }
     let lat_str = numbers_to_csv(lat_raw, "latitude");
     let lng_str = numbers_to_csv(lng_raw, "longitude");
 
@@ -158,9 +166,13 @@ fn elevation_impl(args) {
 // =====================================================================
 
 fn forecast_impl(args) {
-    let lat = require_number(args["latitude"], "latitude");
-    let lng = require_number(args["longitude"], "longitude");
+    // 2026-05-14 — merge defaults FIRST so the operator's pinned
+    // location counts as "supplied." See merge_with_defaults for
+    // the full rationale.
     let merged = merge_with_defaults(args);
+    let coords = require_coords(merged);
+    let lat = coords[0];
+    let lng = coords[1];
 
     let q = base_query(lat, lng, merged);
     q = add_csv(q, "current",  merged["current"]);
@@ -197,11 +209,12 @@ fn pick_forecast_kind(merged) {
 // =====================================================================
 
 fn historical_impl(args) {
-    let lat = require_number(args["latitude"], "latitude");
-    let lng = require_number(args["longitude"], "longitude");
+    let merged = merge_with_defaults(args);
+    let coords = require_coords(merged);
+    let lat = coords[0];
+    let lng = coords[1];
     let start = require_string(args["start_date"], "start_date");
     let end   = require_string(args["end_date"], "end_date");
-    let merged = merge_with_defaults(args);
 
     let q = base_query(lat, lng, merged);
     q["start_date"] = start;
@@ -224,9 +237,10 @@ fn historical_impl(args) {
 // =====================================================================
 
 fn marine_impl(args) {
-    let lat = require_number(args["latitude"], "latitude");
-    let lng = require_number(args["longitude"], "longitude");
     let merged = merge_with_defaults(args);
+    let coords = require_coords(merged);
+    let lat = coords[0];
+    let lng = coords[1];
 
     let q = #{};
     q["latitude"]  = "" + lat;
@@ -257,9 +271,10 @@ fn marine_impl(args) {
 // =====================================================================
 
 fn air_quality_impl(args) {
-    let lat = require_number(args["latitude"], "latitude");
-    let lng = require_number(args["longitude"], "longitude");
     let merged = merge_with_defaults(args);
+    let coords = require_coords(merged);
+    let lat = coords[0];
+    let lng = coords[1];
 
     let q = #{};
     q["latitude"]  = "" + lat;
@@ -289,9 +304,10 @@ fn air_quality_impl(args) {
 // =====================================================================
 
 fn seasonal_impl(args) {
-    let lat = require_number(args["latitude"], "latitude");
-    let lng = require_number(args["longitude"], "longitude");
     let merged = merge_with_defaults(args);
+    let coords = require_coords(merged);
+    let lat = coords[0];
+    let lng = coords[1];
 
     let q = #{};
     q["latitude"]  = "" + lat;
@@ -320,9 +336,10 @@ fn seasonal_impl(args) {
 // =====================================================================
 
 fn ensemble_impl(args) {
-    let lat = require_number(args["latitude"], "latitude");
-    let lng = require_number(args["longitude"], "longitude");
     let merged = merge_with_defaults(args);
+    let coords = require_coords(merged);
+    let lat = coords[0];
+    let lng = coords[1];
 
     let q = base_query(lat, lng, merged);
     q = add_csv(q, "hourly", merged["hourly"]);
@@ -349,9 +366,10 @@ fn ensemble_impl(args) {
 // =====================================================================
 
 fn flood_impl(args) {
-    let lat = require_number(args["latitude"], "latitude");
-    let lng = require_number(args["longitude"], "longitude");
     let merged = merge_with_defaults(args);
+    let coords = require_coords(merged);
+    let lat = coords[0];
+    let lng = coords[1];
 
     let q = #{};
     q["latitude"]  = "" + lat;
@@ -376,14 +394,15 @@ fn flood_impl(args) {
 // =====================================================================
 
 fn climate_impl(args) {
-    let lat = require_number(args["latitude"], "latitude");
-    let lng = require_number(args["longitude"], "longitude");
+    let merged = merge_with_defaults(args);
+    let coords = require_coords(merged);
+    let lat = coords[0];
+    let lng = coords[1];
     let start = require_string(args["start_date"], "start_date");
     let end   = require_string(args["end_date"],   "end_date");
     if args["models"] == () || type_of(args["models"]) != "array" || args["models"].len() == 0 {
         throw "open_meteo.climate: `models` (non-empty array) is required";
     }
-    let merged = merge_with_defaults(args);
 
     let q = #{};
     q["latitude"]   = "" + lat;
@@ -603,7 +622,19 @@ fn merge_with_defaults(args) {
     // Map occasionally fails to find keys when the property name
     // collides with a registered method name on Array (e.g. `current`).
     // Bracket access is unambiguous and slightly faster anyway.
+    //
+    // 2026-05-14 — `latitude` + `longitude` now ride through the same
+    // arg-or-default merge. Pre-rework each `*_impl` did
+    // `require_number(args["latitude"], ...)` BEFORE merging, which
+    // threw whenever the agent omitted lat/lon — even though the
+    // operator had pinned a default in Settings → Plugins → Open-Meteo.
+    // The agent then asked the user "what's your location?" because
+    // the schema marked them required and the tool errored without
+    // them. Now the merge happens first; require_number runs against
+    // `merged[...]` so the operator default counts as "supplied."
     let merged = #{};
+    merged["latitude"]           = if args["latitude"] != ()           { args["latitude"] }           else { cfg.default_latitude };
+    merged["longitude"]          = if args["longitude"] != ()          { args["longitude"] }          else { cfg.default_longitude };
     merged["place_name"]         = if args["place_name"] != ()         { args["place_name"] }         else { cfg.place_name };
     merged["timezone"]           = if args["timezone"] != ()           { args["timezone"] }           else { cfg.default_timezone };
     merged["temperature_unit"]   = if args["temperature_unit"] != ()   { args["temperature_unit"] }   else { cfg.temperature_unit };
@@ -616,6 +647,23 @@ fn merge_with_defaults(args) {
     merged["forecast_days"] = args["forecast_days"];
     merged["past_days"]     = args["past_days"];
     merged
+}
+
+// 2026-05-14 — shared error message for the lat/lon-missing path.
+// Centralised so the same hint about the operator default appears
+// in every per-tool error, and the agent gets a clear suggestion
+// instead of a generic "field is required" stub. The agent reads
+// throw messages back as tool errors, and this phrasing nudges it
+// to either call `open_meteo.geocode` first or surface the missing
+// config to the operator instead of pestering the user.
+fn require_coords(merged) {
+    if merged["latitude"] == () || merged["longitude"] == () {
+        throw "open-meteo: no coordinates supplied and no default location configured. " +
+              "Either pass `latitude` + `longitude`, call `open_meteo.geocode` to resolve a " +
+              "place name to coordinates first, or ask the operator to set a default location " +
+              "in Settings → Plugins → Open-Meteo.";
+    }
+    [merged["latitude"], merged["longitude"]]
 }
 
 fn base_query(lat, lng, merged) {
@@ -731,3 +779,14 @@ fn _test_csv(arr)                          { csv(arr) }
 fn _test_clamp_int(v, lo, hi, fb)          { clamp_int(v, lo, hi, fb) }
 fn _test_numbers_to_csv(v, label)          { numbers_to_csv(v, label) }
 fn _test_pick_forecast_kind(daily_block)   { pick_forecast_kind(#{ "daily": daily_block }) }
+
+// 2026-05-14 — exposed for the lat/lon-default regression test.
+// Returns the merged map so the test can assert that operator
+// defaults (read from `read_config`'s fallback path when no vault
+// is wired) flow into latitude/longitude as expected.
+fn _test_merge_with_defaults(args)         { merge_with_defaults(args) }
+// Mirror of `require_coords` so the test can assert the throw
+// message points at the operator settings page when neither args
+// nor defaults supply coordinates. Returns [lat, lng] on success;
+// throws on failure (caught with try/catch in the test).
+fn _test_require_coords(merged)            { require_coords(merged) }

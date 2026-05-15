@@ -33,7 +33,8 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 /// Build an `AppState` with mock STT/TTS that returns a deterministic
 /// transcript on flush, so the test can assert exact event payloads.
 fn build_state(transcript: &'static str) -> AppState {
-    let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+    let db_config = DbConfig::in_memory_unencrypted();
+    let db = Database::open(&db_config).unwrap();
     MigrationRunner::new(&db).apply_all().unwrap();
     let stage_root =
         std::env::temp_dir().join(format!("execlaw-test-voice-ws-{}", uuid::Uuid::new_v4()));
@@ -43,6 +44,7 @@ fn build_state(transcript: &'static str) -> AppState {
     let tts: TtsFactory = Arc::new(|| (Box::new(MockTts::default()) as Box<dyn TtsClient>, None));
     AppState {
         db: db.clone(),
+        db_config: Arc::new(db_config),
         config: Arc::new(ServerConfig::default()),
         signer: Arc::new(JwtSigner::generate("voice-test".into())),
         refresh_store: Arc::new(RefreshStore::new(db.clone())),

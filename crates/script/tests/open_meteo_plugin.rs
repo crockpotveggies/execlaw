@@ -187,6 +187,74 @@ async fn chart_filename_falls_back_for_blank_titles() {
     assert_eq!(r.as_str().unwrap(), "chart.png");
 }
 
+/// Regression for the 2026-05-14 default-location bug. Pre-rework
+/// the agent kept asking the user for their current location even
+/// when the operator had pinned a default — because each `*_impl`
+/// did `require_number(args["latitude"], ...)` BEFORE merging
+/// defaults, so the require check fired against the user-supplied
+/// args (no lat/lon) instead of the merged map. The fix reorders
+/// the merge to happen first so the operator default counts as
+/// "supplied." This test pins both the merge order and the throw
+/// message that fires when neither args nor defaults supply
+/// coordinates (the operator-actionable hint matters: the agent
+/// reads the error and surfaces it, which only helps if the
+/// message points at the right settings page).
+///
+/// Note: the helper-level test exercises `_test_merge_with_defaults`
+/// directly. read_config in the test fixture returns the fallback
+/// defaults (no vault wired by `with_loopback_allowed_for_tests`),
+/// so the "operator pinned a default" arm requires us to construct
+/// args that override; the missing-default case naturally exercises
+/// the throw path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn require_coords_throws_with_actionable_settings_hint_when_unset() {
+    let p = open_meteo_plugin(None);
+    // Empty merged map → both lat/lon are unit → require_coords throws.
+    let merged: rhai::Map = rhai::Map::new();
+    let result = p
+        .invoke_async("_test_require_coords", vec![Dynamic::from(merged)])
+        .await;
+    let err = result.expect_err("missing coords must throw");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("Settings → Plugins → Open-Meteo"),
+        "throw must point at the operator settings page so the agent can surface an actionable error: {msg}"
+    );
+    assert!(
+        msg.contains("geocode"),
+        "throw must mention the geocode escape-hatch so the agent considers calling it: {msg}"
+    );
+}
+
+/// Regression: when args supply latitude+longitude, the merge keeps
+/// them (defaults don't clobber). Pins the precedence: caller-args
+/// always win over operator defaults.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_with_defaults_preserves_arg_supplied_coordinates() {
+    let p = open_meteo_plugin(None);
+    let mut args = rhai::Map::new();
+    args.insert("latitude".into(), Dynamic::from(64.146_f64));
+    args.insert("longitude".into(), Dynamic::from(-21.940_f64));
+    let merged = p
+        .invoke_async("_test_merge_with_defaults", vec![Dynamic::from(args)])
+        .await
+        .unwrap();
+    // _test_merge_with_defaults exposes the rhai Map; serde-roundtrip
+    // through invoke_async returns serde_json::Value. Pull both lat/lon
+    // back out and confirm they're the values we passed in.
+    let v: serde_json::Value = serde_json::to_value(merged.clone()).unwrap();
+    assert_eq!(
+        v.get("latitude").and_then(|x| x.as_f64()),
+        Some(64.146),
+        "arg-supplied latitude must reach the merged map verbatim: {v:?}",
+    );
+    assert_eq!(
+        v.get("longitude").and_then(|x| x.as_f64()),
+        Some(-21.940),
+        "arg-supplied longitude must reach the merged map verbatim: {v:?}",
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forecast_kind_picker_routes_to_daily_when_daily_present() {
     let p = open_meteo_plugin(None);
