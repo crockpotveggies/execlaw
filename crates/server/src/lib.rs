@@ -75,6 +75,7 @@ pub mod transport_registry;
 // `rhai_transport::RhaiBackedTransport`.
 pub mod skill_capture_runtime;
 pub mod skills_admin;
+pub mod spa;
 pub mod state;
 pub mod think_filter;
 pub mod tool_apis_http;

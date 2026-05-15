@@ -1,0 +1,44 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "execlaw",
+  "version": "0.1.0",
+  "identifier": "com.execlaw.app",
+  "mainBinaryName": "execlaw-tray",
+  "build": {
+    "beforeBuildCommand": "",
+    "beforeDevCommand": "",
+    "devUrl": "http://127.0.0.1:3031",
+    "frontendDist": "../placeholder-frontend"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [],
+    "security": {
+      "csp": null,
+      "capabilities": []
+    },
+    "macOSPrivateApi": false
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "category": "DeveloperTool",
+    "shortDescription": "Self-hosted Rust agent platform — menu bar app.",
+    "longDescription": "execlaw is a self-hosted agent platform with persistent memory, hook-based plugins, and per-conversation runner containers. The menu bar app supervises the local control plane and opens the chat UI.",
+    "icon": ["icons/icon.icns"],
+    "externalBin": ["bin/execlaw"],
+    "resources": [],
+    "macOS": {
+      "minimumSystemVersion": "13.0",
+      "frameworks": [],
+      "signingIdentity": null,
+      "providerShortName": null,
+      "entitlements": null
+    },
+    "dmg": {
+      "windowSize": { "width": 660, "height": 400 },
+      "appPosition": { "x": 180, "y": 170 },
+      "applicationFolderPosition": { "x": 480, "y": 170 }
+    }
+  }
+}

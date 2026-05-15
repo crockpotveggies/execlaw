@@ -174,6 +174,54 @@ open  http://127.0.0.1:3031/api/docs     # Swagger + AsyncAPI
 Windows the Service Control Manager always runs system-level, so
 `--system` is implied.
 
+### Install on macOS (Apple Silicon) — menu bar app
+
+For desktop Macs the recommended path is the menu bar `.app`. It
+bundles the same server binary as the CLI install above, but
+registers the LaunchAgent through Apple's modern `SMAppService`
+API — which means **dragging the `.app` to the Trash
+automatically removes the background service.** No leftover plist
+in `~/Library/LaunchAgents/`, no manual cleanup.
+
+1. Download the latest `execlaw_<version>_aarch64.dmg` from
+   [Releases](https://github.com/justinelgenlong/execlaw/releases).
+2. Open the `.dmg` and drag **execlaw** to `/Applications`.
+3. **First launch** — because the build is unsigned, Gatekeeper
+   refuses a double-click. Right-click execlaw → *Open* → confirm
+   in the dialog. macOS remembers the exception for subsequent
+   launches.
+4. The menu bar icon appears. The first time, macOS may surface
+   *Background Items Added* — that's `SMAppService` registering
+   the LaunchAgent. Approve in *System Settings → General →
+   Login Items & Extensions → Allow in Background* if prompted
+   (the tray's status row links you there).
+5. Click the menu bar icon → *Open execlaw*. The SPA loads from
+   the local server on `127.0.0.1:3031` and walks you through
+   first-run setup.
+
+The menu bar also exposes *Restart service*, *Open data folder*,
+and *Uninstall execlaw…* (the latter deregisters the LaunchAgent
+and optionally wipes `~/.execlaw/` before you drag the `.app` to
+Trash).
+
+**Build it yourself** — on a macOS 13+ host with Xcode CLT, Rust,
+Node 20, and `cargo install tauri-cli --version "^2.0"`:
+
+```bash
+./scripts/build-mac.sh
+# .app → desktop-macos/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/
+# .dmg → desktop-macos/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/
+```
+
+The .dmg opens to a Finder window showing the `execlaw` app on
+the left and an `Applications` symlink on the right — drag one
+to the other to install.
+
+See [desktop-macos/README.md](desktop-macos/README.md) for build
+details, [Phase 6d](docs/architecture.md) for the broader desktop
+wrapper design, and [CONTRIBUTING.md → Cutting a release](CONTRIBUTING.md)
+for the tag → GitHub Release flow.
+
 ### Service lifecycle
 
 | Command | What it does |

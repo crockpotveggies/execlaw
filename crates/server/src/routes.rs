@@ -793,6 +793,14 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::setup_preflight::setup_preflight_router())
         .merge(crate::docs::docs_router())
         .with_state(state)
+        // SPA fallback — merged LAST so every `/api/*` route above
+        // matches first. `crate::spa::spa_router()` owns `/` and
+        // `/{*path}`, embedding `web/dist/` so a Tauri webview
+        // (and any browser hitting the server directly) gets the
+        // chat UI on the same origin as the API. The fallback also
+        // implements React-Router-style deep-link rewrite to
+        // `index.html` for any extension-less miss.
+        .merge(crate::spa::spa_router())
         // Diagnostic layers, applied last so they wrap everything.
         //
         // CatchPanicLayer converts a panic in any handler into a

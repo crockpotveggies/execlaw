@@ -85,6 +85,18 @@ utoipa.workspace = true
 utoipa-axum.workspace = true
 utoipa-swagger-ui.workspace = true
 
+# Phase 6d — embed `web/dist/` so the server serves the SPA at `/`
+# on the same origin it serves `/api/*`. In debug builds rust-embed
+# reads files from disk at request time, so re-running `vite build`
+# while the server is up surfaces edits immediately; release builds
+# bake the bytes into the binary so the Tauri bundle is self-
+# contained. `interpolate-folder-path` lets the `#[folder = ...]`
+# attribute take an absolute path via `$CARGO_MANIFEST_DIR`, which
+# keeps the path correct whether you build from the workspace root
+# or from inside `crates/server`.
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }
+
 # Phase 14.D — disk-free probe.
 # `directories` resolves the default ~/.execlaw cache path; `fs4`
 # wraps the platform-native free-space syscalls (statvfs / GetDiskFreeSpaceExW)

@@ -27,6 +27,12 @@ members = [
     "crates/skills",
     "crates/model-adapter",
 ]
+# Tauri desktop wrapper is built with its own Rust toolchain via
+# `cargo tauri build` (which adds the WebView2/WKWebView linkage and
+# bundles assets) — keep it out of the main workspace so a plain
+# `cargo check` on a Linux/Windows host doesn't try to compile
+# macOS-only Apple framework bindings.
+exclude = ["desktop-macos/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -155,6 +161,13 @@ serde_json_path = "0.7"
 # the host's runtime — ureq has no runtime, just blocking sockets,
 # safe to call from inside spawn_blocking.
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+
+# Embed `web/dist/` into the server binary so one artifact serves
+# the SPA + API on the same origin. In debug builds the SPA is read
+# from disk at request time (interpolation friendly); release builds
+# bake the bytes into the binary.
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+mime_guess = "2"
 
 # --- testing ---
 tempdir = "0.3"

@@ -114,6 +114,75 @@ Common scopes: `whatsapp`, `signal`, `slack`, `sms-socket`, `core`,
 `docs`, `web`, `ci`. New scopes are fine if they describe a coherent
 slice of the system.
 
+### Cutting a release (macOS bundle → GitHub Releases)
+
+execlaw ships its macOS desktop bundle (`execlaw.app` + `.dmg`)
+through tag-driven GitHub Actions. The flow is:
+
+1. **Bump versions.** Two places must match — the root workspace
+   and the Tauri config:
+
+   - `Cargo.toml` → `[workspace.package].version`
+   - `desktop-macos/src-tauri/tauri.conf.json` → `version`
+
+   Commit the bump on its own:
+
+   ```
+   release: bump to 0.2.0
+   ```
+
+2. **Tag the bump commit.** Tag names must start with `v` — the
+   workflow trigger is `on: push: tags: v*`.
+
+   ```bash
+   git tag v0.2.0
+   git push origin main v0.2.0
+   ```
+
+3. **Wait for the workflow.** [`.github/workflows/macos-bundle.yml`](.github/workflows/macos-bundle.yml)
+   runs on `macos-14`. The whole pipeline (SPA build, release Rust
+   build, Tauri bundle, plist injection, ad-hoc resign, SHA256,
+   draft Release creation) takes ~15 minutes. Watch progress at
+   `https://github.com/<repo>/actions`.
+
+4. **Review the draft release.** The workflow creates a
+   `draft: true` Release titled `execlaw v0.2.0` with:
+   - `execlaw_0.2.0_aarch64.dmg`
+   - `execlaw_0.2.0_aarch64.dmg.sha256`
+   - Auto-generated "What's Changed" from merged PRs.
+
+   Open the draft at `https://github.com/<repo>/releases`, edit
+   the body if needed, and either **download the .dmg and test
+   it on a clean Mac** or trust the CI smoke build.
+
+5. **Publish.** Click **Publish release** in the GitHub UI. The
+   release becomes public, picked up by RSS, and surfaced under
+   the repo's *Releases* tab.
+
+6. **Verify the install path** on a fresh Mac:
+   ```bash
+   curl -L -o execlaw.dmg \
+     https://github.com/<repo>/releases/download/v0.2.0/execlaw_0.2.0_aarch64.dmg
+   shasum -a 256 -c <(curl -s https://github.com/<repo>/releases/download/v0.2.0/execlaw_0.2.0_aarch64.dmg.sha256)
+   open execlaw.dmg   # drag execlaw → Applications, right-click → Open
+   ```
+
+**Ad-hoc / dev builds.** To produce a `.dmg` from any branch
+without cutting a release, run the workflow manually via the
+**Actions → macOS bundle → Run workflow** button. That run uploads
+the `.dmg` as a workflow artifact (downloadable from the run page)
+but skips the GitHub Release creation.
+
+**Pre-releases.** Tag with `v0.2.0-rc1` and the current workflow
+still creates a draft Release; flip `prerelease: true` in the
+workflow if you want the "Pre-release" badge applied automatically.
+
+**Re-running a failed release.** If the bundle step succeeds but
+the upload fails, delete the draft Release in the GitHub UI and
+re-run the workflow from the Actions tab (the tag already
+exists). The workflow is idempotent against an existing tag — it
+overwrites the assets on the draft.
+
 ---
 
 ## Code conventions
