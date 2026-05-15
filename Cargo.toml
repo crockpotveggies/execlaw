@@ -52,7 +52,13 @@ tower-http = { version = "0.6", features = ["trace", "cors", "fs", "catch-panic"
 hyper = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 url = "2"
-tokio-tungstenite = "0.24"
+# tokio-tungstenite ships WITHOUT TLS in its default features — so a
+# bare `tokio-tungstenite = "0.24"` would fail every `wss://` connect
+# with "TLS support not compiled in" (signal/whatsapp sidecars use
+# loopback `ws://` so they don't hit it; slack + discord do, against
+# their public gateways). Enable rustls-tls-native-roots to match the
+# rustls + OS-trust-store choice reqwest already uses for OAuth.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 
 # --- storage ---
 # SQLCipher (encrypted SQLite) via bundled build with vendored OpenSSL.
