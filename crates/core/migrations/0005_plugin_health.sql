@@ -1,0 +1,51 @@
+-- 2026-05-15 — soften plugin-host's "auto-evict on hydrate failure" policy.
+--
+-- Pre-rework, when the plugin host failed to load a plugin's script on
+-- boot (file not found, manifest unparseable, subprocess spawn error),
+-- it called `evict_unrecoverable_plugin` which DELETED the
+-- state_plugins row outright. Operators who lost their staged plugin
+-- dirs to a transient cause (Windows file-handle race during cargo
+-- dev cycles, manual cleanup of `~/.execlaw/plugins/`, etc.) found
+-- their entire plugin install list empty on the next restart, with
+-- OAuth tokens + vault secrets stranded under plugin_ids the SPA no
+-- longer knows about.
+--
+-- The fix is non-destructive quarantine. The plugin host marks the
+-- row as broken (with a reason + timestamp) and disables its hooks
+-- in the in-memory registry — but the install record + OAuth +
+-- vault state survive. The SPA renders a "needs reinstall" badge
+-- on the plugins page; operator re-uploads the ZIP; install path
+-- clears the quarantine and the configs are still there.
+--
+-- Columns:
+--
+--   `health_status`  — 'healthy' (the default) or 'quarantined'.
+--                      Free-form TEXT rather than a strict enum so
+--                      future health states (e.g. 'crash_looping',
+--                      'rate_limited') don't need a migration; the
+--                      plugin host code is the source of truth for
+--                      what values are meaningful.
+--
+--   `health_message` — Operator-facing one-liner describing why the
+--                      plugin is quarantined. NULL when healthy.
+--                      Examples:
+--                        "script load failed: io: cannot find path"
+--                        "manifest unparseable: missing [plugin] table"
+--                        "subprocess spawn failed: ENOENT"
+--                      Surfaced in the SPA's plugin-row "broken"
+--                      tooltip so operators see what went wrong
+--                      without grepping logs.
+--
+--   `quarantined_at` — Unix timestamp (seconds) when the row entered
+--                      the quarantined state, or NULL when healthy.
+--                      Lets the SPA show "broken since 2026-05-14
+--                      17:21" — useful for distinguishing "just
+--                      broke this restart" from "operator never
+--                      noticed a long-broken plugin."
+--
+-- All columns default to the healthy/empty state, so every existing
+-- row migrates as 'healthy' — no operator action needed.
+
+ALTER TABLE state_plugins ADD COLUMN health_status TEXT NOT NULL DEFAULT 'healthy';
+ALTER TABLE state_plugins ADD COLUMN health_message TEXT;
+ALTER TABLE state_plugins ADD COLUMN quarantined_at INTEGER;

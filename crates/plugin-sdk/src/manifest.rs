@@ -1162,7 +1162,7 @@ mod tests {
         let m = PluginManifest::parse(SIGNAL_MANIFEST)
             .expect("plugins/signal/plugin.toml must parse cleanly");
         assert_eq!(m.plugin.id, "signal");
-        assert_eq!(m.plugin.version, "0.4.7");
+        assert_eq!(m.plugin.version, "0.5.0");
         // The transport icon must propagate from manifest → SDK so
         // the SPA's sidebar can render a Signal-shaped marker on
         // bridged threads. The SPA's ChannelIcon has a brand-SVG
@@ -1275,7 +1275,7 @@ mod tests {
         let m = PluginManifest::parse(DISCORD_MANIFEST)
             .expect("plugins/discord/plugin.toml must parse cleanly");
         assert_eq!(m.plugin.id, "discord");
-        assert_eq!(m.plugin.version, "0.1.0");
+        assert_eq!(m.plugin.version, "0.2.0");
 
         let transport = m.transport.as_ref().expect("[transport] must be present");
         assert_eq!(transport.transport_id, "discord");
@@ -1346,7 +1346,7 @@ mod tests {
         let m = PluginManifest::parse(GOOGLE_APPS_MANIFEST)
             .expect("plugins/google-apps/plugin.toml must parse cleanly");
         assert_eq!(m.plugin.id, "google-apps");
-        assert_eq!(m.plugin.version, "0.1.0");
+        assert_eq!(m.plugin.version, "0.2.0");
 
         // Identity provider survives the consolidation — same shape
         // as google-contacts had.

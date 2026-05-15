@@ -73,6 +73,33 @@ pub struct PluginSummary {
     /// stored manifest_toml is unparseable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// 2026-05-15 — health surface for the SPA's row badge. Values:
+    ///   * `"healthy"` (default) — plugin loaded cleanly on the last
+    ///     hydrate / install / enable. SPA renders the row normally.
+    ///   * `"quarantined"` — boot-time hydrate failed (e.g. staged
+    ///     `main.rhai` missing, manifest unparseable, subprocess
+    ///     spawn failed). The plugin host disabled the in-memory
+    ///     hooks but kept the install record + OAuth + vault state
+    ///     so a reinstall heals everything. SPA should render a
+    ///     yellow "broken — needs reinstall" badge with
+    ///     `health_message` in the tooltip and offer a re-upload
+    ///     affordance instead of the normal config page (whose
+    ///     admin routes would 404 because the registry is empty).
+    pub health_status: String,
+    /// One-line failure reason when `health_status != "healthy"`.
+    /// Examples:
+    ///   * `"script load failed: io: cannot find path"`
+    ///   * `"manifest unparseable: missing [plugin] table"`
+    ///   * `"subprocess spawn failed: ENOENT"`
+    /// `None` when healthy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_message: Option<String>,
+    /// Unix timestamp (seconds) when the plugin entered its current
+    /// non-healthy state. `None` when healthy. Lets the SPA render
+    /// "broken since 17:21" — useful for distinguishing a fresh
+    /// failure from a long-untouched one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantined_at: Option<i64>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -319,6 +346,9 @@ pub async fn list_handler(State(state): State<AppState>) -> impl IntoResponse {
                         updated_at: r.updated_at,
                         has_settings_ui,
                         description,
+                        health_status: r.health_status,
+                        health_message: r.health_message,
+                        quarantined_at: r.quarantined_at,
                     }
                 })
                 .collect();

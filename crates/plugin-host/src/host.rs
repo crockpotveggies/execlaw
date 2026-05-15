@@ -67,6 +67,26 @@ pub struct PluginRow {
     pub enabled: bool,
     pub installed_at: i64,
     pub updated_at: i64,
+    /// 2026-05-15 — non-destructive replacement for the auto-evict
+    /// policy. `"healthy"` (the default) means the plugin loaded
+    /// cleanly on the last hydrate / install / enable; any other
+    /// value means the in-memory registry has the plugin disabled
+    /// but the install record + OAuth + vault state survive so the
+    /// operator can reinstall without losing config. Today the only
+    /// non-healthy value is `"quarantined"`; keep the column TEXT so
+    /// a future "crash_looping" / "rate_limited" state doesn't need
+    /// a migration.
+    pub health_status: String,
+    /// One-line operator-facing reason this row is non-healthy.
+    /// `None` when `health_status == "healthy"`. Surfaced in the
+    /// SPA's plugin-row tooltip so operators see the failure
+    /// without grepping logs.
+    pub health_message: Option<String>,
+    /// Unix timestamp (seconds) when the row entered its current
+    /// non-healthy state, or `None` when healthy. Lets the SPA show
+    /// "broken since X" — useful for distinguishing a fresh failure
+    /// from one that has been broken for days.
+    pub quarantined_at: Option<i64>,
 }
 
 /// Orchestrator. Cheap to clone; shares one `HookRegistry` and one
@@ -477,6 +497,13 @@ impl PluginHost {
             enabled: true,
             installed_at: now,
             updated_at: now,
+            // Fresh installs are always healthy — the steps above
+            // (manifest parse, hook register, runtime spawn) all
+            // succeeded. Quarantine only happens later, on a boot-
+            // time hydrate that fails to load the plugin.
+            health_status: "healthy".to_owned(),
+            health_message: None,
+            quarantined_at: None,
         };
         self.insert_row(&row)?;
 
@@ -839,6 +866,13 @@ impl PluginHost {
         row.enabled = true;
         row.updated_at = chrono::Utc::now().timestamp();
         self.update_row(&row)?;
+        // 2026-05-15 — clear any prior quarantine marker. If this
+        // enable was the operator's manual recovery from a hydrate
+        // failure that quarantined the plugin earlier, the row was
+        // sitting at health_status='quarantined' until now.
+        // enable() succeeded, so the plugin loads cleanly again —
+        // mark it healthy so the SPA drops the "broken" badge.
+        self.mark_healthy(plugin_id);
         info!(plugin_id, "plugin enabled");
 
         // Fire on_enable for script plugins so a fresh enable / a
@@ -880,13 +914,16 @@ impl PluginHost {
                 Ok(m) => m,
                 Err(e) => {
                     // Unparseable manifest in the DB row → the row
-                    // can never hydrate cleanly. Auto-purge so the
-                    // SPA shows the plugin as uninstalled and the
-                    // operator can reinstall from a clean state
-                    // (see `evict_unrecoverable_plugin` for the
-                    // full rationale on auto-purge vs disable).
-                    warn!(plugin_id = %row.plugin_id, error = %e, "unparseable manifest; auto-purging zombie state_plugins row");
-                    self.evict_unrecoverable_plugin(&row.plugin_id, "unparseable manifest");
+                    // can't hydrate. Quarantine instead of delete so
+                    // the operator's OAuth + vault state survive the
+                    // reinstall, and the SPA renders a "needs
+                    // reinstall: <reason>" badge instead of making
+                    // the plugin disappear from the install list.
+                    warn!(plugin_id = %row.plugin_id, error = %e, "unparseable manifest on hydrate; quarantining (state_plugins row preserved)");
+                    self.quarantine_plugin(
+                        &row.plugin_id,
+                        &format!("manifest unparseable: {e}"),
+                    );
                     continue;
                 }
             };
@@ -918,11 +955,11 @@ impl PluginHost {
                                     warn!(
                                         plugin_id = %row.plugin_id,
                                         error = %e,
-                                        "subprocess plugin manifest missing runtime.executable; auto-purging",
+                                        "subprocess plugin manifest missing runtime.executable; quarantining (state_plugins row preserved)",
                                     );
-                                    self.evict_unrecoverable_plugin(
+                                    self.quarantine_plugin(
                                         &row.plugin_id,
-                                        "missing runtime.executable",
+                                        &format!("manifest missing runtime.executable: {e}"),
                                     );
                                     continue;
                                 }
@@ -950,18 +987,21 @@ impl PluginHost {
                                 Err(e) => {
                                     // Subprocess won't spawn → the
                                     // staged binary is gone or
-                                    // unexec'able. Auto-purge so the
-                                    // operator gets a coherent
-                                    // "install this plugin" affordance
-                                    // instead of a zombie row.
+                                    // unexec'able. Quarantine so the
+                                    // SPA shows the plugin as broken
+                                    // (with the spawn error visible)
+                                    // and gives the operator a
+                                    // reinstall affordance, while
+                                    // keeping OAuth + vault state
+                                    // intact for the reinstall.
                                     warn!(
                                         plugin_id = %row.plugin_id,
                                         error = %e,
-                                        "subprocess spawn failed on hydrate; auto-purging zombie state_plugins row",
+                                        "subprocess spawn failed on hydrate; quarantining (state_plugins row preserved)",
                                     );
-                                    self.evict_unrecoverable_plugin(
+                                    self.quarantine_plugin(
                                         &row.plugin_id,
-                                        "subprocess spawn failed",
+                                        &format!("subprocess spawn failed: {e}"),
                                     );
                                 }
                             }
@@ -973,11 +1013,11 @@ impl PluginHost {
                                     warn!(
                                         plugin_id = %row.plugin_id,
                                         error = %e,
-                                        "script plugin manifest missing runtime.source; auto-purging",
+                                        "script plugin manifest missing runtime.source; quarantining (state_plugins row preserved)",
                                     );
-                                    self.evict_unrecoverable_plugin(
+                                    self.quarantine_plugin(
                                         &row.plugin_id,
-                                        "missing runtime.source",
+                                        &format!("manifest missing runtime.source: {e}"),
                                     );
                                     continue;
                                 }
@@ -1014,20 +1054,36 @@ impl PluginHost {
                                     // route 404s with the confusing
                                     // "no [[admin_routes]] entry on
                                     // plugin 'X' matching GET /…"
-                                    // error. Auto-purging the row
-                                    // restores DB ↔ registry parity
-                                    // and gives the operator the
-                                    // correct affordance: install
-                                    // this plugin (because it isn't,
-                                    // any more).
+                                    // error.
+                                    //
+                                    // 2026-05-15 — quarantine instead
+                                    // of delete (the rev-2 fix). The
+                                    // earlier auto-purge silently
+                                    // destroyed install records when
+                                    // the staged dir went transiently
+                                    // missing (Windows file-handle
+                                    // race during cargo dev cycles,
+                                    // manual cleanup of
+                                    // `~/.execlaw/plugins/`, etc.) —
+                                    // operators lost their entire
+                                    // install list overnight while
+                                    // OAuth tokens + vault secrets
+                                    // were stranded under plugin_ids
+                                    // the SPA no longer knew about.
+                                    // Quarantine keeps the row +
+                                    // marks it broken; SPA renders a
+                                    // "needs reinstall" badge with
+                                    // the error visible; reinstall
+                                    // path clears the quarantine
+                                    // and the configs come back.
                                     warn!(
                                         plugin_id = %row.plugin_id,
                                         error = %e,
-                                        "failed to load script on hydrate; auto-purging zombie state_plugins row",
+                                        "failed to load script on hydrate; quarantining (state_plugins row preserved; OAuth/vault state kept; SPA shows reinstall affordance)",
                                     );
-                                    self.evict_unrecoverable_plugin(
+                                    self.quarantine_plugin(
                                         &row.plugin_id,
-                                        "script load failed",
+                                        &format!("script load failed: {e}"),
                                     );
                                 }
                             }
@@ -1042,59 +1098,17 @@ impl PluginHost {
         Ok(())
     }
 
-    /// Tear down the in-memory + DB state for a plugin whose hydrate
-    /// failed in an unrecoverable way (manifest unparseable, stage
-    /// dir missing, runtime binary missing, etc.).
-    ///
-    /// Pre-2026-05-14 hydrate just called `registry.disable(plugin_id)`
-    /// on the in-memory side and left the `state_plugins` row alone.
-    /// That left an "enabled in DB but missing from registry" zombie
-    /// state — the SPA happily rendered the plugin's settings page
-    /// (because it queries `state_plugins` for the install list),
-    /// then every admin route call 404'd with
-    ///   `no [[admin_routes]] entry on plugin 'X' matching GET /…`
-    /// because the registry had nothing for it.
-    ///
-    /// Now we evict both sides:
-    ///
-    ///   1. `registry.disable(plugin_id)` — clear hooks, sidecars,
-    ///      tools, admin_routes, etc. (unchanged from before).
-    ///   2. `delete_row(plugin_id)` — drop the `state_plugins` row
-    ///      so the SPA's install list reflects reality. The operator
-    ///      then sees the plugin as uninstalled and gets a clean
-    ///      "install" affordance instead of a broken config page.
-    ///
-    /// We do NOT call the orchestrator's `purge_plugin` from here —
-    /// that's a server-layer concern (sidecar containers, on-disk
-    /// state, OAuth + vault + artifact cleanup) and pulling it in
-    /// would invert the crate dependency. The orchestrator already
-    /// runs on uninstall + factory reset; this eviction is the
-    /// narrower "the DB row no longer corresponds to a loadable
-    /// plugin" cleanup.
-    ///
-    /// `reason` is logged with the eviction for ops visibility.
-    /// Best-effort: a delete failure is logged at WARN and the
-    /// boot proceeds (the next hydrate will retry the eviction).
-    fn evict_unrecoverable_plugin(&self, plugin_id: &str, reason: &str) {
-        self.inner.registry.disable(plugin_id);
-        match self.delete_row(plugin_id) {
-            Ok(()) => {
-                tracing::info!(
-                    plugin_id,
-                    reason,
-                    "evicted unrecoverable plugin row from state_plugins",
-                );
-            }
-            Err(e) => {
-                warn!(
-                    plugin_id,
-                    reason,
-                    error = %e,
-                    "failed to delete state_plugins row for unrecoverable plugin; SPA may still show zombie state until next boot",
-                );
-            }
-        }
-    }
+    // 2026-05-15 — `evict_unrecoverable_plugin` removed in favour of
+    // `quarantine_plugin` (defined further down alongside the other
+    // DB row helpers). The earlier auto-evict policy DELETED the
+    // state_plugins row on every hydrate failure, which silently
+    // destroyed the install record on transient causes (Windows file-
+    // handle race during cargo dev cycles, manual cleanup of
+    // `~/.execlaw/plugins/`, etc.) and stranded operators' OAuth
+    // tokens + vault secrets under plugin_ids the SPA no longer
+    // knew about. The new quarantine path keeps the row + marks it
+    // broken; the SPA renders a "needs reinstall" badge instead of
+    // making the plugin disappear from the install list entirely.
 
     /// Query every registered identity-provider plugin to resolve a
     /// transport identifier (`{transport, handle}`) into a set of
@@ -1302,7 +1316,8 @@ impl PluginHost {
             .with_conn(|c| {
                 let mut stmt = c.prepare_cached(
                     "SELECT plugin_id, version, manifest_toml, stage_path, enabled, \
-                        installed_at, updated_at \
+                        installed_at, updated_at, \
+                        health_status, health_message, quarantined_at \
                  FROM state_plugins ORDER BY plugin_id",
                 )?;
                 let rows = stmt
@@ -1315,6 +1330,9 @@ impl PluginHost {
                             enabled: r.get::<_, i64>(4)? != 0,
                             installed_at: r.get(5)?,
                             updated_at: r.get(6)?,
+                            health_status: r.get(7)?,
+                            health_message: r.get(8)?,
+                            quarantined_at: r.get(9)?,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -1330,7 +1348,8 @@ impl PluginHost {
                 let got = c
                     .query_row(
                         "SELECT plugin_id, version, manifest_toml, stage_path, enabled, \
-                            installed_at, updated_at \
+                            installed_at, updated_at, \
+                            health_status, health_message, quarantined_at \
                      FROM state_plugins WHERE plugin_id = ?1",
                         params![plugin_id],
                         |r| {
@@ -1342,6 +1361,9 @@ impl PluginHost {
                                 enabled: r.get::<_, i64>(4)? != 0,
                                 installed_at: r.get(5)?,
                                 updated_at: r.get(6)?,
+                                health_status: r.get(7)?,
+                                health_message: r.get(8)?,
+                                quarantined_at: r.get(9)?,
                             })
                         },
                     )
@@ -1355,8 +1377,9 @@ impl PluginHost {
         self.inner.db.with_conn(|c| {
             c.execute(
                 "INSERT INTO state_plugins \
-                 (plugin_id, version, manifest_toml, stage_path, enabled, installed_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (plugin_id, version, manifest_toml, stage_path, enabled, installed_at, updated_at, \
+                  health_status, health_message, quarantined_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     row.plugin_id,
                     row.version,
@@ -1365,10 +1388,93 @@ impl PluginHost {
                     row.enabled as i64,
                     row.installed_at,
                     row.updated_at,
+                    row.health_status,
+                    row.health_message,
+                    row.quarantined_at,
                 ],
             )?;
             Ok(())
         }).map_err(PluginHostError::Db)
+    }
+
+    /// 2026-05-15 — non-destructive replacement for
+    /// `evict_unrecoverable_plugin`. Marks the row as quarantined +
+    /// disables hooks in the in-memory registry, but keeps the
+    /// install record + OAuth + vault state. The operator's next
+    /// reinstall picks up the existing config without re-running
+    /// the OAuth flow / re-typing API keys.
+    ///
+    /// Reason flows into `state_plugins.health_message` and is
+    /// surfaced in the SPA's plugin-row tooltip. Best-effort: a
+    /// failed UPDATE is logged at WARN but boot proceeds (the next
+    /// hydrate will retry the quarantine).
+    fn quarantine_plugin(&self, plugin_id: &str, reason: &str) {
+        // Step 1: pull hooks/admin_routes/tools/sidecars out of the
+        // in-memory registry so the plugin doesn't surface partly-
+        // wired functionality. Same first move as the old
+        // evict_unrecoverable_plugin path.
+        self.inner.registry.disable(plugin_id);
+        // Step 2: mark the DB row as quarantined. Pre-rework this
+        // was `delete_row(plugin_id)` — silently destructive on a
+        // transient file-not-found. Now we preserve the install
+        // record so the SPA can render a "needs reinstall" badge
+        // and the operator's OAuth tokens / vault secrets / artifact
+        // blobs (FK'd by plugin_id) stay valid for the eventual
+        // reinstall.
+        let now = chrono::Utc::now().timestamp();
+        let result = self.inner.db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_plugins \
+                 SET health_status = 'quarantined', \
+                     health_message = ?1, \
+                     quarantined_at = ?2, \
+                     updated_at = ?2 \
+                 WHERE plugin_id = ?3",
+                params![reason, now, plugin_id],
+            )?;
+            Ok::<_, DbError>(())
+        });
+        match result {
+            Ok(()) => info!(
+                plugin_id,
+                reason,
+                "plugin quarantined (state_plugins row preserved; OAuth/vault/artifact rows kept; SPA shows reinstall affordance)",
+            ),
+            Err(e) => warn!(
+                plugin_id,
+                reason,
+                error = %e,
+                "failed to mark plugin quarantined; in-memory registry has the plugin disabled but the DB row may show stale health",
+            ),
+        }
+    }
+
+    /// Clear the quarantine flag on a row. Called from the install /
+    /// upgrade / enable success paths to flip a previously broken
+    /// plugin back to healthy without a second migration / row delete
+    /// dance. Best-effort: a failed UPDATE is logged but doesn't
+    /// fail the install (the in-memory state is already correct;
+    /// the worst case is the SPA shows a stale "broken" badge until
+    /// the next restart).
+    fn mark_healthy(&self, plugin_id: &str) {
+        let result = self.inner.db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_plugins \
+                 SET health_status = 'healthy', \
+                     health_message = NULL, \
+                     quarantined_at = NULL \
+                 WHERE plugin_id = ?1",
+                params![plugin_id],
+            )?;
+            Ok::<_, DbError>(())
+        });
+        if let Err(e) = result {
+            warn!(
+                plugin_id,
+                error = %e,
+                "failed to clear quarantine flag on state_plugins; SPA may show stale 'broken' badge until next restart",
+            );
+        }
     }
 
     fn update_row(&self, row: &PluginRow) -> Result<(), PluginHostError> {
@@ -2526,11 +2632,25 @@ latency = "low"
     /// every admin route 404'd with
     ///   `no [[admin_routes]] entry on plugin 'X' matching GET /…`
     ///
-    /// Post-fix: hydrate calls `evict_unrecoverable_plugin` which
-    /// disables in the registry AND deletes the `state_plugins` row.
-    /// SPA now correctly sees the plugin as uninstalled.
+    /// Mid-fix (2026-05-14, commit f7d0725): hydrate called
+    /// `evict_unrecoverable_plugin` which disabled in the registry
+    /// AND DELETED the `state_plugins` row. Fixed the zombie 404
+    /// problem but introduced a new one: transient stage-loss
+    /// (Windows file-handle race during cargo dev cycles, manual
+    /// cleanup of `~/.execlaw/plugins/`, etc.) silently destroyed
+    /// the install record overnight, stranding operators' OAuth
+    /// tokens + vault secrets under plugin_ids the SPA no longer
+    /// knew about.
+    ///
+    /// Final fix (2026-05-15): hydrate calls `quarantine_plugin`
+    /// which disables in the registry but PRESERVES the row + marks
+    /// it `health_status='quarantined'`. Operator's reinstall heals
+    /// the quarantine and OAuth/vault state survives automatically.
+    /// SPA queries the new health fields to render a "broken — needs
+    /// reinstall" badge instead of either the zombie 404 OR the
+    /// silent disappearance.
     #[tokio::test]
-    async fn hydrate_auto_purges_zombie_row_when_stage_dir_is_missing() {
+    async fn hydrate_quarantines_row_when_stage_dir_is_missing() {
         let db = fresh_db();
         let registry = HookRegistry::new();
         let stage_root = tempfile::tempdir().unwrap();
@@ -2541,16 +2661,14 @@ latency = "low"
         // identity_provider non-empty) so the hydrate path actually
         // tries to load `main.rhai`. A tool-less plugin's hydrate
         // would skip the script-load step entirely and never hit
-        // the eviction branch we're testing.
+        // the quarantine branch we're testing.
         let (_tmp, stage) = stage_script_plugin_with_on_disable("zombie-test", "0.1.0");
         host.install(&stage).await.unwrap();
-        assert!(
-            host.get_row("zombie-test").unwrap().is_some(),
-            "test setup: install must succeed before we simulate stage-loss",
-        );
+        let installed = host.get_row("zombie-test").unwrap().expect("install must succeed");
+        assert_eq!(installed.health_status, "healthy", "fresh install must be healthy");
 
         // Simulate the stage-dir loss (factory-reset orphan sweep,
-        // manual rm, etc.).
+        // manual rm, Windows file-handle race during cargo restart, etc.).
         std::fs::remove_dir_all(&stage).unwrap();
 
         // Spin up a fresh PluginHost backed by the SAME DB so the
@@ -2560,25 +2678,43 @@ latency = "low"
         let host2 = PluginHost::new(db.clone(), registry2, stage_root.path().to_path_buf());
         host2.hydrate().await.unwrap();
 
-        // Post-hydrate: the zombie row must be gone (auto-purged).
-        assert!(
-            host2.get_row("zombie-test").unwrap().is_none(),
-            "hydrate must auto-purge the state_plugins row when the stage dir is missing — \
-             that's the load-bearing fix for the 'no [[admin_routes]] entry' SPA 404",
+        // Post-hydrate: the row MUST still exist (preserving OAuth
+        // tokens + vault secrets keyed on this plugin_id) but be
+        // marked quarantined with the failure reason.
+        let row = host2
+            .get_row("zombie-test")
+            .unwrap()
+            .expect("hydrate must NOT delete the row — that's the bug we're fixing");
+        assert_eq!(
+            row.health_status, "quarantined",
+            "missing stage dir must mark the row quarantined, not healthy",
         );
-        // And the registry must reflect uninstalled state.
+        let msg = row.health_message.expect("quarantined row must carry a reason");
+        assert!(
+            msg.contains("script load failed"),
+            "health_message must explain the failure (got: {msg})",
+        );
+        assert!(
+            row.quarantined_at.unwrap_or(0) > 0,
+            "quarantined_at must be a real timestamp",
+        );
+
+        // And the registry must reflect uninstalled state — admin
+        // routes are gone so the SPA's old config-page 404 is also
+        // gone (the SPA reads health_status and renders the
+        // reinstall affordance instead).
         assert!(
             host2.registry().admin_routes_for("zombie-test").is_empty(),
-            "registry must have no admin_routes for an evicted plugin",
+            "registry must have no admin_routes for a quarantined plugin",
         );
     }
 
-    /// Hydrate evicting an unparseable manifest: a hand-edited or
-    /// migration-corrupted `state_plugins.manifest_toml` blob is
-    /// just as unrecoverable as a missing stage dir, and produces
-    /// the same zombie state if we leave it alone. Auto-purge.
+    /// Hydrate quarantining an unparseable manifest: a hand-edited
+    /// or migration-corrupted `state_plugins.manifest_toml` blob is
+    /// just as unrecoverable as a missing stage dir from the
+    /// hydrate path's perspective, and quarantines the same way.
     #[tokio::test]
-    async fn hydrate_auto_purges_zombie_row_when_manifest_is_unparseable() {
+    async fn hydrate_quarantines_row_when_manifest_is_unparseable() {
         use rusqlite::params;
         let db = fresh_db();
         let registry = HookRegistry::new();
@@ -2586,6 +2722,9 @@ latency = "low"
         let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
 
         // Insert a hand-crafted row whose manifest_toml is garbage.
+        // Default health_status is 'healthy' (column NOT NULL DEFAULT
+        // 'healthy' from the migration), so we don't need to
+        // explicitly set it in this hand-crafted INSERT.
         let now = chrono::Utc::now().timestamp();
         db.with_conn(|c| {
             c.execute(
@@ -2606,10 +2745,61 @@ latency = "low"
 
         host.hydrate().await.unwrap();
 
+        let row = host
+            .get_row("bad-manifest")
+            .unwrap()
+            .expect("hydrate must NOT delete the row");
+        assert_eq!(row.health_status, "quarantined");
+        let msg = row.health_message.expect("quarantined row must carry a reason");
         assert!(
-            host.get_row("bad-manifest").unwrap().is_none(),
-            "unparseable-manifest rows must be auto-evicted on hydrate",
+            msg.contains("manifest unparseable"),
+            "health_message must explain the failure (got: {msg})",
         );
+    }
+
+    /// Reinstall heals the quarantine: an operator who lost their
+    /// staged plugin dir can re-upload the same plugin ZIP, and
+    /// the new install MUST mark the row healthy again. This is
+    /// the recovery path the user-facing "Reinstall" button uses.
+    #[tokio::test]
+    async fn upgrade_heals_quarantined_row() {
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
+
+        // Stage + install, then yank the stage dir + hydrate to land
+        // the row in the quarantined state — same setup as the
+        // quarantine test above.
+        let (_tmp1, stage1) = stage_script_plugin_with_on_disable("heal-test", "0.1.0");
+        host.install(&stage1).await.unwrap();
+        std::fs::remove_dir_all(&stage1).unwrap();
+        let registry2 = HookRegistry::new();
+        let host2 = PluginHost::new(db.clone(), registry2, stage_root.path().to_path_buf());
+        host2.hydrate().await.unwrap();
+        assert_eq!(
+            host2.get_row("heal-test").unwrap().unwrap().health_status,
+            "quarantined",
+            "test setup: row must be quarantined before we test the heal path",
+        );
+
+        // The operator's reinstall: stage a fresh copy, call upgrade
+        // (which is what the SPA's `?if_existing=upgrade` route
+        // dispatches to). Upgrade does disable→uninstall→install,
+        // and install creates a row with `health_status='healthy'`.
+        let (_tmp2, stage2) = stage_script_plugin_with_on_disable("heal-test", "0.1.1");
+        host2.upgrade(&stage2).await.unwrap();
+
+        let row = host2
+            .get_row("heal-test")
+            .unwrap()
+            .expect("post-upgrade row must exist");
+        assert_eq!(
+            row.health_status, "healthy",
+            "reinstall must clear the quarantine — that's the recovery path",
+        );
+        assert!(row.health_message.is_none(), "healthy row must have no error message");
+        assert!(row.quarantined_at.is_none(), "healthy row must have no quarantined_at");
     }
 
     // === trust_floor enforcement ===
