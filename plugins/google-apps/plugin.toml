@@ -192,8 +192,29 @@ latency = "medium"
 # =====================================================================
 
 [[tools]]
+name = "contacts.search"
+description = """Look up Google contacts by name, email, or phone — \
+the FIRST choice for "find this person's contact info". Args: \
+{ query: string (name fragment, email fragment, or phone digits), \
+max_results?: integer (default 25, cap 100) }. Uses Google's \
+server-side fuzzy search across all the operator's contacts and \
+falls back to a local substring scan if Google's search cache is \
+cold. Returns the same { contacts: [{ principal_id, display_name, \
+emails, phones }], total } shape as `contacts.list`. Prefer this \
+over `contacts.list` whenever you know the name/email/phone you're \
+looking for — `contacts.list` is for browsing the whole address \
+book, not for targeted lookup."""
+trust_floor = "Controller"
+latency = "medium"
+
+[[tools]]
 name = "contacts.list"
-description = "List the operator's Google contacts. Returns name, email addresses, and phone numbers per contact."
+description = """Dump every Google contact, paginating through the \
+full address book. Args: { limit?: integer (default 200, cap 5000) }. \
+Returns { contacts: [...], total, limit }. Use this only when you \
+need the whole address book — for "find this person" lookups, use \
+`contacts.search` instead, which is faster and reliable for \
+operators with large contact lists."""
 trust_floor = "Controller"
 latency = "medium"
 

@@ -134,6 +134,7 @@ fn tool_call(name, args, oauth) {
     if name == "calendar.delete_event" { return cal_delete_event_impl(token, args); }
 
     // Contacts
+    if name == "contacts.search" { return contacts_search_impl(token, args); }
     if name == "contacts.list" { return contacts_list_impl(token, args); }
 
     // Tasks
@@ -888,17 +889,68 @@ fn cal_normalise_when(block) {
 // Contacts — ported from plugins/google-contacts/main.rhai.
 // ===========================================================================
 
+// Fetch ALL of the operator's connections, paginating through
+// nextPageToken. The previous single-page version silently dropped
+// any contact past the first 1000, which made name-lookup fail for
+// operators with larger address books — the exact symptom that
+// motivated adding `contacts.search` alongside this.
+//
+// Hard cap: 5000 contacts. Operators with more than that almost
+// certainly want `contacts.search` instead of dumping the whole
+// list; the cap exists so a runaway pagination loop can't burn the
+// rate limit / blow up memory.
 fn contacts_fetch_connections(token) {
-    let resp = http_get_cached(
-        "https://people.googleapis.com/v1/people/me/connections",
-        #{ "personFields": "names,emailAddresses,phoneNumbers", "pageSize": "1000" },
-        token,
-        300,
-    );
-    if resp == () || resp["connections"] == () {
+    let HARD_CAP = 5000;
+    let acc = [];
+    let next = "";
+    let pages = 0;
+    while pages < 10 {
+        pages += 1;
+        let query = #{
+            "personFields": "names,emailAddresses,phoneNumbers",
+            "pageSize": "1000",
+        };
+        if next != "" {
+            query["pageToken"] = next;
+        }
+        // First page is cached 5 min (matches the previous behaviour);
+        // subsequent pages bypass the cache since the cache key
+        // includes the pageToken and there's no point caching a deep
+        // page individually. Use http_get (uncached) for pages > 1.
+        let resp = if next == "" {
+            http_get_cached(
+                "https://people.googleapis.com/v1/people/me/connections",
+                query,
+                token,
+                300,
+            )
+        } else {
+            http_get(
+                "https://people.googleapis.com/v1/people/me/connections",
+                query,
+                token,
+            )
+        };
+        if resp == () { break; }
+        let connections = resp["connections"];
+        if connections != () {
+            for c in connections {
+                acc.push(c);
+                if acc.len() >= HARD_CAP {
+                    return acc;
+                }
+            }
+        }
+        let token_next = resp["nextPageToken"];
+        if token_next == () || token_next == "" {
+            break;
+        }
+        next = token_next;
+    }
+    if acc.len() == 0 {
         return ();
     }
-    resp["connections"]
+    acc
 }
 
 fn contacts_person_matches(person, transport, target) {
@@ -981,8 +1033,16 @@ fn contacts_summarize_person(person) {
 }
 
 fn contacts_list_impl(token, args) {
+    // Cap raised from 200 → 5000 (matches fetch_connections' HARD_CAP).
+    // The previous 200 default was the silent-truncation bug: agents
+    // calling contacts.list to "find <name>" only saw the first 200
+    // contacts and missed anyone past that. With contacts.search now
+    // available as the lookup path, contacts.list is the "give me the
+    // whole address book" tool — so let it actually return the whole
+    // address book.
     let limit = if args.len() > 0 && args["limit"] != () {
-        args["limit"]
+        let n = args["limit"];
+        if n > 5000 { 5000 } else if n < 1 { 1 } else { n }
     } else {
         200
     };
@@ -997,6 +1057,130 @@ fn contacts_list_impl(token, args) {
         out.push(contacts_summarize_person(connections[i]));
     }
     #{ "contacts": out, "total": total, "limit": limit }
+}
+
+// Server-side search via People API `searchContacts`. Falls back to
+// a local substring scan against the paginated `contacts.list`
+// result when Google returns empty — Google's search index has a
+// known "cold cache" failure mode where the first call after a long
+// idle returns no results even though the contacts exist. The
+// fallback makes lookup reliable in that case.
+//
+// Match semantics for the fallback (case-insensitive substring on
+// display_name, any email, any phone digits):
+//   * "alice"       → matches "Alice Wong"
+//   * "alice@x"     → matches by email
+//   * "5551234"     → matches by phone (digits-only compare)
+fn contacts_search_impl(token, args) {
+    let query = if args["query"] != () { args["query"] } else { "" };
+    if "" + query == "" {
+        throw "contacts.search requires a non-empty `query`";
+    }
+    let max_results = if args["max_results"] != () {
+        let n = args["max_results"];
+        if n > 100 { 100 } else if n < 1 { 1 } else { n }
+    } else {
+        25
+    };
+
+    // 1) Google server-side search. readMask must be CSV; sources
+    //    defaults to READ_SOURCE_TYPE_CONTACT which is what we want
+    //    (the operator's own contacts, not directory/profile rows).
+    let resp = http_get(
+        "https://people.googleapis.com/v1/people:searchContacts",
+        #{
+            "query": "" + query,
+            "readMask": "names,emailAddresses,phoneNumbers",
+            "pageSize": "" + max_results,
+        },
+        token,
+    );
+
+    let out = [];
+    if resp != () && resp["results"] != () {
+        for r in resp["results"] {
+            if r["person"] != () {
+                out.push(contacts_summarize_person(r["person"]));
+            }
+        }
+    }
+    if out.len() > 0 {
+        return #{ "contacts": out, "total": out.len(), "query": "" + query, "source": "google" };
+    }
+
+    // 2) Fallback: paginated full-list scan with case-insensitive
+    //    substring match. Hits when Google's index is cold or the
+    //    contact's display name contains odd characters Google's
+    //    fuzzy matcher misses (e.g. nicknames stored under "Notes").
+    let connections = contacts_fetch_connections(token);
+    if connections == () {
+        return #{ "contacts": [], "total": 0, "query": "" + query, "source": "fallback" };
+    }
+    let needle = lower(trim("" + query));
+    let needle_digits = digits_only("" + query);
+    for c in connections {
+        if contacts_local_match(c, needle, needle_digits) {
+            out.push(contacts_summarize_person(c));
+            if out.len() >= max_results {
+                break;
+            }
+        }
+    }
+    #{ "contacts": out, "total": out.len(), "query": "" + query, "source": "fallback" }
+}
+
+// True when `person` matches the search needle on display name (case-
+// insensitive substring), any email (case-insensitive substring), or
+// any phone (digit-only substring). The digits-only check is skipped
+// when the needle has no digits, so a "smith" query doesn't spuriously
+// match phone numbers.
+fn contacts_local_match(person, needle, needle_digits) {
+    // Display name.
+    if person["names"] != () {
+        for n in person["names"] {
+            if n["displayName"] != () {
+                let lc = lower("" + n["displayName"]);
+                if lc.contains(needle) {
+                    return true;
+                }
+            }
+            if n["givenName"] != () {
+                let lc = lower("" + n["givenName"]);
+                if lc.contains(needle) {
+                    return true;
+                }
+            }
+            if n["familyName"] != () {
+                let lc = lower("" + n["familyName"]);
+                if lc.contains(needle) {
+                    return true;
+                }
+            }
+        }
+    }
+    // Emails.
+    if person["emailAddresses"] != () {
+        for e in person["emailAddresses"] {
+            if e["value"] != () {
+                let lc = lower("" + e["value"]);
+                if lc.contains(needle) {
+                    return true;
+                }
+            }
+        }
+    }
+    // Phones — only when the needle contains digits.
+    if needle_digits != "" && person["phoneNumbers"] != () {
+        for p in person["phoneNumbers"] {
+            if p["value"] != () {
+                let digs = digits_only("" + p["value"]);
+                if digs.contains(needle_digits) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 // ===========================================================================

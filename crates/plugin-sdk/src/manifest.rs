@@ -1379,10 +1379,10 @@ mod tests {
             );
         }
 
-        // Tool count: Gmail (10) + Calendar (7) + Contacts (1) + Tasks (6)
-        // + Drive (6) = 30. If you add or remove a tool, update both
+        // Tool count: Gmail (10) + Calendar (7) + Contacts (2) + Tasks (6)
+        // + Drive (6) = 31. If you add or remove a tool, update both
         // here and the dispatch table in main.rhai.
-        assert_eq!(m.tools.len(), 30);
+        assert_eq!(m.tools.len(), 31);
 
         // EVERY tool except `calendar.check_availability` pins
         // Controller. This is the v1 trust contract — the plugin's
@@ -1414,6 +1414,7 @@ mod tests {
             "calendar.update_event",
             "calendar.delete_event",
             // Contacts.
+            "contacts.search",
             "contacts.list",
             // Tasks — all tools.
             "tasks.list_lists",

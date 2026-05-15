@@ -164,6 +164,10 @@ fn load_script_against_mock(mock_url: &str) -> String {
             &format!(r#""{mock_url}/v1/people/me/connections""#),
         )
         .replace(
+            r#""https://people.googleapis.com/v1/people:searchContacts""#,
+            &format!(r#""{mock_url}/v1/people:searchContacts""#),
+        )
+        .replace(
             r#""https://tasks.googleapis.com/tasks/v1/users/@me/lists""#,
             &format!(r#""{mock_url}/tasks/v1/users/@me/lists""#),
         )
@@ -376,6 +380,120 @@ async fn contacts_list_returns_normalised_shape() {
     assert_eq!(contacts.len(), 1);
     assert_eq!(contacts[0]["display_name"], "Alice");
     assert_eq!(contacts[0]["emails"][0], "a@x");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn contacts_search_returns_google_results_when_index_is_warm() {
+    // Happy path — searchContacts returns matches, plugin surfaces them
+    // with the "google" source tag so the caller can tell which path
+    // resolved the lookup. This is the path that fixes the silent-miss
+    // bug for operators with >200 contacts.
+    let (url, _) = spawn_mock_recording(&[(
+        "/v1/people:searchContacts",
+        r#"{"results":[
+            {"person":{"resourceName":"people/c42",
+             "names":[{"displayName":"Justin Long"}],
+             "emailAddresses":[{"value":"justin@x"}]}}
+        ]}"#,
+    )]);
+    let plugin = build_plugin(&url);
+    let r = plugin
+        .tool_call(
+            "contacts.search",
+            serde_json::json!({"query": "justin"}),
+            oauth("t"),
+        )
+        .await
+        .unwrap();
+    let contacts = r["contacts"].as_array().unwrap();
+    assert_eq!(contacts.len(), 1);
+    assert_eq!(contacts[0]["display_name"], "Justin Long");
+    assert_eq!(r["source"], "google");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn contacts_search_falls_back_to_local_scan_when_google_returns_empty() {
+    // The "cold cache" failure mode: searchContacts returns no results
+    // (Google's index hasn't primed yet), but the connections list
+    // clearly contains the target. The fallback substring-matches the
+    // display name and surfaces the contact with the "fallback" source
+    // tag. Without this, the silent-miss bug we just fixed would
+    // reappear whenever Google's search index was cold.
+    let (url, _) = spawn_mock_recording(&[
+        ("/v1/people:searchContacts", r#"{"results":[]}"#),
+        (
+            "/v1/people/me/connections",
+            r#"{"connections":[
+                {"resourceName":"people/c1","names":[{"displayName":"Bob Smith"}],
+                 "emailAddresses":[{"value":"bob@x"}]},
+                {"resourceName":"people/c2","names":[{"displayName":"Justin Long"}],
+                 "emailAddresses":[{"value":"justin@x"}]}
+            ]}"#,
+        ),
+    ]);
+    let plugin = build_plugin(&url);
+    let r = plugin
+        .tool_call(
+            "contacts.search",
+            serde_json::json!({"query": "justin"}),
+            oauth("t"),
+        )
+        .await
+        .unwrap();
+    let contacts = r["contacts"].as_array().unwrap();
+    assert_eq!(contacts.len(), 1, "fallback must skip non-matching contacts");
+    assert_eq!(contacts[0]["display_name"], "Justin Long");
+    assert_eq!(r["source"], "fallback");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn contacts_search_fallback_matches_by_phone_digits() {
+    // Phone substring match. The needle "5551234" must hit
+    // "+1 (555) 123-4567" via digits_only normalisation. Pins the
+    // contract that phone-number lookup works even when the stored
+    // contact has formatting characters the query doesn't.
+    let (url, _) = spawn_mock_recording(&[
+        ("/v1/people:searchContacts", r#"{"results":[]}"#),
+        (
+            "/v1/people/me/connections",
+            r#"{"connections":[
+                {"resourceName":"people/c1","names":[{"displayName":"Alice"}],
+                 "phoneNumbers":[{"value":"+1 (555) 123-4567"}]}
+            ]}"#,
+        ),
+    ]);
+    let plugin = build_plugin(&url);
+    let r = plugin
+        .tool_call(
+            "contacts.search",
+            serde_json::json!({"query": "5551234"}),
+            oauth("t"),
+        )
+        .await
+        .unwrap();
+    let contacts = r["contacts"].as_array().unwrap();
+    assert_eq!(contacts.len(), 1);
+    assert_eq!(contacts[0]["display_name"], "Alice");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn contacts_search_rejects_empty_query() {
+    // Defensive — caller MUST provide a query; we don't dump the
+    // address book when the search field is empty. (The dump path
+    // is `contacts.list`, deliberately separated.)
+    let plugin = build_plugin("http://127.0.0.1:1");
+    let err = plugin
+        .tool_call(
+            "contacts.search",
+            serde_json::json!({"query": ""}),
+            oauth("t"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("non-empty"),
+        "expected non-empty query rejection, got: {err}",
+    );
 }
 
 // ===========================================================================
