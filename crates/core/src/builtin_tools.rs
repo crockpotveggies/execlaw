@@ -2023,13 +2023,31 @@ fn defensive_unstringify_spec_fields(spec: &mut Value) {
 
 /// If `v` is a string that parses as JSON, replace it with the
 /// parsed value. Otherwise leave it alone.
+///
+/// 2026-05-16 — uses `Deserializer::from_str(...).into_iter::<Value>()`
+/// instead of strict `serde_json::from_str` so we accept "almost-valid
+/// JSON with extra trailing garbage" — the second observed live
+/// failure mode (NVDA chart turn). The model emitted
+///   `series = "[{...}]}"`   (one extra `}` after the array close)
+/// which `serde_json::from_str` rejects with `Extra data: line 1
+/// column N`. Streaming via `into_iter().next()` consumes the FIRST
+/// complete JSON value and stops — the trailing `}` is ignored.
+/// Equivalent to "be liberal in what you accept" without giving up
+/// the safety of a real JSON parser.
 fn defensive_reparse_string_value(v: &mut Value) {
     let Some(s) = v.as_str() else {
         return;
     };
-    if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let mut iter = serde_json::Deserializer::from_str(trimmed).into_iter::<Value>();
+    if let Some(Ok(parsed)) = iter.next() {
         *v = parsed;
     }
+    // Else: leave the string in place so the downstream
+    // `from_value::<ChartSpec>` produces a meaningful error.
 }
 
 pub struct RenderChartTool {
@@ -3025,6 +3043,64 @@ mod tests {
         let mut spec = serde_json::json!({ "series": "not-json-at-all" });
         super::defensive_unstringify_spec_fields(&mut spec);
         assert_eq!(spec["series"], "not-json-at-all");
+    }
+
+    /// Regression for the second live failure (NVDA chart turn,
+    /// 2026-05-16): the model emitted `series` as a stringified
+    /// array with EXTRA TRAILING characters appended — `[{...}]}`
+    /// (one extra `}`) instead of `[{...}]`. The strict
+    /// `serde_json::from_str` parse rejected it with
+    /// `Extra data: line 1 column N`; the helper bailed and the
+    /// chart never rendered.
+    ///
+    /// The streaming `Deserializer::from_str(...).into_iter()`
+    /// approach consumes the FIRST complete JSON value and ignores
+    /// trailing garbage, which is exactly what we want here. Be
+    /// liberal in what you accept — the chart spec just needs the
+    /// well-formed prefix.
+    #[test]
+    fn defensive_unstringify_recovers_string_with_trailing_extra_chars() {
+        let mut spec = serde_json::json!({
+            // Note the extra `}` at the end — the actual byte-for-byte
+            // shape from the production failure.
+            "series": "[{\"name\": \"NVDA\", \"points\": [{\"x\": 1, \"y\": 198.35}]}]}",
+        });
+        super::defensive_unstringify_spec_fields(&mut spec);
+        let series = spec.get("series").expect("series present");
+        assert!(
+            series.is_array(),
+            "stringified series with trailing extra chars MUST be re-parsed (the \
+             trailing `}}` is the second observed live LLM failure mode); got: {series}",
+        );
+        let arr = series.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "the well-formed prefix is exactly one series");
+        assert_eq!(arr[0]["name"], "NVDA");
+        assert_eq!(arr[0]["points"][0]["y"].as_f64(), Some(198.35));
+    }
+
+    /// Whitespace + trailing newline shouldn't trip the recovery.
+    #[test]
+    fn defensive_unstringify_recovers_string_with_surrounding_whitespace() {
+        let mut spec = serde_json::json!({
+            "series": "  [{\"name\": \"X\", \"points\": []}]  \n",
+        });
+        super::defensive_unstringify_spec_fields(&mut spec);
+        assert!(spec["series"].is_array());
+        assert_eq!(spec["series"][0]["name"], "X");
+    }
+
+    /// Truly incomplete JSON (e.g. an unclosed array) should be left
+    /// alone — we only want to handle "valid prefix + trailing
+    /// garbage", not "rebuild the JSON from a fragment." Operator
+    /// gets a clear downstream error in that case.
+    #[test]
+    fn defensive_unstringify_leaves_incomplete_json_alone() {
+        let mut spec = serde_json::json!({
+            "series": "[{\"name\": \"X\", \"points\": [{",
+        });
+        super::defensive_unstringify_spec_fields(&mut spec);
+        // Original string preserved (parse failed, no `next()` value).
+        assert!(spec["series"].is_string());
     }
 
     // --- Registrar ---
