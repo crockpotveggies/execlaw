@@ -817,7 +817,20 @@ impl SidecarSupervisor {
                 );
                 match self.controller.health_check(&url).await {
                     Ok(true) => {
-                        info!(sidecar = %sidecar.name, "sidecar healthy via RPC probe (no Docker HEALTHCHECK)");
+                        // Bollard `inspect` returns `Starting` forever
+                        // for images without a Docker HEALTHCHECK
+                        // (bbernhard/signal-cli-rest-api is one), so
+                        // this branch fires every reconcile tick once
+                        // the sidecar is actually healthy. Gate the
+                        // INFO event on the transition (mirroring the
+                        // Healthy-branch log at the bottom of this
+                        // file) and emit DEBUG per probe so operators
+                        // tailing at DEBUG can still see the loop.
+                        if !matches!(slot.status, ServiceStatus::Healthy) {
+                            info!(sidecar = %sidecar.name, "sidecar healthy via RPC probe (no Docker HEALTHCHECK)");
+                        } else {
+                            debug!(sidecar = %sidecar.name, "sidecar RPC probe ok");
+                        }
                         slot.restart_attempts = 0;
                         self.transition_status(&sidecar.name, slot, ServiceStatus::Healthy);
                     }

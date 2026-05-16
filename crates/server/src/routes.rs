@@ -832,12 +832,19 @@ pub fn build_router(state: AppState) -> Router {
             },
         ))
         .layer(
+            // 2026-05-15 — request/response spans live at DEBUG, not
+            // INFO. The Settings > Logs viewer was drowning in
+            // `finished processing request` lines from periodic
+            // pollers (/api/admin/backends/*/status every 5s for four
+            // backends, /api/admin/alerts/count, /api/admin/sidecars
+            // status checks, etc.). Server-error responses (5xx) still
+            // surface at ERROR via `TraceLayer`'s default `on_failure`.
             tower_http::trace::TraceLayer::new_for_http()
                 .make_span_with(
-                    tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO),
+                    tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::DEBUG),
                 )
                 .on_response(
-                    tower_http::trace::DefaultOnResponse::new().level(tracing::Level::INFO),
+                    tower_http::trace::DefaultOnResponse::new().level(tracing::Level::DEBUG),
                 ),
         )
 }
