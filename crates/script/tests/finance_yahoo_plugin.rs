@@ -150,7 +150,11 @@ async fn interval_and_range_validators_accept_only_known_values() {
             .invoke_async("_test_is_valid_interval", vec![Dynamic::from(bad)])
             .await
             .unwrap();
-        assert_eq!(r.as_bool(), Some(false), "interval `{bad}` should be invalid");
+        assert_eq!(
+            r.as_bool(),
+            Some(false),
+            "interval `{bad}` should be invalid"
+        );
     }
     for ok in ["1d", "1mo", "ytd", "max"] {
         let r = p
@@ -169,7 +173,11 @@ async fn extract_quote_returns_shape_error_on_garbage_body() {
     let r: Value = p
         .invoke_async(
             "_test_extract_quote",
-            vec![Dynamic::from("not a map"), Dynamic::from("AAPL"), Dynamic::from("equity")],
+            vec![
+                Dynamic::from("not a map"),
+                Dynamic::from("AAPL"),
+                Dynamic::from("equity"),
+            ],
         )
         .await
         .unwrap();
@@ -208,13 +216,19 @@ async fn extract_quote_projects_happy_path() {
         )
         .await
         .unwrap();
-    assert!(r.get("error").map(|v| v.is_null()).unwrap_or(true), "no error field expected; got {r}");
+    assert!(
+        r.get("error").map(|v| v.is_null()).unwrap_or(true),
+        "no error field expected; got {r}"
+    );
     assert_eq!(r.get("symbol").and_then(|v| v.as_str()), Some("AAPL"));
     let price = r.get("price").and_then(|v| v.as_f64()).unwrap();
     assert!((price - 193.42).abs() < 1e-9);
     let change_pct = r.get("change_pct").and_then(|v| v.as_f64()).unwrap();
     // (193.42 - 190.00) / 190.00 * 100 = 1.8 (approx)
-    assert!((change_pct - 1.8).abs() < 0.01, "got change_pct={change_pct}");
+    assert!(
+        (change_pct - 1.8).abs() < 0.01,
+        "got change_pct={change_pct}"
+    );
     assert_eq!(
         r.get("chat_component_kind").and_then(|v| v.as_str()),
         Some("stock_quote")
@@ -233,7 +247,10 @@ async fn extract_quote_returns_upstream_error_envelope() {
         )
         .await
         .unwrap();
-    assert_eq!(r.get("error").and_then(|v| v.as_str()), Some("upstream_error"));
+    assert_eq!(
+        r.get("error").and_then(|v| v.as_str()),
+        Some("upstream_error")
+    );
     assert_eq!(r.get("detail").and_then(|v| v.as_str()), Some("Not Found"));
 }
 
@@ -247,7 +264,9 @@ async fn extract_session_cookie_picks_a1_a3_a1s_only() {
     let r: Value = p
         .invoke_async(
             "_test_extract_session_cookie",
-            vec![Dynamic::from("A1=foo=bar; Domain=.yahoo.com; Path=/; Secure")],
+            vec![Dynamic::from(
+                "A1=foo=bar; Domain=.yahoo.com; Path=/; Secure",
+            )],
         )
         .await
         .unwrap();
@@ -260,10 +279,7 @@ async fn extract_session_cookie_picks_a1_a3_a1s_only() {
     arr.push(Dynamic::from("A1=v1=abc; Domain=.yahoo.com; HttpOnly"));
     arr.push(Dynamic::from("A3=v3=def; Domain=.yahoo.com"));
     let r: Value = p
-        .invoke_async(
-            "_test_extract_session_cookie",
-            vec![Dynamic::from(arr)],
-        )
+        .invoke_async("_test_extract_session_cookie", vec![Dynamic::from(arr)])
         .await
         .unwrap();
     assert_eq!(r.as_str(), Some("A1=v1=abc; A3=v3=def"));
@@ -288,18 +304,12 @@ async fn pick_raw_unwraps_yahoo_wrapped_numbers() {
 
     // Yahoo's wrapped `{ raw, fmt, longFmt }` form returns the raw.
     let body = json_to_dynamic(json!({ "raw": 12345, "fmt": "12.3K", "longFmt": "12,345" }));
-    let r: Value = p
-        .invoke_async("_test_pick_raw", vec![body])
-        .await
-        .unwrap();
+    let r: Value = p.invoke_async("_test_pick_raw", vec![body]).await.unwrap();
     assert_eq!(r.as_i64(), Some(12345));
 
     // Missing raw — returns null.
     let body = json_to_dynamic(json!({ "fmt": "N/A" }));
-    let r: Value = p
-        .invoke_async("_test_pick_raw", vec![body])
-        .await
-        .unwrap();
+    let r: Value = p.invoke_async("_test_pick_raw", vec![body]).await.unwrap();
     assert!(r.is_null());
 }
 
@@ -366,10 +376,19 @@ async fn extract_quote_summary_projects_modules() {
         .await
         .unwrap();
     assert_eq!(r.get("symbol").and_then(|v| v.as_str()), Some("AAPL"));
-    assert_eq!(r.get("market_cap").and_then(|v| v.as_i64()), Some(3_000_000_000));
+    assert_eq!(
+        r.get("market_cap").and_then(|v| v.as_i64()),
+        Some(3_000_000_000)
+    );
     assert_eq!(r.get("sector").and_then(|v| v.as_str()), Some("Technology"));
-    assert_eq!(r.get("industry").and_then(|v| v.as_str()), Some("Consumer Electronics"));
-    assert_eq!(r.get("short_name").and_then(|v| v.as_str()), Some("Apple Inc."));
+    assert_eq!(
+        r.get("industry").and_then(|v| v.as_str()),
+        Some("Consumer Electronics")
+    );
+    assert_eq!(
+        r.get("short_name").and_then(|v| v.as_str()),
+        Some("Apple Inc.")
+    );
     assert_eq!(
         r.get("chat_component_kind").and_then(|v| v.as_str()),
         Some("stock_quote_summary")
@@ -394,8 +413,14 @@ async fn extract_quote_summary_returns_error_envelope_on_upstream_error() {
         )
         .await
         .unwrap();
-    assert_eq!(r.get("error").and_then(|v| v.as_str()), Some("upstream_error"));
-    assert_eq!(r.get("detail").and_then(|v| v.as_str()), Some("Invalid Crumb"));
+    assert_eq!(
+        r.get("error").and_then(|v| v.as_str()),
+        Some("upstream_error")
+    );
+    assert_eq!(
+        r.get("detail").and_then(|v| v.as_str()),
+        Some("Invalid Crumb")
+    );
 }
 
 // ---- Live tool dispatch against a loopback mock HTTP server -------
@@ -442,12 +467,20 @@ impl MockServer {
                 let path = parts.get(1).copied().unwrap_or("").to_owned();
                 let body_idx = req.find("\r\n\r\n").map(|i| i + 4).unwrap_or(req.len());
                 let body = req[body_idx..].to_owned();
-                requests_for_thread.lock().unwrap().push((method, path, body));
+                requests_for_thread
+                    .lock()
+                    .unwrap()
+                    .push((method, path, body));
 
                 let (status, content_type, resp_body, extra_headers) = if !responses.is_empty() {
                     responses.remove(0)
                 } else {
-                    (404, "text/plain", "no more canned responses".into(), Vec::new())
+                    (
+                        404,
+                        "text/plain",
+                        "no more canned responses".into(),
+                        Vec::new(),
+                    )
                 };
                 let mut extras = String::new();
                 for (k, v) in &extra_headers {
@@ -652,20 +685,33 @@ async fn quote_summary_retries_once_on_401_after_refreshing_session() {
         .await
         .expect("retry path should succeed");
 
-    assert!(r.get("error").map(|v| v.is_null()).unwrap_or(true), "unexpected error: {r}");
+    assert!(
+        r.get("error").map(|v| v.is_null()).unwrap_or(true),
+        "unexpected error: {r}"
+    );
     assert_eq!(r["symbol"], "TSLA");
     assert_eq!(r["short_name"], "Tesla, Inc.");
     assert_eq!(r["market_cap"], 1_000_000_000_i64);
 
     let reqs = mock.requests();
-    assert_eq!(reqs.len(), 6, "expected 6 calls (2 session + protected + 2 session + retry), got: {reqs:?}");
+    assert_eq!(
+        reqs.len(),
+        6,
+        "expected 6 calls (2 session + protected + 2 session + retry), got: {reqs:?}"
+    );
 
     // The first quoteSummary call should carry old-crumb; the retry
     // should carry fresh-crumb.
     let first_summary_path = &reqs[2].1;
-    assert!(first_summary_path.contains("crumb=old-crumb"), "first call: {first_summary_path}");
+    assert!(
+        first_summary_path.contains("crumb=old-crumb"),
+        "first call: {first_summary_path}"
+    );
     let retry_summary_path = &reqs[5].1;
-    assert!(retry_summary_path.contains("crumb=fresh-crumb"), "retry call: {retry_summary_path}");
+    assert!(
+        retry_summary_path.contains("crumb=fresh-crumb"),
+        "retry call: {retry_summary_path}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -734,7 +780,10 @@ async fn quote_summary_runs_full_crumb_flow_on_first_call() {
         .await
         .expect("quote_summary dispatch should succeed");
 
-    assert!(r.get("error").map(|v| v.is_null()).unwrap_or(true), "unexpected error: {r}");
+    assert!(
+        r.get("error").map(|v| v.is_null()).unwrap_or(true),
+        "unexpected error: {r}"
+    );
     assert_eq!(r["symbol"], "AAPL");
     assert_eq!(r["sector"], "Technology");
     assert_eq!(r["short_name"], "Apple Inc.");
@@ -765,7 +814,9 @@ async fn quote_summary_runs_full_crumb_flow_on_first_call() {
         reqs[2].1
     );
     assert!(
-        reqs[2].1.contains("modules=summaryDetail%2CassetProfile%2Cprice"),
+        reqs[2]
+            .1
+            .contains("modules=summaryDetail%2CassetProfile%2Cprice"),
         "modules CSV must be encoded: {}",
         reqs[2].1
     );

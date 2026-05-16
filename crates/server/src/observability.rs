@@ -547,8 +547,7 @@ mod tests {
 
     #[test]
     fn parse_jsonl_line_falls_back_to_target_when_no_message() {
-        let line =
-            r#"{"timestamp":"2026-05-15T10:30:00Z","level":"WARN","fields":{},"target":"some::module"}"#;
+        let line = r#"{"timestamp":"2026-05-15T10:30:00Z","level":"WARN","fields":{},"target":"some::module"}"#;
         let entry = parse_jsonl_line(line).expect("parses");
         assert_eq!(entry.message, "some::module");
         assert!(entry.fields.is_none());

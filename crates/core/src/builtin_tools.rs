@@ -2179,9 +2179,7 @@ impl ToolImpl for RenderChartTool {
         let api = match ctx.attachments.as_ref() {
             Some(a) => a,
             None => {
-                return ToolOutcome::denied(
-                    "attachment_send capability not granted to this tool",
-                );
+                return ToolOutcome::denied("attachment_send capability not granted to this tool");
             }
         };
         // Decode the spec via the charting crate's own ChartSpec
@@ -2203,35 +2201,28 @@ impl ToolImpl for RenderChartTool {
         // mistake doesn't kill the whole render.
         let mut spec_value = parsed.spec.clone();
         defensive_unstringify_spec_fields(&mut spec_value);
-        let spec: execlaw_charting::ChartSpec =
-            match serde_json::from_value(spec_value) {
-                Ok(s) => s,
-                Err(e) => {
-                    return ToolOutcome::err(
-                        "invalid_spec",
-                        format!("chart.render: invalid spec: {e}"),
-                    );
-                }
-            };
+        let spec: execlaw_charting::ChartSpec = match serde_json::from_value(spec_value) {
+            Ok(s) => s,
+            Err(e) => {
+                return ToolOutcome::err(
+                    "invalid_spec",
+                    format!("chart.render: invalid spec: {e}"),
+                );
+            }
+        };
         let width = clamp_render_chart_dim(parsed.width, execlaw_charting::DEFAULT_WIDTH);
         let height = clamp_render_chart_dim(parsed.height, execlaw_charting::DEFAULT_HEIGHT);
         // Plotters renders are 1-20ms in practice; keep it inline.
         let svg = match execlaw_charting::render_to_svg(&spec, width, height) {
             Ok(s) => s,
             Err(e) => {
-                return ToolOutcome::err(
-                    "render_failed",
-                    format!("chart.render: svg: {e}"),
-                );
+                return ToolOutcome::err("render_failed", format!("chart.render: svg: {e}"));
             }
         };
         let png = match execlaw_charting::render_to_png(&spec, width, height) {
             Ok(p) => p,
             Err(e) => {
-                return ToolOutcome::err(
-                    "render_failed",
-                    format!("chart.render: png: {e}"),
-                );
+                return ToolOutcome::err("render_failed", format!("chart.render: png: {e}"));
             }
         };
         let filename = parsed
@@ -2300,20 +2291,20 @@ impl ToolImpl for RenderChartTool {
                     );
                 }
                 ToolOutcome::Ok(json!({
-                "attachment_id": view.attachment_id,
-                "sha256": view.sha256,
-                "size_bytes": view.size_bytes,
-                "filename": filename,
-                "mime_type": "image/png",
-                "width": width,
-                "height": height,
-                // The SPA's chat-component dispatcher reads `svg` to
-                // render inline without a follow-up fetch.
-                "svg": svg,
-                // Hint the SPA on which chat-component to mount —
-                // the existing convention for plugin tool results.
-                "chat_component_kind": "chart",
-            }))
+                    "attachment_id": view.attachment_id,
+                    "sha256": view.sha256,
+                    "size_bytes": view.size_bytes,
+                    "filename": filename,
+                    "mime_type": "image/png",
+                    "width": width,
+                    "height": height,
+                    // The SPA's chat-component dispatcher reads `svg` to
+                    // render inline without a follow-up fetch.
+                    "svg": svg,
+                    // Hint the SPA on which chat-component to mount —
+                    // the existing convention for plugin tool results.
+                    "chat_component_kind": "chart",
+                }))
             }
             Err(e) => e.into_outcome(),
         }
@@ -3030,7 +3021,10 @@ mod tests {
         });
         super::defensive_unstringify_spec_fields(&mut spec);
         let band = &spec["band"];
-        assert!(band.is_object(), "stringified band wrapper must be re-parsed");
+        assert!(
+            band.is_object(),
+            "stringified band wrapper must be re-parsed"
+        );
         assert!(band["low"].is_array());
         assert!(band["high"].is_array());
     }

@@ -140,12 +140,7 @@ mod tests {
     async fn root_returns_html_or_diagnostic() {
         let app = router();
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
         // 200 (bundle present) or 404 (bundle missing) — both are
@@ -199,4 +194,3 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
-

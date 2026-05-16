@@ -15,9 +15,7 @@ fn dist_finance_yahoo_zip_stages_cleanly() {
         .unwrap()
         .parent()
         .unwrap();
-    let zip_path = workspace_root
-        .join("dist")
-        .join("finance-yahoo-0.1.0.zip");
+    let zip_path = workspace_root.join("dist").join("finance-yahoo-0.1.0.zip");
     if !zip_path.exists() {
         // Fresh clones / CI may not have the zip yet — it's a release
         // artifact rebuilt by the packaging step, not a checked-in

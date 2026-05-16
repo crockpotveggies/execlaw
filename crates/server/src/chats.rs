@@ -6022,9 +6022,7 @@ mod tests {
 
     /// Helper — seed a skill into the store so we can attach it.
     fn seed_skill(state: &crate::state::AppState, name: &str, body: &str) {
-        use execlaw_skills::{
-            NewSkill, NewSkillVersion, RegistrationKind, SkillStore, Strictness,
-        };
+        use execlaw_skills::{NewSkill, NewSkillVersion, RegistrationKind, SkillStore, Strictness};
         let store = SkillStore::new(state.db.clone());
         store
             .create(
@@ -6078,10 +6076,7 @@ mod tests {
     /// AND the applied_skill_names metadata). Going through the log
     /// rather than the response body proves the round-trip lands on
     /// disk + survives a future history replay.
-    fn read_user_msg_payload(
-        state: &crate::state::AppState,
-        cid: &str,
-    ) -> UserMessagePayload {
+    fn read_user_msg_payload(state: &crate::state::AppState, cid: &str) -> UserMessagePayload {
         let log = event_log(state);
         let events = log
             .replay_since(&ConversationId::from(cid), EventSeq(0))
@@ -6135,8 +6130,7 @@ mod tests {
         seed_skill(&state, "test/alpha", "alpha guidance");
         seed_skill(&state, "test/beta", "beta guidance");
         let app = crate::routes::build_router(state.clone());
-        let (status, _) =
-            send_with_skills(app, "go", &["test/beta", "test/alpha"]).await;
+        let (status, _) = send_with_skills(app, "go", &["test/beta", "test/alpha"]).await;
         assert_eq!(status, StatusCode::OK);
 
         let payload = read_user_msg_payload(&state, "conv1");
@@ -6158,8 +6152,7 @@ mod tests {
     async fn send_message_unknown_skill_name_returns_404() {
         let state = test_app_state();
         let app = crate::routes::build_router(state);
-        let (status, body) =
-            send_with_skills(app, "go", &["test/does-not-exist"]).await;
+        let (status, body) = send_with_skills(app, "go", &["test/does-not-exist"]).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "skill_not_found");
     }
@@ -6191,8 +6184,7 @@ mod tests {
         seed_skill(&state, "test/big1", &big_body);
         seed_skill(&state, "test/big2", &big_body);
         let app = crate::routes::build_router(state);
-        let (status, body) =
-            send_with_skills(app, "go", &["test/big1", "test/big2"]).await;
+        let (status, body) = send_with_skills(app, "go", &["test/big1", "test/big2"]).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(body["error"]["code"], "skill_prepend_too_large");
     }
