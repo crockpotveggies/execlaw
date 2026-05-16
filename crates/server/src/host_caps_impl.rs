@@ -498,7 +498,7 @@ async fn consumer_loop(
                             });
                         }
                         Some(Ok(Message::Binary(b))) => {
-                            tracing::info!(
+                            tracing::debug!(
                                 target: "host_caps::ws",
                                 %url,
                                 len = b.len(),
@@ -522,7 +522,12 @@ async fn consumer_loop(
                             // by the consumer task and only ONE arm
                             // of this `select!` runs per iteration,
                             // so we never race the outbox writer.
-                            tracing::info!(
+                            // Keepalive — fires every ~30s per live WS
+                            // (sms-socket gateway, Slack RTM, etc.).
+                            // DEBUG so it stays out of the operator
+                            // log while still being visible when an
+                            // operator is debugging a stalled socket.
+                            tracing::debug!(
                                 target: "host_caps::ws",
                                 %url,
                                 len = payload.len(),
