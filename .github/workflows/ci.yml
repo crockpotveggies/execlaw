@@ -72,6 +72,27 @@ jobs:
           targets: ${{ matrix.target }}
           components: clippy, rustfmt
 
+      # Native system libraries needed by transitive deps:
+      #   * `libfontconfig1-dev` + `libfreetype6-dev` — pulled in by
+      #     `plotters`'s `ttf` feature via `font-kit` →
+      #     `yeslogic-fontconfig-sys` + `freetype-sys`. The
+      #     `execlaw-charting` crate (used by the native
+      #     `chart.render` built-in) needs these to render PNG charts
+      #     with proper antialiased text. macOS uses Core Text and
+      #     Windows uses DirectWrite — both have no system-dep
+      #     requirement, so this step is Linux-only.
+      #   * `pkg-config` is already on the GitHub-hosted ubuntu-latest
+      #     image but listed for explicitness — `*-sys` crates
+      #     resolve their system libs through it.
+      - name: Install Linux system deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libfontconfig1-dev \
+            libfreetype6-dev
+
       - name: Cache cargo registry + build artifacts
         uses: Swatinem/rust-cache@v2
         with:
