@@ -939,6 +939,88 @@ pub trait AttachmentApi: Send + Sync {
         attachment_id: &str,
         caption: Option<&str>,
     ) -> Result<DeliveredAttachmentView, ApiError>;
+
+    /// 2026-05-15 — persist `bytes` as a content-addressed plugin
+    /// artifact and return the new attachment_id (plus integrity +
+    /// size metadata). Built-in tools that PRODUCE files (the
+    /// chart renderer is the v1 caller; future PDF/CSV exporters
+    /// land here too) use this to land their output as a
+    /// state_artifacts row that downstream tools (`send_attachment`,
+    /// transport-specific `send_with_attachments`) can reference.
+    ///
+    /// Pre-rework, the only path that wrote artifacts was the
+    /// script-tier `host_caps.create_artifact_attachment` Rhai
+    /// binding — built-in tools had no way to produce attachments,
+    /// which forced "produce a chart" to live as a plugin tool
+    /// (`open_meteo.render_chart`) even though the implementation
+    /// was 100% native code. This method closes that gap.
+    ///
+    /// `mime_type` is what transports announce + what the SPA's
+    /// download endpoint puts in `Content-Type`. Common values:
+    /// `image/png`, `image/svg+xml`, `application/pdf`.
+    ///
+    /// `filename` is what the operator sees in the save-as dialog;
+    /// it does NOT determine the on-disk path (which is sha256-
+    /// named for content addressing).
+    ///
+    /// `ttl_seconds` opts the artifact into the ephemeral sweeper's
+    /// retention window. `None` keeps the row indefinitely (the
+    /// operator's manual cleanup story); a positive value lets
+    /// chart renders / scratch outputs auto-expire so they don't
+    /// accumulate forever.
+    ///
+    /// Same `Capability::AttachmentSend` gate as `send` — a tool
+    /// that can produce an artifact can also deliver one.
+    async fn create_artifact(
+        &self,
+        filename: &str,
+        mime_type: &str,
+        bytes: Vec<u8>,
+        ttl_seconds: Option<i64>,
+    ) -> Result<CreatedArtifactView, ApiError>;
+
+    /// 2026-05-16 — emit an inline `Chart` card into the caller's
+    /// conversation so the SPA's card pipeline (the same path
+    /// deep-research progress + send_attachment chips use) renders
+    /// the chart instead of relying on the fragile chat-component
+    /// dispatch from a tool_result message.
+    ///
+    /// Existed before only as the `chat_component_kind: "chart"`
+    /// inline path — that path proved unreliable in practice
+    /// (chart never visually appeared even when the tool fired
+    /// and the JSON was correct). Promoting to a first-class card
+    /// mirrors the proven cards path.
+    ///
+    /// Card details payload: `{ svg, attachment_id, filename,
+    /// title?, width, height }`. The SPA's `ChartCard` reads
+    /// these and renders SVG inline + a PNG-download chip.
+    /// Trust scope is the same as `send` — refuses cross-
+    /// conversation delivery via the caller_conversation_id check.
+    /// Best-effort: emit failures (event-bus saturation, DB
+    /// pressure) return ApiError but the rendered SVG + persisted
+    /// artifact already exist, so the caller's tool_result still
+    /// carries them as a fallback.
+    async fn emit_chart_card(
+        &self,
+        attachment_id: &str,
+        svg: &str,
+        filename: &str,
+        title: Option<&str>,
+        width: u32,
+        height: u32,
+    ) -> Result<(), ApiError>;
+}
+
+/// Returned by [`AttachmentApi::create_artifact`]. The
+/// `attachment_id` flows directly into `send_attachment` / a
+/// transport's `send_with_attachments`; `sha256` + `size_bytes`
+/// give downstream tools enough to verify integrity without
+/// re-reading the blob.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CreatedArtifactView {
+    pub attachment_id: String,
+    pub sha256: String,
+    pub size_bytes: u64,
 }
 
 /// Outbound HTTP capability. Implementations are responsible for SSRF

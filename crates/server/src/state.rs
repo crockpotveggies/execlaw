@@ -23,10 +23,27 @@ pub struct ServerConfig {
     /// string; later phases make this a per-conversation + per-role
     /// composition.
     pub system_prompt: String,
-    /// Model id passed in `/v1/chat/completions` requests.
-    pub model_id: String,
+    // 2026-05-13 — removed `pub model_id: String`. Pre-rework, every
+    // chat turn read this constant and shoved it into the
+    // `/v1/chat/completions` `model` field, while the supervisor
+    // launched vLLM with the model arg from
+    // `config_backends.model_spec_json.args["--model"]`. The two
+    // fields drifted whenever an operator swapped backends without
+    // restarting (or, far worse, when the SPA's hardcoded SPA-side
+    // `MODEL_CATALOG` default overwrote the DB row on a no-op save) —
+    // producing `The model X does not exist` 404s from vLLM. The
+    // resolver now returns `ResolvedInference { client, model_id, .. }`
+    // from the same DB row, so the two fields are atomic by
+    // construction. See `inference_resolver::DEFAULT_FALLBACK_MODEL`
+    // for the last-resort placeholder when no row supplies a model.
     /// Hard cap on tool-call rounds per turn (runaway-loop guard).
     pub max_tool_rounds: u32,
+    /// Directory containing the daily-rotated `execlaw.jsonl.<DATE>`
+    /// files written by the tracing file appender. `Some` in real
+    /// server builds; `None` in tests + when the operator disables
+    /// file logging via `EXECLAW_NO_FILE_LOG=1`. `GET /api/admin/logs`
+    /// reads files from this dir to serve the Settings > Logs viewer.
+    pub log_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -63,7 +80,6 @@ impl Default for ServerConfig {
                 "8. Never call a tool just to fill space. If there's genuinely nothing useful to do, finish the turn.\n",
                 "9. When you're done answering, stop. Do not ask follow-up questions unless they are required to act.",
             ).to_owned(),
-            model_id: "QuantTrio/Qwen3.5-27B-AWQ".to_owned(),
             // 2026-05 — bumped 3 → 8 alongside the agent-prompting
             // audit's #5. The old cap was set when plugin tool
             // descriptions were placeholders ("Plugin tool 'X'
@@ -81,6 +97,7 @@ impl Default for ServerConfig {
             // 16 keeps headroom for retries while staying inside
             // the runner hard ceiling (`RUNNER_MAX_TOOL_ROUNDS`).
             max_tool_rounds: 16,
+            log_dir: None,
         }
     }
 }
@@ -89,6 +106,17 @@ impl Default for ServerConfig {
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
+    /// The exact `DbConfig` that opened `db` at boot. Stored so the
+    /// factory-reset path (`crates/server/src/factory_reset.rs`) can
+    /// close the connection, delete the on-disk file, and re-open at
+    /// the same path with the same encryption posture without having
+    /// to round-trip through the OS keyring again. SQLCipher key
+    /// material is already in memory in the `Database`'s open
+    /// connection; carrying it here adds no incremental attack
+    /// surface. For `:memory:` test DBs the config is just the
+    /// in-memory unencrypted preset and the file-delete path is
+    /// short-circuited inside `Database::rebuild_to_empty`.
+    pub db_config: Arc<execlaw_core::db::DbConfig>,
     pub config: Arc<ServerConfig>,
     /// Ed25519 signing key used for JWT + capability tokens.
     pub signer: Arc<crate::auth::JwtSigner>,

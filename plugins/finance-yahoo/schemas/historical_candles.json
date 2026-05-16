@@ -1,0 +1,22 @@
+{
+    "type": "object",
+    "properties": {
+        "symbol": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Any Yahoo-recognised symbol: bare ticker (`AAPL`), index (`^DJI`), crypto (`BTC-USD`), FX (`EURUSD=X`)."
+        },
+        "interval": {
+            "type": "string",
+            "enum": ["1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"],
+            "description": "Candle resolution. Default `1d`. Note Yahoo only serves intraday (sub-day) intervals for ~30 days back; daily-and-up go back decades."
+        },
+        "range": {
+            "type": "string",
+            "enum": ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"],
+            "description": "How far back to fetch. Default `1mo`. Must be compatible with the chosen `interval` — for example `1m` with `range=1y` returns no data."
+        }
+    },
+    "required": ["symbol"],
+    "additionalProperties": false
+}

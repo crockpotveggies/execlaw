@@ -1,0 +1,131 @@
+[plugin]
+id = "finance-yahoo"
+name = "Yahoo Finance"
+version = "0.1.0"
+description = """Real-time and historical market data via Yahoo Finance's
+public endpoints — quotes for stocks, ETFs, indices (Dow, Nasdaq, S&P,
+VIX), crypto, and forex pairs, plus symbol search and news. Personal
+use only per Yahoo's terms — this plugin uses Yahoo's undocumented public
+endpoints and is not affiliated with Yahoo, Inc."""
+author = "execlaw"
+license = "Apache-2.0"
+
+# No sidecar, no OAuth, no API key. Plain HTTPS against Yahoo's
+# query1.finance.yahoo.com / query2.finance.yahoo.com endpoints.
+#
+# Endpoint surface (all work WITHOUT the cookie+crumb dance):
+#   /v8/finance/chart/{symbol}   — quote + OHLC for stocks, ETFs,
+#                                  indices (^DJI/^IXIC/^GSPC), crypto
+#                                  (BTC-USD), forex (EURUSD=X)
+#   /v1/finance/search?q=…       — symbol lookup + embedded news block
+#
+# Endpoints REQUIRING crumb (deferred to v0.2 — needs a host primitive
+# that surfaces response headers / Set-Cookie):
+#   /v10/finance/quoteSummary    — company profile, financials
+#   /v7/finance/options/{symbol} — options chains
+#   /v7/finance/quote?symbols=…  — batch quote (chart endpoint covers
+#                                  the single-symbol case)
+#
+# Per-tool cache TTLs (seconds), chosen to balance freshness against
+# Yahoo's anti-scrape thresholds:
+#   quote         15   ("what's it at NOW")
+#   index_quote   15
+#   crypto_quote  15
+#   fx_quote      15
+#   candles_intraday 300  (5m bars updated every few minutes)
+#   candles_daily 86400   (daily bars settle at session close)
+#   symbol_search 3600    (ticker registry is stable)
+#   market_news   300
+
+# ===== Agent-callable tools =====================================
+
+[[tools]]
+name = "yahoo_finance.quote"
+description = """Real-time-ish quote for a US equity or ETF. Returns regular-market price, change, % change, previous close, day range, and volume. Symbol formats: bare ticker (e.g. `AAPL`, `MSFT`, `SPY`, `QQQ`). For indices use `yahoo_finance.index_quote` (caret-prefixed symbols are mapped there); for crypto use `yahoo_finance.crypto_quote`; for FX use `yahoo_finance.fx_quote`. Args: { symbol: string (required) }."""
+schema = "schemas/quote.json"
+trust_floor = "KnownLimited"
+latency = "low"
+
+[[tools]]
+name = "yahoo_finance.index_quote"
+description = """Quote for a major index. Accepts caret-prefixed symbols (`^DJI` Dow, `^IXIC` Nasdaq Composite, `^GSPC` S&P 500, `^NDX` Nasdaq-100, `^RUT` Russell 2000, `^VIX` volatility) OR friendly names (`"dow"`, `"nasdaq"`, `"s&p"`, `"sp500"`, `"vix"`). Returns the same shape as `yahoo_finance.quote` with an extra `index_symbol` field carrying the canonical caret form. Args: { symbol: string (required) }."""
+schema = "schemas/index_quote.json"
+trust_floor = "KnownLimited"
+latency = "low"
+
+[[tools]]
+name = "yahoo_finance.crypto_quote"
+description = """Quote for a cryptocurrency vs USD. Accepts bare coin tickers (`BTC`, `ETH`, `SOL`) — the plugin appends `-USD` — or full Yahoo-format symbols (`BTC-USD`, `ETH-EUR`). Args: { symbol: string (required) }."""
+schema = "schemas/crypto_quote.json"
+trust_floor = "KnownLimited"
+latency = "low"
+
+[[tools]]
+name = "yahoo_finance.fx_quote"
+description = """Quote for a currency pair. Accepts conventional FX notation (`EUR/USD`, `GBPUSD`, `USD/JPY`) — the plugin coerces to Yahoo's `{PAIR}=X` format. Args: { symbol: string (required) }."""
+schema = "schemas/fx_quote.json"
+trust_floor = "KnownLimited"
+latency = "low"
+
+[[tools]]
+name = "yahoo_finance.historical_candles"
+description = """OHLC + volume candles for any Yahoo symbol. Args: { symbol: string (required), interval?: "1m"|"5m"|"15m"|"30m"|"1h"|"1d"|"1wk"|"1mo" (default "1d"), range?: "1d"|"5d"|"1mo"|"3mo"|"6mo"|"1y"|"2y"|"5y"|"10y"|"ytd"|"max" (default "1mo") }. Intraday intervals (sub-day) only go back ~30 days on Yahoo's side; daily+ goes back decades. Returns: { symbol, interval, candles: [{ t, open, high, low, close, volume }] }."""
+schema = "schemas/historical_candles.json"
+trust_floor = "KnownLimited"
+latency = "medium"
+
+[[tools]]
+name = "yahoo_finance.symbol_search"
+description = """Find tickers by name. Returns equities, ETFs, indices, crypto, forex, mutual funds — with `type_disp` indicating which. Args: { query: string (required), limit?: int (1-20, default 10) }. Returns: { query, results: [{ symbol, name, exchange, type, type_disp }] }."""
+schema = "schemas/symbol_search.json"
+trust_floor = "KnownLimited"
+latency = "low"
+
+[[tools]]
+name = "yahoo_finance.market_news"
+description = """Recent news headlines related to a query (symbol, sector, or topic). Uses Yahoo's search endpoint which embeds a news block alongside ticker results. Args: { query: string (required), limit?: int (1-20, default 10) }. Returns: { query, news: [{ uuid, title, publisher, link, provider_publish_time, type }] }."""
+schema = "schemas/market_news.json"
+trust_floor = "KnownLimited"
+latency = "low"
+
+[[tools]]
+name = "yahoo_finance.quote_summary"
+description = """Detailed quote summary for a single symbol — company profile, sector/industry, market cap, key statistics, dividend yield, beta. Uses Yahoo's protected `/v10/finance/quoteSummary` endpoint which requires a cookie+crumb session (managed transparently by the plugin). Args: { symbol: string (required), modules?: string[] (default ["summaryDetail","assetProfile","price","defaultKeyStatistics"]) }. Slower than `quote` (extra round-trip on first call to refresh the session) and rate-limit-sensitive — use only when the user actually wants company-level detail, not for every quote."""
+schema = "schemas/quote_summary.json"
+trust_floor = "KnownLimited"
+latency = "medium"
+
+[[tools]]
+name = "yahoo_finance.health"
+description = """Canary tool: confirms the plugin can reach Yahoo's endpoints and the cookie+crumb session is healthy. Returns per-asset-class pass/fail (equity, index, crypto, fx, search) plus the session age. Use when the operator reports problems before opening a support thread — this tells you whether Yahoo broke us or we broke ourselves. Args: { }."""
+schema = "schemas/health.json"
+trust_floor = "KnownLimited"
+latency = "low"
+
+# ===== Admin routes =============================================
+
+[[admin_routes]]
+method = "GET"
+path = "/config"
+handler = "admin_get_config"
+description = "Return operator preferences (default symbols, ToS acknowledgment timestamp) + plugin health summary."
+
+[[admin_routes]]
+method = "POST"
+path = "/config"
+handler = "admin_set_config"
+description = "Persist operator preferences (default watchlist symbols, throttle thresholds)."
+
+[[admin_routes]]
+method = "POST"
+path = "/test"
+handler = "admin_test"
+description = "Round-trip check: fetch quotes for AAPL + ^DJI + BTC-USD + EURUSD=X to confirm each asset class works."
+
+[[ui_panels]]
+mount = "admin/plugins/finance-yahoo"
+entry = "ui/panel.js"
+
+[runtime]
+tier = "script"
+source = "main.rhai"

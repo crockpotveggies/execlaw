@@ -35,11 +35,23 @@ pub struct Migration {
 ///
 /// Note: every migration is wrapped in its own transaction by
 /// `MigrationRunner::apply_all`.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    id: 1,
-    name: "baseline",
-    sql: include_str!("../migrations/0001_baseline.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        id: 1,
+        name: "baseline",
+        sql: include_str!("../migrations/0001_baseline.sql"),
+    },
+    // 2026-05-14 — migrations 2-4 (plugin_artifacts, max_history_tokens,
+    // principal_identifiers) were folded into the baseline after a
+    // checksum-divergence error blocked a single-developer rebuild.
+    // The columns + tables those migrations added now live inline in
+    // `0001_baseline.sql`; the IDs are retired forever (never reuse).
+    Migration {
+        id: 5,
+        name: "plugin_health",
+        sql: include_str!("../migrations/0005_plugin_health.sql"),
+    },
+];
 
 #[derive(Debug, Error)]
 pub enum MigrationError {
@@ -219,7 +231,9 @@ mod tests {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
         let runner = MigrationRunner::new(&db);
         let applied = runner.apply_all().unwrap();
-        assert_eq!(applied, vec![1]);
+        // 2026-05-15: migration 5 adds plugin health columns. Update
+        // this list whenever a new migration is added to MIGRATIONS.
+        assert_eq!(applied, vec![1, 5]);
 
         // Spot-check: every documented table exists.
         let tables = vec![
@@ -293,7 +307,7 @@ mod tests {
         let runner = MigrationRunner::new(&db);
         let first = runner.apply_all().unwrap();
         let second = runner.apply_all().unwrap();
-        assert_eq!(first, vec![1]);
+        assert_eq!(first, vec![1, 5]);
         assert!(
             second.is_empty(),
             "rerun must not re-apply already-applied migrations"

@@ -217,6 +217,22 @@ pub struct InferenceBackendDecl {
     pub openai_compatible_endpoint: String,
     pub supports_streaming: bool,
     pub supports_tools: bool,
+    /// Deployment runtimes this backend can run under. Each entry is
+    /// a lowercase identifier matching the supervisor's runtime
+    /// dispatch (`"docker"`, `"native"`). When omitted, the supervisor
+    /// assumes `["docker"]` — every existing managed-mode preset
+    /// (vLLM, Whisper, Kokoro, Piper) ships as a Docker container.
+    ///
+    /// The first non-Docker entry is `service-ollama`, which on Apple
+    /// Silicon must run as a native macOS subprocess because Docker
+    /// Desktop on macOS has no Metal passthrough — that plugin
+    /// declares `runtimes = ["native"]` so the wizard's plugin store
+    /// can warn ahead of time when the operator is on a host class
+    /// the backend can't deploy to (e.g. an Ollama-native plugin
+    /// shouldn't appear "Ready" on a Linux/NVIDIA host where the
+    /// vLLM Docker preset is the right choice).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtimes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1146,13 +1162,19 @@ mod tests {
         let m = PluginManifest::parse(SIGNAL_MANIFEST)
             .expect("plugins/signal/plugin.toml must parse cleanly");
         assert_eq!(m.plugin.id, "signal");
-        assert_eq!(m.plugin.version, "0.4.7");
+        assert_eq!(m.plugin.version, "0.5.0");
         // The transport icon must propagate from manifest → SDK so
         // the SPA's sidebar can render a Signal-shaped marker on
-        // bridged threads. Pin the literal so a typo in the manifest
-        // (or a renamed Bootstrap-icons class) gets caught here.
+        // bridged threads. The SPA's ChannelIcon has a brand-SVG
+        // override path for "signal" (Bootstrap's bi-signal is the
+        // cellular-meter glyph, not the messenger app), so the
+        // manifest's `icon = "signal"` is intentional: it indicates
+        // the channel + plays nicely with the host-side fallback
+        // chain. A future plugin author who copy-pastes the Signal
+        // manifest as a starting point for a new transport gets a
+        // brand-named icon string they can adjust in one place.
         let transport = m.transport.as_ref().expect("[transport] must be present");
-        assert_eq!(transport.icon.as_deref(), Some("chat-quote"));
+        assert_eq!(transport.icon.as_deref(), Some("signal"));
         // 6 agent-callable tools mirror the selfhosted-claw integration,
         // plus 3 host-internal convention tools (v0.4.5+: set_typing,
         // send_with_attachments, fetch_attachment) registered so the
@@ -1245,6 +1267,214 @@ mod tests {
     }
 
     #[test]
+    fn shipped_discord_manifest_parses_cleanly() {
+        // Same "shipped manifest parses against the SDK validator"
+        // smoke test we have for Signal — catches typos /
+        // validator-tightening regressions at `cargo test` time.
+        const DISCORD_MANIFEST: &str = include_str!("../../../plugins/discord/plugin.toml");
+        let m = PluginManifest::parse(DISCORD_MANIFEST)
+            .expect("plugins/discord/plugin.toml must parse cleanly");
+        assert_eq!(m.plugin.id, "discord");
+        assert_eq!(m.plugin.version, "0.2.0");
+
+        let transport = m.transport.as_ref().expect("[transport] must be present");
+        assert_eq!(transport.transport_id, "discord");
+        assert_eq!(transport.icon.as_deref(), Some("discord"));
+        assert!(transport.supports_attachments);
+        assert!(transport.supports_groups);
+
+        // Three agent-callable tools + three host-internal convention
+        // tools (set_typing, send_with_attachments, fetch_attachment).
+        assert_eq!(m.tools.len(), 6);
+        let send = m
+            .tools
+            .iter()
+            .find(|t| t.name == "discord.send_message")
+            .expect("discord.send_message must be declared");
+        assert_eq!(send.trust_floor.as_deref(), Some("Controller"));
+        let reply = m
+            .tools
+            .iter()
+            .find(|t| t.name == "discord.reply")
+            .expect("discord.reply must be declared");
+        assert!(
+            reply.trust_floor.is_none(),
+            "discord.reply must NOT pin a trust floor — host fills `to` from the inbound binding"
+        );
+
+        // Script-tier — no sidecar, no host-implemented bypasses.
+        for t in &m.tools {
+            assert!(
+                !t.host_implemented,
+                "{} must be script-tier in v0.1",
+                t.name
+            );
+        }
+
+        // Admin routes: status, GET config, POST config, POST test.
+        assert_eq!(m.admin_routes.len(), 4);
+
+        // No sidecar — gateway is public WSS.
+        assert!(
+            m.services.is_empty(),
+            "discord plugin must not declare any sidecar in v0.1"
+        );
+
+        // UI panel mount.
+        assert_eq!(m.ui_panels.len(), 1);
+        assert_eq!(m.ui_panels[0].mount, "admin/plugins/discord");
+
+        // Alert-source surface declared for v0.2 use.
+        assert_eq!(m.alert_sources.len(), 1);
+        assert_eq!(m.alert_sources[0].fingerprint_prefix, "plugin.discord");
+    }
+
+    #[test]
+    fn shipped_google_apps_manifest_parses_cleanly() {
+        // Pin the on-disk `plugins/google-apps/plugin.toml` against
+        // this crate's parser so a manifest typo (or an SDK validator
+        // change that breaks the existing description prose) is caught
+        // at `cargo test` time, not at install time.
+        //
+        // Asserts:
+        //   * tool count covers all five modules (Gmail, Calendar,
+        //     Contacts, Tasks, Drive).
+        //   * destructive tools carry a Controller trust floor.
+        //   * read-only tools have NO trust floor.
+        //   * the [identity_provider] section is present (contacts
+        //     module still serves as an identity provider).
+        //   * the oauth scope set includes the union across all five
+        //     modules.
+        const GOOGLE_APPS_MANIFEST: &str = include_str!("../../../plugins/google-apps/plugin.toml");
+        let m = PluginManifest::parse(GOOGLE_APPS_MANIFEST)
+            .expect("plugins/google-apps/plugin.toml must parse cleanly");
+        assert_eq!(m.plugin.id, "google-apps");
+        assert_eq!(m.plugin.version, "0.3.0");
+
+        // Identity provider survives the consolidation — same shape
+        // as google-contacts had.
+        let idp = m
+            .identity_provider
+            .as_ref()
+            .expect("[identity_provider] must be declared");
+        assert!(idp.resolves.iter().any(|r| r == "email"));
+        assert!(idp.resolves.iter().any(|r| r == "phone"));
+
+        // Single OAuth account, with union scopes across all 5 modules.
+        assert_eq!(m.oauth_accounts.len(), 1);
+        let acc = &m.oauth_accounts[0];
+        assert_eq!(acc.name, "controller");
+        assert_eq!(acc.provider, "google");
+        for required in [
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/gmail.send",
+            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/calendar.readonly",
+            "https://www.googleapis.com/auth/calendar.events",
+            "https://www.googleapis.com/auth/contacts.readonly",
+            "https://www.googleapis.com/auth/tasks",
+            "https://www.googleapis.com/auth/drive.readonly",
+            "https://www.googleapis.com/auth/drive.file",
+        ] {
+            assert!(
+                acc.scopes.iter().any(|s| s == required),
+                "manifest must declare scope '{required}'",
+            );
+        }
+
+        // Tool count: Gmail (10) + Calendar (7) + Contacts (2) + Tasks (6)
+        // + Drive (6) = 31. If you add or remove a tool, update both
+        // here and the dispatch table in main.rhai.
+        assert_eq!(m.tools.len(), 31);
+
+        // EVERY tool pins Controller (v0.3.0). The earlier carve-out
+        // for `calendar.check_availability` reasoned that freeBusy
+        // was opaque busy/free intervals and thus safe for outside
+        // contacts to query — but those intervals are themselves a
+        // surveillance + social-engineering primitive. Tightening:
+        // every google-apps tool requires Controller, no exceptions.
+        // If a "let outside contacts schedule with me" workflow is
+        // needed later, it lives in a dedicated booking tool with
+        // explicit scope, not as a side effect of leaving freeBusy
+        // unguarded.
+        const CONTROLLER_FLOOR_TOOLS: &[&str] = &[
+            // Gmail — all tools (read AND write touch the mailbox).
+            "gmail.list_messages",
+            "gmail.search",
+            "gmail.get_message",
+            "gmail.list_labels",
+            "gmail.send_message",
+            "gmail.create_draft",
+            "gmail.reply",
+            "gmail.add_label",
+            "gmail.remove_label",
+            "gmail.trash",
+            // Calendar — every tool, including check_availability
+            // (the v0.2.0 carve-out was removed in v0.3.0).
+            "calendar.list_calendars",
+            "calendar.list_events",
+            "calendar.check_availability",
+            "calendar.get_event",
+            "calendar.create_event",
+            "calendar.update_event",
+            "calendar.delete_event",
+            // Contacts.
+            "contacts.search",
+            "contacts.list",
+            // Tasks — all tools.
+            "tasks.list_lists",
+            "tasks.list_tasks",
+            "tasks.create_task",
+            "tasks.update_task",
+            "tasks.complete_task",
+            "tasks.delete_task",
+            // Drive — all tools.
+            "drive.search",
+            "drive.get_file_metadata",
+            "drive.list_folder",
+            "drive.read_file",
+            "drive.create_file",
+            "drive.share",
+        ];
+        for name in CONTROLLER_FLOOR_TOOLS {
+            let t = m
+                .tools
+                .iter()
+                .find(|t| t.name == *name)
+                .unwrap_or_else(|| panic!("{name} must be declared"));
+            assert_eq!(
+                t.trust_floor.as_deref(),
+                Some("Controller"),
+                "{name} must pin Controller floor",
+            );
+        }
+
+        // No carve-outs in v0.3.0 — every declared tool must pin
+        // Controller. If you're adding a new tool that can SAFELY be
+        // called from outside principals (rare; needs explicit
+        // justification), add it to a new NO_FLOOR_TOOLS list here
+        // AND document why in the manifest comment.
+        assert_eq!(
+            CONTROLLER_FLOOR_TOOLS.len(),
+            m.tools.len(),
+            "every declared tool must pin a Controller trust floor in v0.3.0+",
+        );
+        for t in &m.tools {
+            assert_eq!(
+                t.trust_floor.as_deref(),
+                Some("Controller"),
+                "{} must pin Controller floor (no carve-outs in v0.3.0+)",
+                t.name,
+            );
+        }
+
+        // Runtime tier — script, source = main.rhai.
+        let rt = m.runtime.as_ref().expect("[runtime] must be declared");
+        assert_eq!(rt.parsed_tier(), Some(RuntimeTier::Script));
+        assert_eq!(rt.source.as_deref(), Some("main.rhai"));
+    }
+
+    #[test]
     fn is_known_trust_level_covers_full_ladder() {
         for s in [
             "Controller",
@@ -1259,6 +1489,50 @@ mod tests {
         assert!(!is_known_trust_level("admin"));
         assert!(!is_known_trust_level("CONTROLLER"));
         assert!(!is_known_trust_level(""));
+    }
+
+    #[test]
+    fn inference_backend_decl_runtimes_omitted_is_none() {
+        // Backwards-compat: every shipped manifest pre-Apple-Silicon
+        // omits `runtimes`. The default must be `None` (which the
+        // supervisor reads as "docker only"), not an empty Vec — an
+        // empty Vec would imply "no runtimes supported," which is
+        // exactly the opposite intent.
+        let ok = r#"
+            [plugin]
+            id = "x"
+            name = "X"
+            version = "0.1.0"
+
+            [inference_backend]
+            openai_compatible_endpoint = "/v1"
+            supports_streaming = true
+            supports_tools = true
+        "#;
+        let m = PluginManifest::parse(ok).unwrap();
+        let ib = m.inference_backend.as_ref().unwrap();
+        assert!(ib.runtimes.is_none());
+    }
+
+    #[test]
+    fn inference_backend_decl_runtimes_native_parses() {
+        // The service-ollama plugin (Apple Silicon) declares native
+        // because Docker Desktop on macOS has no Metal passthrough.
+        let ok = r#"
+            [plugin]
+            id = "service-ollama"
+            name = "Ollama"
+            version = "0.1.0"
+
+            [inference_backend]
+            openai_compatible_endpoint = "/v1"
+            supports_streaming = true
+            supports_tools = true
+            runtimes = ["native"]
+        "#;
+        let m = PluginManifest::parse(ok).unwrap();
+        let ib = m.inference_backend.as_ref().unwrap();
+        assert_eq!(ib.runtimes.as_deref(), Some(&["native".to_owned()][..]));
     }
 
     #[test]

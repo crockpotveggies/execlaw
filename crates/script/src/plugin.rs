@@ -197,28 +197,62 @@ impl ScriptPlugin {
     /// `on_enable` or not — `MissingFunction` is converted to a
     /// silent success because the convention is opt-in.
     pub async fn call_on_enable(&self) -> ScriptResult<()> {
-        // Don't go through invoke_async — it forces a Rhai → JSON
-        // conversion of the return value, and on_enable hooks
-        // commonly end with `ws_subscribe(...)` whose return is a
-        // WsSubscriptionHandle that isn't serializable. We just
-        // care that it ran, not what it returned.
+        self.call_lifecycle_hook("on_enable").await
+    }
+
+    /// Optional lifecycle hook — host calls this exactly once
+    /// before the plugin is disabled / uninstalled / factory-reset,
+    /// BEFORE the engine is dropped and BEFORE any WS subscriptions
+    /// are cancelled. Plugins use it to:
+    ///   * Revoke OAuth refresh tokens (`oauth_revoke(...)`).
+    ///   * Send a polite "going offline" message on a chat transport.
+    ///   * Flush in-memory state to vault rows before the wipe.
+    ///   * Cancel webhook subscriptions registered with a remote
+    ///     service.
+    ///
+    /// 2026-05-13: introduced as the symmetric counterpart to
+    /// `on_enable`. Prior to this, factory-reset / disable simply
+    /// dropped the engine and let WS subscriptions cancel via
+    /// `shutdown()`. That's still the *backstop* — the plugin host
+    /// always shuts the engine down whether or not `on_disable`
+    /// runs cleanly — but operators wanted a way for plugins to
+    /// run custom cleanup BEFORE the rug-pull.
+    ///
+    /// Best-effort: `MissingFunction` is converted to silent
+    /// success (the hook is opt-in). Other errors are propagated
+    /// so the caller can log them but they do NOT block the
+    /// destructive operation — the host always proceeds with the
+    /// shutdown regardless.
+    pub async fn call_on_disable(&self) -> ScriptResult<()> {
+        self.call_lifecycle_hook("on_disable").await
+    }
+
+    /// Shared body for `on_enable` / `on_disable` / future
+    /// lifecycle hooks. Each hook is opt-in: a script that doesn't
+    /// define the function gets `MissingFunction` collapsed into
+    /// `Ok(())`. Don't go through `invoke_async` — it forces a
+    /// Rhai → JSON conversion of the return value, and lifecycle
+    /// hooks commonly end with `ws_subscribe(...)` whose return is
+    /// a non-serializable `WsSubscriptionHandle`. We just care that
+    /// the hook ran, not what it returned.
+    async fn call_lifecycle_hook(&self, name: &'static str) -> ScriptResult<()> {
         let inner = self.inner.clone();
         let result = tokio::task::spawn_blocking(move || -> ScriptResult<()> {
             let mut scope = rhai::Scope::new();
             match inner.engine.call_fn::<rhai::Dynamic>(
                 &mut scope,
                 &inner.ast,
-                "on_enable",
+                name,
                 Vec::<rhai::Dynamic>::new(),
             ) {
                 Ok(_) => Ok(()),
                 Err(e) => {
                     let msg = e.to_string();
                     if msg.contains("Function not found") {
-                        Err(ScriptError::MissingFunction("on_enable"))
+                        Err(ScriptError::MissingFunction(name))
                     } else {
                         Err(ScriptError::Runtime(format!(
-                            "[{}] on_enable: {e}",
+                            "[{}] {name}: {e}",
                             inner.plugin_id,
                         )))
                     }

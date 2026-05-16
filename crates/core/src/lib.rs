@@ -30,6 +30,7 @@ pub mod event_hmac;
 pub mod event_retention;
 pub mod events;
 pub mod general_settings;
+pub mod history_budget;
 pub mod ids;
 pub mod log_retention;
 pub mod logs;

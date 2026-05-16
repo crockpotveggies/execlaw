@@ -223,13 +223,15 @@ gateway on the local network; execlaw connects out to it.
 
 ---
 
-## Google Calendar / Google Contacts / Google Places
+## Google Apps / Google Places
 
-The Google integrations split into three plugins:
+The Google integrations consolidate into two plugins:
 
-- `google-calendar` — OAuth, agent-callable calendar tools.
-- `google-contacts` — OAuth, **also an identity provider** (resolves
-  inbound email/phone to a known contact).
+- `google-apps` — OAuth, single grant covering Gmail, Calendar,
+  Contacts, Tasks, and Drive. **Also an identity provider** (resolves
+  inbound email/phone to a known contact via the People API). Replaces
+  the legacy `google-calendar` + `google-contacts` plugins (removed
+  2026-05-14).
 - `google-places` — **API key only**, no OAuth. Search nearby
   businesses + place details.
 
@@ -238,17 +240,21 @@ The Google integrations split into three plugins:
 1. <https://console.cloud.google.com/> → **Create project** (or use
    an existing one).
 
-2. **APIs & Services → Library** → enable each of:
-   - **Google Calendar API** (for `google-calendar`)
-   - **People API** (for `google-contacts`)
-   - **Places API (New)** (for `google-places`)
+2. **APIs & Services → Library** → enable each of (for `google-apps`):
+   - **Gmail API**
+   - **Google Calendar API**
+   - **People API**
+   - **Tasks API**
+   - **Google Drive API**
 
-3. **APIs & Services → OAuth consent screen** (for the OAuth
-   plugins):
+   And for `google-places`:
+   - **Places API (New)**
+
+3. **APIs & Services → OAuth consent screen** (for `google-apps`):
    - User type: **External** (single-operator deployment is fine
      under "Testing" status indefinitely).
-   - Scopes: add the scopes the plugins request (calendar.readonly +
-     calendar.events, contacts.readonly).
+   - Scopes: add the scopes `google-apps` requests (gmail, calendar,
+     contacts, tasks, drive).
    - Test users: add the operator's Google account email.
 
 4. **APIs & Services → Credentials → Create credentials**:
@@ -257,11 +263,9 @@ The Google integrations split into three plugins:
    - For Places (API-key plugin): **API key**. Restrict it to
      **Places API (New)** under API restrictions.
 
-### Pair OAuth plugins in execlaw
+### Pair google-apps in execlaw
 
-For both `google-calendar` and `google-contacts`:
-
-1. **Settings → Plugins → Google Calendar** (or Google Contacts).
+1. **Settings → Plugins → Google Apps**.
 
 2. Paste the OAuth client ID + client secret. Redirect URI defaults
    to `http://localhost:3031/api/oauth/google/callback`. Save.
@@ -273,9 +277,13 @@ For both `google-calendar` and `google-contacts`:
 4. Google redirects back to `http://localhost:3031/api/oauth/google/callback`.
    The host's OAuth handler exchanges the code for a refresh +
    access token, stores them in the vault keyed on
-   `(plugin_id, account_name="controller")`.
+   `(plugin_id="google-apps", account_name="controller")`.
 
-5. The plugin's tools become available to the agent on the next turn.
+5. Per-module toggles surface in the same panel (Calendar /
+   Contacts / Gmail / Tasks / Drive can be enabled or disabled
+   without re-running the consent flow).
+
+6. The plugin's tools become available to the agent on the next turn.
 
 ### Configure google-places
 
@@ -302,12 +310,18 @@ For both `google-calendar` and `google-contacts`:
 - **API key 403** — for Places, the key wasn't restricted to
   Places API or the API isn't enabled in the project. Both are
   fixed in Cloud Console.
-- **Identity provider not auto-resolving** — `google-contacts` is
+- **Identity provider not auto-resolving** — `google-apps` includes
   an identity provider, but the host only consults it when the
   inbound transport handle is an email or phone (per the
   `[identity_provider].resolves` manifest field). Inbound from
   WhatsApp/Signal/Slack uses transport-specific resolution paths
-  first; google-contacts is a fallback.
+  first; google-apps is a fallback.
+- **Migrating from the old `google-calendar` / `google-contacts`
+  plugins** — those were removed in 2026-05-14. Uninstall both,
+  install `google-apps`, re-run the OAuth pairing once. Tool names
+  changed: `calendar.list_calendars`, `contacts.list`, etc. now
+  live under the `google-apps` plugin id, but the agent-facing
+  tool names themselves are unchanged.
 
 ---
 

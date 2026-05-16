@@ -189,6 +189,27 @@ export interface MessageView {
      * via Signal" / "the agent replied via Signal".
      */
     channel_origin?: "signal" | "email" | "voice" | "sms" | null;
+    /**
+     * 2026-05-15 — image attachments included on a user_msg via the
+     * composer's `+` menu. Each entry resolves to a download via
+     * `/api/attachments/<id>`. Empty/absent for every other kind.
+     */
+    attachments?: MessageAttachment[];
+    /**
+     * 2026-05-15 — names of skills the operator picked from the
+     * composer's `+` menu (second item) when sending this user_msg.
+     * The skill bodies were prepended to `text` server-side; the SPA
+     * strips those `<skill name="...">...</skill>` blocks for
+     * display (see `stripSkillPrependBlock`) and renders the names
+     * as a chip under the bubble. Empty/absent for every other
+     * message kind and for user_msg events sent without a skill.
+     */
+    applied_skill_names?: string[];
+}
+
+export interface MessageAttachment {
+    id: string;
+    mime: string;
 }
 
 export interface MessagesListResponse {
@@ -273,6 +294,26 @@ export interface SendMessageRequest {
     /// emitted as `T18:00:00Z` and surfaced 7 hours shifted in
     /// Google Calendar.
     timezone?: string;
+    /// 2026-05-15 — inline image attachments from the composer's
+    /// `+` menu. Each entry carries the bytes as a `data:` URL the
+    /// SPA built locally via `FileReader.readAsDataURL`. Server
+    /// decodes, content-addresses under `<data_dir>/blobs/`, and
+    /// stamps the resulting attachment ids onto the user_msg event
+    /// so subsequent history hydration can re-encode them as
+    /// OpenAI vision content parts when the backend is multimodal.
+    attachments?: InlineAttachment[];
+    /// 2026-05-15 — names of skills the operator picked from the
+    /// composer's `+` menu (second item, "Attach skill"). The server
+    /// resolves each to its current body and prepends `<skill
+    /// name="...">...</skill>` blocks above the user text before the
+    /// model sees it. Sticky for THIS turn only — the picker clears
+    /// after each send. Empty/absent means "no skills attached".
+    skill_names?: string[];
+}
+
+export interface InlineAttachment {
+    mime: string;
+    data_url: string;
 }
 
 export interface SendMessageResponse {
@@ -590,6 +631,7 @@ export interface LogsQuery {
     plugin_id?: string;
     conversation_id?: string;
     since_ms?: number;
+    until_ms?: number;
     limit?: number;
 }
 
@@ -602,6 +644,7 @@ export async function getLogs(
     if (q.plugin_id) qs.set("plugin_id", q.plugin_id);
     if (q.conversation_id) qs.set("conversation_id", q.conversation_id);
     if (q.since_ms !== undefined) qs.set("since_ms", String(q.since_ms));
+    if (q.until_ms !== undefined) qs.set("until_ms", String(q.until_ms));
     if (q.limit !== undefined) qs.set("limit", String(q.limit));
     const path = qs.toString()
         ? `/api/admin/logs?${qs.toString()}`
@@ -926,6 +969,45 @@ export async function getBackendStatus(
 ): Promise<BackendStatusResponse> {
     return apiFetch<BackendStatusResponse>(
         `/api/admin/backends/${encodeURIComponent(purpose)}/status`,
+        {},
+        tokenAccessor,
+    );
+}
+
+/// 2026-05-15 — runtime capability probe for a backend purpose.
+/// The chat shell polls this on mount to decide whether to surface
+/// the composer's image-attach affordance. The server probes
+/// `GET /v1/models` on the resolved endpoint and applies a curated
+/// known-vision-model matcher (Qwen-VL / Qwen3.6 / LLaVA / Pixtral
+/// / etc). A probe that doesn't reach the backend falls through as
+/// `reachable: false, multimodal: false` so the SPA hides the
+/// affordance rather than offering an action it can't fulfil.
+export interface BackendCapabilitiesResponse {
+    purpose: BackendPurpose;
+    endpoint: string | null;
+    reachable: boolean;
+    model_id: string | null;
+    multimodal: boolean;
+    /**
+     * 2026-05-15 — SPA target for the long-edge dimension after
+     * client-side downscale (Canvas resize before base64 encode).
+     * Picked by the server from detected GPU VRAM:
+     *   * 24 GB-class card → 1024
+     *   * 32–64 GB → 1536
+     *   * 64 GB+ → 2048
+     * Non-multimodal backends always return 0 (composer hides the
+     * affordance and never resizes).
+     */
+    recommended_image_edge: number;
+    error: string;
+}
+
+export async function getBackendCapabilities(
+    purpose: BackendPurpose,
+    tokenAccessor: () => string | null,
+): Promise<BackendCapabilitiesResponse> {
+    return apiFetch<BackendCapabilitiesResponse>(
+        `/api/admin/backends/${encodeURIComponent(purpose)}/capabilities`,
         {},
         tokenAccessor,
     );
@@ -1678,6 +1760,46 @@ export async function revokePrincipal(
     return apiFetch(
         `/api/admin/principals/${encodeURIComponent(principalId)}/revoke`,
         { method: "POST", body: reason ? { reason } : {} },
+        tokenAccessor,
+    );
+}
+
+/// The trust classes the operator can elevate or demote a contact
+/// to via Settings → Contacts. Maps 1-1 with the server-side
+/// `SetTrustRequest::class` allowlist — Controller / Delegated /
+/// UnknownPending are deliberately omitted (see the server handler's
+/// doc comment for why).
+export type SettableTrustClass = "KnownTrusted" | "KnownLimited" | "Blocked";
+
+export interface SetTrustOptions {
+    /** Topic allowlist; only meaningful when `class === "KnownLimited"`. */
+    allowed_topics?: string[];
+    /** Free-form note; persisted on Blocked rows. */
+    reason?: string;
+}
+
+export interface SetTrustResponse {
+    principal_id: string;
+    new_trust_class: string;
+    outcome: string;
+}
+
+export async function setPrincipalTrust(
+    principalId: string,
+    klass: SettableTrustClass,
+    opts: SetTrustOptions,
+    tokenAccessor: () => string | null,
+): Promise<SetTrustResponse> {
+    const body: Record<string, unknown> = { class: klass };
+    if (opts.allowed_topics && opts.allowed_topics.length > 0) {
+        body.allowed_topics = opts.allowed_topics;
+    }
+    if (opts.reason) {
+        body.reason = opts.reason;
+    }
+    return apiFetch<SetTrustResponse>(
+        `/api/admin/principals/${encodeURIComponent(principalId)}/trust`,
+        { method: "POST", body },
         tokenAccessor,
     );
 }
@@ -2457,6 +2579,69 @@ export async function testGooglePlaces(
     );
 }
 
+// ---- /api/admin/plugins/open-meteo/* ------------------------------
+//
+// Open-Meteo plugin admin endpoints. No API key needed (Open-Meteo
+// is free + keyless); the only operator-supplied config is a default
+// location + unit preferences + default chart dimensions. The plugin
+// validates the lat/lon by issuing a 1-day forecast lookup at save
+// time, which doubles as a connectivity check.
+
+export interface OpenMeteoConfigResponse {
+    place_name?: string | null;
+    default_latitude?: number | null;
+    default_longitude?: number | null;
+    default_timezone?: string;
+    temperature_unit?: string;
+    wind_speed_unit?: string;
+    precipitation_unit?: string;
+    default_chart_width?: number;
+    default_chart_height?: number;
+}
+
+export interface OpenMeteoTestResponse {
+    ok?: boolean;
+    latitude?: number;
+    longitude?: number;
+    current?: Record<string, unknown>;
+    error?: string;
+}
+
+export async function getOpenMeteoConfig(
+    tokenAccessor: () => string | null,
+): Promise<OpenMeteoConfigResponse> {
+    return apiFetch<OpenMeteoConfigResponse>(
+        "/api/admin/plugins/open-meteo/config",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function setOpenMeteoConfig(
+    body: OpenMeteoConfigResponse,
+    tokenAccessor: () => string | null,
+): Promise<void> {
+    await apiFetch<unknown>(
+        "/api/admin/plugins/open-meteo/config",
+        {
+            method: "POST",
+            body,
+            rawText: true,
+        },
+        tokenAccessor,
+    );
+}
+
+export async function testOpenMeteoForecast(
+    tokenAccessor: () => string | null,
+): Promise<OpenMeteoTestResponse> {
+    return apiFetch<OpenMeteoTestResponse>(
+        "/api/admin/plugins/open-meteo/test",
+        { method: "POST" },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/plugins/sms-socket/* ------------------------------
 //
 // SMS Socket plugin admin endpoints. The plugin holds an api_key +
@@ -2530,6 +2715,82 @@ export async function testSmsSocketMessage(
     return apiFetch<SmsSocketTestResponse>(
         "/api/admin/plugins/sms-socket/test",
         { method: "POST", body: { to } },
+        tokenAccessor,
+    );
+}
+
+// ---- /api/admin/plugins/discord/* ---------------------------------
+//
+// Discord plugin admin endpoints. The plugin holds a single bot
+// token (Authorization: Bot <token>) and discovers guilds + the
+// bot user via the Discord REST API on save. No sidecar — the
+// plugin maintains the gateway WebSocket itself via
+// ws_subscribe_bidi + the application-layer heartbeat installed
+// through ws_set_keepalive.
+
+export interface DiscordConfigResponse {
+    bot_token_masked: string;
+    configured: boolean;
+    bot_user_id?: string | null;
+    bot_username?: string | null;
+}
+
+export interface DiscordStatusResponse {
+    sidecar_status: string;
+    sidecar_rpc_url: string | null;
+    registered_accounts: unknown[];
+    accounts_on_disk: unknown[];
+    fetch_error: string | null;
+    bot_user_id?: string | null;
+    bot_username?: string | null;
+    guilds_known?: number;
+    token_masked?: string;
+}
+
+export async function getDiscordConfig(
+    tokenAccessor: () => string | null,
+): Promise<DiscordConfigResponse> {
+    return apiFetch<DiscordConfigResponse>(
+        "/api/admin/plugins/discord/config",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function setDiscordConfig(
+    bot_token: string,
+    tokenAccessor: () => string | null,
+): Promise<{ ok: boolean; bot_user_id?: string; bot_username?: string }> {
+    return apiFetch<{ ok: boolean; bot_user_id?: string; bot_username?: string }>(
+        "/api/admin/plugins/discord/config",
+        { method: "POST", body: { bot_token } },
+        tokenAccessor,
+    );
+}
+
+export async function getDiscordStatus(
+    tokenAccessor: () => string | null,
+): Promise<DiscordStatusResponse> {
+    return apiFetch<DiscordStatusResponse>(
+        "/api/admin/plugins/discord/status",
+        {},
+        tokenAccessor,
+    );
+}
+
+export interface DiscordTestResponse {
+    ok?: boolean;
+    message_id?: string;
+    error?: string;
+}
+
+export async function testDiscordMessage(
+    channel_id: string,
+    tokenAccessor: () => string | null,
+): Promise<DiscordTestResponse> {
+    return apiFetch<DiscordTestResponse>(
+        "/api/admin/plugins/discord/test",
+        { method: "POST", body: { channel_id } },
         tokenAccessor,
     );
 }
@@ -2996,12 +3257,29 @@ export interface DockerStatus {
     version: string | null;
 }
 
+/// Ollama availability for the Apple-Silicon native-runtime path.
+/// `available: true` means a runnable Ollama binary was found via
+/// PATH / OLLAMA_BINARY / Homebrew prefixes AND its `--version`
+/// invocation succeeded. The wizard renders the model dropdown when
+/// true and the install panel (`brew install ollama`) when false.
+export interface OllamaStatus {
+    available: boolean;
+    version: string | null;
+    /// Absolute path the discoverer resolved. Surfaced in the
+    /// "Ollama X.Y.Z detected" confirmation badge so multi-install
+    /// systems read out unambiguously. Populated even on
+    /// `available: false` when discovery resolved a path but
+    /// `--version` failed — operator can see where the bad install
+    /// sits.
+    path: string | null;
+}
+
 export interface DetectedGpu {
     /// Stringified `GpuId`. Server uses `<vendor_hex>:<device_or_card>`
     /// — opaque to the SPA. Used as the `gpu_id` value when saving
     /// the Standard backend if the operator picks a specific card.
     id: { 0: string } | string;
-    vendor: "Nvidia" | "Intel" | "Amd" | "Unknown";
+    vendor: "Nvidia" | "Intel" | "Amd" | "Apple" | "Unknown";
     pci_vendor_id: string;
     pci_device_id: string;
     /// Linux-only on bare-metal sysfs paths; empty on Windows/macOS
@@ -3020,6 +3298,7 @@ export interface DetectedGpu {
 
 export interface PreflightResponse {
     docker: DockerStatus;
+    ollama: OllamaStatus;
     gpus: DetectedGpu[];
     /// Free space on the volume that hosts execlaw's HF model
     /// cache. `null` when the platform's free-space probe failed
@@ -3155,6 +3434,54 @@ export async function disconnectOauth(
     );
 }
 
+
+// ============================================================
+// Per-plugin settings (PUT/GET /api/admin/plugins/{id}/settings/{key})
+// ============================================================
+//
+// Generic flat-key store backed by the vault. Plugin pages read +
+// write opaque strings here for non-secret operator config — toggles,
+// behaviour flags, per-plugin display preferences. Distinct from the
+// OAuth client surface and from `vault_put` inside Rhai scripts (the
+// latter reaches the same SQLite row, just from the script side).
+
+export interface PluginSettingView {
+    plugin_id: string;
+    key: string;
+    value: string;
+}
+
+export async function getPluginSetting(
+    pluginId: string,
+    key: string,
+    tokenAccessor: () => string | null,
+): Promise<PluginSettingView | null> {
+    try {
+        return await apiFetch<PluginSettingView>(
+            `/api/admin/plugins/${encodeURIComponent(pluginId)}/settings/${encodeURIComponent(key)}`,
+            {},
+            tokenAccessor,
+        );
+    } catch (e) {
+        if (e instanceof ApiError && e.status === 404) {
+            return null;
+        }
+        throw e;
+    }
+}
+
+export async function putPluginSetting(
+    pluginId: string,
+    key: string,
+    value: string,
+    tokenAccessor: () => string | null,
+): Promise<PluginSettingView> {
+    return apiFetch<PluginSettingView>(
+        `/api/admin/plugins/${encodeURIComponent(pluginId)}/settings/${encodeURIComponent(key)}`,
+        { method: "PUT", body: { value } },
+        tokenAccessor,
+    );
+}
 
 // ============================================================
 // Settings → Search (search-provider registry)

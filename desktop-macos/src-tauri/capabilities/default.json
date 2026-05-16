@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Empty default capability — the menu bar app exposes no Tauri IPC commands. The webview points at http://127.0.0.1:3031 directly so all server interactions flow through HTTP, not the Tauri bridge.",
+  "windows": ["main", "chat"],
+  "permissions": [
+    "core:default",
+    "opener:default",
+    "dialog:default"
+  ]
+}

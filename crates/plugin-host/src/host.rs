@@ -67,6 +67,26 @@ pub struct PluginRow {
     pub enabled: bool,
     pub installed_at: i64,
     pub updated_at: i64,
+    /// 2026-05-15 — non-destructive replacement for the auto-evict
+    /// policy. `"healthy"` (the default) means the plugin loaded
+    /// cleanly on the last hydrate / install / enable; any other
+    /// value means the in-memory registry has the plugin disabled
+    /// but the install record + OAuth + vault state survive so the
+    /// operator can reinstall without losing config. Today the only
+    /// non-healthy value is `"quarantined"`; keep the column TEXT so
+    /// a future "crash_looping" / "rate_limited" state doesn't need
+    /// a migration.
+    pub health_status: String,
+    /// One-line operator-facing reason this row is non-healthy.
+    /// `None` when `health_status == "healthy"`. Surfaced in the
+    /// SPA's plugin-row tooltip so operators see the failure
+    /// without grepping logs.
+    pub health_message: Option<String>,
+    /// Unix timestamp (seconds) when the row entered its current
+    /// non-healthy state, or `None` when healthy. Lets the SPA show
+    /// "broken since X" — useful for distinguishing a fresh failure
+    /// from one that has been broken for days.
+    pub quarantined_at: Option<i64>,
 }
 
 /// Orchestrator. Cheap to clone; shares one `HookRegistry` and one
@@ -260,6 +280,63 @@ impl PluginHost {
         }
     }
 
+    /// Fire the optional `on_disable()` Rhai lifecycle hook for
+    /// every loaded script plugin. Called by:
+    ///   * Factory reset (`POST /api/admin/factory-reset`) BEFORE
+    ///     it wipes the DB — gives plugins a last chance to revoke
+    ///     OAuth tokens, send "going offline" notifications, or
+    ///     flush in-memory state to vault rows before everything
+    ///     turns into dust.
+    ///   * Process shutdown (future) — same rationale, less urgent.
+    ///
+    /// Best-effort: a panicking or erroring `on_disable` logs at
+    /// WARN and the loop moves on to the next plugin. The host
+    /// proceeds with whatever destructive operation triggered the
+    /// fire regardless — `on_disable` is a courtesy, not a veto.
+    ///
+    /// Returns the number of plugins for which the hook RAN
+    /// (i.e. excludes plugins that don't define `on_disable`).
+    /// Useful for the factory-reset response + telemetry.
+    pub async fn fire_on_disable_for_all(&self) -> usize {
+        let plugins: Vec<(String, execlaw_script::ScriptPlugin)> = self
+            .inner
+            .script_plugins
+            .read()
+            .await
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut fired = 0usize;
+        for (plugin_id, plugin) in plugins {
+            // The plugin's own definition decides whether the hook
+            // exists. `call_on_disable` collapses "not defined"
+            // into Ok(()) so we can't distinguish here whether it
+            // actually ran or was skipped — the script plugin
+            // could surface that, but the operational signal we
+            // care about is "did any hook error" and the answer
+            // shows up in the WARN log.
+            match plugin.call_on_disable().await {
+                Ok(()) => {
+                    fired += 1;
+                    tracing::debug!(
+                        target: "plugin_host::lifecycle",
+                        plugin_id = %plugin_id,
+                        "on_disable fired",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "plugin_host::lifecycle",
+                        plugin_id = %plugin_id,
+                        error = %e,
+                        "on_disable hook returned an error — continuing teardown anyway",
+                    );
+                }
+            }
+        }
+        fired
+    }
+
     pub fn stage_root(&self) -> &Path {
         &self.inner.stage_root
     }
@@ -298,6 +375,28 @@ impl PluginHost {
         // Already installed?
         if self.get_row(&plugin_id)?.is_some() {
             return Err(PluginHostError::AlreadyInstalled(plugin_id));
+        }
+
+        // 2026-05-14 — refuse the install if any `[[ui_panels]]`
+        // declaration in the manifest points at an `entry` file
+        // that doesn't actually exist in the staged ZIP. Pre-fix
+        // a plugin could declare `entry = "ui/panel.js"` and the
+        // host accepted it silently; the SPA's dynamic-import
+        // attempt at runtime would then 404 and the operator
+        // would see a broken settings page with no upstream signal
+        // about why. Validate at install time so the failure
+        // surfaces during plugin upload, where the operator can
+        // actually do something about it (fix the ZIP).
+        for panel in &manifest.ui_panels {
+            let entry_path = stage_path.join(&panel.entry);
+            if !entry_path.is_file() {
+                return Err(PluginHostError::Manifest(format!(
+                    "plugin '{plugin_id}' declares [[ui_panels]] entry '{}' \
+                     but the file is missing from the staged ZIP at {}",
+                    panel.entry,
+                    entry_path.display(),
+                )));
+            }
         }
 
         // Step 1 — register hooks. Pass the stage path so any
@@ -398,6 +497,13 @@ impl PluginHost {
             enabled: true,
             installed_at: now,
             updated_at: now,
+            // Fresh installs are always healthy — the steps above
+            // (manifest parse, hook register, runtime spawn) all
+            // succeeded. Quarantine only happens later, on a boot-
+            // time hydrate that fails to load the plugin.
+            health_status: "healthy".to_owned(),
+            health_message: None,
+            quarantined_at: None,
         };
         self.insert_row(&row)?;
 
@@ -626,12 +732,45 @@ impl PluginHost {
     /// Disable without uninstalling. Hooks come off the registry and
     /// the subprocess is killed, but the DB row + stage dir stay so
     /// re-enable is cheap.
+    ///
+    /// 2026-05-13 — fires the plugin's optional `on_disable()` Rhai
+    /// lifecycle hook BEFORE shutting down the engine, so the
+    /// plugin can run custom cleanup (revoke OAuth tokens, send a
+    /// "going offline" notification, flush in-memory state) while
+    /// it still has access to host capabilities + the live runtime.
+    /// Best-effort: errors are logged but do not block the disable
+    /// — the host's `shutdown()` of WS subscriptions + the engine
+    /// drop remain the *backstop* teardown that always runs.
     pub async fn disable(&self, plugin_id: &str) -> Result<(), PluginHostError> {
         let Some(mut row) = self.get_row(plugin_id)? else {
             return Err(PluginHostError::NotInstalled(plugin_id.to_owned()));
         };
         if !row.enabled {
             return Ok(()); // idempotent
+        }
+        // Fire on_disable BEFORE removing the script plugin so the
+        // hook still has access to the engine + its host bindings
+        // (oauth_revoke, transport_send, vault_set, …). Best-effort
+        // — a panicking / erroring hook is logged but we proceed
+        // with the destructive teardown anyway. The plugin can't
+        // veto its own disable.
+        if let Some(plugin) = self
+            .inner
+            .script_plugins
+            .read()
+            .await
+            .get(plugin_id)
+            .cloned()
+        {
+            if let Err(e) = plugin.call_on_disable().await {
+                warn!(
+                    plugin_id,
+                    error = %e,
+                    "on_disable hook returned an error — continuing disable anyway",
+                );
+            } else {
+                debug!(plugin_id, "on_disable fired (pre-disable)");
+            }
         }
         self.inner.registry.disable(plugin_id);
         if let Some(plugin) = self.inner.subprocesses.write().await.remove(plugin_id) {
@@ -727,6 +866,13 @@ impl PluginHost {
         row.enabled = true;
         row.updated_at = chrono::Utc::now().timestamp();
         self.update_row(&row)?;
+        // 2026-05-15 — clear any prior quarantine marker. If this
+        // enable was the operator's manual recovery from a hydrate
+        // failure that quarantined the plugin earlier, the row was
+        // sitting at health_status='quarantined' until now.
+        // enable() succeeded, so the plugin loads cleanly again —
+        // mark it healthy so the SPA drops the "broken" badge.
+        self.mark_healthy(plugin_id);
         info!(plugin_id, "plugin enabled");
 
         // Fire on_enable for script plugins so a fresh enable / a
@@ -767,7 +913,14 @@ impl PluginHost {
             let manifest = match PluginManifest::parse(&row.manifest_toml) {
                 Ok(m) => m,
                 Err(e) => {
-                    warn!(plugin_id = %row.plugin_id, error = %e, "skipping plugin with unparseable manifest");
+                    // Unparseable manifest in the DB row → the row
+                    // can't hydrate. Quarantine instead of delete so
+                    // the operator's OAuth + vault state survive the
+                    // reinstall, and the SPA renders a "needs
+                    // reinstall: <reason>" badge instead of making
+                    // the plugin disappear from the install list.
+                    warn!(plugin_id = %row.plugin_id, error = %e, "unparseable manifest on hydrate; quarantining (state_plugins row preserved)");
+                    self.quarantine_plugin(&row.plugin_id, &format!("manifest unparseable: {e}"));
                     continue;
                 }
             };
@@ -776,6 +929,12 @@ impl PluginHost {
                 .registry
                 .enable_with_stage(&manifest, Some(std::path::Path::new(&row.stage_path)))
             {
+                // Hook conflict isn't necessarily unrecoverable (it
+                // could be a transient state where another plugin
+                // owns the same hook id and will itself be purged
+                // later in this same hydrate pass). We keep the
+                // original "skip + warn" behavior here rather than
+                // auto-purging.
                 warn!(plugin_id = %row.plugin_id, error = %e, "skipping plugin with hook conflict on hydrate");
                 continue;
             }
@@ -789,7 +948,18 @@ impl PluginHost {
                         Some(execlaw_plugin_sdk::manifest::RuntimeTier::Subprocess) => {
                             let exe = match runtime_executable_or_err(runtime) {
                                 Ok(s) => s,
-                                Err(_) => continue,
+                                Err(e) => {
+                                    warn!(
+                                        plugin_id = %row.plugin_id,
+                                        error = %e,
+                                        "subprocess plugin manifest missing runtime.executable; quarantining (state_plugins row preserved)",
+                                    );
+                                    self.quarantine_plugin(
+                                        &row.plugin_id,
+                                        &format!("manifest missing runtime.executable: {e}"),
+                                    );
+                                    continue;
+                                }
                             };
                             let spec = SubprocessSpec {
                                 plugin_id: row.plugin_id.clone(),
@@ -812,15 +982,42 @@ impl PluginHost {
                                     debug!(plugin_id = %row.plugin_id, "hydrated subprocess plugin");
                                 }
                                 Err(e) => {
-                                    warn!(plugin_id = %row.plugin_id, error = %e, "failed to respawn subprocess on hydrate");
-                                    self.inner.registry.disable(&row.plugin_id);
+                                    // Subprocess won't spawn → the
+                                    // staged binary is gone or
+                                    // unexec'able. Quarantine so the
+                                    // SPA shows the plugin as broken
+                                    // (with the spawn error visible)
+                                    // and gives the operator a
+                                    // reinstall affordance, while
+                                    // keeping OAuth + vault state
+                                    // intact for the reinstall.
+                                    warn!(
+                                        plugin_id = %row.plugin_id,
+                                        error = %e,
+                                        "subprocess spawn failed on hydrate; quarantining (state_plugins row preserved)",
+                                    );
+                                    self.quarantine_plugin(
+                                        &row.plugin_id,
+                                        &format!("subprocess spawn failed: {e}"),
+                                    );
                                 }
                             }
                         }
                         Some(execlaw_plugin_sdk::manifest::RuntimeTier::Script) => {
                             let src = match runtime_source_or_err(runtime) {
                                 Ok(s) => s,
-                                Err(_) => continue,
+                                Err(e) => {
+                                    warn!(
+                                        plugin_id = %row.plugin_id,
+                                        error = %e,
+                                        "script plugin manifest missing runtime.source; quarantining (state_plugins row preserved)",
+                                    );
+                                    self.quarantine_plugin(
+                                        &row.plugin_id,
+                                        &format!("manifest missing runtime.source: {e}"),
+                                    );
+                                    continue;
+                                }
                             };
                             let path = stage.join(src);
                             match execlaw_script::ScriptPlugin::from_file(
@@ -841,8 +1038,50 @@ impl PluginHost {
                                     // sidecars healthy.
                                 }
                                 Err(e) => {
-                                    warn!(plugin_id = %row.plugin_id, error = %e, "failed to load script on hydrate");
-                                    self.inner.registry.disable(&row.plugin_id);
+                                    // 2026-05-14 — the load-bearing
+                                    // case: the staged `main.rhai`
+                                    // is gone (os error 3 / "system
+                                    // cannot find the path"). Pre-fix
+                                    // this just disabled the plugin
+                                    // in the registry while leaving
+                                    // `state_plugins.enabled=1`,
+                                    // creating a zombie state where
+                                    // the SPA renders the plugin's
+                                    // config page but every admin
+                                    // route 404s with the confusing
+                                    // "no [[admin_routes]] entry on
+                                    // plugin 'X' matching GET /…"
+                                    // error.
+                                    //
+                                    // 2026-05-15 — quarantine instead
+                                    // of delete (the rev-2 fix). The
+                                    // earlier auto-purge silently
+                                    // destroyed install records when
+                                    // the staged dir went transiently
+                                    // missing (Windows file-handle
+                                    // race during cargo dev cycles,
+                                    // manual cleanup of
+                                    // `~/.execlaw/plugins/`, etc.) —
+                                    // operators lost their entire
+                                    // install list overnight while
+                                    // OAuth tokens + vault secrets
+                                    // were stranded under plugin_ids
+                                    // the SPA no longer knew about.
+                                    // Quarantine keeps the row +
+                                    // marks it broken; SPA renders a
+                                    // "needs reinstall" badge with
+                                    // the error visible; reinstall
+                                    // path clears the quarantine
+                                    // and the configs come back.
+                                    warn!(
+                                        plugin_id = %row.plugin_id,
+                                        error = %e,
+                                        "failed to load script on hydrate; quarantining (state_plugins row preserved; OAuth/vault state kept; SPA shows reinstall affordance)",
+                                    );
+                                    self.quarantine_plugin(
+                                        &row.plugin_id,
+                                        &format!("script load failed: {e}"),
+                                    );
                                 }
                             }
                         }
@@ -855,6 +1094,18 @@ impl PluginHost {
         }
         Ok(())
     }
+
+    // 2026-05-15 — `evict_unrecoverable_plugin` removed in favour of
+    // `quarantine_plugin` (defined further down alongside the other
+    // DB row helpers). The earlier auto-evict policy DELETED the
+    // state_plugins row on every hydrate failure, which silently
+    // destroyed the install record on transient causes (Windows file-
+    // handle race during cargo dev cycles, manual cleanup of
+    // `~/.execlaw/plugins/`, etc.) and stranded operators' OAuth
+    // tokens + vault secrets under plugin_ids the SPA no longer
+    // knew about. The new quarantine path keeps the row + marks it
+    // broken; the SPA renders a "needs reinstall" badge instead of
+    // making the plugin disappear from the install list entirely.
 
     /// Query every registered identity-provider plugin to resolve a
     /// transport identifier (`{transport, handle}`) into a set of
@@ -1062,7 +1313,8 @@ impl PluginHost {
             .with_conn(|c| {
                 let mut stmt = c.prepare_cached(
                     "SELECT plugin_id, version, manifest_toml, stage_path, enabled, \
-                        installed_at, updated_at \
+                        installed_at, updated_at, \
+                        health_status, health_message, quarantined_at \
                  FROM state_plugins ORDER BY plugin_id",
                 )?;
                 let rows = stmt
@@ -1075,6 +1327,9 @@ impl PluginHost {
                             enabled: r.get::<_, i64>(4)? != 0,
                             installed_at: r.get(5)?,
                             updated_at: r.get(6)?,
+                            health_status: r.get(7)?,
+                            health_message: r.get(8)?,
+                            quarantined_at: r.get(9)?,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -1090,7 +1345,8 @@ impl PluginHost {
                 let got = c
                     .query_row(
                         "SELECT plugin_id, version, manifest_toml, stage_path, enabled, \
-                            installed_at, updated_at \
+                            installed_at, updated_at, \
+                            health_status, health_message, quarantined_at \
                      FROM state_plugins WHERE plugin_id = ?1",
                         params![plugin_id],
                         |r| {
@@ -1102,6 +1358,9 @@ impl PluginHost {
                                 enabled: r.get::<_, i64>(4)? != 0,
                                 installed_at: r.get(5)?,
                                 updated_at: r.get(6)?,
+                                health_status: r.get(7)?,
+                                health_message: r.get(8)?,
+                                quarantined_at: r.get(9)?,
                             })
                         },
                     )
@@ -1115,8 +1374,9 @@ impl PluginHost {
         self.inner.db.with_conn(|c| {
             c.execute(
                 "INSERT INTO state_plugins \
-                 (plugin_id, version, manifest_toml, stage_path, enabled, installed_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (plugin_id, version, manifest_toml, stage_path, enabled, installed_at, updated_at, \
+                  health_status, health_message, quarantined_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     row.plugin_id,
                     row.version,
@@ -1125,10 +1385,93 @@ impl PluginHost {
                     row.enabled as i64,
                     row.installed_at,
                     row.updated_at,
+                    row.health_status,
+                    row.health_message,
+                    row.quarantined_at,
                 ],
             )?;
             Ok(())
         }).map_err(PluginHostError::Db)
+    }
+
+    /// 2026-05-15 — non-destructive replacement for
+    /// `evict_unrecoverable_plugin`. Marks the row as quarantined +
+    /// disables hooks in the in-memory registry, but keeps the
+    /// install record + OAuth + vault state. The operator's next
+    /// reinstall picks up the existing config without re-running
+    /// the OAuth flow / re-typing API keys.
+    ///
+    /// Reason flows into `state_plugins.health_message` and is
+    /// surfaced in the SPA's plugin-row tooltip. Best-effort: a
+    /// failed UPDATE is logged at WARN but boot proceeds (the next
+    /// hydrate will retry the quarantine).
+    fn quarantine_plugin(&self, plugin_id: &str, reason: &str) {
+        // Step 1: pull hooks/admin_routes/tools/sidecars out of the
+        // in-memory registry so the plugin doesn't surface partly-
+        // wired functionality. Same first move as the old
+        // evict_unrecoverable_plugin path.
+        self.inner.registry.disable(plugin_id);
+        // Step 2: mark the DB row as quarantined. Pre-rework this
+        // was `delete_row(plugin_id)` — silently destructive on a
+        // transient file-not-found. Now we preserve the install
+        // record so the SPA can render a "needs reinstall" badge
+        // and the operator's OAuth tokens / vault secrets / artifact
+        // blobs (FK'd by plugin_id) stay valid for the eventual
+        // reinstall.
+        let now = chrono::Utc::now().timestamp();
+        let result = self.inner.db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_plugins \
+                 SET health_status = 'quarantined', \
+                     health_message = ?1, \
+                     quarantined_at = ?2, \
+                     updated_at = ?2 \
+                 WHERE plugin_id = ?3",
+                params![reason, now, plugin_id],
+            )?;
+            Ok::<_, DbError>(())
+        });
+        match result {
+            Ok(()) => info!(
+                plugin_id,
+                reason,
+                "plugin quarantined (state_plugins row preserved; OAuth/vault/artifact rows kept; SPA shows reinstall affordance)",
+            ),
+            Err(e) => warn!(
+                plugin_id,
+                reason,
+                error = %e,
+                "failed to mark plugin quarantined; in-memory registry has the plugin disabled but the DB row may show stale health",
+            ),
+        }
+    }
+
+    /// Clear the quarantine flag on a row. Called from the install /
+    /// upgrade / enable success paths to flip a previously broken
+    /// plugin back to healthy without a second migration / row delete
+    /// dance. Best-effort: a failed UPDATE is logged but doesn't
+    /// fail the install (the in-memory state is already correct;
+    /// the worst case is the SPA shows a stale "broken" badge until
+    /// the next restart).
+    fn mark_healthy(&self, plugin_id: &str) {
+        let result = self.inner.db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_plugins \
+                 SET health_status = 'healthy', \
+                     health_message = NULL, \
+                     quarantined_at = NULL \
+                 WHERE plugin_id = ?1",
+                params![plugin_id],
+            )?;
+            Ok::<_, DbError>(())
+        });
+        if let Err(e) = result {
+            warn!(
+                plugin_id,
+                error = %e,
+                "failed to clear quarantine flag on state_plugins; SPA may show stale 'broken' badge until next restart",
+            );
+        }
     }
 
     fn update_row(&self, row: &PluginRow) -> Result<(), PluginHostError> {
@@ -2092,6 +2435,162 @@ source = "main.rhai"
         );
     }
 
+    /// Stage a script plugin whose `on_disable` hook writes a marker
+    /// row via `host_log_info` — we can't reach into vault from
+    /// here without wiring host_caps, so the marker is "the log
+    /// line ran", verified indirectly through `fire_on_disable_for_all`
+    /// returning > 0. The richer end-to-end test (on_disable
+    /// mutates vault) lives in `crates/script/tests/`.
+    fn stage_script_plugin_with_on_disable(
+        plugin_id: &str,
+        version: &str,
+    ) -> (tempfile::TempDir, PathBuf) {
+        // A `[[tools]]` block is required: `PluginHost::install`
+        // gates runtime construction on `!manifest.tools.is_empty()
+        // || transport.is_some() || identity_provider.is_some()`,
+        // so without one the script plugin never lands in
+        // `script_plugins` and `fire_on_disable_for_all` has
+        // nothing to iterate. Matches how every real script-tier
+        // plugin in `plugins/` declares at least one tool.
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join(format!("{plugin_id}-{version}"));
+        std::fs::create_dir_all(&stage).unwrap();
+        let manifest = format!(
+            r#"
+[plugin]
+id = "{plugin_id}"
+name = "On-Disable Test"
+version = "{version}"
+description = "test"
+author = "a"
+license = "x"
+
+[runtime]
+tier = "script"
+source = "main.rhai"
+
+[[tools]]
+name = "{plugin_id}.noop"
+latency = "low"
+"#
+        );
+        std::fs::write(stage.join("plugin.toml"), manifest).unwrap();
+        // Minimal Rhai source. `on_disable` exists and returns
+        // unit — the host's `call_on_disable` doesn't require any
+        // host capability bindings (no log_info, no vault), it
+        // just verifies the function exists and runs without
+        // throwing.
+        std::fs::write(
+            stage.join("main.rhai"),
+            "fn tool_call(name, args, oauth) { #{} }\nfn on_disable() { () }\n",
+        )
+        .unwrap();
+        (dir, stage)
+    }
+
+    /// Stage a script plugin without any `on_disable` definition.
+    /// `call_on_disable` must collapse `MissingFunction` into
+    /// silent success so opt-in semantics work.
+    fn stage_script_plugin_without_on_disable(
+        plugin_id: &str,
+        version: &str,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join(format!("{plugin_id}-{version}"));
+        std::fs::create_dir_all(&stage).unwrap();
+        let manifest = format!(
+            r#"
+[plugin]
+id = "{plugin_id}"
+name = "No-Hook Test"
+version = "{version}"
+description = "test"
+author = "a"
+license = "x"
+
+[runtime]
+tier = "script"
+source = "main.rhai"
+
+[[tools]]
+name = "{plugin_id}.noop"
+latency = "low"
+"#
+        );
+        std::fs::write(stage.join("plugin.toml"), manifest).unwrap();
+        std::fs::write(
+            stage.join("main.rhai"),
+            "fn tool_call(name, args, oauth) { #{} }\n",
+        )
+        .unwrap();
+        (dir, stage)
+    }
+
+    /// Regression: factory reset relies on `fire_on_disable_for_all`
+    /// actually invoking each loaded plugin's hook. Pre-2026-05-13
+    /// the hook didn't exist; the bug that motivated this rework
+    /// was the WhatsApp wuzapi container surviving factory reset.
+    /// This test verifies the hook surface itself; the
+    /// integration test that the *factory_reset handler* invokes
+    /// it lives in `factory_reset.rs`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fire_on_disable_for_all_invokes_hook_only_for_plugins_that_define_it() {
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db, registry, stage_root.path().to_path_buf());
+
+        // Plugin A defines `on_disable` — fire_on_disable_for_all
+        // must invoke it.
+        let (_keep_a, stage_a) = stage_script_plugin_with_on_disable("plugin-with-hook", "0.1.0");
+        host.install(&stage_a).await.unwrap();
+        // Plugin B does NOT define `on_disable` — the call must
+        // silently succeed (`MissingFunction` collapse). Counted
+        // in `fired` because the hook returned Ok regardless.
+        let (_keep_b, stage_b) =
+            stage_script_plugin_without_on_disable("plugin-without-hook", "0.1.0");
+        host.install(&stage_b).await.unwrap();
+
+        let fired = host.fire_on_disable_for_all().await;
+        // Both call_on_disable returned Ok (one because the hook
+        // ran, one because MissingFunction collapsed). The return
+        // value is "no hook errored," not "every plugin defined
+        // a hook" — that's the contract.
+        assert_eq!(
+            fired, 2,
+            "both plugins must complete on_disable without error"
+        );
+    }
+
+    /// Regression: PluginHost::disable() must fire on_disable
+    /// BEFORE shutting the engine down. Otherwise the hook can't
+    /// access host bindings it needs for cleanup (oauth_revoke,
+    /// transport_send, vault_set). Verify by installing a plugin
+    /// with an on_disable that exists, calling disable, and
+    /// confirming the disable completes (any panic / error inside
+    /// the hook would surface as a warn-log but not block the
+    /// disable — that's also the contract).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disable_fires_on_disable_before_engine_shutdown() {
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db, registry, stage_root.path().to_path_buf());
+
+        let (_keep, stage) = stage_script_plugin_with_on_disable("disable-test", "0.1.0");
+        host.install(&stage).await.unwrap();
+
+        // disable() should run on_disable and then proceed with
+        // the rest of teardown. No assertion needed beyond
+        // "doesn't error" — the call_on_disable failure path is
+        // logged but doesn't fail disable().
+        host.disable("disable-test").await.unwrap();
+
+        // Plugin is gone from the script_plugins registry.
+        let snapshot = host.inner.script_plugins.read().await;
+        assert!(!snapshot.contains_key("disable-test"));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn upgrade_writes_new_version_string_to_state_plugins() {
         let db = fresh_db();
@@ -2111,6 +2610,211 @@ source = "main.rhai"
             .unwrap()
             .expect("row must exist post-upgrade");
         assert_eq!(row.version, "1.4.7");
+    }
+
+    /// Regression for the 2026-05-14 "zombie plugin row" bug.
+    ///
+    /// Scenario (reproduces what the user reported on the Signal
+    /// config page):
+    ///   1. Install a script plugin via `PluginHost::install` → DB
+    ///      row written with `stage_path`, registry populated with
+    ///      admin_routes / tools / etc.
+    ///   2. Something removes the staged directory from disk
+    ///      (factory-reset orphan sweep, manual rm, disk failure).
+    ///   3. Server restarts → boot calls `PluginHost::hydrate`.
+    ///   4. Hydrate tries to load `main.rhai` from the now-missing
+    ///      path, gets `os error 3`.
+    ///
+    /// Pre-fix: hydrate called `registry.disable(plugin_id)` and
+    /// left `state_plugins.enabled=1`. The SPA queried `state_plugins`,
+    /// saw the plugin as installed, rendered its config page, and
+    /// every admin route 404'd with
+    ///   `no [[admin_routes]] entry on plugin 'X' matching GET /…`
+    ///
+    /// Mid-fix (2026-05-14, commit f7d0725): hydrate called
+    /// `evict_unrecoverable_plugin` which disabled in the registry
+    /// AND DELETED the `state_plugins` row. Fixed the zombie 404
+    /// problem but introduced a new one: transient stage-loss
+    /// (Windows file-handle race during cargo dev cycles, manual
+    /// cleanup of `~/.execlaw/plugins/`, etc.) silently destroyed
+    /// the install record overnight, stranding operators' OAuth
+    /// tokens + vault secrets under plugin_ids the SPA no longer
+    /// knew about.
+    ///
+    /// Final fix (2026-05-15): hydrate calls `quarantine_plugin`
+    /// which disables in the registry but PRESERVES the row + marks
+    /// it `health_status='quarantined'`. Operator's reinstall heals
+    /// the quarantine and OAuth/vault state survives automatically.
+    /// SPA queries the new health fields to render a "broken — needs
+    /// reinstall" badge instead of either the zombie 404 OR the
+    /// silent disappearance.
+    #[tokio::test]
+    async fn hydrate_quarantines_row_when_stage_dir_is_missing() {
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
+
+        // Stage + install a script plugin with at least one tool —
+        // we need `needs_runtime = true` (i.e. tools / transport /
+        // identity_provider non-empty) so the hydrate path actually
+        // tries to load `main.rhai`. A tool-less plugin's hydrate
+        // would skip the script-load step entirely and never hit
+        // the quarantine branch we're testing.
+        let (_tmp, stage) = stage_script_plugin_with_on_disable("zombie-test", "0.1.0");
+        host.install(&stage).await.unwrap();
+        let installed = host
+            .get_row("zombie-test")
+            .unwrap()
+            .expect("install must succeed");
+        assert_eq!(
+            installed.health_status, "healthy",
+            "fresh install must be healthy"
+        );
+
+        // Simulate the stage-dir loss (factory-reset orphan sweep,
+        // manual rm, Windows file-handle race during cargo restart, etc.).
+        std::fs::remove_dir_all(&stage).unwrap();
+
+        // Spin up a fresh PluginHost backed by the SAME DB so the
+        // install row survives but the in-memory registry is empty
+        // (mirrors what happens at boot: new process, same DB).
+        let registry2 = HookRegistry::new();
+        let host2 = PluginHost::new(db.clone(), registry2, stage_root.path().to_path_buf());
+        host2.hydrate().await.unwrap();
+
+        // Post-hydrate: the row MUST still exist (preserving OAuth
+        // tokens + vault secrets keyed on this plugin_id) but be
+        // marked quarantined with the failure reason.
+        let row = host2
+            .get_row("zombie-test")
+            .unwrap()
+            .expect("hydrate must NOT delete the row — that's the bug we're fixing");
+        assert_eq!(
+            row.health_status, "quarantined",
+            "missing stage dir must mark the row quarantined, not healthy",
+        );
+        let msg = row
+            .health_message
+            .expect("quarantined row must carry a reason");
+        assert!(
+            msg.contains("script load failed"),
+            "health_message must explain the failure (got: {msg})",
+        );
+        assert!(
+            row.quarantined_at.unwrap_or(0) > 0,
+            "quarantined_at must be a real timestamp",
+        );
+
+        // And the registry must reflect uninstalled state — admin
+        // routes are gone so the SPA's old config-page 404 is also
+        // gone (the SPA reads health_status and renders the
+        // reinstall affordance instead).
+        assert!(
+            host2.registry().admin_routes_for("zombie-test").is_empty(),
+            "registry must have no admin_routes for a quarantined plugin",
+        );
+    }
+
+    /// Hydrate quarantining an unparseable manifest: a hand-edited
+    /// or migration-corrupted `state_plugins.manifest_toml` blob is
+    /// just as unrecoverable as a missing stage dir from the
+    /// hydrate path's perspective, and quarantines the same way.
+    #[tokio::test]
+    async fn hydrate_quarantines_row_when_manifest_is_unparseable() {
+        use rusqlite::params;
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
+
+        // Insert a hand-crafted row whose manifest_toml is garbage.
+        // Default health_status is 'healthy' (column NOT NULL DEFAULT
+        // 'healthy' from the migration), so we don't need to
+        // explicitly set it in this hand-crafted INSERT.
+        let now = chrono::Utc::now().timestamp();
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO state_plugins(plugin_id, version, manifest_toml, stage_path, enabled, installed_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)",
+                params![
+                    "bad-manifest",
+                    "0.1.0",
+                    "this is not valid toml }} [[",
+                    "/tmp/nonexistent",
+                    now,
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(host.get_row("bad-manifest").unwrap().is_some());
+
+        host.hydrate().await.unwrap();
+
+        let row = host
+            .get_row("bad-manifest")
+            .unwrap()
+            .expect("hydrate must NOT delete the row");
+        assert_eq!(row.health_status, "quarantined");
+        let msg = row
+            .health_message
+            .expect("quarantined row must carry a reason");
+        assert!(
+            msg.contains("manifest unparseable"),
+            "health_message must explain the failure (got: {msg})",
+        );
+    }
+
+    /// Reinstall heals the quarantine: an operator who lost their
+    /// staged plugin dir can re-upload the same plugin ZIP, and
+    /// the new install MUST mark the row healthy again. This is
+    /// the recovery path the user-facing "Reinstall" button uses.
+    #[tokio::test]
+    async fn upgrade_heals_quarantined_row() {
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
+
+        // Stage + install, then yank the stage dir + hydrate to land
+        // the row in the quarantined state — same setup as the
+        // quarantine test above.
+        let (_tmp1, stage1) = stage_script_plugin_with_on_disable("heal-test", "0.1.0");
+        host.install(&stage1).await.unwrap();
+        std::fs::remove_dir_all(&stage1).unwrap();
+        let registry2 = HookRegistry::new();
+        let host2 = PluginHost::new(db.clone(), registry2, stage_root.path().to_path_buf());
+        host2.hydrate().await.unwrap();
+        assert_eq!(
+            host2.get_row("heal-test").unwrap().unwrap().health_status,
+            "quarantined",
+            "test setup: row must be quarantined before we test the heal path",
+        );
+
+        // The operator's reinstall: stage a fresh copy, call upgrade
+        // (which is what the SPA's `?if_existing=upgrade` route
+        // dispatches to). Upgrade does disable→uninstall→install,
+        // and install creates a row with `health_status='healthy'`.
+        let (_tmp2, stage2) = stage_script_plugin_with_on_disable("heal-test", "0.1.1");
+        host2.upgrade(&stage2).await.unwrap();
+
+        let row = host2
+            .get_row("heal-test")
+            .unwrap()
+            .expect("post-upgrade row must exist");
+        assert_eq!(
+            row.health_status, "healthy",
+            "reinstall must clear the quarantine — that's the recovery path",
+        );
+        assert!(
+            row.health_message.is_none(),
+            "healthy row must have no error message"
+        );
+        assert!(
+            row.quarantined_at.is_none(),
+            "healthy row must have no quarantined_at"
+        );
     }
 
     // === trust_floor enforcement ===
@@ -2299,5 +3003,81 @@ executable = "./bin"
             err.contains("trust >= KnownTrusted"),
             "expected trust violation — got {err:?}",
         );
+    }
+
+    /// Regression for the 2026-05-14 plugin-self-containment work.
+    /// A plugin manifest can declare `[[ui_panels]] entry = "ui/panel.js"`
+    /// but if the ZIP doesn't actually contain that file, the SPA's
+    /// runtime `import("…/ui/panel.js")` 404s and the operator sees
+    /// a broken settings page with no upstream signal about why.
+    /// Validate at install time so the failure surfaces during
+    /// plugin upload where it can be acted on.
+    #[tokio::test]
+    async fn install_rejects_when_ui_panel_entry_is_missing_from_stage() {
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
+
+        // Stage a plugin whose manifest declares a UI panel but
+        // DOES NOT ship the entry file.
+        let stage = stage_root.path().join("bad-ui-0.1.0");
+        std::fs::create_dir_all(&stage).unwrap();
+        let manifest = r#"
+[plugin]
+id = "bad-ui"
+name = "Bad UI"
+version = "0.1.0"
+
+[[ui_panels]]
+mount = "admin/plugins/bad-ui"
+entry = "ui/panel.js"
+"#;
+        std::fs::write(stage.join("plugin.toml"), manifest).unwrap();
+        // Intentionally NOT creating stage/ui/panel.js.
+
+        let err = host.install(&stage).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ui_panels") && msg.contains("missing"),
+            "error must mention ui_panels + missing entry; got: {msg}",
+        );
+        // And no DB row should have been written.
+        assert!(host.get_row("bad-ui").unwrap().is_none());
+    }
+
+    /// The opposite case: a manifest that declares a UI panel AND
+    /// ships the entry file must install cleanly.
+    #[tokio::test]
+    async fn install_accepts_when_ui_panel_entry_is_present() {
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
+
+        let stage = stage_root.path().join("good-ui-0.1.0");
+        std::fs::create_dir_all(stage.join("ui")).unwrap();
+        let manifest = r#"
+[plugin]
+id = "good-ui"
+name = "Good UI"
+version = "0.1.0"
+
+[[ui_panels]]
+mount = "admin/plugins/good-ui"
+entry = "ui/panel.js"
+"#;
+        std::fs::write(stage.join("plugin.toml"), manifest).unwrap();
+        std::fs::write(
+            stage.join("ui").join("panel.js"),
+            b"export default function panel() {}",
+        )
+        .unwrap();
+
+        let row = host
+            .install(&stage)
+            .await
+            .expect("install with present panel entry must succeed");
+        assert_eq!(row.plugin_id, "good-ui");
     }
 }

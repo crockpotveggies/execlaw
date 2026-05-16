@@ -1,0 +1,31 @@
+{
+    "type": "object",
+    "properties": {
+        "latitude": {
+            "oneOf": [
+                { "type": "number", "minimum": -90, "maximum": 90 },
+                {
+                    "type": "array",
+                    "items": { "type": "number", "minimum": -90, "maximum": 90 },
+                    "minItems": 1,
+                    "maxItems": 100
+                }
+            ],
+            "description": "Latitude in decimal degrees (or array of latitudes for batch lookups, max 100)."
+        },
+        "longitude": {
+            "oneOf": [
+                { "type": "number", "minimum": -180, "maximum": 180 },
+                {
+                    "type": "array",
+                    "items": { "type": "number", "minimum": -180, "maximum": 180 },
+                    "minItems": 1,
+                    "maxItems": 100
+                }
+            ],
+            "description": "Longitude in decimal degrees (or array — must be the same length as the latitude array)."
+        }
+    },
+    "required": [],
+    "additionalProperties": false
+}

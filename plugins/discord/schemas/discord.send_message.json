@@ -1,0 +1,15 @@
+{
+    "type": "object",
+    "properties": {
+        "to": {
+            "type": "string",
+            "description": "Recipient. Discord channel id (snowflake), Discord user id for DM, or fully-qualified `discord:<id>` JID. For DMs the plugin auto-creates / looks up the DM channel via POST /users/@me/channels."
+        },
+        "text": {
+            "type": "string",
+            "description": "Message body. Long messages are split at 1900-char paragraph/line/space boundaries — pass the full reply, the plugin handles chunking."
+        }
+    },
+    "required": ["to", "text"],
+    "additionalProperties": false
+}

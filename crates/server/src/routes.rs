@@ -331,17 +331,54 @@ pub async fn ping(State(state): State<AppState>) -> impl IntoResponse {
     //                resume at the docker step.
     //   * `pong`   — fully provisioned (or wizard dismissed). SPA
     //                → /chat / /login as before.
+    // 2026-05-13 — DB read errors used to be `.ok().flatten()`-
+    // swallowed into "no backend configured", which forced the
+    // operator back into the first-run wizard on every transient
+    // lock-contention or BLOB-decode error. We now log the failure
+    // at WARN and fall CLOSED (treat as "pong" so the operator can
+    // reach the admin UI to fix the underlying row) rather than
+    // re-triggering an already-completed setup flow.
     let body = match UserStore::new(&state.db).any_exist() {
-        Ok(false) | Err(_) => "setup",
+        Ok(false) => "setup",
+        Err(e) => {
+            tracing::warn!(
+                target: "routes::ping",
+                error = %e,
+                "users.any_exist failed — falling open to 'setup' so the operator can recover",
+            );
+            "setup"
+        }
         Ok(true) => {
-            let backend_configured = BackendStore::new(&state.db)
+            let backend_configured = match BackendStore::new(&state.db)
                 .get(BackendPurpose::Standard)
-                .ok()
-                .flatten()
-                .is_some();
-            let dismissed = GeneralSettingsStore::new(&state.db)
-                .wizard_dismissed()
-                .unwrap_or(false);
+            {
+                Ok(row) => row.is_some(),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "routes::ping",
+                        error = %e,
+                        "config_backends read failed on /api/ping — assuming configured to avoid \
+                         re-triggering the first-run wizard. Likely BLOB column corruption; \
+                         check Settings → Backends.",
+                    );
+                    // Treat as "configured" so the SPA doesn't yank
+                    // the operator back into the wizard. The chat
+                    // path will surface the underlying error on the
+                    // next turn via the resolver's WARN log.
+                    true
+                }
+            };
+            let dismissed = match GeneralSettingsStore::new(&state.db).wizard_dismissed() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "routes::ping",
+                        error = %e,
+                        "wizard_dismissed read failed — defaulting to false",
+                    );
+                    false
+                }
+            };
             if backend_configured || dismissed {
                 "pong"
             } else {
@@ -678,7 +715,23 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/logout/all", post(logout_all))
         .route(
             "/api/chats/{conversation_id}/messages",
-            post(crate::chats::send_message).get(crate::chats::list_messages),
+            // 2026-05-15 — raise the per-request body cap on this
+            // route from axum's default 2 MiB to 32 MiB. The
+            // composer's `+` attach-photo path inlines base64 data
+            // URLs in `SendMessageRequest.attachments`; a single
+            // 8 MiB JPEG base64-encodes to ~10.7 MiB, and the
+            // operator may attach several at once. 32 MiB gives
+            // headroom for 2-3 typical photos. Per-attachment size
+            // is still enforced inside the handler at
+            // MAX_ATTACHMENT_BYTES (20 MiB) so a single malicious
+            // blob can't dominate the body budget. The limit is
+            // attached to the MethodRouter so it scopes to THIS
+            // route only — adding it via `.layer()` on the outer
+            // Router would apply to every route registered before
+            // the call, which is not what we want.
+            post(crate::chats::send_message)
+                .get(crate::chats::list_messages)
+                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .route(
             "/api/chats/{conversation_id}/cards",
@@ -736,9 +789,18 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::settings_search::settings_search_router())
         .merge(crate::research_admin::research_admin_router())
         .merge(crate::oauth_admin::oauth_admin_router())
+        .merge(crate::plugin_settings_admin::plugin_settings_admin_router())
         .merge(crate::setup_preflight::setup_preflight_router())
         .merge(crate::docs::docs_router())
         .with_state(state)
+        // SPA fallback — merged LAST so every `/api/*` route above
+        // matches first. `crate::spa::spa_router()` owns `/` and
+        // `/{*path}`, embedding `web/dist/` so a Tauri webview
+        // (and any browser hitting the server directly) gets the
+        // chat UI on the same origin as the API. The fallback also
+        // implements React-Router-style deep-link rewrite to
+        // `index.html` for any extension-less miss.
+        .merge(crate::spa::spa_router())
         // Diagnostic layers, applied last so they wrap everything.
         //
         // CatchPanicLayer converts a panic in any handler into a
@@ -770,12 +832,19 @@ pub fn build_router(state: AppState) -> Router {
             },
         ))
         .layer(
+            // 2026-05-15 — request/response spans live at DEBUG, not
+            // INFO. The Settings > Logs viewer was drowning in
+            // `finished processing request` lines from periodic
+            // pollers (/api/admin/backends/*/status every 5s for four
+            // backends, /api/admin/alerts/count, /api/admin/sidecars
+            // status checks, etc.). Server-error responses (5xx) still
+            // surface at ERROR via `TraceLayer`'s default `on_failure`.
             tower_http::trace::TraceLayer::new_for_http()
                 .make_span_with(
-                    tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO),
+                    tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::DEBUG),
                 )
                 .on_response(
-                    tower_http::trace::DefaultOnResponse::new().level(tracing::Level::INFO),
+                    tower_http::trace::DefaultOnResponse::new().level(tracing::Level::DEBUG),
                 ),
         )
 }
@@ -785,7 +854,8 @@ pub fn build_router(state: AppState) -> Router {
 pub fn test_app_state() -> AppState {
     use execlaw_core::MigrationRunner;
     use execlaw_plugin_host::{HookRegistry, PluginHost};
-    let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+    let db_config = DbConfig::in_memory_unencrypted();
+    let db = Database::open(&db_config).unwrap();
     MigrationRunner::new(&db).apply_all().unwrap();
     // Per-test temp dir for staged plugins. Tests that exercise the
     // install path create a TempDir explicitly; the default one is
@@ -795,6 +865,7 @@ pub fn test_app_state() -> AppState {
     let events = crate::events::EventBus::new();
     AppState {
         db: db.clone(),
+        db_config: Arc::new(db_config),
         config: Arc::new(ServerConfig::default()),
         signer: Arc::new(JwtSigner::generate("execlaw-test".into())),
         refresh_store: Arc::new(RefreshStore::new(db.clone())),

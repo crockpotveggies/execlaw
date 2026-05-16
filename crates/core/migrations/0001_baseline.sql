@@ -50,7 +50,7 @@ CREATE TABLE config_general (
     start_on_boot   INTEGER NOT NULL DEFAULT 1 CHECK (start_on_boot IN (0, 1)),
     bind_address    TEXT    NOT NULL DEFAULT '127.0.0.1:3030',
     updated_at      INTEGER NOT NULL
-, setup_wizard_dismissed_at INTEGER, hf_secondary_caches_json TEXT, history_retention_days INTEGER NOT NULL DEFAULT 30);
+, setup_wizard_dismissed_at INTEGER, hf_secondary_caches_json TEXT, history_retention_days INTEGER NOT NULL DEFAULT 30, max_history_tokens INTEGER NOT NULL DEFAULT 8000);
 
 CREATE TABLE config_hardware_profile_overrides (
     gpu_id         TEXT    PRIMARY KEY,
@@ -302,6 +302,40 @@ CREATE TABLE principals (
     controller_notes  TEXT
 );
 
+-- Companion index for `principals.identifiers_json` so
+-- `PrincipalStore::find_by_identifier` is an O(1) PK lookup instead
+-- of an O(N) scan over every principal row. Originally migration
+-- 0004 (2026-05-14); collapsed into the baseline 2026-05-14 after
+-- a checksum-divergence event made the standalone migration
+-- unnecessary.
+--
+-- Composite PK on (transport, handle, principal_id) — NOT
+-- (transport, handle) — because a single identifier can be claimed
+-- by multiple principals during reconcile windows: a stale
+-- UnknownPending row shadowing a controller-asserted "My identities"
+-- mapping is the canonical case. Reconcile's `find_all_by_identifier`
+-- needs to enumerate ALL claimants; allowing multiple rows for
+-- (transport, handle) preserves that.
+--
+-- `ON DELETE CASCADE` keeps the index honest: drop a principal and
+-- its identifiers vanish too. Together with PrincipalStore::upsert's
+-- delete-then-reinsert resync, the index never drifts from
+-- `identifiers_json` for any live principal.
+CREATE TABLE principal_identifiers (
+    transport      TEXT    NOT NULL,
+    handle         TEXT    NOT NULL,
+    principal_id   TEXT    NOT NULL,
+    last_seen      INTEGER,
+    PRIMARY KEY (transport, handle, principal_id),
+    FOREIGN KEY (principal_id) REFERENCES principals(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_principal_identifiers_lookup
+    ON principal_identifiers(transport, handle);
+
+CREATE INDEX idx_principal_identifiers_by_pid
+    ON principal_identifiers(principal_id);
+
 CREATE VIRTUAL TABLE skill_search USING fts5(
     description,
     body_md,
@@ -342,13 +376,33 @@ CREATE TABLE state_alerts (
 CREATE TABLE state_artifacts (
     id               TEXT    PRIMARY KEY,
     research_job_id  TEXT,
-    kind             TEXT    NOT NULL,   -- research_pdf | image | other
+    kind             TEXT    NOT NULL,   -- research_pdf | image | other | plugin_artifact
     mime_type        TEXT    NOT NULL,
     path             TEXT    NOT NULL,
     sha256           TEXT    NOT NULL,
     bytes            INTEGER,
-    created_at       INTEGER NOT NULL
+    created_at       INTEGER NOT NULL,
+    -- Plugin-artifact attribution (originally migration 0002).
+    -- NULL for legacy/research rows; set when a plugin minted the
+    -- artifact via the host's plugin-artifact tool.
+    plugin_id        TEXT,
+    -- Operator-facing filename (browser save-as, outbound transport
+    -- attachment name). Kept separate from `path` because `path` is
+    -- the sha256-named blob on disk and would be opaque to a human.
+    filename         TEXT,
+    -- Unix-seconds wall-clock TTL; NULL means no TTL. The ephemeral
+    -- sweeper culls rows past this stamp along with their on-disk
+    -- blob when refcount drops to zero.
+    expires_at       INTEGER
 );
+
+CREATE INDEX idx_artifacts_plugin
+    ON state_artifacts(plugin_id, created_at)
+    WHERE plugin_id IS NOT NULL;
+
+CREATE INDEX idx_artifacts_expiry
+    ON state_artifacts(expires_at)
+    WHERE expires_at IS NOT NULL;
 
 CREATE TABLE state_attachments (
     id               TEXT    PRIMARY KEY,

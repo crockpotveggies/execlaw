@@ -1,0 +1,29 @@
+{
+    "type": "object",
+    "properties": {
+        "latitude": { "type": "number", "minimum": -90, "maximum": 90 },
+        "longitude": { "type": "number", "minimum": -180, "maximum": 180 },
+        "place_name": { "type": "string" },
+        "daily": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Daily variables. Common: river_discharge, river_discharge_mean, river_discharge_median, river_discharge_max, river_discharge_min, river_discharge_p25, river_discharge_p75."
+        },
+        "forecast_days": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 210
+        },
+        "past_days": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 92
+        },
+        "ensemble": {
+            "type": "boolean",
+            "description": "When true, return all 50 ensemble members alongside the deterministic forecast. Default false."
+        }
+    },
+    "required": [],
+    "additionalProperties": false
+}

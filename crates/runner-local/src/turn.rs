@@ -87,6 +87,21 @@ pub struct UserMessagePayload {
     /// per-message channel icon in the chat view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_origin: Option<String>,
+    /// 2026-05-15 — IDs into `state_attachments` for images the
+    /// operator/contact attached to this turn. Must match the
+    /// field name + shape on the server-side `UserMessagePayload`
+    /// in `crates/server/src/chats.rs` so a turn written by either
+    /// code path round-trips consistently when replayed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachment_ids: Vec<String>,
+    /// 2026-05-15 — names of skills the operator picked from the
+    /// composer's `+` menu for the turn that produced this event.
+    /// The bodies are already prepended onto `text`; this field is
+    /// metadata only (audit / SPA chip rendering). Mirror of the
+    /// server-side `UserMessagePayload.applied_skill_names` so
+    /// payloads written by either crate round-trip consistently.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied_skill_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +219,49 @@ impl TurnExecutor {
         sender_principal_id: Option<String>,
         cfg: &TurnConfig,
     ) -> Result<TurnSummary, TurnError> {
+        // Backward-compatible call site: no attachments, no skills.
+        // Internally routes to `run_turn_with_attachments` with empty
+        // vecs.
+        self.run_turn_with_attachments(
+            db,
+            conversation_id,
+            user_text,
+            sender_principal_id,
+            cfg,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Vision-aware turn driver. Same shape as `run_turn` but the
+    /// caller can supply:
+    ///   * `attachment_ids` — id references into `state_attachments`
+    ///     stamped onto the `user_msg` event payload so subsequent
+    ///     history replays know this turn carried images.
+    ///   * `user_image_urls` — pre-encoded `data:<mime>;base64,...`
+    ///     URLs the caller built from those attachments. When
+    ///     non-empty, the trailing user message in the chat array
+    ///     gets replaced with an OpenAI vision content array
+    ///     (`ChatMessage::user_with_images`) so the inference
+    ///     backend sees the images.
+    ///
+    /// The two are passed separately so the executor doesn't need
+    /// access to `AttachmentStore` (it lives in execlaw-core, which
+    /// runner-local can't depend on by design — runners run in a
+    /// separate container with no DB).
+    pub async fn run_turn_with_attachments(
+        &self,
+        db: &Database,
+        conversation_id: &ConversationId,
+        user_text: &str,
+        sender_principal_id: Option<String>,
+        cfg: &TurnConfig,
+        attachment_ids: Vec<String>,
+        user_image_urls: Vec<String>,
+        applied_skill_names: Vec<String>,
+    ) -> Result<TurnSummary, TurnError> {
         // 1. Record the inbound user message as its own event so it's in
         //    the log before we ask the model anything. The log is keyed
         //    with the same HMAC as the server-side append path, so all
@@ -221,6 +279,8 @@ impl TurnExecutor {
                 text: user_text.to_owned(),
                 sender_principal_id: sender_principal_id.clone(),
                 channel_origin: cfg.inbound_channel_origin.clone(),
+                attachment_ids: attachment_ids.clone(),
+                applied_skill_names: applied_skill_names.clone(),
             },
             sender_principal_id,
         )?;
@@ -231,6 +291,33 @@ impl TurnExecutor {
         let mut messages: Vec<ChatMessage> = vec![ChatMessage::system(&cfg.system_prompt)];
         messages.extend(hydrate_messages(&history));
 
+        // 2026-05-15 — when the caller supplied image data URLs for
+        // THIS turn, replace the trailing text-only user ChatMessage
+        // with an OpenAI vision content array so the inference
+        // backend sees the images. Mirrors the equivalent block in
+        // `chats.rs::run_real_turn`. Prior turns' images are not
+        // re-encoded here (the hydrate_messages path is text-only);
+        // multi-turn vision is a known follow-up.
+        if !user_image_urls.is_empty() {
+            // Pull the previously-pushed text-only user message
+            // (the current turn's content). Fall back to the raw
+            // `user_text` if the history projection somehow elided
+            // it (defensive — hydrate_messages always emits a
+            // ChatMessage for the user_msg we just appended).
+            let last_user_text = match messages.last() {
+                Some(m) if matches!(m.role, Role::User) => {
+                    let text = m.content.as_ref().map(|c| c.as_text()).unwrap_or_default();
+                    messages.pop();
+                    text
+                }
+                _ => user_text.to_owned(),
+            };
+            messages.push(ChatMessage::user_with_images(
+                last_user_text,
+                user_image_urls,
+            ));
+        }
+
         // 3. Tool-call loop.
         let mut pending: Vec<PendingEvent> = Vec::new();
         let mut tool_ordinal: u32 = 0;
@@ -238,6 +325,22 @@ impl TurnExecutor {
         let mut last_text: String = String::new();
         let mut prompt_tokens: Option<u32> = None;
         let mut completion_tokens: Option<u32> = None;
+        // 2026-05-12 — turn-timing instrumentation. Routed to the
+        // dedicated `agent::turn_timing` target so it stays OFF by
+        // default (enable with RUST_LOG=agent::turn_timing=debug)
+        // and a future `info`-level dashboard widget can't drown
+        // in per-round chatter. All measurements are wall-clock,
+        // matched to the same monotonic clock — the deltas between
+        // them are what's useful, not the absolute values.
+        let turn_started_at = std::time::Instant::now();
+        let conversation_id_str = conversation_id.as_str().to_owned();
+        tracing::debug!(
+            target: "agent::turn_timing",
+            conversation_id = %conversation_id_str,
+            tool_catalog_count = cfg.tools.len(),
+            history_msg_count = messages.len(),
+            "turn starting (in-process executor)"
+        );
 
         loop {
             if rounds >= cfg.max_tool_rounds {
@@ -268,7 +371,17 @@ impl TurnExecutor {
                     "enable_thinking": cfg.reasoning_enabled,
                 })),
             };
+            // Per-round inference call. Time it so the operator can
+            // tell the model spent N seconds generating vs. N seconds
+            // on prefill (when usage is reported). vLLM's non-streaming
+            // response arrives after generation completes so this
+            // duration is the total round-trip including server-side
+            // queue + prefill + decode.
+            let inference_started_at = std::time::Instant::now();
+            let inference_messages_count = messages.len();
+            let inference_tools_count = cfg.tools.len();
             let resp = self.inference.chat_completions(&req).await?;
+            let inference_elapsed_ms = inference_started_at.elapsed().as_millis() as u64;
             let choice = match resp.choices.first() {
                 Some(c) => c.clone(),
                 None => {
@@ -282,10 +395,33 @@ impl TurnExecutor {
                 prompt_tokens = Some(u.prompt_tokens);
                 completion_tokens = Some(u.completion_tokens);
             }
+            // Per-round inference timing. The (prompt_tokens,
+            // completion_tokens) pair lets the operator compute
+            // prefill tps and decode tps after the fact; we don't
+            // log those derived numbers because they're trivially
+            // computed from the raw counts.
+            tracing::debug!(
+                target: "agent::turn_timing",
+                conversation_id = %conversation_id_str,
+                round = rounds,
+                inference_ms = inference_elapsed_ms,
+                request_messages = inference_messages_count,
+                request_tools = inference_tools_count,
+                prompt_tokens = resp.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
+                completion_tokens = resp.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
+                finish_reason = ?finish_reason,
+                tool_calls_returned = choice.message.tool_calls.len(),
+                "round inference complete"
+            );
 
             // Append the assistant message to our working transcript for
             // any subsequent rounds.
-            let assistant_content = choice.message.content.clone().unwrap_or_default();
+            let assistant_content = choice
+                .message
+                .content
+                .as_ref()
+                .map(|c| c.as_text())
+                .unwrap_or_default();
             last_text = assistant_content.clone();
             messages.push(ChatMessage {
                 role: Role::Assistant,
@@ -324,6 +460,11 @@ impl TurnExecutor {
             }
 
             // Dispatch each tool call, producing paired use/result events.
+            // We also time each dispatch so the operator can tell
+            // "model spent 4 minutes deciding what to call" from
+            // "the tool itself took 4 minutes" (research_start vs
+            // open_meteo.ensemble are wildly different latencies).
+            let mut round_tool_dispatch_ms: u64 = 0;
             for tc in &choice.message.tool_calls {
                 let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
                     .unwrap_or_else(|_| serde_json::json!({}));
@@ -345,7 +486,20 @@ impl TurnExecutor {
                     tool = %tc.function.name,
                     "agent dispatching tool",
                 );
+                let tool_started_at = std::time::Instant::now();
                 let outcome = self.tool_dispatch.call(&tc.function.name, &args).await;
+                let tool_elapsed_ms = tool_started_at.elapsed().as_millis() as u64;
+                round_tool_dispatch_ms = round_tool_dispatch_ms.saturating_add(tool_elapsed_ms);
+                tracing::debug!(
+                    target: "agent::turn_timing",
+                    conversation_id = %conversation_id_str,
+                    round = rounds,
+                    ordinal = tool_ordinal,
+                    tool = %tc.function.name,
+                    tool_ms = tool_elapsed_ms,
+                    ok = outcome.is_ok(),
+                    "tool dispatch complete"
+                );
                 match &outcome {
                     Ok(_) => tracing::info!(
                         target: "executor::tool_dispatch",
@@ -386,6 +540,22 @@ impl TurnExecutor {
                 tool_ordinal += 1;
             }
 
+            // Per-round summary covering both the inference call
+            // (separately logged above) AND the aggregate tool
+            // dispatch time, so a single line tells the whole
+            // story of round N. The model_inference_ms /
+            // tool_dispatch_ms split here mirrors the way
+            // production agents are typically profiled (langfuse
+            // / langsmith spans).
+            tracing::debug!(
+                target: "agent::turn_timing",
+                conversation_id = %conversation_id_str,
+                round = rounds,
+                model_inference_ms = inference_elapsed_ms,
+                tool_dispatch_ms = round_tool_dispatch_ms,
+                tool_calls = choice.message.tool_calls.len(),
+                "round complete (tool round)"
+            );
             rounds += 1;
 
             // Tool round done; the agent is back to LLM-bound thinking.
@@ -411,6 +581,23 @@ impl TurnExecutor {
             store.upsert(&row)?;
         }
 
+        // Total turn timing. `total_ms` includes the user_msg
+        // append + history hydrate + every round (inference +
+        // tool dispatch) + final commit. Useful for the operator-
+        // visible "why did this turn take N seconds" diagnosis:
+        // subtract the per-round totals from `total_ms` to size
+        // the host-side overhead.
+        let total_ms = turn_started_at.elapsed().as_millis() as u64;
+        tracing::debug!(
+            target: "agent::turn_timing",
+            conversation_id = %conversation_id_str,
+            total_ms,
+            tool_rounds = rounds,
+            total_prompt_tokens = prompt_tokens.unwrap_or(0),
+            total_completion_tokens = completion_tokens.unwrap_or(0),
+            assistant_text_chars = last_text.chars().count(),
+            "turn complete (in-process executor)"
+        );
         Ok(TurnSummary {
             events_written: written,
             assistant_text: last_text,

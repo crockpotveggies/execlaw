@@ -44,6 +44,8 @@ pub mod oauth_sweeper;
 pub mod observability;
 pub mod personality;
 pub mod plugin_admin_routes;
+pub mod plugin_lifecycle;
+pub mod plugin_settings_admin;
 pub mod plugin_webhook_routes;
 pub mod plugins;
 pub mod principal_admit;
@@ -73,6 +75,7 @@ pub mod transport_registry;
 // `rhai_transport::RhaiBackedTransport`.
 pub mod skill_capture_runtime;
 pub mod skills_admin;
+pub mod spa;
 pub mod state;
 pub mod think_filter;
 pub mod tool_apis_http;

@@ -121,6 +121,36 @@ fn service_run_args(db_path: &PathBuf) -> Vec<OsString> {
 /// and surfaced as a clear actionable message rather than a raw OS
 /// errno.
 pub fn install(system: bool, bind: Option<String>, db: Option<PathBuf>) -> anyhow::Result<()> {
+    // On macOS the recommended install path is the menu bar app
+    // (`execlaw.app`), which registers the LaunchAgent via
+    // `SMAppService`. SMAppService auto-cleans the agent when the
+    // .app is dragged to the Trash, so users on a desktop Mac get a
+    // much nicer uninstall experience than the legacy plist this
+    // command writes to `~/Library/LaunchAgents/`.
+    //
+    // We still support the legacy path because a headless macOS
+    // server (e.g. a Mac mini sitting in a closet) has no .app to
+    // run — the operator drives everything from SSH. The note is a
+    // heads-up, not a block.
+    //
+    // Conflict-avoidance: the .app uses label `com.execlaw.agent`;
+    // the legacy CLI install uses label `execlaw`. The labels
+    // differ, so launchd won't refuse the second registration, but
+    // running both would cause two servers to fight over port 3031
+    // — and only the first to bind survives. The note also calls
+    // this out so the operator can pick one path explicitly.
+    #[cfg(target_os = "macos")]
+    {
+        eprintln!(
+            "NOTE: On a desktop Mac, the menu bar app (execlaw.app) is the recommended\n\
+             install path — it registers the LaunchAgent via SMAppService so dragging the\n\
+             app to the Trash auto-removes the service. This `execlaw service install`\n\
+             command writes the legacy ~/Library/LaunchAgents/ plist instead, which is\n\
+             intended for headless Mac servers without a UI. If you install both, you'll\n\
+             end up with two services fighting over port 3031.\n"
+        );
+    }
+
     let mgr = manager(system)?;
     let db_path = db.unwrap_or_else(|| default_data_dir().join("execlaw.db"));
 

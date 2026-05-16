@@ -19,6 +19,7 @@ import {
     type UiPanelSummary,
 } from "../api/endpoints";
 import { useConnectionStatus } from "../api/connection";
+import { useAnyBackendInstalling } from "./useAnyBackendInstalling";
 import {
     setActiveThread,
     setAlertFiringCount,
@@ -26,6 +27,7 @@ import {
     setThreads,
     useChatState,
 } from "./store";
+import { ChannelIcon } from "../components/ChannelIcons";
 import { ThreadRowMenu } from "./ThreadRowMenu";
 
 const CONTROLLER_THREAD_PREFIX = "controller-thread:";
@@ -79,6 +81,17 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
     // effect below so the badge tracks alerts on every route, not
     // just /chat.
     const alertFiringCount = useChatState((s) => s.alertFiringCount);
+
+    // Phase 6.5 (Apple Silicon plan) — brand indicator's "installing"
+    // state. Hook polls every backend purpose's `/status` and returns
+    // true while any one is pulling / starting / loading. The brand
+    // indicator's render branch picks `is-installing` when this is
+    // true AND there are no active alerts (alert wins; see precedence
+    // logic inside the component).
+    const anyBackendInstalling = useAnyBackendInstalling(
+        getToken,
+        auth.status === "authenticated",
+    );
 
     const [hideExternal, setHideExternal] = useState(false);
     const [moreExpanded, setMoreExpanded] = useState(false);
@@ -197,7 +210,10 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
         <aside className="execlaw-sidebar">
             <div className="execlaw-sidebar__head">
                 <h1 className="execlaw-brand h6 mb-0">execlaw</h1>
-                <BrandStatusIndicator alertCount={alertFiringCount} />
+                <BrandStatusIndicator
+                    alertCount={alertFiringCount}
+                    installing={anyBackendInstalling}
+                />
             </div>
 
             <nav className="execlaw-sidebar__nav">
@@ -543,8 +559,26 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
 //     active.
 //   * healthy — small green dot. Always visible so the operator has
 //     a steady "everything is fine" signal in the same spot.
-function BrandStatusIndicator({ alertCount }: { alertCount: number }) {
+function BrandStatusIndicator({
+    alertCount,
+    installing,
+}: {
+    alertCount: number;
+    /// True while any managed backend is in a Pulling/Starting/loading
+    /// phase. Drives the `is-installing` variant (pulsing download
+    /// icon → /settings/backends). Computed in the parent so the
+    /// poll cost is paid once per Sidebar mount, not per render.
+    installing: boolean;
+}) {
     const conn = useConnectionStatus();
+    // Precedence (highest → lowest): disconnected > alert > installing > ok.
+    // - Connection loss is the most urgent signal — without it nothing
+    //   else is meaningfully observable, so it wins over alerts that
+    //   may be stale.
+    // - Alerts beat installing because a firing alert means something
+    //   is broken; an install in flight is just slow, not broken.
+    // - Installing beats ok so the operator notices the install is
+    //   still running and can click through to /settings/backends.
     if (conn !== "online") {
         const label =
             conn === "offline"
@@ -575,6 +609,21 @@ function BrandStatusIndicator({ alertCount }: { alertCount: number }) {
                 data-state="alert"
             >
                 <i className="bi bi-exclamation-triangle-fill" aria-hidden />
+            </Link>
+        );
+    }
+    if (installing) {
+        const label = "Backend installing — open Backends page";
+        return (
+            <Link
+                to="/settings/backends"
+                className="execlaw-brand-status is-installing"
+                aria-label={label}
+                title={label}
+                data-testid="sidebar-brand-status"
+                data-state="installing"
+            >
+                <i className="bi bi-cloud-download-fill" aria-hidden />
             </Link>
         );
     }
@@ -740,13 +789,32 @@ function ThreadRow({
             ) : (
                 <span className="execlaw-thread-item__name">{label}</span>
             )}
-            {transportChannel && transportIcon && (
-                <i
-                    className={`bi bi-${transportIcon} execlaw-muted`}
+            {transportChannel && (
+                // 2026-05-12 — ChannelIcon owns the brand-vs-bi-*
+                // resolution chain (signal → official SignalLogo
+                // SVG; whatsapp/discord/slack/telegram → bi-<name>
+                // brand glyphs; manifest icon override → bi-<icon>;
+                // default fallback → bi-chat-quote). Pre-rework
+                // every transport row rendered `bi-${manifest.icon}`
+                // with no brand-SVG fallback, so a Signal thread
+                // showed bi-chat-quote (Signal's manifest icon)
+                // instead of the actual Signal logo. The component
+                // also supplies a default when the manifest omits
+                // the field, so future plugins don't need to
+                // declare an icon for the sidebar to look correct.
+                <span
+                    className="execlaw-muted"
                     title={`Bridged on ${transportChannel}`}
-                    aria-label={`Bridged on ${transportChannel}`}
-                    style={{ marginLeft: "0.25rem" }}
-                />
+                    style={{ marginLeft: "0.25rem", display: "inline-flex" }}
+                >
+                    <ChannelIcon
+                        channel={transportChannel}
+                        manifestIcon={transportIcon}
+                        monochrome
+                        decorative
+                        data-testid="thread-channel-icon"
+                    />
+                </span>
             )}
             {isEphemeral && (
                 <i

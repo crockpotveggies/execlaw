@@ -16,7 +16,10 @@
 //
 //   * Multi-workspace from day 1. The vault holds a JSON array
 //     of workspace records; on_enable iterates each and opens a
-//     Socket Mode connection per workspace.
+//     Socket Mode connection per workspace. v0.3.0+:
+//     admin_add_workspace also connects inline so a fresh
+//     workspace starts receiving immediately, without the
+//     disable+enable dance the v0.2.0 flow required.
 //
 // Vault keys
 // ----------
@@ -32,8 +35,15 @@
 //     thread_ts so threaded replies stay in-thread without
 //     touching the host's InboundMessage struct.
 
-const SLACK_API = "https://slack.com/api";
-const MAX_SLACK_MESSAGE_CHARS = 3500;
+// Note on Rhai scope: top-level `const` declarations aren't visible
+// inside `fn` bodies. The Slack REST base URL and message size cap
+// are therefore inlined as string/int literals at every call site
+// below — same gotcha the google-* plugins document. If you change
+// these, grep "slack.com/api" and "3500" together. The references
+// here exist as documentation only.
+//
+//   SLACK_API               = "https://slack.com/api"
+//   MAX_SLACK_MESSAGE_CHARS = 3500
 
 // =====================================================================
 // LIFECYCLE
@@ -52,6 +62,31 @@ fn on_enable() {
             log_warn("slack: connect_workspace(" + ws.team_id + ") failed: " + e);
         }
     }
+    ()
+}
+
+// =====================================================================
+// TEARDOWN (2026-05-13)
+//
+// Fired by the plugin host before disable/uninstall/factory-reset.
+// Slack's Socket Mode WS subscriptions are auto-cancelled by the
+// host's `plugin.shutdown()` backstop (it walks every live
+// `ws_subscribe*` handle and fires its cancel token). on_disable
+// here is the audit-log point — confirms the lifecycle hook
+// fired so an operator chasing "did factory reset run cleanly?"
+// has signal in the host log.
+//
+// No remote teardown is attempted: Slack doesn't surface a
+// "close this Socket Mode subscription" endpoint (the Socket Mode
+// URL is single-use and dies on its own once we drop the WS).
+// Workspace OAuth tokens stay in vault for the regular disable
+// path; factory reset wipes them via the DB-wide table truncate.
+// =====================================================================
+
+fn on_disable() {
+    let workspaces = load_workspaces();
+    let count = if type_of(workspaces) == "array" { workspaces.len() } else { 0 };
+    log_info("slack: on_disable — " + count + " workspace WS subscription(s) will be cancelled by host shutdown");
     ()
 }
 
@@ -225,12 +260,25 @@ fn decode_event(team_id, event, payload) {
         // question; the host's eligibility gate already exempts them).
         let mention_of_self = if is_group { true } else { () };
 
+        // v0.3.2: seed the conversation's sidebar title with
+        // "<workspace> #<channel-or-DM-username>". For groups it
+        // flows through `group_name`; for DMs through `display_name`
+        // (the host's apply_auto_display_name picks the right one
+        // per generic_inbound.rs:70-75). Cached after first miss so
+        // we don't burn API calls on every subsequent inbound.
+        let conv_label = resolve_channel_label(
+            team_id,
+            event.channel,
+            is_dm,
+            event.user,
+        );
+
         return #{
             "channel": "slack",
             "native_id": event.user,
-            "display_name": (), // resolved server-side via users.info; skip for v0.1
+            "display_name": if is_dm { conv_label } else { () },
             "group_id": group_id,
-            "group_name": (),
+            "group_name": if is_group { conv_label } else { () },
             "text": normalized,
             "timestamp_ms": parse_slack_ts_ms(event.ts),
             "attachments": attachments,
@@ -276,7 +324,7 @@ fn send_message_impl(args) {
     for chunk in chunks {
         let body = #{ "channel": channel, "text": chunk };
         if thread_ts != () && thread_ts != "" { body.thread_ts = thread_ts; }
-        last = http_post(SLACK_API + "/chat.postMessage", body, bot_token);
+        last = http_post("https://slack.com/api/chat.postMessage", body, bot_token);
         if last == () || last.ok != true {
             throw "chat.postMessage failed: " + last;
         }
@@ -299,7 +347,7 @@ fn list_channels_impl() {
         let body = #{ "types": "public_channel,private_channel,mpim,im", "limit": 200 };
         let resp = ();
         try {
-            resp = http_post(SLACK_API + "/conversations.list", body, ws.bot_token);
+            resp = http_post("https://slack.com/api/conversations.list", body, ws.bot_token);
         } catch (e) {
             log_warn("slack: conversations.list failed for team " + ws.team_id + ": " + e);
             continue;
@@ -371,7 +419,7 @@ fn send_with_attachments_impl(args) {
                 + a.data_url.sub_string(0, 80) + "…",
         };
         if thread_ts != () && thread_ts != "" { body.thread_ts = thread_ts; }
-        http_post(SLACK_API + "/chat.postMessage", body, bot_token);
+        http_post("https://slack.com/api/chat.postMessage", body, bot_token);
         i += 1;
     }
     "ok"
@@ -590,6 +638,136 @@ fn bot_user_id_for_team(team_id) {
     ()
 }
 
+fn team_name_for_team(team_id) {
+    let all = load_workspaces();
+    for ws in all {
+        if ws.team_id == team_id { return ws.team_name; }
+    }
+    ()
+}
+
+// =====================================================================
+// Channel/DM label cache + resolver (v0.3.2)
+// =====================================================================
+//
+// The sidebar's thread title comes from the conversation's
+// display_name, which the host seeds from InboundMessage.display_name
+// (DMs) or .group_name (channels) on the first inbound. Previously
+// both fields were `()` so Slack threads showed as "New chat ·
+// <prefix>". v0.3.2 fills them with "<workspace> #<channel-or-user>".
+//
+// Resolution path on first inbound from a given channel id:
+//   * Channel message → conversations.info?channel=<id> → channel.name
+//   * DM             → users.info?user=<sender> → real_name / display_name
+//
+// conversations.info works against public + private channels via
+// the `channels:read` / `groups:read` scopes the operator already
+// granted; users.info works via `users:read`. No new scopes
+// required. Result is cached in vault under the `channel_labels`
+// map so the API calls only fire once per channel — entries only
+// stale if a channel/user is renamed, which is rare and self-heals
+// on plugin reload (cache clear) if it matters.
+
+fn load_channel_labels() {
+    let raw = ();
+    try { raw = vault_get("channel_labels"); } catch (e) { return #{}; }
+    if raw == () || raw == "" { return #{}; }
+    try {
+        let m = parse_json(raw);
+        if type_of(m) != "map" { return #{}; }
+        return m;
+    } catch (e) {
+        return #{};
+    }
+}
+
+fn save_channel_label(channel_id, label) {
+    let m = load_channel_labels();
+    m[channel_id] = label;
+    try { vault_put("channel_labels", to_json_string(m)); } catch (e) {
+        log_warn("slack: vault_put channel_labels failed: " + e);
+    }
+}
+
+fn cached_channel_label(channel_id) {
+    let m = load_channel_labels();
+    if m[channel_id] != () { return m[channel_id]; }
+    ()
+}
+
+// Resolve "<team_name> #<channel-or-DM-username>" for a Slack
+// channel id. Caches on success. Falls back to the channel id's
+// trailing 6 characters when the lookup fails (missing scope,
+// network blip, etc.) so the sidebar still gets *something*
+// useful and we don't burn an API call on every subsequent
+// message in the same conversation.
+fn resolve_channel_label(team_id, channel_id, is_dm, sender_user_id) {
+    let team_name = team_name_for_team(team_id);
+    let team_label = if team_name != () && team_name != "" { "" + team_name } else { "" + team_id };
+
+    if channel_id == () || channel_id == "" {
+        return team_label;
+    }
+    let cached = cached_channel_label(channel_id);
+    if cached != () { return cached; }
+
+    let bot_token = bot_token_for_team(team_id);
+    let resolved_name = ();
+
+    if is_dm {
+        if sender_user_id != () && sender_user_id != "" {
+            try {
+                let resp = http_get(
+                    "https://slack.com/api/users.info",
+                    #{ "user": "" + sender_user_id },
+                    bot_token,
+                );
+                if resp != () && resp.ok == true && resp.user != () {
+                    let u = resp.user;
+                    if u.real_name != () && u.real_name != "" {
+                        resolved_name = "" + u.real_name;
+                    } else if u.profile != () && u.profile.real_name != () && u.profile.real_name != "" {
+                        resolved_name = "" + u.profile.real_name;
+                    } else if u.name != () && u.name != "" {
+                        resolved_name = "" + u.name;
+                    }
+                }
+            } catch (e) {
+                log_warn("slack: users.info(" + sender_user_id + ") failed: " + e);
+            }
+        }
+    } else {
+        try {
+            let resp = http_get(
+                "https://slack.com/api/conversations.info",
+                #{ "channel": "" + channel_id },
+                bot_token,
+            );
+            if resp != () && resp.ok == true && resp.channel != () {
+                let c = resp.channel;
+                if c.name != () && c.name != "" {
+                    resolved_name = "" + c.name;
+                }
+            }
+        } catch (e) {
+            log_warn("slack: conversations.info(" + channel_id + ") failed: " + e);
+        }
+    }
+
+    if resolved_name == () || resolved_name == "" {
+        let cid_str = "" + channel_id;
+        resolved_name = if cid_str.len() > 6 {
+            cid_str.sub_string(cid_str.len() - 6)
+        } else {
+            cid_str
+        };
+    }
+
+    let label = team_label + " #" + resolved_name;
+    save_channel_label(channel_id, label);
+    label
+}
+
 fn cache_channel_workspace(channel, team_id) {
     let raw = vault_get("channel_workspace");
     let m = #{};
@@ -746,12 +924,53 @@ fn admin_add_workspace(req) {
     save_workspaces(updated);
     log_info("slack: workspace " + team_id + " (" + team_name + ") saved");
 
-    #{
+    // v0.3.0: open the Socket Mode subscription inline so the
+    // operator doesn't have to disable+re-enable the plugin to
+    // start receiving messages on a freshly-saved workspace. The
+    // old behaviour was a "saved but silent" footgun — tokens
+    // landed in vault but on_enable() had already run with zero
+    // workspaces and never re-fired.
+    //
+    // Find the row we just upserted in `updated` (auth.test wrote
+    // the canonical team_id / bot_user_id, so prefer that copy over
+    // the request body) and connect. Failure to connect doesn't
+    // unwind the save — the tokens are valid (we just probed
+    // apps.connections.open above), so a transient WS failure
+    // should leave the persisted workspace intact and surface as a
+    // `connection_warning` the SPA can show. on_enable() at next
+    // plugin reload will retry.
+    //
+    // Replacing an existing workspace (token rotation): the old
+    // workspace's WS subscription stays alive in the script
+    // engine's subscription registry. Slack's server side will
+    // close it shortly after we stop ACKing on a fresh URL;
+    // accepting that minor overlap is fine for the rare token-
+    // rotation case.
+    let saved_ws = #{};
+    for ws in updated {
+        if ws.team_id == team_id {
+            saved_ws = ws;
+            break;
+        }
+    }
+    let connection_warning = ();
+    try {
+        connect_workspace(saved_ws);
+    } catch (e) {
+        log_warn("slack: connect_workspace(" + team_id + ") after save failed: " + e);
+        connection_warning = "" + e;
+    }
+
+    let resp = #{
         "team_id": team_id,
         "team_name": team_name,
         "bot_user_id": bot_user_id,
         "controller_user_id": controller_user_id,
+    };
+    if connection_warning != () {
+        resp["connection_warning"] = connection_warning;
     }
+    resp
 }
 
 fn admin_remove_workspace(req) {
@@ -781,7 +1000,7 @@ fn admin_test_message(req) {
     if bot_token == () || bot_token == "" {
         throw "no bot_token for team '" + team_id + "'";
     }
-    let resp = http_post(SLACK_API + "/chat.postMessage", #{
+    let resp = http_post("https://slack.com/api/chat.postMessage", #{
         "channel": strip_slack_prefix(channel),
         "text": "execlaw test message — Slack plugin v0.1.0 wiring confirmed.",
     }, bot_token);

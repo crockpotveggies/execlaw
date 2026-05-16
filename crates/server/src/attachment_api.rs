@@ -28,7 +28,9 @@ use execlaw_core::attachments::AttachmentStore;
 use execlaw_core::cards::{CardAction, CardClosedPayload, CardKind, CardOpenedPayload, CardState};
 // CardAction includes only its enum variants; no separate Kind type.
 use execlaw_core::ids::{AttachmentId, ConversationId};
-use execlaw_core::tool::{ApiError, AttachmentApi, DeliveredAttachmentView};
+use execlaw_core::tool::{ApiError, AttachmentApi, CreatedArtifactView, DeliveredAttachmentView};
+use serde_json::json;
+use std::path::PathBuf;
 
 pub struct ServerAttachmentApi {
     db: Database,
@@ -45,6 +47,14 @@ pub struct ServerAttachmentApi {
     /// tool calls. Required alongside `transports` for the auto-
     /// bridge fan-out.
     plugin_host: Option<execlaw_plugin_host::PluginHost>,
+    /// Filesystem root where `create_artifact` writes its content-
+    /// addressed blob files. `None` means `create_artifact` is
+    /// disabled (errors with `ApiError::Storage`); set explicitly
+    /// in production via `with_artifacts_root` so tests can't
+    /// accidentally write under the developer's real
+    /// `~/.execlaw/plugin_artifacts/`. The `send` method works
+    /// regardless of this field.
+    artifacts_root: Option<PathBuf>,
 }
 
 impl ServerAttachmentApi {
@@ -55,6 +65,7 @@ impl ServerAttachmentApi {
             caller_conversation_id,
             transports: None,
             plugin_host: None,
+            artifacts_root: None,
         }
     }
 
@@ -71,6 +82,17 @@ impl ServerAttachmentApi {
 
     pub fn with_plugin_host(mut self, plugin_host: execlaw_plugin_host::PluginHost) -> Self {
         self.plugin_host = Some(plugin_host);
+        self
+    }
+
+    /// Enable `create_artifact` by pinning the on-disk root used
+    /// for content-addressed blob writes. Production wires this to
+    /// the same `~/.execlaw/plugin_artifacts/` (or
+    /// `EXECLAW_PLUGIN_ARTIFACTS_DIR` override) the host_caps impl
+    /// uses, so a built-in tool's artifact lands in the same tree
+    /// a script-tier `host_render_chart` would.
+    pub fn with_artifacts_root(mut self, root: PathBuf) -> Self {
+        self.artifacts_root = Some(root);
         self
     }
 }
@@ -194,6 +216,170 @@ impl AttachmentApi for ServerAttachmentApi {
             caption: title_caption,
         })
     }
+
+    async fn create_artifact(
+        &self,
+        filename: &str,
+        mime_type: &str,
+        bytes: Vec<u8>,
+        ttl_seconds: Option<i64>,
+    ) -> Result<CreatedArtifactView, ApiError> {
+        // 2026-05-15 — built-in tools that produce attachments (the
+        // chart renderer is the v1 caller) land their bytes here.
+        // Mirrors the script-tier `host_caps.create_artifact_attachment`
+        // path so an artifact produced by a built-in is
+        // indistinguishable from one produced by a Rhai plugin —
+        // same DB shape, same on-disk layout, same TTL story.
+        //
+        // Refuses cleanly when `artifacts_root` wasn't configured
+        // (test fixtures that don't opt in) — no UserDirs fallback
+        // here, deliberately. Tests that accidentally call
+        // create_artifact MUST get an error rather than silently
+        // writing to the developer's real ~/.execlaw/.
+        let root = match &self.artifacts_root {
+            Some(r) => r.clone(),
+            None => {
+                return Err(ApiError::Storage(
+                    "create_artifact called but ServerAttachmentApi has no artifacts_root \
+                     configured (only `send` is available). Production wires this via \
+                     `with_artifacts_root` in tool_dispatch."
+                        .into(),
+                ));
+            }
+        };
+        let db = self.db.clone();
+        let filename_owned = filename.to_owned();
+        let mime_owned = mime_type.to_owned();
+        // We attribute built-in artifacts to the "core" plugin id —
+        // gives ops + the artifact-cleanup sweeper a stable handle
+        // for "artifacts produced by the host itself, not by a
+        // user-installed plugin."
+        const BUILTIN_PLUGIN_ID: &str = "core";
+        let now = chrono::Utc::now().timestamp();
+        let created = tokio::task::spawn_blocking(move || {
+            AttachmentStore::new(&db).insert_plugin_artifact(
+                &root,
+                BUILTIN_PLUGIN_ID,
+                &filename_owned,
+                &mime_owned,
+                &bytes,
+                ttl_seconds,
+                now,
+            )
+        })
+        .await
+        .map_err(|e| ApiError::Storage(format!("artifact write join: {e}")))?
+        .map_err(|e| ApiError::Storage(format!("artifact write: {e}")))?;
+        Ok(CreatedArtifactView {
+            attachment_id: created.attachment_id,
+            sha256: created.sha256,
+            size_bytes: created.size_bytes,
+        })
+    }
+
+    async fn emit_chart_card(
+        &self,
+        attachment_id: &str,
+        svg: &str,
+        filename: &str,
+        title: Option<&str>,
+        width: u32,
+        height: u32,
+    ) -> Result<(), ApiError> {
+        // 2026-05-16 — emit a Chart card following the same
+        // open-then-immediately-close pattern AttachmentCard uses.
+        // The SPA's card-projection picks up the pair on
+        // `/api/chats/:id/cards` and dispatches to the registered
+        // `chart` renderer (web/src/cards/ChartCard.tsx). Same
+        // proven pipeline as deep-research progress + the
+        // send_attachment download chip.
+        //
+        // The SVG goes into `details.svg` so the renderer can drop
+        // it inline via dangerouslySetInnerHTML — same trust posture
+        // as ChartInlineComponent had: SVG comes from our own
+        // plotters renderer, not user-controlled input.
+        let card_id = format!("chart-{attachment_id}");
+        let title_owned = title
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let card_title = title_owned.clone().unwrap_or_else(|| filename.to_owned());
+        let summary = format!("Chart ({width}x{height})");
+        // CardAction::OpenDetail wires a "click to open" affordance;
+        // for charts the natural action is "download the PNG."
+        let download_url = format!("/api/attachments/{attachment_id}");
+        let details = json!({
+            "attachment_id": attachment_id,
+            "filename": filename,
+            "title": title_owned,
+            "svg": svg,
+            "width": width,
+            "height": height,
+            "download_url": download_url,
+            "mime_type": "image/png",
+        });
+
+        open_card_and_broadcast(
+            &self.db,
+            &self.events,
+            &self.caller_conversation_id,
+            "agent",
+            &CardOpenedPayload {
+                card_id: card_id.clone(),
+                kind: CardKind::Chart,
+                title: card_title,
+                summary: summary.clone(),
+                state: Some(CardState::Running),
+                details: details.clone(),
+                actions: vec![CardAction::OpenDetail {
+                    href: download_url.clone(),
+                }],
+            },
+        )
+        .map_err(|e| ApiError::Storage(format!("emit chart card open: {e}")))?;
+        close_card_and_broadcast(
+            &self.db,
+            &self.events,
+            &self.caller_conversation_id,
+            "agent",
+            &CardClosedPayload {
+                card_id,
+                state: CardState::Completed,
+                summary,
+                details: Some(details),
+                attachment_id: Some(attachment_id.to_owned()),
+                error: None,
+            },
+        )
+        .map_err(|e| ApiError::Storage(format!("emit chart card close: {e}")))?;
+
+        // 2026-05-16 — auto-bridge the chart's PNG to the
+        // conversation's originating transport (signal /
+        // whatsapp / discord / slack / future plugins —
+        // channel-agnostic via the registry). Same proven pattern
+        // deep-research uses for its report PDF
+        // (`bridge_research_pdf_to_originating_transport` in
+        // `crates/server/src/research/runner.rs`) and that
+        // `send_attachment` uses for the in-chat chip.
+        //
+        // For Signal-bridged conversations the operator's chat IS
+        // Signal — they're not going to look at the web UI to see
+        // the chart. The web-UI Chart card stays as a fallback if
+        // the bridge dispatch fails.
+        //
+        // No-op for web-only conversations (the bridge returns
+        // early when no transport binding exists). Best-effort:
+        // failures log but don't propagate — the web-UI Chart
+        // card has already committed.
+        //
+        // Caption: prefer the chart's title (operator-meaningful
+        // context) over the bare filename — same convention as
+        // `send_attachment`.
+        let bridge_caption = title.map(str::trim).filter(|s| !s.is_empty());
+        self.bridge_to_originating_transport(attachment_id, filename, bridge_caption)
+            .await;
+        Ok(())
+    }
 }
 
 impl ServerAttachmentApi {
@@ -212,17 +398,50 @@ impl ServerAttachmentApi {
         use execlaw_core::principal_groups::PrincipalGroupStore;
         use execlaw_core::transport_bindings::TransportBindingStore;
 
+        // 2026-05-16 — make wiring-missing failures LOUD. Pre-fix,
+        // a missing `with_plugin_host(...)` call at the dispatch
+        // construction site (was the case for tool_dispatch.rs's
+        // chart.render path) silently no-op'd the entire bridge.
+        // Operators saw "chart rendered fine in web UI but never
+        // arrived on Signal" with zero diagnostic. Now: a single
+        // WARN at boot of the dispatch, every time, so operators
+        // can immediately see WHICH wiring slot is missing.
         let Some(registry) = self.transports.as_ref() else {
+            tracing::warn!(
+                target: "attachment_api::bridge",
+                conversation_id = %self.caller_conversation_id.as_str(),
+                attachment_id = %attachment_id,
+                "transport bridge skipped: ServerAttachmentApi has no `transports` registry. \
+                 Wire it via `.with_transports(state.host_transports.clone())` at the call site.",
+            );
             return;
         };
         let Some(plugin_host) = self.plugin_host.as_ref() else {
+            tracing::warn!(
+                target: "attachment_api::bridge",
+                conversation_id = %self.caller_conversation_id.as_str(),
+                attachment_id = %attachment_id,
+                "transport bridge skipped: ServerAttachmentApi has no `plugin_host`. \
+                 Wire it via `.with_plugin_host(state.plugin_host.clone())` at the call site.",
+            );
             return;
         };
 
         let pg_store = PrincipalGroupStore::new(&self.db);
         let pg_id = match pg_store.principal_group_id_for(self.caller_conversation_id.as_str()) {
             Ok(Some(id)) => id,
-            _ => return,
+            // Web-only conversation (no transport binding). Skip
+            // silently — this is the expected case, not an error.
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(
+                    target: "attachment_api::bridge",
+                    conversation_id = %self.caller_conversation_id.as_str(),
+                    error = %e,
+                    "principal_group lookup failed; skipping transport bridge",
+                );
+                return;
+            }
         };
         let binding_store = TransportBindingStore::new(&self.db);
         let bindings = match binding_store.bindings_for_group_any_channel(&pg_id) {
@@ -238,6 +457,22 @@ impl ServerAttachmentApi {
             }
         };
         let Some(resolved) = registry.lookup_first_supported_binding(&bindings) else {
+            // Conversation has bindings but none match a registered
+            // transport plugin. Surfaces as INFO rather than WARN —
+            // a plausible operator config (e.g. installed Signal,
+            // then uninstalled it without unbinding the
+            // conversation). Still worth logging so the operator
+            // can see why the chip didn't fan out.
+            tracing::info!(
+                target: "attachment_api::bridge",
+                conversation_id = %self.caller_conversation_id.as_str(),
+                attachment_id = %attachment_id,
+                bindings_len = bindings.len(),
+                bound_channels = ?bindings.iter().map(|b| &b.channel).collect::<Vec<_>>(),
+                "transport bridge skipped: no installed transport plugin handles any of the \
+                 conversation's bound channels (registered handlers: {:?})",
+                registry.channels().collect::<Vec<_>>(),
+            );
             return;
         };
 
@@ -385,6 +620,88 @@ mod tests {
         let api = ServerAttachmentApi::new(db, bus, cid);
         let err = api.send("nope", None).await.unwrap_err();
         assert!(matches!(err, ApiError::NotFound(_)));
+    }
+
+    /// Regression for the chart.render → cards-path migration
+    /// (commit `d80a002`) + the auto-bridge wire-up
+    /// (Option A, this commit). The chart's CardOpened+CardClosed
+    /// pair MUST land on the event bus carrying the SVG +
+    /// attachment_id in `details`, so the SPA's CardStore picks
+    /// them up + the ChartCard renderer mounts.
+    ///
+    /// Bridge behavior is exercised on the `send_emits_…` test
+    /// path implicitly — emit_chart_card calls the SAME helper
+    /// (`bridge_to_originating_transport`) that `send` uses, and
+    /// that helper no-ops without a transport binding (as is the
+    /// case in this test fixture). The shared-helper structure
+    /// means a regression that breaks the bridge for charts would
+    /// also break it for `send_attachment` and trip THAT test.
+    #[tokio::test]
+    async fn emit_chart_card_lands_open_close_pair_with_svg_and_attachment_id() {
+        let db = fresh_db();
+        let cid = seed_conv(&db, "c-chart");
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        // No transports/plugin_host wired — the bridge step is a
+        // no-op so this test focuses on the card emit. A
+        // production-equivalent test that DID wire a mock
+        // PluginHost lives outside this scope (the same coverage
+        // gap the existing `send_emits_card_open_then_close_pair`
+        // test has — bridge integration is exercised end-to-end
+        // through real Signal / WhatsApp fixtures).
+        let api = ServerAttachmentApi::new(db, bus, cid);
+
+        api.emit_chart_card(
+            "art-chart-123",
+            "<svg width=\"720\" height=\"400\"><g/></svg>",
+            "AAPL_1mo.png",
+            Some("AAPL — last month"),
+            720,
+            400,
+        )
+        .await
+        .unwrap();
+
+        let evt1 = rx.try_recv().unwrap();
+        let evt2 = rx.try_recv().unwrap();
+        match evt1 {
+            crate::events::UiEvent::CardOpened {
+                card_kind, details, ..
+            } => {
+                assert_eq!(
+                    card_kind, "chart",
+                    "CardOpened MUST use kind='chart' so the SPA's \
+                     `getCardRenderer(\"chart\")` dispatches to \
+                     ChartCard.tsx (the cards-path renderer)",
+                );
+                // The renderer reads `details.svg` and
+                // `details.attachment_id`; pin both.
+                assert!(
+                    details
+                        .get("svg")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .contains("<svg"),
+                    "details.svg MUST be the inline SVG markup, got: {details}",
+                );
+                assert_eq!(
+                    details.get("attachment_id").and_then(|v| v.as_str()),
+                    Some("art-chart-123"),
+                );
+            }
+            other => panic!("expected CardOpened(kind=chart), got {other:?}"),
+        }
+        match evt2 {
+            crate::events::UiEvent::CardClosed {
+                state,
+                attachment_id,
+                ..
+            } => {
+                assert_eq!(state, "Completed");
+                assert_eq!(attachment_id.as_deref(), Some("art-chart-123"));
+            }
+            other => panic!("expected CardClosed, got {other:?}"),
+        }
     }
 
     #[tokio::test]

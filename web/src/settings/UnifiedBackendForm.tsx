@@ -38,7 +38,7 @@ import {
     type UpsertBackendRequest,
 } from "../api/endpoints";
 
-export type ServingMethod = "vllm" | "openvino" | "openarc";
+export type ServingMethod = "vllm" | "openvino" | "openarc" | "ollama";
 
 interface ModelOption {
     /// Hugging Face repo id / OpenVINO model id — written into
@@ -61,12 +61,14 @@ const SERVING_LABEL: Record<ServingMethod, string> = {
     vllm: "vLLM",
     openvino: "OpenVINO model server",
     openarc: "OpenArc",
+    ollama: "Ollama (Metal, native)",
 };
 
 const SERVING_PLUGIN: Record<ServingMethod, string> = {
     vllm: "service-vllm",
     openvino: "service-vllm-openvino-arc",
     openarc: "service-openarc",
+    ollama: "service-ollama",
 };
 
 // Image references for the wizard's serving methods. We track the
@@ -76,14 +78,24 @@ const SERVING_PLUGIN: Record<ServingMethod, string> = {
 // — every spawn against it crashed with "unknown architecture" and
 // the operator had to dig through container logs to figure out why.
 //
-// `nightly` is built daily from main and tested by the vLLM team
-// before publishing. If you need a deterministic build for prod,
-// override the image via the model_spec JSON in Settings → Backends
-// after setup.
+// Pinned to v0.20.2 (May 10 2026) — Qwen3.6 needs vLLM >= 0.19.0
+// + the `qwen3_coder` tool-call parser. Used to track `nightly`
+// while Qwen3.5 architecture support landed pre-stable, but
+// 2026-05-12 an operator hit a hang in `0.20.2rc1.dev209` where
+// vLLM accepted a request and produced zero decode tokens —
+// `nightly` is now actively risky. Operators can override the
+// image post-setup via Settings → Backends → raw JSON if a newer
+// release fixes something they need.
 const SERVING_IMAGE: Record<ServingMethod, string> = {
-    vllm: "vllm/vllm-openai:nightly",
+    vllm: "vllm/vllm-openai:v0.20.2",
     openvino: "execlaw/service-vllm-openvino-arc:v1",
     openarc: "execlaw/service-openarc:v1",
+    // Native runtime — no container image. The supervisor reads
+    // `runtime: "native"` + `binary_hint: "ollama"` from model_spec
+    // and spawns via NativeServiceController instead of bollard.
+    // Field exists only because every other ServingMethod populates
+    // it; the wizard's Apple save path emits an empty `image`.
+    ollama: "",
 };
 
 // Curated model catalog. Every entry MUST be a real, downloadable
@@ -92,18 +104,24 @@ const SERVING_IMAGE: Record<ServingMethod, string> = {
 // with a non-zero code on every spawn (CrashLooping with no obvious
 // cause).
 //
-// The flagship is the locked-decision Qwen 3.5 27B AWQ. Pairs with
-// the `nightly` vLLM image because Qwen 3.5 architecture support
-// hasn't reached a stable cut yet. Smaller fallbacks are Qwen 2.5
-// AWQ which the vLLM nightly also supports — operators on
-// 12 GB / 8 GB / 4 GB cards pick down the list. Operators with a
-// private model override the id post-setup via Settings → Backends
-// → raw JSON.
+// The flagship is Qwen 3.6 27B AWQ (2026-05-12 — superseded the
+// prior Qwen 3.5 default; 3.6 ships explicit agentic-coding
+// improvements and uses the `qwen3_coder` tool-call parser in
+// vLLM v0.19+). Qwen 3.5 stays in the catalog as a fallback for
+// hosts that can't run 3.6 (e.g. older GPU drivers). Smaller
+// fallbacks are Qwen 2.5 AWQ for operators on 12 GB / 8 GB / 4 GB
+// cards. Operators with a private model override the id post-
+// setup via Settings → Backends → raw JSON.
 const MODEL_CATALOG: Record<ServingMethod, ModelOption[]> = {
     vllm: [
         {
+            id: "QuantTrio/Qwen3.6-27B-AWQ",
+            label: "Qwen 3.6 27B (AWQ, ~18 GB) — flagship",
+            min_mb: 18_000,
+        },
+        {
             id: "QuantTrio/Qwen3.5-27B-AWQ",
-            label: "Qwen 3.5 27B (AWQ, ~18 GB) — flagship",
+            label: "Qwen 3.5 27B (AWQ, ~18 GB) — fallback",
             min_mb: 18_000,
         },
         {
@@ -151,6 +169,36 @@ const MODEL_CATALOG: Record<ServingMethod, ModelOption[]> = {
             min_mb: 3_000,
         },
     ],
+    // Apple Silicon — Ollama registry tags. Qwen3.5 isn't published
+    // to the Ollama registry yet (as of 2026-05); we pin Qwen2.5 in
+    // the four parameter sizes that match the preset library's
+    // ollama_model_field choices. Operators with a private model
+    // override post-setup via the raw model_spec_json. The on-disk
+    // size matches the unified-memory budget closely on Apple
+    // Silicon because the GPU shares RAM with the CPU — the wizard's
+    // disk-space check uses these as a proxy.
+    ollama: [
+        {
+            id: "qwen2.5:32b-instruct-q4_K_M",
+            label: "Qwen 2.5 32B Instruct (q4_K_M, ~20 GB)",
+            min_mb: 20_000,
+        },
+        {
+            id: "qwen2.5:14b-instruct-q4_K_M",
+            label: "Qwen 2.5 14B Instruct (q4_K_M, ~9 GB)",
+            min_mb: 9_000,
+        },
+        {
+            id: "qwen2.5:7b-instruct-q4_K_M",
+            label: "Qwen 2.5 7B Instruct (q4_K_M, ~5 GB)",
+            min_mb: 5_000,
+        },
+        {
+            id: "qwen2.5:3b-instruct-q4_K_M",
+            label: "Qwen 2.5 3B Instruct (q4_K_M, ~2 GB)",
+            min_mb: 2_000,
+        },
+    ],
 };
 
 interface ManagedTarget {
@@ -183,6 +231,12 @@ function servingMethodsFor(gpu: DetectedGpu): ServingMethod[] {
             return ["vllm"];
         case "Intel":
             return ["openvino", "openarc"];
+        case "Apple":
+            // Native Ollama subprocess — no Docker. The form's Apple
+            // branch renders the install-prompt panel when
+            // ollamaAvailable === false, otherwise the standard
+            // model picker.
+            return ["ollama"];
         default:
             return [];
     }
@@ -199,10 +253,33 @@ export interface UnifiedBackendFormProps {
     /// shown in the form itself.
     purpose: BackendPurpose;
     gpus: DetectedGpu[];
-    /// Whether the host has a reachable Docker daemon. When false
-    /// the GPU targets are hidden and only Remote is offered (since
-    /// managed mode would have nowhere to spawn).
+    /// Whether the host has a reachable Docker daemon. When false,
+    /// Docker-dependent GPU targets (NVIDIA, Intel) are hidden and
+    /// only Remote (+ any non-Docker target like Apple/Ollama) is
+    /// offered.
     dockerAvailable: boolean;
+    /// Whether Ollama is installed + runnable on the host. Apple
+    /// GPUs use it as their native runtime (no Metal-to-container
+    /// passthrough exists on macOS). When `false`, the form still
+    /// surfaces Apple GPUs as a target but renders an install panel
+    /// with `brew install ollama` instructions and disables Save
+    /// until the operator clicks Recheck and we re-probe `available`.
+    /// Optional — wizard callers added pre-2026-05-11 can omit it
+    /// (default `false`); Apple targets then always render the
+    /// install panel.
+    ollamaAvailable?: boolean;
+    /// Trimmed `ollama --version` output, e.g. `"0.1.43"`. Rendered
+    /// in the "Ollama X.Y.Z detected" confirmation badge above the
+    /// model picker. Optional; omitted/null hides the version line.
+    ollamaVersion?: string | null;
+    /// Absolute path the discoverer landed on (Homebrew prefix or
+    /// PATH). Shown next to the version for disambiguation on
+    /// multi-install systems.
+    ollamaPath?: string | null;
+    /// Re-probe trigger. Wizard callers should call the preflight
+    /// endpoint and update `ollamaAvailable/Version/Path` props.
+    /// Optional — when omitted the form hides the Recheck button.
+    onRecheckOllama?: () => Promise<void> | void;
     /// Free bytes on the host's HF cache volume (from the preflight
     /// response). When supplied + the picked model exceeds
     /// `disk_free_bytes - 5 GB safety margin`, the form renders a
@@ -253,10 +330,135 @@ function fmtBytes(b: number): string {
     return `${b} B`;
 }
 
+/// Apple-Silicon preflight panel — replaces the wizard's model-picker
+/// step with an install-prompt banner when Ollama isn't present, and
+/// with a small "detected" badge once it is. The form gates Save on
+/// the same `available` flag so the operator can't submit a backend
+/// row the supervisor will reject at spawn time.
+///
+/// Mirrors the Docker-Desktop install nudge the wizard already shows
+/// when `dockerAvailable === false` and the operator picks an
+/// NVIDIA/Intel target — but with Apple-specific copy.
+function ApplePreflightPanel({
+    available,
+    version,
+    path,
+    onRecheck,
+    submitting,
+    testIdPrefix,
+}: {
+    available: boolean;
+    version: string | null;
+    path: string | null;
+    onRecheck?: () => Promise<void> | void;
+    submitting: boolean;
+    testIdPrefix: string;
+}) {
+    const [rechecking, setRechecking] = useState(false);
+    const handleRecheck = useCallback(async () => {
+        if (!onRecheck) return;
+        setRechecking(true);
+        try {
+            await onRecheck();
+        } finally {
+            setRechecking(false);
+        }
+    }, [onRecheck]);
+
+    if (available) {
+        const versionText = version ? ` v${version}` : "";
+        const pathText = path ? ` · ${path}` : "";
+        return (
+            <div
+                className="execlaw-muted small mb-3"
+                data-testid={`${testIdPrefix}-ollama-detected`}
+                data-ollama-state="available"
+            >
+                <i className="bi bi-check-circle-fill me-1" aria-hidden />
+                Ollama{versionText} detected{pathText}
+            </div>
+        );
+    }
+
+    return (
+        <div
+            className="execlaw-card mb-3"
+            data-testid={`${testIdPrefix}-ollama-install`}
+            data-ollama-state="missing"
+        >
+            <div className="execlaw-card__title">
+                <i
+                    className="bi bi-exclamation-triangle-fill me-2"
+                    aria-hidden
+                />
+                Install Ollama to enable Apple-Silicon inference
+            </div>
+            <p className="execlaw-muted small mb-2">
+                Apple Silicon has no Metal-to-container passthrough, so
+                execlaw spawns Ollama as a native macOS subprocess
+                instead of a Docker container. Install it once and
+                we&rsquo;ll detect it on Recheck:
+            </p>
+            <pre
+                className="execlaw-code mb-2"
+                style={{
+                    padding: "0.5rem 0.75rem",
+                    background: "rgba(255,255,255,0.04)",
+                    borderRadius: "0.25rem",
+                    fontSize: "0.85rem",
+                    overflowX: "auto",
+                }}
+            >
+                <code>brew install ollama</code>
+            </pre>
+            {path && (
+                <p className="execlaw-muted small mb-2">
+                    A binary was found at <code>{path}</code> but
+                    <code> --version</code> failed — the install may be
+                    corrupted. Run <code>{path} --version</code> in a
+                    terminal to see the underlying error.
+                </p>
+            )}
+            <p className="execlaw-muted small mb-2">
+                Already installed somewhere else?{" "}
+                Set <code>OLLAMA_BINARY</code> to the absolute path and
+                restart execlaw.
+            </p>
+            {onRecheck && (
+                <Button
+                    type="button"
+                    variant="outline-secondary"
+                    size="sm"
+                    disabled={submitting || rechecking}
+                    onClick={() => void handleRecheck()}
+                    data-testid={`${testIdPrefix}-ollama-recheck`}
+                >
+                    {rechecking ? (
+                        <>
+                            <Spinner
+                                size="sm"
+                                animation="border"
+                                className="me-2"
+                            />
+                            Checking…
+                        </>
+                    ) : (
+                        "Recheck"
+                    )}
+                </Button>
+            )}
+        </div>
+    );
+}
+
 export function UnifiedBackendForm({
     purpose,
     gpus,
     dockerAvailable,
+    ollamaAvailable = false,
+    ollamaVersion = null,
+    ollamaPath = null,
+    onRecheckOllama,
     diskFreeBytes,
     diskFreePath,
     cachedModels = {},
@@ -267,13 +469,17 @@ export function UnifiedBackendForm({
     testIdPrefix = "unified-backend",
 }: UnifiedBackendFormProps) {
     const targets: Target[] = [];
-    if (dockerAvailable) {
-        gpus.forEach((g, idx) => {
-            if (servingMethodsFor(g).length > 0) {
-                targets.push({ kind: "gpu", gpu: g, gpuIdx: idx });
-            }
-        });
-    }
+    // Apple GPUs go through the native Ollama runtime — no Docker
+    // required. Docker-dependent GPUs (NVIDIA, Intel) stay gated on
+    // dockerAvailable so a Mac-without-Docker host still sees its
+    // Apple GPU as a target option (and the install-prompt panel
+    // tells the operator how to make it work).
+    gpus.forEach((g, idx) => {
+        if (servingMethodsFor(g).length === 0) return;
+        const requiresDocker = g.vendor !== "Apple";
+        if (requiresDocker && !dockerAvailable) return;
+        targets.push({ kind: "gpu", gpu: g, gpuIdx: idx });
+    });
     targets.push({ kind: "remote" });
 
     const [targetIdx, setTargetIdx] = useState(0);
@@ -361,22 +567,50 @@ export function UnifiedBackendForm({
                         setSubmitting(false);
                         return;
                     }
-                    const vendorIdx = vendorOrdinal(gpus, target.gpuIdx);
-                    const vendorTag = serverVendorTag(target.gpu.vendor);
-                    await onSubmit(purpose, {
-                        inference_backend: SERVING_PLUGIN[serving],
-                        model_spec: {
-                            image: SERVING_IMAGE[serving],
-                            args: [`--model=${modelId}`],
-                            container_port: 8000,
-                            gpu_vendor: vendorTag,
-                        },
-                        gpu_id: vendorIdx,
-                        endpoint: null,
-                        notes: `Configured via backend wizard (${SERVING_LABEL[serving]})`,
-                        reasoning_enabled: false,
-                        mode: "managed",
-                    });
+                    // Apple / native-Ollama path emits a different
+                    // model_spec_json envelope (no `image`, carries
+                    // `runtime` / `binary_hint` / `model`) so the
+                    // supervisor's spec_from_row routes it through
+                    // NativeServiceController. Mirrors what
+                    // backend_presets::materialise_spec emits for
+                    // the `ollama-apple` preset row.
+                    if (serving === "ollama") {
+                        await onSubmit(purpose, {
+                            inference_backend: SERVING_PLUGIN[serving],
+                            model_spec: {
+                                runtime: "native",
+                                binary_hint: "ollama",
+                                args: ["serve"],
+                                container_port: 11434,
+                                model: modelId,
+                            },
+                            // No GPU id needed — Ollama discovers
+                            // Metal devices on its own and a Mac
+                            // never has more than one anyway.
+                            gpu_id: null,
+                            endpoint: null,
+                            notes: `Configured via backend wizard (${SERVING_LABEL[serving]})`,
+                            reasoning_enabled: false,
+                            mode: "managed",
+                        });
+                    } else {
+                        const vendorIdx = vendorOrdinal(gpus, target.gpuIdx);
+                        const vendorTag = serverVendorTag(target.gpu.vendor);
+                        await onSubmit(purpose, {
+                            inference_backend: SERVING_PLUGIN[serving],
+                            model_spec: {
+                                image: SERVING_IMAGE[serving],
+                                args: [`--model=${modelId}`],
+                                container_port: 8000,
+                                gpu_vendor: vendorTag,
+                            },
+                            gpu_id: vendorIdx,
+                            endpoint: null,
+                            notes: `Configured via backend wizard (${SERVING_LABEL[serving]})`,
+                            reasoning_enabled: false,
+                            mode: "managed",
+                        });
+                    }
                 }
             } catch (err) {
                 setSubmitError(err instanceof Error ? err.message : String(err));
@@ -426,6 +660,17 @@ export function UnifiedBackendForm({
                     )}
                 </Form.Group>
 
+                {target.kind === "gpu" && target.gpu.vendor === "Apple" && (
+                    <ApplePreflightPanel
+                        available={ollamaAvailable}
+                        version={ollamaVersion}
+                        path={ollamaPath}
+                        onRecheck={onRecheckOllama}
+                        submitting={submitting}
+                        testIdPrefix={testIdPrefix}
+                    />
+                )}
+
                 {target.kind === "gpu" && (
                     <>
                         {availableServing.length === 1 ? (
@@ -469,6 +714,14 @@ export function UnifiedBackendForm({
                             </Form.Group>
                         )}
 
+                        {/* Apple/Ollama: skip the model picker until
+                            the install panel above reports the binary
+                            is runnable. Avoids the operator picking a
+                            model into a spec that the supervisor will
+                            then reject at spawn time. */}
+                        {target.kind === "gpu" &&
+                        target.gpu.vendor === "Apple" &&
+                        !ollamaAvailable ? null : (
                         <Form.Group className="mb-3">
                             <Form.Label className="execlaw-muted small mb-1">
                                 Model
@@ -517,6 +770,7 @@ export function UnifiedBackendForm({
                                 </>
                             )}
                         </Form.Group>
+                        )}
                     </>
                 )}
 
@@ -557,7 +811,7 @@ export function UnifiedBackendForm({
                                 value={remoteModel}
                                 onChange={(e) => setRemoteModel(e.target.value)}
                                 disabled={submitting}
-                                placeholder="QuantTrio/Qwen3.5-27B-AWQ"
+                                placeholder="QuantTrio/Qwen3.6-27B-AWQ"
                                 data-testid={`${testIdPrefix}-external-model`}
                             />
                             <Form.Text className="execlaw-muted">
@@ -572,7 +826,18 @@ export function UnifiedBackendForm({
                     <Button
                         type="submit"
                         variant="primary"
-                        disabled={submitting}
+                        // Apple/Ollama: don't let the operator submit
+                        // until Ollama is actually present. The form
+                        // would otherwise write a spec the supervisor
+                        // can't spawn and the row would flip to
+                        // CrashLooping after the wizard already
+                        // claimed success — bad UX.
+                        disabled={
+                            submitting ||
+                            (target.kind === "gpu" &&
+                                target.gpu.vendor === "Apple" &&
+                                !ollamaAvailable)
+                        }
                         data-testid={`${testIdPrefix}-submit`}
                     >
                         {submitting ? (
@@ -634,6 +899,8 @@ function vendorDisplayName(v: DetectedGpu["vendor"]): string {
             return "Intel";
         case "Amd":
             return "AMD";
+        case "Apple":
+            return "Apple Silicon (Metal)";
         default:
             return "GPU";
     }
@@ -677,6 +944,8 @@ export function serverVendorTag(v: DetectedGpu["vendor"]): string | undefined {
             return "intel";
         case "Amd":
             return "amd";
+        case "Apple":
+            return "apple";
         default:
             return undefined;
     }

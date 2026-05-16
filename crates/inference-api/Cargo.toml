@@ -23,7 +23,21 @@ async-stream.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+# Example-only deps for the `bench_turn` diagnostic harness — it
+# reads the live tool catalog from the operator's SQLite to
+# replicate the EXACT production request shape.
+rusqlite = { workspace = true }
 
 [[bench]]
 name = "inference_hot_paths"
 harness = false
+
+# `cargo run -p execlaw-inference-api --example bench_turn` — manual
+# latency-diagnosis tool. Sends ChatCompletions of progressively
+# larger shape (no tools → real catalog) to localhost vLLM and prints
+# a side-by-side breakdown so the operator can isolate which axis
+# (prompt size, tool count, schema complexity) is responsible for
+# observed slowness. NOT a CI benchmark — runs against a live model.
+[[example]]
+name = "bench_turn"
+path = "examples/bench_turn.rs"

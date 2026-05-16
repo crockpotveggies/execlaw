@@ -1,0 +1,30 @@
+{
+    "type": "object",
+    "properties": {
+        "latitude": { "type": "number", "minimum": -90, "maximum": 90 },
+        "longitude": { "type": "number", "minimum": -180, "maximum": 180 },
+        "place_name": { "type": "string" },
+        "six_hourly": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Per-member 6-hourly variables, e.g. [\"temperature_2m_member01\", ..., \"temperature_2m_member04\"]."
+        },
+        "daily": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Daily variables, e.g. [\"temperature_2m_max_member01\", ...]."
+        },
+        "forecast_days": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 275,
+            "description": "Days ahead (1-275, default 92). The CFSv2 seasonal model loses skill well before its full horizon — the agent should explain that to the operator."
+        },
+        "temperature_unit": {
+            "type": "string",
+            "enum": ["celsius", "fahrenheit"]
+        }
+    },
+    "required": [],
+    "additionalProperties": false
+}

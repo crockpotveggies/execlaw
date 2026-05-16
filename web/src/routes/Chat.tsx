@@ -18,6 +18,7 @@ import {
     getAlertCount,
     listCards,
     listMessages,
+    listSkills,
     listThreads,
     listUiPanels,
     patchThread,
@@ -26,8 +27,11 @@ import {
     postStopTurn,
     respondApproval,
     type ApprovalVerb,
+    type InlineAttachment,
+    type SkillListEntry,
     type UiPanelSummary,
 } from "../api/endpoints";
+import { useBackendCapabilities } from "../chat/useBackendCapabilities";
 import { WsClient, type WsEvent } from "../api/ws";
 import { applyCardEvent, setCardsForConversation } from "../cards/cardStore";
 // Side-effect import: registers the ResearchCard renderer for
@@ -38,6 +42,11 @@ import "../cards/ResearchCard";
 // `kind: "attachment"` cards (the inline file-delivery chip the
 // agent emits via `send_attachment`).
 import "../cards/AttachmentCard";
+// Side-effect import: registers the ChartCard renderer for
+// `kind: "chart"` cards. The built-in `chart.render` tool emits
+// these alongside its tool_result so the SVG renders inline via
+// the same proven cards-projection path as research/attachment.
+import "../cards/ChartCard";
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
 import { ApprovalCard } from "../chat/ApprovalCard";
@@ -316,7 +325,11 @@ export function Chat() {
     }, [navigate, activeId]);
 
     const onSend = useCallback(
-        async (text: string) => {
+        async (
+            text: string,
+            attachments: InlineAttachment[] = [],
+            skillNames: string[] = [],
+        ) => {
             // Lazy-mint a fresh ConversationId on first send when no
             // thread is active. Incognito sends use the same path —
             // they just carry an `incognito: true` flag that tells
@@ -357,13 +370,31 @@ export function Chat() {
             // seq for regular chats, which appendMessage de-duplicates
             // on. For incognito the seq stays client-only since there's
             // no event-log row to derive a canonical one from.
+            //
+            // Optimistic attachments: stash the data URL itself in
+            // the `id` field. MessageStream renders attachments via
+            // `<img src={att.id.startsWith("data:") ? id : `/api/attachments/${id}`}>`,
+            // so the operator sees their own image inline immediately
+            // — no flicker waiting on the server round-trip. Once
+            // `listMessages` lands the optimistic entry is replaced
+            // by the canonical row that points at the persisted blob.
             const optimisticSeq = Date.now();
+            const optimisticAttachments = attachments.map((a) => ({
+                id: a.data_url,
+                mime: a.mime,
+            }));
             appendMessage(targetId, {
                 seq: optimisticSeq,
                 kind: "user_msg",
                 text,
                 actor: auth.user?.user_id ?? null,
                 committed_at: Math.floor(Date.now() / 1000),
+                attachments: optimisticAttachments,
+                // 2026-05-15 — surface the chosen skills as a chip on
+                // the user bubble immediately. The canonical row from
+                // listMessages will replace this on the seq match.
+                applied_skill_names:
+                    skillNames.length > 0 ? skillNames : undefined,
             });
             // Capture whether THIS turn is the conversation's first
             // — used to fire title generation after the round-trip
@@ -406,8 +437,17 @@ export function Chat() {
                               incognito: true,
                               prior_messages: priorMessages,
                               timezone: browserTz,
+                              attachments,
+                              skill_names:
+                                  skillNames.length > 0 ? skillNames : undefined,
                           }
-                        : { text, timezone: browserTz },
+                        : {
+                              text,
+                              timezone: browserTz,
+                              attachments,
+                              skill_names:
+                                  skillNames.length > 0 ? skillNames : undefined,
+                          },
                     getToken,
                 );
                 if (incognito) {
@@ -804,6 +844,7 @@ export function Chat() {
                 <ChatPane
                     activeId={activeId}
                     onSend={onSend}
+                    getToken={getToken}
                     incognito={incognito}
                     onToggleIncognito={() => setIncognito((v) => !v)}
                     onStop={() => {
@@ -840,6 +881,7 @@ export function Chat() {
 function ChatPane({
     activeId,
     onSend,
+    getToken,
     onStop,
     incognito,
     onToggleIncognito,
@@ -848,7 +890,12 @@ function ChatPane({
     voiceTranscript,
 }: {
     activeId: string | null;
-    onSend: (text: string) => Promise<void> | void;
+    onSend: (
+        text: string,
+        attachments: InlineAttachment[],
+        skillNames: string[],
+    ) => Promise<void> | void;
+    getToken: () => string | null;
     onStop: () => void;
     incognito: boolean;
     onToggleIncognito: () => void;
@@ -860,6 +907,12 @@ function ChatPane({
         is_final: boolean;
     } | null;
 }) {
+    // 2026-05-15 — probe the Standard backend's multimodal capability
+    // so the Composer's `+` (attach photo) affordance only surfaces
+    // when the loaded model actually accepts images. The hook is
+    // safe to call here (always-on chat shell); it does one HTTP RTT
+    // on mount and re-fetches when the token rotates.
+    const caps = useBackendCapabilities(getToken, true);
     const messages = useChatState((s) =>
         activeId ? s.messages[activeId] ?? null : null,
     );
@@ -901,13 +954,30 @@ function ChatPane({
         },
     });
     const onSendWithFlipCapture = useCallback(
-        (text: string) => {
+        (
+            text: string,
+            attachments: InlineAttachment[],
+            skillNames: string[],
+        ) => {
             if (!hasContent) {
                 captureBeforeFirstSend();
             }
-            return onSend(text);
+            return onSend(text, attachments, skillNames);
         },
         [hasContent, captureBeforeFirstSend, onSend],
+    );
+
+    /// 2026-05-15 — `getSkills` for the composer's "Attach skill"
+    /// menu item. Lazy: the Composer calls this the first time the
+    /// picker opens, then caches locally for the rest of its
+    /// instance. Re-fetches on every fresh Composer mount (so an
+    /// admin who just authored a new skill in another tab sees it
+    /// after a chat-pane remount). Re-uses the same admin route the
+    /// Skills page hits since "controller == admin" today.
+    const getSkills = useCallback(
+        (): Promise<SkillListEntry[]> =>
+            listSkills(getToken).then((r) => r.skills),
+        [getToken],
     );
     // 2026-04-28 dev-only: diagnostic for the incognito flash bug.
     if (
@@ -942,6 +1012,9 @@ function ChatPane({
                     busy={isSendingActive}
                     incognito={incognito}
                     onToggleIncognito={onToggleIncognito}
+                    multimodal={caps.multimodal}
+                    recommendedImageEdge={caps.recommendedImageEdge}
+                    getSkills={getSkills}
                 />
             </>
         );
@@ -957,6 +1030,9 @@ function ChatPane({
                 onSend={onSend}
                 sendVoiceFrame={sendVoiceFrame}
                 sendVoiceControl={sendVoiceControl}
+                multimodal={caps.multimodal}
+                recommendedImageEdge={caps.recommendedImageEdge}
+                getSkills={getSkills}
             />
         </>
     );
@@ -967,11 +1043,21 @@ function ActiveThreadPane({
     onSend,
     sendVoiceFrame,
     sendVoiceControl,
+    multimodal,
+    recommendedImageEdge,
+    getSkills,
 }: {
     conversationId: string;
-    onSend: (text: string) => Promise<void> | void;
+    onSend: (
+        text: string,
+        attachments: InlineAttachment[],
+        skillNames: string[],
+    ) => Promise<void> | void;
     sendVoiceFrame: (bytes: ArrayBuffer) => boolean;
     sendVoiceControl: (payload: object) => boolean;
+    multimodal?: boolean;
+    recommendedImageEdge?: number;
+    getSkills?: () => Promise<SkillListEntry[]>;
 }) {
     const auth = useAuth();
     const getToken = auth.getAccessToken;
@@ -1127,6 +1213,9 @@ function ActiveThreadPane({
                     sendVoiceControl={sendVoiceControl}
                     voiceReadiness={voiceReadiness}
                     busy={isSending || (thread?.is_processing ?? false)}
+                    multimodal={multimodal}
+                    recommendedImageEdge={recommendedImageEdge}
+                    getSkills={getSkills}
                     onStop={() => {
                         // 2026-04-28 — POST /api/chats/:id/stop. Fire-and-
                         // forget: server is idempotent. We DON'T clear

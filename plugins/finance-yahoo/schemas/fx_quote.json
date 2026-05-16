@@ -1,0 +1,12 @@
+{
+    "type": "object",
+    "properties": {
+        "symbol": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Currency pair. Accepts `EUR/USD`, `EURUSD`, `EURUSD=X`, `USD/JPY`, etc. — the plugin coerces to Yahoo's `{PAIR}=X` format."
+        }
+    },
+    "required": ["symbol"],
+    "additionalProperties": false
+}

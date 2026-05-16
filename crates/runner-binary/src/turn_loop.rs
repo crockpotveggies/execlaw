@@ -90,13 +90,25 @@ pub async fn run_turn(
         Some(delim) => format!("{delim}\n{}\n{delim}", req.user_text),
         None => req.user_text.clone(),
     };
-    messages.push(ChatMessage {
-        role: Role::User,
-        content: Some(user_text),
-        tool_call_id: None,
-        name: None,
-        tool_calls: vec![],
-    });
+    // 2026-05-15 — vision support. When the supervisor passed image
+    // data URLs in `user_image_urls`, build an OpenAI vision content
+    // array via `ChatMessage::user_with_images`. Otherwise fall
+    // through to the text-only path (the historical shape; every
+    // text-only turn keeps an identical wire encoding).
+    if req.user_image_urls.is_empty() {
+        messages.push(ChatMessage {
+            role: Role::User,
+            content: Some(execlaw_inference_api::MessageContent::Text(user_text)),
+            tool_call_id: None,
+            name: None,
+            tool_calls: vec![],
+        });
+    } else {
+        messages.push(ChatMessage::user_with_images(
+            user_text,
+            req.user_image_urls.iter().cloned(),
+        ));
+    }
 
     // Notify "thinking" so the SPA's typing indicator lights up.
     tx.send(RunnerToServer::Phase {
@@ -121,6 +133,21 @@ pub async fn run_turn(
     let completion_tokens: Option<u32> = None;
     let mut was_cancelled = false;
     let mut round: u32 = 0;
+    // 2026-05-12 — turn-timing instrumentation (runner-mediated
+    // path, streaming). Same `agent::turn_timing` target as the
+    // in-process executor so a downstream log aggregator can union
+    // both paths without per-source filters. All measurements are
+    // wall-clock on the monotonic Instant clock; absolute values
+    // aren't comparable across processes but deltas are.
+    let turn_started_at = std::time::Instant::now();
+    let conversation_id_for_log = req.conversation_id.clone();
+    tracing::debug!(
+        target: "agent::turn_timing",
+        conversation_id = %conversation_id_for_log,
+        tool_catalog_count = tools.as_ref().map(|t| t.len()).unwrap_or(0),
+        history_msg_count = messages.len(),
+        "turn starting (runner-mediated, streaming)"
+    );
 
     loop {
         if round >= RUNNER_MAX_TOOL_ROUNDS {
@@ -141,14 +168,30 @@ pub async fn run_turn(
                 "enable_thinking": req.reasoning_enabled,
             })),
         };
+        // Per-round timing. For STREAMING (which this is) the
+        // useful splits are:
+        //   * `open_stream_ms` — request send + 200 OK headers
+        //     (a network/TLS/queue cost, mostly stable per call).
+        //   * `first_chunk_ms` — headers → first body chunk
+        //     (vLLM's prefill latency; this is the time the model
+        //     spent processing the prompt before producing its
+        //     first generated token).
+        //   * `stream_total_ms` — open → final chunk (covers
+        //     prefill + the full decode of all output tokens).
+        // The (chunks, text_acc.len()) pair lets the operator
+        // back into a rough decode tps after the fact.
+        let round_started_at = std::time::Instant::now();
         let mut stream = client
             .chat_completions_stream(&chat_req)
             .await
             .context("opening inference stream")?;
+        let open_stream_ms = round_started_at.elapsed().as_millis() as u64;
 
         let mut text_acc = String::new();
         let mut tool_calls: Vec<ToolCallAcc> = Vec::new();
         let mut finish_reason: Option<String> = None;
+        let mut first_chunk_at: Option<std::time::Instant> = None;
+        let mut chunk_count: u64 = 0;
 
         while let Some(chunk) = stream.next().await {
             if cancel.load(Ordering::SeqCst) {
@@ -156,6 +199,10 @@ pub async fn run_turn(
                 break;
             }
             let chunk = chunk.context("reading inference stream chunk")?;
+            if first_chunk_at.is_none() {
+                first_chunk_at = Some(std::time::Instant::now());
+            }
+            chunk_count = chunk_count.saturating_add(1);
             if !chunk.model.is_empty() {
                 model_id = chunk.model.clone();
             }
@@ -174,6 +221,23 @@ pub async fn run_turn(
             }
         }
         drop(stream);
+        let stream_total_ms = round_started_at.elapsed().as_millis() as u64;
+        let first_chunk_ms = first_chunk_at
+            .map(|t| t.duration_since(round_started_at).as_millis() as u64)
+            .unwrap_or(0);
+        tracing::debug!(
+            target: "agent::turn_timing",
+            conversation_id = %conversation_id_for_log,
+            round = round - 1, // round was pre-incremented above
+            open_stream_ms,
+            first_chunk_ms,
+            stream_total_ms,
+            chunks_received = chunk_count,
+            text_chars = text_acc.chars().count(),
+            tool_calls_accumulated = tool_calls.len(),
+            finish_reason = ?finish_reason,
+            "round stream complete"
+        );
 
         if was_cancelled {
             tx.send(RunnerToServer::Error {
@@ -222,7 +286,9 @@ pub async fn run_turn(
                 content: if text_acc.is_empty() {
                     None
                 } else {
-                    Some(text_acc.clone())
+                    Some(execlaw_inference_api::MessageContent::Text(
+                        text_acc.clone(),
+                    ))
                 },
                 tool_call_id: None,
                 name: None,
@@ -345,6 +411,17 @@ pub async fn run_turn(
         conversation_id: req.conversation_id.clone(),
         phase: "idle".into(),
     })?;
+
+    let total_ms = turn_started_at.elapsed().as_millis() as u64;
+    tracing::debug!(
+        target: "agent::turn_timing",
+        conversation_id = %conversation_id_for_log,
+        total_ms,
+        tool_rounds = round.saturating_sub(1),
+        assistant_text_chars = final_assistant_text.chars().count(),
+        finish_reason = ?final_finish_reason,
+        "turn complete (runner-mediated)"
+    );
 
     tx.send(RunnerToServer::TurnComplete {
         turn_id: req.turn_id.clone(),

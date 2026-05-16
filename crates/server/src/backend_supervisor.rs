@@ -272,10 +272,21 @@ fn spec_from_row(row: &BackendRow) -> Result<ServiceSpec, String> {
         .model_spec_json
         .as_object()
         .ok_or_else(|| "model_spec_json must be a JSON object for managed mode".to_string())?;
-    let image = obj
-        .get("image")
+    // Apple-Silicon native presets (Ollama) omit `image` because they
+    // spawn a host-native subprocess, not a Docker container. We
+    // accept the missing field for `runtime: "native"` rows and pass
+    // an empty image through; the validation in `NativeServiceController`
+    // doesn't consult `image` at all.
+    let is_native_runtime = obj
+        .get("runtime")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "managed model_spec_json must include `image`".to_string())?;
+        .map(|s| s.eq_ignore_ascii_case("native"))
+        .unwrap_or(false);
+    let image = match obj.get("image").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None if is_native_runtime => "",
+        None => return Err("managed model_spec_json must include `image`".to_string()),
+    };
     let mut args = obj
         .get("args")
         .and_then(|v| v.as_array())
@@ -337,6 +348,28 @@ fn spec_from_row(row: &BackendRow) -> Result<ServiceSpec, String> {
                 .collect()
         })
         .unwrap_or_default();
+    // Dispatch on the optional `runtime` discriminator in
+    // model_spec_json. Apple-Silicon Ollama presets set
+    // `"runtime": "native"` + `"binary_hint": "ollama"` so the
+    // multiplexed controller routes the spawn to
+    // `NativeServiceController` instead of bollard. Other rows omit
+    // the field and default to Docker (matches every existing
+    // managed-mode preset).
+    let (runtime, binary_hint) = match row.model_spec_json.get("runtime").and_then(|v| v.as_str()) {
+        Some("native") => {
+            let hint = row
+                .model_spec_json
+                .get("binary_hint")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            (execlaw_container_manager::ServiceRuntime::Native, hint)
+        }
+        _ => (
+            execlaw_container_manager::ServiceRuntime::Docker,
+            String::new(),
+        ),
+    };
     Ok(ServiceSpec {
         name: format!("execlaw-backend-{}", row.purpose.as_str()),
         image: image.to_owned(),
@@ -348,6 +381,8 @@ fn spec_from_row(row: &BackendRow) -> Result<ServiceSpec, String> {
         mounts,
         host_port: host_port_for(row.purpose),
         container_port,
+        runtime,
+        binary_hint,
     })
 }
 
@@ -448,6 +483,13 @@ fn default_tool_parser_for_args(args: &[String]) -> &'static str {
         "llama3_json"
     } else if lower.contains("mistral") {
         "mistral"
+    } else if lower.contains("qwen3.6") || lower.contains("qwen3_6") {
+        // Qwen3.6 uses the `qwen3_coder` parser per vLLM Recipes
+        // (https://recipes.vllm.ai/Qwen/Qwen3.6-27B). Distinct from
+        // Qwen3 / Qwen3.5 which emit native XML — Qwen3.6's
+        // tool-call output shape is different enough that
+        // `qwen3_xml` silently extracts zero tool_calls.
+        "qwen3_coder"
     } else if lower.contains("qwen3") {
         // Qwen3 + Qwen3.5 emit XML-shaped tool calls; hermes
         // silently fails on them.
@@ -461,11 +503,62 @@ fn default_tool_parser_for_args(args: &[String]) -> &'static str {
     }
 }
 
+/// HTTP path the supervisor probes for liveness. Engine-specific
+/// because every inference daemon picks a different convention:
+///
+///   * **Ollama** (`binary_hint = "ollama"`) — `/api/tags`. Returns
+///     200 + a JSON list of locally-cached models. Ollama doesn't
+///     ship a `/health` endpoint.
+///   * **vLLM / Whisper / Kokoro / Piper** (Docker runtime, or
+///     `binary_hint == ""`) — `/health`. Convention shared by every
+///     execlaw-built service image.
+///
+/// Returns a leading `/` so the supervisor can string-concat onto
+/// `ServiceHandle::endpoint_url("http")` without thinking about it.
+///
+/// **Known gap (Apple Silicon Ollama):** the Ollama daemon answers
+/// `/api/tags` ~instantly on startup, well before any model is
+/// pulled. So a fresh wizard run will mark the backend `Healthy` and
+/// write the `/v1` endpoint — but the first `/v1/chat/completions`
+/// request will 404 with "model 'X' not found" because Ollama
+/// doesn't auto-pull on the OpenAI-compat path. v1 punts on the
+/// active-pull integration; operators must run
+/// `ollama pull <model>` manually after configuring the wizard. The
+/// follow-up (tracked in the plan's audit gaps) wires
+/// `POST /api/pull` into the supervisor's existing download-task
+/// machinery so the SPA can surface "Pulling 47%…" the same way it
+/// does for HF model downloads on vLLM today.
+fn health_path_for(spec: &ServiceSpec) -> &'static str {
+    health_path_for_hint(&spec.binary_hint)
+}
+
+/// String-only form used by the reconcile loop's health-check arm
+/// (the loop doesn't keep a `ServiceSpec` in scope after spawn —
+/// only the `BackendRow` and `ServiceHandle`).
+fn health_path_for_hint(hint: &str) -> &'static str {
+    match hint {
+        "ollama" => "/api/tags",
+        _ => "/health",
+    }
+}
+
+/// Extract the binary_hint from a `BackendRow`'s `model_spec_json`
+/// without re-running `spec_from_row`. Returns an empty string when
+/// the row pre-dates the native-runtime work, which yields `/health`
+/// from `health_path_for_hint` — exactly the legacy behaviour.
+fn binary_hint_from_row(row: &BackendRow) -> &str {
+    row.model_spec_json
+        .get("binary_hint")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+}
+
 fn parse_gpu_vendor(s: &str) -> Option<GpuVendor> {
     match s.trim().to_ascii_lowercase().as_str() {
         "nvidia" => Some(GpuVendor::Nvidia),
         "intel" => Some(GpuVendor::Intel),
         "amd" => Some(GpuVendor::Amd),
+        "apple" => Some(GpuVendor::Apple),
         _ => None,
     }
 }
@@ -976,7 +1069,11 @@ impl BackendSupervisor {
                             slot.last_log_tail = Some(tail);
                         }
                     }
-                    let url = format!("{}/health", handle.endpoint_url("http"));
+                    let url = format!(
+                        "{}{}",
+                        handle.endpoint_url("http"),
+                        health_path_for_hint(binary_hint_from_row(&row))
+                    );
                     match self.controller.health_check(&url).await {
                         Ok(true) => {
                             slot.status = ServiceStatus::Healthy;
@@ -1351,6 +1448,44 @@ mod tests {
     }
 
     #[test]
+    fn health_path_picks_ollama_api_tags_for_native_ollama() {
+        let spec = ServiceSpec {
+            binary_hint: "ollama".into(),
+            runtime: execlaw_container_manager::ServiceRuntime::Native,
+            ..Default::default()
+        };
+        assert_eq!(health_path_for(&spec), "/api/tags");
+    }
+
+    #[test]
+    fn health_path_picks_slash_health_for_docker_vllm() {
+        let spec = ServiceSpec {
+            image: "vllm/vllm-openai:nightly".into(),
+            binary_hint: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(health_path_for(&spec), "/health");
+    }
+
+    #[test]
+    fn health_path_picks_slash_health_for_unknown_hint() {
+        // Defensive: a future preset that types the wrong hint in
+        // model_spec_json shouldn't accidentally probe `/api/tags`
+        // (which would 404 on a vLLM and demote a healthy backend).
+        let spec = ServiceSpec {
+            binary_hint: "made-up-engine".into(),
+            ..Default::default()
+        };
+        assert_eq!(health_path_for(&spec), "/health");
+    }
+
+    #[test]
+    fn parse_gpu_vendor_recognises_apple() {
+        assert_eq!(parse_gpu_vendor("apple"), Some(GpuVendor::Apple));
+        assert_eq!(parse_gpu_vendor("Apple"), Some(GpuVendor::Apple));
+    }
+
+    #[test]
     fn host_port_is_stable_per_purpose() {
         // The runner relies on these being deterministic across
         // restarts so a routine that ran yesterday doesn't see a
@@ -1391,6 +1526,28 @@ mod tests {
         // Prefix caching is mandatory for tool-loop performance —
         // see the doc comment on inject_required_vllm_tool_args.
         assert!(out.contains(&"--enable-prefix-caching".into()));
+    }
+
+    #[test]
+    fn inject_tool_args_picks_qwen3_coder_for_qwen3_6_models() {
+        // 2026-05-12 — Qwen3.6 uses the `qwen3_coder` tool-call
+        // parser per the vLLM Recipes guide. Distinct from Qwen3 /
+        // Qwen3.5 which use `qwen3_xml`. Test both common spellings
+        // of the model id ("3.6" and the underscore variant some
+        // mirror repos use).
+        for model in [
+            "--model=QuantTrio/Qwen3.6-27B-AWQ",
+            "--model=Qwen/Qwen3.6-27B",
+            "--model=some/Qwen3_6-MoE",
+        ] {
+            let original = vec![model.into()];
+            let mut out = original.clone();
+            inject_required_vllm_tool_args("vllm/vllm-openai:v0.20.2", &original, &mut out);
+            assert!(
+                out.contains(&"--tool-call-parser=qwen3_coder".into()),
+                "expected qwen3_coder parser for {model}, got: {out:?}"
+            );
+        }
     }
 
     #[test]
@@ -1496,6 +1653,72 @@ mod tests {
         assert_eq!(spec.host_port, host_port_for(BackendPurpose::Standard));
         assert_eq!(spec.container_port, 8000);
         assert_eq!(spec.gpu_id.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn spec_from_row_routes_apple_preset_to_native_runtime() {
+        // End-to-end Phase 4 wiring: a row matching what the Apple
+        // preset library writes (no `image`, `runtime: "native"`,
+        // `binary_hint: "ollama"`) must round-trip through
+        // `spec_from_row` into a Native-runtime ServiceSpec the
+        // multiplexed controller can dispatch.
+        let row = BackendRow {
+            purpose: BackendPurpose::Standard,
+            inference_backend: "service-ollama".into(),
+            model_spec_json: serde_json::json!({
+                "runtime": "native",
+                "binary_hint": "ollama",
+                "args": ["serve"],
+                "container_port": 11434,
+                "model": "qwen2.5:32b-instruct-q4_K_M",
+            }),
+            gpu_id: None,
+            endpoint: None,
+            notes: None,
+            reasoning_enabled: true,
+            mode: BackendMode::Managed,
+            created_at: 100,
+            updated_at: 100,
+        };
+        let spec = spec_from_row(&row).expect("native preset row must round-trip");
+        assert_eq!(
+            spec.runtime,
+            execlaw_container_manager::ServiceRuntime::Native
+        );
+        assert_eq!(spec.binary_hint, "ollama");
+        assert_eq!(spec.container_port, 11434);
+        assert!(spec.image.is_empty());
+        // The supervisor's health probe will hit /api/tags via
+        // health_path_for; sanity-check that helper agrees on this
+        // spec shape so the integration is end-to-end.
+        assert_eq!(health_path_for(&spec), "/api/tags");
+        // Ollama-args injection: `serve` is the only thing the
+        // supervisor needs; no vLLM tool-call args should sneak in.
+        assert_eq!(spec.args, vec!["serve".to_owned()]);
+    }
+
+    #[test]
+    fn spec_from_row_docker_runtime_still_requires_image() {
+        // Regression guard: relaxing `image` for native rows must
+        // NOT relax it for the default Docker path. A typo'd Docker
+        // row (image missing) must still fail spec_from_row so the
+        // supervisor doesn't try to spawn a no-image container.
+        let row = BackendRow {
+            purpose: BackendPurpose::Standard,
+            inference_backend: "service-vllm".into(),
+            model_spec_json: serde_json::json!({
+                // No `runtime` field → defaults to Docker.
+                "args": ["--model", "X"],
+            }),
+            gpu_id: None,
+            endpoint: None,
+            notes: None,
+            reasoning_enabled: false,
+            mode: BackendMode::Managed,
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert!(spec_from_row(&row).is_err());
     }
 
     #[test]
@@ -1961,14 +2184,11 @@ mod tests {
         let mut spec = ServiceSpec {
             name: "execlaw-backend-Standard".into(),
             image: "vllm:nightly".into(),
-            args: vec![],
-            entrypoint: None,
-            env: vec![],
             gpu_id: Some("0".into()),
             gpu_vendor: Some(GpuVendor::Nvidia),
-            mounts: vec![],
             host_port: 8101,
             container_port: 8000,
+            ..Default::default()
         };
         let cache = PathBuf::from("/home/me/.execlaw/hf-cache");
         attach_hf_cache_mount(&mut spec, &cache);
@@ -2025,13 +2245,10 @@ mod tests {
             name: "execlaw-backend-Standard".into(),
             image: "vllm:test".into(),
             args: vec!["--model".into(), "X".into()],
-            entrypoint: None,
-            env: vec![],
             gpu_id: Some("0".into()),
-            gpu_vendor: None,
-            mounts: vec![],
             host_port: 8101,
             container_port: 8000,
+            ..Default::default()
         };
         let pre_handle = mock.spawn(&pre_spec).await.unwrap();
         let pre_spawn_count = mock.spawn_count().await;
@@ -2087,14 +2304,10 @@ mod tests {
         let spec = ServiceSpec {
             name: "execlaw-backend-Standard".into(),
             image: "vllm:test".into(),
-            args: vec![],
-            entrypoint: None,
-            env: vec![],
             gpu_id: Some("0".into()),
-            gpu_vendor: None,
-            mounts: vec![],
             host_port: 8101,
             container_port: 8000,
+            ..Default::default()
         };
         let h = mock.spawn(&spec).await.unwrap();
         mock.stop(&h).await.unwrap();

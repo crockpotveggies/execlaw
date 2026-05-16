@@ -24,10 +24,11 @@ pub use hf_downloader::{DownloadEvent, DownloadStream, HfDownloader, HfError, Re
 
 pub use hardware::{
     GpuDevice, GpuId, GpuVendor, HardwareProfile, SysfsSource, detect, detect_sysfs,
+    parse_macos_system_profiler,
 };
 pub use service::{
-    BollardServiceController, HostMount, ServiceController, ServiceError, ServiceHandle,
-    ServiceSpec, ServiceStatus,
+    BollardServiceController, HostMount, MultiplexedServiceController, NativeServiceController,
+    ServiceController, ServiceError, ServiceHandle, ServiceRuntime, ServiceSpec, ServiceStatus,
 };
 
 #[cfg(any(test, feature = "test-mock"))]

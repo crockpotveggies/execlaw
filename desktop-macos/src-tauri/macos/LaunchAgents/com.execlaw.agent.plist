@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for the execlaw control plane.
+
+  Registered at runtime via SMAppService.agent(plistName:) from the
+  menu bar app. The plist must live inside the .app bundle at
+  Contents/Library/LaunchAgents/<filename>.plist — see
+  scripts/build-mac.sh for the post-bundle copy that puts it there
+  (Tauri's bundler doesn't write into Contents/Library/ by default).
+
+  Best-practice notes:
+
+  * `BundleProgram` is bundle-relative — SMAppService rewrites it to
+    the actual on-disk path inside the .app at registration time, so
+    we don't hardcode /Applications/execlaw.app/... anywhere.
+  * `ProgramArguments[0]` must match BundleProgram for launchd to
+    accept the spawn. Subsequent entries are passed as argv.
+  * `RunAtLoad` and `KeepAlive` together give us "start now, restart
+    on crash, restart on healthy-exit-too" — the control plane never
+    intends to exit voluntarily, so any exit is a bug worth restart.
+  * Std{Out,Err}Path land under ~/Library/Logs/execlaw/ which is the
+    standard macOS log location (and what `log show` indexes).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.execlaw.agent</string>
+
+    <key>BundleProgram</key>
+    <string>Contents/MacOS/execlaw</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>Contents/MacOS/execlaw</string>
+        <string>service</string>
+        <string>run</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/execlaw.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/execlaw.stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

@@ -21,7 +21,9 @@ use execlaw_core::backends::BackendPurpose;
 use execlaw_core::conversation::{
     ConversationKind, ConversationRow, ConversationStore, Modality, Phase, ThreadSummary,
 };
-use execlaw_core::events::{EventKind, EventLog, EventRecord, PendingEvent};
+use execlaw_core::events::{
+    EventKind, EventLog, EventRecord, PendingEvent, ToolResultPayload, ToolUsePayload,
+};
 use execlaw_core::ids::{ConversationId, EventSeq};
 use execlaw_core::principal::{Principal, PrincipalStore, TrustLevel as CoreTrustLevel};
 use execlaw_inference_api::ModelId;
@@ -65,6 +67,67 @@ pub struct SendMessageRequest {
     /// ask if a clock time is ambiguous.
     #[serde(default)]
     pub timezone: Option<String>,
+    /// 2026-05-15 — inline image attachments. Each entry is a
+    /// `data:image/...;base64,...` URL the SPA produced from the
+    /// operator's file picker. The server decodes, content-
+    /// addresses the bytes under `<data_dir>/blobs/`, and inserts a
+    /// `state_attachments` row scoped to the conversation. The
+    /// resulting attachment ids are stamped onto the `user_msg`
+    /// event payload so history replay can re-encode them as
+    /// `image_url` content parts when calling a vision-capable
+    /// model (Qwen3-VL / Qwen3.6 / LLaVA / Pixtral, etc).
+    ///
+    /// Per-image data URL is capped at ~20 MiB after base64 decode;
+    /// oversize images are rejected with `attachment_too_large`.
+    /// The SPA should pre-resize before send (1024-ish px on the
+    /// long edge is enough for nearly every vision model and keeps
+    /// the request comfortably under the cap).
+    #[serde(default)]
+    pub attachments: Vec<InlineAttachmentRequest>,
+    /// 2026-05-15 — names of skills the operator picked from the
+    /// composer's `+` menu to apply to THIS turn only. The server
+    /// resolves each name to its current stable/trial body, prepends
+    /// the bodies as `<skill name="...">...</skill>` blocks above
+    /// the user text, and ships the combined string to the model.
+    /// The original (un-prepended) text remains in
+    /// `UserMessagePayload.text` so subsequent turns don't keep
+    /// re-seeing the skill body in history. The applied names land
+    /// on `UserMessagePayload.applied_skill_names` so the SPA can
+    /// render a "applied: foo, bar" chip on the message bubble.
+    ///
+    /// Validation:
+    ///   * Unknown / archived skill name → 404 `skill_not_found`.
+    ///   * Total resolved body bytes > [`MAX_PREPEND_SKILL_BYTES`]
+    ///     → 413 `skill_prepend_too_large` (prevents ballooning the
+    ///     request past the model's context window in one shot).
+    ///
+    /// Empty / absent for every non-web inbound path; transports
+    /// don't surface a picker UI today.
+    #[serde(default)]
+    pub skill_names: Vec<String>,
+}
+
+/// Hard cap on the total bytes of resolved skill bodies prepended
+/// onto a single turn. Kept generous (32 KiB ≈ 8000 tokens) so a
+/// few medium-sized skills fit comfortably; exceeded only when the
+/// operator picks several large skills at once. The cap is checked
+/// AFTER resolving each name to its body — names alone don't count.
+const MAX_PREPEND_SKILL_BYTES: usize = 32 * 1024;
+
+/// One image attachment from the SPA composer. The `data_url` carries
+/// the bytes inline as a `data:` URL (`data:<mime>;base64,<bytes>`).
+/// The SPA encodes locally so the server doesn't need a separate
+/// upload endpoint for the common Phase-1 case.
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+pub struct InlineAttachmentRequest {
+    /// IANA mime type. Restricted server-side to the image family
+    /// today (`image/png`, `image/jpeg`, `image/webp`, `image/gif`).
+    /// Non-image mime types fail with `attachment_mime_unsupported`.
+    pub mime: String,
+    /// `data:<mime>;base64,<bytes>` URL. The mime in this URL must
+    /// match the `mime` field above; mismatches fail with
+    /// `attachment_data_url_invalid`.
+    pub data_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
@@ -103,6 +166,29 @@ pub struct MessageView {
     /// via Signal".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_origin: Option<String>,
+    /// 2026-05-15 — image attachments included on a user_msg via
+    /// the composer's `+` menu. Empty (and serialised as absent)
+    /// for every other message kind. The SPA renders each entry
+    /// as an inline `<img src="/api/attachments/{id}">` above the
+    /// text bubble.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<MessageAttachmentView>,
+    /// 2026-05-15 — names of skills the operator picked from the
+    /// composer's `+` menu when sending this `user_msg`. The skill
+    /// bodies were prepended onto the message text server-side
+    /// before the model saw them; the SPA strips those `<skill
+    /// name="...">...</skill>` blocks out of `text` for display
+    /// and renders this list as a chip under the bubble. Empty for
+    /// every non-user_msg kind and for user_msg events sent without
+    /// any skill selection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied_skill_names: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MessageAttachmentView {
+    pub id: String,
+    pub mime: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -136,7 +222,10 @@ pub async fn send_message(
     Path(conversation_id): Path<String>,
     Json(req): Json<SendMessageRequest>,
 ) -> impl IntoResponse {
-    if req.text.trim().is_empty() {
+    // 2026-05-15 — accept an image-only turn (empty text + at least
+    // one attachment). Vision models behave fine with just an image
+    // + the implicit "describe / answer about this" framing.
+    if req.text.trim().is_empty() && req.attachments.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "text must not be empty"})),
@@ -145,6 +234,61 @@ pub async fn send_message(
     }
 
     let cid = ConversationId::from(conversation_id.as_str());
+
+    // 2026-05-15 — decode + persist inline image attachments BEFORE
+    // identity resolution / policy. The attachment rows are scoped
+    // to the conversation id and end up referenced from the
+    // user_msg event payload; subsequent history hydration re-loads
+    // the bytes and emits them as OpenAI vision content parts.
+    // Persisting up front (vs. inside a turn helper) means every
+    // dispatch path — stub / real / runner / tool-capable —
+    // receives the same `Vec<String>` of attachment ids.
+    //
+    // Incognito turns skip persistence: the SPA owns the running
+    // transcript and the data URLs can be encoded straight into
+    // the LLM call without a DB write (incognito invariant: no
+    // persistent state).
+    let persisted_attachments: Vec<String> = if req.incognito || req.attachments.is_empty() {
+        Vec::new()
+    } else {
+        match persist_inline_attachments(&state, &cid, &req.attachments) {
+            Ok(ids) => ids,
+            Err(err) => return err.into_response(),
+        }
+    };
+
+    // 2026-05-15 — operator-picked skills (composer `+` menu, second
+    // item). Resolve every name to its current body and build the
+    // `<skill name="...">...</skill>\n\n` prepend block. Validation
+    // failures (unknown / archived / prepend too large) short-circuit
+    // BEFORE any event-log write so a typo'd skill name doesn't
+    // half-commit the turn. Skills land on every dispatch path
+    // (stub / real / runner / tool-capable) — same prepend semantics
+    // regardless of which runtime answers. Skipped for incognito
+    // (no DB read against the transient session) and for non-web
+    // inbounds (transports don't surface a skill picker today).
+    let (skill_prepend, applied_skill_names): (String, Vec<String>) =
+        if req.incognito || req.skill_names.is_empty() {
+            (String::new(), Vec::new())
+        } else {
+            match resolve_skill_prepend(&state.db, &req.skill_names) {
+                Ok(block) => (block, req.skill_names.clone()),
+                Err((status, code, message)) => {
+                    return (
+                        status,
+                        Json(serde_json::json!({
+                            "error": {"code": code, "message": message}
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        };
+    let effective_user_text: String = if skill_prepend.is_empty() {
+        req.text.clone()
+    } else {
+        format!("{skill_prepend}{}", req.text)
+    };
 
     // 2026-04-28 — incognito short-circuit. We branch BEFORE
     // identity resolution / policy evaluation / event-log writes
@@ -363,7 +507,7 @@ pub async fn send_message(
                     state: &state,
                     group_id,
                     cid: &cid,
-                    user_text: &req.text,
+                    user_text: &effective_user_text,
                     sender_principal_id: req.sender_principal_id.clone(),
                     spotlight_content,
                     cancel_flag: cancel_flag.clone(),
@@ -374,6 +518,8 @@ pub async fn send_message(
                     inbound_channel_origin: None,
                     caller_timezone: req.timezone.as_deref(),
                     group_context: group_context_for_turn.clone(),
+                    attachment_ids: persisted_attachments.clone(),
+                    applied_skill_names: applied_skill_names.clone(),
                 })
                 .await
                 {
@@ -394,13 +540,15 @@ pub async fn send_message(
                 &state,
                 inference.clone(),
                 &cid,
-                &req.text,
+                &effective_user_text,
                 req.sender_principal_id.clone(),
                 caller_caps.clone(),
                 sender_trust,
                 None,
                 req.timezone.as_deref(),
                 group_context_for_turn.clone(),
+                persisted_attachments.clone(),
+                applied_skill_names.clone(),
             )
             .await
             {
@@ -421,7 +569,7 @@ pub async fn send_message(
                     &state,
                     inference.clone(),
                     &cid,
-                    &req.text,
+                    &effective_user_text,
                     req.sender_principal_id.clone(),
                     sender_trust,
                     spotlight_content,
@@ -429,6 +577,8 @@ pub async fn send_message(
                     None,
                     req.timezone.as_deref(),
                     group_context_for_turn.clone(),
+                    persisted_attachments.clone(),
+                    applied_skill_names.clone(),
                 )
                 .await
                 {
@@ -449,9 +599,11 @@ pub async fn send_message(
                 match run_stub_turn(
                     &state,
                     &cid,
-                    &req.text,
+                    &effective_user_text,
                     req.sender_principal_id.clone(),
                     None,
+                    persisted_attachments.clone(),
+                    applied_skill_names.clone(),
                 ) {
                     Ok(out) => out,
                     Err(e) => {
@@ -578,6 +730,8 @@ fn run_stub_turn(
     user_text: &str,
     sender_principal_id: Option<String>,
     inbound_channel_origin: Option<&str>,
+    attachment_ids: Vec<String>,
+    applied_skill_names: Vec<String>,
 ) -> Result<(i64, String, i64), String> {
     let log = event_log(state);
     let reply_text = format!(
@@ -591,6 +745,8 @@ fn run_stub_turn(
             text: user_text.to_owned(),
             sender_principal_id,
             channel_origin: inbound_channel_origin.map(|s| s.to_owned()),
+            attachment_ids,
+            applied_skill_names,
         },
         None,
     )
@@ -647,7 +803,7 @@ fn run_stub_turn(
 /// path for future tool integrations).
 async fn run_real_turn(
     state: &AppState,
-    inference: Arc<execlaw_inference_api::InferenceClient>,
+    resolved: crate::inference_resolver::ResolvedInference,
     cid: &ConversationId,
     user_text: &str,
     sender_principal_id: Option<String>,
@@ -657,7 +813,19 @@ async fn run_real_turn(
     inbound_channel_origin: Option<&str>,
     caller_timezone: Option<&str>,
     group_context: Option<GroupTurnContext>,
+    attachment_ids: Vec<String>,
+    applied_skill_names: Vec<String>,
 ) -> Result<(i64, String, i64), String> {
+    // 2026-05-13 — `resolved` carries the InferenceClient + the
+    // model_id paired from the SAME `config_backends` row read.
+    // Pre-rework these came from two sources (the inference URL
+    // from the DB row, the model id from `state.config.model_id`
+    // baked in at boot) and drifted out of sync as soon as an
+    // operator swapped models without restarting; the chat path
+    // sent model=X while vLLM was loaded with model=Y and 404'd.
+    // One source of truth, one read, both fields atomic.
+    let inference = resolved.client.clone();
+    let resolved_model_id = resolved.model_id.clone();
     use execlaw_inference_api::{ChatMessage, ChatRequest};
     use execlaw_policy::spotlighting::Spotlight;
     use futures::StreamExt;
@@ -675,6 +843,8 @@ async fn run_real_turn(
             text: user_text.to_owned(),
             sender_principal_id: sender_principal_id.clone(),
             channel_origin: inbound_channel_origin.map(|s| s.to_owned()),
+            attachment_ids: attachment_ids.clone(),
+            applied_skill_names: applied_skill_names.clone(),
         },
         sender_principal_id.clone(),
     )
@@ -719,47 +889,130 @@ async fn run_real_turn(
         "",
         &turn_context,
     );
+    // Hydrate into role-tagged messages FIRST (without spotlighting),
+    // then run the sliding-window truncation, then convert into
+    // `ChatMessage` with spotlight applied to surviving user messages.
+    //
+    // Separating "build" from "truncate" lets the same truncation
+    // policy (`execlaw_core::history_budget::truncate_to_budget`) feed
+    // both turn paths without each having to know about spotlighting
+    // or ChatMessage construction.
+    //
+    // Spotlighting is applied AFTER truncation: the random delimiter
+    // overhead is a few characters per user message and not worth
+    // accounting for in the token budget (the heuristic is already
+    // ±50% per-message — these delimiters are within the noise).
+    let raw_history: Vec<execlaw_core::history_budget::HistoryMessage> = history
+        .iter()
+        .filter_map(|ev| match ev.kind {
+            EventKind::UserMsg => ev.decode_payload::<UserMessagePayload>().ok().map(|p| {
+                execlaw_core::history_budget::HistoryMessage {
+                    role: execlaw_core::history_budget::HistoryRole::User,
+                    text: p.text,
+                }
+            }),
+            EventKind::ModelTurn => ev
+                .decode_payload::<RealModelTurnPayload>()
+                .ok()
+                .map(|p| execlaw_core::history_budget::HistoryMessage {
+                    role: execlaw_core::history_budget::HistoryRole::Assistant,
+                    text: p.text,
+                })
+                .or_else(|| {
+                    ev.decode_payload::<StubModelTurnPayload>().ok().map(|p| {
+                        execlaw_core::history_budget::HistoryMessage {
+                            role: execlaw_core::history_budget::HistoryRole::Assistant,
+                            text: p.text,
+                        }
+                    })
+                }),
+            _ => None,
+        })
+        .collect();
+    let budget = execlaw_core::history_budget::load_max_history_tokens(&state.db)
+        .unwrap_or(execlaw_core::history_budget::DEFAULT_HISTORY_TOKENS);
+    let truncated = execlaw_core::history_budget::truncate_to_budget(raw_history, budget);
+    if truncated.dropped_count > 0 {
+        tracing::debug!(
+            target: "chats::run_real_turn",
+            conversation_id = %cid.as_str(),
+            dropped = truncated.dropped_count,
+            kept = truncated.kept.len(),
+            kept_tokens_estimate = truncated.kept_tokens_estimate,
+            budget,
+            "truncated conversation history to fit token budget",
+        );
+    }
     let mut messages: Vec<ChatMessage> = vec![ChatMessage::system(&composed_system)];
-    for ev in &history {
-        match ev.kind {
-            EventKind::UserMsg => {
-                if let Ok(p) = ev.decode_payload::<UserMessagePayload>() {
-                    let content = match &spotlight {
-                        Some(s) => s.wrap(&p.text),
-                        None => p.text,
-                    };
-                    messages.push(ChatMessage::user(content));
-                }
+    for m in truncated.kept {
+        match m.role {
+            execlaw_core::history_budget::HistoryRole::User => {
+                let content = match &spotlight {
+                    Some(s) => s.wrap(&m.text),
+                    None => m.text,
+                };
+                messages.push(ChatMessage::user(content));
             }
-            EventKind::ModelTurn => {
-                // The stub path writes `StubModelTurnPayload`; the real
-                // path (below) writes `RealModelTurnPayload`. Try both.
-                if let Ok(p) = ev.decode_payload::<RealModelTurnPayload>() {
-                    messages.push(ChatMessage::assistant(p.text));
-                } else if let Ok(p) = ev.decode_payload::<StubModelTurnPayload>() {
-                    messages.push(ChatMessage::assistant(p.text));
-                }
+            execlaw_core::history_budget::HistoryRole::Assistant => {
+                messages.push(ChatMessage::assistant(m.text));
             }
-            _ => {}
+        }
+    }
+
+    // 2026-05-15 — when the operator attached images this turn (via
+    // the composer's `+` menu), upgrade the trailing user message
+    // into an OpenAI vision content array. Each attachment id is
+    // loaded from `state_attachments`, the bytes are base64-encoded
+    // into a `data:<mime>;base64,...` URL, and the parts replace
+    // the text-only ChatMessage we just pushed.
+    //
+    // Limitation (Phase 1): only THIS turn's attachments survive
+    // into the prompt — prior turns' images are read back as text-
+    // only (their id list is on the event payload but the history-
+    // budget projection only carries `text`). Lifting that requires
+    // extending `history_budget::HistoryMessage` to carry the ids
+    // through truncation; left as a follow-up since multi-turn
+    // image conversations are uncommon today and the budget keeps
+    // the prompt cheap.
+    if !attachment_ids.is_empty() {
+        let image_urls = encode_attachments_as_data_urls(&state.db, cid, &attachment_ids);
+        if !image_urls.is_empty() {
+            // Pull the previously-pushed text-only user message
+            // (the current turn's content). Fall back to the raw
+            // `user_text` if truncation evicted it (extreme budget
+            // pressure on a long history).
+            let last_user_text = match messages.last() {
+                Some(m) if matches!(m.role, execlaw_inference_api::Role::User) => {
+                    let text = m.content.as_ref().map(|c| c.as_text()).unwrap_or_default();
+                    messages.pop();
+                    text
+                }
+                _ => match &spotlight {
+                    Some(s) => s.wrap(user_text),
+                    None => user_text.to_owned(),
+                },
+            };
+            messages.push(ChatMessage::user_with_images(last_user_text, image_urls));
         }
     }
 
     // Step 3 — open stream.
     //
     // 2026-04-28 — read the Standard backend row's reasoning_enabled
-    // and forward it as `chat_template_kwargs.enable_thinking`. Qwen3.5
+    // and forward it as `chat_template_kwargs.enable_thinking`. Qwen3
     // honours this knob in its chat template; without it the model
     // defaults to emitting a "Thinking Process:" monologue ahead of
     // every reply. We always send the field (rather than omitting it
     // when false) so the chat template's `if` branch evaluates a
     // concrete bool — Qwen's template treats "missing" as the
     // model-default, which on Qwen3.5 is reasoning-on.
-    let reasoning_enabled = execlaw_core::backends::BackendStore::new(&state.db)
-        .get(BackendPurpose::Standard)
-        .ok()
-        .flatten()
-        .map(|r| r.reasoning_enabled)
-        .unwrap_or(false);
+    //
+    // 2026-05-13 — sourced from `resolved.reasoning_enabled` (the
+    // same DB row that supplied endpoint + model id). Pre-rework
+    // this was a second `BackendStore::get(...).ok().flatten()` read
+    // that silently masked DB errors AND opened a drift window
+    // between the resolve and the reasoning read.
+    let reasoning_enabled = resolved.reasoning_enabled;
     // Pre-set chat_template_kwargs based on the operator's
     // reasoning_enabled flag; the adapter's prepare_request will
     // honor whatever the caller chose for Conversation hint (Qwen3
@@ -767,7 +1020,7 @@ async fn run_real_turn(
     // None). This preserves the existing reasoning-enabled toggle
     // while still routing through the per-family adapter.
     let base_req = ChatRequest {
-        model: ModelId(state.config.model_id.clone()),
+        model: ModelId(resolved_model_id.clone()),
         messages,
         tools: None,
         stream: true,
@@ -784,7 +1037,7 @@ async fn run_real_turn(
         })),
     };
     let adapter = execlaw_model_adapter::adapter_for(execlaw_model_adapter::ModelFamily::detect(
-        &state.config.model_id,
+        &resolved_model_id,
     ));
     let req = adapter.prepare_request(base_req, execlaw_model_adapter::OutputHint::Conversation);
     let mut stream = inference
@@ -803,7 +1056,7 @@ async fn run_real_turn(
     // well-formed and the operator sees their partial reply.
     let mut assembled = String::new();
     let mut finish_reason: Option<String> = None;
-    let mut model_id = state.config.model_id.clone();
+    let mut model_id = resolved_model_id.clone();
     let mut was_cancelled = false;
     // 2026-04-28 — defensive `<think>...</think>` stripper. Even with
     // `enable_thinking=false` in the chat template, the model can
@@ -998,6 +1251,20 @@ pub(crate) struct RunnerTurnCtx<'a> {
     /// else is in the room, and why the upstream router decided
     /// this turn should run.
     pub group_context: Option<GroupTurnContext>,
+    /// 2026-05-15 — attachment ids attached to the user_msg this
+    /// turn carries. Persisted into `UserMessagePayload.attachment_ids`
+    /// so the chat-history hydration in subsequent turns can encode
+    /// the images as OpenAI vision content parts. Empty for every
+    /// non-web inbound path (Signal / email today; future bridges
+    /// land their own image plumbing later).
+    pub attachment_ids: Vec<String>,
+    /// 2026-05-15 — names of skills the operator picked from the
+    /// composer's `+` menu for this turn. Persisted into
+    /// `UserMessagePayload.applied_skill_names` for SPA rendering
+    /// + audit. The bodies are already prepended onto `user_text`
+    /// by the send-handler upstream; the runner doesn't need to
+    /// re-resolve them.
+    pub applied_skill_names: Vec<String>,
 }
 
 pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, String, i64), String> {
@@ -1014,6 +1281,8 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         inbound_channel_origin,
         caller_timezone,
         group_context,
+        attachment_ids,
+        applied_skill_names,
     } = ctx;
     let supervisor = state
         .runner_supervisor
@@ -1036,6 +1305,8 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
             text: user_text.to_owned(),
             sender_principal_id: sender_principal_id.clone(),
             channel_origin: inbound_channel_origin.map(|s| s.to_owned()),
+            attachment_ids: attachment_ids.clone(),
+            applied_skill_names: applied_skill_names.clone(),
         },
         sender_principal_id.clone(),
     )
@@ -1089,40 +1360,89 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         &routing_prose,
         &turn_context,
     );
-    let mut hist_messages: Vec<ChatMessage> = Vec::new();
-    for ev in &history {
-        match ev.kind {
+    // Hydrate into role-tagged history first, run the sliding-window
+    // truncation, then convert to ChatMessage with spotlighting. See
+    // the matching block in `run_real_turn` for the rationale; the
+    // tool-capable path has one extra step — skipping the user_msg
+    // we just appended this turn (the runner receives that as
+    // `TurnRequest.user_text`, not as part of history).
+    let raw_history: Vec<execlaw_core::history_budget::HistoryMessage> = history
+        .iter()
+        .filter_map(|ev| match ev.kind {
             EventKind::UserMsg => {
-                if let Ok(p) = ev.decode_payload::<UserMessagePayload>() {
-                    let content = match &spotlight {
-                        Some(s) => s.wrap(&p.text),
-                        None => p.text,
-                    };
-                    // Don't include the user_msg we just appended
-                    // — the runner gets it via TurnRequest.user_text.
-                    if ev.seq != user_seq {
-                        hist_messages.push(ChatMessage::user(content));
+                if ev.seq == user_seq {
+                    // Current turn — runner gets it via `user_text`.
+                    return None;
+                }
+                ev.decode_payload::<UserMessagePayload>().ok().map(|p| {
+                    execlaw_core::history_budget::HistoryMessage {
+                        role: execlaw_core::history_budget::HistoryRole::User,
+                        text: p.text,
                     }
-                }
+                })
             }
-            EventKind::ModelTurn => {
-                if let Ok(p) = ev.decode_payload::<RealModelTurnPayload>() {
-                    hist_messages.push(ChatMessage::assistant(p.text));
-                } else if let Ok(p) = ev.decode_payload::<StubModelTurnPayload>() {
-                    hist_messages.push(ChatMessage::assistant(p.text));
-                }
+            EventKind::ModelTurn => ev
+                .decode_payload::<RealModelTurnPayload>()
+                .ok()
+                .map(|p| execlaw_core::history_budget::HistoryMessage {
+                    role: execlaw_core::history_budget::HistoryRole::Assistant,
+                    text: p.text,
+                })
+                .or_else(|| {
+                    ev.decode_payload::<StubModelTurnPayload>().ok().map(|p| {
+                        execlaw_core::history_budget::HistoryMessage {
+                            role: execlaw_core::history_budget::HistoryRole::Assistant,
+                            text: p.text,
+                        }
+                    })
+                }),
+            _ => None,
+        })
+        .collect();
+    let budget = execlaw_core::history_budget::load_max_history_tokens(&state.db)
+        .unwrap_or(execlaw_core::history_budget::DEFAULT_HISTORY_TOKENS);
+    let truncated = execlaw_core::history_budget::truncate_to_budget(raw_history, budget);
+    if truncated.dropped_count > 0 {
+        tracing::debug!(
+            target: "chats::run_tool_capable_turn",
+            conversation_id = %cid.as_str(),
+            dropped = truncated.dropped_count,
+            kept = truncated.kept.len(),
+            kept_tokens_estimate = truncated.kept_tokens_estimate,
+            budget,
+            "truncated conversation history to fit token budget",
+        );
+    }
+    let mut hist_messages: Vec<ChatMessage> = Vec::with_capacity(truncated.kept.len());
+    for m in truncated.kept {
+        match m.role {
+            execlaw_core::history_budget::HistoryRole::User => {
+                let content = match &spotlight {
+                    Some(s) => s.wrap(&m.text),
+                    None => m.text,
+                };
+                hist_messages.push(ChatMessage::user(content));
             }
-            _ => {}
+            execlaw_core::history_budget::HistoryRole::Assistant => {
+                hist_messages.push(ChatMessage::assistant(m.text));
+            }
         }
     }
 
     // Step 3 — build TurnRequest.
     let turn_id = supervisor.mint_turn_id();
-    let inference_client_for_subagents = state
+    // Resolve client + model id from the SAME backend-row read so
+    // they can't drift (cf. the 2026-05-13 regression where the chat
+    // path sent `model=Qwen3.5` to a vLLM container loaded with
+    // `model=Qwen3.6`, because the URL came from the DB and the
+    // model id came from a stale `state.config.model_id` constant).
+    let resolved = state
         .inference
         .resolve(&state.db, BackendPurpose::Standard)
         .ok_or_else(|| "no inference backend configured".to_owned())?;
-    let inference_url = inference_client_for_subagents.base_url.clone();
+    let inference_client_for_subagents = resolved.client.clone();
+    let resolved_model_id = resolved.model_id.clone();
+    let inference_url = resolved.endpoint.clone();
     // The supervisor resolved the URL from the SERVER's network
     // namespace (likely `http://127.0.0.1:8101/v1` for a local
     // vLLM). Inside a runner container, `127.0.0.1` resolves to
@@ -1131,12 +1451,9 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
     // the runner. selfhosted-claw does the same dance in its
     // `resolveContainerOpenAIBaseUrl`.
     let inference_url = rewrite_url_for_container(&inference_url);
-    let reasoning_enabled = execlaw_core::backends::BackendStore::new(&state.db)
-        .get(BackendPurpose::Standard)
-        .ok()
-        .flatten()
-        .map(|r| r.reasoning_enabled)
-        .unwrap_or(false);
+    // 2026-05-13 — sourced from the same resolved row as endpoint +
+    // model id; see `ResolvedInference::reasoning_enabled`.
+    let reasoning_enabled = resolved.reasoning_enabled;
 
     // Build the tool catalog the runner advertises to the model.
     // Includes BOTH the trait-based built-in tier (registered at
@@ -1189,11 +1506,20 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
     // model's "from:" header. The flat policy tag is canonical.
     let sender_trust_class = format!("{:?}", caller_trust);
 
+    // 2026-05-15 — encode attached images as data URLs so the runner
+    // can build an OpenAI vision content array. The persisted blobs
+    // were already validated + mime-checked by `persist_inline_attachments`
+    // upstream of this call; a missing or cross-conversation row is
+    // dropped silently so a stale id doesn't break the turn.
+    let user_image_urls: Vec<String> =
+        encode_attachments_as_data_urls(&state.db, cid, &attachment_ids);
+
     let req = execlaw_runner_protocol::TurnRequest {
         turn_id: turn_id.clone(),
         conversation_id: cid.as_str().to_owned(),
         group_id: group_id.to_owned(),
         user_text: user_text.to_owned(),
+        user_image_urls,
         sender_principal_id: sender_principal_id
             .clone()
             .unwrap_or_else(|| "controller".into()),
@@ -1202,7 +1528,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         history: hist_messages,
         tool_catalog: tool_decls,
         inference_url,
-        model: state.config.model_id.clone(),
+        model: resolved_model_id.clone(),
         // Delta #6 — explicit 0.3 (was None → vLLM default 1.0).
         // Critical on the runner path because it carries multi-
         // round tool-calling: at temp 1.0 Qwen3.5-AWQ frequently
@@ -1244,7 +1570,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         // child LLM calls against the parent's backend.
         .with_inference(
             inference_client_for_subagents.clone(),
-            state.config.model_id.clone(),
+            resolved_model_id.clone(),
         )
         .with_events(state.events.clone())
         .with_research_supervisor_wake_opt(
@@ -1274,7 +1600,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
     let history_chars: usize = req
         .history
         .iter()
-        .map(|m| m.content.as_deref().map(|s| s.len()).unwrap_or(0))
+        .map(|m| m.content.as_ref().map(|c| c.as_text().len()).unwrap_or(0))
         .sum();
     let tool_chars: usize = req
         .tool_catalog
@@ -1491,7 +1817,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
 /// signing apply identically.
 async fn run_tool_capable_turn(
     state: &AppState,
-    inference: Arc<execlaw_inference_api::InferenceClient>,
+    resolved: crate::inference_resolver::ResolvedInference,
     cid: &ConversationId,
     user_text: &str,
     sender_principal_id: Option<String>,
@@ -1500,9 +1826,36 @@ async fn run_tool_capable_turn(
     inbound_channel_origin: Option<&str>,
     caller_timezone: Option<&str>,
     group_context: Option<GroupTurnContext>,
+    attachment_ids: Vec<String>,
+    applied_skill_names: Vec<String>,
 ) -> Result<(i64, String, i64), String> {
     use execlaw_inference_api::ToolDeclaration;
     use execlaw_runner_local::turn::{TurnConfig, TurnExecutor};
+    // 2026-05-13 — see the rationale comment on `run_real_turn`:
+    // client + model_id are paired from one row read so they
+    // can't drift.
+    let inference = resolved.client.clone();
+    let resolved_model_id = resolved.model_id.clone();
+
+    // 2026-05-12 — turn-timing instrumentation on the
+    // `agent::turn_timing` target (same as inner TurnExecutor).
+    // Every step from "request arrives in this handler" to
+    // "TurnExecutor returns" gets a sub-timing so the operator
+    // can see which step actually owns the wall-clock. Enable
+    // with RUST_LOG=info,agent::turn_timing=debug. All measurements
+    // are on the monotonic clock; deltas between events are what's
+    // meaningful, not absolutes.
+    let outer_started_at = std::time::Instant::now();
+    let cid_for_log = cid.as_str().to_owned();
+    let user_text_chars = user_text.chars().count();
+    tracing::debug!(
+        target: "agent::turn_timing",
+        conversation_id = %cid_for_log,
+        path = "run_tool_capable_turn",
+        user_text_chars,
+        channel = inbound_channel_origin.unwrap_or("web"),
+        "turn entry (chats.rs handler)"
+    );
 
     // Same description/schema plumbing fix as the runner-turn path
     // (delta #1) — without this the in-process tool-capable path
@@ -1515,6 +1868,7 @@ async fn run_tool_capable_turn(
     // research_* / memory_* / etc. The dispatch chain already
     // routes built-ins via `try_registry_builtin`; we just need to
     // tell the model they're there.
+    let catalog_started_at = std::time::Instant::now();
     let mut tool_decls: Vec<ToolDeclaration> = state
         .plugin_host
         .registry()
@@ -1546,6 +1900,19 @@ async fn run_tool_capable_turn(
                 ToolDeclaration::function(t.tool_name.clone(), description, schema)
             }),
     );
+    let catalog_ms = catalog_started_at.elapsed().as_millis() as u64;
+    let catalog_bytes: usize = tool_decls
+        .iter()
+        .map(|t| serde_json::to_string(t).map(|s| s.len()).unwrap_or(0))
+        .sum();
+    tracing::debug!(
+        target: "agent::turn_timing",
+        conversation_id = %cid_for_log,
+        catalog_ms,
+        tool_count = tool_decls.len(),
+        catalog_bytes,
+        "tool catalog assembled"
+    );
 
     // Phase-8a: dispatch consults `config_tool_access` for every
     // call, so a tool the operator has restricted to (say)
@@ -1570,7 +1937,7 @@ async fn run_tool_capable_turn(
         // 2026-04-29 — wire the inference client + model so
         // `delegate_task` and any future SubagentSpawn-capability
         // tools have a live child-LLM path for this turn.
-        .with_inference(inference.clone(), state.config.model_id.clone())
+        .with_inference(inference.clone(), resolved_model_id.clone())
         .with_events(state.events.clone())
         .with_research_supervisor_wake_opt(
             state.research_supervisor.as_ref().map(|s| s.wake.clone()),
@@ -1612,6 +1979,7 @@ async fn run_tool_capable_turn(
         .iter()
         .map(|t| t.tool_name.clone())
         .collect();
+    let prompt_started_at = std::time::Instant::now();
     let routing_prose = build_tool_routing_prose(&routing_builtins, &routing_plugins);
     let turn_context = build_turn_context_prose(
         chrono::Utc::now(),
@@ -1622,15 +1990,26 @@ async fn run_tool_capable_turn(
         caller_timezone,
         group_context.as_ref(),
     );
+    let composed_system_prompt = assemble_system_prompt(
+        &state.db,
+        Some(cid.as_str()),
+        &state.config.system_prompt,
+        &routing_prose,
+        &turn_context,
+    );
+    let prompt_ms = prompt_started_at.elapsed().as_millis() as u64;
+    tracing::debug!(
+        target: "agent::turn_timing",
+        conversation_id = %cid_for_log,
+        prompt_assembly_ms = prompt_ms,
+        system_prompt_chars = composed_system_prompt.chars().count(),
+        routing_prose_chars = routing_prose.chars().count(),
+        turn_context_chars = turn_context.chars().count(),
+        "system prompt assembled"
+    );
     let cfg = TurnConfig {
-        model: ModelId(state.config.model_id.clone()),
-        system_prompt: assemble_system_prompt(
-            &state.db,
-            Some(cid.as_str()),
-            &state.config.system_prompt,
-            &routing_prose,
-            &turn_context,
-        ),
+        model: ModelId(resolved_model_id.clone()),
+        system_prompt: composed_system_prompt,
         // Delta #6 — explicit 0.3 (was None → vLLM default 1.0).
         // Same rationale as the runner-tier path above.
         temperature: Some(0.3),
@@ -1642,23 +2021,42 @@ async fn run_tool_capable_turn(
         tools: tool_decls,
         event_log_hmac_key: state.event_log_hmac_key.as_ref().map(|k| (**k).clone()),
         phase_observer: Some(phase_observer),
-        // Read reasoning toggle from the Standard backend row;
-        // defaults to false when the row isn't configured. The
-        // runner forwards this into Qwen's chat template so a
-        // misconfigured reasoning bit doesn't leak `<think>` blocks
-        // into the operator's chat.
-        reasoning_enabled: execlaw_core::backends::BackendStore::new(&state.db)
-            .get(BackendPurpose::Standard)
-            .ok()
-            .flatten()
-            .map(|r| r.reasoning_enabled)
-            .unwrap_or(false),
+        // 2026-05-13 — sourced from `resolved.reasoning_enabled`
+        // (same DB row as endpoint + model id). Pre-rework this was
+        // a separate `BackendStore::get(...).ok().flatten()` read
+        // that silently swallowed DB errors AND opened a drift
+        // window with the model id field.
+        reasoning_enabled: resolved.reasoning_enabled,
         inbound_channel_origin: inbound_channel_origin.map(|s| s.to_owned()),
     };
+    let exec_started_at = std::time::Instant::now();
+    tracing::debug!(
+        target: "agent::turn_timing",
+        conversation_id = %cid_for_log,
+        outer_setup_ms = outer_started_at.elapsed().as_millis() as u64,
+        "TurnExecutor.run_turn starting (per-round timings follow on this target)"
+    );
+    // 2026-05-15 — encode any attachments into data URLs HERE, then
+    // pass to the executor's vision-aware run path. The executor
+    // itself can't reach `AttachmentStore` (runner-local can't
+    // depend on execlaw-core), so we resolve bytes → data URL
+    // server-side. The persisted `attachment_ids` still flow onto
+    // the `user_msg` event payload so history projection sees them.
+    let user_image_urls = encode_attachments_as_data_urls(&state.db, cid, &attachment_ids);
     let summary = exec
-        .run_turn(&state.db, cid, user_text, sender_principal_id, &cfg)
+        .run_turn_with_attachments(
+            &state.db,
+            cid,
+            user_text,
+            sender_principal_id,
+            &cfg,
+            attachment_ids,
+            user_image_urls,
+            applied_skill_names,
+        )
         .await
         .map_err(|e| format!("executor: {e}"))?;
+    let exec_ms = exec_started_at.elapsed().as_millis() as u64;
 
     let log = event_log(state);
     // TurnExecutor appends user_msg via `append` (not commit_turn) so
@@ -1674,6 +2072,16 @@ async fn run_tool_capable_turn(
         .find(|e| e.kind == EventKind::ModelTurn)
         .map(|e| e.seq.0)
         .unwrap_or(last);
+    tracing::debug!(
+        target: "agent::turn_timing",
+        conversation_id = %cid_for_log,
+        outer_total_ms = outer_started_at.elapsed().as_millis() as u64,
+        executor_run_ms = exec_ms,
+        tool_rounds = summary.tool_rounds,
+        events_committed = summary.events_written.len(),
+        assistant_text_chars = summary.assistant_text.chars().count(),
+        "turn exit (chats.rs handler)"
+    );
     Ok((user_seq, summary.assistant_text, assistant_seq))
 }
 
@@ -2011,6 +2419,10 @@ pub async fn dispatch_routine_turn(
                 None,
                 routine_tz_ref,
                 routine_group_ctx.clone(),
+                Vec::new(),
+                // Routines don't surface a skill picker — operators
+                // pick skills inline in the composer, not from cron.
+                Vec::new(),
             )
             .await
         }
@@ -2042,12 +2454,22 @@ pub async fn dispatch_routine_turn(
                 None,
                 routine_tz_ref,
                 routine_group_ctx.clone(),
+                Vec::new(),
+                Vec::new(),
             )
             .await;
             drop(cancel_guard);
             res
         }
-        None => run_stub_turn(state, &cid, prompt, sender.clone(), None),
+        None => run_stub_turn(
+            state,
+            &cid,
+            prompt,
+            sender.clone(),
+            None,
+            Vec::new(),
+            Vec::new(),
+        ),
     };
 
     let mapped = result.map(|(_user_seq, text, _assistant_seq)| RoutineDispatchOutcome {
@@ -2218,6 +2640,7 @@ pub async fn commit_inbound_user_msg_silently(
     sender_principal_id: &str,
     text: &str,
     inbound_channel_origin: &str,
+    attachment_ids: Vec<String>,
 ) -> Result<(), String> {
     let log = event_log(state);
     let base_seq = log.last_seq(cid).map_err(|e| format!("last_seq: {e}"))?;
@@ -2229,6 +2652,9 @@ pub async fn commit_inbound_user_msg_silently(
             text: text.to_owned(),
             sender_principal_id: Some(sender_principal_id.to_owned()),
             channel_origin: Some(inbound_channel_origin.to_owned()),
+            attachment_ids,
+            // Transports don't surface a skill picker today.
+            applied_skill_names: Vec::new(),
         },
         Some(sender_principal_id.to_owned()),
     )
@@ -2278,6 +2704,7 @@ pub async fn dispatch_external_turn(
     text: &str,
     inbound_channel_origin: Option<&str>,
     group_context: Option<GroupTurnContext>,
+    attachment_ids: Vec<String>,
 ) -> Result<(), String> {
     use execlaw_policy::trust::{TurnPolicyInput, evaluate_turn};
 
@@ -2358,6 +2785,13 @@ pub async fn dispatch_external_turn(
     let caller_timezone: Option<&str> = None;
     let result = match inference_for_turn {
         Some(inference) if has_plugin_tools => {
+            // 2026-05-15 — inbound transports (Signal etc.) reach
+            // here when plugin tools are registered, which is the
+            // common production shape. `attachment_ids` is the
+            // persisted-image list `route_inbound` produced from
+            // `<channel>.fetch_attachment`; `run_tool_capable_turn`
+            // resolves the data URLs server-side and feeds them
+            // into `TurnExecutor::run_turn_with_attachments`.
             run_tool_capable_turn(
                 state,
                 inference.clone(),
@@ -2369,6 +2803,9 @@ pub async fn dispatch_external_turn(
                 inbound_channel_origin,
                 caller_timezone,
                 group_context.clone(),
+                attachment_ids.clone(),
+                // Transports don't surface a skill picker.
+                Vec::new(),
             )
             .await
         }
@@ -2390,12 +2827,22 @@ pub async fn dispatch_external_turn(
                 inbound_channel_origin,
                 caller_timezone,
                 group_context.clone(),
+                attachment_ids.clone(),
+                Vec::new(),
             )
             .await;
             drop(cancel_guard);
             res
         }
-        None => run_stub_turn(state, cid, text, sender.clone(), inbound_channel_origin),
+        None => run_stub_turn(
+            state,
+            cid,
+            text,
+            sender.clone(),
+            inbound_channel_origin,
+            attachment_ids.clone(),
+            Vec::new(),
+        ),
     };
 
     match &result {
@@ -2820,6 +3267,9 @@ pub async fn dispatch_clarification_turn(
                 None,
                 caller_timezone,
                 synth_group_ctx.clone(),
+                Vec::new(),
+                // Orchestrator-synthesized turn — no operator skill picker.
+                Vec::new(),
             )
             .await
         }
@@ -2841,12 +3291,22 @@ pub async fn dispatch_clarification_turn(
                 None,
                 caller_timezone,
                 synth_group_ctx.clone(),
+                Vec::new(),
+                Vec::new(),
             )
             .await;
             drop(cancel_guard);
             res
         }
-        None => run_stub_turn(state, cid, &prompt, sender.clone(), None),
+        None => run_stub_turn(
+            state,
+            cid,
+            &prompt,
+            sender.clone(),
+            None,
+            Vec::new(),
+            Vec::new(),
+        ),
     };
 
     // 2026-05-04 — broadcast the agent's reply on the WS bus so the
@@ -3543,15 +4003,53 @@ pub(crate) fn build_tool_routing_prose(
              `https://mcp.atlassian.com/v1/mcp/authv2`, auth via API token from \
              id.atlassian.com.",
         ),
+        (
+            // 2026-05-15 — added because the routing prose previously
+            // had no chart entry, and `chart.render` was bucketed as
+            // a "plugin-prefixed" tool with the generic
+            // "read its description" prose. Result: model didn't
+            // recognise chart-rendering as a workflow with a fetch
+            // step, defaulted to the "no tool helps, answer from
+            // own knowledge" escape hatch, and hallucinated stock
+            // prices. Top-level entry tells the model the chain
+            // BEFORE it scans individual descriptions.
+            "chart",
+            "* `chart.render` (built-in) — for ANY visualisation request, ALWAYS fetch real \
+             data via the matching data-source tool FIRST, then pipe the values into \
+             `chart.render`. Examples: stocks/ETFs/indices/crypto/FX → \
+             `yahoo_finance.historical_candles` first; weather → `open_meteo.forecast` / \
+             `.historical` first; anything else with an API → `web_fetch` first. NEVER \
+             invent data points to chart — if you cannot fetch them, say so instead of \
+             fabricating. After the chart renders it shows inline; your follow-up reply \
+             should be one short line of context, NOT a recap of the data.",
+        ),
     ];
+
+    // 2026-05-15 — built-in tool namespaces that look plugin-like
+    // (have a `.` in the name) but aren't actually plugin-supplied.
+    // Catch these BEFORE the plugin-namespace bucketing so they don't
+    // get the misleading "comes from the X plugin" prose. The
+    // matching `routing_lines` entry above carries the right guidance.
+    const BUILTIN_NAMESPACES: &[&str] = &["chart"];
 
     // Bucket every tool by its family prefix.
     let mut present: BTreeSet<&str> = BTreeSet::new();
     let mut plugin_namespaces: BTreeSet<String> = BTreeSet::new();
     for name in builtin_names.iter().chain(plugin_names.iter()) {
         if let Some(dot) = name.find('.') {
+            let ns = &name[..dot];
+            // Built-in dotted names route through the explicit
+            // `routing_lines` entry (e.g. "chart"). Look up the
+            // 'static str so we can insert into `present` (which
+            // holds &'static str matching the routing_lines keys),
+            // and skip the plugin-namespace bucket below so we
+            // don't double-emit prose.
+            if let Some(builtin_ns) = BUILTIN_NAMESPACES.iter().find(|b| **b == ns) {
+                present.insert(*builtin_ns);
+                continue;
+            }
             // `calendar.list_events` → namespace `calendar`.
-            plugin_namespaces.insert(name[..dot].to_owned());
+            plugin_namespaces.insert(ns.to_owned());
             continue;
         }
         let prefix = name.split('_').next().unwrap_or(name);
@@ -3619,8 +4117,12 @@ pub(crate) fn build_tool_routing_prose(
         out.push('\n');
     }
     out.push_str(
-        "\nWhen multiple families could apply, prefer the most specific one. If no tool helps, \
-         answer from your own knowledge.",
+        "\nWhen multiple families could apply, prefer the most specific one. If no tool helps \
+         AND the question is general knowledge (definitions, history, how-things-work, your own \
+         opinion), answer from your own knowledge. If no tool helps AND the question needs LIVE \
+         or DATED data (current prices, today's weather, breaking news, the operator's calendar, \
+         anything that may have changed since training), say you cannot fetch it — never \
+         invent values.",
     );
     out
 }
@@ -3715,13 +4217,18 @@ pub async fn list_messages(
                 || e.actor.as_deref() != Some(SYSTEM_ORCHESTRATOR_ACTOR)
         })
         .take(limit as usize)
-        .map(|e| MessageView {
-            seq: e.seq.0,
-            kind: e.kind.as_str().to_owned(),
-            text: extract_text(&e),
-            actor: e.actor.clone(),
-            committed_at: e.committed_at,
-            channel_origin: extract_channel_origin(&e),
+        .map(|e| {
+            let attachment_ids = extract_attachment_ids(&e);
+            MessageView {
+                seq: e.seq.0,
+                kind: e.kind.as_str().to_owned(),
+                text: extract_text(&e),
+                actor: e.actor.clone(),
+                committed_at: e.committed_at,
+                channel_origin: extract_channel_origin(&e),
+                attachments: hydrate_message_attachments(&state.db, &cid, &attachment_ids),
+                applied_skill_names: extract_applied_skill_names(&e),
+            }
         })
         .collect();
 
@@ -4031,9 +4538,11 @@ async fn run_incognito_send(
     use execlaw_inference_api::{ChatMessage, ChatRequest, Role};
     use futures::StreamExt;
 
-    let Some(inference) = state.inference.resolve(&state.db, BackendPurpose::Standard) else {
+    let Some(resolved) = state.inference.resolve(&state.db, BackendPurpose::Standard) else {
         return err_500("no inference backend configured for incognito chat");
     };
+    let inference = resolved.client.clone();
+    let resolved_model_id = resolved.model_id.clone();
 
     // Compose: static system prompt (no personality merge) +
     // prior client-supplied history + new user text.
@@ -4047,18 +4556,17 @@ async fn run_incognito_send(
     }
     messages.push(ChatMessage {
         role: Role::User,
-        content: Some(req.text.clone()),
+        content: Some(execlaw_inference_api::MessageContent::Text(
+            req.text.clone(),
+        )),
         tool_call_id: None,
         name: None,
         tool_calls: vec![],
     });
 
-    let reasoning_enabled = execlaw_core::backends::BackendStore::new(&state.db)
-        .get(BackendPurpose::Standard)
-        .ok()
-        .flatten()
-        .map(|r| r.reasoning_enabled)
-        .unwrap_or(false);
+    // 2026-05-13 — sourced from `resolved.reasoning_enabled` (same
+    // DB row as endpoint + model id); see `ResolvedInference`.
+    let reasoning_enabled = resolved.reasoning_enabled;
 
     // Phase events + cancel flag use the SAME plumbing as the
     // regular path so the SPA's typing indicator + stop button
@@ -4088,7 +4596,7 @@ async fn run_incognito_send(
     });
 
     let base_req = ChatRequest {
-        model: ModelId(state.config.model_id.clone()),
+        model: ModelId(resolved_model_id.clone()),
         messages,
         tools: None,
         stream: true,
@@ -4101,7 +4609,7 @@ async fn run_incognito_send(
         })),
     };
     let adapter = execlaw_model_adapter::adapter_for(execlaw_model_adapter::ModelFamily::detect(
-        &state.config.model_id,
+        &resolved_model_id,
     ));
     let chat_req =
         adapter.prepare_request(base_req, execlaw_model_adapter::OutputHint::Conversation);
@@ -4291,8 +4799,8 @@ pub async fn generate_title(
             .into_response();
     }
 
-    let inference = match state.inference.resolve(&state.db, BackendPurpose::Standard) {
-        Some(c) => c,
+    let resolved = match state.inference.resolve(&state.db, BackendPurpose::Standard) {
+        Some(r) => r,
         None => {
             return (
                 StatusCode::OK,
@@ -4305,6 +4813,8 @@ pub async fn generate_title(
                 .into_response();
         }
     };
+    let inference = resolved.client.clone();
+    let resolved_model_id = resolved.model_id.clone();
 
     let system = "You produce very short titles for chat conversations. \
                   Reply with ONLY the title — 3 to 5 words, no quotes, no \
@@ -4317,7 +4827,7 @@ pub async fn generate_title(
         format!("First message: {user_text}\n\nAssistant reply: {assistant_text}\n\nTitle:")
     };
     let req = ChatRequest {
-        model: ModelId(state.config.model_id.clone()),
+        model: ModelId(resolved_model_id.clone()),
         messages: vec![ChatMessage::system(system), ChatMessage::user(user_prompt)],
         tools: None,
         stream: false,
@@ -4329,7 +4839,7 @@ pub async fn generate_title(
         chat_template_kwargs: None,
     };
     let adapter = execlaw_model_adapter::adapter_for(execlaw_model_adapter::ModelFamily::detect(
-        &state.config.model_id,
+        &resolved_model_id,
     ));
     let adapted = match adapter
         .chat(&inference, req, execlaw_model_adapter::OutputHint::Plain)
@@ -4575,6 +5085,526 @@ fn err_500(msg: &str) -> axum::response::Response {
         .into_response()
 }
 
+/// Max accepted attachment bytes after base64 decode. ~20 MiB
+/// per image, comfortably above what the SPA pre-resizes to (~1 MiB
+/// on a 1024px JPEG) but small enough that an accidental "drop a
+/// 50 MB raw" doesn't blow up the request body parser or vLLM's
+/// per-image budget.
+const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+/// Allowed mime types for composer-attached images. Anything outside
+/// this set fails with `attachment_mime_unsupported` so a malformed
+/// SPA upload doesn't end up routed to a vision model that rejects
+/// the format. Order doesn't matter — substring `eq` lookup.
+const ALLOWED_ATTACHMENT_MIMES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+/// Decode + persist every `InlineAttachmentRequest` in the send
+/// payload, returning the new attachment ids in input order. The
+/// web-composer path (POST /api/chats/{id}/messages) calls this;
+/// the inbound transport-bridge path (Signal etc.) calls
+/// [`persist_inbound_attachment_bytes`] directly, which both share
+/// the [`write_attachment_blob`] core.
+///
+/// Errors translate to `ApiError`-shaped 4xx so the SPA can surface
+/// the specific failure (mime unsupported / data URL invalid / too
+/// large) inline next to the offending chip.
+fn persist_inline_attachments(
+    state: &AppState,
+    cid: &ConversationId,
+    requests: &[InlineAttachmentRequest],
+) -> Result<Vec<String>, crate::routes::ApiError> {
+    use base64::Engine;
+
+    let mut ids = Vec::with_capacity(requests.len());
+    for (idx, att) in requests.iter().enumerate() {
+        let mime = att.mime.trim().to_lowercase();
+        if !ALLOWED_ATTACHMENT_MIMES.contains(&mime.as_str()) {
+            return Err(crate::routes::ApiError {
+                status: StatusCode::BAD_REQUEST,
+                code: "attachment_mime_unsupported",
+                message: format!(
+                    "attachment #{idx}: mime '{}' is not supported (allowed: {})",
+                    att.mime,
+                    ALLOWED_ATTACHMENT_MIMES.join(", "),
+                ),
+            });
+        }
+        // Parse `data:<mime>;base64,<bytes>`. Tolerate optional
+        // parameters between the mime and `;base64,` (e.g.
+        // `data:image/png;name=foo;base64,...`) since some SPAs add
+        // them; we extract the comma-prefix and decode whatever
+        // follows.
+        let url = att.data_url.as_str();
+        let stripped = url
+            .strip_prefix("data:")
+            .ok_or_else(|| crate::routes::ApiError {
+                status: StatusCode::BAD_REQUEST,
+                code: "attachment_data_url_invalid",
+                message: format!("attachment #{idx}: data URL must start with 'data:'"),
+            })?;
+        let (meta, body) = stripped
+            .split_once(',')
+            .ok_or_else(|| crate::routes::ApiError {
+                status: StatusCode::BAD_REQUEST,
+                code: "attachment_data_url_invalid",
+                message: format!("attachment #{idx}: data URL has no comma separator"),
+            })?;
+        if !meta.contains("base64") {
+            return Err(crate::routes::ApiError {
+                status: StatusCode::BAD_REQUEST,
+                code: "attachment_data_url_invalid",
+                message: format!("attachment #{idx}: only base64 data URLs are accepted"),
+            });
+        }
+        let meta_mime = meta.split(';').next().unwrap_or("").trim().to_lowercase();
+        if !meta_mime.is_empty() && meta_mime != mime {
+            return Err(crate::routes::ApiError {
+                status: StatusCode::BAD_REQUEST,
+                code: "attachment_data_url_invalid",
+                message: format!(
+                    "attachment #{idx}: mime '{}' in data URL doesn't match declared '{}'",
+                    meta_mime, mime
+                ),
+            });
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(body.trim())
+            .map_err(|e| crate::routes::ApiError {
+                status: StatusCode::BAD_REQUEST,
+                code: "attachment_data_url_invalid",
+                message: format!("attachment #{idx}: base64 decode failed: {e}"),
+            })?;
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(crate::routes::ApiError {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                code: "attachment_too_large",
+                message: format!(
+                    "attachment #{idx} is {} bytes (max {})",
+                    bytes.len(),
+                    MAX_ATTACHMENT_BYTES
+                ),
+            });
+        }
+        let id = write_attachment_blob(state, cid, &mime, &bytes).map_err(|e| {
+            crate::routes::ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "attachment_write_failed",
+                message: format!("attachment #{idx}: {e}"),
+            }
+        })?;
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// Shared core for persisting an attachment's raw bytes. Writes
+/// `<data_dir>/blobs/<sha256>` content-addressed (identical bytes
+/// share one on-disk file) and inserts a `state_attachments` row
+/// scoped to the conversation, returning the fresh attachment id.
+///
+/// Called from both:
+///   * `persist_inline_attachments` — web composer's `+` flow, after
+///     decoding the data URL.
+///   * `persist_inbound_attachment_bytes` — transport-bridge flow
+///     (Signal etc.), after fetching the bytes via the plugin's
+///     `<channel>.fetch_attachment` tool.
+///
+/// Errors are returned as plain strings so callers can wrap them in
+/// the right error type for their surface (ApiError for the web
+/// path, tracing::warn-and-skip for the inbound path where a single
+/// bad attachment shouldn't fail the whole turn).
+fn write_attachment_blob(
+    state: &AppState,
+    cid: &ConversationId,
+    mime: &str,
+    bytes: &[u8],
+) -> Result<String, String> {
+    use execlaw_core::attachments::{AttachmentRow, AttachmentStore};
+    use execlaw_core::ids::AttachmentId;
+    use sha2::{Digest, Sha256};
+
+    let data_dir = state
+        .db_config
+        .path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let blobs_dir = data_dir.join("blobs");
+    std::fs::create_dir_all(&blobs_dir)
+        .map_err(|e| format!("create blobs dir {}: {e}", blobs_dir.display()))?;
+
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let sha = format!("{:x}", h.finalize());
+    let path = blobs_dir.join(&sha);
+    if !path.exists() {
+        std::fs::write(&path, bytes).map_err(|e| format!("write blob {}: {e}", path.display()))?;
+    }
+
+    let att_id = AttachmentId::new();
+    let row = AttachmentRow {
+        id: att_id.clone(),
+        conversation_id: cid.clone(),
+        mime_type: mime.to_owned(),
+        path: path.to_string_lossy().into_owned(),
+        sha256: sha,
+        received_at: chrono::Utc::now().timestamp(),
+    };
+    AttachmentStore::new(&state.db)
+        .insert(&row)
+        .map_err(|e| format!("insert state_attachments row: {e}"))?;
+    Ok(att_id.as_str().to_owned())
+}
+
+/// Inbound-side: fetch every image attachment on an inbound
+/// transport message via the originating channel's
+/// `<channel>.fetch_attachment` plugin tool, persist via the same
+/// content-addressed `state_attachments` path as the web composer,
+/// and return the fresh attachment ids in input order.
+///
+/// Non-image MIME types are skipped silently (vision models can
+/// only see images; PDFs / audio / video would need separate
+/// preprocessors). Oversize blobs are rejected per-attachment so a
+/// single bad file doesn't kill the rest of the turn. Plugin-tool
+/// failures (sidecar offline, network hiccup) are logged at WARN
+/// and the failing attachment is dropped — the agent still gets
+/// the surviving subset.
+pub async fn persist_inbound_attachments(
+    state: &AppState,
+    cid: &ConversationId,
+    channel: &str,
+    attachments: &[execlaw_script::InboundAttachmentMeta],
+) -> Vec<String> {
+    use base64::Engine;
+
+    if attachments.is_empty() {
+        return Vec::new();
+    }
+    let tool_name = format!("{channel}.fetch_attachment");
+    let mut ids = Vec::new();
+    for att in attachments {
+        // Filter to images upfront — every other media type just
+        // wastes a fetch + on-disk blob the LLM can't use.
+        let content_type = att.content_type.as_deref().unwrap_or("");
+        if !content_type.starts_with("image/") {
+            tracing::debug!(
+                target: "chats::inbound_attachments",
+                bridge_id = %att.bridge_id,
+                content_type,
+                "non-image inbound attachment skipped (vision-only for now)",
+            );
+            continue;
+        }
+        if let Some(size) = att.size_bytes {
+            if size as usize > MAX_ATTACHMENT_BYTES {
+                tracing::warn!(
+                    target: "chats::inbound_attachments",
+                    bridge_id = %att.bridge_id,
+                    size_bytes = size,
+                    max = MAX_ATTACHMENT_BYTES,
+                    "inbound attachment exceeds size cap; skipping",
+                );
+                continue;
+            }
+        }
+
+        // Call the plugin's fetch_attachment tool. Controller-trust
+        // call site (the inbound consumer is host-driven), no
+        // capability gate.
+        let args = serde_json::json!({"attachment_id": att.bridge_id});
+        let resp = match state
+            .plugin_host
+            .call_tool(&tool_name, args, &["*"], Some("Controller"))
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "chats::inbound_attachments",
+                    channel,
+                    bridge_id = %att.bridge_id,
+                    error = %e,
+                    "fetch_attachment tool failed; skipping",
+                );
+                continue;
+            }
+        };
+
+        // Parse the plugin's response shape:
+        //   { data_url: "data:<mime>;base64,...", mime_type, size_bytes }
+        let data_url = match resp.get("data_url").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    target: "chats::inbound_attachments",
+                    channel,
+                    bridge_id = %att.bridge_id,
+                    "fetch_attachment response missing data_url; skipping",
+                );
+                continue;
+            }
+        };
+        let reported_mime = resp
+            .get("mime_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or(content_type)
+            .to_lowercase();
+        // Same parse rules as the web composer's data-URL flow.
+        let Some(stripped) = data_url.strip_prefix("data:") else {
+            tracing::warn!(
+                target: "chats::inbound_attachments",
+                bridge_id = %att.bridge_id,
+                "fetch_attachment data_url missing 'data:' prefix; skipping",
+            );
+            continue;
+        };
+        let Some((meta, body)) = stripped.split_once(',') else {
+            tracing::warn!(
+                target: "chats::inbound_attachments",
+                bridge_id = %att.bridge_id,
+                "fetch_attachment data_url missing comma; skipping",
+            );
+            continue;
+        };
+        if !meta.contains("base64") {
+            tracing::warn!(
+                target: "chats::inbound_attachments",
+                bridge_id = %att.bridge_id,
+                "fetch_attachment data_url is not base64; skipping",
+            );
+            continue;
+        }
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(body.trim()) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    target: "chats::inbound_attachments",
+                    bridge_id = %att.bridge_id,
+                    error = %e,
+                    "fetch_attachment base64 decode failed; skipping",
+                );
+                continue;
+            }
+        };
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            tracing::warn!(
+                target: "chats::inbound_attachments",
+                bridge_id = %att.bridge_id,
+                size_bytes = bytes.len(),
+                max = MAX_ATTACHMENT_BYTES,
+                "inbound attachment exceeds size cap after decode; skipping",
+            );
+            continue;
+        }
+        // Final mime check — even if the plugin self-reported, only
+        // accept what the vision pipeline can ingest.
+        if !ALLOWED_ATTACHMENT_MIMES.contains(&reported_mime.as_str()) {
+            tracing::debug!(
+                target: "chats::inbound_attachments",
+                bridge_id = %att.bridge_id,
+                mime = %reported_mime,
+                "fetched attachment is not an accepted image type; skipping",
+            );
+            continue;
+        }
+        match write_attachment_blob(state, cid, &reported_mime, &bytes) {
+            Ok(id) => ids.push(id),
+            Err(e) => {
+                tracing::warn!(
+                    target: "chats::inbound_attachments",
+                    bridge_id = %att.bridge_id,
+                    error = %e,
+                    "persist inbound attachment failed; skipping",
+                );
+            }
+        }
+    }
+    ids
+}
+
+/// Load each attachment id from `state_attachments`, read the bytes,
+/// and emit a `data:<mime>;base64,<bytes>` URL. Ids missing from the
+/// store or pointing at another conversation are skipped silently so
+/// a half-broken row can't fail the turn; the agent sees the
+/// surviving subset rather than crashing the chat.
+///
+/// Shared between `run_real_turn` (non-runner path) and
+/// `run_runner_turn`. Used to build the OpenAI vision content array
+/// that gets sent to the inference backend for the current turn.
+fn encode_attachments_as_data_urls(
+    db: &execlaw_core::Database,
+    cid: &ConversationId,
+    attachment_ids: &[String],
+) -> Vec<String> {
+    use base64::Engine;
+    if attachment_ids.is_empty() {
+        return Vec::new();
+    }
+    let store = execlaw_core::attachments::AttachmentStore::new(db);
+    let mut out: Vec<String> = Vec::with_capacity(attachment_ids.len());
+    for id_str in attachment_ids {
+        let id = execlaw_core::ids::AttachmentId::from(id_str.as_str());
+        let Ok(Some(row)) = store.get(&id) else {
+            tracing::warn!(
+                target: "chats::encode_attachments",
+                attachment_id = %id_str,
+                "attachment row missing — image will not reach the model",
+            );
+            continue;
+        };
+        if row.conversation_id.as_str() != cid.as_str() {
+            tracing::warn!(
+                target: "chats::encode_attachments",
+                attachment_id = %id_str,
+                "attachment cross-conversation; refusing to include in LLM call",
+            );
+            continue;
+        }
+        match std::fs::read(&row.path) {
+            Ok(bytes) => {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                out.push(format!("data:{};base64,{}", row.mime_type, b64));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "chats::encode_attachments",
+                    attachment_id = %id_str,
+                    path = %row.path,
+                    error = %e,
+                    "attachment blob read failed — skipping",
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Resolve operator-picked skill names to a single prepended block
+/// that gets prefixed onto the user text before the model sees it.
+/// Returns the prepended block (empty `String` when no skills were
+/// picked) — caller concatenates it with the original text. Each
+/// skill renders as:
+///
+/// ```text
+/// <skill name="foo/bar">
+/// {body_md}
+/// </skill>
+///
+/// ```
+///
+/// XML-style tags because the model parses them cleanly and the SPA
+/// can regex-strip the same shape from the prepended `text` when
+/// rendering the original user message in the bubble.
+///
+/// Errors:
+///   * Unknown / archived skill → `(StatusCode::NOT_FOUND, "skill_not_found")`.
+///   * Sum of resolved body bytes exceeds [`MAX_PREPEND_SKILL_BYTES`]
+///     → `(StatusCode::PAYLOAD_TOO_LARGE, "skill_prepend_too_large")`.
+fn resolve_skill_prepend(
+    db: &execlaw_core::Database,
+    names: &[String],
+) -> Result<String, (StatusCode, &'static str, String)> {
+    if names.is_empty() {
+        return Ok(String::new());
+    }
+    let store = execlaw_skills::SkillStore::new(db.clone());
+    let mut blocks = String::new();
+    let mut total_bytes: usize = 0;
+    for name in names {
+        let view = store.view(name).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "skill_lookup_failed",
+                format!("skill '{name}' lookup failed: {e}"),
+            )
+        })?;
+        let Some(view) = view else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "skill_not_found",
+                format!("no skill named '{name}' (or it is archived)"),
+            ));
+        };
+        total_bytes = total_bytes.saturating_add(view.body_md.len());
+        if total_bytes > MAX_PREPEND_SKILL_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "skill_prepend_too_large",
+                format!(
+                    "selected skills exceed the {MAX_PREPEND_SKILL_BYTES}-byte prepend cap; \
+                     remove one or pick smaller skills"
+                ),
+            ));
+        }
+        blocks.push_str(&format!(
+            "<skill name=\"{name}\">\n{body}\n</skill>\n\n",
+            body = view.body_md.trim_end_matches('\n'),
+        ));
+    }
+    Ok(blocks)
+}
+
+/// Pull the attachment-ids list off a `user_msg` payload. Empty for
+/// other kinds and for legacy events that pre-date the field. Used
+/// by `list_messages` to surface image refs on the SPA bubble and by
+/// the chat-history hydration in `run_real_turn` to encode images as
+/// content parts when calling a vision-capable model.
+fn extract_attachment_ids(e: &EventRecord) -> Vec<String> {
+    match e.kind {
+        EventKind::UserMsg => e
+            .decode_payload::<UserMessagePayload>()
+            .ok()
+            .map(|p| p.attachment_ids)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Pull the `applied_skill_names` list off a `user_msg` payload.
+/// Empty for other kinds and for legacy events that pre-date the
+/// field. Surfaced on `MessageView` so the SPA can render an
+/// "applied: foo, bar" chip under the message bubble.
+fn extract_applied_skill_names(e: &EventRecord) -> Vec<String> {
+    match e.kind {
+        EventKind::UserMsg => e
+            .decode_payload::<UserMessagePayload>()
+            .ok()
+            .map(|p| p.applied_skill_names)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Resolve attachment ids → `MessageAttachmentView` rows. Hydrates
+/// mime types from `state_attachments`; ids that can't be looked up
+/// (deleted blob, cross-conversation probe attempt, DB hiccup) are
+/// silently dropped from the response so the SPA renders the
+/// best-effort subset rather than failing the whole list call.
+fn hydrate_message_attachments(
+    db: &execlaw_core::Database,
+    cid: &ConversationId,
+    ids: &[String],
+) -> Vec<MessageAttachmentView> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let store = execlaw_core::attachments::AttachmentStore::new(db);
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let att_id = execlaw_core::ids::AttachmentId::from(id.as_str());
+        match store.get(&att_id) {
+            Ok(Some(row)) if row.conversation_id.as_str() == cid.as_str() => {
+                out.push(MessageAttachmentView {
+                    id: id.clone(),
+                    mime: row.mime_type,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn extract_text(e: &EventRecord) -> Option<String> {
     match e.kind {
         EventKind::UserMsg => e
@@ -4591,6 +5621,36 @@ fn extract_text(e: &EventRecord) -> Option<String> {
                 e.decode_payload::<RealModelTurnPayload>()
                     .ok()
                     .map(|p| p.text)
+            }),
+        // 2026-05-15 — surface ToolUse + ToolResult payloads as JSON
+        // strings so the SPA's MessageStream can:
+        //   * dispatch tool_result events to the chat-component
+        //     registry (`detectChatComponent` parses this JSON
+        //     looking for `chat_component_kind: "<kind>"`); and
+        //   * fall back to a readable `renderToolFallback` for
+        //     unknown kinds (better than the empty-text view that
+        //     shipped before — was the bug behind "agent ran
+        //     chart.render but the chart never appeared").
+        //
+        // For ToolResult, prefer the inner Ok(...) value when
+        // success — that's the JSON the tool actually emitted (and
+        // what the chat-component dispatcher needs). Errors get
+        // wrapped in a small envelope so the SPA's fallback shows
+        // "tool failed: <reason>" rather than dumping the raw Result
+        // discriminant.
+        EventKind::ToolUse => e
+            .decode_payload::<ToolUsePayload>()
+            .ok()
+            .and_then(|p| serde_json::to_string(&p.args_json).ok()),
+        EventKind::ToolResult => e
+            .decode_payload::<ToolResultPayload>()
+            .ok()
+            .and_then(|p| match p.outcome {
+                Ok(value) => serde_json::to_string(&value).ok(),
+                Err(reason) => serde_json::to_string(&serde_json::json!({
+                    "error": reason,
+                }))
+                .ok(),
             }),
         _ => None,
     }
@@ -4635,6 +5695,25 @@ struct UserMessagePayload {
     /// deserialize as `None` and the SPA shows no icon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     channel_origin: Option<String>,
+    /// 2026-05-15 — IDs into `state_attachments` for image attachments
+    /// the operator added via the composer's `+` menu. Backward-
+    /// compatible default `Vec::new()` so prior events without the
+    /// field deserialize cleanly. When non-empty, the chat-history
+    /// projection (in `run_real_turn`) fetches each row, base64-
+    /// encodes the bytes, and emits the user turn as an OpenAI
+    /// vision content array.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attachment_ids: Vec<String>,
+    /// 2026-05-15 — names of skills the operator selected from the
+    /// composer's `+` menu for THIS turn. The skill bodies were
+    /// already resolved + prepended onto `text` server-side before
+    /// the model saw them; this field is purely metadata for the
+    /// SPA to render an "applied: foo, bar" chip on the message
+    /// bubble (and for forensics — an audit reader can see which
+    /// guidance shaped this turn). Backward-compatible default
+    /// `Vec::new()` so prior events without the field deserialize.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    applied_skill_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4931,6 +6010,396 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
+    // ---- skill-attachment (composer `+` menu, second item) --------
+    //
+    // The composer ships a per-message `skill_names: []` field on
+    // `SendMessageRequest`. The server resolves each name to the
+    // current stable/trial body, prepends `<skill name="...">` blocks
+    // onto the user text the model sees, and stamps the names on
+    // `UserMessagePayload.applied_skill_names` for SPA chip rendering
+    // + audit. These tests pin the contract end-to-end via the
+    // public HTTP surface.
+
+    /// Helper — seed a skill into the store so we can attach it.
+    fn seed_skill(state: &crate::state::AppState, name: &str, body: &str) {
+        use execlaw_skills::{NewSkill, NewSkillVersion, RegistrationKind, SkillStore, Strictness};
+        let store = SkillStore::new(state.db.clone());
+        store
+            .create(
+                NewSkill {
+                    name: name.into(),
+                    source: "test".into(),
+                    registration_kind: RegistrationKind::Authored,
+                    owning_plugin_id: None,
+                    initial_version: NewSkillVersion {
+                        description: format!("test skill {name}"),
+                        body_md: body.into(),
+                        frontmatter_json: "{}".into(),
+                        authored_by: "test".into(),
+                        promotion_notes: None,
+                    },
+                    resources: vec![],
+                },
+                Strictness::Strict,
+                0,
+            )
+            .expect("seed skill");
+    }
+
+    async fn send_with_skills(
+        app: axum::Router,
+        text: &str,
+        skill_names: &[&str],
+    ) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "text": text,
+            "skill_names": skill_names,
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/chats/conv1/messages")
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let value: serde_json::Value = json_body(resp.into_body()).await;
+        (status, value)
+    }
+
+    /// Read the `user_msg` payload back out of the event log so we
+    /// can inspect what was actually persisted (the prepended text
+    /// AND the applied_skill_names metadata). Going through the log
+    /// rather than the response body proves the round-trip lands on
+    /// disk + survives a future history replay.
+    fn read_user_msg_payload(state: &crate::state::AppState, cid: &str) -> UserMessagePayload {
+        let log = event_log(state);
+        let events = log
+            .replay_since(&ConversationId::from(cid), EventSeq(0))
+            .expect("replay");
+        let user_event = events
+            .iter()
+            .find(|e| e.kind == EventKind::UserMsg)
+            .expect("user_msg event");
+        user_event
+            .decode_payload::<UserMessagePayload>()
+            .expect("decode user_msg payload")
+    }
+
+    #[tokio::test]
+    async fn send_message_with_one_skill_prepends_body_and_records_name() {
+        let state = test_app_state();
+        seed_skill(
+            &state,
+            "test/foo",
+            "When asked, always answer in haiku form.",
+        );
+        let app = crate::routes::build_router(state.clone());
+        let (status, body) = send_with_skills(app, "tell me a story", &["test/foo"]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["user_msg_seq"].as_i64().unwrap(), 1);
+
+        let payload = read_user_msg_payload(&state, "conv1");
+        assert_eq!(payload.applied_skill_names, vec!["test/foo".to_string()]);
+        assert!(
+            payload.text.starts_with("<skill name=\"test/foo\">\n"),
+            "user_msg.text must start with the skill block; got: {}",
+            payload.text
+        );
+        assert!(
+            payload
+                .text
+                .contains("When asked, always answer in haiku form."),
+            "skill body must appear in the prepended text; got: {}",
+            payload.text
+        );
+        assert!(
+            payload.text.ends_with("tell me a story"),
+            "original user text must remain at the tail; got: {}",
+            payload.text
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_with_multiple_skills_preserves_picker_order() {
+        let state = test_app_state();
+        seed_skill(&state, "test/alpha", "alpha guidance");
+        seed_skill(&state, "test/beta", "beta guidance");
+        let app = crate::routes::build_router(state.clone());
+        let (status, _) = send_with_skills(app, "go", &["test/beta", "test/alpha"]).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let payload = read_user_msg_payload(&state, "conv1");
+        assert_eq!(
+            payload.applied_skill_names,
+            vec!["test/beta".to_string(), "test/alpha".to_string()]
+        );
+        let beta_pos = payload.text.find("beta guidance").unwrap();
+        let alpha_pos = payload.text.find("alpha guidance").unwrap();
+        assert!(
+            beta_pos < alpha_pos,
+            "beta block must precede alpha when picker order was [beta, alpha]; \
+             got text={}",
+            payload.text
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_unknown_skill_name_returns_404() {
+        let state = test_app_state();
+        let app = crate::routes::build_router(state);
+        let (status, body) = send_with_skills(app, "go", &["test/does-not-exist"]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "skill_not_found");
+    }
+
+    #[tokio::test]
+    async fn send_message_archived_skill_returns_404() {
+        // SkillStore::view treats archived as not-found from the
+        // agent's POV; the composer picker can only surface
+        // non-archived rows in its dropdown, so an archived name
+        // arriving here means a stale UI — same 404 as a typo.
+        use execlaw_skills::SkillStore;
+        let state = test_app_state();
+        seed_skill(&state, "test/stale", "old guidance");
+        SkillStore::new(state.db.clone())
+            .archive("test/stale", 0)
+            .expect("archive");
+        let app = crate::routes::build_router(state);
+        let (status, body) = send_with_skills(app, "go", &["test/stale"]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "skill_not_found");
+    }
+
+    #[tokio::test]
+    async fn send_message_skill_prepend_over_cap_returns_413() {
+        let state = test_app_state();
+        // Each skill body is half the cap — two of them push us
+        // just over.
+        let big_body = "x".repeat(MAX_PREPEND_SKILL_BYTES / 2 + 1024);
+        seed_skill(&state, "test/big1", &big_body);
+        seed_skill(&state, "test/big2", &big_body);
+        let app = crate::routes::build_router(state);
+        let (status, body) = send_with_skills(app, "go", &["test/big1", "test/big2"]).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body["error"]["code"], "skill_prepend_too_large");
+    }
+
+    /// Regression: a send WITHOUT `skill_names` must continue to
+    /// behave exactly as before — empty applied_skill_names, no
+    /// prepend block, original text only. Catches accidental
+    /// always-on prepend.
+    #[tokio::test]
+    async fn send_message_without_skills_leaves_text_unchanged() {
+        let state = test_app_state();
+        let app = crate::routes::build_router(state.clone());
+        let (status, _) = send(app, "plain hello").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let payload = read_user_msg_payload(&state, "conv1");
+        assert_eq!(payload.text, "plain hello");
+        assert!(payload.applied_skill_names.is_empty());
+    }
+
+    /// `MessageView` (returned from `GET /api/chats/:id/messages`)
+    /// surfaces `applied_skill_names` so the SPA can render the
+    /// "applied: foo" chip on the bubble. Pin the wire shape end-
+    /// to-end so the field doesn't silently disappear.
+    #[tokio::test]
+    async fn list_messages_surfaces_applied_skill_names_for_user_msg() {
+        let state = test_app_state();
+        seed_skill(&state, "test/foo", "guidance body");
+        let app = crate::routes::build_router(state);
+        let (status, _) = send_with_skills(app.clone(), "hi", &["test/foo"]).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/chats/conv1/messages")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = json_body(resp.into_body()).await;
+        let messages = body["messages"].as_array().unwrap();
+        let user = messages
+            .iter()
+            .find(|m| m["kind"] == "user_msg")
+            .expect("user_msg in list");
+        assert_eq!(
+            user["applied_skill_names"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["test/foo"],
+        );
+    }
+
+    /// Regression for the "skill picker shows up on every other turn"
+    /// fear: a user_msg sent WITHOUT skills must NOT include
+    /// `applied_skill_names` in its serialized MessageView (the field
+    /// is `skip_serializing_if = "Vec::is_empty"`). Keeps the wire
+    /// payload tidy and lets the SPA treat the missing field as
+    /// "no skills" without an explicit `?? []` shim per call site.
+    #[tokio::test]
+    async fn list_messages_omits_applied_skill_names_when_empty() {
+        let state = test_app_state();
+        let app = crate::routes::build_router(state);
+        let (status, _) = send(app.clone(), "no skills here").await;
+        assert_eq!(status, StatusCode::OK);
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/chats/conv1/messages")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = json_body(resp.into_body()).await;
+        let user = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["kind"] == "user_msg")
+            .unwrap();
+        assert!(
+            user.get("applied_skill_names").is_none(),
+            "applied_skill_names must be omitted when empty; got: {user}"
+        );
+    }
+
+    /// Regression for the "skill body changes between turns" worry:
+    /// the prepended text lives in `UserMessagePayload.text`, NOT
+    /// in a re-resolved-on-replay shape. So if an admin edits the
+    /// skill body after a turn already used it, replay still shows
+    /// the original body. Pin that invariant.
+    #[tokio::test]
+    async fn skill_prepend_is_frozen_at_send_time_not_re_resolved() {
+        use execlaw_skills::SkillStore;
+        let state = test_app_state();
+        seed_skill(&state, "test/foo", "ORIGINAL body");
+        let app = crate::routes::build_router(state.clone());
+        let (status, _) = send_with_skills(app, "go", &["test/foo"]).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Mutate the skill body AFTER the turn was sent. Replay
+        // should still show the original body in the log.
+        SkillStore::new(state.db.clone())
+            .add_version(
+                "test/foo",
+                execlaw_skills::NewSkillVersion {
+                    description: "test skill test/foo".into(),
+                    body_md: "REVISED body".into(),
+                    frontmatter_json: "{}".into(),
+                    authored_by: "test".into(),
+                    promotion_notes: None,
+                },
+                execlaw_skills::Strictness::Strict,
+                1,
+            )
+            .expect("add new version");
+
+        let payload = read_user_msg_payload(&state, "conv1");
+        assert!(
+            payload.text.contains("ORIGINAL body"),
+            "stored text must keep the body that was live at send time; got: {}",
+            payload.text
+        );
+        assert!(
+            !payload.text.contains("REVISED body"),
+            "the new body must NOT leak into the historical event; got: {}",
+            payload.text
+        );
+    }
+
+    /// Regression for the "agent ran chart.render but the chart
+    /// never appeared" bug. `extract_text` only handled UserMsg +
+    /// ModelTurn before 2026-05-15; ToolResult fell through to
+    /// `None`. The SPA's MessageStream then had no JSON to scan
+    /// for `chat_component_kind`, so `detectChatComponent` always
+    /// returned null and the chart-renderer was never dispatched.
+    /// The agent's text reply ("Here's the chart...") rendered fine
+    /// but the chart itself was missing.
+    ///
+    /// This test pins both sides:
+    ///   * A successful tool_result event's `extract_text` returns
+    ///     the inner Ok-value JSON verbatim, including any
+    ///     `chat_component_kind` marker the tool emitted.
+    ///   * A failed tool_result returns a small error envelope so
+    ///     the SPA's renderToolFallback shows something useful
+    ///     instead of an empty bubble.
+    ///   * tool_use events return their args_json (lower-priority
+    ///     surface but useful for the planner-trace view).
+    #[test]
+    fn extract_text_surfaces_tool_result_json_for_spa_dispatcher() {
+        use execlaw_core::events::{ToolResultPayload, ToolUsePayload};
+        use execlaw_core::ids::{ConversationId, EventSeq};
+        // Success: chart.render's typical output. The SPA's
+        // detectChatComponent expects chat_component_kind in the
+        // JSON; the unit-level assertion is just that the field
+        // round-trips.
+        let success = EventRecord::new(
+            ConversationId::from("c-extract-test"),
+            EventSeq(1),
+            EventKind::ToolResult,
+            &ToolResultPayload {
+                ordinal: 1,
+                outcome: Ok(serde_json::json!({
+                    "attachment_id": "art_abc",
+                    "svg": "<svg>...</svg>",
+                    "chat_component_kind": "chart",
+                })),
+            },
+            Some("agent".into()),
+        )
+        .unwrap();
+        let text = extract_text(&success).expect("ToolResult must surface text");
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("must be JSON");
+        assert_eq!(
+            parsed["chat_component_kind"], "chart",
+            "chat_component_kind MUST round-trip through extract_text — the SPA's \
+             dispatcher reads it to pick a renderer (this is what was broken)",
+        );
+        assert_eq!(parsed["attachment_id"], "art_abc");
+
+        // Failure path: small error envelope, no panic.
+        let failure = EventRecord::new(
+            ConversationId::from("c-extract-test"),
+            EventSeq(2),
+            EventKind::ToolResult,
+            &ToolResultPayload {
+                ordinal: 2,
+                outcome: Err("vega-lite spec invalid".into()),
+            },
+            Some("agent".into()),
+        )
+        .unwrap();
+        let text = extract_text(&failure).expect("failed ToolResult still surfaces text");
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["error"], "vega-lite spec invalid");
+
+        // ToolUse: args_json is what the planner-trace view wants.
+        let usage = EventRecord::new(
+            ConversationId::from("c-extract-test"),
+            EventSeq(3),
+            EventKind::ToolUse,
+            &ToolUsePayload {
+                ordinal: 1,
+                tool_name: "chart.render".into(),
+                args_json: serde_json::json!({"title": "Test"}),
+            },
+            Some("agent".into()),
+        )
+        .unwrap();
+        let text = extract_text(&usage).expect("ToolUse must surface text");
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["title"], "Test");
+    }
+
     #[tokio::test]
     async fn list_messages_returns_committed_events() {
         let app = build_app();
@@ -4979,6 +6448,8 @@ mod tests {
                 text: "[SYSTEM ORCHESTRATOR NOTICE] please ask the user X".into(),
                 sender_principal_id: Some(SYSTEM_ORCHESTRATOR_ACTOR.into()),
                 channel_origin: None,
+                attachment_ids: Vec::new(),
+                applied_skill_names: Vec::new(),
             },
             Some(SYSTEM_ORCHESTRATOR_ACTOR.into()),
         )
@@ -5191,6 +6662,60 @@ mod tests {
         // forgetting capabilities — emit nothing.
         let prose = super::build_tool_routing_prose(&[], &[]);
         assert!(prose.is_empty());
+    }
+
+    /// Regression for the 2026-05-15 "agent hallucinated AAPL prices
+    /// instead of calling chart.render + yahoo_finance.historical_candles"
+    /// thread. Three asserts pin the fix:
+    ///   * `chart.render` (built-in dotted name) routes through the
+    ///     dedicated routing-line, NOT the generic "comes from the
+    ///     `chart` plugin" plugin-namespace line.
+    ///   * The chart entry tells the model to fetch real data first
+    ///     and forbids inventing data points.
+    ///   * The closing fallback distinguishes general knowledge (OK
+    ///     to answer from training) from live/dated data (must say
+    ///     "can't fetch" rather than hallucinate).
+    #[test]
+    fn build_tool_routing_prose_chart_render_routes_via_chart_entry_not_plugin_fallback() {
+        let prose = super::build_tool_routing_prose(
+            &["chart.render".into(), "web_search".into()],
+            &["yahoo_finance.historical_candles".into()],
+        );
+        // Dedicated chart guidance is present.
+        assert!(
+            prose.contains("`chart.render` (built-in)"),
+            "chart entry must be the dedicated built-in line, got: {prose}",
+        );
+        assert!(
+            prose.contains("ALWAYS fetch real data"),
+            "chart entry must spell out the fetch-first chain, got: {prose}",
+        );
+        assert!(
+            prose.contains("NEVER invent data"),
+            "chart entry must explicitly forbid hallucinating data points, got: {prose}",
+        );
+        // Plugin-namespace fallback is NOT used for chart (it IS used
+        // for the real plugin yahoo_finance — that's fine, that one's
+        // a plugin).
+        assert!(
+            !prose.contains("`chart.` come from"),
+            "chart.render is a built-in; the plugin-namespace 'comes from the chart plugin' \
+             prose must be skipped (was the source of the misdirection that caused the model \
+             to ignore chart.render). Got: {prose}",
+        );
+        assert!(
+            prose.contains("`yahoo_finance.`"),
+            "real plugin namespaces still get the generic 'comes from the X plugin' line",
+        );
+        // Closing fallback distinguishes knowledge from live data.
+        assert!(
+            prose.contains("LIVE or DATED data"),
+            "closing fallback must call out live/dated data as a no-fabricate case, got: {prose}",
+        );
+        assert!(
+            prose.contains("never invent values"),
+            "closing fallback must explicitly forbid invented values for live data, got: {prose}",
+        );
     }
 
     #[test]

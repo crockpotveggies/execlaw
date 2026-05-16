@@ -338,10 +338,6 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let want_json = std::env::var("EXECLAW_LOG_FORMAT")
         .map(|v| v.eq_ignore_ascii_case("json"))
         .unwrap_or(false);
-    let want_file = std::env::var("EXECLAW_NO_FILE_LOG")
-        .map(|v| !matches!(v.as_str(), "1" | "true" | "yes"))
-        .unwrap_or(true);
-
     // Stdout layer.
     let stdout_layer = if want_json {
         tracing_subscriber::fmt::layer()
@@ -355,25 +351,23 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     };
 
     // File layer — daily-rotated JSONL.
-    let (file_layer, guard) = if want_file {
-        let log_dir = std::env::var("EXECLAW_LOG_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| default_data_dir().join("logs"));
-        if let Err(e) = std::fs::create_dir_all(&log_dir) {
-            eprintln!("execlaw: failed to create log dir {log_dir:?}: {e}");
-            (None, None)
-        } else {
-            let file_appender = tracing_appender::rolling::daily(&log_dir, "execlaw.jsonl");
-            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-            let layer = tracing_subscriber::fmt::layer()
-                .json()
-                .with_writer(non_blocking)
-                .with_ansi(false)
-                .boxed();
-            (Some(layer), Some(guard))
+    let (file_layer, guard) = match resolve_log_dir() {
+        Some(log_dir) => {
+            if let Err(e) = std::fs::create_dir_all(&log_dir) {
+                eprintln!("execlaw: failed to create log dir {log_dir:?}: {e}");
+                (None, None)
+            } else {
+                let file_appender = tracing_appender::rolling::daily(&log_dir, "execlaw.jsonl");
+                let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+                let layer = tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(non_blocking)
+                    .with_ansi(false)
+                    .boxed();
+                (Some(layer), Some(guard))
+            }
         }
-    } else {
-        (None, None)
+        None => (None, None),
     };
 
     let registry = tracing_subscriber::registry()
@@ -385,6 +379,24 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     };
 
     guard
+}
+
+/// Returns the directory the tracing file appender writes
+/// `execlaw.jsonl.<DATE>` files into, or `None` if the operator has
+/// disabled file logging (`EXECLAW_NO_FILE_LOG=1`). Same resolution
+/// rules as `init_tracing` so both sides agree on which dir the log
+/// viewer reads from.
+pub(crate) fn resolve_log_dir() -> Option<PathBuf> {
+    let want_file = std::env::var("EXECLAW_NO_FILE_LOG")
+        .map(|v| !matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(true);
+    if !want_file {
+        return None;
+    }
+    let dir = std::env::var("EXECLAW_LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| default_data_dir().join("logs"));
+    Some(dir)
 }
 
 fn default_data_dir() -> PathBuf {
@@ -407,6 +419,20 @@ fn default_db_path() -> PathBuf {
 }
 
 pub(crate) fn open_db(db_path: &Path, no_encrypt: bool) -> anyhow::Result<execlaw_core::Database> {
+    let (db, _cfg) = open_db_with_config(db_path, no_encrypt)?;
+    Ok(db)
+}
+
+/// Open the DB and ALSO return the `DbConfig` used to open it.
+/// Production callers that need to do file-level lifecycle ops on
+/// the DB (factory reset — close the connection, delete the file,
+/// re-open) stash the config in `AppState::db_config` so they can
+/// re-open at the same path with the same encryption posture
+/// without re-querying the OS keyring.
+pub(crate) fn open_db_with_config(
+    db_path: &Path,
+    no_encrypt: bool,
+) -> anyhow::Result<(execlaw_core::Database, execlaw_core::DbConfig)> {
     use execlaw_core::db::SqlCipherKey;
 
     let key = if no_encrypt {
@@ -420,7 +446,8 @@ pub(crate) fn open_db(db_path: &Path, no_encrypt: bool) -> anyhow::Result<execla
         path: db_path.to_path_buf(),
         key,
     };
-    Ok(execlaw_core::Database::open(&cfg)?)
+    let db = execlaw_core::Database::open(&cfg)?;
+    Ok((db, cfg))
 }
 
 /// Build the runner image when it's missing OR older than the
@@ -1196,7 +1223,7 @@ fn resolve_bind(cli: Option<String>, db: Option<String>) -> (String, &'static st
 }
 
 async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> anyhow::Result<()> {
-    let db = open_db(&db_path, no_encrypt)?;
+    let (db, db_config) = open_db_with_config(&db_path, no_encrypt)?;
     execlaw_core::MigrationRunner::new(&db).apply_all()?;
 
     // Bind address resolution (precedence: CLI flag > DB > default).
@@ -1245,6 +1272,7 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
 
     let config = std::sync::Arc::new(execlaw_server::ServerConfig {
         bind_addr: bind.parse()?,
+        log_dir: resolve_log_dir(),
         ..Default::default()
     });
 
@@ -1404,7 +1432,45 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
             }
         };
 
-    let backend_supervisor = docker_ctrl.as_ref().map(|ctrl| {
+    // Phase 14.G (Apple Silicon plan) — the backend supervisor needs
+    // a controller that can dispatch to either Docker (vLLM, Whisper,
+    // Kokoro — every existing managed preset) OR a native subprocess
+    // (Ollama on Apple Silicon, where Metal has no container
+    // passthrough). When Docker is reachable, we wrap both behind
+    // `MultiplexedServiceController` so the supervisor's existing
+    // `Arc<dyn ServiceController>` slot keeps working unchanged.
+    // When Docker is unreachable but we're on a Mac (or any host with
+    // Ollama installed), we still expose the native path so the
+    // wizard's Apple preset can spawn — Docker rows on the same host
+    // will surface a clear "BollardServiceController cannot spawn..."
+    // error rather than silently disappearing.
+    let native_ctrl: std::sync::Arc<dyn execlaw_container_manager::ServiceController> =
+        std::sync::Arc::new(execlaw_container_manager::NativeServiceController::new());
+    let backend_ctrl: Option<std::sync::Arc<dyn execlaw_container_manager::ServiceController>> =
+        match &docker_ctrl {
+            Some(d) => Some(std::sync::Arc::new(
+                execlaw_container_manager::MultiplexedServiceController::new(
+                    d.clone(),
+                    native_ctrl.clone(),
+                ),
+            )),
+            None => {
+                // Native-only path. Useful on Macs without Docker Desktop
+                // installed — the operator can still configure the
+                // Apple-Silicon Ollama preset and the supervisor will
+                // spawn it. Sidecar supervisor (signal-cli etc.) stays
+                // gated on `docker_ctrl` below so it correctly reports
+                // "Docker unreachable" without affecting the inference
+                // path.
+                tracing::info!(
+                    "backend supervisor falling back to native-only controller — Docker is \
+                 unreachable, but managed-mode Apple-Silicon Ollama presets will still spawn"
+                );
+                Some(native_ctrl.clone())
+            }
+        };
+
+    let backend_supervisor = backend_ctrl.as_ref().map(|ctrl| {
         // Resolve the host's primary HF cache directory.
         // Operator can override with EXECLAW_HF_CACHE; default
         // is `~/.execlaw/hf-cache/`. Created on demand so a
@@ -1628,6 +1694,18 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                 icon: sms_socket_icon,
             },
         );
+        const DISCORD_MANIFEST: &str = include_str!("../../../plugins/discord/plugin.toml");
+        let discord_icon = execlaw_plugin_sdk::manifest::PluginManifest::parse(DISCORD_MANIFEST)
+            .ok()
+            .and_then(|m| m.transport.and_then(|t| t.icon))
+            .unwrap_or_else(|| "discord".to_owned());
+        reg.register(
+            "discord",
+            execlaw_server::transport_registry::ChannelInfo {
+                plugin_id: "discord".into(),
+                icon: discord_icon,
+            },
+        );
         tracing::info!(channels = reg.len(), "host-transport registry populated");
         reg
     };
@@ -1636,7 +1714,6 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         db.clone(),
         inference.clone(),
         research_workspace.clone(),
-        config.model_id.clone(),
         events.clone(),
     )
     .with_host_transports(Some(host_transports.clone()))
@@ -1647,12 +1724,16 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     // contended; the worker gates internally on
     // `config_skills.auto_capture_enabled` (default OFF) so an
     // operator who hasn't opted in never burns inference cycles.
+    //
+    // 2026-05-13 — no model_id parameter: the worker's
+    // `InferenceSummarizer` reads `resolved.model_id` from the
+    // same DB row that supplied the endpoint, so caching a model
+    // string at construction time is no longer a drift source.
     let (skill_capture_sink, _skill_capture_handle) =
         execlaw_server::skill_capture_runtime::spawn_capture_worker(
             db.clone(),
             skill_store.clone(),
             inference.clone(),
-            execlaw_inference_api::ModelId(config.model_id.clone()),
         );
     // Phase D.3 — reuse-update worker. Same shape; gates on
     // `config_skills.reuse_update_enabled` (default OFF).
@@ -1661,11 +1742,15 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
             db.clone(),
             skill_store.clone(),
             inference.clone(),
-            execlaw_inference_api::ModelId(config.model_id.clone()),
         );
 
     let state = execlaw_server::AppState {
         db: db.clone(),
+        // Stash the exact config we just opened with so the
+        // factory-reset endpoint can close-and-rebuild at the same
+        // path with the same encryption posture. See
+        // `crates/core/src/db.rs::Database::rebuild_to_empty`.
+        db_config: std::sync::Arc::new(db_config),
         config: config.clone(),
         signer,
         refresh_store,
@@ -1927,7 +2012,6 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         let prewarm_launcher = launcher.clone();
         let prewarm_db = db.clone();
         let prewarm_inference = state.inference.clone();
-        let prewarm_model = state.config.model_id.clone();
         tokio::spawn(async move {
             // Wait briefly so the WS endpoint is up before the
             // runner phones home. (Axum's `serve` task hasn't
@@ -1938,7 +2022,7 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                 &prewarm_db,
                 execlaw_core::backends::BackendPurpose::Standard,
             ) {
-                Some(c) => c.base_url.clone(),
+                Some(c) => c.endpoint.clone(),
                 None => {
                     tracing::info!(
                         "prewarm skipped: no inference backend configured (controller runner will spawn lazily on first chat)"
@@ -1975,7 +2059,6 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
             // group `(web, {controller})`. Mirror that exactly so
             // the prewarmed group_id matches the one the chat
             // path will look up on the first send.
-            let _ = prewarm_model; // reserved for spec.env
             match prewarm_sup
                 .prewarm_controller(
                     prewarm_launcher.as_ref(),

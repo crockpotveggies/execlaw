@@ -186,7 +186,7 @@ describe("Sidebar", () => {
                 ephemeral_expires_at: null,
                 last_seq: 3,
                 transport_channel: "signal",
-                transport_icon: "chat-quote",
+                transport_icon: "signal",
             },
         ]);
         rerender(<Sidebar onNewThread={() => {}} />);

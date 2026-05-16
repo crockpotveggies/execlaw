@@ -104,21 +104,45 @@ impl VoiceRuntime {
             events,
             Arc::new(move || {
                 use execlaw_core::backends::{BackendPurpose, BackendStore};
-                BackendStore::new(&db_for_whisper)
-                    .get(BackendPurpose::VoiceStt)
-                    .ok()
-                    .flatten()
-                    .and_then(|r| r.endpoint)
-                    .filter(|s| !s.trim().is_empty())
+                // 2026-05-13 — log DB read errors loudly to the
+                // `voice_runtime` target instead of `.ok().flatten()`-
+                // ing them into a silent "no endpoint" result. Pre-
+                // rework a BLOB-decode failure on `model_spec_json`
+                // would silently fall to an empty `WhisperClient`
+                // URL, surfacing later as a generic "no audio" bug.
+                match BackendStore::new(&db_for_whisper).get(BackendPurpose::VoiceStt) {
+                    Ok(row) => row
+                        .and_then(|r| r.endpoint)
+                        .filter(|s| !s.trim().is_empty()),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "voice_runtime",
+                            purpose = "VoiceStt",
+                            error = %e,
+                            "config_backends read failed — voice STT will be a no-op for this session. \
+                             Likely BLOB column corruption from a raw SQL UPDATE; use Settings → Backends instead.",
+                        );
+                        None
+                    }
+                }
             }),
             Arc::new(move || {
                 use execlaw_core::backends::{BackendPurpose, BackendStore};
-                BackendStore::new(&db_for_kokoro)
-                    .get(BackendPurpose::VoiceTts)
-                    .ok()
-                    .flatten()
-                    .and_then(|r| r.endpoint)
-                    .filter(|s| !s.trim().is_empty())
+                match BackendStore::new(&db_for_kokoro).get(BackendPurpose::VoiceTts) {
+                    Ok(row) => row
+                        .and_then(|r| r.endpoint)
+                        .filter(|s| !s.trim().is_empty()),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "voice_runtime",
+                            purpose = "VoiceTts",
+                            error = %e,
+                            "config_backends read failed — voice TTS will be a no-op for this session. \
+                             Likely BLOB column corruption from a raw SQL UPDATE; use Settings → Backends instead.",
+                        );
+                        None
+                    }
+                }
             }),
             Arc::new(move || {
                 // Voice id from Settings → Personality (default row).
@@ -126,13 +150,30 @@ impl VoiceRuntime {
                 // `bf_emma+am_michael` if the row's value is empty
                 // or NULL — defense-in-depth even though migration
                 // 0016 already populates the canonical value.
+                //
+                // 2026-05-13 — log DB read errors instead of
+                // `.ok()`-swallowing them. Operators who saved a
+                // custom voice and hit the default were getting no
+                // diagnostic when a `config_personality` decode
+                // failed; now the WARN points them at the row.
                 use execlaw_core::personality::PersonalityStore;
-                PersonalityStore::new(&db_for_voice)
-                    .get_default()
-                    .ok()
-                    .and_then(|p| p.voice_id)
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| "bf_emma+am_michael".to_owned())
+                const FALLBACK_VOICE: &str = "bf_emma+am_michael";
+                match PersonalityStore::new(&db_for_voice).get_default() {
+                    Ok(p) => p
+                        .voice_id
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| FALLBACK_VOICE.to_owned()),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "voice_runtime",
+                            error = %e,
+                            fallback = FALLBACK_VOICE,
+                            "config_personality read failed — using fallback voice. \
+                             Likely BLOB column corruption; check Settings → Personality.",
+                        );
+                        FALLBACK_VOICE.to_owned()
+                    }
+                }
             }),
         )
     }

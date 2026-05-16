@@ -1,0 +1,12 @@
+{
+    "type": "object",
+    "properties": {
+        "symbol": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Cryptocurrency symbol. Accepts bare coin tickers (`BTC`, `ETH`, `SOL`, `DOGE`) — the plugin appends `-USD` — or full Yahoo-format pairs (`BTC-USD`, `ETH-EUR`, `SOL-GBP`)."
+        }
+    },
+    "required": ["symbol"],
+    "additionalProperties": false
+}

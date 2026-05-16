@@ -1,0 +1,74 @@
+{
+    "type": "object",
+    "properties": {
+        "latitude": {
+            "type": "number",
+            "minimum": -90,
+            "maximum": 90,
+            "description": "Latitude in decimal degrees. Resolve via open_meteo.geocode if the operator gave a place name."
+        },
+        "longitude": {
+            "type": "number",
+            "minimum": -180,
+            "maximum": 180,
+            "description": "Longitude in decimal degrees."
+        },
+        "place_name": {
+            "type": "string",
+            "description": "Optional — echoed back in the response so the SPA chat-component cards can label the result (\"Reykjavík\" rather than coordinates)."
+        },
+        "timezone": {
+            "type": "string",
+            "description": "IANA timezone name (\"Europe/Reykjavik\") or the literal \"auto\" to use the coordinate's local zone. Default \"auto\"."
+        },
+        "forecast_days": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 16,
+            "description": "How many days ahead to forecast (1-16, default 7)."
+        },
+        "past_days": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 92,
+            "description": "How many days of history to prepend (0-92, default 0)."
+        },
+        "current": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Current-conditions variables. Common: temperature_2m, apparent_temperature, weather_code, wind_speed_10m, wind_direction_10m, relative_humidity_2m, precipitation, cloud_cover."
+        },
+        "hourly": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Hourly variables — see https://open-meteo.com/en/docs for the full list."
+        },
+        "daily": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Daily variables. Common: temperature_2m_max, temperature_2m_min, precipitation_sum, precipitation_probability_max, weather_code, wind_speed_10m_max, sunrise, sunset."
+        },
+        "temperature_unit": {
+            "type": "string",
+            "enum": ["celsius", "fahrenheit"],
+            "description": "Default \"celsius\"."
+        },
+        "wind_speed_unit": {
+            "type": "string",
+            "enum": ["kmh", "ms", "mph", "kn"],
+            "description": "Default \"kmh\"."
+        },
+        "precipitation_unit": {
+            "type": "string",
+            "enum": ["mm", "inch"],
+            "description": "Default \"mm\"."
+        },
+        "models": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Specific forecast models to use (e.g. [\"gfs_seamless\"], [\"icon_seamless\",\"ecmwf_ifs04\"]). Omit for Open-Meteo's default best-fit."
+        }
+    },
+    "required": [],
+    "additionalProperties": false
+}

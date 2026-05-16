@@ -1,0 +1,30 @@
+{
+    "type": "object",
+    "properties": {
+        "latitude": { "type": "number", "minimum": -90, "maximum": 90 },
+        "longitude": { "type": "number", "minimum": -180, "maximum": 180 },
+        "place_name": { "type": "string" },
+        "current": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Current variables. Common: european_aqi, us_aqi, pm10, pm2_5, carbon_monoxide, nitrogen_dioxide, ozone."
+        },
+        "hourly": {
+            "type": "array",
+            "items": { "type": "string" }
+        },
+        "timezone": { "type": "string" },
+        "forecast_days": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 7
+        },
+        "domains": {
+            "type": "string",
+            "enum": ["cams_europe", "cams_global"],
+            "description": "Default \"cams_global\". Use cams_europe inside Europe for higher-resolution data."
+        }
+    },
+    "required": [],
+    "additionalProperties": false
+}

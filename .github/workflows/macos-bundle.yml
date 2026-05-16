@@ -1,0 +1,179 @@
+name: macOS bundle
+
+# Build the execlaw .app + .dmg on every push to a release tag, and
+# also on-demand via workflow_dispatch (for ad-hoc dev builds from
+# any branch). Uploads the artefacts so a maintainer can attach them
+# to the GitHub Release.
+#
+# We do NOT run this on every push — it's expensive (Tauri + Node +
+# Rust release build = ~12 min on macos-14) and not relevant to the
+# vast majority of changes. The per-push CI matrix in ci.yml already
+# covers `aarch64-apple-darwin` for compile + test signal.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or tag to build (defaults to the current ref)"
+        required: false
+        default: ""
+
+concurrency:
+  group: macos-bundle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bundle:
+    runs-on: macos-14
+    timeout-minutes: 30
+    permissions:
+      # `contents: write` is required by the release step to
+      # create a GitHub Release and upload the .dmg as an asset.
+      # workflow_dispatch runs (non-tag) just upload artifacts to
+      # the run; the release step is skipped via the `if:` guard.
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          # Tauri's `cargo tauri build` reads the version from
+          # tauri.conf.json; we don't need git history.
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          # One key per workflow + lockfile pair so an unrelated PR
+          # touching the cli crate doesn't poison the Tauri build's
+          # incremental compile.
+          shared-key: macos-bundle
+          workspaces: |
+            .
+            desktop-macos/src-tauri
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Tauri CLI
+        # Pin the CLI to Tauri 2.x. We pull from crates.io rather
+        # than the standalone tauri-cli npm package so the version
+        # is reproducible and doesn't drift on a Node minor bump.
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      - name: Build bundle
+        run: ./scripts/build-mac.sh
+
+      - name: Locate bundle outputs
+        id: outputs
+        # The `.dmg` filename includes the version from
+        # tauri.conf.json — glob it and remember the absolute path
+        # for the upload step.
+        run: |
+          set -e
+          BUNDLE_ROOT="desktop-macos/src-tauri/target/aarch64-apple-darwin/release/bundle"
+          APP="$BUNDLE_ROOT/macos/execlaw.app"
+          DMG=$(ls "$BUNDLE_ROOT"/dmg/execlaw_*_aarch64.dmg 2>/dev/null | head -n 1 || true)
+          if [[ ! -d "$APP" ]]; then
+              echo "::error::expected .app at $APP — build-mac.sh failed silently?"
+              exit 1
+          fi
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+          echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
+
+      - name: Upload .app
+        uses: actions/upload-artifact@v4
+        with:
+          name: execlaw-app-aarch64
+          # Zip the .app for upload — actions/upload-artifact unpacks
+          # directories into individual files, losing the .app's
+          # bundle structure (and any executable bits). A zip
+          # preserves both.
+          path: ${{ steps.outputs.outputs.app }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload .dmg
+        if: steps.outputs.outputs.dmg != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: execlaw-dmg-aarch64
+          path: ${{ steps.outputs.outputs.dmg }}
+          if-no-files-found: error
+          retention-days: 90
+
+      # ----- Release path -----
+      # The remaining steps only fire on a tag push. workflow_dispatch
+      # runs (manual ad-hoc builds) skip them — those builds just
+      # leave the .dmg as a workflow artifact for the maintainer to
+      # grab. This guard keeps "test the bundle on a branch" cheap
+      # while still cutting a real Release on `git push --tags`.
+      - name: Compute SHA256 of .dmg
+        id: checksum
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -e
+          DMG='${{ steps.outputs.outputs.dmg }}'
+          SHA=$(shasum -a 256 "$DMG" | awk '{print $1}')
+          # Write the checksum as a sibling file so the release
+          # step can attach it verbatim. Format mirrors
+          # `shasum -a 256` output so a downstream `shasum -a 256
+          # -c execlaw_<v>_aarch64.dmg.sha256` verifies cleanly.
+          BASENAME=$(basename "$DMG")
+          echo "$SHA  $BASENAME" > "${DMG}.sha256"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "sha_file=${DMG}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          # `draft: true` — the workflow stages the release; a
+          # maintainer reviews the auto-generated notes + the
+          # uploaded artefacts, then clicks Publish in the GitHub
+          # UI. Switch to `draft: false` once you trust the
+          # pipeline.
+          draft: true
+          # `prerelease: false` — flip to true for `v*-rc*` / `v*-beta*`
+          # tags if you start using pre-release naming.
+          prerelease: false
+          # Auto-generate the "What's Changed" section from the PRs
+          # merged between this tag and the previous release. The
+          # body here is prepended above the auto-generated block.
+          generate_release_notes: true
+          name: "execlaw ${{ github.ref_name }}"
+          body: |
+            ## execlaw ${{ github.ref_name }} — macOS bundle
+
+            **Apple Silicon only.** Intel Macs follow the Linux-with-Docker path
+            (see [docs/setup-mac.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/setup-mac.md)).
+
+            ### Install
+            1. Download `execlaw_<version>_aarch64.dmg` below.
+            2. Open the `.dmg` and drag **execlaw** to your **Applications** folder.
+            3. The build is unsigned — first launch needs **right-click → Open** to bypass Gatekeeper.
+
+            ### Verify (optional)
+            ```bash
+            shasum -a 256 -c execlaw_<version>_aarch64.dmg.sha256
+            ```
+
+            SHA-256: `${{ steps.checksum.outputs.sha256 }}`
+
+          files: |
+            ${{ steps.outputs.outputs.dmg }}
+            ${{ steps.checksum.outputs.sha_file }}
+          fail_on_unmatched_files: true

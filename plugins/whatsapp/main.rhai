@@ -88,6 +88,56 @@ fn on_enable() {
     ()
 }
 
+// =====================================================================
+// TEARDOWN (2026-05-13)
+//
+// Fired by the plugin host on disable / uninstall / factory reset
+// BEFORE the engine is dropped. The WhatsApp-specific teardown is
+// "clear the webhook callback URL at wuzapi" — without this step,
+// wuzapi keeps POSTing inbound message events to a URL that may
+// not exist (factory reset wipes the host's webhook routes) or
+// that now belongs to a different installation (re-install on the
+// same host re-uses :3031). Clearing the webhook makes wuzapi
+// drop inbound events until on_enable re-registers fresh ones.
+//
+// Stopping the wuzapi container itself is the SidecarSupervisor's
+// job (`stop_all()` on factory reset, or the reconcile-loop's
+// orphan sweep on regular disable). We don't try to stop it here.
+//
+// Best-effort: any error is logged but doesn't block the host's
+// disable. The container is going away anyway on factory reset;
+// for a regular disable, the orphaned webhook URL gets corrected
+// on the next enable.
+// =====================================================================
+
+fn on_disable() {
+    log_info("whatsapp: on_disable — clearing webhook callback at wuzapi before teardown");
+    let base = sidecar_url("wuzapi");
+    if base == () || base == "" {
+        log_info("whatsapp: wuzapi sidecar already stopped — nothing to unregister");
+        return;
+    }
+    // wuzapi accepts a webhook clear via POST /webhook with an
+    // empty webhookurl. Verified upstream: handlers.go writes the
+    // empty string straight to the user row, so subsequent inbound
+    // events are dropped instead of being POSTed to a dead URL.
+    try {
+        sidecar_http_post(
+            base + "/webhook",
+            #{ "webhookurl": "", "events": "" },
+            user_headers(),
+        );
+        log_info("whatsapp: webhook cleared at wuzapi");
+    } catch (e) {
+        // Don't surface as warn — the container is most likely
+        // already stopped (factory-reset path stops sidecars
+        // before this fires in some race interleavings). Operators
+        // chasing real failures get the prior log line.
+        log_info("whatsapp: webhook clear skipped (" + e + ")");
+    }
+    ()
+}
+
 // Generate (or reuse) a webhook secret + register the callback
 // URL with wuzapi so it knows where to POST inbound events.
 //

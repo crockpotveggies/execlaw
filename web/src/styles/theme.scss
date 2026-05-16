@@ -25,6 +25,11 @@ $accent:         #4493f8;     // controller-thread blue
 $success:        #3fb950;
 $warning:        #d29922;
 $danger:         #f85149;
+// "In-progress, not broken" blue — used by the brand-indicator's
+// `is-installing` state while a backend is pulling or warming up.
+// Picked to read distinctly from `$accent` (controller-thread blue)
+// so the pulsing download icon doesn't get mistaken for a thread.
+$info:           #58a6ff;
 
 // ---- Geometry tokens ----------------------------------------------
 // Floating-sidebar gutter: distance from each viewport edge to the
@@ -443,11 +448,12 @@ body {
         box-shadow: 0 0 6px rgba($success, 0.55);
     }
 
-    // Alert + disconnected variants render an icon glyph, so we
-    // expand the box past the 0.6rem dot footprint and drop the
+    // Alert + disconnected + installing variants render an icon glyph,
+    // so we expand the box past the 0.6rem dot footprint and drop the
     // background fill — the icon does the visual work.
     &.is-alert,
-    &.is-disconnected {
+    &.is-disconnected,
+    &.is-installing {
         width: auto;
         height: auto;
         background-color: transparent;
@@ -464,6 +470,23 @@ body {
 
     &.is-disconnected {
         color: $warning;
+    }
+
+    // Installing state — at least one backend is in Pulling /
+    // Starting / DownloadingModel / LoadingModel. Reuses the same
+    // pulse keyframes the alert variant uses so the visual rhythm
+    // stays consistent; the colour says "in-progress, not broken."
+    // Click routes to /settings/backends so the operator can see the
+    // pull % per row.
+    //
+    // Precedence (computed in BrandStatusIndicator): alert > disconnected
+    // > installing > ok. An installing backend during an active
+    // alert keeps the red triangle visible — the alert is the
+    // higher-priority signal.
+    &.is-installing {
+        color: $info;
+        animation: execlaw-brand-status-pulse 1.6s ease-in-out infinite;
+        &:hover { color: color.adjust($info, $lightness: 6%); }
     }
 }
 
@@ -863,6 +886,21 @@ body {
     margin-bottom: 0.2rem;
 }
 
+.execlaw-msg__attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-bottom: 0.4rem;
+}
+
+.execlaw-msg__attachment-image {
+    max-width: 16rem;
+    max-height: 16rem;
+    border-radius: 0.5rem;
+    display: block;
+    object-fit: cover;
+}
+
 .execlaw-msg__bubble {
     // 2026-04-28 — agent reply renders flush against the page
     // background (ChatGPT-style "no bubble"). User + tool
@@ -1014,21 +1052,10 @@ body {
         border-top: 1px solid $border-subtle;
     }
 
-    &.is-clamped {
-        position: relative;
-        // Soft fade at the bottom of clamped messages cues that
-        // there's more content under the "Read more…" button.
-        mask-image: linear-gradient(
-            to bottom,
-            #000 60%,
-            rgba(0, 0, 0, 0.65) 100%
-        );
-        -webkit-mask-image: linear-gradient(
-            to bottom,
-            #000 60%,
-            rgba(0, 0, 0, 0.65) 100%
-        );
-    }
+    // (.is-clamped removed 2026-05-15 — long messages now render in
+    // full; the Phase-6 truncation spec was reverted because hiding
+    // long-form replies behind a click was friction the operator
+    // never asked for.)
 }
 
 .execlaw-streaming-cursor {
@@ -1258,6 +1285,255 @@ body {
         color: $bg-deep;
         opacity: 1;
     }
+}
+
+// 2026-05-15 — image-attachment chips above the textarea. Render
+// as a thumbnail grid; each chip has a small × in the corner to
+// remove. Layout collapses to nothing when the staged list is
+// empty (the parent component skips rendering the row).
+.execlaw-composer__attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.execlaw-composer__attachment-chip {
+    position: relative;
+    width: 4rem;
+    height: 4rem;
+    border-radius: 0.5rem;
+    overflow: hidden;
+    background-color: rgba($text-primary, 0.05);
+}
+
+.execlaw-composer__attachment-thumb {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+.execlaw-composer__attachment-remove {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 1.25rem;
+    height: 1.25rem;
+    padding: 0;
+    border-radius: 999px;
+    border: 0;
+    background-color: rgba(0, 0, 0, 0.7);
+    color: #fff;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.875rem;
+    line-height: 1;
+    cursor: pointer;
+
+    &:hover,
+    &:focus-visible {
+        background-color: rgba(0, 0, 0, 0.9);
+    }
+}
+
+// + button + popup menu anchor. Position-relative so the absolute
+// menu lands above the trigger.
+.execlaw-composer__attach-anchor {
+    position: relative;
+}
+
+.execlaw-composer__attach-btn.btn-link,
+.execlaw-composer__attach-btn.btn {
+    min-width: 2rem;
+    width: 2rem;
+    height: 2rem;
+    padding: 0;
+    color: $text-muted;
+    text-decoration: none;
+
+    &:hover,
+    &:focus-visible {
+        color: $text-primary;
+        text-decoration: none;
+    }
+}
+
+.execlaw-composer__attach-menu {
+    position: absolute;
+    bottom: calc(100% + 0.25rem);
+    left: 0;
+    min-width: 10rem;
+    background-color: $bg-deep;
+    border: 1px solid rgba($text-primary, 0.15);
+    border-radius: 0.5rem;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+    padding: 0.25rem;
+    z-index: 20;
+}
+
+.execlaw-composer__attach-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    padding: 0.5rem 0.65rem;
+    border: 0;
+    border-radius: 0.4rem;
+    background-color: transparent;
+    color: $text-primary;
+    font-size: 0.875rem;
+    text-align: left;
+    cursor: pointer;
+
+    &:hover,
+    &:focus-visible {
+        background-color: rgba($text-primary, 0.08);
+    }
+
+    i {
+        font-size: 1rem;
+        color: $text-muted;
+    }
+}
+
+// 2026-05-15 — skill picker (composer `+` menu, second item)
+.execlaw-composer__attach-menu--skills {
+    min-width: 18rem;
+    max-width: 28rem;
+    max-height: 22rem;
+    overflow-y: auto;
+}
+
+.execlaw-composer__skill-picker-header {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.4rem 0.55rem;
+    color: $text-muted;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    border-bottom: 1px solid rgba($text-primary, 0.08);
+    margin-bottom: 0.25rem;
+}
+
+.execlaw-composer__skill-picker-back {
+    border: 0;
+    background: transparent;
+    color: $text-primary;
+    cursor: pointer;
+    padding: 0.1rem 0.3rem;
+    border-radius: 0.3rem;
+    line-height: 1;
+
+    &:hover,
+    &:focus-visible {
+        background-color: rgba($text-primary, 0.08);
+    }
+}
+
+.execlaw-composer__skill-picker-status {
+    padding: 0.6rem 0.65rem;
+    color: $text-muted;
+    font-size: 0.85rem;
+
+    &--error {
+        color: #f47878;
+    }
+}
+
+.execlaw-composer__skill-picker-item {
+    display: grid;
+    grid-template-columns: 1.1rem 1fr;
+    grid-template-rows: auto auto;
+    column-gap: 0.5rem;
+    width: 100%;
+    padding: 0.45rem 0.55rem;
+    border: 0;
+    border-radius: 0.4rem;
+    background-color: transparent;
+    color: $text-primary;
+    text-align: left;
+    cursor: pointer;
+
+    &:hover,
+    &:focus-visible {
+        background-color: rgba($text-primary, 0.08);
+    }
+
+    &.is-checked {
+        background-color: rgba($accent, 0.12);
+    }
+
+    i {
+        grid-row: 1 / span 2;
+        align-self: center;
+        font-size: 1rem;
+        color: $text-muted;
+    }
+}
+
+.execlaw-composer__skill-picker-name {
+    font-size: 0.875rem;
+    font-weight: 500;
+}
+
+.execlaw-composer__skill-picker-desc {
+    font-size: 0.75rem;
+    color: $text-muted;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+// Selected-skill chip in the composer's attachments row
+.execlaw-composer__skill-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.25rem 0.55rem;
+    background-color: rgba($accent, 0.15);
+    color: $text-primary;
+    border-radius: $radius-pill;
+    font-size: 0.78rem;
+
+    i {
+        color: color.adjust($accent, $lightness: 18%);
+    }
+}
+
+.execlaw-composer__skill-chip-name {
+    max-width: 12rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+// "applied: foo, bar" line under a user_msg bubble
+.execlaw-msg__applied-skills {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.3rem;
+    margin-top: 0.45rem;
+    font-size: 0.72rem;
+    color: $text-muted;
+
+    i {
+        color: color.adjust($accent, $lightness: 12%);
+    }
+}
+
+.execlaw-msg__applied-skills-label {
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.execlaw-msg__applied-skill-chip {
+    color: $text-primary;
+    font-family: monospace;
 }
 
 .execlaw-approval-card {

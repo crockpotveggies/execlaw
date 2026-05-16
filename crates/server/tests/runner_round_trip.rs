@@ -222,6 +222,7 @@ async fn forward_turn_round_trips_token_delta_to_runner_and_event_bus() {
         max_tokens: None,
         reasoning_enabled: false,
         spotlight: None,
+        user_image_urls: Vec::new(),
     };
     let _stream = state
         .supervisor

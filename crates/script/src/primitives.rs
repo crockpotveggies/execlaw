@@ -26,7 +26,7 @@
 use crate::cache::{HttpCache, cache_key};
 use crate::host_caps::{
     HostCapabilitiesArc, InboundAttachmentMeta, InboundMessage, WsFrameHandler,
-    WsSubscriptionHandle,
+    WsKeepaliveCallback, WsSubscriptionHandle,
 };
 use rhai::{Dynamic, Engine, EvalAltResult, ImmutableString, Map};
 use sha2::{Digest, Sha256};
@@ -291,6 +291,50 @@ pub(crate) fn register(
         );
     }
 
+    // http_get_envelope(url, query, bearer, headers) -> {
+    //     status:    i64,        — HTTP status code (including 4xx/5xx;
+    //                              the envelope variant does NOT throw
+    //                              on non-2xx so the plugin can inspect
+    //                              error responses)
+    //     headers:   Map,        — response headers, keys lowercased,
+    //                              multi-valued (Set-Cookie) returned
+    //                              as an Array of strings
+    //     body:      Dynamic,    — JSON-parsed if Content-Type is JSON-
+    //                              ish OR the bytes parse as JSON; raw
+    //                              String otherwise; Unit on empty body
+    //     body_text: String      — raw body bytes as UTF-8 (always
+    //                              present, useful for plain-text APIs
+    //                              like Yahoo Finance's /v1/test/getcrumb)
+    // }
+    //
+    // Slow path: every call is uncached and forces the SSRF + URL parse
+    // every time. Use only when a plugin needs response metadata that
+    // `http_get` strips — Set-Cookie capture for session/crumb flows,
+    // Retry-After parsing on 429 backoff, status-code branching on
+    // upstreams that abuse 4xx as data.
+    {
+        let agent = http_agent.clone();
+        let pid = plugin_id.to_owned();
+        engine.register_fn(
+            "http_get_envelope",
+            move |url: ImmutableString,
+                  query: Map,
+                  bearer: ImmutableString,
+                  headers: Map|
+                  -> Result<Dynamic, Box<EvalAltResult>> {
+                http_get_envelope_impl(
+                    &agent,
+                    &pid,
+                    &url,
+                    &query,
+                    &bearer,
+                    Some(&headers),
+                    allow_loopback,
+                )
+            },
+        );
+    }
+
     // ---- String ---------------------------------------------------
 
     engine.register_fn("digits_only", |s: ImmutableString| -> ImmutableString {
@@ -517,6 +561,56 @@ fn register_host_cap_bindings(
         base64::engine::general_purpose::STANDARD
             .encode(s.as_bytes())
             .into()
+    });
+
+    // base64url_encode(s) -> base64url (URL-safe alphabet, no padding).
+    // Required by Gmail's `users.messages.send` endpoint which takes
+    // a `raw` field of base64url-encoded RFC822. The standard-alphabet
+    // variant uses `+` and `/` which Gmail's parser rejects, and the
+    // padding `=` is conventionally stripped in URL-safe contexts.
+    engine.register_fn(
+        "base64url_encode",
+        |s: ImmutableString| -> ImmutableString {
+            use base64::Engine as _;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(s.as_bytes())
+                .into()
+        },
+    );
+
+    // base64_decode(s) -> string | unit. Inverse of base64_encode.
+    // Tolerates BOTH the standard and URL-safe alphabets (Gmail sends
+    // bodies back as base64url). Returns `()` if the decoded bytes
+    // aren't valid UTF-8 so plugins can branch on binary content.
+    engine.register_fn("base64_decode", |s: ImmutableString| -> Dynamic {
+        use base64::Engine as _;
+        // Replace URL-safe chars with standard then try standard
+        // decode — covers both alphabets without two attempts.
+        let normalised: String = s
+            .chars()
+            .map(|c| match c {
+                '-' => '+',
+                '_' => '/',
+                other => other,
+            })
+            .collect();
+        // Pad if needed (URL_SAFE_NO_PAD strips padding).
+        let padded = match normalised.len() % 4 {
+            0 => normalised,
+            n => {
+                let mut p = normalised;
+                p.push_str(&"=".repeat(4 - n));
+                p
+            }
+        };
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(padded.as_bytes()) {
+            Ok(b) => b,
+            Err(_) => return Dynamic::UNIT,
+        };
+        match String::from_utf8(bytes) {
+            Ok(s) => Dynamic::from(ImmutableString::from(s)),
+            Err(_) => Dynamic::UNIT,
+        }
     });
 
     // parse_json(text) -> rhai value. The host's HTTP primitives
@@ -1325,6 +1419,68 @@ fn register_host_cap_bindings(
         );
     }
 
+    // ws_set_keepalive(handle, interval_ms, callback_name) -> bool
+    // ws_set_keepalive(handle, interval_ms, callback_name, jitter_first) -> bool
+    //
+    // Install a periodic application-layer keepalive on a bidi WS
+    // handle. The named Rhai callback runs every `interval_ms`
+    // and returns the text-frame body to write (empty string to
+    // skip that tick). Required for protocols where the server
+    // expects the client to send a periodic heartbeat — Discord's
+    // gateway `{"op":1,"d":<seq>}` is the canonical example.
+    //
+    // RFC-6455 protocol-level Ping/Pong is host-handled in
+    // consumer_loop and does NOT need plugin participation;
+    // ws_set_keepalive is strictly for application-layer
+    // heartbeats whose payload depends on mutable plugin state.
+    //
+    // `jitter_first` (default true) jitters the first tick across
+    // 0..1 × interval — Discord's gateway docs explicitly require
+    // this to avoid a thundering-herd on mass reconnect. Plugins
+    // can opt out with the 4-arg overload.
+    //
+    // Returns true when the timer was installed (replacing any
+    // previously-installed keepalive on the same handle). Returns
+    // false if host_caps is unavailable, the handle is already
+    // closed, or interval_ms is zero.
+    {
+        let pid = plugin_id.to_owned();
+        let caps = host_caps.clone();
+        let owning = owning_plugin.clone();
+        engine.register_fn(
+            "ws_set_keepalive",
+            move |h: &mut WsSubscriptionHandle,
+                  interval_ms: i64,
+                  callback: ImmutableString|
+                  -> Result<bool, Box<EvalAltResult>> {
+                ws_set_keepalive_impl(&pid, &caps, &owning, h, interval_ms, &callback, true)
+            },
+        );
+    }
+    {
+        let pid = plugin_id.to_owned();
+        let caps = host_caps.clone();
+        let owning = owning_plugin.clone();
+        engine.register_fn(
+            "ws_set_keepalive",
+            move |h: &mut WsSubscriptionHandle,
+                  interval_ms: i64,
+                  callback: ImmutableString,
+                  jitter_first: bool|
+                  -> Result<bool, Box<EvalAltResult>> {
+                ws_set_keepalive_impl(
+                    &pid,
+                    &caps,
+                    &owning,
+                    h,
+                    interval_ms,
+                    &callback,
+                    jitter_first,
+                )
+            },
+        );
+    }
+
     // host_route_inbound(message_map) -> "Dispatched" |
     //                                    "GroupNotAddressed" |
     //                                    "ColdContact" |
@@ -1444,6 +1600,8 @@ fn register_host_cap_bindings(
     register_sidecar_http_put(engine, plugin_id, host_caps.clone());
     register_sidecar_http_delete(engine, plugin_id, host_caps.clone());
     register_host_get_attachment_bytes(engine, plugin_id, host_caps.clone());
+    register_host_create_attachment(engine, plugin_id, host_caps.clone());
+    register_host_render_chart(engine, plugin_id, host_caps.clone());
     register_sidecar_http_get_bytes(engine, plugin_id, host_caps.clone());
     register_vault_bindings(engine, plugin_id, host_caps);
 }
@@ -1605,6 +1763,289 @@ fn register_host_get_attachment_bytes(
             }
         },
     );
+}
+
+/// `host_create_attachment(data_url_or_b64, mime, filename, ttl_seconds)
+/// → { attachment_id, sha256, size_bytes }`
+///
+/// Decodes the input as either a `data:` URL or a raw base64 string,
+/// then asks the host to persist the bytes as a plugin artifact. The
+/// returned `attachment_id` flows verbatim into transport plugins'
+/// `send_with_attachments` and into the SPA's
+/// `/api/attachments/<id>` route (same read path as inbound
+/// attachments — both stores share a UUID namespace).
+///
+/// Size cap: 10 MiB. The cap is enforced before the bytes touch disk;
+/// a script that tries to attach a 50 MB PNG gets a clean Rhai error.
+///
+/// `ttl_seconds = 0` is treated as "no TTL" (artifact lives until the
+/// operator manually clears it). Negative values are rejected.
+fn register_host_create_attachment(
+    engine: &mut Engine,
+    plugin_id: &str,
+    host_caps: HostCapsHandle,
+) {
+    /// 10 MiB cap. Chart PNGs typically land in the 30–200 KB range;
+    /// 10 MiB leaves comfortable headroom for higher-resolution renders
+    /// while keeping a runaway plugin from filling the artifacts dir.
+    const MAX_BYTES: usize = 10 * 1024 * 1024;
+    let pid = plugin_id.to_owned();
+    engine.register_fn(
+        "host_create_attachment",
+        move |data: ImmutableString,
+              mime: ImmutableString,
+              filename: ImmutableString,
+              ttl_seconds: i64|
+              -> Result<Dynamic, Box<EvalAltResult>> {
+            let caps = match host_caps.get() {
+                Some(c) => c.clone(),
+                None => return Err(host_cap_unavailable_err(&pid, "host_create_attachment")),
+            };
+            // Accept both `data:<mime>;base64,<payload>` and raw base64.
+            // The plugin author shouldn't have to know which one we want.
+            let payload = data.as_str();
+            let b64 = if let Some(comma) = payload.find(",") {
+                if payload.starts_with("data:") {
+                    &payload[comma + 1..]
+                } else {
+                    payload
+                }
+            } else {
+                payload
+            };
+            use base64::Engine as _;
+            // Tolerate both standard and URL-safe alphabets in case a
+            // plugin author drops a URL-safe-encoded string in.
+            let normalised: String = b64
+                .chars()
+                .map(|c| match c {
+                    '-' => '+',
+                    '_' => '/',
+                    other => other,
+                })
+                .collect();
+            let padded = match normalised.len() % 4 {
+                0 => normalised,
+                n => {
+                    let mut p = normalised;
+                    p.push_str(&"=".repeat(4 - n));
+                    p
+                }
+            };
+            let bytes = match base64::engine::general_purpose::STANDARD.decode(padded.as_bytes()) {
+                Ok(b) => b,
+                Err(e) => {
+                    return Err(Box::new(EvalAltResult::ErrorRuntime(
+                        format!("[{pid}] host_create_attachment: invalid base64: {e}").into(),
+                        rhai::Position::NONE,
+                    )));
+                }
+            };
+            if bytes.len() > MAX_BYTES {
+                return Err(Box::new(EvalAltResult::ErrorRuntime(
+                    format!(
+                        "[{pid}] host_create_attachment: {} bytes exceeds max {}",
+                        bytes.len(),
+                        MAX_BYTES
+                    )
+                    .into(),
+                    rhai::Position::NONE,
+                )));
+            }
+            if ttl_seconds < 0 {
+                return Err(Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_create_attachment: ttl_seconds must be >= 0").into(),
+                    rhai::Position::NONE,
+                )));
+            }
+            let ttl = if ttl_seconds == 0 {
+                None
+            } else {
+                Some(ttl_seconds)
+            };
+            let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_create_attachment: no tokio runtime: {e}").into(),
+                    rhai::Position::NONE,
+                ))
+            })?;
+            let pid_for_call = pid.clone();
+            let filename_owned = filename.to_string();
+            let mime_owned = mime.to_string();
+            let res = tokio::task::block_in_place(|| {
+                runtime.block_on(caps.create_artifact_attachment(
+                    &pid_for_call,
+                    &filename_owned,
+                    &mime_owned,
+                    bytes,
+                    ttl,
+                ))
+            });
+            match res {
+                Ok(a) => {
+                    let mut m = rhai::Map::new();
+                    m.insert(
+                        "attachment_id".into(),
+                        Dynamic::from(ImmutableString::from(a.attachment_id)),
+                    );
+                    m.insert(
+                        "sha256".into(),
+                        Dynamic::from(ImmutableString::from(a.sha256)),
+                    );
+                    m.insert("size_bytes".into(), Dynamic::from(a.size_bytes as i64));
+                    Ok(Dynamic::from(m))
+                }
+                Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_create_attachment: {}", e.0).into(),
+                    rhai::Position::NONE,
+                ))),
+            }
+        },
+    );
+}
+
+/// `host_render_chart(spec_json, width, height, filename, ttl_seconds)
+/// → { attachment_id, sha256, size_bytes, svg, png_data_url }`
+///
+/// Pure-Rust pipeline:
+///   1. Parse `spec_json` as an `execlaw_charting::ChartSpec`.
+///   2. Render to SVG (for inline SPA rendering — returned as the
+///      `svg` field) and to PNG (for transport attachments — stored
+///      via `create_artifact_attachment`).
+///   3. Return both: the attachment_id flows into
+///      `{transport}.send_with_attachments`; the inline SVG goes into
+///      the tool_result so the SPA's chat-component dispatcher can
+///      render it without a follow-up fetch.
+///
+/// width / height are clamped to a sensible range. Setting either to
+/// zero requests the renderer's defaults (720×400).
+fn register_host_render_chart(engine: &mut Engine, plugin_id: &str, host_caps: HostCapsHandle) {
+    /// Minimum and maximum canvas dimensions. The minimum keeps
+    /// axes legible; the maximum stops a runaway script from asking
+    /// for an 8K image and pinning the renderer for seconds.
+    const MIN_DIM: u32 = 240;
+    const MAX_DIM: u32 = 2400;
+    let pid = plugin_id.to_owned();
+    engine.register_fn(
+        "host_render_chart",
+        move |spec_json: ImmutableString,
+              width: i64,
+              height: i64,
+              filename: ImmutableString,
+              ttl_seconds: i64|
+              -> Result<Dynamic, Box<EvalAltResult>> {
+            let caps = match host_caps.get() {
+                Some(c) => c.clone(),
+                None => return Err(host_cap_unavailable_err(&pid, "host_render_chart")),
+            };
+            let spec: execlaw_charting::ChartSpec =
+                serde_json::from_str(&spec_json).map_err(|e| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        format!("[{pid}] host_render_chart: invalid spec_json: {e}").into(),
+                        rhai::Position::NONE,
+                    ))
+                })?;
+            let w = clamp_dim(width, MIN_DIM, MAX_DIM, execlaw_charting::DEFAULT_WIDTH);
+            let h = clamp_dim(height, MIN_DIM, MAX_DIM, execlaw_charting::DEFAULT_HEIGHT);
+            if ttl_seconds < 0 {
+                return Err(Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_render_chart: ttl_seconds must be >= 0").into(),
+                    rhai::Position::NONE,
+                )));
+            }
+            let ttl = if ttl_seconds == 0 {
+                None
+            } else {
+                Some(ttl_seconds)
+            };
+
+            // Render both. Plotters renders are ~1-20ms for the
+            // typical chart so we do them on the calling Rhai thread
+            // (already inside spawn_blocking — the host engine
+            // executes Rhai under tokio::task::block_in_place).
+            let svg = execlaw_charting::render_to_svg(&spec, w, h).map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_render_chart: svg render: {e}").into(),
+                    rhai::Position::NONE,
+                ))
+            })?;
+            let png = execlaw_charting::render_to_png(&spec, w, h).map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_render_chart: png render: {e}").into(),
+                    rhai::Position::NONE,
+                ))
+            })?;
+
+            let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_render_chart: no tokio runtime: {e}").into(),
+                    rhai::Position::NONE,
+                ))
+            })?;
+            let pid_for_call = pid.clone();
+            let filename_owned = filename.to_string();
+            let png_for_caps = png.clone();
+            let created = tokio::task::block_in_place(|| {
+                runtime.block_on(caps.create_artifact_attachment(
+                    &pid_for_call,
+                    &filename_owned,
+                    "image/png",
+                    png_for_caps,
+                    ttl,
+                ))
+            })
+            .map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_render_chart: store: {}", e.0).into(),
+                    rhai::Position::NONE,
+                ))
+            })?;
+
+            // Build the response map. The `svg` field is the
+            // inline-renderable string the SPA's chat-component
+            // dispatcher consumes; `attachment_id` flows into
+            // `{transport}.send_with_attachments`.
+            use base64::Engine as _;
+            let png_b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+            let mut m = rhai::Map::new();
+            m.insert(
+                "attachment_id".into(),
+                Dynamic::from(ImmutableString::from(created.attachment_id)),
+            );
+            m.insert(
+                "sha256".into(),
+                Dynamic::from(ImmutableString::from(created.sha256)),
+            );
+            m.insert(
+                "size_bytes".into(),
+                Dynamic::from(created.size_bytes as i64),
+            );
+            m.insert("svg".into(), Dynamic::from(ImmutableString::from(svg)));
+            m.insert(
+                "png_data_url".into(),
+                Dynamic::from(ImmutableString::from(format!(
+                    "data:image/png;base64,{png_b64}"
+                ))),
+            );
+            m.insert("width".into(), Dynamic::from(w as i64));
+            m.insert("height".into(), Dynamic::from(h as i64));
+            Ok(Dynamic::from(m))
+        },
+    );
+}
+
+fn clamp_dim(requested: i64, min: u32, max: u32, default: u32) -> u32 {
+    if requested <= 0 {
+        return default;
+    }
+    let r = requested as u64;
+    if r < min as u64 {
+        return min;
+    }
+    if r > max as u64 {
+        return max;
+    }
+    r as u32
 }
 
 fn register_sidecar_http_get_bytes(
@@ -2065,6 +2506,104 @@ fn host_cap_unavailable_err(plugin_id: &str, name: &str) -> Box<EvalAltResult> {
     ))
 }
 
+/// Shared implementation behind both `ws_set_keepalive` Rhai
+/// overloads. Resolves the host caps + owning plugin, builds a
+/// `WsKeepaliveCallback` that dispatches into a named Rhai
+/// function on every tick, and forwards to
+/// `HostCapabilities::ws_set_keepalive`.
+///
+/// The callback runs from a long-lived tokio task spawned by the
+/// host's default impl. `plugin.invoke_async_owned` returns a
+/// `serde_json::Value`; if it's a string we use it as the
+/// keepalive frame, otherwise we serialize the whole value (Maps
+/// and other shapes the Rhai callback might naively return).
+/// Empty / null returns become the empty string, which
+/// `ws_set_keepalive`'s default impl interprets as "skip this
+/// tick".
+fn ws_set_keepalive_impl(
+    plugin_id: &str,
+    caps: &HostCapsHandle,
+    owning: &OwningPluginSlot,
+    h: &WsSubscriptionHandle,
+    interval_ms: i64,
+    callback: &ImmutableString,
+    jitter_first: bool,
+) -> Result<bool, Box<EvalAltResult>> {
+    let caps_arc = match caps.get() {
+        Some(c) => c.clone(),
+        None => return Err(host_cap_unavailable_err(plugin_id, "ws_set_keepalive")),
+    };
+    if interval_ms <= 0 {
+        return Err(Box::new(EvalAltResult::ErrorRuntime(
+            format!("[{plugin_id}] ws_set_keepalive: interval_ms must be > 0").into(),
+            rhai::Position::NONE,
+        )));
+    }
+    if h.is_closed() {
+        tracing::debug!(
+            target: "execlaw_script::primitives",
+            plugin_id = %plugin_id,
+            "ws_set_keepalive: handle already closed; not installing"
+        );
+        return Ok(false);
+    }
+    let plugin = owning
+        .lock()
+        .expect("OwningPluginSlot mutex poisoned")
+        .clone();
+    let plugin = match plugin {
+        Some(p) => p,
+        None => {
+            return Err(Box::new(EvalAltResult::ErrorRuntime(
+                format!("[{plugin_id}] ws_set_keepalive: owning plugin not yet wired").into(),
+                rhai::Position::NONE,
+            )));
+        }
+    };
+    let pid_for_handler = plugin_id.to_owned();
+    let cb_name: String = callback.to_string();
+    let cb: WsKeepaliveCallback = Arc::new(move || {
+        let plugin = plugin.clone();
+        let cb = cb_name.clone();
+        let pid = pid_for_handler.clone();
+        Box::pin(async move {
+            match plugin.invoke_async_owned(cb, Vec::new()).await {
+                Ok(serde_json::Value::String(s)) => s,
+                Ok(serde_json::Value::Null) => String::new(),
+                Ok(other) => other.to_string(),
+                Err(e) => {
+                    tracing::warn!(
+                        plugin_id = %pid,
+                        error = %e,
+                        "ws_set_keepalive callback errored; skipping this tick",
+                    );
+                    String::new()
+                }
+            }
+        })
+    });
+    let runtime = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(e) => {
+            return Err(Box::new(EvalAltResult::ErrorRuntime(
+                format!("[{plugin_id}] ws_set_keepalive: no tokio runtime: {e}").into(),
+                rhai::Position::NONE,
+            )));
+        }
+    };
+    let h_clone = h.clone();
+    let result = tokio::task::block_in_place(|| {
+        runtime.block_on(caps_arc.ws_set_keepalive(&h_clone, interval_ms as u64, jitter_first, cb))
+    });
+    match result {
+        Ok(()) => Ok(true),
+        Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
+            format!("[{plugin_id}] ws_set_keepalive: {}", e.0).into(),
+            rhai::Position::NONE,
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HTTP impls (ureq, sync).
 
@@ -2358,6 +2897,93 @@ fn decode_response(
         )
     })?;
     Ok(json_to_rhai(&parsed))
+}
+
+fn http_get_envelope_impl(
+    agent: &ureq::Agent,
+    plugin_id: &str,
+    url: &str,
+    query: &Map,
+    bearer: &str,
+    headers: Option<&Map>,
+    allow_loopback: bool,
+) -> Result<Dynamic, Box<EvalAltResult>> {
+    validate_url(plugin_id, "http_get_envelope", url, allow_loopback)?;
+    let mut req = agent.get(url);
+    for (k, v) in map_to_query_iter(query) {
+        req = req.query(&k, &v);
+    }
+    if !bearer.is_empty() {
+        req = req.set("Authorization", &format!("Bearer {bearer}"));
+    }
+    if let Some(h) = headers {
+        req = apply_headers(req, h);
+    }
+    // Unlike `http_get`, the envelope variant must hand 4xx/5xx
+    // responses back to the plugin as data — many session/crumb flows
+    // hinge on cookies set on a 404 (yahoo.com/fc) or 302. Transport
+    // errors still bubble up as an Err.
+    let resp = match req.call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(e @ ureq::Error::Transport(_)) => {
+            return Err(ureq_to_eval_err(plugin_id, "http_get_envelope", url, e));
+        }
+    };
+    decode_envelope(plugin_id, url, resp)
+}
+
+fn decode_envelope(
+    plugin_id: &str,
+    url: &str,
+    resp: ureq::Response,
+) -> Result<Dynamic, Box<EvalAltResult>> {
+    let status = resp.status() as i64;
+    // Headers MUST be read before `into_string()` consumes the
+    // response. Names lowercased so plugins can lookup with a
+    // single canonical form rather than guessing case.
+    let header_names: Vec<String> = resp
+        .headers_names()
+        .into_iter()
+        .map(|n| n.to_string())
+        .collect();
+    let mut headers_map = rhai::Map::new();
+    for name in &header_names {
+        let lower = name.to_ascii_lowercase();
+        let all: Vec<&str> = resp.all(name);
+        if all.len() == 1 {
+            headers_map.insert(lower.into(), Dynamic::from(all[0].to_string()));
+        } else {
+            let mut arr = rhai::Array::new();
+            for v in all {
+                arr.push(Dynamic::from(v.to_string()));
+            }
+            headers_map.insert(lower.into(), Dynamic::from(arr));
+        }
+    }
+    let body_text = resp.into_string().map_err(|e| {
+        EvalAltResult::ErrorRuntime(
+            format!("[{plugin_id}] read body {url}: {e}").into(),
+            rhai::Position::NONE,
+        )
+    })?;
+    let body: Dynamic = if body_text.trim().is_empty() {
+        Dynamic::UNIT
+    } else {
+        match serde_json::from_str::<serde_json::Value>(&body_text) {
+            Ok(v) => json_to_rhai(&v),
+            // Not JSON — fall back to the raw string so callers like
+            // the Yahoo Finance crumb endpoint (returns a bare token)
+            // get something useful in `body`.
+            Err(_) => Dynamic::from(body_text.clone()),
+        }
+    };
+    let mut envelope = rhai::Map::new();
+    envelope.insert("status".into(), Dynamic::from(status));
+    envelope.insert("headers".into(), Dynamic::from(headers_map));
+    envelope.insert("body".into(), body);
+    envelope.insert("body_text".into(), Dynamic::from(body_text));
+    Ok(Dynamic::from(envelope))
 }
 
 fn ureq_to_eval_err(plugin_id: &str, op: &str, url: &str, e: ureq::Error) -> Box<EvalAltResult> {

@@ -88,10 +88,24 @@ pub async fn admit_external_principal(
         return Ok((existing, flat));
     }
 
-    // Step 2 — by-identifier hit. Catches "My identities" mappings:
-    // the controller has asserted that `signal:+1...` is them, so
-    // an inbound on that handle resolves to the controller without
-    // going through the cold-contact gate.
+    // Step 2 — by-identifier hit. Local-cache short-circuit: ANY
+    // (transport, handle) we've seen before — controller-asserted
+    // "My identities" mapping, auto-trusted KnownLimited contact
+    // from a prior plugin fanout, hand-classified KnownTrusted, even
+    // UnknownPending awaiting operator decision, even Blocked —
+    // resolves here without re-running the identity-provider fanout.
+    //
+    // **This is the load-bearing policy:** "store our own local copy
+    // of principals, only check external contacts if they haven't
+    // been seen before or classified through the trust system."
+    // Anything in the `principal_identifiers` index has been seen.
+    // Anything not in the index hasn't, and falls through to step 4.
+    //
+    // 2026-05-14 — migration 0004 made `find_by_identifier` an O(1)
+    // PK lookup against `principal_identifiers`; pre-migration it
+    // was an O(N) scan over every principal row (loaded + JSON-
+    // deserialised), which made the "cached" path nearly as slow as
+    // the un-cached fanout for installs with many contacts.
     let ident = Identifier {
         transport: transport.to_owned(),
         handle: handle.to_owned(),
@@ -99,6 +113,14 @@ pub async fn admit_external_principal(
     if let Some(existing) = store.find_by_identifier(&ident)? {
         let flat = TrustLevel::parse(existing.trust_level.class_tag())
             .unwrap_or(TrustLevel::UnknownPending);
+        tracing::debug!(
+            target: "principal_admit",
+            transport,
+            handle,
+            principal_id = %existing.id.as_str(),
+            trust = %existing.trust_level.class_tag(),
+            "admission served from local principal cache; skipping plugin fanout",
+        );
         return Ok((existing, flat));
     }
 

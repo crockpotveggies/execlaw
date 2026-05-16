@@ -238,15 +238,20 @@ fn merge_system_into_user(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
         return messages;
     }
     // Collect all leading system messages, then prepend their
-    // joined content into the first user message.
+    // joined content into the first user message. Vision content
+    // arrays in a System message are flattened to their text parts
+    // here (System currently never carries images in execlaw; this
+    // is defensive for future expansion).
+    use execlaw_inference_api::{ContentPart, MessageContent};
     let mut system_parts: Vec<String> = Vec::new();
     let mut iter = messages.into_iter().peekable();
     while let Some(m) = iter.peek() {
         if matches!(m.role, Role::System) {
             let m = iter.next().unwrap();
             if let Some(c) = m.content {
-                if !c.is_empty() {
-                    system_parts.push(c);
+                let text = c.as_text();
+                if !text.is_empty() {
+                    system_parts.push(text);
                 }
             }
         } else {
@@ -259,11 +264,20 @@ fn merge_system_into_user(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     }
     let merged = system_parts.join("\n\n");
     // Find the first user message and prepend; if there is none,
-    // create one (defensive — Gemma needs a user turn).
+    // create one (defensive — Gemma needs a user turn). When the
+    // first user message carries an image (Parts variant), the
+    // merged system prose is prepended as a leading text part so the
+    // image attachment survives.
     if let Some(first_user) = out.iter_mut().find(|m| matches!(m.role, Role::User)) {
         let new_content = match first_user.content.take() {
-            Some(orig) if !orig.is_empty() => format!("{merged}\n\n{orig}"),
-            _ => merged,
+            Some(MessageContent::Text(orig)) if !orig.is_empty() => {
+                MessageContent::Text(format!("{merged}\n\n{orig}"))
+            }
+            Some(MessageContent::Parts(mut parts)) => {
+                parts.insert(0, ContentPart::Text { text: merged });
+                MessageContent::Parts(parts)
+            }
+            _ => MessageContent::Text(merged),
         };
         first_user.content = Some(new_content);
     } else {
@@ -313,6 +327,7 @@ mod tests {
     use execlaw_inference_api::{ChatMessage, ChatResponse, Choice, ModelId, Role};
 
     fn resp_with_content(text: &str) -> ChatResponse {
+        use execlaw_inference_api::MessageContent;
         ChatResponse {
             id: "1".into(),
             model: "test-model".into(),
@@ -320,7 +335,7 @@ mod tests {
                 index: 0,
                 message: ChatMessage {
                     role: Role::Assistant,
-                    content: Some(text.into()),
+                    content: Some(MessageContent::Text(text.into())),
                     tool_call_id: None,
                     name: None,
                     tool_calls: vec![],
@@ -442,7 +457,7 @@ mod tests {
         let r = GemmaAdapter.prepare_request(req(), OutputHint::Conversation);
         assert_eq!(r.messages.len(), 1);
         assert!(matches!(r.messages[0].role, Role::User));
-        let body = r.messages[0].content.as_deref().unwrap();
+        let body = r.messages[0].content.as_ref().unwrap().as_text();
         assert!(body.contains("sys"));
         assert!(body.contains("hi"));
     }
@@ -457,7 +472,7 @@ mod tests {
         ];
         let r = GemmaAdapter.prepare_request(base, OutputHint::Conversation);
         assert_eq!(r.messages.len(), 1);
-        let body = r.messages[0].content.as_deref().unwrap();
+        let body = r.messages[0].content.as_ref().unwrap().as_text();
         assert!(body.contains("rule 1"));
         assert!(body.contains("rule 2"));
         assert!(body.contains("question"));

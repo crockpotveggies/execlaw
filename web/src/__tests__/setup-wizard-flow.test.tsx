@@ -372,13 +372,13 @@ describe("SetupWizard — multi-step flow", () => {
         // "fixed serving method" note instead.
         expect(screen.getByTestId("setup-backend-serving-fixed")).toBeInTheDocument();
         expect(screen.queryByTestId("setup-backend-serving-picker")).toBeNull();
-        // Model dropdown should include all five vLLM catalog
+        // Model dropdown should include all SIX vLLM catalog
         // entries because 24 GB fits the 20 GB Qwen 2.5 32B and
-        // the 18 GB Qwen 3.5 27B flagship.
+        // the 18 GB Qwen 3.6 27B flagship + Qwen 3.5 fallback.
         const modelSelect = screen.getByTestId(
             "setup-backend-model-select",
         ) as HTMLSelectElement;
-        expect(modelSelect.options.length).toBe(5);
+        expect(modelSelect.options.length).toBe(6);
         // Save → PUT with vLLM image + chosen model in args.
         fireEvent.click(screen.getByTestId("setup-backend-submit"));
         await waitFor(() => {
@@ -399,13 +399,14 @@ describe("SetupWizard — multi-step flow", () => {
         // The supervisor reads `gpu_vendor` from model_spec to pick
         // the device-passthrough strategy.
         expect(body.model_spec.gpu_vendor).toBe("nvidia");
-        // Wizard tracks the `nightly` vLLM tag because Qwen 3.5
-        // architecture support isn't in any stable cut yet.
-        expect(body.model_spec.image).toBe("vllm/vllm-openai:nightly");
+        // Wizard pins the stable v0.20.2 vLLM tag — `nightly` was
+        // retired 2026-05-12 after it shipped a hang for Qwen3
+        // tool-call requests.
+        expect(body.model_spec.image).toBe("vllm/vllm-openai:v0.20.2");
         // First option in the dropdown is the locked-decision
-        // Qwen 3.5 27B AWQ flagship.
+        // Qwen 3.6 27B AWQ flagship.
         expect(body.model_spec.args).toContain(
-            "--model=QuantTrio/Qwen3.5-27B-AWQ",
+            "--model=QuantTrio/Qwen3.6-27B-AWQ",
         );
     });
 
@@ -774,6 +775,212 @@ describe("SetupWizard — multi-step flow", () => {
         await waitFor(() => {
             expect(screen.getByTestId("setup-docker-recheck")).toBeInTheDocument();
         });
+    });
+
+    // ---- Apple Silicon / Ollama branch (Phase 14.G) -----------------
+
+    /// Common Apple-Silicon preflight body. Vary `ollama.available` per
+    /// test to exercise the install-prompt vs detected-badge branches.
+    function applePreflight(ollamaAvailable: boolean) {
+        return JSON.stringify({
+            // Docker is unreachable on a typical Mac without Docker
+            // Desktop — the Apple path doesn't need it, so the form
+            // must still surface the Apple GPU as a target.
+            docker: { available: false, version: null },
+            ollama: ollamaAvailable
+                ? {
+                      available: true,
+                      version: "0.1.43",
+                      path: "/opt/homebrew/bin/ollama",
+                  }
+                : { available: false, version: null, path: null },
+            gpus: [
+                {
+                    id: "0x106b:Apple M3 Pro",
+                    vendor: "Apple",
+                    pci_vendor_id: "0x106b",
+                    pci_device_id: "0x0000",
+                    device_files: [],
+                    kernel_card_index: 0,
+                    model_name: "Apple M3 Pro",
+                    memory_mb: 24576,
+                },
+            ],
+        });
+    }
+
+    it("apple silicon + ollama installed → shows detected badge and model picker", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/setup") return setupResponse();
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/setup/preflight") {
+                return new Response(applePreflight(true), { status: 200 });
+            }
+            return new Response("{}", { status: 200 });
+        });
+        mountWizard();
+        await fillAndSubmitAccount();
+        // Docker is unavailable on this fixture — wizard surfaces the
+        // missing-Docker step. Skip past it (Apple path doesn't need
+        // Docker).
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("setup-docker-missing"),
+            ).toBeInTheDocument();
+        });
+        fireEvent.click(screen.getByTestId("setup-docker-skip"));
+        await waitFor(() => {
+            expect(screen.getByTestId("setup-backend-form")).toBeInTheDocument();
+        });
+        // Two targets: Apple GPU + Remote (no NVIDIA/Intel because
+        // dockerAvailable=false, but Apple bypasses that gate).
+        const select = screen.getByTestId(
+            "setup-backend-target-select",
+        ) as HTMLSelectElement;
+        expect(select.options.length).toBe(2);
+        expect(select.options[0].textContent).toMatch(/Apple M3 Pro/);
+        // Ollama is installed → "detected" badge appears, install
+        // panel does not.
+        expect(
+            screen.getByTestId("setup-backend-ollama-detected"),
+        ).toBeInTheDocument();
+        expect(
+            screen.queryByTestId("setup-backend-ollama-install"),
+        ).toBeNull();
+        // Model picker IS rendered (the Apple-Ollama catalog has
+        // 4 entries; on a 24 GB Mac all four fit).
+        const modelSelect = screen.getByTestId(
+            "setup-backend-model-select",
+        ) as HTMLSelectElement;
+        expect(modelSelect.options.length).toBe(4);
+        // Save is enabled.
+        const submit = screen.getByTestId(
+            "setup-backend-submit",
+        ) as HTMLButtonElement;
+        expect(submit.disabled).toBe(false);
+    });
+
+    it("apple silicon + ollama missing → shows install panel and disables save", async () => {
+        fetchMock.mockImplementation(async (url: string) => {
+            if (url === "/api/setup") return setupResponse();
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/setup/preflight") {
+                return new Response(applePreflight(false), { status: 200 });
+            }
+            return new Response("{}", { status: 200 });
+        });
+        mountWizard();
+        await fillAndSubmitAccount();
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("setup-docker-missing"),
+            ).toBeInTheDocument();
+        });
+        fireEvent.click(screen.getByTestId("setup-docker-skip"));
+        await waitFor(() => {
+            expect(screen.getByTestId("setup-backend-form")).toBeInTheDocument();
+        });
+        // Apple GPU still appears as a target — the form doesn't
+        // hide it just because Ollama isn't installed; instead it
+        // surfaces the install panel so the operator knows what
+        // to do.
+        const select = screen.getByTestId(
+            "setup-backend-target-select",
+        ) as HTMLSelectElement;
+        expect(select.options[0].textContent).toMatch(/Apple M3 Pro/);
+        // Install panel renders, detected badge does not.
+        expect(
+            screen.getByTestId("setup-backend-ollama-install"),
+        ).toBeInTheDocument();
+        expect(
+            screen.queryByTestId("setup-backend-ollama-detected"),
+        ).toBeNull();
+        // brew install copy is present so the operator can copy/paste.
+        expect(
+            screen.getByText(/brew install ollama/),
+        ).toBeInTheDocument();
+        // Model picker is HIDDEN until Ollama is detected — avoids
+        // an operator picking a model into a spec the supervisor
+        // can't spawn.
+        expect(
+            screen.queryByTestId("setup-backend-model-select"),
+        ).toBeNull();
+        // Save is disabled because Ollama isn't available.
+        const submit = screen.getByTestId(
+            "setup-backend-submit",
+        ) as HTMLButtonElement;
+        expect(submit.disabled).toBe(true);
+    });
+
+    it("apple silicon save emits native-runtime envelope (no image, runtime/binary_hint set)", async () => {
+        fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+            calls.push({ url, init });
+            if (url === "/api/setup") return setupResponse();
+            if (url === "/api/admin/me") return meResponse();
+            if (url === "/api/admin/setup/preflight") {
+                return new Response(applePreflight(true), { status: 200 });
+            }
+            if (
+                url === "/api/admin/backends/Standard" &&
+                init?.method === "PUT"
+            ) {
+                return new Response(
+                    JSON.stringify({
+                        purpose: "Standard",
+                        inference_backend: "service-ollama",
+                        model_spec: {},
+                        gpu_id: null,
+                        endpoint: null,
+                        notes: null,
+                        reasoning_enabled: false,
+                        supports_reasoning_toggle: true,
+                        mode: "managed",
+                        created_at: 0,
+                        updated_at: 0,
+                    }),
+                    { status: 200 },
+                );
+            }
+            return new Response("{}", { status: 200 });
+        });
+        mountWizard();
+        await fillAndSubmitAccount();
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("setup-docker-missing"),
+            ).toBeInTheDocument();
+        });
+        fireEvent.click(screen.getByTestId("setup-docker-skip"));
+        await waitFor(() => {
+            expect(screen.getByTestId("setup-backend-form")).toBeInTheDocument();
+        });
+        fireEvent.click(screen.getByTestId("setup-backend-submit"));
+        // Wizard advances to chat shell on success.
+        await waitFor(() => {
+            expect(screen.getByTestId("chat-shell")).toBeInTheDocument();
+        });
+        const put = calls.find(
+            (c) =>
+                c.url === "/api/admin/backends/Standard" &&
+                c.init?.method === "PUT",
+        )!;
+        expect(put).toBeDefined();
+        const body = JSON.parse((put.init?.body as string) ?? "{}");
+        expect(body.mode).toBe("managed");
+        expect(body.inference_backend).toBe("service-ollama");
+        // gpu_id is null — Ollama discovers Metal on its own.
+        expect(body.gpu_id).toBeNull();
+        // The native-runtime envelope: no `image`, but `runtime`
+        // and `binary_hint` set. The supervisor's spec_from_row
+        // routes this to NativeServiceController.
+        expect(body.model_spec.runtime).toBe("native");
+        expect(body.model_spec.binary_hint).toBe("ollama");
+        expect(body.model_spec.image).toBeUndefined();
+        expect(body.model_spec.container_port).toBe(11434);
+        // Default model from the curated catalog (largest that fits).
+        expect(body.model_spec.model).toMatch(/^qwen2\.5:/);
+        // `serve` is the only CLI arg `ollama serve` needs.
+        expect(body.model_spec.args).toEqual(["serve"]);
     });
 
     // Smoke check that the recordedFetch helper compiles + the mocks

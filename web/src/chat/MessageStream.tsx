@@ -4,30 +4,48 @@
 // already at the bottom. When the operator has scrolled up to read
 // history, incoming messages no longer yank the viewport — instead
 // a small ↓ button surfaces above the composer; clicking it snaps
-// to the latest. Long messages get a fixed-height clamp +
-// "Read more…" affordance per the Phase-6 truncation spec. Each
-// bubble also renders a subtle channel-origin icon (signal / email
-// / voice) so the controller can see at a glance which transport
-// delivered the message.
+// to the latest. Long messages render in full — no clamp, no
+// "Read more…" affordance (the Phase-6 truncation spec was reverted
+// 2026-05-15: in practice, a click-to-expand hides important
+// context behind a friction the operator never asked for, and the
+// drafted long-form replies the agent produces are exactly the
+// content the operator wants to read inline). Each bubble also
+// renders a subtle channel-origin icon (signal / email / voice) so
+// the controller can see at a glance which transport delivered the
+// message.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+    useCallback,
+    useContext,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+} from "react";
 import type { MessageView } from "../api/endpoints";
+import { AuthContext } from "../auth/AuthContext";
 import { getCardRenderer } from "../cards/CardRenderer";
 import { useCardsForConversation } from "../cards/cardStore";
 import type { Card } from "../cards/types";
 import { ChannelIcon } from "../components/ChannelIcons";
 import { MarkdownContent } from "../components/MarkdownContent";
 import { ToolActivityPill } from "./ToolActivityPill";
+import {
+    detectChatComponent,
+    getChatComponent,
+} from "./chatComponentRegistry";
+// Side-effect imports — each module self-registers its renderer with
+// the chat-component registry at module-load. Listed here so the
+// bundler keeps them in the SPA build; without this they'd be tree-
+// shaken since no symbol from them is referenced directly.
+import "./components/ChartInlineComponent";
+import "./components/WeatherCurrentComponent";
+import "./components/WeatherDailyComponent";
 import { useChatState } from "./store";
 
 interface Props {
     conversationId: string;
 }
-
-/** Lines past which the bubble truncates with a "Read more…" toggle. */
-const TRUNCATE_LINES = 12;
-/** Char heuristic — fall back to length when the line count is hard to gauge. */
-const TRUNCATE_CHARS = 1200;
 
 /** Pixel slack on the at-bottom check. Browsers can leave a fractional
  *  gap between scrollTop+clientHeight and scrollHeight even when the
@@ -223,14 +241,45 @@ export function MessageStream({ conversationId }: Props) {
 }
 
 function MessageBubble({ message }: { message: MessageView }) {
+    // 2026-05-15 — read AuthContext directly (not via the `useAuth()`
+    // wrapper that throws when there's no provider). MessageStream
+    // unit tests render the component in isolation without an
+    // `<AuthProvider>`; gracefully degrading to `null` keeps those
+    // tests passing — the only consequence is that the access-token
+    // query param on `<img>` attachment URLs is absent, which would
+    // 401 against the live server but doesn't affect those tests.
+    const auth = useContext(AuthContext);
     const role = roleFor(message);
-    const text = message.text ?? renderToolFallback(message);
+    // 2026-05-15 — when the operator picked a skill from the
+    // composer's `+` menu, the server prepended a `<skill
+    // name="...">...</skill>\n\n` block onto the user_msg text
+    // before the model saw it. Strip those blocks here so the chat
+    // bubble shows only what the operator actually typed; the
+    // skills surface as chips below the bubble instead. Stripping
+    // is keyed off `applied_skill_names` being non-empty so we
+    // never accidentally trim text the user actually typed that
+    // happens to start with `<skill ...>`.
+    const appliedSkills = message.applied_skill_names ?? [];
+    const rawText = message.text ?? renderToolFallback(message);
+    const text =
+        appliedSkills.length > 0
+            ? stripSkillPrependBlock(rawText)
+            : rawText;
     const channelOrigin = readChannelOrigin(message);
-    const lines = text.split("\n").length;
-    const isLong = lines > TRUNCATE_LINES || text.length > TRUNCATE_CHARS;
-    const [expanded, setExpanded] = useState(false);
 
-    const display = isLong && !expanded ? clamp(text, TRUNCATE_LINES, TRUNCATE_CHARS) : text;
+    // Long messages render in full — see the file-header note for
+    // why we dropped the Phase-6 clamp + "Read more" affordance.
+
+    // Rich tool-result rendering: if a tool_result message's payload
+    // is JSON carrying a `chat_component_kind` marker and a renderer
+    // is registered for that kind, render via the chat-component
+    // registry instead of dumping raw JSON. Falls back to plain text
+    // for unknown kinds or non-JSON payloads.
+    const chatComponent =
+        message.kind === "tool_result" ? detectChatComponent(text) : null;
+    const ChatComponentRenderer = chatComponent
+        ? getChatComponent(chatComponent.kind)
+        : undefined;
 
     // 2026-04-28 — meta-line cleanup:
     //   * Hide the channel-origin icon for the default `web` origin
@@ -256,6 +305,17 @@ function MessageBubble({ message }: { message: MessageView }) {
     const isUserMessage = message.kind === "user_msg";
     const showMeta = !isUserMessage || channelOrigin !== "web";
 
+    // 2026-05-15 — image attachments. The server emits these on
+    // user_msg events the operator submitted through the composer's
+    // `+` menu. Each entry has an `id` and `mime`; the id is either:
+    //   * a persisted attachment id (server-minted) → served via
+    //     `/api/attachments/<id>` and gated by the auth cookie /
+    //     bearer the SPA already holds, OR
+    //   * a `data:` URL when the entry is still optimistic (the SPA
+    //     just sent it; canonical id arrives once listMessages
+    //     refetches). The `<img>` accepts both verbatim.
+    const attachments = message.attachments ?? [];
+
     return (
         <div
             className={"execlaw-msg" + (isUserMessage ? " is-user" : "")}
@@ -274,31 +334,78 @@ function MessageBubble({ message }: { message: MessageView }) {
                     "execlaw-msg__bubble" +
                     (isUserMessage ? " is-user" : "") +
                     (isToolKind(message.kind) ? " is-tool" : "") +
-                    (isLong && !expanded ? " is-clamped" : "")
+                    (ChatComponentRenderer ? " is-rich-component" : "")
                 }
-                data-testid={isLong ? "msg-truncated" : undefined}
             >
-                {/* Tool messages are JSON / monospace dumps — render
-                    as raw text. Everything else (agent + user) goes
-                    through the markdown pipeline so headings, lists,
-                    code blocks, links, tables etc. render properly.
-                    Markdown inside fenced code blocks is preserved
-                    as literal text (remark's default). */}
-                {isToolKind(message.kind) ? (
-                    display
-                ) : (
-                    <MarkdownContent text={display} />
+                {attachments.length > 0 && (
+                    <div
+                        className="execlaw-msg__attachments"
+                        data-testid="message-attachments"
+                    >
+                        {attachments.map((a) => {
+                            // 2026-05-15 — `<img>` tags can't attach
+                            // the SPA's Authorization: Bearer header,
+                            // so a plain `/api/attachments/{id}` src
+                            // gets blocked by `AuthedUser` and the
+                            // browser falls back to the alt text.
+                            // The auth extractor supports a
+                            // `?access_token=<jwt>` query fallback
+                            // specifically for browser-direct GETs;
+                            // we use it here for persisted ids.
+                            // Optimistic data URLs (in-flight upload)
+                            // are still rendered verbatim.
+                            const src = a.id.startsWith("data:")
+                                ? a.id
+                                : buildAttachmentSrc(
+                                      a.id,
+                                      auth?.getAccessToken() ?? null,
+                                  );
+                            return (
+                                <img
+                                    key={a.id}
+                                    src={src}
+                                    alt="attached image"
+                                    className="execlaw-msg__attachment-image"
+                                />
+                            );
+                        })}
+                    </div>
                 )}
-                {isLong && (
-                    <div className="mt-2">
-                        <button
-                            type="button"
-                            className="btn btn-link btn-sm p-0 execlaw-muted"
-                            onClick={() => setExpanded((v) => !v)}
-                            data-testid="msg-read-more"
-                        >
-                            {expanded ? "Show less" : "Read more…"}
-                        </button>
+                {/* Tool messages are JSON / monospace dumps by default —
+                    render as raw text. Exception: when the payload
+                    carries a `chat_component_kind` marker AND a
+                    matching renderer is registered (open-meteo's
+                    weather / chart components), dispatch to the
+                    component instead. Everything else (agent + user)
+                    goes through the markdown pipeline. */}
+                {text.length > 0 &&
+                    (ChatComponentRenderer && chatComponent ? (
+                        <ChatComponentRenderer data={chatComponent.data} />
+                    ) : isToolKind(message.kind) ? (
+                        text
+                    ) : (
+                        <MarkdownContent text={text} />
+                    ))}
+                {appliedSkills.length > 0 && (
+                    <div
+                        className="execlaw-msg__applied-skills"
+                        data-testid="message-applied-skills"
+                    >
+                        <i className="bi bi-stars" aria-hidden />
+                        <span className="execlaw-msg__applied-skills-label">
+                            applied:
+                        </span>
+                        {appliedSkills.map((name, i) => (
+                            <span
+                                key={name}
+                                className="execlaw-msg__applied-skill-chip"
+                                data-testid="message-applied-skill"
+                                data-skill-name={name}
+                            >
+                                {name}
+                                {i < appliedSkills.length - 1 ? "," : ""}
+                            </span>
+                        ))}
                     </div>
                 )}
             </div>
@@ -306,13 +413,35 @@ function MessageBubble({ message }: { message: MessageView }) {
     );
 }
 
-function clamp(text: string, lineLimit: number, charLimit: number): string {
-    const lines = text.split("\n");
-    let out = lines.slice(0, lineLimit).join("\n");
-    if (out.length > charLimit) {
-        out = out.slice(0, charLimit);
-    }
-    return out + "…";
+/// Strip the leading `<skill name="...">...</skill>` blocks the
+/// server prepends onto a user_msg when the operator picked skills
+/// from the composer's `+` menu. The block format is fixed:
+///
+/// ```text
+/// <skill name="ns/short">
+/// {body}
+/// </skill>
+///
+/// {original user text}
+/// ```
+///
+/// We match one OR MORE leading blocks (multi-skill picks) followed
+/// by any blank lines, then return whatever's left. Caller only
+/// invokes this when `applied_skill_names` is non-empty so we never
+/// trim text the user typed that happens to look like a skill
+/// block.
+export function stripSkillPrependBlock(text: string): string {
+    // Greedy match for any number of consecutive `<skill name="X">
+    // ... </skill>` blocks at the very start of the text, plus any
+    // trailing whitespace before the user's actual content. The
+    // `[\s\S]*?` (non-greedy) inside each block stops at the first
+    // `</skill>` so we don't accidentally swallow user text that
+    // contains the literal substring.
+    const stripped = text.replace(
+        /^(<skill name="[^"]*">[\s\S]*?<\/skill>\s*)+/,
+        "",
+    );
+    return stripped;
 }
 
 function readChannelOrigin(m: MessageView): ChannelOrigin {
@@ -362,4 +491,17 @@ function isToolKind(kind: string): boolean {
 
 function renderToolFallback(m: MessageView): string {
     return `[${m.kind} (no text payload)]`;
+}
+
+/// Build an `/api/attachments/<id>` URL with the access token in the
+/// query string. The auth extractor (`AuthedUser`) accepts
+/// `?access_token=<jwt>` as a fallback for browser-direct GETs like
+/// `<img>` tags, which can't carry an Authorization: Bearer header.
+/// A null token (e.g. just-rotated, render before refresh lands)
+/// falls back to the bare URL — the request will 401, the `<img>`
+/// shows alt text briefly, and the next render after token rotation
+/// re-renders with the new token.
+function buildAttachmentSrc(id: string, token: string | null): string {
+    const path = `/api/attachments/${encodeURIComponent(id)}`;
+    return token ? `${path}?access_token=${encodeURIComponent(token)}` : path;
 }

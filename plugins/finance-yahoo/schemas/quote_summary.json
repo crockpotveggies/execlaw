@@ -1,0 +1,32 @@
+{
+    "type": "object",
+    "properties": {
+        "symbol": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Ticker symbol — equity (`AAPL`), ETF (`SPY`), or index (`^DJI`)."
+        },
+        "modules": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "enum": [
+                    "summaryDetail",
+                    "assetProfile",
+                    "price",
+                    "defaultKeyStatistics",
+                    "financialData",
+                    "earnings",
+                    "summaryProfile",
+                    "calendarEvents",
+                    "incomeStatementHistory",
+                    "balanceSheetHistory",
+                    "cashflowStatementHistory"
+                ]
+            },
+            "description": "Which Yahoo quoteSummary modules to fetch. Default is a useful subset for chat — summaryDetail (price metadata), assetProfile (sector/industry/business summary), price (display name), defaultKeyStatistics (beta, share counts). Add more sparingly — each module enlarges the response."
+        }
+    },
+    "required": ["symbol"],
+    "additionalProperties": false
+}

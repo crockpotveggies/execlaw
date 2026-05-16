@@ -644,6 +644,7 @@ fn build_presets_response(
             GpuVendor::Nvidia => "nvidia",
             GpuVendor::Intel => "intel",
             GpuVendor::Amd => "amd",
+            GpuVendor::Apple => "apple",
             GpuVendor::Unknown => continue,
         };
         if !detected_str.iter().any(|existing| existing == s) {
@@ -707,11 +708,169 @@ pub fn backends_router() -> Router<AppState> {
             put(upsert_handler).delete(clear_handler),
         )
         .route("/api/admin/backends/{purpose}/status", get(status_handler))
+        .route(
+            "/api/admin/backends/{purpose}/capabilities",
+            get(capabilities_handler),
+        )
         .route("/api/admin/backends/{purpose}/logs", get(logs_handler))
         .route(
             "/api/admin/backends/{purpose}/restart",
             post(restart_handler),
         )
+}
+
+/// Runtime-detected capabilities for a backend purpose. The SPA reads
+/// this on chat-shell mount to decide whether to surface the image-
+/// attach affordance in the Composer. The probe hits
+/// `GET /v1/models` on the resolved inference endpoint to discover
+/// the model id loaded server-side, then applies the curated
+/// `is_known_multimodal_model` pattern matcher. Errors fall through
+/// as `reachable: false`, which the SPA renders as "no probe yet —
+/// no image affordance" rather than a hard failure.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BackendCapabilitiesResponse {
+    pub purpose: String,
+    /// Endpoint we probed. Useful for the SPA's debug surface — an
+    /// operator can see whether the probe hit the managed-supervisor
+    /// URL vs the operator-typed external URL.
+    pub endpoint: Option<String>,
+    /// Was the `/v1/models` call reachable AND non-error? When false
+    /// the SPA assumes no multimodal support (graceful degradation).
+    pub reachable: bool,
+    /// First model id reported by the backend's `/v1/models` data
+    /// array. None when the probe didn't land or the list was empty.
+    pub model_id: Option<String>,
+    /// True when `model_id` matches a known vision-capable family.
+    pub multimodal: bool,
+    /// 2026-05-15 — SPA target for the long-edge dimension after
+    /// client-side downscale. Picked from the host's detected VRAM:
+    ///   * < 32 GB on any single GPU → 1024 px (24 GB-class card —
+    ///     KV cache is tight enough that 1 K vision tokens per image
+    ///     is the right trade).
+    ///   * 32–64 GB → 1536 px (most operators land here on the
+    ///     L40-class card the project ships against).
+    ///   * ≥ 64 GB → 2048 px (H100 / multi-A100, no practical
+    ///     ceiling on a single image's token cost).
+    /// Non-multimodal backends always return 0 — there's nothing to
+    /// downscale to and the SPA shouldn't surface the affordance.
+    pub recommended_image_edge: u32,
+    /// One-line operator-facing diagnostic when the probe didn't
+    /// succeed — e.g. "endpoint not configured", "HTTP 503", "decode
+    /// error: …". Empty string on success.
+    pub error: String,
+}
+
+/// Pick the SPA's downscale target from the host's detected VRAM.
+/// Conservative: when we can't read GPU memory at all, we assume a
+/// 24 GB-class card and return 1024 so an operator on a 4090 / 3090
+/// doesn't blow their KV-cache budget on a single 4 K image.
+fn recommended_image_edge_for_host() -> u32 {
+    let profile = execlaw_container_manager::detect();
+    let max_vram_gb: u64 = profile
+        .gpus
+        .iter()
+        .filter_map(|g| g.memory_mb)
+        .max()
+        .map(|mb| mb / 1024)
+        .unwrap_or(0);
+    if max_vram_gb >= 64 {
+        2048
+    } else if max_vram_gb >= 32 {
+        1536
+    } else {
+        1024
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/admin/backends/{purpose}/capabilities",
+    params(("purpose" = String, Path, description = "Backend purpose")),
+    responses(
+        (status = 200, description = "Runtime capability probe", body = BackendCapabilitiesResponse),
+        (status = 400, description = "Unknown purpose"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "backends"
+)]
+pub async fn capabilities_handler(
+    State(state): State<AppState>,
+    _user: AuthedUser,
+    AxumPath(purpose): AxumPath<String>,
+) -> Result<Json<BackendCapabilitiesResponse>, ApiError> {
+    let purpose = BackendPurpose::parse(&purpose).ok_or_else(|| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        code: "unknown_purpose",
+        message: format!("'{purpose}' is not a recognised backend purpose"),
+    })?;
+
+    // Resolve the live endpoint the same way the chat path does —
+    // managed-mode rows pick up the supervisor-written URL, external
+    // rows pick up the operator-typed value. A purpose that has no
+    // row at all returns `reachable=false` so the SPA's hooks can
+    // surface "not configured" without crashing.
+    let resolved = state.inference.resolve(&state.db, purpose);
+    let endpoint = resolved.as_ref().map(|r| r.endpoint.clone());
+    let Some(resolved) = resolved else {
+        return Ok(Json(BackendCapabilitiesResponse {
+            purpose: purpose.as_str().to_owned(),
+            endpoint: None,
+            reachable: false,
+            model_id: None,
+            multimodal: false,
+            recommended_image_edge: 0,
+            error: "endpoint not configured".to_owned(),
+        }));
+    };
+
+    let host_edge = recommended_image_edge_for_host();
+
+    match resolved.client.list_models().await {
+        Ok(list) => {
+            // Prefer the model id the resolver paired with this row
+            // (it's the source of truth for what we ship to
+            // /chat/completions). Fall back to the first /v1/models
+            // entry when the resolver returned an empty model id.
+            let resolver_model = resolved.model_id.trim().to_owned();
+            let probe_model = list.data.first().map(|m| m.id.clone());
+            let model_id = if !resolver_model.is_empty() {
+                Some(resolver_model)
+            } else {
+                probe_model.clone()
+            };
+            let multimodal = match (model_id.as_deref(), probe_model.as_deref()) {
+                (Some(id), _) => execlaw_inference_api::is_known_multimodal_model(id),
+                (None, Some(id)) => execlaw_inference_api::is_known_multimodal_model(id),
+                _ => false,
+            };
+            Ok(Json(BackendCapabilitiesResponse {
+                purpose: purpose.as_str().to_owned(),
+                endpoint,
+                reachable: true,
+                model_id,
+                multimodal,
+                recommended_image_edge: if multimodal { host_edge } else { 0 },
+                error: String::new(),
+            }))
+        }
+        Err(e) => {
+            let multimodal = execlaw_inference_api::is_known_multimodal_model(&resolved.model_id);
+            Ok(Json(BackendCapabilitiesResponse {
+                purpose: purpose.as_str().to_owned(),
+                endpoint,
+                reachable: false,
+                model_id: Some(resolved.model_id.clone()).filter(|s| !s.is_empty()),
+                // Fall back to id-only check when the probe didn't
+                // land but the resolver had a model id from the row
+                // spec — an operator who saved Qwen3.6 still gets the
+                // attach affordance even if the backend is briefly
+                // unreachable.
+                multimodal,
+                recommended_image_edge: if multimodal { host_edge } else { 0 },
+                error: format!("probe failed: {e}"),
+            }))
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1921,6 +1921,397 @@ impl ToolImpl for SendAttachmentTool {
 }
 
 // ---------------------------------------------------------------
+// chart.render — pure-Rust Vega-Lite-ish chart renderer.
+//
+// 2026-05-15 — promoted from the open-meteo plugin's
+// `open_meteo.render_chart` to a native built-in. The
+// implementation was already 100% native (the plugin just called
+// `host_render_chart` which lived in the script-tier); the only
+// reason it lived as a plugin tool was that built-ins had no way
+// to produce attachments. With `AttachmentApi::create_artifact`
+// (added the same day) that gap closes and the tool moves where
+// it belongs — every plugin that wants to chart its data can now
+// route through one tool name (`chart.render`) instead of
+// re-exposing it under a per-plugin namespace.
+//
+// The renderer accepts a structured spec (line / bar / area /
+// scatter, optional band overlay, optional time axis) and
+// produces both an inline SVG (for the SPA's chat-component
+// dispatcher) and a PNG attachment (for transport fan-out via
+// `send_attachment` or a channel's `send_with_attachments`). The
+// SVG is returned in the tool result; the PNG is persisted as a
+// state_artifacts row whose `attachment_id` flows into downstream
+// tool calls.
+// ---------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct RenderChartArgs {
+    /// Operator-friendly spec — flattened from the open-meteo
+    /// `render_chart_impl` shape so plugin authors can copy-paste
+    /// their existing builders. Forwarded verbatim to the
+    /// charting crate's `serde_json::from_value::<ChartSpec>`.
+    #[serde(flatten)]
+    spec: serde_json::Value,
+    /// Canvas width in px. Clamped to [240, 2400]; 0 / missing
+    /// uses the renderer's default (720).
+    #[serde(default)]
+    width: Option<u32>,
+    /// Canvas height in px. Clamped to [240, 2400]; 0 / missing
+    /// uses the renderer's default (400).
+    #[serde(default)]
+    height: Option<u32>,
+    /// Filename for the PNG attachment (operator's save-as
+    /// dialog). Default `"chart.png"`.
+    #[serde(default)]
+    filename: Option<String>,
+    /// How long the PNG artifact lives before the ephemeral
+    /// sweeper removes it. `None` / 0 = keep forever; positive =
+    /// seconds. Default 7 days.
+    #[serde(default)]
+    ttl_seconds: Option<i64>,
+}
+
+const RENDER_CHART_MIN_DIM: u32 = 240;
+const RENDER_CHART_MAX_DIM: u32 = 2400;
+const RENDER_CHART_DEFAULT_TTL_SECS: i64 = 7 * 86400;
+
+fn clamp_render_chart_dim(value: Option<u32>, default: u32) -> u32 {
+    let v = value.unwrap_or(0);
+    if v == 0 {
+        default
+    } else {
+        v.clamp(RENDER_CHART_MIN_DIM, RENDER_CHART_MAX_DIM)
+    }
+}
+
+/// 2026-05-16 — workaround for the "JSON-string-inside-JSON" LLM
+/// failure mode on `chart.render`. Walks the spec and re-parses any
+/// stringified value for fields that should be an array or nested
+/// object. Mutates in place; missing fields and already-typed values
+/// are left untouched. Bad JSON is also left untouched (the
+/// downstream `serde_json::from_value::<ChartSpec>` will surface a
+/// clean error).
+///
+/// Fields that have been observed in the wild as stringified:
+///   * `series` — array of `{ name, points: [{ x, y }] }`
+///   * `band.low` / `band.high` — point arrays (ensemble fans)
+///
+/// New fields with the same risk should be added here as they
+/// appear; the helper is a tight defensive layer, not an attempt
+/// to be schema-aware.
+fn defensive_unstringify_spec_fields(spec: &mut Value) {
+    let Some(map) = spec.as_object_mut() else {
+        return;
+    };
+    if let Some(v) = map.get_mut("series") {
+        defensive_reparse_string_value(v);
+    }
+    if let Some(band) = map.get_mut("band") {
+        // band itself can also arrive stringified (less common but
+        // same failure mode). Re-parse the wrapper first.
+        defensive_reparse_string_value(band);
+        if let Some(band_map) = band.as_object_mut() {
+            if let Some(v) = band_map.get_mut("low") {
+                defensive_reparse_string_value(v);
+            }
+            if let Some(v) = band_map.get_mut("high") {
+                defensive_reparse_string_value(v);
+            }
+        }
+    }
+}
+
+/// If `v` is a string that parses as JSON, replace it with the
+/// parsed value. Otherwise leave it alone.
+///
+/// 2026-05-16 — uses `Deserializer::from_str(...).into_iter::<Value>()`
+/// instead of strict `serde_json::from_str` so we accept "almost-valid
+/// JSON with extra trailing garbage" — the second observed live
+/// failure mode (NVDA chart turn). The model emitted
+///   `series = "[{...}]}"`   (one extra `}` after the array close)
+/// which `serde_json::from_str` rejects with `Extra data: line 1
+/// column N`. Streaming via `into_iter().next()` consumes the FIRST
+/// complete JSON value and stops — the trailing `}` is ignored.
+/// Equivalent to "be liberal in what you accept" without giving up
+/// the safety of a real JSON parser.
+fn defensive_reparse_string_value(v: &mut Value) {
+    let Some(s) = v.as_str() else {
+        return;
+    };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let mut iter = serde_json::Deserializer::from_str(trimmed).into_iter::<Value>();
+    if let Some(Ok(parsed)) = iter.next() {
+        *v = parsed;
+    }
+    // Else: leave the string in place so the downstream
+    // `from_value::<ChartSpec>` produces a meaningful error.
+}
+
+pub struct RenderChartTool {
+    descriptor: ToolDescriptor,
+}
+
+impl Default for RenderChartTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RenderChartTool {
+    pub fn new() -> Self {
+        // Schema mirrors the original `plugins/open-meteo/schemas/render_chart.json`.
+        // Kept here in code rather than as a sidecar JSON file so the
+        // built-in catalog stays self-contained (the same pattern
+        // the other built-ins follow).
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Chart title rendered at the top of the SVG/PNG."
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["line", "bar", "area", "scatter"],
+                    "description": "Default \"line\"."
+                },
+                "x_label": { "type": "string" },
+                "y_label": { "type": "string" },
+                "y_unit": {
+                    "type": "string",
+                    "description": "Suffix appended to y-axis tick labels (e.g. \"°C\", \" mm\")."
+                },
+                "time_axis": {
+                    "type": "boolean",
+                    "description": "When true, x-values are interpreted as Unix-milliseconds and the axis renders as HH:MM / MMM-DD."
+                },
+                "series": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "points": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "x": { "type": "number" },
+                                        "y": { "type": "number" }
+                                    },
+                                    "required": ["x", "y"]
+                                }
+                            },
+                            "color": {
+                                "type": "array",
+                                "items": { "type": "integer", "minimum": 0, "maximum": 255 },
+                                "minItems": 3,
+                                "maxItems": 3
+                            }
+                        },
+                        "required": ["name", "points"]
+                    }
+                },
+                "band": {
+                    "type": "object",
+                    "description": "Optional probability / range overlay (ensemble fans).",
+                    "properties": {
+                        "low":  { "type": "array" },
+                        "high": { "type": "array" },
+                        "color": {
+                            "type": "array",
+                            "items": { "type": "integer", "minimum": 0, "maximum": 255 },
+                            "minItems": 3,
+                            "maxItems": 3
+                        }
+                    },
+                    "required": ["low", "high"]
+                },
+                "width":  { "type": "integer", "minimum": 240, "maximum": 2400 },
+                "height": { "type": "integer", "minimum": 240, "maximum": 2400 },
+                "filename": { "type": "string" },
+                "ttl_seconds": { "type": "integer", "minimum": 0 }
+            }
+        });
+        Self {
+            descriptor: ToolDescriptor {
+                name: "chart.render".into(),
+                // Keep tight — every byte ships in the per-turn tool
+                // catalog. Load-bearing signals only:
+                //   1. fetch real data FIRST with another tool (was
+                //      missing; agent hallucinated stock prices)
+                //   2. never invent points
+                //   3. don't recap the data in text after rendering
+                // Arg shape lives in the schema; the model reads
+                // both. Concrete fetch examples (yahoo_finance,
+                // open_meteo, etc.) are visible in the catalog —
+                // listing them here is redundant.
+                description: concat!(
+                    "Render a line/bar/area/scatter chart from `series: [{name, points: [{x, y}]}]`; ",
+                    "set `time_axis: true` when x is Unix-ms. Returns inline SVG + a PNG attachment_id.\n",
+                    "FETCH REAL DATA FIRST via the appropriate tool (stock/weather/web/etc.) — ",
+                    "NEVER invent points. After it renders, your reply should be one short line of ",
+                    "context, not a recap of what the chart shows."
+                ).into(),
+                schema,
+                source: ToolSource::Builtin,
+                latency: ToolLatency::Low,
+                capabilities: vec![Capability::AttachmentSend],
+                default_allowed_classes: default_allowed_for_attachment_send(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl ToolImpl for RenderChartTool {
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
+    async fn invoke(&self, ctx: ToolCtx, args: Value) -> ToolOutcome {
+        let parsed: RenderChartArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolOutcome::err("invalid_argument", e.to_string()),
+        };
+        let api = match ctx.attachments.as_ref() {
+            Some(a) => a,
+            None => {
+                return ToolOutcome::denied("attachment_send capability not granted to this tool");
+            }
+        };
+        // Decode the spec via the charting crate's own ChartSpec
+        // shape — flattening the operator-supplied JSON into the
+        // renderer's struct so unsupported fields surface a clear
+        // error instead of being silently dropped.
+        //
+        // 2026-05-16 — defense against the "JSON-string-inside-JSON"
+        // LLM failure mode. Models occasionally emit
+        //   `"series": "[{...}]"`  (string containing JSON)
+        // instead of
+        //   `"series": [{...}]`    (actual array)
+        // when they get confused about nesting. The first observed
+        // case was a Signal-channel TSLA chart turn — the same
+        // prompt rendered fine on the web channel but failed on
+        // Signal because the model emitted a different shape.
+        // Pre-parse string-shaped values for the array/object fields
+        // that can plausibly arrive stringified, so a one-off LLM
+        // mistake doesn't kill the whole render.
+        let mut spec_value = parsed.spec.clone();
+        defensive_unstringify_spec_fields(&mut spec_value);
+        let spec: execlaw_charting::ChartSpec = match serde_json::from_value(spec_value) {
+            Ok(s) => s,
+            Err(e) => {
+                return ToolOutcome::err(
+                    "invalid_spec",
+                    format!("chart.render: invalid spec: {e}"),
+                );
+            }
+        };
+        let width = clamp_render_chart_dim(parsed.width, execlaw_charting::DEFAULT_WIDTH);
+        let height = clamp_render_chart_dim(parsed.height, execlaw_charting::DEFAULT_HEIGHT);
+        // Plotters renders are 1-20ms in practice; keep it inline.
+        let svg = match execlaw_charting::render_to_svg(&spec, width, height) {
+            Ok(s) => s,
+            Err(e) => {
+                return ToolOutcome::err("render_failed", format!("chart.render: svg: {e}"));
+            }
+        };
+        let png = match execlaw_charting::render_to_png(&spec, width, height) {
+            Ok(p) => p,
+            Err(e) => {
+                return ToolOutcome::err("render_failed", format!("chart.render: png: {e}"));
+            }
+        };
+        let filename = parsed
+            .filename
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("chart.png")
+            .to_owned();
+        // TTL: None / 0 = renderer's default (7d). Positive = explicit seconds.
+        let ttl = match parsed.ttl_seconds {
+            None => Some(RENDER_CHART_DEFAULT_TTL_SECS),
+            Some(0) => None,
+            Some(n) if n > 0 => Some(n),
+            Some(neg) => {
+                return ToolOutcome::err(
+                    "invalid_argument",
+                    format!("chart.render: ttl_seconds must be >= 0 (got {neg})"),
+                );
+            }
+        };
+        // Pull a "title" hint out of the spec so the card shows
+        // something better than the filename when the model
+        // supplied one. Best-effort string read, no validation —
+        // the chart renderer already validated it.
+        let title_for_card: Option<String> = parsed
+            .spec
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        match api.create_artifact(&filename, "image/png", png, ttl).await {
+            Ok(view) => {
+                // 2026-05-16 — emit a Chart card so the SPA's
+                // proven cards-projection path renders the chart
+                // inline. The chat-component-inline path
+                // (`chat_component_kind: "chart"` in the
+                // tool_result) was unreliable in practice — the
+                // card path is what deep-research and
+                // send_attachment use, and they work.
+                //
+                // Best-effort: a card-emit failure is logged at the
+                // server side but doesn't fail the tool. The
+                // tool_result's payload still carries the SVG +
+                // attachment_id so the SPA's old chat-component
+                // dispatch can take over as a fallback if the card
+                // emit failed (e.g. event-bus saturation).
+                if let Err(e) = api
+                    .emit_chart_card(
+                        &view.attachment_id,
+                        &svg,
+                        &filename,
+                        title_for_card.as_deref(),
+                        width,
+                        height,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target: "chart.render",
+                        attachment_id = %view.attachment_id,
+                        error = %e.to_string(),
+                        "emit_chart_card failed; chart will still appear via tool_result \
+                         dispatch fallback if the SPA's chat-component path is wired",
+                    );
+                }
+                ToolOutcome::Ok(json!({
+                    "attachment_id": view.attachment_id,
+                    "sha256": view.sha256,
+                    "size_bytes": view.size_bytes,
+                    "filename": filename,
+                    "mime_type": "image/png",
+                    "width": width,
+                    "height": height,
+                    // The SPA's chat-component dispatcher reads `svg` to
+                    // render inline without a follow-up fetch.
+                    "svg": svg,
+                    // Hint the SPA on which chat-component to mount —
+                    // the existing convention for plugin tool results.
+                    "chat_component_kind": "chart",
+                }))
+            }
+            Err(e) => e.into_outcome(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------
 // research_clarify — resume an awaiting_input job with the user's
 // answer. Per project-locked-decisions 2026-04-23, the agent is the
 // primary interface for the clarification path; this tool is the
@@ -2447,6 +2838,7 @@ pub fn core_builtin_tools() -> Vec<Arc<dyn ToolImpl>> {
         Arc::new(ResearchListTool::new()),
         Arc::new(ResearchGetReportTool::new()),
         Arc::new(SendAttachmentTool::new()),
+        Arc::new(RenderChartTool::new()),
         Arc::new(McpListServersTool::new()),
         Arc::new(McpAddServerTool::new()),
         Arc::new(McpRemoveServerTool::new()),
@@ -2557,6 +2949,154 @@ mod tests {
         ctx
     }
 
+    // --- chart.render defensive unstringify ---
+
+    /// Regression for the 2026-05-16 Signal-channel TSLA chart turn:
+    /// the model emitted `series` as a JSON-encoded STRING instead of
+    /// an array. Without the defensive unstringify pass, the
+    /// downstream `serde_json::from_value::<ChartSpec>` errored with
+    /// `invalid type: string "[...]", expected a sequence` and the
+    /// chart never rendered.
+    #[test]
+    fn defensive_unstringify_recovers_string_encoded_series() {
+        // Simulate the exact shape from the production failure: a
+        // single series stringified into the spec.
+        let mut spec = serde_json::json!({
+            "title": "TSLA",
+            "kind": "line",
+            "series": "[{\"name\": \"TSLA\", \"points\": [{\"x\": 1, \"y\": 388.9}]}]",
+        });
+        super::defensive_unstringify_spec_fields(&mut spec);
+        // After: series is an array, not a string.
+        let series = spec.get("series").expect("series present");
+        assert!(
+            series.is_array(),
+            "stringified series must be re-parsed into an array, got: {series}",
+        );
+        let arr = series.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "TSLA");
+        assert_eq!(arr[0]["points"][0]["y"].as_f64(), Some(388.9));
+    }
+
+    /// Properly-formed array values (the common case) must NOT be
+    /// touched — we only re-parse when the value is a string.
+    #[test]
+    fn defensive_unstringify_leaves_real_arrays_alone() {
+        let original = serde_json::json!({
+            "series": [{"name": "A", "points": [{"x": 0, "y": 1}]}],
+        });
+        let mut spec = original.clone();
+        super::defensive_unstringify_spec_fields(&mut spec);
+        assert_eq!(spec, original, "real arrays must round-trip unchanged");
+    }
+
+    /// `band.low` / `band.high` are equally susceptible to
+    /// stringification (ensemble fans). Pin both the wrapper and the
+    /// inner-array re-parse paths.
+    #[test]
+    fn defensive_unstringify_recovers_string_encoded_band() {
+        let mut spec = serde_json::json!({
+            "band": {
+                "low":  "[{\"x\": 1, \"y\": 0.1}]",
+                "high": "[{\"x\": 1, \"y\": 0.9}]",
+            },
+        });
+        super::defensive_unstringify_spec_fields(&mut spec);
+        let low = &spec["band"]["low"];
+        let high = &spec["band"]["high"];
+        assert!(low.is_array(), "band.low stringified must be re-parsed");
+        assert!(high.is_array(), "band.high stringified must be re-parsed");
+        assert_eq!(low.as_array().unwrap()[0]["y"].as_f64(), Some(0.1));
+        assert_eq!(high.as_array().unwrap()[0]["y"].as_f64(), Some(0.9));
+    }
+
+    /// Even the wrapper `band` itself can arrive stringified. The
+    /// helper must re-parse the wrapper before drilling into
+    /// `low` / `high`.
+    #[test]
+    fn defensive_unstringify_recovers_fully_string_encoded_band() {
+        let mut spec = serde_json::json!({
+            "band": "{\"low\": [{\"x\": 1, \"y\": 0.1}], \"high\": [{\"x\": 1, \"y\": 0.9}]}",
+        });
+        super::defensive_unstringify_spec_fields(&mut spec);
+        let band = &spec["band"];
+        assert!(
+            band.is_object(),
+            "stringified band wrapper must be re-parsed"
+        );
+        assert!(band["low"].is_array());
+        assert!(band["high"].is_array());
+    }
+
+    /// Garbage strings (not parseable JSON) are left as-is so the
+    /// downstream `from_value::<ChartSpec>` surfaces its own error
+    /// rather than the helper silently dropping a non-JSON value.
+    #[test]
+    fn defensive_unstringify_leaves_garbage_strings_alone() {
+        let mut spec = serde_json::json!({ "series": "not-json-at-all" });
+        super::defensive_unstringify_spec_fields(&mut spec);
+        assert_eq!(spec["series"], "not-json-at-all");
+    }
+
+    /// Regression for the second live failure (NVDA chart turn,
+    /// 2026-05-16): the model emitted `series` as a stringified
+    /// array with EXTRA TRAILING characters appended — `[{...}]}`
+    /// (one extra `}`) instead of `[{...}]`. The strict
+    /// `serde_json::from_str` parse rejected it with
+    /// `Extra data: line 1 column N`; the helper bailed and the
+    /// chart never rendered.
+    ///
+    /// The streaming `Deserializer::from_str(...).into_iter()`
+    /// approach consumes the FIRST complete JSON value and ignores
+    /// trailing garbage, which is exactly what we want here. Be
+    /// liberal in what you accept — the chart spec just needs the
+    /// well-formed prefix.
+    #[test]
+    fn defensive_unstringify_recovers_string_with_trailing_extra_chars() {
+        let mut spec = serde_json::json!({
+            // Note the extra `}` at the end — the actual byte-for-byte
+            // shape from the production failure.
+            "series": "[{\"name\": \"NVDA\", \"points\": [{\"x\": 1, \"y\": 198.35}]}]}",
+        });
+        super::defensive_unstringify_spec_fields(&mut spec);
+        let series = spec.get("series").expect("series present");
+        assert!(
+            series.is_array(),
+            "stringified series with trailing extra chars MUST be re-parsed (the \
+             trailing `}}` is the second observed live LLM failure mode); got: {series}",
+        );
+        let arr = series.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "the well-formed prefix is exactly one series");
+        assert_eq!(arr[0]["name"], "NVDA");
+        assert_eq!(arr[0]["points"][0]["y"].as_f64(), Some(198.35));
+    }
+
+    /// Whitespace + trailing newline shouldn't trip the recovery.
+    #[test]
+    fn defensive_unstringify_recovers_string_with_surrounding_whitespace() {
+        let mut spec = serde_json::json!({
+            "series": "  [{\"name\": \"X\", \"points\": []}]  \n",
+        });
+        super::defensive_unstringify_spec_fields(&mut spec);
+        assert!(spec["series"].is_array());
+        assert_eq!(spec["series"][0]["name"], "X");
+    }
+
+    /// Truly incomplete JSON (e.g. an unclosed array) should be left
+    /// alone — we only want to handle "valid prefix + trailing
+    /// garbage", not "rebuild the JSON from a fragment." Operator
+    /// gets a clear downstream error in that case.
+    #[test]
+    fn defensive_unstringify_leaves_incomplete_json_alone() {
+        let mut spec = serde_json::json!({
+            "series": "[{\"name\": \"X\", \"points\": [{",
+        });
+        super::defensive_unstringify_spec_fields(&mut spec);
+        // Original string preserved (parse failed, no `next()` value).
+        assert!(spec["series"].is_string());
+    }
+
     // --- Registrar ---
 
     #[test]
@@ -2587,10 +3127,14 @@ mod tests {
         assert!(names.contains(&"research_list"));
         assert!(names.contains(&"research_get_report"));
         assert!(names.contains(&"send_attachment"));
+        assert!(
+            names.contains(&"chart.render"),
+            "chart.render built-in must be registered (replaces the old plugin tool open_meteo.render_chart)",
+        );
         assert!(names.contains(&"mcp_list_servers"));
         assert!(names.contains(&"mcp_add_server"));
         assert!(names.contains(&"mcp_remove_server"));
-        assert_eq!(names.len(), 27);
+        assert_eq!(names.len(), 28);
     }
 
     #[test]

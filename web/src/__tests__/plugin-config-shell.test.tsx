@@ -116,10 +116,21 @@ describe("PluginConfigShell", () => {
         // through to the "no configuration UI available" stub.
         // The danger zone must STILL be there — operators need a
         // path to uninstall any installed plugin.
+        //
+        // 2026-05-16 — `/ui/panel.js` 404 was previously shadowed by
+        // the catch-all `200 "{}"` response, which made
+        // DynamicPluginPanel try to dynamic-import an empty blob and
+        // fall into the "default export is not a function" error
+        // branch instead of the "no-panel" state the assertion
+        // expects. Returning 404 explicitly for the panel.js URL
+        // routes the panel cleanly into the no-panel branch (the
+        // documented "this plugin doesn't ship a UI" path).
         fetchMock.mockImplementation(async (url: string) => {
             if (url === "/api/admin/me") return meResponse();
             if (url === "/api/admin/plugins")
                 return pluginsResponse("unregistered-plugin", false);
+            if (url === "/api/admin/plugins/unregistered-plugin/ui/panel.js")
+                return new Response("not found", { status: 404 });
             return new Response("{}", { status: 200 });
         });
         mountAt("/settings/plugins/unregistered-plugin");
@@ -128,10 +139,16 @@ describe("PluginConfigShell", () => {
                 screen.getByTestId("plugin-config-danger-zone"),
             ).toBeInTheDocument();
         });
-        // The fallback stub is also present.
-        expect(
-            screen.getByText(/No configuration UI available/i),
-        ).toBeInTheDocument();
+        // The fallback stub is also present. Wait for it because
+        // DynamicPluginPanel's useEffect now defers until
+        // AuthProvider boot resolves, so the no-panel state lands
+        // on a later render than the danger zone (which is part of
+        // the surrounding shell that doesn't depend on auth).
+        await waitFor(() => {
+            expect(
+                screen.getByText(/No configuration UI available/i),
+            ).toBeInTheDocument();
+        });
         // Uninstall button still present.
         expect(screen.getByTestId("plugin-config-uninstall")).toBeInTheDocument();
     });

@@ -1,5 +1,6 @@
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { AuthProvider } from "./auth/AuthContext";
+import { BridgeInstaller } from "./plugins/BridgeInstaller";
 import { AlertWatcher } from "./routes/AlertWatcher";
 import { ApprovalWatcher } from "./routes/ApprovalWatcher";
 import { AppBoot } from "./routes/AppBoot";
@@ -18,6 +19,15 @@ export function App() {
     return (
         <AuthProvider>
             <BrowserRouter>
+                {/*
+                  Installs `globalThis.execlawHost` so dynamically-
+                  loaded plugin UI panels can reach the host's React +
+                  helpers + shared components through a single stable
+                  global. Idempotent + headless. See
+                  `plugins/host-bridge.ts` for the bridge contract and
+                  `plugins/types.ts` for the API plugin authors consume.
+                */}
+                <BridgeInstaller />
                 <ConnectionBanner />
                 {/*
                   Persistent alert-event WS subscription. Lives at the

@@ -55,12 +55,38 @@ fn origin_channel_for_conversation(state: &AppState, cid: &ConversationId) -> Op
     use execlaw_core::principal_groups::PrincipalGroupStore;
     use execlaw_core::transport_bindings::TransportBindingStore;
     let pg_store = PrincipalGroupStore::new(&state.db);
-    let pg_id = pg_store
-        .principal_group_id_for(cid.as_str())
-        .ok()
-        .flatten()?;
+    // 2026-05-13 — log DB errors loudly instead of `.ok()`-
+    // swallowing them. Pre-rework a `principal_groups` or
+    // `transport_bindings` decode failure silently degraded the
+    // approval reply to "no transport bridged this message" with
+    // no diagnostic, which is indistinguishable from a legitimately
+    // web-only chat. The WARN now distinguishes the two.
+    let pg_id = match pg_store.principal_group_id_for(cid.as_str()) {
+        Ok(opt) => opt?,
+        Err(e) => {
+            tracing::warn!(
+                target: "approvals",
+                conversation_id = %cid.as_str(),
+                error = %e,
+                "principal_groups read failed — approval reply will not be bridged via transport. \
+                 Likely BLOB column corruption; check Settings → Groups.",
+            );
+            return None;
+        }
+    };
     let binding_store = TransportBindingStore::new(&state.db);
-    let bindings = binding_store.bindings_for_group_any_channel(&pg_id).ok()?;
+    let bindings = match binding_store.bindings_for_group_any_channel(&pg_id) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                target: "approvals",
+                principal_group_id = %pg_id,
+                error = %e,
+                "transport_bindings read failed — approval reply will not be bridged via transport.",
+            );
+            return None;
+        }
+    };
     state
         .host_transports
         .lookup_first_supported_binding(&bindings)
@@ -384,6 +410,15 @@ pub async fn respond_handler(
             &original_text,
             origin_channel.as_deref(),
             replay_group_ctx,
+            // Approval-replay paths don't carry attachments — the
+            // cold-contact's first message arrived before the
+            // trust upgrade, attachments (if any) weren't fetched
+            // back then, and re-fetching here would require
+            // re-running the plugin's `fetch_attachment` from a
+            // stored bridge_id that we don't currently persist.
+            // Future: stash the bridge_ids on the parked event so
+            // approval replay can re-hydrate images too.
+            Vec::new(),
         )
         .await
         {
@@ -569,6 +604,9 @@ async fn claim_as_me(
         &original_text,
         origin_channel.as_deref(),
         claim_group_ctx,
+        // claim_as_me replay path doesn't carry attachments — see
+        // the comment in the cold-contact branch above.
+        Vec::new(),
     )
     .await
     {
@@ -609,24 +647,52 @@ fn find_cold_contact_event(
     state: &AppState,
     approval_id: &str,
 ) -> Option<(ConversationId, String, String)> {
+    // 2026-05-13 — log DB errors at WARN instead of `.ok()?`-
+    // swallowing them. Pre-rework a `state_events` query failure
+    // (lock contention, schema mismatch, HMAC reverification error)
+    // silently degraded to "approval not found", which the caller
+    // surfaces as a generic 404 — operators chasing a missing
+    // approval had no signal that the underlying read failed.
     let db = &state.db;
-    let conv_ids: Vec<String> = db
-        .with_conn(|c| {
-            let mut stmt = c
-                .prepare("SELECT DISTINCT conversation_id FROM state_events WHERE kind = 'cold_contact_arrived'")
-                .map_err(execlaw_core::db::DbError::from)?;
-            let rows = stmt
-                .query_map([], |r| r.get::<_, String>(0))
-                .map_err(execlaw_core::db::DbError::from)?;
-            let out: Result<Vec<_>, _> = rows.collect();
-            Ok(out?)
-        })
-        .ok()?;
+    let conv_ids: Vec<String> = match db.with_conn(|c| {
+        let mut stmt = c
+            .prepare("SELECT DISTINCT conversation_id FROM state_events WHERE kind = 'cold_contact_arrived'")
+            .map_err(execlaw_core::db::DbError::from)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(execlaw_core::db::DbError::from)?;
+        let out: Result<Vec<_>, _> = rows.collect();
+        Ok(out?)
+    }) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                target: "approvals::find_cold_contact_event",
+                approval_id = %approval_id,
+                error = %e,
+                "state_events scan failed — caller will see 'approval not found'. \
+                 Likely DB lock contention or schema drift.",
+            );
+            return None;
+        }
+    };
 
     let log = event_log(state);
     for id in conv_ids {
         let cid = ConversationId::from(id);
-        let events = log.replay_since(&cid, EventSeq(0)).ok()?;
+        let events = match log.replay_since(&cid, EventSeq(0)) {
+            Ok(ev) => ev,
+            Err(e) => {
+                tracing::warn!(
+                    target: "approvals::find_cold_contact_event",
+                    approval_id = %approval_id,
+                    conversation_id = %cid.as_str(),
+                    error = %e,
+                    "replay_since failed for one conversation — continuing scan.",
+                );
+                continue;
+            }
+        };
         for ev in events {
             if ev.kind != EventKind::ColdContactArrived {
                 continue;
@@ -724,6 +790,140 @@ pub async fn revoke_handler(
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct RevokeRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `POST /api/admin/principals/:id/trust` — controller-only path to
+/// change a principal's trust class out-of-band (i.e. not through the
+/// cold-contact approval flow). Use this from Settings → Contacts to
+/// promote a `KnownLimited` to `KnownTrusted`, demote a Trusted
+/// principal to Limited (with optional topic scope), or Block them.
+///
+/// Distinct from `revoke` (which is the one-click "I'm done with this
+/// person" path that always lands on Blocked): `trust` accepts a
+/// target class so the operator can elevate as well as demote.
+///
+/// Restricted to the operator-mutable contact tiers — `Controller`,
+/// `Delegated`, and `UnknownPending` cannot be set via this endpoint
+/// because:
+///   * `Controller` is the operator's own identity, minted at setup;
+///     letting a SPA button demote it is a foot-gun with no upside.
+///   * `Delegated` carries a capability scope + expiry that the
+///     simple `{class}` body can't express; that flow needs its own
+///     ceremony when we ship it.
+///   * `UnknownPending` is a system state — going BACK to it from
+///     an explicitly-trusted principal is incoherent.
+///
+/// Like `revoke_handler`, the trust transition mutates the principals
+/// store directly without committing a `TrustChanged` event log entry
+/// — that event variant is conversation-scoped and this path operates
+/// on a principal in isolation. The trace span below is the audit
+/// trail.
+#[utoipa::path(
+    post,
+    path = "/api/admin/principals/{principal_id}/trust",
+    params(
+        ("principal_id" = String, Path, description = "Principal whose trust class to change"),
+    ),
+    responses(
+        (status = 200, description = "Trust class updated"),
+        (status = 400, description = "Target class is not operator-settable"),
+        (status = 404, description = "Unknown principal id"),
+    ),
+    tag = "approvals"
+)]
+pub async fn set_trust_handler(
+    State(state): State<AppState>,
+    _user: crate::auth_extract::AuthedUser,
+    Path(principal_id): Path<String>,
+    Json(req): Json<SetTrustRequest>,
+) -> impl IntoResponse {
+    let principals = PrincipalStore::new(&state.db);
+    let pid = PrincipalId::from(principal_id.clone());
+    let Ok(Some(_existing)) = principals.get(&pid) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "principal_not_found",
+                    "message": format!("no principal with id '{principal_id}'"),
+                }
+            })),
+        )
+            .into_response();
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let new_level = match req.class.as_str() {
+        "KnownTrusted" => CoreTrustLevel::KnownTrusted {
+            resolvers: vec![],
+            approved_by: PrincipalId::from("controller"),
+            approved_at: now,
+        },
+        "KnownLimited" => CoreTrustLevel::KnownLimited {
+            resolvers: vec![],
+            allowed_topics: req.allowed_topics.clone().unwrap_or_default(),
+            allowed_tools: None,
+        },
+        "Blocked" => CoreTrustLevel::Blocked {
+            blocked_by: PrincipalId::from("controller"),
+            blocked_at: now,
+            reason: req.reason.clone(),
+        },
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "unsupported_class",
+                        "message": format!(
+                            "trust class '{other}' is not operator-settable; \
+                             use one of: KnownTrusted, KnownLimited, Blocked"
+                        ),
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let new_class_tag = new_level.class_tag().to_owned();
+    if let Err(e) = principals.set_trust(&pid, new_level) {
+        return internal_error(&format!("set_trust: {e}"));
+    }
+
+    tracing::info!(
+        target: "approvals::set_trust",
+        principal_id = %principal_id,
+        new_class = %new_class_tag,
+        reason = ?req.reason,
+        "controller changed principal trust class",
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "principal_id": principal_id,
+            "new_trust_class": new_class_tag,
+            "outcome": "trust_changed",
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct SetTrustRequest {
+    /// Target trust class — must be one of `KnownTrusted`,
+    /// `KnownLimited`, `Blocked`. Other values are rejected.
+    pub class: String,
+    /// Topic allowlist when `class == "KnownLimited"`. Ignored for
+    /// other classes. Defaults to `[]` (no topic restrictions).
+    #[serde(default)]
+    pub allowed_topics: Option<Vec<String>>,
+    /// Free-form operator note. Persisted on `Blocked` rows for
+    /// future "why did I block this contact?" recall; logged on
+    /// trace for the others.
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -927,6 +1127,10 @@ pub fn approvals_router() -> Router<AppState> {
             "/api/admin/principals/{principal_id}/revoke",
             post(revoke_handler),
         )
+        .route(
+            "/api/admin/principals/{principal_id}/trust",
+            post(set_trust_handler),
+        )
 }
 
 #[cfg(test)]
@@ -1104,5 +1308,228 @@ mod tests {
         let arr = body["approvals"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["approval_id"], "appr-real-1");
+    }
+
+    // ---- set_trust_handler ----------------------------------------
+
+    async fn post_json(
+        app: &axum::Router,
+        token: Option<&str>,
+        uri: &str,
+        body_value: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(t) = token {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let resp = app
+            .clone()
+            .oneshot(
+                req.body(Body::from(serde_json::to_vec(&body_value).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, v)
+    }
+
+    fn seed_principal(state: &AppState, id: &str, level: CoreTrustLevel) -> PrincipalId {
+        use execlaw_core::principal::Principal;
+        let pid = PrincipalId::from(id);
+        PrincipalStore::new(&state.db)
+            .upsert(&Principal {
+                id: pid.clone(),
+                identifiers: Vec::new(),
+                trust_level: level,
+                resolved_by: Vec::new(),
+                metadata: serde_json::json!({}),
+                first_seen: 0,
+                last_seen: None,
+                controller_notes: None,
+            })
+            .unwrap();
+        pid
+    }
+
+    #[tokio::test]
+    async fn set_trust_requires_auth() {
+        let app = build_router(test_app_state());
+        let (status, _) = post_json(
+            &app,
+            None,
+            "/api/admin/principals/pri_x/trust",
+            serde_json::json!({"class": "KnownTrusted"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn set_trust_404s_unknown_principal() {
+        let state = test_app_state();
+        let app = build_router(state.clone());
+        let token = setup_get_token(&app).await;
+        let (status, body) = post_json(
+            &app,
+            Some(&token),
+            "/api/admin/principals/pri_does_not_exist/trust",
+            serde_json::json!({"class": "KnownTrusted"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "principal_not_found");
+    }
+
+    #[tokio::test]
+    async fn set_trust_elevates_limited_to_trusted() {
+        // The primary user-facing path: a KnownLimited contact in
+        // Settings → Contacts gets bumped to KnownTrusted.
+        let state = test_app_state();
+        let app = build_router(state.clone());
+        let token = setup_get_token(&app).await;
+        let pid = seed_principal(
+            &state,
+            "pri_signal_+15551111111",
+            CoreTrustLevel::KnownLimited {
+                resolvers: Vec::new(),
+                allowed_topics: vec!["scheduling".into()],
+                allowed_tools: None,
+            },
+        );
+
+        let (status, body) = post_json(
+            &app,
+            Some(&token),
+            &format!("/api/admin/principals/{}/trust", pid.as_str()),
+            serde_json::json!({"class": "KnownTrusted"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["new_trust_class"], "KnownTrusted");
+
+        // Read-back: the store actually flipped.
+        let principals = PrincipalStore::new(&state.db);
+        let p = principals.get(&pid).unwrap().unwrap();
+        assert_eq!(p.trust_level.class_tag(), "KnownTrusted");
+    }
+
+    #[tokio::test]
+    async fn set_trust_demotes_to_limited_with_topic_scope() {
+        let state = test_app_state();
+        let app = build_router(state.clone());
+        let token = setup_get_token(&app).await;
+        let pid = seed_principal(
+            &state,
+            "pri_signal_+15552222222",
+            CoreTrustLevel::KnownTrusted {
+                resolvers: Vec::new(),
+                approved_by: PrincipalId::from("controller"),
+                approved_at: 0,
+            },
+        );
+
+        let (status, body) = post_json(
+            &app,
+            Some(&token),
+            &format!("/api/admin/principals/{}/trust", pid.as_str()),
+            serde_json::json!({
+                "class": "KnownLimited",
+                "allowed_topics": ["scheduling", "logistics"],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let principals = PrincipalStore::new(&state.db);
+        let p = principals.get(&pid).unwrap().unwrap();
+        match &p.trust_level {
+            CoreTrustLevel::KnownLimited { allowed_topics, .. } => {
+                assert_eq!(
+                    allowed_topics,
+                    &vec!["scheduling".to_owned(), "logistics".to_owned()],
+                );
+            }
+            other => panic!("expected KnownLimited, got {:?}", other.class_tag()),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_trust_blocks_with_reason() {
+        let state = test_app_state();
+        let app = build_router(state.clone());
+        let token = setup_get_token(&app).await;
+        let pid = seed_principal(
+            &state,
+            "pri_signal_+15553333333",
+            CoreTrustLevel::KnownTrusted {
+                resolvers: Vec::new(),
+                approved_by: PrincipalId::from("controller"),
+                approved_at: 0,
+            },
+        );
+
+        let (status, _) = post_json(
+            &app,
+            Some(&token),
+            &format!("/api/admin/principals/{}/trust", pid.as_str()),
+            serde_json::json!({"class": "Blocked", "reason": "spam after vacation"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let principals = PrincipalStore::new(&state.db);
+        let p = principals.get(&pid).unwrap().unwrap();
+        match &p.trust_level {
+            CoreTrustLevel::Blocked { reason, .. } => {
+                assert_eq!(reason.as_deref(), Some("spam after vacation"));
+            }
+            other => panic!("expected Blocked, got {:?}", other.class_tag()),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_trust_rejects_non_settable_classes() {
+        // Controller / Delegated / UnknownPending are NOT valid
+        // targets — guard the operator against the obvious foot-gun.
+        let state = test_app_state();
+        let app = build_router(state.clone());
+        let token = setup_get_token(&app).await;
+        let pid = seed_principal(
+            &state,
+            "pri_signal_+15554444444",
+            CoreTrustLevel::KnownLimited {
+                resolvers: Vec::new(),
+                allowed_topics: Vec::new(),
+                allowed_tools: None,
+            },
+        );
+
+        for forbidden in ["Controller", "Delegated", "UnknownPending", "Garbage"] {
+            let (status, body) = post_json(
+                &app,
+                Some(&token),
+                &format!("/api/admin/principals/{}/trust", pid.as_str()),
+                serde_json::json!({"class": forbidden}),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "class {forbidden} must be rejected",
+            );
+            assert_eq!(body["error"]["code"], "unsupported_class");
+        }
+
+        // And the store is unchanged.
+        let principals = PrincipalStore::new(&state.db);
+        let p = principals.get(&pid).unwrap().unwrap();
+        assert_eq!(p.trust_level.class_tag(), "KnownLimited");
     }
 }

@@ -127,13 +127,23 @@ Thin Rust binary (`runner-local`). Speaks OpenAI-compatible API to whichever loc
 
 **Why per-conversation isolation?** Ported the HotRunnerPool pattern from selfhosted-claw. A runner compromised by prompt injection in conversation A can't touch conversation B's data — its capability token scopes it to one `conversation_id`.
 
-### 4.3 Inference services (separate containers)
+### 4.3 Inference services (separate containers — or native subprocesses on Apple Silicon)
 
 `service-vllm` (nvidia), `service-openarc` (Intel), `service-whisper`, `service-kokoro`, etc. Each serves an OpenAI-compatible or protocol-matched endpoint. Control plane calls them via `inference-api` client. These are the containers that carry the heavy vendor runtimes — keeping the control plane minimal (axiom #12).
 
+**Apple Silicon carve-out:** `service-ollama` runs as a host-native subprocess, not a Docker container. Docker Desktop on macOS executes containers inside a Linux microVM with no Metal passthrough — every container-bound inference engine on Mac falls back to CPU and loses the entire point of an Apple-GPU host. The same constraint affects every Metal-backed engine (llama.cpp Metal, Whisper.cpp Metal, MLX), so the control plane manages them as native subprocesses via `NativeServiceController` instead. vLLM is intentionally **not** supported on Apple Silicon — it has no Metal kernels and the CPU build is unusable for any LLM larger than a few billion parameters. See [`setup-mac.md`](setup-mac.md) for first-run setup. The "minimal containers" axiom (#12) still holds — it's the same principle expressed as "minimal native dependencies" because Apple Silicon doesn't offer a container-passthrough surface for the GPU.
+
+| Host class | Standard inference | Process model |
+|---|---|---|
+| Linux + NVIDIA | vLLM | Docker container, `--gpus` passthrough |
+| Linux + Intel Arc | vLLM-CPU / OpenVINO | Docker container, `/dev/dri` bind |
+| Windows + NVIDIA | vLLM (Docker Desktop) | Docker container, `--gpus` passthrough |
+| **macOS + Apple Silicon** | **Ollama** | **Native `ollama serve` subprocess** |
+| Any host, GPU-less | vLLM-CPU | Docker container, CPU-only |
+
 ### 4.4 Plugins (ZIP-installed extensions)
 
-Plugins are how every non-core capability lights up — transports, third-party integrations, identity providers, OAuth-using HTTP bridges, sidecar-backed services. Operator uploads a ZIP via the SPA; the host parses `plugin.toml`, registers all declared hooks atomically, and from that moment the plugin's tools appear in the agent's catalog (subject to capability + trust gating). Two runtime tiers: **script** (Rhai source loaded into an embedded interpreter — the dominant tier; used by signal, whatsapp, slack, sms-socket, google-calendar, google-contacts, google-places, pushover) and **subprocess** (native binary, JSON-RPC over stdio — used by hello reference plugin and identity-local-address-book). Transport-class plugins additionally implement the conversation-routing contract: receive inbound events, push them to the event log with stable `(plugin_id, source_event_id)` identifiers, drain outbox rows, deliver to the external surface. Full reference in [`plugins.md`](plugins.md).
+Plugins are how every non-core capability lights up — transports, third-party integrations, identity providers, OAuth-using HTTP bridges, sidecar-backed services. Operator uploads a ZIP via the SPA; the host parses `plugin.toml`, registers all declared hooks atomically, and from that moment the plugin's tools appear in the agent's catalog (subject to capability + trust gating). Two runtime tiers: **script** (Rhai source loaded into an embedded interpreter — the dominant tier; used by signal, whatsapp, slack, discord, sms-socket, google-apps, google-places, open-meteo, pushover) and **subprocess** (native binary, JSON-RPC over stdio — used by hello reference plugin and identity-local-address-book). Transport-class plugins additionally implement the conversation-routing contract: receive inbound events, push them to the event log with stable `(plugin_id, source_event_id)` identifiers, drain outbox rows, deliver to the external surface. Full reference in [`plugins.md`](plugins.md).
 
 ### 4.5 Outbox relay
 
@@ -799,7 +809,8 @@ For the reader who wants to jump into code:
 | [`crates/server/src/sidecar_supervisor.rs`](../crates/server/src/sidecar_supervisor.rs) | Supervised-container reconcile loop, health probe, crash-loop guard. See [`docs/sidecar-supervisor-design.md`](sidecar-supervisor-design.md). |
 | [`crates/server/src/plugin_admin_routes.rs`](../crates/server/src/plugin_admin_routes.rs) | Authenticated dispatcher at `/api/admin/plugins/{plugin_id}{path}` |
 | [`crates/server/src/plugin_webhook_routes.rs`](../crates/server/src/plugin_webhook_routes.rs) | Unauthenticated dispatcher at `/api/webhooks/{plugin_id}{path}`; supports both `application/json` and `application/x-www-form-urlencoded` bodies |
-| [`crates/container-manager/src/hardware.rs`](../crates/container-manager/src/hardware.rs) | Tier-1 sysfs GPU detection |
+| [`crates/container-manager/src/hardware.rs`](../crates/container-manager/src/hardware.rs) | Cross-platform GPU detection — Linux sysfs (Tier 1) + `hardware-query` (WMI on Windows) + `system_profiler SPDisplaysDataType -json` parse on macOS (the upstream crate's macOS GPU path is currently stubbed). Apple Silicon SoCs surface as `GpuVendor::Apple` with a unified-memory budget derived from `sysctl hw.memsize × 2/3` (matches macOS's `iogpu.wired_limit` default). |
+| [`crates/container-manager/src/service.rs`](../crates/container-manager/src/service.rs) | `ServiceController` trait + `BollardServiceController` (Docker) + `NativeServiceController` (host subprocess) + `MultiplexedServiceController` (per-spec dispatch). `ServiceSpec::runtime: ServiceRuntime` (Docker / Native) drives which one spawns; default is Docker for backwards-compat. Native is gated on `binary_hint` (`"ollama"` in v1) so future native engines (llama-server, MLX) slot in by adding match arms in `discover_for_hint`. |
 | [`crates/server/src/routes.rs`](../crates/server/src/routes.rs) | REST surface (auth, OpenAPI) |
 | [`crates/server/src/chats.rs`](../crates/server/src/chats.rs) | Chat surface — policy + capability + cold-contact + streaming |
 | [`crates/server/src/approvals.rs`](../crates/server/src/approvals.rs) | `POST /api/admin/approvals/:id/respond` (Phase 3) |
@@ -819,7 +830,7 @@ For the reader who wants to jump into code:
 | [`spec/asyncapi.yaml`](../spec/asyncapi.yaml) | WebSocket event vocabulary |
 | [`plugins/hello/`](../plugins/hello/) | In-tree reference subprocess plugin |
 | [`plugins/signal/`, `plugins/whatsapp/`, `plugins/slack/`, `plugins/sms-socket/`](../plugins/) | Transport plugins — sidecar / webhook / WS variants |
-| [`plugins/google-calendar/`, `plugins/google-contacts/`, `plugins/google-places/`](../plugins/) | OAuth + API-key reference HTTP plugins |
+| [`plugins/google-apps/`, `plugins/google-places/`](../plugins/) | OAuth + API-key reference HTTP plugins |
 | [`docs/plugins.md`](plugins.md) | Plugin-author reference: when to use plugins vs MCP, manifest schema, sidecar model, primitives, walkthroughs |
 | [`crates/core/src/eval.rs`](../crates/core/src/eval.rs) | `EvalFlaggedStore` for regression-target event ranges (Phase 5) |
 | [`crates/server/src/observability.rs`](../crates/server/src/observability.rs) | `GET /api/admin/logs` + `GET /api/admin/eval/flags` (Phase 5) |
@@ -858,7 +869,7 @@ Last refreshed: 2026-05-08. The phase tags below reflect implementation mileston
 - Streaming SSE (`chat_completions_stream`) + `ChatTokenDelta` on the WS bus
 - Crash-safety tests (kill mid-turn, replay-after-restart, post-commit tamper)
 
-**Phase 2 — Plugin framework.** Complete and exercised in production by 10 in-tree plugins.
+**Phase 2 — Plugin framework.** Complete and exercised in production by 12 in-tree plugins.
 - `PluginHost` lifecycle (install/enable/disable/uninstall/hydrate) with SQLite persistence via migration 0003
 - `POST /api/admin/plugins/install` + list / enable / disable / uninstall / tools routes
 - Manifest schema: `[plugin]`, `[runtime]` (script + subprocess tiers), `[[tools]]` (with `host_internal`, `trust_floor`, `latency`), `[transport]`, `[identity_provider]`, `[[services]]` + `[services.sidecar]`, `[[admin_routes]]`, `[[webhook_routes]]` (unauthenticated, plugin validates), `[[oauth_accounts]]`, `[[ui_panels]]`, `[[skills]]`, `[[health_checks]]`, `[[event_subscriptions]]`, `[[alert_sources]]`
@@ -867,7 +878,7 @@ Last refreshed: 2026-05-08. The phase tags below reflect implementation mileston
 - Subprocess-tier engine — JSON-RPC over stdio; reference at `plugins/hello/`
 - Authenticated admin router at `/api/admin/plugins/{id}/...`; unauthenticated webhook router at `/api/webhooks/{id}/...` accepting both `application/json` and `application/x-www-form-urlencoded` bodies
 - Sidecar supervisor (`crates/server/src/sidecar_supervisor.rs`) with 5 s reconcile, health probes, crash-loop guard, stable per-`(plugin_id, sidecar_name)` host port allocation
-- Shipped plugins: `signal` (Signal-Messenger transport, supervised `signal-cli` sidecar), `whatsapp` (WhatsApp transport, supervised `wuzapi` sidecar, webhook inbound, `markread` read receipts), `slack` (multi-workspace OAuth transport), `sms-socket` (Android-gateway WS transport), `google-calendar` / `google-contacts` / `google-places` (OAuth or API-key HTTP integrations; `google-contacts` is also an identity provider), `pushover` (one-way notifier), `hello` (subprocess reference), `identity-local-address-book` (subprocess identity provider)
+- Shipped plugins: `signal` (Signal-Messenger transport, supervised `signal-cli` sidecar), `whatsapp` (WhatsApp transport, supervised `wuzapi` sidecar, webhook inbound, `markread` read receipts), `slack` (multi-workspace OAuth transport), `discord` (multi-guild gateway-WS transport), `sms-socket` (Android-gateway WS transport), `google-apps` (consolidated Gmail/Calendar/Contacts/Tasks/Drive OAuth integration; also an identity provider — replaced separate google-calendar + google-contacts plugins 2026-05-14), `google-places` (Places API key-only HTTP integration), `open-meteo` (key-less weather/marine/air-quality/seasonal/ensemble/flood/climate/geocoding/elevation tools + chart renderer), `pushover` (one-way notifier), `hello` (subprocess reference), `identity-local-address-book` (subprocess identity provider)
 - Plugin-author reference: [`docs/plugins.md`](plugins.md)
 
 **Phase 3 — Participants, trust, policy engine, Rule of Two.** Complete.
@@ -925,12 +936,13 @@ Last refreshed: 2026-05-08. The phase tags below reflect implementation mileston
 - Eval-flag dashboard
 - Trace viewer embedded in the chat UI
 
-**Phase 6 — UI port (chat-first SPA + Tauri Desktop).** In progress (sub-phases 6a–6c partially landed; 6d Tauri pending).
+**Phase 6 — UI port (chat-first SPA + Tauri Desktop).** Sub-phases 6a–6d landed; full incognito-thread UI polish and voice UI still pending.
 - Chat-first SPA scaffolding under `web/` is live: pinned Control thread, thread list, inbound messages from external transports collapse into the controller thread per the `ConversationResolver` rule, OpenAI-style streaming token render.
 - Settings → Plugins page drives install / enable / disable / uninstall + per-plugin admin panels (each plugin's `[[ui_panels]]` mounts a SPA route).
 - Research subsystem (C3–C6) shipped: deep-research plan/gather/synthesize pipeline, retention policy, `/research` page, every-phase event flow.
 - Approval queue infrastructure: cold-contact alerts, sensitive-tool approvals, OAuth-grant proposals all flow through one SPA dropdown.
-- Pending: Tauri Desktop wrapper (6d), full incognito-thread UI polish, voice UI (lands with Phase 8 audio plugins).
+- **6d Tauri Desktop wrapper** shipped 2026-05-15: `desktop-macos/src-tauri/` produces `execlaw.app` for Apple Silicon. Menu bar app with no Dock icon (NSApplication `Accessory` activation policy), registers the bundled LaunchAgent via Apple's `SMAppService` (macOS 13+) so drag-to-Trash auto-disables the service. SPA embedded in the server binary via `rust-embed`; the webview navigates to `http://127.0.0.1:3031` for same-origin API + SPA. Build via `scripts/build-mac.sh`; release via tag push (see `.github/workflows/macos-bundle.yml`).
+- Pending: full incognito-thread UI polish, voice UI (lands with Phase 8 audio plugins).
 
 Stack (locked in 2026-04-25):
 - **React Native** + **react-native-web** as the cross-platform component layer.
@@ -938,7 +950,7 @@ Stack (locked in 2026-04-25):
 - **Vite** (web) / **Metro** (native).
 - **TanStack Query** for REST, **Zustand** for the WS event store.
 - **Plugins are trusted** — UI panels load via dynamic ESM `import()`; no sandboxing.
-- Built static assets embedded in the Rust binary via `rust-embed` so the production artifact stays a single Docker image.
+- Built static assets embedded in the Rust binary via `rust-embed` (shipped 2026-05-15 alongside Phase 6d) so the production artifact stays a single binary serving SPA + API on one origin — both the Docker image and the Tauri `.app` bundle rely on this.
 
 UX (locked):
 - Chat-first landing; OpenWebUI-shaped sidebar with `New chat`, nav (Routines / Contacts / More → Tools, Skills, plugin panels), thread list, settings + user at the bottom.

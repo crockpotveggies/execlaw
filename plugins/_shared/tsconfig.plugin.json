@@ -1,0 +1,44 @@
+{
+    "//": [
+        "Shared TypeScript config for plugin UI panel sources.",
+        "Each plugin's tsconfig.json extends this one.",
+        "",
+        "What it does:",
+        "  * Type-checks plugin/<id>/ui/panel.tsx against the same TS",
+        "    settings the host SPA uses (strict, ESNext modules, JSX).",
+        "  * Wires the `@execlaw/plugin-ui` path alias to the host's",
+        "    types module — plugins import types from there with the",
+        "    canonical bare-name import; the runtime side passes the",
+        "    bridge via component props, not a runtime import.",
+        "  * `noEmit: true` because the actual JS is produced by",
+        "    `scripts/build-plugin-ui.mjs` (esbuild). This config is",
+        "    for type-checking + IDE help only.",
+        "",
+        "The path alias resolves relative to THIS file's directory",
+        "(`plugins/_shared/`). Each plugin's tsconfig.json sits one",
+        "level deeper at `plugins/<id>/tsconfig.json`, so the relative",
+        "path here climbs one extra `..` from the perspective of",
+        "TypeScript's `paths` resolution (which is relative to the",
+        "tsconfig that declares the option)."
+    ],
+    "compilerOptions": {
+        "target": "ES2022",
+        "module": "ESNext",
+        "moduleResolution": "Bundler",
+        "jsx": "react",
+        "jsxFactory": "React.createElement",
+        "jsxFragmentFactory": "React.Fragment",
+        "strict": true,
+        "esModuleInterop": true,
+        "skipLibCheck": true,
+        "isolatedModules": true,
+        "verbatimModuleSyntax": true,
+        "noEmit": true,
+        "lib": ["ES2022", "DOM", "DOM.Iterable"],
+        "types": ["@types/react"],
+        "baseUrl": ".",
+        "paths": {
+            "@execlaw/plugin-ui": ["../../web/src/plugins/types.ts"]
+        }
+    }
+}

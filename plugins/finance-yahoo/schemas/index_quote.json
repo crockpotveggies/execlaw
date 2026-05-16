@@ -1,0 +1,12 @@
+{
+    "type": "object",
+    "properties": {
+        "symbol": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Index identifier. Accepts caret-prefixed Yahoo symbols (`^DJI`, `^IXIC`, `^GSPC`, `^NDX`, `^RUT`, `^VIX`, `^FTSE`, `^N225`, `^GDAXI`) or friendly names the plugin maps automatically: `dow`/`dow jones`/`djia`, `nasdaq`/`nasdaq composite`, `nasdaq 100`/`ndx`, `s&p`/`s&p 500`/`sp500`/`spx`, `russell`/`russell 2000`, `vix`, `ftse`/`ftse 100`, `nikkei`/`nikkei 225`, `dax`."
+        }
+    },
+    "required": ["symbol"],
+    "additionalProperties": false
+}

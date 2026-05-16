@@ -73,6 +73,22 @@ pub enum CardKind {
     /// "agent attaches a file to its reply" affordance that
     /// TextOnly transports get via `send_file`.
     Attachment,
+    /// 2026-05-16 — A rendered chart the agent has produced (via
+    /// the built-in `chart.render` tool). Opens + immediately
+    /// closes with `details = { svg, attachment_id, filename,
+    /// title?, width, height }`. The SPA renders the inline SVG
+    /// + a "PNG" download chip, identical pattern to
+    /// `Attachment` but with the SVG embedded.
+    ///
+    /// Existed pre-2026-05-16 only as the inline-component path
+    /// (a `chat_component_kind: "chart"` marker on the tool_result
+    /// payload). That path landed an SVG into the chat bubble's
+    /// content area but proved unreliable — chart never visually
+    /// appeared even when the tool fired and the JSON was correct.
+    /// Promoting to a first-class card mirrors the proven
+    /// deep-research / send_attachment path and gives the SPA's
+    /// card-projection pipeline the same hook to render.
+    Chart,
 }
 
 impl CardKind {
@@ -83,6 +99,7 @@ impl CardKind {
             Self::ShellSession => "shell_session",
             Self::FilePipeline => "file_pipeline",
             Self::Attachment => "attachment",
+            Self::Chart => "chart",
         }
     }
 
@@ -93,6 +110,7 @@ impl CardKind {
             "shell_session" | "ShellSession" => Self::ShellSession,
             "file_pipeline" | "FilePipeline" => Self::FilePipeline,
             "attachment" | "Attachment" => Self::Attachment,
+            "chart" | "Chart" => Self::Chart,
             // Unknown kind from the wire — render as the generic
             // catch-all so the SPA still shows progress without the
             // operator seeing a broken-render placeholder.
@@ -564,9 +582,19 @@ mod tests {
             CardKind::Research,
             CardKind::ShellSession,
             CardKind::FilePipeline,
+            CardKind::Attachment,
+            CardKind::Chart,
         ] {
             assert_eq!(CardKind::parse(k.as_str()), k);
         }
+        // Wire form for the new Chart variant pinned explicitly so a
+        // future rename of the snake_case string doesn't silently
+        // break SPA dispatch (the SPA side registers
+        // `registerCardRenderer("chart", ChartCard)`).
+        assert_eq!(CardKind::Chart.as_str(), "chart");
+        // PascalCase legacy form still parses (defense against any
+        // older event-log row that pre-dates the snake_case rework).
+        assert_eq!(CardKind::parse("Chart"), CardKind::Chart);
     }
 
     #[test]

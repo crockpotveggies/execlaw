@@ -211,6 +211,119 @@ impl Database {
             Ok(got)
         })
     }
+
+    /// Wipe the database back to first-boot state by closing the
+    /// current connection, deleting the file(s) on disk, and opening
+    /// a fresh blank one at the same path with the same encryption
+    /// posture. **The schema is gone** — callers MUST run
+    /// `MigrationRunner::apply_all()` afterwards to re-create tables
+    /// and re-fire migration seeds.
+    ///
+    /// Why this is preferable to schema-level `DROP TABLE` loops:
+    ///
+    ///   * Virtual tables (FTS5 `skill_search`, etc.) require the
+    ///     vtable module to load successfully at DROP time. A
+    ///     mismatched SQLite/SQLCipher build, a missing extension, or
+    ///     simply a connection that was opened with different module
+    ///     registrations than at `CREATE VIRTUAL TABLE` time will
+    ///     surface as `vtable constructor failed: <name>` — observed
+    ///     in production today (2026-05-13). File-level delete bypasses
+    ///     the vtable module entirely.
+    ///   * `sqlite_master` enumeration + `DROP TABLE` is sensitive to
+    ///     FK declaration order: SQLite refuses to drop a parent that
+    ///     a child still references. Even with `foreign_keys = OFF`
+    ///     some configurations trip on this. File delete sidesteps
+    ///     the dependency graph.
+    ///   * Plain semantic: "factory reset" should mean "the DB equals
+    ///     what `execlaw install` would have produced." Deleting the
+    ///     file then re-opening is exactly that.
+    ///
+    /// On `:memory:` paths the file-delete is skipped; the in-memory
+    /// connection is simply replaced with a fresh in-memory one. Used
+    /// by the test harness.
+    ///
+    /// Side-files cleaned up alongside the main DB file:
+    ///
+    ///   * `<path>-wal` — write-ahead log (always present in WAL mode)
+    ///   * `<path>-shm` — shared-memory file backing the WAL
+    ///   * `<path>-journal` — rollback journal (only present
+    ///     transiently or under non-WAL configurations; try-delete
+    ///     is harmless if absent)
+    ///
+    /// The caller must hold no other handles to the Database. The
+    /// `Arc<Mutex<Connection>>` we own is the only handle by design
+    /// (see the struct docstring), so the lock acquired below is
+    /// sufficient. If a future refactor introduces a second
+    /// connection, this method must be revisited.
+    pub fn rebuild_to_empty(&self, config: &DbConfig) -> Result<(), DbError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| DbError::Config(format!("connection mutex poisoned: {e}")))?;
+
+        // Replace the existing connection with a temporary in-memory
+        // one. Dropping the old `Connection` releases its file
+        // handle, which is required on Windows before `remove_file`
+        // can succeed.
+        *guard = Connection::open_in_memory()?;
+
+        // `:memory:` path → nothing on disk to delete, just open a
+        // new in-memory connection in place.
+        let is_memory = self.path == Path::new(":memory:");
+        if !is_memory {
+            // Delete the main DB file + every SQLite side-file that
+            // can sit alongside it. `remove_file` is best-effort
+            // for the side-files (NotFound is fine — they may not
+            // exist), but a failure on the main file is fatal
+            // because callers depend on a fresh state.
+            let path = &self.path;
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let side = sibling_with_suffix(path, suffix);
+                if side.exists() {
+                    // Side-file delete failure is non-fatal — SQLite
+                    // will overwrite stale WAL/SHM on first checkpoint
+                    // of the new connection. Log via stderr (we don't
+                    // have a tracing handle in core).
+                    if let Err(e) = std::fs::remove_file(&side) {
+                        eprintln!(
+                            "rebuild_to_empty: failed to remove {} (continuing): {e}",
+                            side.display(),
+                        );
+                    }
+                }
+            }
+            // Open fresh at the same path. `Connection::open` creates
+            // the file if absent.
+            let new_conn = Connection::open(path)?;
+            Self::apply_init_pragmas(&new_conn, config)?;
+            *guard = new_conn;
+        } else {
+            // For in-memory, the temporary we already swapped in IS
+            // the new connection. Apply pragmas to it.
+            Self::apply_init_pragmas(&guard, config)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Compute the path of an SQLite side-file (e.g. `db-wal`, `db-shm`,
+/// `db-journal`) given the main DB path. SQLite appends the suffix to
+/// the full filename rather than swapping the extension — `foo.db`'s
+/// WAL is `foo.db-wal`, not `foo-wal`.
+fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    name.push(suffix);
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
+        _ => PathBuf::from(name),
+    }
 }
 
 impl std::fmt::Debug for Database {

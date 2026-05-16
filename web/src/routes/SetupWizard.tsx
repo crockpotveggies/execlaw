@@ -688,6 +688,9 @@ function BackendStep({
 }) {
     const gpus = preflight?.gpus ?? [];
     const dockerAvailable = preflight?.docker.available ?? false;
+    const ollamaAvailable = preflight?.ollama?.available ?? false;
+    const ollamaVersion = preflight?.ollama?.version ?? null;
+    const ollamaPath = preflight?.ollama?.path ?? null;
     const diskFreeBytes = preflight?.disk_free_bytes ?? null;
     const diskFreePath = preflight?.disk_free_path ?? null;
     const cachedModels = preflight?.cached_models ?? {};
@@ -717,6 +720,10 @@ function BackendStep({
                 purpose="Standard"
                 gpus={gpus}
                 dockerAvailable={dockerAvailable}
+                ollamaAvailable={ollamaAvailable}
+                ollamaVersion={ollamaVersion}
+                ollamaPath={ollamaPath}
+                onRecheckOllama={refresh}
                 diskFreeBytes={diskFreeBytes}
                 diskFreePath={diskFreePath}
                 cachedModels={cachedModels}
@@ -742,7 +749,11 @@ function HardwareSummary({
     refresh: () => Promise<void>;
 }) {
     const usable = gpus.filter(
-        (g) => g.vendor === "Nvidia" || g.vendor === "Intel" || g.vendor === "Amd",
+        (g) =>
+            g.vendor === "Nvidia" ||
+            g.vendor === "Intel" ||
+            g.vendor === "Amd" ||
+            g.vendor === "Apple",
     );
     return (
         <div

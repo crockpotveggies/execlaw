@@ -42,6 +42,21 @@
 //   MAX_RADIUS_METERS           = 50000
 
 // =====================================================================
+// LIFECYCLE (2026-05-13)
+//
+// google-places is HTTP-only against the Places API with an
+// API-key auth model (no OAuth). The key lives in vault and is
+// wiped by factory reset's DB-wide truncate. There's no
+// remote-side resource to revoke (API keys are managed in the
+// Google Cloud Console). on_disable here is the audit-log point.
+// =====================================================================
+
+fn on_disable() {
+    log_info("google-places: on_disable — no remote teardown required (API key is operator-managed in Cloud Console)");
+    ()
+}
+
+// =====================================================================
 // AGENT TOOL DISPATCH
 // =====================================================================
 

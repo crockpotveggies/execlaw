@@ -393,7 +393,7 @@ pub async fn advance_job_handler(
     // Resolve the inference backend the runner was using. If none is
     // available we can't run further phases; fail loud so the
     // operator notices.
-    let inference = state
+    let resolved = state
         .inference
         .resolve(&state.db, execlaw_core::backends::BackendPurpose::Standard)
         .ok_or_else(|| ApiError {
@@ -401,7 +401,8 @@ pub async fn advance_job_handler(
             code: "no_inference_backend",
             message: "no inference backend configured; cannot advance research phase".into(),
         })?;
-    let model = state.config.model_id.clone();
+    let inference = resolved.client.clone();
+    let model = resolved.model_id.clone();
     let workspace =
         crate::research::ResearchWorkspace::new(crate::research::ResearchWorkspace::default_root());
     let plan = row
@@ -874,7 +875,6 @@ mod tests {
             state.db.clone(),
             state.inference.clone(),
             ResearchWorkspace::new(tmp.path()),
-            "test-model".into(),
             state.events.clone(),
         );
         let token = tokio_util::sync::CancellationToken::new();
@@ -1098,7 +1098,6 @@ mod tests {
             state.db.clone(),
             state.inference.clone(),
             ResearchWorkspace::new(tmp.path()),
-            "test-model".into(),
             state.events.clone(),
         );
         let registry = supervisor.cancel_tokens.clone();

@@ -1,0 +1,34 @@
+{
+    "type": "object",
+    "properties": {
+        "latitude": { "type": "number", "minimum": -90, "maximum": 90 },
+        "longitude": { "type": "number", "minimum": -180, "maximum": 180 },
+        "place_name": { "type": "string" },
+        "hourly": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Marine variables. Common: wave_height, wave_period, wave_direction, wind_wave_height, wind_wave_period, swell_wave_height, swell_wave_period, swell_wave_direction."
+        },
+        "daily": {
+            "type": "array",
+            "items": { "type": "string" }
+        },
+        "current": {
+            "type": "array",
+            "items": { "type": "string" }
+        },
+        "timezone": { "type": "string" },
+        "length_unit": {
+            "type": "string",
+            "enum": ["metric", "imperial"],
+            "description": "Default \"metric\" (meters / seconds)."
+        },
+        "forecast_days": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 7
+        }
+    },
+    "required": [],
+    "additionalProperties": false
+}

@@ -97,6 +97,14 @@ pub enum AddressedReason {
     /// with.
     EligibilityBypass,
 
+    /// The message carries an image attachment, which is treated
+    /// as a strong "addressed" signal regardless of message text.
+    /// Group members sending the agent a photo are almost always
+    /// intentionally pulling it in (text-only banter rarely carries
+    /// media), and image-only inbounds have empty text the
+    /// classifier would otherwise filter out every time.
+    AttachmentDirected,
+
     /// The classifier couldn't be consulted (no inference backend
     /// resolved, missing display_name, principal lookup failed). We
     /// dispatched anyway because silencing the agent on a config
@@ -128,6 +136,9 @@ impl AddressedReason {
             }
             AddressedReason::ClassifierDirected => {
                 "a small classifier guessed this was for you, with no name match — weak signal, treat as likely-not-for-you unless the message body clearly says otherwise"
+            }
+            AddressedReason::AttachmentDirected => {
+                "the sender included an image attachment — group members rarely share photos as ambient banter, so this is a strong signal they want you to look at it (still apply the hard rules)"
             }
             AddressedReason::EligibilityBypass => {
                 "this conversation isn't a multi-human group from the addressing layer's perspective — the hard rules still apply, but ambient chatter is unlikely"
@@ -337,9 +348,27 @@ pub fn name_in_text(name: &str, text: &str) -> bool {
 /// the lookup fails, or the display_name is shorter than 2 chars
 /// after trim — every "I'm not sure who the agent is" path falls
 /// open at the caller.
+///
+/// 2026-05-13 — DB read errors are logged at WARN to the
+/// `group_addressing` target before returning `None`. Pre-rework
+/// the `.ok()?` swallow turned a `config_personality` BLOB-decode
+/// failure into a silent "no agent identity" branch that disabled
+/// the LLM-based addressing classifier for every group conversation
+/// without a peep in the logs.
 fn read_agent_identity(state: &AppState) -> Option<(String, String)> {
     use execlaw_core::personality::PersonalityStore;
-    let row = PersonalityStore::new(&state.db).get_default().ok()?;
+    let row = match PersonalityStore::new(&state.db).get_default() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                target: "group_addressing",
+                error = %e,
+                "config_personality read failed — group-addressing classifier will fall open (treat-as-directed). \
+                 Likely BLOB column corruption from a raw SQL UPDATE; use Settings → Personality instead.",
+            );
+            return None;
+        }
+    };
     let name = row.display_name.trim().to_owned();
     if name.chars().count() < 2 {
         return None;
@@ -364,12 +393,12 @@ async fn classify_via_llm(
     // Small isn't wired — better to spend the standard model's
     // latency budget here than to silently dispatch every group
     // message.
-    let inference = state
+    let resolved = state
         .inference
         .resolve(&state.db, BackendPurpose::Small)
         .or_else(|| state.inference.resolve(&state.db, BackendPurpose::Standard));
-    let inference = match inference {
-        Some(c) => c,
+    let resolved = match resolved {
+        Some(r) => r,
         None => {
             tracing::debug!(
                 target: "group_addressing",
@@ -378,6 +407,8 @@ async fn classify_via_llm(
             return DispatchDecision::Dispatch(AddressedReason::FallOpenClassifierUnavailable);
         }
     };
+    let inference = resolved.client.clone();
+    let resolved_model_id = resolved.model_id.clone();
 
     let role_phrase = if agent_role.trim().is_empty() {
         "assistant"
@@ -407,7 +438,7 @@ async fn classify_via_llm(
     );
 
     let req = ChatRequest {
-        model: ModelId(state.config.model_id.clone()),
+        model: ModelId(resolved_model_id.clone()),
         messages: vec![
             ChatMessage::system(system_prompt),
             ChatMessage::user(format!(
@@ -457,11 +488,12 @@ async fn classify_via_llm(
         }
     };
 
-    let text = resp
+    let text_owned = resp
         .choices
         .first()
-        .and_then(|c| c.message.content.as_deref())
-        .unwrap_or("");
+        .and_then(|c| c.message.content.as_ref().map(|mc| mc.as_text()))
+        .unwrap_or_default();
+    let text = text_owned.as_str();
     match parse_directed_verdict(text) {
         Some(true) => DispatchDecision::Dispatch(AddressedReason::ClassifierDirected),
         Some(false) => DispatchDecision::Skip,

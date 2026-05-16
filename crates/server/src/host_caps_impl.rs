@@ -26,9 +26,10 @@
 
 use crate::state::AppState;
 use execlaw_script::{
-    HostCapError, HostCapabilities, InboundMessage, RouteOutcome, WsFrameHandler,
+    CreatedArtifact, HostCapError, HostCapabilities, InboundMessage, RouteOutcome, WsFrameHandler,
     WsSubscriptionHandle,
 };
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -158,14 +159,30 @@ impl HostCapabilities for AppStateHostCapabilities {
         use execlaw_core::ids::AttachmentId;
         let store = AttachmentStore::new(&self.state.db);
         let aid = AttachmentId::from(attachment_id);
-        let row = store
+
+        // Two stores share the read path: inbound `state_attachments`
+        // (transport-minted) AND plugin-rendered `state_artifacts`. Try
+        // attachments first since that's the historical hot path; fall
+        // back to artifacts so `discord.send_with_attachments` (and the
+        // SPA's `/api/attachments/<id>` route) accept chart ids minted
+        // by `host_create_attachment`.
+        let (path, mime_type) = match store
             .get(&aid)
             .map_err(|e| HostCapError::new(format!("attachment lookup: {e}")))?
-            .ok_or_else(|| HostCapError::new(format!("no attachment '{attachment_id}'")))?;
+        {
+            Some(row) => (row.path, row.mime_type),
+            None => {
+                let art = store
+                    .get_artifact(attachment_id)
+                    .map_err(|e| HostCapError::new(format!("artifact lookup: {e}")))?
+                    .ok_or_else(|| HostCapError::new(format!("no attachment '{attachment_id}'")))?;
+                (art.path, art.mime_type)
+            }
+        };
         // 25 MiB cap mirrors the inbound + outbound caps in the
         // retired signal_transport.rs.
         const MAX_BYTES: u64 = 25 * 1024 * 1024;
-        let on_disk = std::fs::metadata(&row.path)
+        let on_disk = std::fs::metadata(&path)
             .map_err(|e| HostCapError::new(format!("attachment stat: {e}")))?
             .len();
         if on_disk > MAX_BYTES {
@@ -173,21 +190,60 @@ impl HostCapabilities for AppStateHostCapabilities {
                 "attachment '{attachment_id}' is {on_disk} bytes; max is {MAX_BYTES}"
             )));
         }
-        let path = row.path.clone();
-        let bytes = tokio::task::spawn_blocking(move || std::fs::read(path))
+        let path_for_read = path.clone();
+        let bytes = tokio::task::spawn_blocking(move || std::fs::read(path_for_read))
             .await
             .map_err(|e| HostCapError::new(format!("attachment read join: {e}")))?
             .map_err(|e| HostCapError::new(format!("attachment read: {e}")))?;
-        let mime = if row.mime_type.is_empty() {
+        let mime = if mime_type.is_empty() {
             "application/octet-stream"
         } else {
-            row.mime_type.as_str()
+            mime_type.as_str()
         };
         let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
         Ok(execlaw_script::AttachmentBytes {
             data_url: format!("data:{mime};base64,{encoded}"),
             mime_type: mime.to_owned(),
             size_bytes: bytes.len() as u64,
+        })
+    }
+
+    async fn create_artifact_attachment(
+        &self,
+        plugin_id: &str,
+        filename: &str,
+        mime_type: &str,
+        bytes: Vec<u8>,
+        ttl_seconds: Option<i64>,
+    ) -> Result<CreatedArtifact, HostCapError> {
+        use execlaw_core::attachments::AttachmentStore;
+        // Clone the db handle out of &self so the spawn_blocking
+        // closure owns a 'static set of inputs — the store itself
+        // borrows from &self.state.db and can't escape the method.
+        let db = self.state.db.clone();
+        let root = plugin_artifacts_root(&self.state);
+        let plugin_id_owned = plugin_id.to_owned();
+        let filename_owned = filename.to_owned();
+        let mime_owned = mime_type.to_owned();
+        let now = chrono::Utc::now().timestamp();
+        let created = tokio::task::spawn_blocking(move || {
+            AttachmentStore::new(&db).insert_plugin_artifact(
+                &root,
+                &plugin_id_owned,
+                &filename_owned,
+                &mime_owned,
+                &bytes,
+                ttl_seconds,
+                now,
+            )
+        })
+        .await
+        .map_err(|e| HostCapError::new(format!("artifact write join: {e}")))?
+        .map_err(|e| HostCapError::new(format!("artifact write: {e}")))?;
+        Ok(CreatedArtifact {
+            attachment_id: created.attachment_id,
+            sha256: created.sha256,
+            size_bytes: created.size_bytes,
         })
     }
 
@@ -229,6 +285,37 @@ impl HostCapabilities for AppStateHostCapabilities {
         store
             .delete(Some(plugin_id), name)
             .map_err(|e| HostCapError::new(format!("vault_delete: {e}")))
+    }
+}
+
+/// Where plugin-rendered artifacts live on disk. Resolution order:
+///   1. `EXECLAW_PLUGIN_ARTIFACTS_DIR` env var — wins outright. Tests
+///      set this to a tempdir so a misconfigured run can't escape its
+///      sandbox.
+///   2. `<home>/.execlaw/plugin_artifacts/` — the production default,
+///      matches the rest of execlaw's `~/.execlaw/` data layout.
+///   3. `./.execlaw/plugin_artifacts/` (cwd-relative) — last-ditch
+///      fallback for environments without a resolvable home dir.
+///
+/// The directory is created lazily by `insert_plugin_artifact`.
+fn plugin_artifacts_root(_state: &AppState) -> PathBuf {
+    builtin_artifacts_root_path()
+}
+
+/// 2026-05-15 — pulled out as a free function so the built-in
+/// `chart.render` tool's dispatch wiring (in `tool_dispatch.rs`)
+/// can reach the same path without an `&AppState` borrow. Same
+/// resolution chain as `plugin_artifacts_root`: env override →
+/// `~/.execlaw/plugin_artifacts/` → cwd-relative fallback.
+pub(crate) fn builtin_artifacts_root_path() -> PathBuf {
+    if let Ok(p) = std::env::var("EXECLAW_PLUGIN_ARTIFACTS_DIR") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    match directories::UserDirs::new() {
+        Some(d) => d.home_dir().join(".execlaw").join("plugin_artifacts"),
+        None => PathBuf::from(".execlaw").join("plugin_artifacts"),
     }
 }
 
@@ -411,7 +498,7 @@ async fn consumer_loop(
                             });
                         }
                         Some(Ok(Message::Binary(b))) => {
-                            tracing::info!(
+                            tracing::debug!(
                                 target: "host_caps::ws",
                                 %url,
                                 len = b.len(),
@@ -435,7 +522,12 @@ async fn consumer_loop(
                             // by the consumer task and only ONE arm
                             // of this `select!` runs per iteration,
                             // so we never race the outbox writer.
-                            tracing::info!(
+                            // Keepalive — fires every ~30s per live WS
+                            // (sms-socket gateway, Slack RTM, etc.).
+                            // DEBUG so it stays out of the operator
+                            // log while still being visible when an
+                            // operator is debugging a stalled socket.
+                            tracing::debug!(
                                 target: "host_caps::ws",
                                 %url,
                                 len = payload.len(),

@@ -12,6 +12,230 @@ this changelog is for operators and plugin authors who want to see the
 
 ## [Unreleased]
 
+### Fixed
+
+- **Hydrate auto-evicts zombie plugin rows.** When `PluginHost::hydrate`
+  couldn't load a plugin at boot — stage directory missing,
+  `main.rhai` gone, subprocess binary unexec'able, manifest TOML
+  corrupted — it used to call `registry.disable(plugin_id)` and
+  leave `state_plugins.enabled=1` in the DB. That left a "zombie"
+  state where the SPA queried `state_plugins`, saw the plugin as
+  installed, rendered its config page, and every admin route 404'd
+  with the confusing
+    `no [[admin_routes]] entry on plugin 'X' matching GET /…`
+  error. Recovery required a manual uninstall + reinstall via the
+  SPA.
+
+  Symptom: the factory-reset orphan-directory sweep added in
+  commit 3753e05 wipes `~/.execlaw/plugins/` as part of a clean
+  slate; if a `state_plugins` row from before the reset somehow
+  survived (or if the user ran a different code path that wiped
+  the stage tree without nuking the DB), the next server restart
+  hit this exact zombie state.
+
+  New behavior: hydrate now calls a single `evict_unrecoverable_plugin`
+  helper that disables the plugin in the registry AND deletes the
+  `state_plugins` row. The SPA's install-list query then correctly
+  reports the plugin as uninstalled, and the operator sees a clean
+  "Install plugin" affordance instead of a broken config page.
+  All four hydrate failure branches (manifest unparseable, missing
+  runtime.executable, missing runtime.source, runtime spawn failure)
+  go through the same eviction path so DB ↔ registry parity is the
+  rule, not the exception.
+
+  Two new regression tests pin the contract:
+  `hydrate_auto_purges_zombie_row_when_stage_dir_is_missing` (the
+  reported failure mode) and
+  `hydrate_auto_purges_zombie_row_when_manifest_is_unparseable`
+  (the corrupted-TOML cousin).
+
+- **Sidecar host-port allocation is now dynamic and self-healing.** The
+  prior allocator was a naive monotonic counter starting at port 8501;
+  when any pool member was occupied externally (a stale Docker veth, a
+  competing dev server, a prior crashed sidecar holding the port), the
+  supervisor minted the busy port, the Docker spawn failed with
+  `Bind for 127.0.0.1:<p> failed: port is already allocated`, the slot
+  burned a restart attempt, and the supervisor pinned the same dead
+  port on every retry — parking the sidecar `CrashLooping` after
+  `MAX_RESTART_ATTEMPTS` for an entirely environmental, externally-
+  fixable problem. (Observed in production 2026-05-14 with signal-cli
+  blocked on port 8502.)
+
+  Two new layers in `crates/server/src/sidecar_supervisor.rs` close
+  the gap:
+
+    * **`port_is_free` OS probe.** `allocate_port` now walks the pool
+      from `next_host_port` toward `SIDECAR_PORT_POOL_END` and skips
+      any candidate that fails a `TcpListener::bind` probe. Common-
+      case fast path: the busy port is detected before Docker is
+      even called.
+    * **`is_port_conflict_error` spawn-failure classifier.** When a
+      Docker spawn does fail with a port-conflict signature (the
+      probe-vs-bind TOCTOU race that the probe can't catch), the
+      supervisor releases `slot.host_port` so the next reconcile
+      mints a fresh one, and crucially does **NOT** burn a restart
+      attempt — port conflicts are environmental, not plugin bugs,
+      and the retry is cheap. The supervisor also `kick()`s the
+      reconcile loop so the recovery spawn happens immediately
+      instead of waiting the full tick interval.
+
+  Four new tests pin the behavior: external-occupant skip (real
+  `TcpListener` binds a pool port → allocator must hand out a
+  different one), the `port_is_free` probe round-trip, the
+  `is_port_conflict_error` matcher across known Docker error
+  variants, and the end-to-end conflict-recovery flow (spawn fails
+  → port released → next spawn succeeds with no restart-attempt
+  burn).
+
+### Added
+
+- **Conversation history sliding-window truncation.** Pre-fix every
+  chat turn re-hydrated the entire `state_events` table from
+  `seq = 0` into the prompt, growing linearly with conversation
+  length and quadratically with operator usage. Observed 2026-05-14:
+  a long-lived Signal thread with ~83 KB of stored events took
+  ~24.5 s per turn vs ~657 ms on a fresh web chat with ~3 KB of
+  events on the same backend, same model, same code path. The cost
+  is entirely prompt-prefill on the larger history.
+
+  New `execlaw_core::history_budget` module + migration 0003
+  (`config_general.max_history_tokens`, default 8000). Both
+  `run_real_turn` and `run_tool_capable_turn` route their hydrated
+  history through `truncate_to_budget` before constructing
+  `ChatMessage`s. Walks backward from most-recent, drops oldest
+  past the budget, preserves pair coherence (Assistant always has
+  its preceding User), and guarantees the last 4 messages survive
+  any budget (anti-starvation). Char-to-token estimate is
+  `chars/4` — no tokenizer dependency. 11 unit tests pin the
+  invariants (monotone in budget, current-turn always lands at the
+  model, dedupe-aware blob delete is unchanged, etc.).
+
+- **Local principal cache + O(1) identifier lookup.** Pre-fix
+  `PrincipalStore::find_by_identifier` did
+  `list_all().into_iter().find(...)` — an O(N) scan over every
+  principal row (each loaded + JSON-deserialised) just to answer
+  "have we seen this (transport, handle) before?" Every external
+  inbound (Signal, WhatsApp, future bridges) hits this check via
+  `admit_external_principal`, and a 500-contact install paid a full
+  principal-table read per inbound message.
+
+  Migration 0004 adds `principal_identifiers (transport, handle,
+  principal_id)` with composite PK + supporting indexes + CASCADE
+  delete + a one-shot backfill from existing `identifiers_json`
+  (`json_each` over a `CAST AS TEXT` of the BLOB column).
+  `PrincipalStore::upsert` now resyncs the index inside a single
+  transaction (delete-then-insert; identifier sets are 1-4 rows
+  per principal, cheap). `find_by_identifier` becomes a PK probe;
+  `find_all_by_identifier` (used by reconcile to enumerate every
+  claimant of the same identifier) is a small filtered query.
+
+  Policy unchanged but now documented in code: the
+  `principal_admit::admit_external_principal` cache-first path
+  returns ANY previously-seen principal regardless of trust class
+  (Controller, KnownTrusted, KnownLimited, UnknownPending, Blocked)
+  without re-running the identity-provider plugin fanout. Plugin
+  fanout only runs for first-ever inbound from a `(transport,
+  handle)` pair. Six new tests pin the index sync (population
+  on upsert, resync on identifier-set change, CASCADE on principal
+  delete, single-claimant lookup, multi-claimant lookup for the
+  reconcile fixture, migration backfill).
+
+- **Plugin-lifecycle `purge` orchestration** —
+  `crates/server/src/plugin_lifecycle.rs` is a new module that chains
+  every per-plugin teardown step in one load-bearing order:
+
+    1. `PluginHost::disable` fires the plugin's `on_disable` Rhai hook
+       while its OAuth tokens, vault secrets, and transport bindings are
+       still readable — so a well-behaved plugin can revoke an upstream
+       OAuth grant or send a "going offline" message on its transport.
+    2. `SidecarSupervisor::remove_for_plugin` stops + `docker rm -f`'s
+       every container the plugin owns AND recursively deletes its
+       per-plugin state root at `~/.execlaw/sidecars/<plugin_id>/`. The
+       state-dir delete is the gap that earlier `stop_all` left behind:
+       a re-install silently inherited signal-cli's keystore /
+       wuzapi's session DB.
+    3. OAuth tokens + clients, plugin artifacts (with refcount-aware
+       blob delete), and vault secrets for the plugin are deleted by
+       their respective stores' new `delete_for_plugin` /
+       `purge_artifacts_for_plugin` methods.
+    4. `PluginHost::uninstall` archives plugin-shipped skills, deletes
+       the `state_plugins` row, and removes the staged plugin dir.
+
+  Two callers consume the orchestrator:
+
+    * `DELETE /api/admin/plugins/{id}` — the SPA's "Uninstall plugin"
+      button now produces a true clean slate instead of leaving orphan
+      Docker containers, state dirs, OAuth grants, vault secrets, and
+      artifact blobs behind. Response shape changed from `{"ok": true}`
+      to a `PluginPurgeReport` JSON body with per-resource counts.
+    * `POST /api/admin/factory-reset` — enumerates every installed
+      plugin via `PluginHost::list_rows`, runs `purge_plugin` for each,
+      then sweeps top-level orphan dirs (`~/.execlaw/sidecars`,
+      `~/.execlaw/plugin_artifacts`, `~/.execlaw/plugins`,
+      `~/.execlaw/research`) before the DB file is rebuilt. Response
+      body grew `plugins_purged: Vec<PluginPurgeReport>` and
+      `orphan_dirs_removed: Vec<String>`; the old opaque
+      `plugins_torn_down` / `sidecars_stopped` counters are replaced.
+
+- **`OauthClientStore::delete_for_plugin` + `OauthTokenStore::delete_for_plugin`**
+  (`crates/core/src/oauth.rs`) — bulk delete every OAuth grant owned by
+  a `plugin_id`. Tokens already cascade from clients via the FK; the
+  explicit token-delete is a defensive safety-net for hand-edited DBs.
+- **`AttachmentStore::purge_artifacts_for_plugin`**
+  (`crates/core/src/attachments.rs`) — wipe every `state_artifacts`
+  row for a plugin AND (refcount-aware) unlink the underlying blobs
+  on disk. Two plugins emitting identical chart bytes share one blob;
+  uninstalling one must not break the other — pinned by test.
+- **`VaultRowStore::delete_for_plugin`**
+  (`crates/core/src/vault_row.rs`) — drop a plugin's `vault_secrets`
+  rows. Core-scope rows (`plugin_id IS NULL`) are never touched —
+  pinned by test.
+- **`SidecarSupervisor::remove_for_plugin`**
+  (`crates/server/src/sidecar_supervisor.rs`) — per-plugin variant of
+  `stop_all`. Stops + removes every container matching the plugin
+  AND deletes `~/.execlaw/sidecars/<plugin_id>/`. Returns a
+  `SidecarRemovalReport`. Other plugins' state is untouched.
+
+### Fixed
+
+- **Factory reset now produces an actual factory state.** The previous
+  `wipe_all_user_tables` `DELETE`d every non-`schema_version` row but
+  only re-seeded `config_general`. Every other migration-seeded
+  singleton (`config_research`, `config_personality`,
+  `config_search_providers`, `config_skills`, …) was left empty.
+  Downstream code reading those tables via `query_row(...)?` (no
+  `.optional()` fallback) blew up minutes later with
+  `sqlite error: Query returned no rows`. Symptom: deep-research jobs
+  stalled / failed immediately after a fresh-account setup that
+  followed a factory reset.
+
+  Rewrote `factory_reset.rs::wipe_and_remigrate` to blow away the
+  on-disk database file entirely (`.db` + `-wal` + `-shm` +
+  `-journal`) via a new `Database::rebuild_to_empty(&DbConfig)`
+  method, then re-open at the same path with the same encryption
+  posture and re-run `MigrationRunner::apply_all()`. The migration
+  set's `CREATE TABLE` + `INSERT OR IGNORE` statements take care of
+  re-creating the schema AND re-seeding every singleton. An earlier
+  iteration tried DROP TABLE per user table, but that tripped on the
+  FTS5 `skill_search` virtual table's destructor
+  (`vtable constructor failed: skill_search`); file-level delete
+  bypasses vtable lifecycle entirely. `AppState` gained a
+  `db_config: Arc<DbConfig>` field so the reset path can re-open
+  without round-tripping through the OS keyring. The response body
+  now reports `migrations_reapplied`. Three new regression tests
+  pin: (a) every migration-seeded singleton is populated after
+  reset, (b) `ResearchConfigStore::get()` succeeds post-reset, (c)
+  the `tables_wiped` + `migrations_reapplied` counts both surface in
+  the response JSON.
+
+- **`ResearchConfigStore::get()` honors its docstring.** The
+  docstring promised "returns the defaults on a fresh DB rather than
+  `None`" but the implementation propagated `QueryReturnedNoRows`
+  through `?` whenever the singleton row was missing. Fixed with
+  `.optional()` + fall-through to `ResearchConfig::default()`. A new
+  unit test pins the contract by DELETEing the row then asserting
+  `get()` still returns defaults.
+
 ### Added
 
 - **GitHub Actions CI** (`.github/workflows/ci.yml`) — four-target

@@ -39,7 +39,7 @@ fn resp(text: &str) -> ChatResponse {
             index: 0,
             message: ChatMessage {
                 role: Role::Assistant,
-                content: Some(text.into()),
+                content: Some(execlaw_inference_api::MessageContent::Text(text.into())),
                 tool_call_id: None,
                 name: None,
                 tool_calls: vec![],
@@ -93,7 +93,13 @@ fn bench_qwen3_process(c: &mut Criterion) {
     );
 
     group.throughput(Throughput::Bytes(
-        clean.choices[0].message.content.as_ref().unwrap().len() as u64,
+        clean.choices[0]
+            .message
+            .content
+            .as_ref()
+            .unwrap()
+            .as_text()
+            .len() as u64,
     ));
     group.bench_function("clean", |b| {
         b.iter(|| {
