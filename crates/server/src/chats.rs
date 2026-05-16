@@ -84,7 +84,35 @@ pub struct SendMessageRequest {
     /// the request comfortably under the cap).
     #[serde(default)]
     pub attachments: Vec<InlineAttachmentRequest>,
+    /// 2026-05-15 — names of skills the operator picked from the
+    /// composer's `+` menu to apply to THIS turn only. The server
+    /// resolves each name to its current stable/trial body, prepends
+    /// the bodies as `<skill name="...">...</skill>` blocks above
+    /// the user text, and ships the combined string to the model.
+    /// The original (un-prepended) text remains in
+    /// `UserMessagePayload.text` so subsequent turns don't keep
+    /// re-seeing the skill body in history. The applied names land
+    /// on `UserMessagePayload.applied_skill_names` so the SPA can
+    /// render a "applied: foo, bar" chip on the message bubble.
+    ///
+    /// Validation:
+    ///   * Unknown / archived skill name → 404 `skill_not_found`.
+    ///   * Total resolved body bytes > [`MAX_PREPEND_SKILL_BYTES`]
+    ///     → 413 `skill_prepend_too_large` (prevents ballooning the
+    ///     request past the model's context window in one shot).
+    ///
+    /// Empty / absent for every non-web inbound path; transports
+    /// don't surface a picker UI today.
+    #[serde(default)]
+    pub skill_names: Vec<String>,
 }
+
+/// Hard cap on the total bytes of resolved skill bodies prepended
+/// onto a single turn. Kept generous (32 KiB ≈ 8000 tokens) so a
+/// few medium-sized skills fit comfortably; exceeded only when the
+/// operator picks several large skills at once. The cap is checked
+/// AFTER resolving each name to its body — names alone don't count.
+const MAX_PREPEND_SKILL_BYTES: usize = 32 * 1024;
 
 /// One image attachment from the SPA composer. The `data_url` carries
 /// the bytes inline as a `data:` URL (`data:<mime>;base64,<bytes>`).
@@ -145,6 +173,16 @@ pub struct MessageView {
     /// text bubble.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<MessageAttachmentView>,
+    /// 2026-05-15 — names of skills the operator picked from the
+    /// composer's `+` menu when sending this `user_msg`. The skill
+    /// bodies were prepended onto the message text server-side
+    /// before the model saw them; the SPA strips those `<skill
+    /// name="...">...</skill>` blocks out of `text` for display
+    /// and renders this list as a chip under the bubble. Empty for
+    /// every non-user_msg kind and for user_msg events sent without
+    /// any skill selection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied_skill_names: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -217,6 +255,39 @@ pub async fn send_message(
             Ok(ids) => ids,
             Err(err) => return err.into_response(),
         }
+    };
+
+    // 2026-05-15 — operator-picked skills (composer `+` menu, second
+    // item). Resolve every name to its current body and build the
+    // `<skill name="...">...</skill>\n\n` prepend block. Validation
+    // failures (unknown / archived / prepend too large) short-circuit
+    // BEFORE any event-log write so a typo'd skill name doesn't
+    // half-commit the turn. Skills land on every dispatch path
+    // (stub / real / runner / tool-capable) — same prepend semantics
+    // regardless of which runtime answers. Skipped for incognito
+    // (no DB read against the transient session) and for non-web
+    // inbounds (transports don't surface a skill picker today).
+    let (skill_prepend, applied_skill_names): (String, Vec<String>) =
+        if req.incognito || req.skill_names.is_empty() {
+            (String::new(), Vec::new())
+        } else {
+            match resolve_skill_prepend(&state.db, &req.skill_names) {
+                Ok(block) => (block, req.skill_names.clone()),
+                Err((status, code, message)) => {
+                    return (
+                        status,
+                        Json(serde_json::json!({
+                            "error": {"code": code, "message": message}
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        };
+    let effective_user_text: String = if skill_prepend.is_empty() {
+        req.text.clone()
+    } else {
+        format!("{skill_prepend}{}", req.text)
     };
 
     // 2026-04-28 — incognito short-circuit. We branch BEFORE
@@ -436,7 +507,7 @@ pub async fn send_message(
                     state: &state,
                     group_id,
                     cid: &cid,
-                    user_text: &req.text,
+                    user_text: &effective_user_text,
                     sender_principal_id: req.sender_principal_id.clone(),
                     spotlight_content,
                     cancel_flag: cancel_flag.clone(),
@@ -448,6 +519,7 @@ pub async fn send_message(
                     caller_timezone: req.timezone.as_deref(),
                     group_context: group_context_for_turn.clone(),
                     attachment_ids: persisted_attachments.clone(),
+                    applied_skill_names: applied_skill_names.clone(),
                 })
                 .await
                 {
@@ -468,7 +540,7 @@ pub async fn send_message(
                 &state,
                 inference.clone(),
                 &cid,
-                &req.text,
+                &effective_user_text,
                 req.sender_principal_id.clone(),
                 caller_caps.clone(),
                 sender_trust,
@@ -476,6 +548,7 @@ pub async fn send_message(
                 req.timezone.as_deref(),
                 group_context_for_turn.clone(),
                 persisted_attachments.clone(),
+                applied_skill_names.clone(),
             )
             .await
             {
@@ -496,7 +569,7 @@ pub async fn send_message(
                     &state,
                     inference.clone(),
                     &cid,
-                    &req.text,
+                    &effective_user_text,
                     req.sender_principal_id.clone(),
                     sender_trust,
                     spotlight_content,
@@ -505,6 +578,7 @@ pub async fn send_message(
                     req.timezone.as_deref(),
                     group_context_for_turn.clone(),
                     persisted_attachments.clone(),
+                    applied_skill_names.clone(),
                 )
                 .await
                 {
@@ -525,10 +599,11 @@ pub async fn send_message(
                 match run_stub_turn(
                     &state,
                     &cid,
-                    &req.text,
+                    &effective_user_text,
                     req.sender_principal_id.clone(),
                     None,
                     persisted_attachments.clone(),
+                    applied_skill_names.clone(),
                 ) {
                     Ok(out) => out,
                     Err(e) => {
@@ -656,6 +731,7 @@ fn run_stub_turn(
     sender_principal_id: Option<String>,
     inbound_channel_origin: Option<&str>,
     attachment_ids: Vec<String>,
+    applied_skill_names: Vec<String>,
 ) -> Result<(i64, String, i64), String> {
     let log = event_log(state);
     let reply_text = format!(
@@ -670,6 +746,7 @@ fn run_stub_turn(
             sender_principal_id,
             channel_origin: inbound_channel_origin.map(|s| s.to_owned()),
             attachment_ids,
+            applied_skill_names,
         },
         None,
     )
@@ -737,6 +814,7 @@ async fn run_real_turn(
     caller_timezone: Option<&str>,
     group_context: Option<GroupTurnContext>,
     attachment_ids: Vec<String>,
+    applied_skill_names: Vec<String>,
 ) -> Result<(i64, String, i64), String> {
     // 2026-05-13 — `resolved` carries the InferenceClient + the
     // model_id paired from the SAME `config_backends` row read.
@@ -766,6 +844,7 @@ async fn run_real_turn(
             sender_principal_id: sender_principal_id.clone(),
             channel_origin: inbound_channel_origin.map(|s| s.to_owned()),
             attachment_ids: attachment_ids.clone(),
+            applied_skill_names: applied_skill_names.clone(),
         },
         sender_principal_id.clone(),
     )
@@ -1179,6 +1258,13 @@ pub(crate) struct RunnerTurnCtx<'a> {
     /// non-web inbound path (Signal / email today; future bridges
     /// land their own image plumbing later).
     pub attachment_ids: Vec<String>,
+    /// 2026-05-15 — names of skills the operator picked from the
+    /// composer's `+` menu for this turn. Persisted into
+    /// `UserMessagePayload.applied_skill_names` for SPA rendering
+    /// + audit. The bodies are already prepended onto `user_text`
+    /// by the send-handler upstream; the runner doesn't need to
+    /// re-resolve them.
+    pub applied_skill_names: Vec<String>,
 }
 
 pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, String, i64), String> {
@@ -1196,6 +1282,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         caller_timezone,
         group_context,
         attachment_ids,
+        applied_skill_names,
     } = ctx;
     let supervisor = state
         .runner_supervisor
@@ -1219,6 +1306,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
             sender_principal_id: sender_principal_id.clone(),
             channel_origin: inbound_channel_origin.map(|s| s.to_owned()),
             attachment_ids: attachment_ids.clone(),
+            applied_skill_names: applied_skill_names.clone(),
         },
         sender_principal_id.clone(),
     )
@@ -1739,6 +1827,7 @@ async fn run_tool_capable_turn(
     caller_timezone: Option<&str>,
     group_context: Option<GroupTurnContext>,
     attachment_ids: Vec<String>,
+    applied_skill_names: Vec<String>,
 ) -> Result<(i64, String, i64), String> {
     use execlaw_inference_api::ToolDeclaration;
     use execlaw_runner_local::turn::{TurnConfig, TurnExecutor};
@@ -1963,6 +2052,7 @@ async fn run_tool_capable_turn(
             &cfg,
             attachment_ids,
             user_image_urls,
+            applied_skill_names,
         )
         .await
         .map_err(|e| format!("executor: {e}"))?;
@@ -2330,6 +2420,9 @@ pub async fn dispatch_routine_turn(
                 routine_tz_ref,
                 routine_group_ctx.clone(),
                 Vec::new(),
+                // Routines don't surface a skill picker — operators
+                // pick skills inline in the composer, not from cron.
+                Vec::new(),
             )
             .await
         }
@@ -2362,12 +2455,21 @@ pub async fn dispatch_routine_turn(
                 routine_tz_ref,
                 routine_group_ctx.clone(),
                 Vec::new(),
+                Vec::new(),
             )
             .await;
             drop(cancel_guard);
             res
         }
-        None => run_stub_turn(state, &cid, prompt, sender.clone(), None, Vec::new()),
+        None => run_stub_turn(
+            state,
+            &cid,
+            prompt,
+            sender.clone(),
+            None,
+            Vec::new(),
+            Vec::new(),
+        ),
     };
 
     let mapped = result.map(|(_user_seq, text, _assistant_seq)| RoutineDispatchOutcome {
@@ -2551,6 +2653,8 @@ pub async fn commit_inbound_user_msg_silently(
             sender_principal_id: Some(sender_principal_id.to_owned()),
             channel_origin: Some(inbound_channel_origin.to_owned()),
             attachment_ids,
+            // Transports don't surface a skill picker today.
+            applied_skill_names: Vec::new(),
         },
         Some(sender_principal_id.to_owned()),
     )
@@ -2700,6 +2804,8 @@ pub async fn dispatch_external_turn(
                 caller_timezone,
                 group_context.clone(),
                 attachment_ids.clone(),
+                // Transports don't surface a skill picker.
+                Vec::new(),
             )
             .await
         }
@@ -2722,6 +2828,7 @@ pub async fn dispatch_external_turn(
                 caller_timezone,
                 group_context.clone(),
                 attachment_ids.clone(),
+                Vec::new(),
             )
             .await;
             drop(cancel_guard);
@@ -2734,6 +2841,7 @@ pub async fn dispatch_external_turn(
             sender.clone(),
             inbound_channel_origin,
             attachment_ids.clone(),
+            Vec::new(),
         ),
     };
 
@@ -3160,6 +3268,8 @@ pub async fn dispatch_clarification_turn(
                 caller_timezone,
                 synth_group_ctx.clone(),
                 Vec::new(),
+                // Orchestrator-synthesized turn — no operator skill picker.
+                Vec::new(),
             )
             .await
         }
@@ -3182,12 +3292,21 @@ pub async fn dispatch_clarification_turn(
                 caller_timezone,
                 synth_group_ctx.clone(),
                 Vec::new(),
+                Vec::new(),
             )
             .await;
             drop(cancel_guard);
             res
         }
-        None => run_stub_turn(state, cid, &prompt, sender.clone(), None, Vec::new()),
+        None => run_stub_turn(
+            state,
+            cid,
+            &prompt,
+            sender.clone(),
+            None,
+            Vec::new(),
+            Vec::new(),
+        ),
     };
 
     // 2026-05-04 — broadcast the agent's reply on the WS bus so the
@@ -3884,15 +4003,53 @@ pub(crate) fn build_tool_routing_prose(
              `https://mcp.atlassian.com/v1/mcp/authv2`, auth via API token from \
              id.atlassian.com.",
         ),
+        (
+            // 2026-05-15 — added because the routing prose previously
+            // had no chart entry, and `chart.render` was bucketed as
+            // a "plugin-prefixed" tool with the generic
+            // "read its description" prose. Result: model didn't
+            // recognise chart-rendering as a workflow with a fetch
+            // step, defaulted to the "no tool helps, answer from
+            // own knowledge" escape hatch, and hallucinated stock
+            // prices. Top-level entry tells the model the chain
+            // BEFORE it scans individual descriptions.
+            "chart",
+            "* `chart.render` (built-in) — for ANY visualisation request, ALWAYS fetch real \
+             data via the matching data-source tool FIRST, then pipe the values into \
+             `chart.render`. Examples: stocks/ETFs/indices/crypto/FX → \
+             `yahoo_finance.historical_candles` first; weather → `open_meteo.forecast` / \
+             `.historical` first; anything else with an API → `web_fetch` first. NEVER \
+             invent data points to chart — if you cannot fetch them, say so instead of \
+             fabricating. After the chart renders it shows inline; your follow-up reply \
+             should be one short line of context, NOT a recap of the data.",
+        ),
     ];
+
+    // 2026-05-15 — built-in tool namespaces that look plugin-like
+    // (have a `.` in the name) but aren't actually plugin-supplied.
+    // Catch these BEFORE the plugin-namespace bucketing so they don't
+    // get the misleading "comes from the X plugin" prose. The
+    // matching `routing_lines` entry above carries the right guidance.
+    const BUILTIN_NAMESPACES: &[&str] = &["chart"];
 
     // Bucket every tool by its family prefix.
     let mut present: BTreeSet<&str> = BTreeSet::new();
     let mut plugin_namespaces: BTreeSet<String> = BTreeSet::new();
     for name in builtin_names.iter().chain(plugin_names.iter()) {
         if let Some(dot) = name.find('.') {
+            let ns = &name[..dot];
+            // Built-in dotted names route through the explicit
+            // `routing_lines` entry (e.g. "chart"). Look up the
+            // 'static str so we can insert into `present` (which
+            // holds &'static str matching the routing_lines keys),
+            // and skip the plugin-namespace bucket below so we
+            // don't double-emit prose.
+            if let Some(builtin_ns) = BUILTIN_NAMESPACES.iter().find(|b| **b == ns) {
+                present.insert(*builtin_ns);
+                continue;
+            }
             // `calendar.list_events` → namespace `calendar`.
-            plugin_namespaces.insert(name[..dot].to_owned());
+            plugin_namespaces.insert(ns.to_owned());
             continue;
         }
         let prefix = name.split('_').next().unwrap_or(name);
@@ -3960,8 +4117,12 @@ pub(crate) fn build_tool_routing_prose(
         out.push('\n');
     }
     out.push_str(
-        "\nWhen multiple families could apply, prefer the most specific one. If no tool helps, \
-         answer from your own knowledge.",
+        "\nWhen multiple families could apply, prefer the most specific one. If no tool helps \
+         AND the question is general knowledge (definitions, history, how-things-work, your own \
+         opinion), answer from your own knowledge. If no tool helps AND the question needs LIVE \
+         or DATED data (current prices, today's weather, breaking news, the operator's calendar, \
+         anything that may have changed since training), say you cannot fetch it — never \
+         invent values.",
     );
     out
 }
@@ -4066,6 +4227,7 @@ pub async fn list_messages(
                 committed_at: e.committed_at,
                 channel_origin: extract_channel_origin(&e),
                 attachments: hydrate_message_attachments(&state.db, &cid, &attachment_ids),
+                applied_skill_names: extract_applied_skill_names(&e),
             }
         })
         .collect();
@@ -5317,6 +5479,71 @@ fn encode_attachments_as_data_urls(
     out
 }
 
+/// Resolve operator-picked skill names to a single prepended block
+/// that gets prefixed onto the user text before the model sees it.
+/// Returns the prepended block (empty `String` when no skills were
+/// picked) — caller concatenates it with the original text. Each
+/// skill renders as:
+///
+/// ```text
+/// <skill name="foo/bar">
+/// {body_md}
+/// </skill>
+///
+/// ```
+///
+/// XML-style tags because the model parses them cleanly and the SPA
+/// can regex-strip the same shape from the prepended `text` when
+/// rendering the original user message in the bubble.
+///
+/// Errors:
+///   * Unknown / archived skill → `(StatusCode::NOT_FOUND, "skill_not_found")`.
+///   * Sum of resolved body bytes exceeds [`MAX_PREPEND_SKILL_BYTES`]
+///     → `(StatusCode::PAYLOAD_TOO_LARGE, "skill_prepend_too_large")`.
+fn resolve_skill_prepend(
+    db: &execlaw_core::Database,
+    names: &[String],
+) -> Result<String, (StatusCode, &'static str, String)> {
+    if names.is_empty() {
+        return Ok(String::new());
+    }
+    let store = execlaw_skills::SkillStore::new(db.clone());
+    let mut blocks = String::new();
+    let mut total_bytes: usize = 0;
+    for name in names {
+        let view = store.view(name).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "skill_lookup_failed",
+                format!("skill '{name}' lookup failed: {e}"),
+            )
+        })?;
+        let Some(view) = view else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "skill_not_found",
+                format!("no skill named '{name}' (or it is archived)"),
+            ));
+        };
+        total_bytes = total_bytes.saturating_add(view.body_md.len());
+        if total_bytes > MAX_PREPEND_SKILL_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "skill_prepend_too_large",
+                format!(
+                    "selected skills exceed the {MAX_PREPEND_SKILL_BYTES}-byte prepend cap; \
+                     remove one or pick smaller skills"
+                ),
+            ));
+        }
+        blocks.push_str(&format!(
+            "<skill name=\"{name}\">\n{body}\n</skill>\n\n",
+            body = view.body_md.trim_end_matches('\n'),
+        ));
+    }
+    Ok(blocks)
+}
+
 /// Pull the attachment-ids list off a `user_msg` payload. Empty for
 /// other kinds and for legacy events that pre-date the field. Used
 /// by `list_messages` to surface image refs on the SPA bubble and by
@@ -5328,6 +5555,21 @@ fn extract_attachment_ids(e: &EventRecord) -> Vec<String> {
             .decode_payload::<UserMessagePayload>()
             .ok()
             .map(|p| p.attachment_ids)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Pull the `applied_skill_names` list off a `user_msg` payload.
+/// Empty for other kinds and for legacy events that pre-date the
+/// field. Surfaced on `MessageView` so the SPA can render an
+/// "applied: foo, bar" chip under the message bubble.
+fn extract_applied_skill_names(e: &EventRecord) -> Vec<String> {
+    match e.kind {
+        EventKind::UserMsg => e
+            .decode_payload::<UserMessagePayload>()
+            .ok()
+            .map(|p| p.applied_skill_names)
             .unwrap_or_default(),
         _ => Vec::new(),
     }
@@ -5462,6 +5704,16 @@ struct UserMessagePayload {
     /// vision content array.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     attachment_ids: Vec<String>,
+    /// 2026-05-15 — names of skills the operator selected from the
+    /// composer's `+` menu for THIS turn. The skill bodies were
+    /// already resolved + prepended onto `text` server-side before
+    /// the model saw them; this field is purely metadata for the
+    /// SPA to render an "applied: foo, bar" chip on the message
+    /// bubble (and for forensics — an audit reader can see which
+    /// guidance shaped this turn). Backward-compatible default
+    /// `Vec::new()` so prior events without the field deserialize.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    applied_skill_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5758,6 +6010,320 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
+    // ---- skill-attachment (composer `+` menu, second item) --------
+    //
+    // The composer ships a per-message `skill_names: []` field on
+    // `SendMessageRequest`. The server resolves each name to the
+    // current stable/trial body, prepends `<skill name="...">` blocks
+    // onto the user text the model sees, and stamps the names on
+    // `UserMessagePayload.applied_skill_names` for SPA chip rendering
+    // + audit. These tests pin the contract end-to-end via the
+    // public HTTP surface.
+
+    /// Helper — seed a skill into the store so we can attach it.
+    fn seed_skill(state: &crate::state::AppState, name: &str, body: &str) {
+        use execlaw_skills::{
+            NewSkill, NewSkillVersion, RegistrationKind, SkillStore, Strictness,
+        };
+        let store = SkillStore::new(state.db.clone());
+        store
+            .create(
+                NewSkill {
+                    name: name.into(),
+                    source: "test".into(),
+                    registration_kind: RegistrationKind::Authored,
+                    owning_plugin_id: None,
+                    initial_version: NewSkillVersion {
+                        description: format!("test skill {name}"),
+                        body_md: body.into(),
+                        frontmatter_json: "{}".into(),
+                        authored_by: "test".into(),
+                        promotion_notes: None,
+                    },
+                    resources: vec![],
+                },
+                Strictness::Strict,
+                0,
+            )
+            .expect("seed skill");
+    }
+
+    async fn send_with_skills(
+        app: axum::Router,
+        text: &str,
+        skill_names: &[&str],
+    ) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "text": text,
+            "skill_names": skill_names,
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/chats/conv1/messages")
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let value: serde_json::Value = json_body(resp.into_body()).await;
+        (status, value)
+    }
+
+    /// Read the `user_msg` payload back out of the event log so we
+    /// can inspect what was actually persisted (the prepended text
+    /// AND the applied_skill_names metadata). Going through the log
+    /// rather than the response body proves the round-trip lands on
+    /// disk + survives a future history replay.
+    fn read_user_msg_payload(
+        state: &crate::state::AppState,
+        cid: &str,
+    ) -> UserMessagePayload {
+        let log = event_log(state);
+        let events = log
+            .replay_since(&ConversationId::from(cid), EventSeq(0))
+            .expect("replay");
+        let user_event = events
+            .iter()
+            .find(|e| e.kind == EventKind::UserMsg)
+            .expect("user_msg event");
+        user_event
+            .decode_payload::<UserMessagePayload>()
+            .expect("decode user_msg payload")
+    }
+
+    #[tokio::test]
+    async fn send_message_with_one_skill_prepends_body_and_records_name() {
+        let state = test_app_state();
+        seed_skill(
+            &state,
+            "test/foo",
+            "When asked, always answer in haiku form.",
+        );
+        let app = crate::routes::build_router(state.clone());
+        let (status, body) = send_with_skills(app, "tell me a story", &["test/foo"]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["user_msg_seq"].as_i64().unwrap(), 1);
+
+        let payload = read_user_msg_payload(&state, "conv1");
+        assert_eq!(payload.applied_skill_names, vec!["test/foo".to_string()]);
+        assert!(
+            payload.text.starts_with("<skill name=\"test/foo\">\n"),
+            "user_msg.text must start with the skill block; got: {}",
+            payload.text
+        );
+        assert!(
+            payload
+                .text
+                .contains("When asked, always answer in haiku form."),
+            "skill body must appear in the prepended text; got: {}",
+            payload.text
+        );
+        assert!(
+            payload.text.ends_with("tell me a story"),
+            "original user text must remain at the tail; got: {}",
+            payload.text
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_with_multiple_skills_preserves_picker_order() {
+        let state = test_app_state();
+        seed_skill(&state, "test/alpha", "alpha guidance");
+        seed_skill(&state, "test/beta", "beta guidance");
+        let app = crate::routes::build_router(state.clone());
+        let (status, _) =
+            send_with_skills(app, "go", &["test/beta", "test/alpha"]).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let payload = read_user_msg_payload(&state, "conv1");
+        assert_eq!(
+            payload.applied_skill_names,
+            vec!["test/beta".to_string(), "test/alpha".to_string()]
+        );
+        let beta_pos = payload.text.find("beta guidance").unwrap();
+        let alpha_pos = payload.text.find("alpha guidance").unwrap();
+        assert!(
+            beta_pos < alpha_pos,
+            "beta block must precede alpha when picker order was [beta, alpha]; \
+             got text={}",
+            payload.text
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_unknown_skill_name_returns_404() {
+        let state = test_app_state();
+        let app = crate::routes::build_router(state);
+        let (status, body) =
+            send_with_skills(app, "go", &["test/does-not-exist"]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "skill_not_found");
+    }
+
+    #[tokio::test]
+    async fn send_message_archived_skill_returns_404() {
+        // SkillStore::view treats archived as not-found from the
+        // agent's POV; the composer picker can only surface
+        // non-archived rows in its dropdown, so an archived name
+        // arriving here means a stale UI — same 404 as a typo.
+        use execlaw_skills::SkillStore;
+        let state = test_app_state();
+        seed_skill(&state, "test/stale", "old guidance");
+        SkillStore::new(state.db.clone())
+            .archive("test/stale", 0)
+            .expect("archive");
+        let app = crate::routes::build_router(state);
+        let (status, body) = send_with_skills(app, "go", &["test/stale"]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "skill_not_found");
+    }
+
+    #[tokio::test]
+    async fn send_message_skill_prepend_over_cap_returns_413() {
+        let state = test_app_state();
+        // Each skill body is half the cap — two of them push us
+        // just over.
+        let big_body = "x".repeat(MAX_PREPEND_SKILL_BYTES / 2 + 1024);
+        seed_skill(&state, "test/big1", &big_body);
+        seed_skill(&state, "test/big2", &big_body);
+        let app = crate::routes::build_router(state);
+        let (status, body) =
+            send_with_skills(app, "go", &["test/big1", "test/big2"]).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body["error"]["code"], "skill_prepend_too_large");
+    }
+
+    /// Regression: a send WITHOUT `skill_names` must continue to
+    /// behave exactly as before — empty applied_skill_names, no
+    /// prepend block, original text only. Catches accidental
+    /// always-on prepend.
+    #[tokio::test]
+    async fn send_message_without_skills_leaves_text_unchanged() {
+        let state = test_app_state();
+        let app = crate::routes::build_router(state.clone());
+        let (status, _) = send(app, "plain hello").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let payload = read_user_msg_payload(&state, "conv1");
+        assert_eq!(payload.text, "plain hello");
+        assert!(payload.applied_skill_names.is_empty());
+    }
+
+    /// `MessageView` (returned from `GET /api/chats/:id/messages`)
+    /// surfaces `applied_skill_names` so the SPA can render the
+    /// "applied: foo" chip on the bubble. Pin the wire shape end-
+    /// to-end so the field doesn't silently disappear.
+    #[tokio::test]
+    async fn list_messages_surfaces_applied_skill_names_for_user_msg() {
+        let state = test_app_state();
+        seed_skill(&state, "test/foo", "guidance body");
+        let app = crate::routes::build_router(state);
+        let (status, _) = send_with_skills(app.clone(), "hi", &["test/foo"]).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/chats/conv1/messages")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = json_body(resp.into_body()).await;
+        let messages = body["messages"].as_array().unwrap();
+        let user = messages
+            .iter()
+            .find(|m| m["kind"] == "user_msg")
+            .expect("user_msg in list");
+        assert_eq!(
+            user["applied_skill_names"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["test/foo"],
+        );
+    }
+
+    /// Regression for the "skill picker shows up on every other turn"
+    /// fear: a user_msg sent WITHOUT skills must NOT include
+    /// `applied_skill_names` in its serialized MessageView (the field
+    /// is `skip_serializing_if = "Vec::is_empty"`). Keeps the wire
+    /// payload tidy and lets the SPA treat the missing field as
+    /// "no skills" without an explicit `?? []` shim per call site.
+    #[tokio::test]
+    async fn list_messages_omits_applied_skill_names_when_empty() {
+        let state = test_app_state();
+        let app = crate::routes::build_router(state);
+        let (status, _) = send(app.clone(), "no skills here").await;
+        assert_eq!(status, StatusCode::OK);
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/chats/conv1/messages")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body: serde_json::Value = json_body(resp.into_body()).await;
+        let user = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["kind"] == "user_msg")
+            .unwrap();
+        assert!(
+            user.get("applied_skill_names").is_none(),
+            "applied_skill_names must be omitted when empty; got: {user}"
+        );
+    }
+
+    /// Regression for the "skill body changes between turns" worry:
+    /// the prepended text lives in `UserMessagePayload.text`, NOT
+    /// in a re-resolved-on-replay shape. So if an admin edits the
+    /// skill body after a turn already used it, replay still shows
+    /// the original body. Pin that invariant.
+    #[tokio::test]
+    async fn skill_prepend_is_frozen_at_send_time_not_re_resolved() {
+        use execlaw_skills::SkillStore;
+        let state = test_app_state();
+        seed_skill(&state, "test/foo", "ORIGINAL body");
+        let app = crate::routes::build_router(state.clone());
+        let (status, _) = send_with_skills(app, "go", &["test/foo"]).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Mutate the skill body AFTER the turn was sent. Replay
+        // should still show the original body in the log.
+        SkillStore::new(state.db.clone())
+            .add_version(
+                "test/foo",
+                execlaw_skills::NewSkillVersion {
+                    description: "test skill test/foo".into(),
+                    body_md: "REVISED body".into(),
+                    frontmatter_json: "{}".into(),
+                    authored_by: "test".into(),
+                    promotion_notes: None,
+                },
+                execlaw_skills::Strictness::Strict,
+                1,
+            )
+            .expect("add new version");
+
+        let payload = read_user_msg_payload(&state, "conv1");
+        assert!(
+            payload.text.contains("ORIGINAL body"),
+            "stored text must keep the body that was live at send time; got: {}",
+            payload.text
+        );
+        assert!(
+            !payload.text.contains("REVISED body"),
+            "the new body must NOT leak into the historical event; got: {}",
+            payload.text
+        );
+    }
+
     /// Regression for the "agent ran chart.render but the chart
     /// never appeared" bug. `extract_text` only handled UserMsg +
     /// ModelTurn before 2026-05-15; ToolResult fell through to
@@ -5891,6 +6457,7 @@ mod tests {
                 sender_principal_id: Some(SYSTEM_ORCHESTRATOR_ACTOR.into()),
                 channel_origin: None,
                 attachment_ids: Vec::new(),
+                applied_skill_names: Vec::new(),
             },
             Some(SYSTEM_ORCHESTRATOR_ACTOR.into()),
         )
@@ -6103,6 +6670,60 @@ mod tests {
         // forgetting capabilities — emit nothing.
         let prose = super::build_tool_routing_prose(&[], &[]);
         assert!(prose.is_empty());
+    }
+
+    /// Regression for the 2026-05-15 "agent hallucinated AAPL prices
+    /// instead of calling chart.render + yahoo_finance.historical_candles"
+    /// thread. Three asserts pin the fix:
+    ///   * `chart.render` (built-in dotted name) routes through the
+    ///     dedicated routing-line, NOT the generic "comes from the
+    ///     `chart` plugin" plugin-namespace line.
+    ///   * The chart entry tells the model to fetch real data first
+    ///     and forbids inventing data points.
+    ///   * The closing fallback distinguishes general knowledge (OK
+    ///     to answer from training) from live/dated data (must say
+    ///     "can't fetch" rather than hallucinate).
+    #[test]
+    fn build_tool_routing_prose_chart_render_routes_via_chart_entry_not_plugin_fallback() {
+        let prose = super::build_tool_routing_prose(
+            &["chart.render".into(), "web_search".into()],
+            &["yahoo_finance.historical_candles".into()],
+        );
+        // Dedicated chart guidance is present.
+        assert!(
+            prose.contains("`chart.render` (built-in)"),
+            "chart entry must be the dedicated built-in line, got: {prose}",
+        );
+        assert!(
+            prose.contains("ALWAYS fetch real data"),
+            "chart entry must spell out the fetch-first chain, got: {prose}",
+        );
+        assert!(
+            prose.contains("NEVER invent data"),
+            "chart entry must explicitly forbid hallucinating data points, got: {prose}",
+        );
+        // Plugin-namespace fallback is NOT used for chart (it IS used
+        // for the real plugin yahoo_finance — that's fine, that one's
+        // a plugin).
+        assert!(
+            !prose.contains("`chart.` come from"),
+            "chart.render is a built-in; the plugin-namespace 'comes from the chart plugin' \
+             prose must be skipped (was the source of the misdirection that caused the model \
+             to ignore chart.render). Got: {prose}",
+        );
+        assert!(
+            prose.contains("`yahoo_finance.`"),
+            "real plugin namespaces still get the generic 'comes from the X plugin' line",
+        );
+        // Closing fallback distinguishes knowledge from live data.
+        assert!(
+            prose.contains("LIVE or DATED data"),
+            "closing fallback must call out live/dated data as a no-fabricate case, got: {prose}",
+        );
+        assert!(
+            prose.contains("never invent values"),
+            "closing fallback must explicitly forbid invented values for live data, got: {prose}",
+        );
     }
 
     #[test]
