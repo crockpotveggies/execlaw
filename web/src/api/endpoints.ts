@@ -1428,6 +1428,31 @@ export async function listSkills(
     );
 }
 
+/// 2026-05-16 — manual skill creation from the Skills page's
+/// "New skill" button. Wraps the auto-capture / agent-driven paths
+/// that already existed by giving the operator a direct authoring
+/// surface. Controller-only server-side; mirrors `updateSkillBody`'s
+/// shape (description + body + optional frontmatter).
+export interface CreateSkillRequest {
+    name: string;
+    description: string;
+    body_md: string;
+    /// Optional JSON-encoded frontmatter. Server defaults to "{}" if
+    /// omitted, so the SPA can send `undefined` for the common case.
+    frontmatter_json?: string;
+}
+
+export async function createSkill(
+    req: CreateSkillRequest,
+    tokenAccessor: () => string | null,
+): Promise<SkillDetail> {
+    return apiFetch<SkillDetail>(
+        "/api/admin/skills",
+        { method: "POST", body: req },
+        tokenAccessor,
+    );
+}
+
 export async function getSkill(
     name: string,
     tokenAccessor: () => string | null,

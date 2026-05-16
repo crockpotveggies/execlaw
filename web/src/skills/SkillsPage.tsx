@@ -10,9 +10,11 @@
 // Backed by the new admin endpoints under `/api/admin/skills/*`.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import Modal from "react-bootstrap/Modal";
 import {
     approveSkillProposal,
     archiveSkill,
+    createSkill,
     getSkill,
     getSkillsConfig,
     listSkillProposals,
@@ -123,6 +125,7 @@ function SkillsTab({
     const [skills, setSkills] = useState<SkillListEntry[] | null>(null);
     const [includeArchived, setIncludeArchived] = useState(false);
     const [selectedName, setSelectedName] = useState<string | null>(null);
+    const [createOpen, setCreateOpen] = useState(false);
 
     const refresh = useCallback(async () => {
         try {
@@ -153,7 +156,24 @@ function SkillsTab({
 
     return (
         <>
-            <div className="d-flex align-items-center gap-3 px-3 py-2 border-bottom flex-wrap">
+            <div
+                className="execlaw-skills__toolbar"
+                data-testid="skills-toolbar"
+            >
+                {isController && (
+                    <button
+                        type="button"
+                        className="btn btn-sm btn-primary"
+                        onClick={() => setCreateOpen(true)}
+                        data-testid="skills-new-btn"
+                    >
+                        <i
+                            className="bi bi-plus-lg me-1"
+                            aria-hidden
+                        />
+                        New skill
+                    </button>
+                )}
                 <span className="execlaw-muted small">
                     {skills?.length ?? 0} skill
                     {skills?.length === 1 ? "" : "s"}
@@ -162,7 +182,7 @@ function SkillsTab({
                     isController={isController}
                     onError={(m) => onError(m)}
                 />
-                <label className="form-check form-switch ms-auto mb-0 small">
+                <label className="execlaw-skills__toolbar-spacer form-check form-switch mb-0 small">
                     <input
                         type="checkbox"
                         className="form-check-input"
@@ -179,11 +199,15 @@ function SkillsTab({
             {skills === null ? (
                 <div className="m-3 execlaw-muted small">Loading…</div>
             ) : skills.length === 0 ? (
-                <SkillsEmptyState includeArchived={includeArchived} />
+                <SkillsEmptyState
+                    includeArchived={includeArchived}
+                    canCreate={isController}
+                    onCreate={() => setCreateOpen(true)}
+                />
             ) : (
                 <div
-                    className="execlaw-skills__split d-flex flex-grow-1"
-                    style={{ minHeight: 0 }}
+                    className="execlaw-skills__split"
+                    data-testid="skills-split"
                 >
                     <SkillsList
                         skills={skills}
@@ -199,28 +223,61 @@ function SkillsTab({
                     />
                 </div>
             )}
+            {createOpen && (
+                <NewSkillModal
+                    onClose={() => setCreateOpen(false)}
+                    onCreated={(name) => {
+                        setCreateOpen(false);
+                        setSelectedName(name);
+                        void refresh();
+                    }}
+                />
+            )}
         </>
     );
 }
 
-function SkillsEmptyState({ includeArchived }: { includeArchived: boolean }) {
+function SkillsEmptyState({
+    includeArchived,
+    canCreate,
+    onCreate,
+}: {
+    includeArchived: boolean;
+    canCreate: boolean;
+    onCreate: () => void;
+}) {
     return (
         <div
-            className="m-3 execlaw-muted small"
+            className="execlaw-skills__detail-empty"
             data-testid="skills-empty-state"
         >
-            {includeArchived ? (
-                <>
-                    No skills exist yet — not even archived ones. Skills are
-                    procedural-knowledge documents the agent reads to shape
-                    its behavior.
-                </>
-            ) : (
-                <>
-                    No active skills. Toggle <strong>Show archived</strong>{" "}
-                    to see retired skills, or ask the agent to{" "}
-                    <code>skills.create</code> a new one.
-                </>
+            <i
+                className="bi bi-stars d-block mb-2"
+                style={{ fontSize: "2rem" }}
+                aria-hidden
+            />
+            <div className="mb-2">
+                {includeArchived ? (
+                    <>No skills exist yet — not even archived ones.</>
+                ) : (
+                    <>No active skills yet.</>
+                )}
+            </div>
+            <div className="small execlaw-muted mb-3" style={{ maxWidth: 32 + "rem" }}>
+                Skills are procedural-knowledge documents the agent reads to
+                shape its behavior. Create one to capture a workflow the
+                agent should reuse.
+            </div>
+            {canCreate && (
+                <button
+                    type="button"
+                    className="btn btn-sm btn-primary"
+                    onClick={onCreate}
+                    data-testid="skills-empty-new-btn"
+                >
+                    <i className="bi bi-plus-lg me-1" aria-hidden />
+                    New skill
+                </button>
             )}
         </div>
     );
@@ -237,8 +294,7 @@ function SkillsList({
 }) {
     return (
         <aside
-            className="execlaw-skills__list d-flex flex-column overflow-auto border-end"
-            style={{ width: 360, minWidth: 320 }}
+            className="execlaw-skills__list"
             data-testid="skills-list"
         >
             {skills.map((s) => (
@@ -246,15 +302,15 @@ function SkillsList({
                     key={s.name}
                     type="button"
                     className={
-                        "execlaw-skills__list-row text-start px-3 py-2 border-bottom bg-transparent border-0 border-bottom" +
-                        (s.name === selectedName ? " bg-body-secondary" : "")
+                        "execlaw-skills__list-row" +
+                        (s.name === selectedName ? " is-active" : "")
                     }
                     onClick={() => onSelect(s.name)}
                     data-testid="skills-list-row"
                     data-state={s.state}
                     data-kind={s.registration_kind}
                 >
-                    <div className="d-flex align-items-center gap-2">
+                    <div className="execlaw-skills__list-row-head">
                         <span
                             className={`badge ${STATE_BADGE[s.state]}`}
                             title={`State: ${s.state}`}
@@ -267,12 +323,14 @@ function SkillsList({
                         >
                             {s.registration_kind}
                         </span>
-                        <span className="execlaw-muted small ms-auto">
+                        <span className="execlaw-skills__list-row-version">
                             v{s.version}
                         </span>
                     </div>
-                    <div className="fw-semibold mt-1">{s.name}</div>
-                    <div className="execlaw-muted small text-truncate">
+                    <div className="execlaw-skills__list-row-name">
+                        {s.name}
+                    </div>
+                    <div className="execlaw-skills__list-row-desc">
                         {s.description}
                     </div>
                 </button>
@@ -404,33 +462,42 @@ function SkillsDetail({
     if (name === null) {
         return (
             <section
-                className="execlaw-skills__detail flex-grow-1 m-3 execlaw-muted small"
+                className="execlaw-skills__detail"
                 data-testid="skills-detail"
             >
-                Select a skill on the left.
+                <div className="execlaw-skills__detail-empty">
+                    <i
+                        className="bi bi-stars d-block mb-2"
+                        style={{ fontSize: "2rem" }}
+                        aria-hidden
+                    />
+                    <div>Select a skill on the left.</div>
+                </div>
             </section>
         );
     }
     if (loading && detail === null) {
         return (
             <section
-                className="execlaw-skills__detail flex-grow-1 m-3 execlaw-muted small"
+                className="execlaw-skills__detail"
                 data-testid="skills-detail"
             >
-                Loading…
+                <div className="execlaw-skills__detail-empty">Loading…</div>
             </section>
         );
     }
     if (detail === null) {
         return (
             <section
-                className="execlaw-skills__detail flex-grow-1 m-3"
+                className="execlaw-skills__detail"
                 data-testid="skills-detail"
             >
-                <ErrorBanner
-                    message={actionError ?? "Failed to load skill."}
-                    onDismiss={() => setActionError(null)}
-                />
+                <div className="execlaw-skills__detail-body">
+                    <ErrorBanner
+                        message={actionError ?? "Failed to load skill."}
+                        onDismiss={() => setActionError(null)}
+                    />
+                </div>
             </section>
         );
     }
@@ -441,13 +508,15 @@ function SkillsDetail({
 
     return (
         <section
-            className="execlaw-skills__detail flex-grow-1 overflow-auto"
+            className="execlaw-skills__detail"
             data-testid="skills-detail"
             data-skill-name={detail.name}
         >
-            <div className="px-3 py-3">
-                <div className="d-flex align-items-center gap-2 flex-wrap">
-                    <h3 className="h5 mb-0 me-2">{detail.name}</h3>
+            <div className="execlaw-skills__detail-body">
+                <header className="execlaw-skills__detail-head">
+                    <h3 className="execlaw-skills__detail-title">
+                        {detail.name}
+                    </h3>
                     <span className={`badge ${STATE_BADGE[detail.state]}`}>
                         {detail.state}
                     </span>
@@ -456,10 +525,10 @@ function SkillsDetail({
                     >
                         {detail.registration_kind}
                     </span>
-                    <span className="execlaw-muted small ms-2">
+                    <span className="execlaw-muted small">
                         v{detail.current_version}
                     </span>
-                    <div className="ms-auto d-flex gap-2">
+                    <div className="execlaw-skills__detail-actions">
                         {canEdit && !editing && (
                             <button
                                 type="button"
@@ -495,8 +564,8 @@ function SkillsDetail({
                             </button>
                         )}
                     </div>
-                </div>
-                {!editing && <p className="mt-2 mb-3">{detail.description}</p>}
+                </header>
+                {!editing && <p className="mb-3">{detail.description}</p>}
                 {actionError && (
                     <ErrorBanner
                         message={actionError}
@@ -528,7 +597,7 @@ function SkillsDetail({
                             onChange={(e) => setEditBody(e.target.value)}
                             data-testid="skills-edit-body"
                         />
-                        <div className="d-flex gap-2 mt-3">
+                        <div className="d-flex gap-2 mt-3 flex-wrap">
                             <button
                                 type="button"
                                 className="btn btn-sm btn-primary"
@@ -558,11 +627,7 @@ function SkillsDetail({
                     </div>
                 ) : (
                     <pre
-                        className="p-3 rounded bg-body-tertiary"
-                        style={{
-                            whiteSpace: "pre-wrap",
-                            wordBreak: "break-word",
-                        }}
+                        className="execlaw-skills__body-pre"
                         data-testid="skills-body-md"
                     >
                         {detail.body_md}
@@ -582,8 +647,8 @@ function SkillsDetail({
                 )}
                 <h4 className="h6 mt-4">Frontmatter</h4>
                 <pre
-                    className="p-3 rounded bg-body-tertiary small"
-                    style={{ whiteSpace: "pre-wrap" }}
+                    className="execlaw-skills__body-pre"
+                    style={{ fontSize: "0.78rem" }}
                 >
                     {prettyJson(detail.frontmatter_json)}
                 </pre>
@@ -1155,4 +1220,194 @@ function prettyJson(s: string): string {
     } catch {
         return s;
     }
+}
+
+// ----------------------------------------------------------------
+// 2026-05-16 — New-skill modal (composer for the "+ New skill"
+// button). Three fields: name, description, body. Frontmatter
+// defaults to `{}` server-side; an advanced toggle lets the
+// operator override it as raw JSON without cluttering the common
+// path.
+// ----------------------------------------------------------------
+
+function NewSkillModal({
+    onClose,
+    onCreated,
+}: {
+    onClose: () => void;
+    onCreated: (name: string) => void;
+}) {
+    const auth = useAuth();
+    const getToken = auth.getAccessToken;
+    const [name, setName] = useState("");
+    const [description, setDescription] = useState("");
+    const [bodyMd, setBodyMd] = useState("");
+    const [advanced, setAdvanced] = useState(false);
+    const [frontmatter, setFrontmatter] = useState("{}");
+    const [submitting, setSubmitting] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+
+    /// Local validation that mirrors the server's
+    /// `validate_skill_name` so the operator sees the constraint
+    /// inline instead of a 400 after submit. Matches
+    /// `<namespace>/<segment>` with `[a-z0-9][a-z0-9-]*` per segment.
+    const nameValid =
+        /^[a-z0-9][a-z0-9-]*\/[a-z0-9][a-z0-9-]*$/.test(name) &&
+        name.length >= 3 &&
+        name.length <= 128;
+    const canSubmit =
+        nameValid &&
+        description.trim().length > 0 &&
+        bodyMd.trim().length > 0 &&
+        !submitting;
+
+    const onSubmit = useCallback(async () => {
+        if (!canSubmit) return;
+        setSubmitting(true);
+        setError(null);
+        try {
+            const detail = await createSkill(
+                {
+                    name,
+                    description,
+                    body_md: bodyMd,
+                    frontmatter_json: advanced ? frontmatter : undefined,
+                },
+                getToken,
+            );
+            onCreated(detail.name);
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setSubmitting(false);
+        }
+    }, [
+        canSubmit,
+        name,
+        description,
+        bodyMd,
+        advanced,
+        frontmatter,
+        getToken,
+        onCreated,
+    ]);
+
+    return (
+        <Modal
+            show
+            onHide={onClose}
+            backdrop="static"
+            size="lg"
+            data-testid="skills-new-modal"
+        >
+            <Modal.Header closeButton>
+                <Modal.Title className="h6">
+                    <i className="bi bi-plus-lg me-2" aria-hidden />
+                    New skill
+                </Modal.Title>
+            </Modal.Header>
+            <Modal.Body>
+                {error && (
+                    <ErrorBanner
+                        message={error}
+                        onDismiss={() => setError(null)}
+                        className="mb-3"
+                    />
+                )}
+                <label className="form-label small fw-semibold">
+                    Name
+                </label>
+                <input
+                    type="text"
+                    className={
+                        "form-control" +
+                        (name.length > 0 && !nameValid ? " is-invalid" : "")
+                    }
+                    placeholder="namespace/short-name"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    disabled={submitting}
+                    data-testid="skills-new-name"
+                />
+                <div className="form-text small">
+                    Format: <code>namespace/short-name</code>. Both segments
+                    lowercase, letters/digits/hyphens only, 3–128 chars total.
+                </div>
+
+                <label className="form-label small fw-semibold mt-3">
+                    Description
+                </label>
+                <textarea
+                    className="form-control"
+                    rows={2}
+                    placeholder="One-line summary surfaced in the skill picker"
+                    value={description}
+                    onChange={(e) => setDescription(e.target.value)}
+                    disabled={submitting}
+                    data-testid="skills-new-description"
+                />
+
+                <label className="form-label small fw-semibold mt-3">
+                    Body (markdown)
+                </label>
+                <textarea
+                    className="form-control font-monospace"
+                    rows={14}
+                    placeholder="# Skill body in markdown..."
+                    value={bodyMd}
+                    onChange={(e) => setBodyMd(e.target.value)}
+                    disabled={submitting}
+                    data-testid="skills-new-body"
+                />
+
+                <div className="form-check form-switch mt-3">
+                    <input
+                        type="checkbox"
+                        className="form-check-input"
+                        id="skills-new-advanced-toggle"
+                        checked={advanced}
+                        onChange={(e) => setAdvanced(e.target.checked)}
+                        disabled={submitting}
+                        data-testid="skills-new-advanced-toggle"
+                    />
+                    <label
+                        className="form-check-label small"
+                        htmlFor="skills-new-advanced-toggle"
+                    >
+                        Custom frontmatter JSON (advanced)
+                    </label>
+                </div>
+                {advanced && (
+                    <textarea
+                        className="form-control font-monospace mt-2"
+                        rows={4}
+                        value={frontmatter}
+                        onChange={(e) => setFrontmatter(e.target.value)}
+                        disabled={submitting}
+                        data-testid="skills-new-frontmatter"
+                    />
+                )}
+            </Modal.Body>
+            <Modal.Footer>
+                <button
+                    type="button"
+                    className="btn btn-sm btn-outline-secondary"
+                    onClick={onClose}
+                    disabled={submitting}
+                    data-testid="skills-new-cancel"
+                >
+                    Cancel
+                </button>
+                <button
+                    type="button"
+                    className="btn btn-sm btn-primary"
+                    onClick={onSubmit}
+                    disabled={!canSubmit}
+                    data-testid="skills-new-create"
+                >
+                    {submitting ? "Creating…" : "Create skill"}
+                </button>
+            </Modal.Footer>
+        </Modal>
+    );
 }
