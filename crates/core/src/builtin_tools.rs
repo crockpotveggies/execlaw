@@ -1984,6 +1984,54 @@ fn clamp_render_chart_dim(value: Option<u32>, default: u32) -> u32 {
     }
 }
 
+/// 2026-05-16 — workaround for the "JSON-string-inside-JSON" LLM
+/// failure mode on `chart.render`. Walks the spec and re-parses any
+/// stringified value for fields that should be an array or nested
+/// object. Mutates in place; missing fields and already-typed values
+/// are left untouched. Bad JSON is also left untouched (the
+/// downstream `serde_json::from_value::<ChartSpec>` will surface a
+/// clean error).
+///
+/// Fields that have been observed in the wild as stringified:
+///   * `series` — array of `{ name, points: [{ x, y }] }`
+///   * `band.low` / `band.high` — point arrays (ensemble fans)
+///
+/// New fields with the same risk should be added here as they
+/// appear; the helper is a tight defensive layer, not an attempt
+/// to be schema-aware.
+fn defensive_unstringify_spec_fields(spec: &mut Value) {
+    let Some(map) = spec.as_object_mut() else {
+        return;
+    };
+    if let Some(v) = map.get_mut("series") {
+        defensive_reparse_string_value(v);
+    }
+    if let Some(band) = map.get_mut("band") {
+        // band itself can also arrive stringified (less common but
+        // same failure mode). Re-parse the wrapper first.
+        defensive_reparse_string_value(band);
+        if let Some(band_map) = band.as_object_mut() {
+            if let Some(v) = band_map.get_mut("low") {
+                defensive_reparse_string_value(v);
+            }
+            if let Some(v) = band_map.get_mut("high") {
+                defensive_reparse_string_value(v);
+            }
+        }
+    }
+}
+
+/// If `v` is a string that parses as JSON, replace it with the
+/// parsed value. Otherwise leave it alone.
+fn defensive_reparse_string_value(v: &mut Value) {
+    let Some(s) = v.as_str() else {
+        return;
+    };
+    if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+        *v = parsed;
+    }
+}
+
 pub struct RenderChartTool {
     descriptor: ToolDescriptor,
 }
@@ -2122,8 +2170,23 @@ impl ToolImpl for RenderChartTool {
         // shape — flattening the operator-supplied JSON into the
         // renderer's struct so unsupported fields surface a clear
         // error instead of being silently dropped.
+        //
+        // 2026-05-16 — defense against the "JSON-string-inside-JSON"
+        // LLM failure mode. Models occasionally emit
+        //   `"series": "[{...}]"`  (string containing JSON)
+        // instead of
+        //   `"series": [{...}]`    (actual array)
+        // when they get confused about nesting. The first observed
+        // case was a Signal-channel TSLA chart turn — the same
+        // prompt rendered fine on the web channel but failed on
+        // Signal because the model emitted a different shape.
+        // Pre-parse string-shaped values for the array/object fields
+        // that can plausibly arrive stringified, so a one-off LLM
+        // mistake doesn't kill the whole render.
+        let mut spec_value = parsed.spec.clone();
+        defensive_unstringify_spec_fields(&mut spec_value);
         let spec: execlaw_charting::ChartSpec =
-            match serde_json::from_value(parsed.spec.clone()) {
+            match serde_json::from_value(spec_value) {
                 Ok(s) => s,
                 Err(e) => {
                     return ToolOutcome::err(
@@ -2875,6 +2938,93 @@ mod tests {
             )));
         }
         ctx
+    }
+
+    // --- chart.render defensive unstringify ---
+
+    /// Regression for the 2026-05-16 Signal-channel TSLA chart turn:
+    /// the model emitted `series` as a JSON-encoded STRING instead of
+    /// an array. Without the defensive unstringify pass, the
+    /// downstream `serde_json::from_value::<ChartSpec>` errored with
+    /// `invalid type: string "[...]", expected a sequence` and the
+    /// chart never rendered.
+    #[test]
+    fn defensive_unstringify_recovers_string_encoded_series() {
+        // Simulate the exact shape from the production failure: a
+        // single series stringified into the spec.
+        let mut spec = serde_json::json!({
+            "title": "TSLA",
+            "kind": "line",
+            "series": "[{\"name\": \"TSLA\", \"points\": [{\"x\": 1, \"y\": 388.9}]}]",
+        });
+        super::defensive_unstringify_spec_fields(&mut spec);
+        // After: series is an array, not a string.
+        let series = spec.get("series").expect("series present");
+        assert!(
+            series.is_array(),
+            "stringified series must be re-parsed into an array, got: {series}",
+        );
+        let arr = series.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "TSLA");
+        assert_eq!(arr[0]["points"][0]["y"].as_f64(), Some(388.9));
+    }
+
+    /// Properly-formed array values (the common case) must NOT be
+    /// touched — we only re-parse when the value is a string.
+    #[test]
+    fn defensive_unstringify_leaves_real_arrays_alone() {
+        let original = serde_json::json!({
+            "series": [{"name": "A", "points": [{"x": 0, "y": 1}]}],
+        });
+        let mut spec = original.clone();
+        super::defensive_unstringify_spec_fields(&mut spec);
+        assert_eq!(spec, original, "real arrays must round-trip unchanged");
+    }
+
+    /// `band.low` / `band.high` are equally susceptible to
+    /// stringification (ensemble fans). Pin both the wrapper and the
+    /// inner-array re-parse paths.
+    #[test]
+    fn defensive_unstringify_recovers_string_encoded_band() {
+        let mut spec = serde_json::json!({
+            "band": {
+                "low":  "[{\"x\": 1, \"y\": 0.1}]",
+                "high": "[{\"x\": 1, \"y\": 0.9}]",
+            },
+        });
+        super::defensive_unstringify_spec_fields(&mut spec);
+        let low = &spec["band"]["low"];
+        let high = &spec["band"]["high"];
+        assert!(low.is_array(), "band.low stringified must be re-parsed");
+        assert!(high.is_array(), "band.high stringified must be re-parsed");
+        assert_eq!(low.as_array().unwrap()[0]["y"].as_f64(), Some(0.1));
+        assert_eq!(high.as_array().unwrap()[0]["y"].as_f64(), Some(0.9));
+    }
+
+    /// Even the wrapper `band` itself can arrive stringified. The
+    /// helper must re-parse the wrapper before drilling into
+    /// `low` / `high`.
+    #[test]
+    fn defensive_unstringify_recovers_fully_string_encoded_band() {
+        let mut spec = serde_json::json!({
+            "band": "{\"low\": [{\"x\": 1, \"y\": 0.1}], \"high\": [{\"x\": 1, \"y\": 0.9}]}",
+        });
+        super::defensive_unstringify_spec_fields(&mut spec);
+        let band = &spec["band"];
+        assert!(band.is_object(), "stringified band wrapper must be re-parsed");
+        assert!(band["low"].is_array());
+        assert!(band["high"].is_array());
+    }
+
+    /// Garbage strings (not parseable JSON) are left as-is so the
+    /// downstream `from_value::<ChartSpec>` surfaces its own error
+    /// rather than the helper silently dropping a non-JSON value.
+    #[test]
+    fn defensive_unstringify_leaves_garbage_strings_alone() {
+        let mut spec = serde_json::json!({ "series": "not-json-at-all" });
+        super::defensive_unstringify_spec_fields(&mut spec);
+        assert_eq!(spec["series"], "not-json-at-all");
     }
 
     // --- Registrar ---
