@@ -1,13 +1,16 @@
 //! Observability admin routes (Phase 5).
 //!
-//! - `GET /api/admin/logs` — paginated `log_entries` rows with
-//!   level / plugin_id / conversation_id / since filters.
+//! - `GET /api/admin/logs` — reads the tracing file appender's
+//!   `execlaw.jsonl.<DATE>` files from `ServerConfig.log_dir` and
+//!   applies level / plugin_id / conversation_id / time-range filters.
+//!   The `log_entries` SQLite table and `SqliteLogLayer` exist but
+//!   were never plumbed onto the global subscriber (the layer needs
+//!   the DB handle, which doesn't exist when `init_tracing` runs);
+//!   reading the JSONL files directly is the simplest surface that
+//!   actually shows operators their logs in Settings > Logs.
 //! - `GET /api/admin/eval/flags` — every eval-flag row, optionally
 //!   filtered by label.
-//!
-//! Pure data feeds for the Phase-6 React UI. No HTML rendering;
-//! no chart generation. The CLI replay command (`execlaw replay`)
-//! is the operator-facing surface today.
+//! - `GET /api/admin/audit` — recent `config_audit` rows.
 
 use crate::state::AppState;
 use axum::Json;
@@ -17,8 +20,10 @@ use axum::response::IntoResponse;
 use axum::{Router, routing::get};
 use execlaw_core::audit::AuditStore;
 use execlaw_core::eval::EvalFlaggedStore;
-use execlaw_core::logs::{LogLevel, LogStore};
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize, Default)]
 pub struct LogsQuery {
@@ -29,6 +34,8 @@ pub struct LogsQuery {
     pub conversation_id: Option<String>,
     /// Inclusive lower bound on `ts_ms`.
     pub since_ms: Option<i64>,
+    /// Inclusive upper bound on `ts_ms`.
+    pub until_ms: Option<i64>,
     /// Hard cap; default 200, max 1000.
     pub limit: Option<i64>,
 }
@@ -58,6 +65,7 @@ pub struct LogsResponse {
         ("plugin_id" = Option<String>, Query, description = "Filter to one plugin"),
         ("conversation_id" = Option<String>, Query, description = "Filter to one conversation"),
         ("since_ms" = Option<i64>, Query, description = "Inclusive lower bound on ts_ms"),
+        ("until_ms" = Option<i64>, Query, description = "Inclusive upper bound on ts_ms"),
         ("limit" = Option<i64>, Query, description = "1..=1000, default 200"),
     ),
     responses(
@@ -72,54 +80,216 @@ pub async fn logs_handler(
     _user: crate::auth_extract::AuthedUser,
     Query(q): Query<LogsQuery>,
 ) -> impl IntoResponse {
-    let level = q
-        .level
-        .as_deref()
-        .and_then(|s| match s.to_ascii_lowercase().as_str() {
-            "trace" => Some(LogLevel::Trace),
-            "debug" => Some(LogLevel::Debug),
-            "info" => Some(LogLevel::Info),
-            "warn" | "warning" => Some(LogLevel::Warn),
-            "error" => Some(LogLevel::Error),
-            _ => None,
-        });
-    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
-    let store = LogStore::new(&state.db);
-    let rows = match store.query(
-        level,
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000) as usize;
+    let level_floor = parse_level(q.level.as_deref());
+    let Some(log_dir) = state.config.log_dir.as_deref() else {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!(LogsResponse { entries: vec![] })),
+        )
+            .into_response();
+    };
+    let entries = match read_log_entries(
+        log_dir,
+        level_floor,
         q.plugin_id.as_deref(),
         q.conversation_id.as_deref(),
         q.since_ms,
+        q.until_ms,
         limit,
     ) {
-        Ok(r) => r,
+        Ok(v) => v,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
-                    "error": {"code": "logs_query", "message": e.to_string()}
+                    "error": {"code": "logs_read", "message": e.to_string()}
                 })),
             )
                 .into_response();
         }
     };
-    let entries: Vec<LogEntryView> = rows
-        .into_iter()
-        .map(|r| LogEntryView {
-            ts_ms: r.ts_ms,
-            level: r.level.as_str().to_owned(),
-            target: r.target,
-            conversation_id: r.conversation_id,
-            plugin_id: r.plugin_id,
-            message: r.message,
-            fields: r.fields_json.and_then(|b| serde_json::from_slice(&b).ok()),
-        })
-        .collect();
     (
         StatusCode::OK,
         Json(serde_json::json!(LogsResponse { entries })),
     )
         .into_response()
+}
+
+/// trace=0 .. error=4. Used as a "minimum" floor — entries at or
+/// above the selected level pass the filter.
+fn level_rank(level: &str) -> u8 {
+    match level.to_ascii_lowercase().as_str() {
+        "trace" => 0,
+        "debug" => 1,
+        "info" => 2,
+        "warn" | "warning" => 3,
+        "error" => 4,
+        _ => 2,
+    }
+}
+
+fn parse_level(s: Option<&str>) -> Option<u8> {
+    let s = s?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "trace" | "debug" | "info" | "warn" | "warning" | "error" => Some(level_rank(trimmed)),
+        _ => None,
+    }
+}
+
+/// Lists files matching `execlaw.jsonl[.<DATE>]` in `dir`, newest
+/// first. tracing-appender's daily rotation produces names like
+/// `execlaw.jsonl.2026-05-15`; sorting filenames descending gives
+/// newest-first because the suffix is ISO date. Files without a
+/// recognized date suffix (a hand-edited "execlaw.jsonl" left in the
+/// dir, say) still get included, sorted to the end.
+fn list_log_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut entries: Vec<PathBuf> = match fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|d| d.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("execlaw.jsonl"))
+                    .unwrap_or(false)
+            })
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e),
+    };
+    entries.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    Ok(entries)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_log_entries(
+    dir: &Path,
+    level_floor: Option<u8>,
+    plugin_id: Option<&str>,
+    conversation_id: Option<&str>,
+    since_ms: Option<i64>,
+    until_ms: Option<i64>,
+    limit: usize,
+) -> std::io::Result<Vec<LogEntryView>> {
+    let files = list_log_files(dir)?;
+    let mut out: Vec<LogEntryView> = Vec::with_capacity(limit);
+    // Walk newest file first; within a file, read forward and keep
+    // a sliding window of the most recent `limit` matching entries.
+    // Stop scanning earlier files once we have a full window AND the
+    // earliest collected entry's timestamp predates the file's
+    // contents — but that requires per-file metadata; the simpler
+    // (and still cheap for daily files of typical size) approach is
+    // to read until we hit a since_ms lower bound or run out.
+    for path in files {
+        let f = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        for line in BufReader::new(f).lines() {
+            let Ok(line) = line else { continue };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Some(entry) = parse_jsonl_line(&line) else {
+                continue;
+            };
+            if let Some(floor) = level_floor {
+                if level_rank(&entry.level) < floor {
+                    continue;
+                }
+            }
+            if let Some(p) = plugin_id {
+                if entry.plugin_id.as_deref() != Some(p) {
+                    continue;
+                }
+            }
+            if let Some(c) = conversation_id {
+                if entry.conversation_id.as_deref() != Some(c) {
+                    continue;
+                }
+            }
+            if let Some(since) = since_ms {
+                if entry.ts_ms < since {
+                    continue;
+                }
+            }
+            if let Some(until) = until_ms {
+                if entry.ts_ms > until {
+                    continue;
+                }
+            }
+            out.push(entry);
+        }
+        // Heuristic early exit: once we've collected >= limit and the
+        // OLDEST entry we have predates the start of the previous
+        // (older) file, additional files can only contribute older
+        // rows that we'd drop anyway. We can't cheaply prove that
+        // without parsing file names, so just keep reading — daily
+        // files are bounded in size, and the UI caps at 1000 anyway.
+        if out.len() >= limit * 4 {
+            break;
+        }
+    }
+    out.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
+    out.truncate(limit);
+    Ok(out)
+}
+
+fn parse_jsonl_line(line: &str) -> Option<LogEntryView> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let obj = v.as_object()?;
+    let ts_ms = obj
+        .get("timestamp")
+        .and_then(|t| t.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp_millis())?;
+    let level = obj
+        .get("level")
+        .and_then(|l| l.as_str())
+        .unwrap_or("INFO")
+        .to_owned();
+    let target = obj
+        .get("target")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_owned();
+    // tracing-appender's JSON format nests user fields (and the
+    // event's format-string `message`) under `fields`. Pull
+    // `message` / `conversation_id` / `plugin_id` out, leave the
+    // remainder in `fields` for the UI's expandable rendering later.
+    let mut fields_obj = obj
+        .get("fields")
+        .and_then(|f| f.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let message = fields_obj
+        .remove("message")
+        .and_then(|m| m.as_str().map(|s| s.to_owned()))
+        .unwrap_or_else(|| target.clone());
+    let conversation_id = fields_obj
+        .remove("conversation_id")
+        .and_then(|m| m.as_str().map(|s| s.to_owned()));
+    let plugin_id = fields_obj
+        .remove("plugin_id")
+        .and_then(|m| m.as_str().map(|s| s.to_owned()));
+    let fields = if fields_obj.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(fields_obj))
+    };
+    Some(LogEntryView {
+        ts_ms,
+        level,
+        target,
+        conversation_id,
+        plugin_id,
+        message,
+        fields,
+    })
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -348,7 +518,7 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
         let token = setup_get_token(&app).await;
-        // 2. Fresh DB → empty entries.
+        // 2. `log_dir = None` in default config → empty entries.
         let (status, body) = read_json(&app, Some(&token), "/api/admin/logs").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["entries"].is_array());
@@ -357,6 +527,103 @@ mod tests {
         let (status, body) = read_json(&app, Some(&token), "/api/admin/logs?level=warn").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["entries"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn parse_jsonl_line_extracts_known_fields() {
+        let line = r#"{"timestamp":"2026-05-15T10:30:00.123Z","level":"INFO","fields":{"message":"hello","conversation_id":"conv-1","plugin_id":"weather","extra":42},"target":"execlaw_server::chats"}"#;
+        let entry = parse_jsonl_line(line).expect("parses");
+        assert_eq!(entry.level, "INFO");
+        assert_eq!(entry.target, "execlaw_server::chats");
+        assert_eq!(entry.message, "hello");
+        assert_eq!(entry.conversation_id.as_deref(), Some("conv-1"));
+        assert_eq!(entry.plugin_id.as_deref(), Some("weather"));
+        assert_eq!(entry.fields.as_ref().unwrap()["extra"], 42);
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-05-15T10:30:00.123Z")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(entry.ts_ms, expected);
+    }
+
+    #[test]
+    fn parse_jsonl_line_falls_back_to_target_when_no_message() {
+        let line =
+            r#"{"timestamp":"2026-05-15T10:30:00Z","level":"WARN","fields":{},"target":"some::module"}"#;
+        let entry = parse_jsonl_line(line).expect("parses");
+        assert_eq!(entry.message, "some::module");
+        assert!(entry.fields.is_none());
+    }
+
+    #[test]
+    fn parse_jsonl_line_returns_none_on_garbage() {
+        assert!(parse_jsonl_line("not json").is_none());
+        // Missing timestamp = unusable.
+        assert!(parse_jsonl_line(r#"{"level":"INFO"}"#).is_none());
+    }
+
+    #[test]
+    fn read_log_entries_filters_and_sorts_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_day1 = dir.path().join("execlaw.jsonl.2026-05-14");
+        let path_day2 = dir.path().join("execlaw.jsonl.2026-05-15");
+        std::fs::write(
+            &path_day1,
+            "\
+{\"timestamp\":\"2026-05-14T09:00:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"a\"},\"target\":\"t\"}
+{\"timestamp\":\"2026-05-14T09:01:00Z\",\"level\":\"DEBUG\",\"fields\":{\"message\":\"b\"},\"target\":\"t\"}
+",
+        )
+        .unwrap();
+        std::fs::write(
+            &path_day2,
+            "\
+{\"timestamp\":\"2026-05-15T10:00:00Z\",\"level\":\"ERROR\",\"fields\":{\"message\":\"c\",\"plugin_id\":\"weather\"},\"target\":\"t\"}
+{\"timestamp\":\"2026-05-15T10:05:00Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"d\"},\"target\":\"t\"}
+",
+        )
+        .unwrap();
+        // No filter → all 4, newest first: d (10:05 day2), c (10:00 day2),
+        // b (09:01 day1), a (09:00 day1).
+        let v = read_log_entries(dir.path(), None, None, None, None, None, 100).unwrap();
+        assert_eq!(v.len(), 4);
+        assert_eq!(v[0].message, "d");
+        assert_eq!(v[1].message, "c");
+        assert_eq!(v[2].message, "b");
+        assert_eq!(v[3].message, "a");
+        // Level floor = warn → only the error.
+        let v = read_log_entries(dir.path(), Some(3), None, None, None, None, 100).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].message, "c");
+        // Plugin filter.
+        let v = read_log_entries(dir.path(), None, Some("weather"), None, None, None, 100).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].plugin_id.as_deref(), Some("weather"));
+        // since_ms cuts off day-1 entries.
+        let cutoff = chrono::DateTime::parse_from_rfc3339("2026-05-15T00:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let v = read_log_entries(dir.path(), None, None, None, Some(cutoff), None, 100).unwrap();
+        assert_eq!(v.len(), 2);
+        // limit truncates after sort.
+        let v = read_log_entries(dir.path(), None, None, None, None, None, 2).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].message, "d");
+        assert_eq!(v[1].message, "c");
+    }
+
+    #[test]
+    fn read_log_entries_missing_dir_is_empty_not_error() {
+        let v = read_log_entries(
+            std::path::Path::new("/definitely/does/not/exist"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        assert!(v.is_empty());
     }
 
     #[tokio::test]

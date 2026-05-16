@@ -614,6 +614,7 @@ export interface LogsQuery {
     plugin_id?: string;
     conversation_id?: string;
     since_ms?: number;
+    until_ms?: number;
     limit?: number;
 }
 
@@ -626,6 +627,7 @@ export async function getLogs(
     if (q.plugin_id) qs.set("plugin_id", q.plugin_id);
     if (q.conversation_id) qs.set("conversation_id", q.conversation_id);
     if (q.since_ms !== undefined) qs.set("since_ms", String(q.since_ms));
+    if (q.until_ms !== undefined) qs.set("until_ms", String(q.until_ms));
     if (q.limit !== undefined) qs.set("limit", String(q.limit));
     const path = qs.toString()
         ? `/api/admin/logs?${qs.toString()}`

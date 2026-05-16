@@ -38,6 +38,12 @@ pub struct ServerConfig {
     // for the last-resort placeholder when no row supplies a model.
     /// Hard cap on tool-call rounds per turn (runaway-loop guard).
     pub max_tool_rounds: u32,
+    /// Directory containing the daily-rotated `execlaw.jsonl.<DATE>`
+    /// files written by the tracing file appender. `Some` in real
+    /// server builds; `None` in tests + when the operator disables
+    /// file logging via `EXECLAW_NO_FILE_LOG=1`. `GET /api/admin/logs`
+    /// reads files from this dir to serve the Settings > Logs viewer.
+    pub log_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -91,6 +97,7 @@ impl Default for ServerConfig {
             // 16 keeps headroom for retries while staying inside
             // the runner hard ceiling (`RUNNER_MAX_TOOL_ROUNDS`).
             max_tool_rounds: 16,
+            log_dir: None,
         }
     }
 }

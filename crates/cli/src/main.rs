@@ -338,10 +338,6 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let want_json = std::env::var("EXECLAW_LOG_FORMAT")
         .map(|v| v.eq_ignore_ascii_case("json"))
         .unwrap_or(false);
-    let want_file = std::env::var("EXECLAW_NO_FILE_LOG")
-        .map(|v| !matches!(v.as_str(), "1" | "true" | "yes"))
-        .unwrap_or(true);
-
     // Stdout layer.
     let stdout_layer = if want_json {
         tracing_subscriber::fmt::layer()
@@ -355,25 +351,23 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     };
 
     // File layer — daily-rotated JSONL.
-    let (file_layer, guard) = if want_file {
-        let log_dir = std::env::var("EXECLAW_LOG_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| default_data_dir().join("logs"));
-        if let Err(e) = std::fs::create_dir_all(&log_dir) {
-            eprintln!("execlaw: failed to create log dir {log_dir:?}: {e}");
-            (None, None)
-        } else {
-            let file_appender = tracing_appender::rolling::daily(&log_dir, "execlaw.jsonl");
-            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-            let layer = tracing_subscriber::fmt::layer()
-                .json()
-                .with_writer(non_blocking)
-                .with_ansi(false)
-                .boxed();
-            (Some(layer), Some(guard))
+    let (file_layer, guard) = match resolve_log_dir() {
+        Some(log_dir) => {
+            if let Err(e) = std::fs::create_dir_all(&log_dir) {
+                eprintln!("execlaw: failed to create log dir {log_dir:?}: {e}");
+                (None, None)
+            } else {
+                let file_appender = tracing_appender::rolling::daily(&log_dir, "execlaw.jsonl");
+                let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+                let layer = tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(non_blocking)
+                    .with_ansi(false)
+                    .boxed();
+                (Some(layer), Some(guard))
+            }
         }
-    } else {
-        (None, None)
+        None => (None, None),
     };
 
     let registry = tracing_subscriber::registry()
@@ -385,6 +379,24 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     };
 
     guard
+}
+
+/// Returns the directory the tracing file appender writes
+/// `execlaw.jsonl.<DATE>` files into, or `None` if the operator has
+/// disabled file logging (`EXECLAW_NO_FILE_LOG=1`). Same resolution
+/// rules as `init_tracing` so both sides agree on which dir the log
+/// viewer reads from.
+pub(crate) fn resolve_log_dir() -> Option<PathBuf> {
+    let want_file = std::env::var("EXECLAW_NO_FILE_LOG")
+        .map(|v| !matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(true);
+    if !want_file {
+        return None;
+    }
+    let dir = std::env::var("EXECLAW_LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| default_data_dir().join("logs"));
+    Some(dir)
 }
 
 fn default_data_dir() -> PathBuf {
@@ -1260,6 +1272,7 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
 
     let config = std::sync::Arc::new(execlaw_server::ServerConfig {
         bind_addr: bind.parse()?,
+        log_dir: resolve_log_dir(),
         ..Default::default()
     });
 
