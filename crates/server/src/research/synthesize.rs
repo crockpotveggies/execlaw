@@ -144,6 +144,8 @@ pub async fn run_synthesize(ctx: SynthesizeCtx) -> Result<SynthesizeOutcome, Syn
         stream: false,
         tools: None,
         chat_template_kwargs: None,
+        tool_choice: None,
+        guided_decoding_backend: None,
     };
     let adapter =
         execlaw_model_adapter::adapter_for(execlaw_model_adapter::ModelFamily::detect(&model));

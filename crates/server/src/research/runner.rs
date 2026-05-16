@@ -915,6 +915,8 @@ async fn call_planner(
         // Adapter applies per-family kwargs (e.g. enable_thinking
         // for Qwen3); leave None here so the adapter's choice wins.
         chat_template_kwargs: None,
+        tool_choice: None,
+        guided_decoding_backend: None,
     };
     let adapter =
         execlaw_model_adapter::adapter_for(execlaw_model_adapter::ModelFamily::detect(model));

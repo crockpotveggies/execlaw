@@ -370,6 +370,8 @@ impl TurnExecutor {
                 chat_template_kwargs: Some(serde_json::json!({
                     "enable_thinking": cfg.reasoning_enabled,
                 })),
+                tool_choice: None,
+                guided_decoding_backend: None,
             };
             // Per-round inference call. Time it so the operator can
             // tell the model spent N seconds generating vs. N seconds

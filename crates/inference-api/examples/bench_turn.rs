@@ -402,6 +402,8 @@ async fn run_one(
         // The whole point of this harness: reproduce production
         // request shape, which sets enable_thinking explicitly.
         chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+        tool_choice: None,
+        guided_decoding_backend: None,
     };
 
     let started_at = Instant::now();

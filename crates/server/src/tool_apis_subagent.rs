@@ -158,6 +158,8 @@ impl SubagentApi for InferenceSubagentApi {
             stream: false,
             tools: None,
             chat_template_kwargs: None,
+            tool_choice: None,
+            guided_decoding_backend: None,
         };
 
         let adapter = execlaw_model_adapter::adapter_for(

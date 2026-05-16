@@ -238,6 +238,29 @@ pub struct ChatRequest {
     /// the field, so passing it unconditionally is safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// 2026-05-16 — explicit `tool_choice` so vLLM's
+    /// auto-tool-choice path engages on every tool-bearing request.
+    /// Per OpenAI spec the default when `tools` is set is `"auto"`,
+    /// but passing it explicitly works around vLLM versions where
+    /// omission falls into a no-tools fast path. Accepts every
+    /// shape OpenAI does: `"auto"`, `"none"`, `"required"`, or
+    /// `{"type":"function","function":{"name":"x"}}` — typed as
+    /// `Value` to keep the wire shape flexible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
+    /// 2026-05-16 — vLLM-extension knob. When set, vLLM uses the
+    /// named backend (`"outlines"`, `"lm-format-enforcer"`,
+    /// `"xgrammar"`) to grammar-constrain decoding for any
+    /// `guided_*` field on this request. On vLLM ≥ 0.7 with
+    /// `--enable-auto-tool-choice`, this engages schema-constrained
+    /// decoding on `tools.function.parameters` for the selected
+    /// tool so `function.arguments` is guaranteed to be valid JSON
+    /// matching the schema — the failure class that produced
+    /// Signal-channel chart 400s. Older vLLM versions ignore the
+    /// field. Always passing `"outlines"` for tool-bearing requests
+    /// is safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guided_decoding_backend: Option<String>,
 }
 
 /// `GET /v1/models` response shape (OpenAI list endpoint). vLLM,
@@ -384,6 +407,23 @@ fn base_inference_http_client() -> reqwest::Client {
         .pool_idle_timeout(std::time::Duration::from_secs(15))
         .read_timeout(std::time::Duration::from_secs(120))
         .tcp_keepalive(std::time::Duration::from_secs(30))
+        // 2026-05-16 — pin HTTP/1.1. vLLM v0.20+ negotiates HTTP/2
+        // by default; on long-lived SSE streams (multi-second
+        // decode windows of a single tool-bearing chat completion)
+        // the HTTP/2 flow-control window deadlocked between the
+        // runner container's hyper client and uvicorn's h2 server.
+        // The smoking-gun trace: vLLM happily generated at 31
+        // tok/s with `Running: 1 reqs, KV cache 12%` for 120s
+        // while the runner received the first 5 SSE chunks and
+        // then nothing — classic stalled-window symptom. HTTP/1.1
+        // uses chunked transfer encoding for SSE and has no
+        // window mechanism to deadlock; it's the historical
+        // default for SSE streaming and the safer floor for our
+        // self-hosted-vLLM topology. If a future backend
+        // *requires* HTTP/2 (e.g. multiplexed gRPC over HTTP/2 on
+        // a different port), that backend should construct its
+        // own client; the LLM streaming path stays on 1.1.
+        .http1_only()
         .build()
         .expect("reqwest client build")
 }
@@ -661,11 +701,14 @@ struct ChatRequestStreaming<'a>(&'a ChatRequest);
 impl<'a> Serialize for ChatRequestStreaming<'a> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("ChatRequest", 7)?;
+        let mut st = s.serialize_struct("ChatRequest", 9)?;
         st.serialize_field("model", &self.0.model)?;
         st.serialize_field("messages", &self.0.messages)?;
         if let Some(tools) = &self.0.tools {
             st.serialize_field("tools", tools)?;
+        }
+        if let Some(tc) = &self.0.tool_choice {
+            st.serialize_field("tool_choice", tc)?;
         }
         st.serialize_field("stream", &true)?;
         if let Some(t) = &self.0.temperature {
@@ -676,6 +719,9 @@ impl<'a> Serialize for ChatRequestStreaming<'a> {
         }
         if let Some(kw) = &self.0.chat_template_kwargs {
             st.serialize_field("chat_template_kwargs", kw)?;
+        }
+        if let Some(g) = &self.0.guided_decoding_backend {
+            st.serialize_field("guided_decoding_backend", g)?;
         }
         st.end()
     }
@@ -755,11 +801,14 @@ struct ChatRequestNonStreaming<'a>(&'a ChatRequest);
 impl<'a> Serialize for ChatRequestNonStreaming<'a> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("ChatRequest", 7)?;
+        let mut st = s.serialize_struct("ChatRequest", 9)?;
         st.serialize_field("model", &self.0.model)?;
         st.serialize_field("messages", &self.0.messages)?;
         if let Some(tools) = &self.0.tools {
             st.serialize_field("tools", tools)?;
+        }
+        if let Some(tc) = &self.0.tool_choice {
+            st.serialize_field("tool_choice", tc)?;
         }
         st.serialize_field("stream", &false)?;
         if let Some(t) = &self.0.temperature {
@@ -770,6 +819,9 @@ impl<'a> Serialize for ChatRequestNonStreaming<'a> {
         }
         if let Some(kw) = &self.0.chat_template_kwargs {
             st.serialize_field("chat_template_kwargs", kw)?;
+        }
+        if let Some(g) = &self.0.guided_decoding_backend {
+            st.serialize_field("guided_decoding_backend", g)?;
         }
         st.end()
     }
@@ -801,6 +853,8 @@ mod tests {
             temperature: None,
             max_tokens: Some(512),
             chat_template_kwargs: None,
+            tool_choice: None,
+            guided_decoding_backend: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(s.contains("\"model\""));
@@ -901,6 +955,8 @@ mod tests {
             temperature: None,
             max_tokens: None,
             chat_template_kwargs: None,
+            tool_choice: None,
+            guided_decoding_backend: None,
         };
         let mut stream = client.chat_completions_stream(&req).await.unwrap();
         let mut text = String::new();
@@ -959,6 +1015,8 @@ mod tests {
             temperature: None,
             max_tokens: None,
             chat_template_kwargs: None,
+            tool_choice: None,
+            guided_decoding_backend: None,
         };
         let mut stream = client.chat_completions_stream(&req).await.unwrap();
         let mut saw_err = false;
@@ -1029,6 +1087,8 @@ mod tests {
             temperature: Some(0.0),
             max_tokens: Some(16),
             chat_template_kwargs: None,
+            tool_choice: None,
+            guided_decoding_backend: None,
         };
         let resp = client.chat_completions(&req).await.unwrap();
         assert_eq!(resp.id, "test-1");

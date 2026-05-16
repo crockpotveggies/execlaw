@@ -45,3 +45,32 @@ mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+
+# 2026-05-16 — optional tokio-console support for live async-task
+# debugging. Off by default to keep production binaries lean.
+# Operator workflow when enabling:
+#
+#   RUSTFLAGS="--cfg tokio_unstable" \
+#     cargo build -p execlaw-runner --features tokio-console
+#
+# Then on the runner host (or inside the container with the port
+# exposed):
+#
+#   EXECLAW_TOKIO_CONSOLE_BIND=0.0.0.0:6669 ./execlaw-runner
+#
+# From the operator's laptop:
+#
+#   tokio-console http://<runner-host>:6669
+#
+# The `--cfg tokio_unstable` build flag is REQUIRED for
+# console-subscriber to see task IDs + spawn locations — without
+# it the console connects but every task reads as "anonymous".
+# Make sure both the build environment AND any container layer
+# that re-builds during deploy pass the flag through.
+[features]
+default = []
+tokio-console = ["dep:console-subscriber", "tokio/tracing"]
+
+[dependencies.console-subscriber]
+version = "0.4"
+optional = true

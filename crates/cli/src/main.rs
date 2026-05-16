@@ -313,6 +313,35 @@ enum EvalOp {
 /// `EXECLAW_LOG_DIR` overrides the file directory; `EXECLAW_NO_FILE_LOG=1`
 /// disables the file appender (useful for tests + ephemeral CLI
 /// invocations like `execlaw doctor`).
+/// Replace the default `eprintln!`-based panic hook with one that
+/// emits a structured tracing event AND aborts the process. See
+/// the call site comment for the rationale; mirrors the runner-
+/// binary's `install_panic_hook` for journal-grep parity (target
+/// `server::panic` on this side).
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("<non-string panic payload>");
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_owned());
+        tracing::error!(
+            target: "server::panic",
+            message,
+            location,
+            backtrace = %backtrace,
+            "SERVER_PANIC — process aborting (core dump if ulimit -c allows)"
+        );
+        std::process::abort();
+    }));
+}
+
 fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
@@ -2093,6 +2122,15 @@ fn main() -> ExitCode {
     // Hold the tracing-appender guard for the whole process lifetime
     // so the background flush thread sees every event before exit.
     let _tracing_guard = init_tracing();
+    // 2026-05-16 — install a panic hook that emits a structured
+    // tracing event (full backtrace + payload + location) and
+    // aborts. The abort produces a core dump if the host's
+    // `ulimit -c` allows; `rust-gdb <execlaw> <core>` then
+    // attaches for post-mortem analysis. Without this hook a
+    // panic in a tokio worker thread silently prints to stderr
+    // and the server keeps running with a corrupt runtime —
+    // exactly the failure mode that's hardest to debug.
+    install_panic_hook();
     let cli = Cli::parse();
     let result: anyhow::Result<()> = (|| match cli.command {
         Command::Install {

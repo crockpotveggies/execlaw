@@ -2066,8 +2066,29 @@ impl RenderChartTool {
         // Kept here in code rather than as a sidecar JSON file so the
         // built-in catalog stays self-contained (the same pattern
         // the other built-ins follow).
+        // 2026-05-16 — schema strictness is a trade-off:
+        //   * `additionalProperties: false` on top-level object
+        //     stays — it narrows the grammar enough to catch
+        //     "model invented a key" mistakes if outlines is on,
+        //     without forbidding standard nested objects.
+        //   * `additionalProperties: false` on EVERY nested object
+        //     was removed: combined with outlines + a quantized
+        //     27B model, the cumulative grammar became too tight
+        //     and the model started giving up on tool calls
+        //     altogether (replying with plain text instead of a
+        //     `chart.render` invocation).
+        //   * Top-level `required: ["series"]` was removed for
+        //     the same reason — when outlines forces a field the
+        //     model isn't sure how to populate, falling back to
+        //     "no tool call at all" is the worse failure mode.
+        //     The tool's runtime decoder already errors clearly
+        //     on a missing `series`; the schema doesn't need to.
+        //   * Inner `required: ["x", "y"]` and `["name", "points"]`
+        //     stay — those describe the actual shape of valid
+        //     data and the tool's parser depends on them.
         let schema = json!({
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "title": {
                     "type": "string",
@@ -2153,8 +2174,8 @@ impl RenderChartTool {
                     "Render a line/bar/area/scatter chart from `series: [{name, points: [{x, y}]}]`; ",
                     "set `time_axis: true` when x is Unix-ms. Returns inline SVG + a PNG attachment_id.\n",
                     "FETCH REAL DATA FIRST via the appropriate tool (stock/weather/web/etc.) — ",
-                    "NEVER invent points. After it renders, your reply should be one short line of ",
-                    "context, not a recap of what the chart shows."
+                    "NEVER invent points. `series` and `points` are real arrays — never JSON-encoded strings. ",
+                    "After it renders, your reply should be one short line of context, not a recap."
                 ).into(),
                 schema,
                 source: ToolSource::Builtin,

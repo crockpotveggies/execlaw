@@ -33,6 +33,7 @@ pub mod factory_reset;
 pub mod generic_inbound;
 pub mod group_addressing;
 pub mod host_caps_impl;
+pub mod inference_probe;
 pub mod inference_resolver;
 pub mod mcp_admin;
 pub mod mcp_host;

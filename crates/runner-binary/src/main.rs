@@ -43,6 +43,19 @@ use turn_loop::{CancelFlags, ToolResultRoutes};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<()> {
+    // 2026-05-16 — install the panic hook BEFORE the tokio
+    // runtime is built. A panic in any task otherwise unwinds
+    // through tokio's worker thread, prints a default backtrace,
+    // and exits 101 with no record in the runner's tracing
+    // journal. With this hook the panic lands as a structured
+    // ERROR log (full backtrace + location) AND we call
+    // `process::abort()` to produce a core dump when the host's
+    // `ulimit -c` allows it. That gives `rust-gdb core` something
+    // to attach to for post-mortem analysis. Set
+    // `RUST_BACKTRACE=full` in the runner container's env for the
+    // longest captured backtrace; `1` is the OK default.
+    install_panic_hook();
+
     // Manual runtime construction (instead of `#[tokio::main]`) so we
     // can pin a generous thread stack. musl's default is 128 KB —
     // dangerously small for deep async chains and serde_json
@@ -53,6 +66,55 @@ fn main() -> Result<()> {
         .build()
         .context("building tokio runtime")?;
     rt.block_on(async_main())
+}
+
+/// Replace the default `eprintln!`-based panic hook with one that
+/// emits a structured tracing event AND aborts the process. The
+/// abort matters because:
+///   * `panic = "unwind"` (default in dev/release) keeps the
+///     process alive after one task panics; subsequent task
+///     panics race against an already-corrupted runtime.
+///   * `process::abort` triggers `SIGABRT`, which the kernel can
+///     core-dump (when `ulimit -c unlimited` and the host
+///     allows). With debug symbols in the binary (`debug =
+///     "limited"` already on the release profile via
+///     workspace settings), `rust-gdb <binary> <core>` gives
+///     the full panic-site backtrace.
+///
+/// The hook captures `std::backtrace::Backtrace::force_capture()`
+/// unconditionally — distinct from `RUST_BACKTRACE`, which only
+/// drives the default hook. Operators see the full stack in the
+/// journal regardless of env-var state.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        // `panic_payload_string` mirrors the default hook's
+        // extraction order: `String` payload, then `&str`, then
+        // fall back to the Debug rendering.
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("<non-string panic payload>");
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_owned());
+        // ERROR not WARN — a panic is an invariant violation, not
+        // a recoverable condition. The journal grep target
+        // `runner::panic` mirrors `runner::turn_failure_snapshot`
+        // so an operator can find both with the same query
+        // prefix.
+        tracing::error!(
+            target: "runner::panic",
+            message,
+            location,
+            backtrace = %backtrace,
+            "RUNNER_PANIC — process aborting (core dump if ulimit -c allows)"
+        );
+        std::process::abort();
+    }));
 }
 
 async fn async_main() -> Result<()> {
@@ -213,12 +275,61 @@ async fn handle_frame(
 }
 
 fn init_tracing() {
-    use tracing_subscriber::{EnvFilter, fmt};
+    use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
+
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,execlaw_runner=debug"));
-    fmt()
-        .with_env_filter(filter)
+    let fmt_layer = fmt::layer()
         .with_target(true)
         .with_level(true)
-        .init();
+        .with_filter(filter);
+    let registry = tracing_subscriber::registry().with(fmt_layer);
+
+    // 2026-05-16 — tokio-console wiring. Opt-in via the
+    // `tokio-console` Cargo feature AND a runtime env var so a
+    // production build can include the dep cost-free and operators
+    // turn it on only when debugging. The env var doubles as the
+    // bind address; absent → not wired, present → console layer
+    // spawned on that address.
+    //
+    // Connect from the operator's laptop with:
+    //   tokio-console http://<runner-host>:6669
+    //
+    // Build prerequisite (HARD requirement, not a recommendation):
+    //   RUSTFLAGS="--cfg tokio_unstable" \
+    //     cargo build -p execlaw-runner --features tokio-console
+    // Without `tokio_unstable`, console-subscriber spawns but
+    // can't see task spawn locations or per-task IDs — every task
+    // shows as "anonymous" and the diagnostic value drops to zero.
+    #[cfg(feature = "tokio-console")]
+    {
+        if let Ok(bind) = std::env::var("EXECLAW_TOKIO_CONSOLE_BIND") {
+            match bind.parse::<std::net::SocketAddr>() {
+                Ok(addr) => {
+                    let console_layer = console_subscriber::ConsoleLayer::builder()
+                        .with_default_env()
+                        .server_addr(addr)
+                        .spawn();
+                    registry.with(console_layer).init();
+                    tracing::info!(
+                        target: "runner::tokio_console",
+                        %addr,
+                        "tokio-console layer engaged; connect with: \
+                         tokio-console http://<host>:<port>"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "EXECLAW_TOKIO_CONSOLE_BIND={bind:?} did not parse as a SocketAddr ({e}); \
+                         tokio-console will be inactive this run"
+                    );
+                }
+            }
+        }
+    }
+
+    // Default path (no tokio-console, or feature disabled, or env
+    // var unset) — fmt layer only.
+    registry.init();
 }

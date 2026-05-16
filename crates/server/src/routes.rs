@@ -773,6 +773,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::routines::routines_router())
         .merge(crate::personality::personality_router())
         .merge(crate::runners_admin::runners_admin_router())
+        .merge(crate::inference_probe::inference_probe_router())
         .merge(crate::sidecars_admin::sidecars_admin_router())
         // (Phase B: signal_admin_router retired. Pairing flow is
         // now plugin-served via [[admin_routes]] in

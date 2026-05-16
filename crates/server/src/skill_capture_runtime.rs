@@ -63,6 +63,8 @@ impl SkillSummarizer for InferenceSummarizer {
             max_tokens: Some(max_tokens),
             // Adapter applies per-family kwargs.
             chat_template_kwargs: None,
+            tool_choice: None,
+            guided_decoding_backend: None,
         };
         let adapter = execlaw_model_adapter::adapter_for(
             execlaw_model_adapter::ModelFamily::detect(model_id.as_str()),
