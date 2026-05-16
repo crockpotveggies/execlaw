@@ -398,17 +398,50 @@ impl ServerAttachmentApi {
         use execlaw_core::principal_groups::PrincipalGroupStore;
         use execlaw_core::transport_bindings::TransportBindingStore;
 
+        // 2026-05-16 — make wiring-missing failures LOUD. Pre-fix,
+        // a missing `with_plugin_host(...)` call at the dispatch
+        // construction site (was the case for tool_dispatch.rs's
+        // chart.render path) silently no-op'd the entire bridge.
+        // Operators saw "chart rendered fine in web UI but never
+        // arrived on Signal" with zero diagnostic. Now: a single
+        // WARN at boot of the dispatch, every time, so operators
+        // can immediately see WHICH wiring slot is missing.
         let Some(registry) = self.transports.as_ref() else {
+            tracing::warn!(
+                target: "attachment_api::bridge",
+                conversation_id = %self.caller_conversation_id.as_str(),
+                attachment_id = %attachment_id,
+                "transport bridge skipped: ServerAttachmentApi has no `transports` registry. \
+                 Wire it via `.with_transports(state.host_transports.clone())` at the call site.",
+            );
             return;
         };
         let Some(plugin_host) = self.plugin_host.as_ref() else {
+            tracing::warn!(
+                target: "attachment_api::bridge",
+                conversation_id = %self.caller_conversation_id.as_str(),
+                attachment_id = %attachment_id,
+                "transport bridge skipped: ServerAttachmentApi has no `plugin_host`. \
+                 Wire it via `.with_plugin_host(state.plugin_host.clone())` at the call site.",
+            );
             return;
         };
 
         let pg_store = PrincipalGroupStore::new(&self.db);
         let pg_id = match pg_store.principal_group_id_for(self.caller_conversation_id.as_str()) {
             Ok(Some(id)) => id,
-            _ => return,
+            // Web-only conversation (no transport binding). Skip
+            // silently — this is the expected case, not an error.
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(
+                    target: "attachment_api::bridge",
+                    conversation_id = %self.caller_conversation_id.as_str(),
+                    error = %e,
+                    "principal_group lookup failed; skipping transport bridge",
+                );
+                return;
+            }
         };
         let binding_store = TransportBindingStore::new(&self.db);
         let bindings = match binding_store.bindings_for_group_any_channel(&pg_id) {
@@ -424,6 +457,22 @@ impl ServerAttachmentApi {
             }
         };
         let Some(resolved) = registry.lookup_first_supported_binding(&bindings) else {
+            // Conversation has bindings but none match a registered
+            // transport plugin. Surfaces as INFO rather than WARN —
+            // a plausible operator config (e.g. installed Signal,
+            // then uninstalled it without unbinding the
+            // conversation). Still worth logging so the operator
+            // can see why the chip didn't fan out.
+            tracing::info!(
+                target: "attachment_api::bridge",
+                conversation_id = %self.caller_conversation_id.as_str(),
+                attachment_id = %attachment_id,
+                bindings_len = bindings.len(),
+                bound_channels = ?bindings.iter().map(|b| &b.channel).collect::<Vec<_>>(),
+                "transport bridge skipped: no installed transport plugin handles any of the \
+                 conversation's bound channels (registered handlers: {:?})",
+                registry.channels().collect::<Vec<_>>(),
+            );
             return;
         };
 

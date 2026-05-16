@@ -433,6 +433,18 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
                 // explicit error from create_artifact instead of
                 // silently writing under the developer's real home.
                 let artifacts_root = builtin_artifacts_root();
+                // 2026-05-16 — `with_plugin_host` was missing, which
+                // silently disabled the auto-bridge path inside
+                // `bridge_to_originating_transport` (it returns
+                // early without logging when `plugin_host.is_none()`).
+                // Symptom: chart.render fired cleanly, the chart
+                // landed in web UI as a card, but no
+                // `<channel>.send_with_attachments` call ever
+                // dispatched — operators on Signal/WhatsApp/etc.
+                // never received the PNG. The same gap silently
+                // affected `send_attachment`'s transport fan-out.
+                // Wire the plugin host so the bridge can actually
+                // dispatch the channel-side delivery tool.
                 ctx.attachments = Some(Arc::new(
                     crate::attachment_api::ServerAttachmentApi::new(
                         self.host.db().clone(),
@@ -440,6 +452,7 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
                         ctx.conversation_id.clone(),
                     )
                     .with_transports(self.host_transports.clone())
+                    .with_plugin_host(self.host.clone())
                     .with_artifacts_root(artifacts_root),
                 ));
             }
