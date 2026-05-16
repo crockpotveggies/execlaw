@@ -11,7 +11,13 @@ export type CardKind =
     | "research"
     | "shell_session"
     | "file_pipeline"
-    | "attachment";
+    | "attachment"
+    // 2026-05-16 — chart card produced by the native `chart.render`
+    // built-in tool. Mirrors the `CardKind::Chart` Rust variant
+    // (added in `crates/core/src/cards.rs` as part of the
+    // chart-render → cards-path migration). Renderer registered at
+    // `web/src/cards/ChartCard.tsx`.
+    | "chart";
 
 export type CardState =
     | "Pending"
