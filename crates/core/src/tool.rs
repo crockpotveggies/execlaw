@@ -978,6 +978,37 @@ pub trait AttachmentApi: Send + Sync {
         bytes: Vec<u8>,
         ttl_seconds: Option<i64>,
     ) -> Result<CreatedArtifactView, ApiError>;
+
+    /// 2026-05-16 — emit an inline `Chart` card into the caller's
+    /// conversation so the SPA's card pipeline (the same path
+    /// deep-research progress + send_attachment chips use) renders
+    /// the chart instead of relying on the fragile chat-component
+    /// dispatch from a tool_result message.
+    ///
+    /// Existed before only as the `chat_component_kind: "chart"`
+    /// inline path — that path proved unreliable in practice
+    /// (chart never visually appeared even when the tool fired
+    /// and the JSON was correct). Promoting to a first-class card
+    /// mirrors the proven cards path.
+    ///
+    /// Card details payload: `{ svg, attachment_id, filename,
+    /// title?, width, height }`. The SPA's `ChartCard` reads
+    /// these and renders SVG inline + a PNG-download chip.
+    /// Trust scope is the same as `send` — refuses cross-
+    /// conversation delivery via the caller_conversation_id check.
+    /// Best-effort: emit failures (event-bus saturation, DB
+    /// pressure) return ApiError but the rendered SVG + persisted
+    /// artifact already exist, so the caller's tool_result still
+    /// carries them as a fallback.
+    async fn emit_chart_card(
+        &self,
+        attachment_id: &str,
+        svg: &str,
+        filename: &str,
+        title: Option<&str>,
+        width: u32,
+        height: u32,
+    ) -> Result<(), ApiError>;
 }
 
 /// Returned by [`AttachmentApi::create_artifact`]. The

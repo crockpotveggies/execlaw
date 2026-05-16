@@ -2172,8 +2172,53 @@ impl ToolImpl for RenderChartTool {
                 );
             }
         };
+        // Pull a "title" hint out of the spec so the card shows
+        // something better than the filename when the model
+        // supplied one. Best-effort string read, no validation —
+        // the chart renderer already validated it.
+        let title_for_card: Option<String> = parsed
+            .spec
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         match api.create_artifact(&filename, "image/png", png, ttl).await {
-            Ok(view) => ToolOutcome::Ok(json!({
+            Ok(view) => {
+                // 2026-05-16 — emit a Chart card so the SPA's
+                // proven cards-projection path renders the chart
+                // inline. The chat-component-inline path
+                // (`chat_component_kind: "chart"` in the
+                // tool_result) was unreliable in practice — the
+                // card path is what deep-research and
+                // send_attachment use, and they work.
+                //
+                // Best-effort: a card-emit failure is logged at the
+                // server side but doesn't fail the tool. The
+                // tool_result's payload still carries the SVG +
+                // attachment_id so the SPA's old chat-component
+                // dispatch can take over as a fallback if the card
+                // emit failed (e.g. event-bus saturation).
+                if let Err(e) = api
+                    .emit_chart_card(
+                        &view.attachment_id,
+                        &svg,
+                        &filename,
+                        title_for_card.as_deref(),
+                        width,
+                        height,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target: "chart.render",
+                        attachment_id = %view.attachment_id,
+                        error = %e.to_string(),
+                        "emit_chart_card failed; chart will still appear via tool_result \
+                         dispatch fallback if the SPA's chat-component path is wired",
+                    );
+                }
+                ToolOutcome::Ok(json!({
                 "attachment_id": view.attachment_id,
                 "sha256": view.sha256,
                 "size_bytes": view.size_bytes,
@@ -2187,7 +2232,8 @@ impl ToolImpl for RenderChartTool {
                 // Hint the SPA on which chat-component to mount —
                 // the existing convention for plugin tool results.
                 "chat_component_kind": "chart",
-            })),
+            }))
+            }
             Err(e) => e.into_outcome(),
         }
     }

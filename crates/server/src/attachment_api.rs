@@ -29,6 +29,7 @@ use execlaw_core::cards::{CardAction, CardClosedPayload, CardKind, CardOpenedPay
 // CardAction includes only its enum variants; no separate Kind type.
 use execlaw_core::ids::{AttachmentId, ConversationId};
 use execlaw_core::tool::{ApiError, AttachmentApi, CreatedArtifactView, DeliveredAttachmentView};
+use serde_json::json;
 use std::path::PathBuf;
 
 pub struct ServerAttachmentApi {
@@ -274,6 +275,84 @@ impl AttachmentApi for ServerAttachmentApi {
             sha256: created.sha256,
             size_bytes: created.size_bytes,
         })
+    }
+
+    async fn emit_chart_card(
+        &self,
+        attachment_id: &str,
+        svg: &str,
+        filename: &str,
+        title: Option<&str>,
+        width: u32,
+        height: u32,
+    ) -> Result<(), ApiError> {
+        // 2026-05-16 — emit a Chart card following the same
+        // open-then-immediately-close pattern AttachmentCard uses.
+        // The SPA's card-projection picks up the pair on
+        // `/api/chats/:id/cards` and dispatches to the registered
+        // `chart` renderer (web/src/cards/ChartCard.tsx). Same
+        // proven pipeline as deep-research progress + the
+        // send_attachment download chip.
+        //
+        // The SVG goes into `details.svg` so the renderer can drop
+        // it inline via dangerouslySetInnerHTML — same trust posture
+        // as ChartInlineComponent had: SVG comes from our own
+        // plotters renderer, not user-controlled input.
+        let card_id = format!("chart-{attachment_id}");
+        let title_owned = title
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let card_title = title_owned.clone().unwrap_or_else(|| filename.to_owned());
+        let summary = format!("Chart ({width}x{height})");
+        // CardAction::OpenDetail wires a "click to open" affordance;
+        // for charts the natural action is "download the PNG."
+        let download_url = format!("/api/attachments/{attachment_id}");
+        let details = json!({
+            "attachment_id": attachment_id,
+            "filename": filename,
+            "title": title_owned,
+            "svg": svg,
+            "width": width,
+            "height": height,
+            "download_url": download_url,
+            "mime_type": "image/png",
+        });
+
+        open_card_and_broadcast(
+            &self.db,
+            &self.events,
+            &self.caller_conversation_id,
+            "agent",
+            &CardOpenedPayload {
+                card_id: card_id.clone(),
+                kind: CardKind::Chart,
+                title: card_title,
+                summary: summary.clone(),
+                state: Some(CardState::Running),
+                details: details.clone(),
+                actions: vec![CardAction::OpenDetail {
+                    href: download_url.clone(),
+                }],
+            },
+        )
+        .map_err(|e| ApiError::Storage(format!("emit chart card open: {e}")))?;
+        close_card_and_broadcast(
+            &self.db,
+            &self.events,
+            &self.caller_conversation_id,
+            "agent",
+            &CardClosedPayload {
+                card_id,
+                state: CardState::Completed,
+                summary,
+                details: Some(details),
+                attachment_id: Some(attachment_id.to_owned()),
+                error: None,
+            },
+        )
+        .map_err(|e| ApiError::Storage(format!("emit chart card close: {e}")))?;
+        Ok(())
     }
 }
 
