@@ -49,9 +49,10 @@ pub use import::{
     ImportFailure, ImportReport, import_plugin_skills, namespaced_name, sanitize_local_name,
 };
 pub use model::{
-    NewProposal, NewSkill, NewSkillVersion, ProposalId, ProposalKind, ProposalState,
-    RegistrationKind, ResourceBlob, Skill, SkillError, SkillId, SkillIndexEntry, SkillMatch,
-    SkillProposal, SkillResource, SkillState, SkillVersion, SkillView, VersionId,
+    MAX_BODY_BYTES, MAX_RESOURCE_BYTES, MAX_SKILL_TOTAL_BYTES, NewProposal, NewSkill,
+    NewSkillVersion, ProposalId, ProposalKind, ProposalState, RegistrationKind, ResourceBlob,
+    Skill, SkillError, SkillId, SkillIndexEntry, SkillMatch, SkillProposal, SkillResource,
+    SkillState, SkillVersion, SkillView, VersionId,
 };
 pub use reuse_update::{ReuseUpdateRequest, ReuseUpdateSink, ReuseUpdateWorker};
 pub use sanitizer::{SanitizationReport, SanitizedStep, sanitize_step};

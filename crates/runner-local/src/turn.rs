@@ -620,12 +620,34 @@ impl TurnExecutor {
 /// Convert a span of event-log records into chat messages for the next
 /// model call. Phase 1 handles user_msg + model_turn + tool_use/tool_result
 /// pairs; richer event kinds (voice, etc.) are skipped over for text turns.
+/// Reconstruct OpenAI-compliant `ChatMessage` history from the event
+/// log. Invariant: every `tool` role message MUST be preceded by an
+/// `assistant` message whose `tool_calls` array carries the matching
+/// `tool_call_id`.
+///
+/// The event log doesn't commit the intermediate tool-calling
+/// assistant messages — only the final per-turn `ModelTurn` is
+/// logged — so we synthesise one assistant-with-tool_calls per
+/// `ToolUse` event. The terminal `ModelTurn` becomes a plain
+/// assistant message with no `tool_calls`.
+///
+/// 2026-05-16 — fix #P1a: pre-fix this buffered `ToolUse` events
+/// into `pending_tool_calls` and swapped them onto the FINAL
+/// `ModelTurn`'s assistant message, after the matching `tool`
+/// messages had already been pushed. The resulting shape
+/// `[user, tool, assistant(tool_calls)]` is structurally invalid
+/// for OpenAI: vLLM with `--enable-auto-tool-choice` may reject it
+/// outright, and otherwise the model interprets it as "future tool
+/// calls" instead of "past ones" and confabulates. The fix emits
+/// one assistant→tool pair per call, which is OpenAI-compliant.
+/// Loses the "parallel calls in one round" grouping (we emit one
+/// assistant per call); parallel calls at temp 0.3 are rare on
+/// Qwen3.5 27B-AWQ.
 fn hydrate_messages(
     events: &[EventRecord],
     spotlight_delim: Option<&str>,
 ) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = Vec::new();
-    let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
 
     for ev in events {
         match ev.kind {
@@ -638,26 +660,22 @@ fn hydrate_messages(
                     out.push(ChatMessage::user(text));
                 }
             }
-            EventKind::ModelTurn => {
-                if let Ok(p) = ev.decode_payload::<ModelTurnPayload>() {
-                    let mut m = ChatMessage::assistant(p.text);
-                    // If there were tool calls in the same turn, we attach
-                    // them to the assistant message so the follow-up tool
-                    // messages align.
-                    std::mem::swap(&mut m.tool_calls, &mut pending_tool_calls);
-                    out.push(m);
-                }
-            }
             EventKind::ToolUse => {
                 if let Ok(p) = ev.decode_payload::<ToolUsePayload>() {
-                    pending_tool_calls.push(ToolCall {
+                    let call = ToolCall {
                         id: format!("call_{}", p.ordinal),
                         kind: "function".into(),
                         function: execlaw_inference_api::ToolCallFunction {
                             name: p.tool_name,
                             arguments: p.args_json.to_string(),
                         },
-                    });
+                    };
+                    // Synthetic assistant message bearing the call.
+                    // Empty content per OpenAI convention for
+                    // tool-only assistant turns.
+                    let mut m = ChatMessage::assistant(String::new());
+                    m.tool_calls = vec![call];
+                    out.push(m);
                 }
             }
             EventKind::ToolResult => {
@@ -670,6 +688,14 @@ fn hydrate_messages(
                         format!("call_{}", p.ordinal),
                         body,
                     ));
+                }
+            }
+            EventKind::ModelTurn => {
+                if let Ok(p) = ev.decode_payload::<ModelTurnPayload>() {
+                    // Terminal assistant turn — plain text, no
+                    // tool_calls (any preceding ToolUse events have
+                    // already been materialised above).
+                    out.push(ChatMessage::assistant(p.text));
                 }
             }
             _ => { /* other event kinds don't surface to the model */ }
@@ -1107,6 +1133,100 @@ mod tests {
             TurnError::MaxRounds(n) => assert_eq!(n, 2),
             other => panic!("wrong error: {other:?}"),
         }
+    }
+
+    /// 2026-05-16 — fix #P1a (Codex review): `hydrate_messages` must
+    /// produce OpenAI-compliant `[user, assistant(tool_calls), tool,
+    /// assistant(final)]` order. Pre-fix it emitted the event-log
+    /// order `[user, tool, assistant(tool_calls)]`, which vLLM with
+    /// `--enable-auto-tool-choice` rejects and which confuses the
+    /// model into reading "past tool calls" as "future".
+    #[test]
+    fn hydrate_messages_emits_openai_compliant_tool_order() {
+        use execlaw_core::events::{EventKind, EventRecord};
+        use execlaw_core::ids::{ConversationId, EventSeq};
+        use execlaw_inference_api::Role;
+        use super::{ModelTurnPayload, ToolResultPayload, ToolUsePayload, UserMessagePayload};
+
+        let cid = ConversationId::from("c");
+        let user_ev = EventRecord::new(
+            cid.clone(),
+            EventSeq(1),
+            EventKind::UserMsg,
+            &UserMessagePayload {
+                text: "draw a chart".into(),
+                sender_principal_id: Some("controller".into()),
+                channel_origin: None,
+                attachment_ids: Vec::new(),
+                applied_skill_names: Vec::new(),
+            },
+            Some("controller".into()),
+        )
+        .unwrap();
+        let tool_use_ev = EventRecord::new(
+            cid.clone(),
+            EventSeq(2),
+            EventKind::ToolUse,
+            &ToolUsePayload {
+                ordinal: 0,
+                tool_name: "chart.render".into(),
+                args_json: serde_json::json!({"spec": "..."}),
+            },
+            Some("agent".into()),
+        )
+        .unwrap();
+        let tool_result_ev = EventRecord::new(
+            cid.clone(),
+            EventSeq(3),
+            EventKind::ToolResult,
+            &ToolResultPayload {
+                ordinal: 0,
+                outcome: Ok(serde_json::json!({"chart_id": "c1"})),
+            },
+            Some("system".into()),
+        )
+        .unwrap();
+        let model_turn_ev = EventRecord::new(
+            cid.clone(),
+            EventSeq(4),
+            EventKind::ModelTurn,
+            &ModelTurnPayload {
+                model: "Q".into(),
+                finish_reason: Some("stop".into()),
+                text: "here is the chart".into(),
+                prompt_tokens: None,
+                completion_tokens: None,
+                channel_origin: None,
+            },
+            Some("agent".into()),
+        )
+        .unwrap();
+
+        let messages = super::hydrate_messages(
+            &[user_ev, tool_use_ev, tool_result_ev, model_turn_ev],
+            None,
+        );
+        assert_eq!(messages.len(), 4);
+        // OpenAI-compliant: user → assistant(tool_calls) → tool → assistant(final).
+        assert!(matches!(messages[0].role, Role::User));
+        assert!(matches!(messages[1].role, Role::Assistant));
+        assert!(matches!(messages[2].role, Role::Tool));
+        assert!(matches!(messages[3].role, Role::Assistant));
+        // The synthetic assistant carries the tool_call.
+        assert_eq!(messages[1].tool_calls.len(), 1);
+        assert_eq!(messages[1].tool_calls[0].id, "call_0");
+        assert_eq!(messages[1].tool_calls[0].function.name, "chart.render");
+        // The tool message references that call id.
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_0"));
+        // The terminal ModelTurn assistant has no tool_calls.
+        assert!(messages[3].tool_calls.is_empty());
+        assert_eq!(
+            messages[3]
+                .content
+                .as_ref()
+                .map(|c| c.as_text().to_owned()),
+            Some("here is the chart".to_owned()),
+        );
     }
 
     /// 2026-05-16 — spotlighting wraps UserMsg-derived ChatMessages

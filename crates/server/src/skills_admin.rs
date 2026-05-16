@@ -367,6 +367,30 @@ fn skill_err(e: execlaw_skills::SkillError) -> ApiError {
             code: "denied",
             message: r,
         },
+        // 2026-05-16 — fix #P3 (Codex review): these are caller-input
+        // validation failures, not server errors. The SPA's composer
+        // exposes the custom-frontmatter blob directly, so 400 lets
+        // the UI render an inline error chip instead of the generic
+        // "server error, retry" the 500 catch-all surfaced.
+        InvalidFrontmatter(m) => ApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_frontmatter",
+            message: format!("frontmatter is not valid JSON: {m}"),
+        },
+        BodyTooLarge { size, cap } => ApiError {
+            // Size-violation; PAYLOAD_TOO_LARGE is the closer fit
+            // than 400 since the SPA can short-circuit on this exact
+            // status to surface a "trim your body" message without
+            // re-parsing the error code string.
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code: "body_too_large",
+            message: format!("skill body size {size}B exceeds cap {cap}B"),
+        },
+        ResourceTooLarge { size, cap } => ApiError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code: "resource_too_large",
+            message: format!("skill resource size {size}B exceeds cap {cap}B"),
+        },
         other => ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "skill_error",
@@ -827,6 +851,54 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid_name");
+    }
+
+    /// 2026-05-16 — fix #P3 (Codex review): malformed JSON in the
+    /// composer's custom-frontmatter field surfaced as 500 pre-fix
+    /// because `InvalidFrontmatter` fell through the catch-all
+    /// branch of `skill_err`. The OpenAPI schema documents 400 for
+    /// caller-input validation; the SPA's inline error chip relies
+    /// on the 400 status to surface a "fix your JSON" message rather
+    /// than the generic "server error, retry" loop.
+    #[tokio::test]
+    async fn invalid_frontmatter_returns_400() {
+        let (app, bearer) = seed_user_and_token(UserRole::Controller).await;
+        let (status, body) = post_create(
+            app,
+            &bearer,
+            serde_json::json!({
+                "name": "test/bad-fm",
+                "description": "x",
+                "body_md": "x",
+                // Not parseable JSON.
+                "frontmatter_json": "{not: valid json}",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_frontmatter");
+    }
+
+    /// Skill bodies above `MAX_BODY_BYTES` surface as 413 with an
+    /// `body_too_large` code (was 500 pre-fix).
+    #[tokio::test]
+    async fn oversized_body_returns_413() {
+        let (app, bearer) = seed_user_and_token(UserRole::Controller).await;
+        // MAX_BODY_BYTES = 256 KiB; ship one byte over.
+        let oversized =
+            "a".repeat((execlaw_skills::MAX_BODY_BYTES as usize) + 1);
+        let (status, body) = post_create(
+            app,
+            &bearer,
+            serde_json::json!({
+                "name": "test/big-body",
+                "description": "x",
+                "body_md": oversized,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body["error"]["code"], "body_too_large");
     }
 
     #[tokio::test]

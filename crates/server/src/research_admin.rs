@@ -455,28 +455,70 @@ pub async fn advance_job_handler(
         _ => "complete".to_owned(),
     };
     tokio::spawn(async move {
-        if matches!(prior, ResearchJobStatus::Planned) {
-            let halt_after_gather = matches!(cfg.phase_gates, PhaseGates::EveryPhase);
-            let notes = match crate::research::runner::run_gather_phase(
-                &phase_deps,
-                &id_for_task,
-                &plan,
-                &cfg,
-                halt_after_gather,
-            )
-            .await
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::warn!(
-                        job_id = id_for_task.as_str(),
-                        error = %e,
-                        "advance(Planned) gather phase failed",
-                    );
-                    return;
+        // 2026-05-16 — fix #P1b (Codex review): wrap the phase work
+        // in an inner async block so EVERY exit path — success,
+        // gather error, synthesize error, missing-notes branch — hits
+        // the cleanup at the end. Pre-fix the early `return;`s inside
+        // the match arms jumped past the registry cleanup, leaving
+        // entries in `ResearchSupervisor::cancel_tokens` forever
+        // whenever a phase errored. The
+        // `advance_endpoint_cleans_up_cancel_token_after_spawned_task_exits`
+        // integration test points the inference backend at an
+        // unreachable port specifically to exercise this failure path.
+        let _phase_result: () = async {
+            if matches!(prior, ResearchJobStatus::Planned) {
+                let halt_after_gather = matches!(cfg.phase_gates, PhaseGates::EveryPhase);
+                let notes = match crate::research::runner::run_gather_phase(
+                    &phase_deps,
+                    &id_for_task,
+                    &plan,
+                    &cfg,
+                    halt_after_gather,
+                )
+                .await
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!(
+                            job_id = id_for_task.as_str(),
+                            error = %e,
+                            "advance(Planned) gather phase failed",
+                        );
+                        return;
+                    }
+                };
+                if !halt_after_gather {
+                    if let Err(e) = crate::research::runner::run_synthesize_phase(
+                        &phase_deps,
+                        &id_for_task,
+                        &query,
+                        &plan,
+                        &notes,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            job_id = id_for_task.as_str(),
+                            error = %e,
+                            "advance(Planned→synthesize) failed",
+                        );
+                    }
                 }
-            };
-            if !halt_after_gather {
+            } else {
+                // prior == Gathering; pull the persisted notes back.
+                let notes_row = match ResearchJobStore::new(&db_for_notes).get(&id_for_task)
+                {
+                    Ok(Some(r)) => r,
+                    _ => return,
+                };
+                let notes = notes_row
+                    .notes_json
+                    .as_ref()
+                    .and_then(|b| {
+                        rmp_serde::from_slice::<Vec<execlaw_core::research::ResearchNote>>(b)
+                            .ok()
+                    })
+                    .unwrap_or_default();
                 if let Err(e) = crate::research::runner::run_synthesize_phase(
                     &phase_deps,
                     &id_for_task,
@@ -489,43 +531,16 @@ pub async fn advance_job_handler(
                     tracing::warn!(
                         job_id = id_for_task.as_str(),
                         error = %e,
-                        "advance(Planned→synthesize) failed",
+                        "advance(Gathering→synthesize) failed",
                     );
                 }
             }
-        } else {
-            // prior == Gathering; pull the persisted notes back.
-            let notes_row = match ResearchJobStore::new(&db_for_notes).get(&id_for_task) {
-                Ok(Some(r)) => r,
-                _ => return,
-            };
-            let notes = notes_row
-                .notes_json
-                .as_ref()
-                .and_then(|b| {
-                    rmp_serde::from_slice::<Vec<execlaw_core::research::ResearchNote>>(b).ok()
-                })
-                .unwrap_or_default();
-            if let Err(e) = crate::research::runner::run_synthesize_phase(
-                &phase_deps,
-                &id_for_task,
-                &query,
-                &plan,
-                &notes,
-            )
-            .await
-            {
-                tracing::warn!(
-                    job_id = id_for_task.as_str(),
-                    error = %e,
-                    "advance(Gathering→synthesize) failed",
-                );
-            }
         }
-        // Drop the registry entry on exit (success, failure, halt).
-        // Mirrors what `ResearchSupervisor::spawn_runner_for` does on
-        // its happy + sad paths so the DashMap can't leak entries
-        // across the supervisor's lifetime.
+        .await;
+        // Drop the registry entry on exit — every exit. Mirrors what
+        // `ResearchSupervisor::spawn_runner_for` does on its happy +
+        // sad paths so the DashMap can't leak entries across the
+        // supervisor's lifetime.
         if let Some(tokens) = cancel_cleanup {
             tokens.remove(&id_key_for_cleanup);
         }

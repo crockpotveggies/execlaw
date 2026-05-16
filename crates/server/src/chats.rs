@@ -1193,6 +1193,22 @@ pub(crate) struct RunnerTurnCtx<'a> {
 ///    treated as "allow" (boot-transient default, same as
 ///    `ChainedToolDispatch::check_access`). DB error on lookup
 ///    excludes the tool (fail-closed).
+/// 2026-05-16 — fix #P2 (Codex review): bundles the filtered tool
+/// declarations with the categorized name lists the routing-prose
+/// builder needs, so callers never derive prose from the
+/// *unfiltered* registry while the catalog is filtered (which leaks
+/// tool names to the model that policy has removed).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RunnerToolView {
+    /// Tool declarations to ship in `TurnRequest.tool_catalog`.
+    pub declarations: Vec<execlaw_inference_api::ToolDeclaration>,
+    /// Names of built-in tools that survived filtering. Feeds the
+    /// routing-prose block in the system prompt.
+    pub builtin_names: Vec<String>,
+    /// Names of agent-callable plugin tools that survived filtering.
+    pub plugin_tool_names: Vec<String>,
+}
+
 /// 3. Plugin tools: `caller_caps` must be a superset of
 ///    `required_capabilities`, with `"*"` as a wildcard. Same rule
 ///    the plugin host's `call_tool` enforces at dispatch.
@@ -1204,18 +1220,25 @@ pub(crate) struct RunnerTurnCtx<'a> {
 ///    so the model burned prompt tokens on tool schemas it could
 ///    never invoke. Filtering here keeps the model's view aligned
 ///    with what dispatch will let through.
+///
+/// Returns a [`RunnerToolView`] carrying the declarations the runner
+/// receives PLUS the categorized name lists the routing-prose
+/// builder needs. Single source of truth for "what does the model
+/// see this turn" — pre-fix the catalog was filtered but the routing
+/// prose was generated from the unfiltered registry, so the system
+/// prompt told the model about tools the catalog had stripped.
 pub(crate) fn build_runner_tool_catalog(
     db: &execlaw_core::Database,
     plugin_host: &execlaw_plugin_host::PluginHost,
     caller_trust: TrustLevel,
     caller_caps: &[String],
     planner_executor: bool,
-) -> Vec<execlaw_inference_api::ToolDeclaration> {
+) -> RunnerToolView {
     use execlaw_core::tool_access::ToolAccessStore;
     use execlaw_inference_api::ToolDeclaration;
 
     if planner_executor {
-        return Vec::new();
+        return RunnerToolView::default();
     }
 
     let access_store = ToolAccessStore::new(db);
@@ -1243,6 +1266,8 @@ pub(crate) fn build_runner_tool_catalog(
     };
 
     let mut decls: Vec<ToolDeclaration> = Vec::new();
+    let mut builtin_names: Vec<String> = Vec::new();
+    let mut plugin_tool_names: Vec<String> = Vec::new();
     // Pre-build the `&[&str]` view of `caller_caps` once; the cap
     // helper takes `&[&str]` and we'd otherwise rebuild this on
     // every iteration.
@@ -1266,6 +1291,7 @@ pub(crate) fn build_runner_tool_catalog(
         if !caps_ok {
             continue;
         }
+        builtin_names.push(d.name.clone());
         decls.push(ToolDeclaration::function(
             d.name.clone(),
             d.description.clone(),
@@ -1297,13 +1323,18 @@ pub(crate) fn build_runner_tool_catalog(
             .schema_json
             .clone()
             .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+        plugin_tool_names.push(t.tool_name.clone());
         decls.push(ToolDeclaration::function(
             t.tool_name.clone(),
             description,
             schema,
         ));
     }
-    decls
+    RunnerToolView {
+        declarations: decls,
+        builtin_names,
+        plugin_tool_names,
+    }
 }
 
 /// 2026-05-16 — Codex P4: build the `ChatMessage` history the runner
@@ -1417,11 +1448,31 @@ fn build_runner_history_messages(
     }
     let kept_groups = &groups[drop_from_front..];
 
-    // Second pass: materialise ChatMessages in event order.
-    // Buffers tool_use into pending_tool_calls and attaches them to
-    // the following ModelTurn — same shape as runner-local.
+    // Second pass: materialise ChatMessages in OpenAI-compliant order.
+    //
+    // OpenAI's chat-completions schema requires every `tool` role
+    // message to be preceded by an `assistant` message whose
+    // `tool_calls` array contains the matching `tool_call_id`. The
+    // event log doesn't commit the intermediate assistant(tool_calls)
+    // message — only the final `ModelTurn` text-only response is
+    // logged per turn — so we synthesise one assistant-with-tool_calls
+    // per `ToolUse` event. The final `ModelTurn` then becomes a
+    // plain assistant message with no `tool_calls`.
+    //
+    // Pre-fix this mirrored `runner-local::hydrate_messages`, which
+    // buffers ToolUse events and dumps them all onto the final
+    // ModelTurn's `tool_calls` after the tool messages have already
+    // landed. That order is `[user, tool, assistant(tool_calls)]` —
+    // structurally invalid for OpenAI. vLLM with
+    // `--enable-auto-tool-choice` may reject it outright; otherwise
+    // the model sees "future tool calls" instead of "past ones" and
+    // confabulates.
+    //
+    // Loses the "parallel calls in one round" grouping (we emit one
+    // assistant message per call). Parallel calls are rare at the
+    // operator's temperature 0.3 setting, and the model still sees
+    // each call → result correctly.
     let mut messages: Vec<ChatMessage> = Vec::new();
-    let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
     for g in kept_groups {
         for ev in &g.events {
             match ev.kind {
@@ -1434,31 +1485,23 @@ fn build_runner_history_messages(
                         messages.push(ChatMessage::user(text));
                     }
                 }
-                EventKind::ModelTurn => {
-                    let text = ev
-                        .decode_payload::<RealModelTurnPayload>()
-                        .ok()
-                        .map(|p| p.text)
-                        .or_else(|| {
-                            ev.decode_payload::<StubModelTurnPayload>()
-                                .ok()
-                                .map(|p| p.text)
-                        })
-                        .unwrap_or_default();
-                    let mut m = ChatMessage::assistant(text);
-                    std::mem::swap(&mut m.tool_calls, &mut pending_tool_calls);
-                    messages.push(m);
-                }
                 EventKind::ToolUse => {
                     if let Ok(p) = ev.decode_payload::<ToolUsePayload>() {
-                        pending_tool_calls.push(ToolCall {
+                        let call = ToolCall {
                             id: format!("call_{}", p.ordinal),
                             kind: "function".into(),
                             function: ToolCallFunction {
                                 name: p.tool_name,
                                 arguments: p.args_json.to_string(),
                             },
-                        });
+                        };
+                        // Synthetic assistant message that BEARS the
+                        // tool_call this ToolResult will match against.
+                        // Empty content per OpenAI convention for
+                        // tool-only assistant turns.
+                        let mut m = ChatMessage::assistant(String::new());
+                        m.tool_calls = vec![call];
+                        messages.push(m);
                     }
                 }
                 EventKind::ToolResult => {
@@ -1472,6 +1515,22 @@ fn build_runner_history_messages(
                             body,
                         ));
                     }
+                }
+                EventKind::ModelTurn => {
+                    let text = ev
+                        .decode_payload::<RealModelTurnPayload>()
+                        .ok()
+                        .map(|p| p.text)
+                        .or_else(|| {
+                            ev.decode_payload::<StubModelTurnPayload>()
+                                .ok()
+                                .map(|p| p.text)
+                        })
+                        .unwrap_or_default();
+                    // Terminal assistant turn — plain text, no
+                    // tool_calls (any preceding tool_use events have
+                    // already been materialised above).
+                    messages.push(ChatMessage::assistant(text));
                 }
                 _ => {}
             }
@@ -1537,24 +1596,28 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
     } else {
         None
     };
-    // Collect tool-name lists upfront so the system prompt can carry
-    // the routing-prose block (delta #2 — the model needs a "which
-    // family handles which task" map BEFORE the per-tool descriptions).
-    let builtin_names: Vec<String> = state
-        .plugin_host
-        .registry()
-        .all_builtins()
-        .iter()
-        .map(|t| t.descriptor().name.clone())
-        .collect();
-    let plugin_tool_names: Vec<String> = state
-        .plugin_host
-        .registry()
-        .agent_callable_tools()
-        .iter()
-        .map(|t| t.tool_name.clone())
-        .collect();
-    let routing_prose = build_tool_routing_prose(&builtin_names, &plugin_tool_names);
+    // 2026-05-16 — fix #P2: build the filtered catalog FIRST, then
+    // derive the routing prose from its categorized name lists. Pre-
+    // fix the prose was built from the unfiltered registry while the
+    // catalog was filtered, so the model's system prompt routed it
+    // to tool names the catalog had stripped — confusing for the
+    // model, wasteful of prompt tokens, and a policy hygiene gap.
+    let tool_view = build_runner_tool_catalog(
+        &state.db,
+        &state.plugin_host,
+        caller_trust,
+        &caller_caps,
+        planner_executor,
+    );
+    if planner_executor {
+        tracing::debug!(
+            target: "chats::run_runner_turn",
+            caller_trust = ?caller_trust,
+            "planner/executor split active; advertising empty tool catalog",
+        );
+    }
+    let routing_prose =
+        build_tool_routing_prose(&tool_view.builtin_names, &tool_view.plugin_tool_names);
     // Per-turn context — wall-clock + identity facts the model
     // would otherwise have to ask a tool for. Always emitted; cost
     // is negligible vs. the LLM round-trip (delta #3).
@@ -1638,41 +1701,11 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
     // model id; see `ResolvedInference::reasoning_enabled`.
     let reasoning_enabled = resolved.reasoning_enabled;
 
-    // Build the tool catalog the runner advertises to the model.
-    //
-    // §9.2 planner/executor split: when `planner_executor = true`
-    // (effective_trust < KnownTrusted), the catalog is EMPTY. The
-    // model that sees the untrusted content gets no tool_use slots,
-    // so a prompt-injected executor can't exfiltrate via tool args.
-    // This mirrors `use_tool_path = false` in the in-process branch.
-    //
-    // Otherwise we filter on:
-    //   * `config_tool_access` — caller_trust must be in
-    //     `allowed_classes`, row must be `enabled`, row's
-    //     `removed_at` must be NULL. Tools that fail dispatch's
-    //     `check_access` are removed from the catalog too so the
-    //     model doesn't burn tokens describing a tool it can't
-    //     invoke. A missing row is treated as "allow" — same
-    //     transitional default the dispatch gate uses.
-    //   * caller_caps ⊇ tool.required_capabilities for plugin tools
-    //     (with `"*"` wildcard). Same rule the plugin host's
-    //     `call_tool` enforces at dispatch — pre-filtering here keeps
-    //     the model from being tempted by a tool that would just
-    //     error.
-    let tool_decls: Vec<ToolDeclaration> = build_runner_tool_catalog(
-        &state.db,
-        &state.plugin_host,
-        caller_trust,
-        &caller_caps,
-        planner_executor,
-    );
-    if planner_executor {
-        tracing::debug!(
-            target: "chats::run_runner_turn",
-            caller_trust = ?caller_trust,
-            "planner/executor split active; advertising empty tool catalog",
-        );
-    }
+    // The filtered catalog was already built upstream alongside the
+    // routing-prose name lists (see `tool_view` above). Same source
+    // of truth feeds both the runner's `tool_catalog` field and the
+    // system prompt's routing block.
+    let tool_decls: Vec<ToolDeclaration> = tool_view.declarations.clone();
 
     // Trust-class string the runner copies into log lines + the
     // model's "from:" header. The flat policy tag is canonical.
@@ -2162,21 +2195,20 @@ async fn run_tool_capable_turn(
         "turn entry (chats.rs handler)"
     );
 
-    // 2026-05-16 — Codex P2: the in-process fallback path used to
-    // build the tool catalog inline with NO filtering — every
-    // built-in + every plugin tool was shipped to the model
-    // regardless of `config_tool_access`, `caller_caps`, or the
-    // planner/executor split. The runner path already routes through
-    // `build_runner_tool_catalog` (which honours all three); reuse
-    // the same helper here so the two paths can't drift again.
+    // 2026-05-16 — fix #P2: build the filtered catalog ONCE via the
+    // shared helper. The returned `RunnerToolView` carries the
+    // declarations AND the categorized name lists the routing-prose
+    // builder needs, so the system prompt and the model's tool
+    // catalog stay in sync.
     let catalog_started_at = std::time::Instant::now();
-    let tool_decls: Vec<ToolDeclaration> = build_runner_tool_catalog(
+    let tool_view = build_runner_tool_catalog(
         &state.db,
         &state.plugin_host,
         caller_trust,
         &caller_caps,
         planner_executor,
     );
+    let tool_decls: Vec<ToolDeclaration> = tool_view.declarations.clone();
     let catalog_ms = catalog_started_at.elapsed().as_millis() as u64;
     let catalog_bytes: usize = tool_decls
         .iter()
@@ -2235,30 +2267,16 @@ async fn run_tool_capable_turn(
             events: state.events.clone(),
             conversation_id: cid.as_str().to_owned(),
         });
-    // The in-process tool-capable path doesn't have built-ins
-    // wired into `tool_decls` above (NoBuiltinTools below), so the
-    // routing prose only needs the plugin tool names. Built-ins
-    // are still in the registry though; pass them so the model
-    // gets routing hints for the families it can use via the
-    // dispatch chain (read_memory etc. land via `with_builtins`
-    // wiring later — for now this matches what the runner path
-    // exposes).
-    let routing_builtins: Vec<String> = state
-        .plugin_host
-        .registry()
-        .all_builtins()
-        .iter()
-        .map(|t| t.descriptor().name.clone())
-        .collect();
-    let routing_plugins: Vec<String> = state
-        .plugin_host
-        .registry()
-        .agent_callable_tools()
-        .iter()
-        .map(|t| t.tool_name.clone())
-        .collect();
+    // 2026-05-16 — fix #P2: derive routing prose from the FILTERED
+    // catalog name lists (`tool_view`). Pre-fix this pulled names
+    // directly from `all_builtins()` / `agent_callable_tools()` —
+    // the unfiltered registry — so the system prompt routed the
+    // model to tools the catalog had stripped via
+    // `config_tool_access`, capability_set, or the
+    // planner/executor split.
     let prompt_started_at = std::time::Instant::now();
-    let routing_prose = build_tool_routing_prose(&routing_builtins, &routing_plugins);
+    let routing_prose =
+        build_tool_routing_prose(&tool_view.builtin_names, &tool_view.plugin_tool_names);
     let turn_context = build_turn_context_prose(
         chrono::Utc::now(),
         cid.as_str(),
@@ -5264,8 +5282,13 @@ mod tests {
             prose.contains("ALWAYS fetch real data"),
             "chart entry must spell out the fetch-first chain, got: {prose}",
         );
+        // 2026-05-16 — commit 146b0d4 trimmed the verbose chart prose
+        // from "NEVER invent data" to "Never invent points; never
+        // retype data into points." The invariant (forbid
+        // hallucinating data) is preserved; this assertion follows
+        // the current wording rather than the original phrasing.
         assert!(
-            prose.contains("NEVER invent data"),
+            prose.contains("Never invent points"),
             "chart entry must explicitly forbid hallucinating data points, got: {prose}",
         );
         // Plugin-namespace fallback is NOT used for chart (it IS used
@@ -6205,8 +6228,17 @@ required_capabilities = []
             false,
         );
         assert!(
-            !with_split_off.is_empty(),
+            !with_split_off.declarations.is_empty(),
             "baseline: catalog must be non-empty for Controller without split"
+        );
+        // Routing-prose name list must mirror declarations (P2):
+        // pre-fix prose was built from the unfiltered registry while
+        // declarations were filtered, so the model's system prompt
+        // routed it to stripped names.
+        assert!(
+            !with_split_off.builtin_names.is_empty()
+                || !with_split_off.plugin_tool_names.is_empty(),
+            "name lists must also be populated for routing prose"
         );
 
         // With the split on → empty regardless of caller trust / caps.
@@ -6218,8 +6250,13 @@ required_capabilities = []
             true,
         );
         assert!(
-            with_split_on.is_empty(),
+            with_split_on.declarations.is_empty(),
             "planner/executor split MUST strip all tools (§9.2 invariant)"
+        );
+        assert!(
+            with_split_on.builtin_names.is_empty()
+                && with_split_on.plugin_tool_names.is_empty(),
+            "name lists must also be empty when the split fires (otherwise routing prose leaks tool names)"
         );
     }
 
@@ -6280,7 +6317,11 @@ required_capabilities = []
             &["messaging.reply_current_transport".to_owned()],
             false,
         );
-        let names: Vec<&str> = limited.iter().map(|t| t.function.name.as_str()).collect();
+        let names: Vec<&str> = limited
+            .declarations
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
         assert!(
             !names.contains(&"controller_only_tool"),
             "Controller-only tool must NOT appear in a KnownLimited catalog"
@@ -6289,6 +6330,9 @@ required_capabilities = []
             names.contains(&"open_tool"),
             "missing-row tool must be allow-by-default"
         );
+        // Routing-prose names track declarations.
+        assert!(!limited.plugin_tool_names.contains(&"controller_only_tool".to_owned()));
+        assert!(limited.plugin_tool_names.contains(&"open_tool".to_owned()));
 
         // Controller caller: both tools appear.
         let controller = super::build_runner_tool_catalog(
@@ -6299,6 +6343,7 @@ required_capabilities = []
             false,
         );
         let names: Vec<&str> = controller
+            .declarations
             .iter()
             .map(|t| t.function.name.as_str())
             .collect();
@@ -6374,7 +6419,11 @@ required_capabilities = []
             &["messaging.reply_current_transport".to_owned()],
             false,
         );
-        let names: Vec<&str> = limited.iter().map(|t| t.function.name.as_str()).collect();
+        let names: Vec<&str> = limited
+            .declarations
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
         assert!(
             !names.contains(&"memory_write_test"),
             "built-in declaring MemoryWrite must be filtered from a \
@@ -6384,6 +6433,9 @@ required_capabilities = []
             names.contains(&"no_caps_test"),
             "built-in with no capability requirements must survive"
         );
+        // Routing-prose builtin_names tracks the filtered declarations.
+        assert!(!limited.builtin_names.contains(&"memory_write_test".to_owned()));
+        assert!(limited.builtin_names.contains(&"no_caps_test".to_owned()));
 
         // Controller wildcard — both visible.
         let controller = super::build_runner_tool_catalog(
@@ -6394,6 +6446,7 @@ required_capabilities = []
             false,
         );
         let names: Vec<&str> = controller
+            .declarations
             .iter()
             .map(|t| t.function.name.as_str())
             .collect();
@@ -6436,7 +6489,11 @@ required_capabilities = []
             &["messaging.reply_current_transport".to_owned()],
             false,
         );
-        let names: Vec<&str> = limited.iter().map(|t| t.function.name.as_str()).collect();
+        let names: Vec<&str> = limited
+            .declarations
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
         assert!(
             !names.contains(&"needs_memory"),
             "tool with required_capabilities not in caller_caps must be filtered"
@@ -6459,7 +6516,11 @@ required_capabilities = []
             ],
             false,
         );
-        let names: Vec<&str> = trusted.iter().map(|t| t.function.name.as_str()).collect();
+        let names: Vec<&str> = trusted
+            .declarations
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
         assert!(names.contains(&"needs_memory"));
         assert!(names.contains(&"needs_nothing"));
     }
@@ -6646,7 +6707,11 @@ required_capabilities = []
                 .unwrap(),
                 PendingEvent::encode(
                     EventKind::ModelTurn,
-                    &serde_json::json!({"text": "here is the chart"}),
+                    &serde_json::json!({
+                        "model": "Q",
+                        "text": "here is the chart",
+                        "finish_reason": "stop",
+                    }),
                     Some("agent".into()),
                 )
                 .unwrap(),
@@ -6677,31 +6742,46 @@ required_capabilities = []
             execlaw_core::history_budget::DEFAULT_HISTORY_TOKENS,
         );
 
-        // Expected shape (mirrors `runner-local::hydrate_messages`):
+        // Expected shape (OpenAI-compliant; the assistant message
+        // bearing tool_calls MUST precede the matching tool message):
         //   [0] User "find me a chart"
-        //   [1] Tool message with `tool_call_id = call_0` and the chart result
-        //   [2] Assistant "here is the chart" with the `tool_use` event
-        //       attached as a tool_calls array
+        //   [1] Assistant (content="", tool_calls=[call_0])
+        //   [2] Tool (tool_call_id="call_0", chart result)
+        //   [3] Assistant "here is the chart" (terminal ModelTurn,
+        //       no tool_calls)
         // The current turn's user_msg is SKIPPED — runner gets it via
         // `TurnRequest.user_text`.
         assert_eq!(
             messages.len(),
-            3,
-            "user + tool_result + assistant must all hydrate; current-turn user_msg must be skipped"
+            4,
+            "user + assistant(tool_calls) + tool + assistant(final) must all hydrate; \
+             current-turn user_msg must be skipped"
         );
         assert!(matches!(messages[0].role, Role::User));
-        assert!(matches!(messages[1].role, Role::Tool));
-        assert!(matches!(messages[2].role, Role::Assistant));
-        // The assistant message carries the tool_use as a `tool_calls` array.
+        assert!(matches!(messages[1].role, Role::Assistant));
+        assert!(matches!(messages[2].role, Role::Tool));
+        assert!(matches!(messages[3].role, Role::Assistant));
+        // The synthetic assistant(tool_calls) message bears the call.
         assert_eq!(
-            messages[2].tool_calls.len(),
+            messages[1].tool_calls.len(),
             1,
-            "ModelTurn must absorb preceding ToolUse events into tool_calls"
+            "synthetic assistant message must carry the matching tool_call"
         );
-        assert_eq!(messages[2].tool_calls[0].function.name, "chart.render");
-        // The tool message references the same call id the assistant declares.
-        assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_0"));
-        assert_eq!(messages[2].tool_calls[0].id, "call_0");
+        assert_eq!(messages[1].tool_calls[0].function.name, "chart.render");
+        assert_eq!(messages[1].tool_calls[0].id, "call_0");
+        // The tool message references that call id.
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_0"));
+        // The terminal ModelTurn assistant carries the final text and
+        // NO tool_calls (per fix #P1a — tool_calls live on the
+        // synthetic assistant, not the terminal one).
+        assert_eq!(
+            messages[3].content.as_ref().map(|c| c.as_text().to_owned()),
+            Some("here is the chart".to_owned()),
+        );
+        assert!(
+            messages[3].tool_calls.is_empty(),
+            "terminal ModelTurn assistant must not carry tool_calls"
+        );
     }
 
     /// 2026-05-16 — runner-path error/cancel audit invariant
