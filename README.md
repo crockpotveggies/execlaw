@@ -5,7 +5,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 Self-hosted Rust agent framework with persistent memory, hook-based plugins,
-tools, and skills. **No cloud LLMs, ever.** All inference runs on operator
+tools, and skills. **Bare metal best metal.** All inference runs on operator
 hardware.
 
 <p align="center">
