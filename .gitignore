@@ -35,3 +35,10 @@ web/dist/
 *.swp
 .DS_Store
 .git-commit-msg
+
+# Test-leaked blob store. Any test that constructs a default
+# `builtin_artifacts_root_path()` without an env override and runs
+# from the server crate's cwd writes here — should use a TempDir
+# instead. Tracked here as a safety net so the debris never gets
+# committed.
+crates/server/blobs/
