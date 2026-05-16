@@ -134,7 +134,7 @@ The runner is **stateless against the event log**. Memorise this — it's the pr
 
 ## 4. Memory model
 
-### 4.1 The four layers (from §2.7 of `MIGRATION_PLAN.md`)
+### 4.1 The four layers
 
 ```
    ┌────────────────────────────────────────────────────────────────┐
