@@ -2078,11 +2078,36 @@ impl RenderChartTool {
                     "with optional band overlay for ensemble fans). Returns BOTH an inline ",
                     "SVG string (for the SPA chat card to render directly) AND a PNG ",
                     "attachment_id (for delivery via `send_attachment` or a channel's ",
-                    "`send_with_attachments`). Use this whenever the user asks for a chart, ",
-                    "graph, or visualisation — pass the data as `series: [{name, points: ",
-                    "[{x, y}]}]`. Set `time_axis: true` when x-values are Unix-milliseconds. ",
-                    "Width/height in px (clamped 240-2400, default 720x400). The PNG ",
-                    "attachment expires after `ttl_seconds` (default 7 days)."
+                    "`send_with_attachments`).\n\n",
+                    // 2026-05-15 — explicit "fetch first, render second" guidance.
+                    // Pre-rework, the agent skipped tool calls entirely on prompts
+                    // like "chart AAPL closing price for the last month" — it had
+                    // both `chart.render` AND `yahoo_finance.historical_candles`
+                    // in its catalog, but read the description as "I provide the
+                    // data" and either hallucinated values or just text-summarised.
+                    // The model needs the chain spelled out.
+                    "**ALWAYS fetch real data with another tool BEFORE calling chart.render** when the ",
+                    "user asks about anything time-sensitive or live (stock prices, weather, ",
+                    "sports scores, sensor readings, news counts, etc.). NEVER invent data ",
+                    "points to chart — if you don't have a way to fetch them, say so instead ",
+                    "of fabricating numbers. Typical chains:\n",
+                    "  * Stock / ETF / index / crypto / FX charts → call ",
+                    "    `yahoo_finance.historical_candles(symbol, range, interval)` first, then ",
+                    "    map each candle's `t` (Unix-seconds — multiply by 1000 for the chart's ",
+                    "    Unix-milliseconds x-axis) and `close` into a `{x, y}` point.\n",
+                    "  * Weather charts → call `open_meteo.forecast` / `.historical` etc. first, ",
+                    "    then map the response's parallel `time[]` + `temperature_2m[]` (or ",
+                    "    whichever variable) arrays into `{x, y}` points.\n",
+                    "  * Anything else with a real API → call `web_fetch` against the API, ",
+                    "    parse the response, then chart it.\n\n",
+                    "Call shape: pass the data as `series: [{name, points: [{x, y}]}]`. Set ",
+                    "`time_axis: true` when x-values are Unix-milliseconds (the common case ",
+                    "for any time-series chart). Width/height in px (clamped 240-2400, default ",
+                    "720x400). The PNG attachment expires after `ttl_seconds` (default 7 days). ",
+                    "After this tool returns, the chart renders inline in the user's chat card ",
+                    "automatically — your follow-up text reply should be SHORT (one or two ",
+                    "sentences of context), NOT a play-by-play of the data the chart already ",
+                    "shows."
                 ).into(),
                 schema,
                 source: ToolSource::Builtin,
