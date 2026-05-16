@@ -181,6 +181,23 @@ pub struct TurnRequest {
     /// uses the prior text-only path.
     #[serde(default)]
     pub user_image_urls: Vec<String>,
+    /// 2026-05-16 — operator-configured per-turn cap on tool-call
+    /// rounds (`config_general.max_tool_rounds`, default 16 server-
+    /// side). The runner clamps to its own belt-and-suspenders
+    /// `RUNNER_MAX_TOOL_ROUNDS` (24) so a misconfigured server can't
+    /// pin the runner in an unbounded loop. Backward-compatible
+    /// default `default_max_tool_rounds` keeps older supervisors
+    /// (and any future test fixture that omits the field) working.
+    #[serde(default = "default_max_tool_rounds")]
+    pub max_tool_rounds: u32,
+}
+
+/// Conservative default mirroring `crate::server::state::ServerConfig`'s
+/// default. Used when an older supervisor deserialises into a newer
+/// runner that expects the field. 16 is the same hard floor the
+/// in-process executor's tests use.
+fn default_max_tool_rounds() -> u32 {
+    16
 }
 
 /// Server → runner reply to a `ToolCallRequest`.
@@ -339,6 +356,7 @@ mod tests {
             reasoning_enabled: false,
             spotlight: None,
             user_image_urls: Vec::new(),
+            max_tool_rounds: 8,
         };
         let s1 = serde_json::to_string(&req).unwrap();
         let back: TurnRequest = serde_json::from_str(&s1).unwrap();
@@ -346,6 +364,38 @@ mod tests {
         // form which is canonical and field-by-field.
         let s2 = serde_json::to_string(&back).unwrap();
         assert_eq!(s1, s2);
+        assert_eq!(back.max_tool_rounds, 8);
+    }
+
+    /// 2026-05-16 — fix #5 backward compat: a supervisor that doesn't
+    /// send `max_tool_rounds` (older version, test fixture, etc.) must
+    /// deserialise into the default value, not fail or land at 0. The
+    /// default mirrors the in-process executor's value (16) and lives
+    /// well below the runner's `RUNNER_MAX_TOOL_ROUNDS` ceiling (24).
+    #[test]
+    fn turn_request_max_tool_rounds_defaults_when_field_omitted() {
+        let json_no_field = serde_json::json!({
+            "turn_id": "t",
+            "conversation_id": "c",
+            "group_id": "g",
+            "user_text": "hi",
+            "sender_principal_id": "controller",
+            "sender_trust_class": "Controller",
+            "system_prompt": "sp",
+            "history": [],
+            "tool_catalog": [],
+            "inference_url": "http://127.0.0.1:8101/v1",
+            "model": "qwen3.5",
+            "temperature": null,
+            "max_tokens": null,
+            "reasoning_enabled": false,
+            "spotlight": null,
+        });
+        let parsed: TurnRequest = serde_json::from_value(json_no_field).unwrap();
+        assert_eq!(
+            parsed.max_tool_rounds, 16,
+            "missing max_tool_rounds must default to 16 for backward compat"
+        );
     }
 
     #[test]

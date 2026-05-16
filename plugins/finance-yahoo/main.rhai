@@ -848,8 +848,8 @@ fn extract_candles(body, symbol, interval) {
         return #{
             "symbol":   symbol,
             "interval": interval,
+            "candle_count": 0,
             "candles":  [],
-            "chat_component_kind": "stock_candles",
         };
     }
     let q = quote_arr[0];
@@ -875,11 +875,99 @@ fn extract_candles(body, symbol, interval) {
             "volume": volumes[i],
         });
     }
+    // 2026-05-16 — v0.2.0: data-ref pipeline. Pre-this-change the
+    // candles array was returned inline in the tool_result, which
+    // forced the model to re-emit every row when piping into
+    // chart.render. On a 6-month NKE history (~125 rows) that was
+    // ~4 KB of structured JSON the model decoded at ~30 tok/s,
+    // which on a quantized 27B blew past the runner's 120s
+    // inference read-timeout and the entire chart turn died. The
+    // host now exposes `host_create_data_ref(json_str, ttl)`; we
+    // stash per-series point arrays server-side and return only
+    // their ids + a small inline summary. The agent passes
+    // `points: {"$data_ref": "<id>"}` into chart.render and the
+    // host inflates it before the chart tool sees args — zero
+    // changes to chart.render itself.
+    //
+    // Short series (≤ 30 points: most intraday "today" calls)
+    // skip the ref step and return inline candles — the savings
+    // don't pay for the extra round trips to the host and the
+    // model handles the small array cheaply.
+    let count = out.len();
+    if count <= 30 {
+        return #{
+            "symbol":   symbol,
+            "interval": interval,
+            "candle_count": count,
+            "candles":  out,
+            "_hint": "Series is short; candles are inline. Use them directly in chart.render's series[].points.",
+        };
+    }
+
+    // Build per-series {x, y} point arrays so the agent can wire
+    // any single series into chart.render with one ref. `x` is
+    // always the candle timestamp (`t`); `y` is the named field.
+    let open_points = [];
+    let high_points = [];
+    let low_points = [];
+    let close_points = [];
+    let volume_points = [];
+    for c in out {
+        open_points.push(  #{ "x": c["t"], "y": c["open"]   });
+        high_points.push(  #{ "x": c["t"], "y": c["high"]   });
+        low_points.push(   #{ "x": c["t"], "y": c["low"]    });
+        close_points.push( #{ "x": c["t"], "y": c["close"]  });
+        volume_points.push(#{ "x": c["t"], "y": c["volume"] });
+    }
+
+    // 1-hour TTL: longer than any normal chat-turn span; short
+    // enough that abandoned refs from a fast-failing turn don't
+    // pile up on disk.
+    let ttl = 3600;
+    let candles_ref      = host_create_data_ref(to_json_string(out),            ttl);
+    let open_ref         = host_create_data_ref(to_json_string(open_points),    ttl);
+    let high_ref         = host_create_data_ref(to_json_string(high_points),    ttl);
+    let low_ref          = host_create_data_ref(to_json_string(low_points),     ttl);
+    let close_ref        = host_create_data_ref(to_json_string(close_points),   ttl);
+    let volume_ref       = host_create_data_ref(to_json_string(volume_points),  ttl);
+
+    // Summary lets the agent answer non-charting questions
+    // ("what was the high?", "did it go up?") without resolving
+    // the refs. First + last candles preserved verbatim so the
+    // model can quote a specific date.
+    let highest_high = highs[0];
+    let lowest_low = lows[0];
+    for v in highs { if v != () && (highest_high == () || v > highest_high) { highest_high = v; } }
+    for v in lows  { if v != () && (lowest_low  == () || v < lowest_low)    { lowest_low  = v; } }
+    let first_close = out[0]["close"];
+    let last_close = out[out.len() - 1]["close"];
+    let pct_change = ();
+    if first_close != () && last_close != () && first_close != 0 {
+        pct_change = ((last_close - first_close) / first_close) * 100.0;
+    }
+
     #{
         "symbol":   symbol,
         "interval": interval,
-        "candles":  out,
-        "chat_component_kind": "stock_candles",
+        "candle_count": count,
+        "first_candle": out[0],
+        "last_candle":  out[out.len() - 1],
+        "summary": #{
+            "highest_high": highest_high,
+            "lowest_low":   lowest_low,
+            "first_close":  first_close,
+            "last_close":   last_close,
+            "pct_change":   pct_change,
+        },
+        "data_refs": #{
+            "candles":       candles_ref["data_ref_id"],
+            "open_points":   open_ref["data_ref_id"],
+            "high_points":   high_ref["data_ref_id"],
+            "low_points":    low_ref["data_ref_id"],
+            "close_points":  close_ref["data_ref_id"],
+            "volume_points": volume_ref["data_ref_id"],
+        },
+        "_hint": "To chart, pass `points: {\"$data_ref\": data_refs.close_points}` (or .open/.high/.low/.volume) into chart.render. DO NOT retype the candles — the host resolves the ref server-side.",
     }
 }
 

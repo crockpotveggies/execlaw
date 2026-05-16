@@ -2115,16 +2115,39 @@ impl RenderChartTool {
                         "type": "object",
                         "properties": {
                             "name": { "type": "string" },
+                            // 2026-05-16 — `points` accepts EITHER the
+                            // inline `[{x,y}]` array form OR a
+                            // `{"$data_ref": "<id>"}` wrapper that the
+                            // host inflates to the same array shape
+                            // before the chart tool runs. The data-ref
+                            // form is how `yahoo_finance.historical_candles`
+                            // (and any other tool returning long point
+                            // series) hands data into chart.render
+                            // without forcing the model to re-emit
+                            // hundreds of points. Both shapes resolve
+                            // to the same plotter input — the tool's
+                            // `invoke` body never sees the wrapper.
                             "points": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "x": { "type": "number" },
-                                        "y": { "type": "number" }
+                                "oneOf": [
+                                    {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "x": { "type": "number" },
+                                                "y": { "type": "number" }
+                                            },
+                                            "required": ["x", "y"]
+                                        }
                                     },
-                                    "required": ["x", "y"]
-                                }
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "$data_ref": { "type": "string" }
+                                        },
+                                        "required": ["$data_ref"]
+                                    }
+                                ]
                             },
                             "color": {
                                 "type": "array",
@@ -2171,11 +2194,15 @@ impl RenderChartTool {
                 // open_meteo, etc.) are visible in the catalog —
                 // listing them here is redundant.
                 description: concat!(
-                    "Render a line/bar/area/scatter chart from `series: [{name, points: [{x, y}]}]`; ",
+                    "Render a line/bar/area/scatter chart from `series: [{name, points}]`; ",
                     "set `time_axis: true` when x is Unix-ms. Returns inline SVG + a PNG attachment_id.\n",
-                    "FETCH REAL DATA FIRST via the appropriate tool (stock/weather/web/etc.) — ",
-                    "NEVER invent points. `series` and `points` are real arrays — never JSON-encoded strings. ",
-                    "After it renders, your reply should be one short line of context, not a recap."
+                    "FETCH REAL DATA FIRST via the appropriate tool (stock/weather/web/etc.) — NEVER invent points.\n",
+                    "DATA REFS: when the data source returned a `data_refs` object (e.g. ",
+                    "yahoo_finance.historical_candles for series > 30 points), pass `points: {\"$data_ref\": \"<id>\"}` ",
+                    "using the matching id from that map (.close_points, .open_points, etc.). DO NOT retype the ",
+                    "data into points — the host inflates the ref before this tool runs. Inline `[{x, y}]` ",
+                    "arrays are accepted too for short series. After it renders, your reply should be one short ",
+                    "line of context, not a recap."
                 ).into(),
                 schema,
                 source: ToolSource::Builtin,

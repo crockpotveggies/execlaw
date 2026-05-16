@@ -55,8 +55,8 @@ pub use types::{
 // `pub(crate)` item).
 pub(crate) use attachments::{
     encode_attachments_as_data_urls, extract_applied_skill_names, extract_attachment_ids,
-    extract_channel_origin, extract_text, hydrate_message_attachments, persist_inbound_attachments,
-    persist_inline_attachments,
+    extract_channel_origin, extract_text, fetch_data_ref, hydrate_message_attachments,
+    persist_data_ref, persist_inbound_attachments,
 };
 pub(crate) use prompt::{assemble_system_prompt, build_tool_routing_prose, humanise_tool_call};
 // 2026-05-16 — small utilities split out into `chats/helpers.rs`.
@@ -108,27 +108,28 @@ pub async fn send_message(
 
     let cid = ConversationId::from(conversation_id.as_str());
 
-    // 2026-05-15 — decode + persist inline image attachments BEFORE
-    // identity resolution / policy. The attachment rows are scoped
-    // to the conversation id and end up referenced from the
-    // user_msg event payload; subsequent history hydration re-loads
-    // the bytes and emits them as OpenAI vision content parts.
-    // Persisting up front (vs. inside a turn helper) means every
-    // dispatch path — stub / real / runner / tool-capable —
-    // receives the same `Vec<String>` of attachment ids.
+    // 2026-05-16 — fix #6: validate + decode inline attachments up
+    // front so a malformed payload still 400s fast, but DEFER the
+    // blob + `state_attachments` row write until after every
+    // identity / Blocked / UnknownPending / Rule-of-Two early-return
+    // gate has passed. Pre-fix the persistence happened upfront, so a
+    // turn that the policy engine later dropped (or that we parked
+    // for cold-contact admission) left orphan blob files + rows
+    // behind. The decoded bytes live in this stack frame until the
+    // commit point right before dispatch.
     //
-    // Incognito turns skip persistence: the SPA owns the running
-    // transcript and the data URLs can be encoded straight into
-    // the LLM call without a DB write (incognito invariant: no
-    // persistent state).
-    let persisted_attachments: Vec<String> = if req.incognito || req.attachments.is_empty() {
-        Vec::new()
-    } else {
-        match persist_inline_attachments(&state, &cid, &req.attachments) {
-            Ok(ids) => ids,
-            Err(err) => return err.into_response(),
-        }
-    };
+    // Incognito turns never persist: the SPA owns the running
+    // transcript and the data URLs are encoded straight into the LLM
+    // call (incognito invariant: no persistent state).
+    let decoded_attachments: Vec<crate::chats::attachments::DecodedAttachment> =
+        if req.incognito || req.attachments.is_empty() {
+            Vec::new()
+        } else {
+            match crate::chats::attachments::decode_inline_attachments(&req.attachments) {
+                Ok(d) => d,
+                Err(err) => return err.into_response(),
+            }
+        };
 
     // 2026-05-15 — operator-picked skills (composer `+` menu, second
     // item). Resolve every name to its current body and build the
@@ -368,6 +369,27 @@ pub async fn send_message(
         crate::group_addressing::AddressedReason::EligibilityBypass,
     );
 
+    // 2026-05-16 — fix #6 commit point. Every identity / Blocked /
+    // UnknownPending / Rule-of-Two / require_approval gate above has
+    // already returned (with attachment bytes still in-memory only).
+    // From here the turn is going to dispatch, so we can safely
+    // write the blobs + `state_attachments` rows. Failure surfaces
+    // as a 500 — there's nothing useful the caller can do besides
+    // retry.
+    let persisted_attachments: Vec<String> = if decoded_attachments.is_empty() {
+        Vec::new()
+    } else {
+        match crate::chats::attachments::commit_decoded_attachments(
+            &state,
+            &cid,
+            &decoded_attachments,
+        ) {
+            Ok(ids) => ids,
+            Err(err) => return err.into_response(),
+        }
+    };
+    drop(decoded_attachments);
+
     let (user_msg_seq, assistant_text, assistant_seq) =
         match (inference_for_turn, runner_routed.as_deref()) {
             (Some(_inference), Some(group_id)) => {
@@ -386,6 +408,7 @@ pub async fn send_message(
                     cancel_flag: cancel_flag.clone(),
                     caller_caps: caller_caps.clone(),
                     caller_trust: sender_trust,
+                    planner_executor: policy.planner_executor,
                     // send_message hits this from the web-chat path;
                     // no transport-bridge here.
                     inbound_channel_origin: None,
@@ -417,6 +440,13 @@ pub async fn send_message(
                 req.sender_principal_id.clone(),
                 caller_caps.clone(),
                 sender_trust,
+                spotlight_content,
+                // `use_tool_path` is `has_plugin_tools &&
+                // !policy.planner_executor`, so this arm only fires
+                // when the split is OFF. Pass `false` rather than
+                // `policy.planner_executor` to be explicit about the
+                // invariant.
+                false,
                 None,
                 req.timezone.as_deref(),
                 group_context_for_turn.clone(),
@@ -1102,6 +1132,14 @@ pub(crate) struct RunnerTurnCtx<'a> {
     pub cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub caller_caps: Vec<String>,
     pub caller_trust: TrustLevel,
+    /// §9.2 planner/executor split — when `true` (i.e. policy fires
+    /// the split because `effective_trust < KnownTrusted`), the
+    /// runner is shipped an EMPTY `tool_catalog`. A prompt-injected
+    /// executor can't exfiltrate via `tool_use` args when there are
+    /// no tool_use slots available; stripping tools is the load-
+    /// bearing invariant of the split. Mirrors `use_tool_path = false`
+    /// in the in-process branch.
+    pub planner_executor: bool,
     /// Originating transport when the turn was triggered by an
     /// inbound transport message (signal / email / etc.). Stamped
     /// into the user_msg + model_turn payloads so the SPA can
@@ -1142,6 +1180,306 @@ pub(crate) struct RunnerTurnCtx<'a> {
     pub applied_skill_names: Vec<String>,
 }
 
+/// Build the `tool_catalog` the runner advertises to the model for one
+/// turn. Filtering rules (mirrors the dispatch-time gates so the model
+/// only ever sees a tool it could actually invoke):
+///
+/// 1. `planner_executor = true` (effective_trust < KnownTrusted) →
+///    EMPTY catalog. §9.2 invariant: untrusted planner has no tool
+///    slots, so a prompt-injected executor can't exfiltrate via
+///    tool_use args.
+/// 2. `config_tool_access` — `caller_trust` must be in `allowed_classes`,
+///    `enabled = true`, `removed_at IS NULL`. A missing row is
+///    treated as "allow" (boot-transient default, same as
+///    `ChainedToolDispatch::check_access`). DB error on lookup
+///    excludes the tool (fail-closed).
+/// 3. Plugin tools: `caller_caps` must be a superset of
+///    `required_capabilities`, with `"*"` as a wildcard. Same rule
+///    the plugin host's `call_tool` enforces at dispatch.
+/// 4. Built-in tools: every `Capability` the descriptor declares is
+///    cross-checked against `caller_caps` via
+///    [`execlaw_policy::trust::check_builtin_capability`]. Pre-fix
+///    built-ins were advertised to the model regardless of caller
+///    caps (the dispatch gate from fix #4 would deny at call time),
+///    so the model burned prompt tokens on tool schemas it could
+///    never invoke. Filtering here keeps the model's view aligned
+///    with what dispatch will let through.
+pub(crate) fn build_runner_tool_catalog(
+    db: &execlaw_core::Database,
+    plugin_host: &execlaw_plugin_host::PluginHost,
+    caller_trust: TrustLevel,
+    caller_caps: &[String],
+    planner_executor: bool,
+) -> Vec<execlaw_inference_api::ToolDeclaration> {
+    use execlaw_core::tool_access::ToolAccessStore;
+    use execlaw_inference_api::ToolDeclaration;
+
+    if planner_executor {
+        return Vec::new();
+    }
+
+    let access_store = ToolAccessStore::new(db);
+    let caller_trust_tag = caller_trust.as_str();
+    let caller_has_wildcard = caller_caps.iter().any(|c| c == "*");
+
+    let access_allows = |tool_name: &str| -> bool {
+        match access_store.get(tool_name) {
+            Ok(None) => true,
+            Ok(Some(row)) => {
+                row.enabled
+                    && row.removed_at.is_none()
+                    && row.allowed_classes.iter().any(|c| c == caller_trust_tag)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "chats::run_runner_turn",
+                    tool = %tool_name,
+                    error = %e,
+                    "tool_access lookup failed; excluding tool from catalog",
+                );
+                false
+            }
+        }
+    };
+
+    let mut decls: Vec<ToolDeclaration> = Vec::new();
+    // Pre-build the `&[&str]` view of `caller_caps` once; the cap
+    // helper takes `&[&str]` and we'd otherwise rebuild this on
+    // every iteration.
+    let caps_slice: Vec<&str> = caller_caps.iter().map(|s| s.as_str()).collect();
+    for t in plugin_host.registry().all_builtins().iter() {
+        let d = t.descriptor();
+        if !access_allows(&d.name) {
+            continue;
+        }
+        // Capability filter (Codex P2): drop the tool from the
+        // catalog when ANY of its declared `Capability` entries
+        // maps to a policy tag the caller doesn't hold. Wildcard
+        // `"*"` (Controller) short-circuits inside the helper.
+        let mut caps_ok = true;
+        for c in &d.capabilities {
+            if execlaw_policy::trust::check_builtin_capability(*c, &caps_slice).is_err() {
+                caps_ok = false;
+                break;
+            }
+        }
+        if !caps_ok {
+            continue;
+        }
+        decls.push(ToolDeclaration::function(
+            d.name.clone(),
+            d.description.clone(),
+            d.schema.clone(),
+        ));
+    }
+    for t in plugin_host.registry().agent_callable_tools().iter() {
+        if !access_allows(&t.tool_name) {
+            continue;
+        }
+        if !caller_has_wildcard {
+            let caps_ok = t
+                .required_capabilities
+                .iter()
+                .all(|req| caller_caps.iter().any(|c| c == req));
+            if !caps_ok {
+                continue;
+            }
+        }
+        let description = t.description.clone().unwrap_or_else(|| {
+            format!(
+                "Plugin tool '{}' from '{}' (latency: {}). \
+                 The plugin manifest did not supply a description; \
+                 ask the operator to add one for better tool selection.",
+                t.tool_name, t.plugin_id, t.latency,
+            )
+        });
+        let schema = t
+            .schema_json
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+        decls.push(ToolDeclaration::function(
+            t.tool_name.clone(),
+            description,
+            schema,
+        ));
+    }
+    decls
+}
+
+/// 2026-05-16 — Codex P4: build the `ChatMessage` history the runner
+/// receives from the conversation's event log. Mirrors
+/// [`execlaw_runner_local::turn::hydrate_messages`] (which is what
+/// the in-process executor uses), so the two paths see an identical
+/// projection — `UserMsg`, `ModelTurn` with attached `tool_calls`,
+/// and standalone `tool_result` messages keyed by `call_<ordinal>`.
+///
+/// Pre-fix this function emitted only `User` + `Assistant` text
+/// rows, dropping `ToolUse` / `ToolResult` events. A runner turn
+/// after a previous turn with tool calls then saw the
+/// user→assistant exchange but had no record of WHICH tools the
+/// agent had called, so re-asking the model "what did you find?"
+/// produced a hallucinated reconstruction instead of the actual
+/// tool output.
+///
+/// Truncation: groups events into "turn blocks" by `UserMsg`
+/// boundary, then drops oldest WHOLE turns until the total estimated
+/// token count fits `budget`. This preserves the assistant ↔
+/// tool_use/tool_result pairing — splitting a tool round off its
+/// assistant would leave the model with orphan `tool` messages.
+///
+/// Skips the just-appended `UserMsg` for the CURRENT turn (caller
+/// passes that as `TurnRequest.user_text` so the runner can
+/// spotlight-wrap it on the runner side).
+fn build_runner_history_messages(
+    history: &[execlaw_core::events::EventRecord],
+    current_user_seq: execlaw_core::ids::EventSeq,
+    spotlight: Option<&execlaw_policy::spotlighting::Spotlight>,
+    budget: u32,
+) -> Vec<execlaw_inference_api::ChatMessage> {
+    use execlaw_core::events::{EventKind, ToolResultPayload, ToolUsePayload};
+    use execlaw_inference_api::{ChatMessage, ToolCall, ToolCallFunction};
+    // UserMessagePayload + the model-turn payloads live in
+    // `chats::types`; the canonical event encoding uses these.
+
+    // First pass: bucket events into "turn groups". A new group
+    // starts at every UserMsg; subsequent ToolUse/ToolResult/ModelTurn
+    // events attach to the open group. The CURRENT turn's UserMsg
+    // is skipped entirely (the runner gets it via
+    // `TurnRequest.user_text`).
+    struct TurnGroup<'a> {
+        events: Vec<&'a execlaw_core::events::EventRecord>,
+        approx_chars: usize,
+    }
+    let mut groups: Vec<TurnGroup<'_>> = Vec::new();
+    for ev in history.iter() {
+        match ev.kind {
+            EventKind::UserMsg => {
+                if ev.seq == current_user_seq {
+                    continue;
+                }
+                groups.push(TurnGroup {
+                    events: vec![ev],
+                    approx_chars: ev
+                        .decode_payload::<UserMessagePayload>()
+                        .ok()
+                        .map(|p| p.text.len())
+                        .unwrap_or(0),
+                });
+            }
+            EventKind::ModelTurn | EventKind::ToolUse | EventKind::ToolResult => {
+                if let Some(g) = groups.last_mut() {
+                    let payload_chars = match ev.kind {
+                        EventKind::ModelTurn => ev
+                            .decode_payload::<RealModelTurnPayload>()
+                            .ok()
+                            .map(|p| p.text.len())
+                            .or_else(|| {
+                                ev.decode_payload::<StubModelTurnPayload>()
+                                    .ok()
+                                    .map(|p| p.text.len())
+                            })
+                            .unwrap_or(0),
+                        EventKind::ToolUse => ev
+                            .decode_payload::<ToolUsePayload>()
+                            .ok()
+                            .map(|p| {
+                                p.tool_name.len() + p.args_json.to_string().len()
+                            })
+                            .unwrap_or(0),
+                        EventKind::ToolResult => ev
+                            .decode_payload::<ToolResultPayload>()
+                            .ok()
+                            .map(|p| match &p.outcome {
+                                Ok(v) => v.to_string().len(),
+                                Err(e) => e.len() + 16,
+                            })
+                            .unwrap_or(0),
+                        _ => 0,
+                    };
+                    g.events.push(ev);
+                    g.approx_chars = g.approx_chars.saturating_add(payload_chars);
+                }
+                // Otherwise: events before any UserMsg — ignore.
+            }
+            _ => {}
+        }
+    }
+
+    // Truncation: drop oldest whole groups until the total fits the
+    // budget. Token estimate = chars / 4 (rough Qwen tokenizer ratio,
+    // same heuristic as `history_budget::estimate_tokens`).
+    let budget_chars = (budget as usize).saturating_mul(4);
+    let mut total: usize = groups.iter().map(|g| g.approx_chars).sum();
+    let mut drop_from_front = 0usize;
+    while total > budget_chars && drop_from_front < groups.len() {
+        total = total.saturating_sub(groups[drop_from_front].approx_chars);
+        drop_from_front += 1;
+    }
+    let kept_groups = &groups[drop_from_front..];
+
+    // Second pass: materialise ChatMessages in event order.
+    // Buffers tool_use into pending_tool_calls and attaches them to
+    // the following ModelTurn — same shape as runner-local.
+    let mut messages: Vec<ChatMessage> = Vec::new();
+    let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
+    for g in kept_groups {
+        for ev in &g.events {
+            match ev.kind {
+                EventKind::UserMsg => {
+                    if let Ok(p) = ev.decode_payload::<UserMessagePayload>() {
+                        let text = match spotlight {
+                            Some(s) => s.wrap(&p.text),
+                            None => p.text,
+                        };
+                        messages.push(ChatMessage::user(text));
+                    }
+                }
+                EventKind::ModelTurn => {
+                    let text = ev
+                        .decode_payload::<RealModelTurnPayload>()
+                        .ok()
+                        .map(|p| p.text)
+                        .or_else(|| {
+                            ev.decode_payload::<StubModelTurnPayload>()
+                                .ok()
+                                .map(|p| p.text)
+                        })
+                        .unwrap_or_default();
+                    let mut m = ChatMessage::assistant(text);
+                    std::mem::swap(&mut m.tool_calls, &mut pending_tool_calls);
+                    messages.push(m);
+                }
+                EventKind::ToolUse => {
+                    if let Ok(p) = ev.decode_payload::<ToolUsePayload>() {
+                        pending_tool_calls.push(ToolCall {
+                            id: format!("call_{}", p.ordinal),
+                            kind: "function".into(),
+                            function: ToolCallFunction {
+                                name: p.tool_name,
+                                arguments: p.args_json.to_string(),
+                            },
+                        });
+                    }
+                }
+                EventKind::ToolResult => {
+                    if let Ok(p) = ev.decode_payload::<ToolResultPayload>() {
+                        let body = match &p.outcome {
+                            Ok(v) => v.to_string(),
+                            Err(e) => serde_json::json!({"error": e}).to_string(),
+                        };
+                        messages.push(ChatMessage::tool_result(
+                            format!("call_{}", p.ordinal),
+                            body,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    messages
+}
+
 pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, String, i64), String> {
     let RunnerTurnCtx {
         state,
@@ -1153,6 +1491,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         cancel_flag,
         caller_caps,
         caller_trust,
+        planner_executor,
         inbound_channel_origin,
         caller_timezone,
         group_context,
@@ -1235,74 +1574,43 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         &routing_prose,
         &turn_context,
     );
-    // Hydrate into role-tagged history first, run the sliding-window
-    // truncation, then convert to ChatMessage with spotlighting. See
-    // the matching block in `run_real_turn` for the rationale; the
-    // tool-capable path has one extra step — skipping the user_msg
-    // we just appended this turn (the runner receives that as
-    // `TurnRequest.user_text`, not as part of history).
-    let raw_history: Vec<execlaw_core::history_budget::HistoryMessage> = history
-        .iter()
-        .filter_map(|ev| match ev.kind {
-            EventKind::UserMsg => {
-                if ev.seq == user_seq {
-                    // Current turn — runner gets it via `user_text`.
-                    return None;
-                }
-                ev.decode_payload::<UserMessagePayload>().ok().map(|p| {
-                    execlaw_core::history_budget::HistoryMessage {
-                        role: execlaw_core::history_budget::HistoryRole::User,
-                        text: p.text,
-                    }
-                })
-            }
-            EventKind::ModelTurn => ev
-                .decode_payload::<RealModelTurnPayload>()
-                .ok()
-                .map(|p| execlaw_core::history_budget::HistoryMessage {
-                    role: execlaw_core::history_budget::HistoryRole::Assistant,
-                    text: p.text,
-                })
-                .or_else(|| {
-                    ev.decode_payload::<StubModelTurnPayload>().ok().map(|p| {
-                        execlaw_core::history_budget::HistoryMessage {
-                            role: execlaw_core::history_budget::HistoryRole::Assistant,
-                            text: p.text,
-                        }
-                    })
-                }),
-            _ => None,
-        })
-        .collect();
+    // 2026-05-16 — Codex P4: hydrate `tool_use` / `tool_result` events
+    // into runner history. Pre-fix only `UserMsg` / `ModelTurn` were
+    // emitted, so a runner turn that followed a previous turn with
+    // tool calls saw the user → assistant exchange but had NO record
+    // of what tools were called in between — replay diverged from
+    // the in-process executor's `hydrate_messages` and weakened the
+    // event log as the canonical transcript.
+    //
+    // Mirrors `runner-local::turn::hydrate_messages`: buffer
+    // `ToolUse` events into `pending_tool_calls`, attach them onto
+    // the following `ModelTurn`'s assistant message; emit
+    // `ToolResult` events as standalone `tool` messages keyed by
+    // `call_<ordinal>`. Spotlighting still wraps `UserMsg` content.
+    //
+    // Turn-group truncation: we drop OLDEST whole turns until under
+    // the token budget, never splitting an assistant from its
+    // tool_use/tool_result pair (which would leave the model
+    // confused by orphan tool messages). A "turn group" is every
+    // event from one `UserMsg` up to (and including) the
+    // `ModelTurn` that closes it.
     let budget = execlaw_core::history_budget::load_max_history_tokens(&state.db)
         .unwrap_or(execlaw_core::history_budget::DEFAULT_HISTORY_TOKENS);
-    let truncated = execlaw_core::history_budget::truncate_to_budget(raw_history, budget);
-    if truncated.dropped_count > 0 {
-        tracing::debug!(
-            target: "chats::run_tool_capable_turn",
-            conversation_id = %cid.as_str(),
-            dropped = truncated.dropped_count,
-            kept = truncated.kept.len(),
-            kept_tokens_estimate = truncated.kept_tokens_estimate,
-            budget,
-            "truncated conversation history to fit token budget",
-        );
-    }
-    let mut hist_messages: Vec<ChatMessage> = Vec::with_capacity(truncated.kept.len());
-    for m in truncated.kept {
-        match m.role {
-            execlaw_core::history_budget::HistoryRole::User => {
-                let content = match &spotlight {
-                    Some(s) => s.wrap(&m.text),
-                    None => m.text,
-                };
-                hist_messages.push(ChatMessage::user(content));
-            }
-            execlaw_core::history_budget::HistoryRole::Assistant => {
-                hist_messages.push(ChatMessage::assistant(m.text));
-            }
-        }
-    }
+    let hist_messages: Vec<ChatMessage> = build_runner_history_messages(
+        &history,
+        user_seq,
+        spotlight.as_ref(),
+        budget,
+    );
+    // Bookkeeping log so an operator can confirm how many turns
+    // survived the budget.
+    tracing::debug!(
+        target: "chats::run_runner_turn",
+        conversation_id = %cid.as_str(),
+        history_msgs = hist_messages.len(),
+        budget,
+        "runner history hydrated (tool events included)",
+    );
 
     // Step 3 — build TurnRequest.
     let turn_id = supervisor.mint_turn_id();
@@ -1331,51 +1639,40 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
     let reasoning_enabled = resolved.reasoning_enabled;
 
     // Build the tool catalog the runner advertises to the model.
-    // Includes BOTH the trait-based built-in tier (registered at
-    // boot via `register_core_builtins`) AND every plugin-supplied
-    // tool. Tools whose `config_tool_access` row excludes this
-    // trust class are rejected on dispatch — the catalogue itself
-    // doesn't filter, so the LLM still sees the name and can read
-    // its schema even if it can't call it.
-    let mut tool_decls: Vec<ToolDeclaration> = state
-        .plugin_host
-        .registry()
-        .all_builtins()
-        .iter()
-        .map(|t| {
-            let d = t.descriptor();
-            ToolDeclaration::function(d.name.clone(), d.description.clone(), d.schema.clone())
-        })
-        .collect();
-    tool_decls.extend(
-        state
-            .plugin_host
-            .registry()
-            .agent_callable_tools()
-            .iter()
-            .map(|t| {
-                // Pre-fix this advertised every plugin tool as
-                // `Plugin tool 'X' (latency: Y)` with an empty
-                // `{"type":"object"}` schema — the model couldn't
-                // tell what any of them did. Now we ship the
-                // manifest's `description` + the JSON Schema loaded
-                // at register time. Falls back only when the plugin
-                // itself omitted them.
-                let description = t.description.clone().unwrap_or_else(|| {
-                    format!(
-                        "Plugin tool '{}' from '{}' (latency: {}). \
-                         The plugin manifest did not supply a description; \
-                         ask the operator to add one for better tool selection.",
-                        t.tool_name, t.plugin_id, t.latency,
-                    )
-                });
-                let schema = t
-                    .schema_json
-                    .clone()
-                    .unwrap_or_else(|| serde_json::json!({"type": "object"}));
-                ToolDeclaration::function(t.tool_name.clone(), description, schema)
-            }),
+    //
+    // §9.2 planner/executor split: when `planner_executor = true`
+    // (effective_trust < KnownTrusted), the catalog is EMPTY. The
+    // model that sees the untrusted content gets no tool_use slots,
+    // so a prompt-injected executor can't exfiltrate via tool args.
+    // This mirrors `use_tool_path = false` in the in-process branch.
+    //
+    // Otherwise we filter on:
+    //   * `config_tool_access` — caller_trust must be in
+    //     `allowed_classes`, row must be `enabled`, row's
+    //     `removed_at` must be NULL. Tools that fail dispatch's
+    //     `check_access` are removed from the catalog too so the
+    //     model doesn't burn tokens describing a tool it can't
+    //     invoke. A missing row is treated as "allow" — same
+    //     transitional default the dispatch gate uses.
+    //   * caller_caps ⊇ tool.required_capabilities for plugin tools
+    //     (with `"*"` wildcard). Same rule the plugin host's
+    //     `call_tool` enforces at dispatch — pre-filtering here keeps
+    //     the model from being tempted by a tool that would just
+    //     error.
+    let tool_decls: Vec<ToolDeclaration> = build_runner_tool_catalog(
+        &state.db,
+        &state.plugin_host,
+        caller_trust,
+        &caller_caps,
+        planner_executor,
     );
+    if planner_executor {
+        tracing::debug!(
+            target: "chats::run_runner_turn",
+            caller_trust = ?caller_trust,
+            "planner/executor split active; advertising empty tool catalog",
+        );
+    }
 
     // Trust-class string the runner copies into log lines + the
     // model's "from:" header. The flat policy tag is canonical.
@@ -1425,6 +1722,13 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         // the wrap; the runner mirrors policy::Spotlight::wrap on
         // its side.
         spotlight: spotlight.as_ref().map(|s| s.open.clone()),
+        // 2026-05-16 — per-turn `max_tool_rounds` from the
+        // operator's `config_general` setting (default 16). The
+        // runner clamps to its own `RUNNER_MAX_TOOL_ROUNDS` (24)
+        // belt-and-suspenders ceiling so a misconfiguration can't
+        // push the cap arbitrarily high. Pre-fix the runner used a
+        // hard-coded 24 ignoring this knob entirely.
+        max_tool_rounds: state.config.max_tool_rounds,
     };
 
     // Build the tool dispatcher we'll use to honour the runner's
@@ -1706,23 +2010,75 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
     }
     cancel_watcher.abort();
 
-    if !got_complete && error_message.is_some() {
-        // Surface as a turn error. Don't commit any partials.
+    // 2026-05-16 — error/cancel commit invariant. Pre-fix this branch
+    // returned `Err(...)` without committing `pending`, so any
+    // `tool_use` + `tool_result` events the drain loop had already
+    // pushed (for tools that ALREADY executed — HTTP fetches fired,
+    // memory written, calendar events created) were silently dropped.
+    // The audit-trail-integrity invariant from §7.4 requires that the
+    // event log record every executed side effect; we must commit
+    // those pairs even when the turn ends abnormally.
+    //
+    // Three cases:
+    //   1. got_complete: runner's terminal `model_turn` is in `pending`
+    //      already (pushed via the `EventLogAppend` arm). Normal commit.
+    //   2. was_cancelled (operator stop): synthesise a
+    //      "(stopped...)" model_turn so the transcript stays well-
+    //      formed and the SPA's "stop button" UX returns a reply.
+    //      Commit, return Ok.
+    //   3. plain error with pending NON-empty: synthesise a model_turn
+    //      with `finish_reason = "error"` so the executed-tools audit
+    //      trail lands, then return Err so the handler still surfaces
+    //      the failure to the SPA. With pending EMPTY (dispatch
+    //      failed before any tool ran), preserve the prior behaviour
+    //      and return Err WITHOUT committing — there's nothing
+    //      audit-relevant to record and the user_msg already in the
+    //      log keeps the prior SPA contract.
+    let abnormal_end = !got_complete && error_message.is_some();
+    if abnormal_end && pending.is_empty() && !was_cancelled {
         return Err(error_message.unwrap_or_else(|| "runner error".into()));
     }
-    if was_cancelled {
-        // Synthesise a "stopped" reply so the transcript stays
-        // well-formed.
+    if abnormal_end {
         if assistant_text.is_empty() {
-            assistant_text = "(stopped before any output)".into();
+            assistant_text = if was_cancelled {
+                "(stopped before any output)".to_owned()
+            } else {
+                "(turn errored before completion)".to_owned()
+            };
+        }
+        let finish_reason = if was_cancelled { "cancelled" } else { "error" };
+        let synth_payload = serde_json::json!({
+            // Model id is unknown on this branch — the runner errored
+            // before TurnEvent::Complete carried it.
+            "model": "",
+            "text": assistant_text.clone(),
+            "finish_reason": finish_reason,
+        });
+        match execlaw_core::events::PendingEvent::encode(
+            EventKind::ModelTurn,
+            &synth_payload,
+            Some("system".into()),
+        ) {
+            Ok(ev) => pending.push(ev),
+            Err(e) => {
+                tracing::error!(
+                    target: "chats::run_runner_turn",
+                    error = %e,
+                    "failed to encode synthetic model_turn on error/cancel; \
+                     audit-trail commit will rely on commit_turn's tool_result \
+                     synthesis only",
+                );
+            }
         }
     }
 
-    // Step 5 — commit accumulated events. `pending` holds the
-    // runner's `model_turn` plus every paired `tool_use` /
-    // `tool_result` we pushed during the drain loop, so the
-    // event log gets the full audit trail in one commit (§7.4
-    // pairing invariant).
+    // Step 5 — commit accumulated events. On the happy path `pending`
+    // holds the runner's `model_turn` plus every paired `tool_use` /
+    // `tool_result` we pushed during the drain loop. On error/cancel
+    // it holds the synthetic model_turn above plus any tool pairs
+    // for tools that already executed. Either way `commit_turn`
+    // enforces the §7.4 pairing invariant — any dangling `tool_use`
+    // gets a synthesized cancellation `tool_result`.
     let latest = log.last_seq(cid).map_err(|e| format!("last_seq: {e}"))?;
     let written = log
         .commit_turn(cid, latest, pending)
@@ -1732,6 +2088,15 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         .find(|e| e.kind == EventKind::ModelTurn)
         .map(|e| e.seq.0)
         .unwrap_or(latest.0 + 1);
+
+    // Plain error (not cancellation): commit landed the audit trail;
+    // now surface the underlying failure to the handler so the SPA
+    // sees a 500. Cancellation falls through and returns the
+    // "(stopped...)" reply normally — that's the operator-stop UX
+    // contract.
+    if abnormal_end && !was_cancelled {
+        return Err(error_message.unwrap_or_else(|| "runner error".into()));
+    }
 
     // Touch the principal group's last_active_at so the reaper
     // measures from "this turn ended" not "row inserted."
@@ -1760,6 +2125,8 @@ async fn run_tool_capable_turn(
     sender_principal_id: Option<String>,
     caller_caps: Vec<String>,
     caller_trust: TrustLevel,
+    spotlight_content: bool,
+    planner_executor: bool,
     inbound_channel_origin: Option<&str>,
     caller_timezone: Option<&str>,
     group_context: Option<GroupTurnContext>,
@@ -1767,6 +2134,7 @@ async fn run_tool_capable_turn(
     applied_skill_names: Vec<String>,
 ) -> Result<(i64, String, i64), String> {
     use execlaw_inference_api::ToolDeclaration;
+    use execlaw_policy::spotlighting::Spotlight;
     use execlaw_runner_local::turn::{TurnConfig, TurnExecutor};
     // 2026-05-13 — see the rationale comment on `run_real_turn`:
     // client + model_id are paired from one row read so they
@@ -1794,48 +2162,20 @@ async fn run_tool_capable_turn(
         "turn entry (chats.rs handler)"
     );
 
-    // Same description/schema plumbing fix as the runner-turn path
-    // (delta #1) — without this the in-process tool-capable path
-    // shipped `Plugin tool 'X' (latency: Y)` + an empty schema.
-    //
-    // Tool catalog = built-ins ∪ plugin tools. Pre-fix this only
-    // included plugin tools, so a Controller messaging through the
-    // tool-capable path (typical for Signal-bridged turns when the
-    // operator has plugins installed) saw signal.* but NOT
-    // research_* / memory_* / etc. The dispatch chain already
-    // routes built-ins via `try_registry_builtin`; we just need to
-    // tell the model they're there.
+    // 2026-05-16 — Codex P2: the in-process fallback path used to
+    // build the tool catalog inline with NO filtering — every
+    // built-in + every plugin tool was shipped to the model
+    // regardless of `config_tool_access`, `caller_caps`, or the
+    // planner/executor split. The runner path already routes through
+    // `build_runner_tool_catalog` (which honours all three); reuse
+    // the same helper here so the two paths can't drift again.
     let catalog_started_at = std::time::Instant::now();
-    let mut tool_decls: Vec<ToolDeclaration> = state
-        .plugin_host
-        .registry()
-        .all_builtins()
-        .iter()
-        .map(|t| {
-            let d = t.descriptor();
-            ToolDeclaration::function(d.name.clone(), d.description.clone(), d.schema.clone())
-        })
-        .collect();
-    tool_decls.extend(
-        state
-            .plugin_host
-            .registry()
-            .agent_callable_tools()
-            .iter()
-            .map(|t| {
-                let description = t.description.clone().unwrap_or_else(|| {
-                    format!(
-                        "Plugin tool '{}' from '{}' (latency: {}). The plugin manifest did not \
-                 supply a description; ask the operator to add one for better tool selection.",
-                        t.tool_name, t.plugin_id, t.latency,
-                    )
-                });
-                let schema = t
-                    .schema_json
-                    .clone()
-                    .unwrap_or_else(|| serde_json::json!({"type": "object"}));
-                ToolDeclaration::function(t.tool_name.clone(), description, schema)
-            }),
+    let tool_decls: Vec<ToolDeclaration> = build_runner_tool_catalog(
+        &state.db,
+        &state.plugin_host,
+        caller_trust,
+        &caller_caps,
+        planner_executor,
     );
     let catalog_ms = catalog_started_at.elapsed().as_millis() as u64;
     let catalog_bytes: usize = tool_decls
@@ -1848,6 +2188,7 @@ async fn run_tool_capable_turn(
         catalog_ms,
         tool_count = tool_decls.len(),
         catalog_bytes,
+        planner_executor,
         "tool catalog assembled"
     );
 
@@ -1944,6 +2285,18 @@ async fn run_tool_capable_turn(
         turn_context_chars = turn_context.chars().count(),
         "system prompt assembled"
     );
+    // 2026-05-16 — spotlight delimiter (§7.4). Mirrors the runner
+    // path's `req.spotlight`: when policy says
+    // `effective_trust < KnownTrusted`, every UserMsg the executor
+    // renders gets `delim\n<text>\n delim` wrapped so a prompt-
+    // injection payload from a KnownLimited / UnknownPending contact
+    // can't masquerade as agent instructions. Event log stores the
+    // unwrapped text — audit/replay are unchanged.
+    let spotlight_delim: Option<String> = if spotlight_content {
+        Some(Spotlight::generate().open)
+    } else {
+        None
+    };
     let cfg = TurnConfig {
         model: ModelId(resolved_model_id.clone()),
         system_prompt: composed_system_prompt,
@@ -1965,6 +2318,7 @@ async fn run_tool_capable_turn(
         // window with the model id field.
         reasoning_enabled: resolved.reasoning_enabled,
         inbound_channel_origin: inbound_channel_origin.map(|s| s.to_owned()),
+        spotlight_delim,
     };
     let exec_started_at = std::time::Instant::now();
     tracing::debug!(
@@ -2269,6 +2623,11 @@ pub async fn dispatch_routine_turn(
                 sender.clone(),
                 caller_caps,
                 caller_trust,
+                // Routines fire as Controller — no untrusted content
+                // to spotlight.
+                false,
+                // Controller-trust → planner/executor split is OFF.
+                false,
                 None,
                 routine_tz_ref,
                 routine_group_ctx.clone(),
@@ -2627,10 +2986,11 @@ pub async fn dispatch_external_turn(
                 cid,
                 user_text: text,
                 sender_principal_id: sender.clone(),
-                spotlight_content: false,
+                spotlight_content: policy.spotlighting,
                 cancel_flag,
                 caller_caps: caller_caps.clone(),
                 caller_trust,
+                planner_executor: policy.planner_executor,
                 inbound_channel_origin,
                 caller_timezone,
                 group_context: group_context.clone(),
@@ -2659,6 +3019,16 @@ pub async fn dispatch_external_turn(
                 sender.clone(),
                 caller_caps,
                 caller_trust,
+                policy.spotlighting,
+                // 2026-05-16 — Codex P2: forward the planner/executor
+                // split into the fallback path too. Pre-fix this site
+                // routed to `run_tool_capable_turn` whenever the
+                // supervisor was unavailable + plugins existed,
+                // regardless of `policy.planner_executor`, so a
+                // KnownLimited contact would have seen the full tool
+                // catalog through this branch. The helper now strips
+                // the catalog when the split is on.
+                policy.planner_executor,
                 inbound_channel_origin,
                 caller_timezone,
                 group_context.clone(),
@@ -3123,6 +3493,11 @@ pub async fn dispatch_clarification_turn(
                 sender.clone(),
                 caller_caps,
                 caller_trust,
+                // Synthetic orchestrator turn: prompt is server-authored,
+                // not from an untrusted contact — no spotlighting.
+                false,
+                // Controller-trust → planner/executor split is OFF.
+                false,
                 None,
                 caller_timezone,
                 synth_group_ctx.clone(),
@@ -5793,6 +6168,637 @@ mod tests {
         );
     }
 
+    /// 2026-05-16 — planner/executor containment: when policy fires
+    /// the split (`effective_trust < KnownTrusted`), the runner's
+    /// `tool_catalog` must be EMPTY. Pre-fix the runner branch won
+    /// over the `use_tool_path` filter in send_message AND
+    /// `run_runner_turn` advertised every tool unconditionally — so
+    /// a Limited contact reaching the runner saw the full plugin +
+    /// built-in catalog and could be jailbroken into exfil via tool
+    /// args. The catalog-build helper is the load-bearing fix.
+    #[test]
+    fn build_runner_tool_catalog_strips_all_tools_when_planner_executor() {
+        let state = test_app_state();
+        // Seed one plugin tool so an unfiltered catalog would be non-empty.
+        let manifest = execlaw_plugin_sdk::PluginManifest::parse(
+            r#"
+[plugin]
+id = "p"
+name = "p"
+version = "1.0.0"
+
+[[tools]]
+name = "p.tool_a"
+latency = "low"
+required_capabilities = []
+"#,
+        )
+        .unwrap();
+        state.plugin_host.registry().enable(&manifest).unwrap();
+
+        // Sanity: catalog is non-empty WITHOUT the split.
+        let with_split_off = super::build_runner_tool_catalog(
+            &state.db,
+            &state.plugin_host,
+            TrustLevel::Controller,
+            &["*".to_owned()],
+            false,
+        );
+        assert!(
+            !with_split_off.is_empty(),
+            "baseline: catalog must be non-empty for Controller without split"
+        );
+
+        // With the split on → empty regardless of caller trust / caps.
+        let with_split_on = super::build_runner_tool_catalog(
+            &state.db,
+            &state.plugin_host,
+            TrustLevel::Controller,
+            &["*".to_owned()],
+            true,
+        );
+        assert!(
+            with_split_on.is_empty(),
+            "planner/executor split MUST strip all tools (§9.2 invariant)"
+        );
+    }
+
+    /// `config_tool_access` pre-filter: a tool whose `allowed_classes`
+    /// excludes the caller's trust class is removed from the catalog,
+    /// so the model never sees a name it would just get denied on at
+    /// dispatch. Mirrors `ChainedToolDispatch::check_access`.
+    #[test]
+    fn build_runner_tool_catalog_filters_by_tool_access_row() {
+        use execlaw_core::tool_access::{
+            ToolAccessSeed, ToolAccessStore, ToolSource,
+        };
+
+        let state = test_app_state();
+        let manifest = execlaw_plugin_sdk::PluginManifest::parse(
+            r#"
+[plugin]
+id = "p"
+name = "p"
+version = "1.0.0"
+
+[[tools]]
+name = "controller_only_tool"
+latency = "low"
+required_capabilities = []
+
+[[tools]]
+name = "open_tool"
+latency = "low"
+required_capabilities = []
+"#,
+        )
+        .unwrap();
+        state.plugin_host.registry().enable(&manifest).unwrap();
+
+        // Seed an access row that restricts `controller_only_tool` to
+        // `["Controller"]`. `open_tool` has no row → allow-by-default.
+        let store = ToolAccessStore::new(&state.db);
+        store
+            .upsert_seen(
+                &ToolAccessSeed {
+                    tool_name: "controller_only_tool".into(),
+                    source: ToolSource::Plugin,
+                    source_id: Some("p".into()),
+                    description: None,
+                    input_schema: None,
+                    default_allowed_classes: vec!["Controller".into()],
+                },
+                100,
+            )
+            .unwrap();
+
+        // KnownLimited caller: `controller_only_tool` is excluded; `open_tool` survives.
+        let limited = super::build_runner_tool_catalog(
+            &state.db,
+            &state.plugin_host,
+            TrustLevel::KnownLimited,
+            &["messaging.reply_current_transport".to_owned()],
+            false,
+        );
+        let names: Vec<&str> = limited.iter().map(|t| t.function.name.as_str()).collect();
+        assert!(
+            !names.contains(&"controller_only_tool"),
+            "Controller-only tool must NOT appear in a KnownLimited catalog"
+        );
+        assert!(
+            names.contains(&"open_tool"),
+            "missing-row tool must be allow-by-default"
+        );
+
+        // Controller caller: both tools appear.
+        let controller = super::build_runner_tool_catalog(
+            &state.db,
+            &state.plugin_host,
+            TrustLevel::Controller,
+            &["*".to_owned()],
+            false,
+        );
+        let names: Vec<&str> = controller
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
+        assert!(names.contains(&"controller_only_tool"));
+        assert!(names.contains(&"open_tool"));
+    }
+
+    /// 2026-05-16 — Codex P2: built-in tools are now capability-
+    /// filtered before being advertised to the model. A KnownLimited
+    /// caller seeing a memory_write built-in in the catalog would
+    /// waste prompt tokens on a tool the dispatch gate (fix #4) will
+    /// just deny; aligning catalog with dispatch policy keeps the two
+    /// in sync.
+    #[test]
+    fn build_runner_tool_catalog_filters_builtins_by_caller_caps() {
+        use async_trait::async_trait;
+        use execlaw_core::tool::{
+            Capability, ToolCtx, ToolDescriptor, ToolImpl, ToolLatency,
+            ToolOutcome as CoreToolOutcome, ToolSource as CoreToolSource,
+        };
+
+        struct Builtin {
+            d: ToolDescriptor,
+        }
+        #[async_trait]
+        impl ToolImpl for Builtin {
+            fn descriptor(&self) -> &ToolDescriptor {
+                &self.d
+            }
+            async fn invoke(&self, _ctx: ToolCtx, _args: serde_json::Value) -> CoreToolOutcome {
+                CoreToolOutcome::ok(serde_json::json!({}))
+            }
+        }
+
+        let state = test_app_state();
+        state
+            .plugin_host
+            .registry()
+            .register_builtin(std::sync::Arc::new(Builtin {
+                d: ToolDescriptor {
+                    name: "memory_write_test".into(),
+                    description: "writes memory".into(),
+                    schema: serde_json::json!({"type": "object"}),
+                    source: CoreToolSource::Builtin,
+                    latency: ToolLatency::Low,
+                    capabilities: vec![Capability::MemoryWrite],
+                    default_allowed_classes: vec!["Controller".into(), "KnownTrusted".into()],
+                },
+            }))
+            .unwrap();
+        state
+            .plugin_host
+            .registry()
+            .register_builtin(std::sync::Arc::new(Builtin {
+                d: ToolDescriptor {
+                    name: "no_caps_test".into(),
+                    description: "no capability requirements".into(),
+                    schema: serde_json::json!({"type": "object"}),
+                    source: CoreToolSource::Builtin,
+                    latency: ToolLatency::Low,
+                    capabilities: vec![],
+                    default_allowed_classes: vec!["Controller".into(), "KnownLimited".into()],
+                },
+            }))
+            .unwrap();
+
+        // KnownLimited (only `messaging.reply_current_transport`) —
+        // memory_write_test is filtered out, no_caps_test survives.
+        let limited = super::build_runner_tool_catalog(
+            &state.db,
+            &state.plugin_host,
+            TrustLevel::KnownLimited,
+            &["messaging.reply_current_transport".to_owned()],
+            false,
+        );
+        let names: Vec<&str> = limited.iter().map(|t| t.function.name.as_str()).collect();
+        assert!(
+            !names.contains(&"memory_write_test"),
+            "built-in declaring MemoryWrite must be filtered from a \
+             KnownLimited catalog — caller has no memory.write cap"
+        );
+        assert!(
+            names.contains(&"no_caps_test"),
+            "built-in with no capability requirements must survive"
+        );
+
+        // Controller wildcard — both visible.
+        let controller = super::build_runner_tool_catalog(
+            &state.db,
+            &state.plugin_host,
+            TrustLevel::Controller,
+            &["*".to_owned()],
+            false,
+        );
+        let names: Vec<&str> = controller
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
+        assert!(names.contains(&"memory_write_test"));
+        assert!(names.contains(&"no_caps_test"));
+    }
+
+    /// Plugin-tool capability pre-filter: a plugin tool whose
+    /// `required_capabilities` exceeds the caller's `caller_caps` is
+    /// removed from the catalog. Wildcard `"*"` (Controller) bypasses.
+    #[test]
+    fn build_runner_tool_catalog_filters_plugin_tools_by_required_capabilities() {
+        let state = test_app_state();
+        let manifest = execlaw_plugin_sdk::PluginManifest::parse(
+            r#"
+[plugin]
+id = "p"
+name = "p"
+version = "1.0.0"
+
+[[tools]]
+name = "needs_memory"
+latency = "low"
+required_capabilities = ["memory.read", "memory.write"]
+
+[[tools]]
+name = "needs_nothing"
+latency = "low"
+required_capabilities = []
+"#,
+        )
+        .unwrap();
+        state.plugin_host.registry().enable(&manifest).unwrap();
+
+        // KnownLimited caller (no memory caps) — `needs_memory` is filtered.
+        let limited = super::build_runner_tool_catalog(
+            &state.db,
+            &state.plugin_host,
+            TrustLevel::KnownLimited,
+            &["messaging.reply_current_transport".to_owned()],
+            false,
+        );
+        let names: Vec<&str> = limited.iter().map(|t| t.function.name.as_str()).collect();
+        assert!(
+            !names.contains(&"needs_memory"),
+            "tool with required_capabilities not in caller_caps must be filtered"
+        );
+        assert!(
+            names.contains(&"needs_nothing"),
+            "tool with zero required_capabilities must remain visible"
+        );
+
+        // KnownTrusted caller (has memory.read + memory.write) — both visible.
+        let trusted = super::build_runner_tool_catalog(
+            &state.db,
+            &state.plugin_host,
+            TrustLevel::KnownTrusted,
+            &[
+                "messaging.reply_current_transport".to_owned(),
+                "memory.read".to_owned(),
+                "memory.write".to_owned(),
+                "tools.safe".to_owned(),
+            ],
+            false,
+        );
+        let names: Vec<&str> = trusted.iter().map(|t| t.function.name.as_str()).collect();
+        assert!(names.contains(&"needs_memory"));
+        assert!(names.contains(&"needs_nothing"));
+    }
+
+    /// 2026-05-16 — runner-path durability: when the runner dispatches
+    /// tools via the WS `ToolCallRequest` / `ToolCallResult` round-trip,
+    /// the server is responsible for emitting paired `tool_use` +
+    /// `tool_result` events into the log (the runner only emits
+    /// `model_turn`). This test mirrors the exact `pending`-Vec shape
+    /// `run_runner_turn` builds for a two-call turn (one success, one
+    /// failure) and confirms `commit_turn` accepts it and replay
+    /// reconstructs both pairs with matching ordinals.
+    ///
+    /// Pre-fix this didn't pair: the drain loop submitted the result
+    /// to the supervisor and updated in-memory `messages` but never
+    /// pushed `tool_use`/`tool_result` `PendingEvent`s, so replay/audit
+    /// couldn't see what tools ran.
+    #[tokio::test]
+    async fn runner_path_emits_paired_tool_events() {
+        use execlaw_core::events::{
+            EventKind, EventLog, PendingEvent, ToolResultPayload, ToolUsePayload,
+        };
+        use execlaw_core::ids::{ConversationId, EventSeq};
+
+        let state = test_app_state();
+        let log = EventLog::new(&state.db)
+            .with_hmac_key(state.event_log_hmac_key.as_ref().unwrap().as_ref().clone());
+        let cid = ConversationId::from("runner-pair-conv");
+
+        // Mirror the exact `pending`-Vec shape the drain loop builds
+        // for a turn with two tool calls (ordinal 0 ok, ordinal 1 err)
+        // followed by a `model_turn`.
+        let mut tool_ordinal: u32 = 0;
+        let mut pending: Vec<PendingEvent> = Vec::new();
+
+        // Call 1 — success.
+        let o0 = tool_ordinal;
+        tool_ordinal += 1;
+        pending.push(
+            PendingEvent::encode(
+                EventKind::ToolUse,
+                &ToolUsePayload {
+                    ordinal: o0,
+                    tool_name: "web.fetch".into(),
+                    args_json: serde_json::json!({"url": "https://example.test"}),
+                },
+                Some("agent".into()),
+            )
+            .unwrap(),
+        );
+        pending.push(
+            PendingEvent::encode(
+                EventKind::ToolResult,
+                &ToolResultPayload {
+                    ordinal: o0,
+                    outcome: Ok(serde_json::json!({"status": 200, "body": "ok"})),
+                },
+                Some("system".into()),
+            )
+            .unwrap(),
+        );
+
+        // Call 2 — failure (e.g. plugin denied).
+        let o1 = tool_ordinal;
+        tool_ordinal += 1;
+        pending.push(
+            PendingEvent::encode(
+                EventKind::ToolUse,
+                &ToolUsePayload {
+                    ordinal: o1,
+                    tool_name: "memory.write".into(),
+                    args_json: serde_json::json!({"key": "k", "value": "v"}),
+                },
+                Some("agent".into()),
+            )
+            .unwrap(),
+        );
+        pending.push(
+            PendingEvent::encode(
+                EventKind::ToolResult,
+                &ToolResultPayload {
+                    ordinal: o1,
+                    outcome: Err("capability not granted".into()),
+                },
+                Some("system".into()),
+            )
+            .unwrap(),
+        );
+
+        // Terminal model_turn.
+        pending.push(
+            PendingEvent::encode(
+                EventKind::ModelTurn,
+                &serde_json::json!({"text": "done"}),
+                Some("agent".into()),
+            )
+            .unwrap(),
+        );
+
+        let written = log.commit_turn(&cid, EventSeq(0), pending).unwrap();
+        // No synthesized cancel — every tool_use already has a paired
+        // tool_result, so commit_turn emits exactly what we passed.
+        assert_eq!(
+            written.len(),
+            5,
+            "expected 2x (tool_use + tool_result) + model_turn",
+        );
+
+        // Replay and verify the pairs reconstruct.
+        let events = log.replay_since(&cid, EventSeq(0)).unwrap();
+        let uses: Vec<u32> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::ToolUse)
+            .map(|e| e.decode_payload::<ToolUsePayload>().unwrap().ordinal)
+            .collect();
+        let results: Vec<(u32, bool)> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::ToolResult)
+            .map(|e| {
+                let r: ToolResultPayload = e.decode_payload().unwrap();
+                (r.ordinal, r.outcome.is_err())
+            })
+            .collect();
+        assert_eq!(uses, vec![0, 1]);
+        assert_eq!(results, vec![(0, false), (1, true)]);
+        assert!(
+            events.iter().any(|e| e.kind == EventKind::ModelTurn),
+            "model_turn must be in the same commit"
+        );
+    }
+
+    /// 2026-05-16 — Codex P4: the runner-mediated history hydration
+    /// must include `tool_use` / `tool_result` events. Pre-fix only
+    /// `UserMsg` / `ModelTurn` were emitted, so a turn that followed
+    /// a prior turn with tool calls saw "user asked X / assistant
+    /// said Y" but had no record of WHICH tools the agent had
+    /// invoked to produce Y. The runner path now mirrors
+    /// `runner-local::hydrate_messages`: buffer `ToolUse` into a
+    /// pending list, attach them to the next `ModelTurn`'s
+    /// `tool_calls`, and emit `ToolResult` as standalone `tool`
+    /// messages keyed by `call_<ordinal>`.
+    #[test]
+    fn build_runner_history_messages_includes_tool_traces() {
+        use execlaw_core::events::{
+            EventKind, EventLog, PendingEvent, ToolResultPayload, ToolUsePayload,
+        };
+        use execlaw_core::ids::{ConversationId, EventSeq};
+        use execlaw_inference_api::Role;
+
+        let state = test_app_state();
+        let log = EventLog::new(&state.db)
+            .with_hmac_key(state.event_log_hmac_key.as_ref().unwrap().as_ref().clone());
+        let cid = ConversationId::from("runner-hydrate-conv");
+
+        // Turn 1: user → tool_use → tool_result → model_turn.
+        log.commit_turn(
+            &cid,
+            EventSeq(0),
+            vec![
+                PendingEvent::encode(
+                    EventKind::UserMsg,
+                    &serde_json::json!({"text": "find me a chart"}),
+                    Some("controller".into()),
+                )
+                .unwrap(),
+                PendingEvent::encode(
+                    EventKind::ToolUse,
+                    &ToolUsePayload {
+                        ordinal: 0,
+                        tool_name: "chart.render".into(),
+                        args_json: serde_json::json!({"spec": "..."}),
+                    },
+                    Some("agent".into()),
+                )
+                .unwrap(),
+                PendingEvent::encode(
+                    EventKind::ToolResult,
+                    &ToolResultPayload {
+                        ordinal: 0,
+                        outcome: Ok(serde_json::json!({"chart_id": "c1"})),
+                    },
+                    Some("system".into()),
+                )
+                .unwrap(),
+                PendingEvent::encode(
+                    EventKind::ModelTurn,
+                    &serde_json::json!({"text": "here is the chart"}),
+                    Some("agent".into()),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        // Turn 2: a new user_msg representing the CURRENT turn (which
+        // the runner will receive via `TurnRequest.user_text` and so
+        // must be skipped from history).
+        let latest = log.last_seq(&cid).unwrap();
+        let current_user_event = execlaw_core::events::EventRecord::new(
+            cid.clone(),
+            latest.next(),
+            EventKind::UserMsg,
+            &serde_json::json!({"text": "what color was that?"}),
+            Some("controller".into()),
+        )
+        .unwrap();
+        log.append(&current_user_event).unwrap();
+
+        let history = log.replay_since(&cid, EventSeq(0)).unwrap();
+
+        let messages = super::build_runner_history_messages(
+            &history,
+            current_user_event.seq,
+            None,
+            execlaw_core::history_budget::DEFAULT_HISTORY_TOKENS,
+        );
+
+        // Expected shape (mirrors `runner-local::hydrate_messages`):
+        //   [0] User "find me a chart"
+        //   [1] Tool message with `tool_call_id = call_0` and the chart result
+        //   [2] Assistant "here is the chart" with the `tool_use` event
+        //       attached as a tool_calls array
+        // The current turn's user_msg is SKIPPED — runner gets it via
+        // `TurnRequest.user_text`.
+        assert_eq!(
+            messages.len(),
+            3,
+            "user + tool_result + assistant must all hydrate; current-turn user_msg must be skipped"
+        );
+        assert!(matches!(messages[0].role, Role::User));
+        assert!(matches!(messages[1].role, Role::Tool));
+        assert!(matches!(messages[2].role, Role::Assistant));
+        // The assistant message carries the tool_use as a `tool_calls` array.
+        assert_eq!(
+            messages[2].tool_calls.len(),
+            1,
+            "ModelTurn must absorb preceding ToolUse events into tool_calls"
+        );
+        assert_eq!(messages[2].tool_calls[0].function.name, "chart.render");
+        // The tool message references the same call id the assistant declares.
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_0"));
+        assert_eq!(messages[2].tool_calls[0].id, "call_0");
+    }
+
+    /// 2026-05-16 — runner-path error/cancel audit invariant
+    /// (Codex P1). If the runner emits `TurnEvent::Error` (cancel OR
+    /// real failure) AFTER one or more tools have already executed,
+    /// the drain loop's `pending` Vec must STILL land in the event
+    /// log along with a synthetic `model_turn` carrying the cancel/
+    /// error reason. Pre-fix the abnormal-end branch returned
+    /// `Err(...)` without committing, dropping the audit trail for
+    /// side effects (HTTP fetches fired, memory written, etc.) that
+    /// had already happened.
+    ///
+    /// This test pins the on-disk shape `run_runner_turn` produces
+    /// in the abnormal-end branch: tool_use + tool_result + a
+    /// system-actor model_turn with `finish_reason = "cancelled"`.
+    #[tokio::test]
+    async fn runner_abnormal_end_still_commits_executed_tools() {
+        use execlaw_core::events::{
+            EventKind, EventLog, PendingEvent, ToolResultPayload, ToolUsePayload,
+        };
+        use execlaw_core::ids::{ConversationId, EventSeq};
+
+        let state = test_app_state();
+        let log = EventLog::new(&state.db)
+            .with_hmac_key(state.event_log_hmac_key.as_ref().unwrap().as_ref().clone());
+        let cid = ConversationId::from("runner-cancel-conv");
+
+        // Mirror exactly what `run_runner_turn`'s abnormal-end branch
+        // pushes: one already-executed tool pair + a synthetic
+        // model_turn marked cancelled.
+        let mut pending: Vec<PendingEvent> = Vec::new();
+        pending.push(
+            PendingEvent::encode(
+                EventKind::ToolUse,
+                &ToolUsePayload {
+                    ordinal: 0,
+                    tool_name: "calendar.create_event".into(),
+                    args_json: serde_json::json!({"title": "lunch"}),
+                },
+                Some("agent".into()),
+            )
+            .unwrap(),
+        );
+        pending.push(
+            PendingEvent::encode(
+                EventKind::ToolResult,
+                &ToolResultPayload {
+                    ordinal: 0,
+                    outcome: Ok(serde_json::json!({"event_id": "evt-1"})),
+                },
+                Some("system".into()),
+            )
+            .unwrap(),
+        );
+        pending.push(
+            PendingEvent::encode(
+                EventKind::ModelTurn,
+                &serde_json::json!({
+                    "model": "",
+                    "text": "(stopped before any output)",
+                    "finish_reason": "cancelled",
+                }),
+                Some("system".into()),
+            )
+            .unwrap(),
+        );
+
+        let written = log.commit_turn(&cid, EventSeq(0), pending).unwrap();
+        assert_eq!(
+            written.len(),
+            3,
+            "tool_use + tool_result + synth model_turn must all land"
+        );
+
+        let events = log.replay_since(&cid, EventSeq(0)).unwrap();
+        let kinds: Vec<EventKind> = events.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::ToolUse,
+                EventKind::ToolResult,
+                EventKind::ModelTurn
+            ],
+            "executed tool pair must survive the abnormal-end commit \
+             so audit can reconstruct what side effects happened"
+        );
+        // The synthetic model_turn carries the cancel marker so
+        // replay can distinguish "(stopped...)" from a normal reply.
+        let mt = events
+            .iter()
+            .find(|e| e.kind == EventKind::ModelTurn)
+            .unwrap();
+        let payload: serde_json::Value = mt.decode_payload().unwrap();
+        assert_eq!(payload["finish_reason"], "cancelled");
+        assert_eq!(payload["text"], "(stopped before any output)");
+    }
+
     /// **Phase 1 crash test (b):** replay after a simulated crash
     /// reconstructs the conversation exactly — same events, same
     /// order, all HMAC-verified. Models the "worker restarts, reads
@@ -5857,6 +6863,105 @@ mod tests {
             resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "tampered log must fail the read, not return forged rows"
+        );
+    }
+
+    /// 2026-05-16 — fix #6: when the sender is unknown (cold-contact
+    /// flow parks the turn awaiting approval), any inline attachments
+    /// the SPA shipped MUST NOT be persisted. Pre-fix
+    /// `persist_inline_attachments` ran upfront, so a malicious caller
+    /// could drop bytes-on-disk + `state_attachments` rows for a
+    /// conversation it had no policy right to send to. Now the bytes
+    /// are decoded in-memory only and committed at the end, past the
+    /// cold-contact short-circuit.
+    #[tokio::test]
+    async fn parked_cold_contact_turn_does_not_persist_attachments() {
+        let state = test_app_state();
+        let db = state.db.clone();
+        let app = crate::routes::build_router(state);
+
+        // Tiny valid base64 string (4 bytes after decode). Mime
+        // matches the allowlist; the body passes Phase A validation
+        // so the request would have hit Phase B persist on the pre-fix
+        // path.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "text": "smuggle this in",
+            "sender_principal_id": "stranger-attach-1",
+            "attachments": [{
+                "mime": "image/png",
+                "data_url": "data:image/png;base64,AAAA",
+            }],
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/chats/cold-conv-attach/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // Cold-contact path returns 202 (parked).
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // Now confirm NO state_attachments row was written for this
+        // conversation. The pre-fix bug would have left exactly one
+        // row pointing at a blob file under <data_dir>/blobs/.
+        let row_count: i64 = db
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM state_attachments WHERE conversation_id = ?1",
+                    rusqlite::params!["cold-conv-attach"],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(execlaw_core::db::DbError::Sqlite)
+            })
+            .unwrap();
+        assert_eq!(
+            row_count, 0,
+            "fix #6: a parked cold-contact turn must NOT leak persisted attachments"
+        );
+    }
+
+    /// Sanity companion: a successful Controller turn DOES persist
+    /// its attachment. Asserts the commit-point still fires on the
+    /// happy path so we haven't regressed the success path while
+    /// fixing the drop path.
+    #[tokio::test]
+    async fn controller_turn_persists_attachments_through_commit_point() {
+        let state = test_app_state();
+        let db = state.db.clone();
+        let app = crate::routes::build_router(state);
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "text": "look at this",
+            "attachments": [{
+                "mime": "image/png",
+                "data_url": "data:image/png;base64,AAAA",
+            }],
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/chats/persist-happy/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let row_count: i64 = db
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM state_attachments WHERE conversation_id = ?1",
+                    rusqlite::params!["persist-happy"],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(execlaw_core::db::DbError::Sqlite)
+            })
+            .unwrap();
+        assert_eq!(
+            row_count, 1,
+            "Controller turn must persist its inline attachment exactly once"
         );
     }
 

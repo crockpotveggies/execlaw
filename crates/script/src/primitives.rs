@@ -1601,6 +1601,7 @@ fn register_host_cap_bindings(
     register_sidecar_http_delete(engine, plugin_id, host_caps.clone());
     register_host_get_attachment_bytes(engine, plugin_id, host_caps.clone());
     register_host_create_attachment(engine, plugin_id, host_caps.clone());
+    register_host_create_data_ref(engine, plugin_id, host_caps.clone());
     register_host_render_chart(engine, plugin_id, host_caps.clone());
     register_sidecar_http_get_bytes(engine, plugin_id, host_caps.clone());
     register_vault_bindings(engine, plugin_id, host_caps);
@@ -1897,6 +1898,140 @@ fn register_host_create_attachment(
                 }
                 Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
                     format!("[{pid}] host_create_attachment: {}", e.0).into(),
+                    rhai::Position::NONE,
+                ))),
+            }
+        },
+    );
+}
+
+/// `host_create_data_ref(json_string, ttl_seconds)
+/// → { data_ref_id, sha256, size_bytes }`
+///
+/// 2026-05-16 — store a JSON value server-side under a fresh
+/// attachment id so a subsequent tool call can reference it
+/// instead of forcing the model to re-emit the bytes inline. See
+/// the dispatcher's `resolve_data_refs` for the consumer-side
+/// substitution rule (`{"$data_ref": "<id>"}`).
+///
+/// Use case that motivated this: `yahoo_finance.historical_candles`
+/// returning 125 OHLC rows that the model would then have to type
+/// back into `chart.render` — 4 KB of structured output the model
+/// had to decode at ~30 tok/sec, blowing past the runner's
+/// inference read timeout. With a data ref the plugin returns
+/// just the id + a small preview; the model passes the id to
+/// `chart.render`; the host inflates server-side before the chart
+/// tool sees it.
+///
+/// `ttl_seconds = 0` uses the host default (1 hour). Negative is
+/// rejected. JSON payload capped at 32 MiB (set in
+/// `chats::attachments::DATA_REF_MAX_BYTES`).
+fn register_host_create_data_ref(engine: &mut Engine, plugin_id: &str, host_caps: HostCapsHandle) {
+    /// 32 MiB cap on the JSON string the plugin hands in. Larger
+    /// than the 10 MiB attachment cap because the typical use case
+    /// (entire historical candle series, deep-research bibliography,
+    /// large search result set) trends bigger than a single image;
+    /// small enough that a runaway plugin can't fill the artifacts
+    /// dir from one tool call.
+    const MAX_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+    let pid = plugin_id.to_owned();
+    engine.register_fn(
+        "host_create_data_ref",
+        move |json_str: ImmutableString,
+              ttl_seconds: i64|
+              -> Result<Dynamic, Box<EvalAltResult>> {
+            let caps = match host_caps.get() {
+                Some(c) => c.clone(),
+                None => return Err(host_cap_unavailable_err(&pid, "host_create_data_ref")),
+            };
+            let payload = json_str.as_str();
+            if payload.len() > MAX_PAYLOAD_BYTES {
+                return Err(Box::new(EvalAltResult::ErrorRuntime(
+                    format!(
+                        "[{pid}] host_create_data_ref: {} bytes exceeds max {}",
+                        payload.len(),
+                        MAX_PAYLOAD_BYTES
+                    )
+                    .into(),
+                    rhai::Position::NONE,
+                )));
+            }
+            // Validate the payload IS valid JSON up front — fail
+            // fast with a clear error rather than letting an
+            // unparseable blob land on disk and break the consumer
+            // later. Cheap (we only parse to validate, not to
+            // transform; we still hand the original bytes to the
+            // store so whitespace and key order survive verbatim).
+            if let Err(e) = serde_json::from_str::<serde_json::Value>(payload) {
+                return Err(Box::new(EvalAltResult::ErrorRuntime(
+                    format!(
+                        "[{pid}] host_create_data_ref: payload is not valid JSON: {e}"
+                    )
+                    .into(),
+                    rhai::Position::NONE,
+                )));
+            }
+            if ttl_seconds < 0 {
+                return Err(Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_create_data_ref: ttl_seconds must be >= 0").into(),
+                    rhai::Position::NONE,
+                )));
+            }
+            let ttl = if ttl_seconds == 0 {
+                None
+            } else {
+                Some(ttl_seconds)
+            };
+            let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_create_data_ref: no tokio runtime: {e}").into(),
+                    rhai::Position::NONE,
+                ))
+            })?;
+            let pid_for_call = pid.clone();
+            let bytes = payload.as_bytes().to_vec();
+            // Reuse the existing artifact attachment path under the
+            // hood — same on-disk layout, same TTL semantics, same
+            // ephemeral sweeper. Differentiated from regular
+            // attachments only by the mime type (`application/json`)
+            // and the fact that the dispatcher inflates rather than
+            // proxies them. Filename is purely for operator
+            // debuggability when listing the artifacts dir.
+            let res = tokio::task::block_in_place(|| {
+                runtime.block_on(caps.create_artifact_attachment(
+                    &pid_for_call,
+                    "data_ref.json",
+                    "application/json",
+                    bytes,
+                    ttl,
+                ))
+            });
+            match res {
+                Ok(a) => {
+                    let mut m = rhai::Map::new();
+                    // Surface the id under BOTH names so plugin
+                    // authors writing new tools (and reading the
+                    // doc) can use either convention. `data_ref_id`
+                    // is the new canonical name; `attachment_id`
+                    // mirrors `host_create_attachment` so existing
+                    // plugins porting over don't have to relearn.
+                    m.insert(
+                        "data_ref_id".into(),
+                        Dynamic::from(ImmutableString::from(a.attachment_id.clone())),
+                    );
+                    m.insert(
+                        "attachment_id".into(),
+                        Dynamic::from(ImmutableString::from(a.attachment_id)),
+                    );
+                    m.insert(
+                        "sha256".into(),
+                        Dynamic::from(ImmutableString::from(a.sha256)),
+                    );
+                    m.insert("size_bytes".into(), Dynamic::from(a.size_bytes as i64));
+                    Ok(Dynamic::from(m))
+                }
+                Err(e) => Err(Box::new(EvalAltResult::ErrorRuntime(
+                    format!("[{pid}] host_create_data_ref: {}", e.0).into(),
                     rhai::Position::NONE,
                 ))),
             }

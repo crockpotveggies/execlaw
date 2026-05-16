@@ -119,9 +119,22 @@ pub struct InferenceProbeResponse {
 )]
 pub async fn inference_probe_handler(
     State(state): State<AppState>,
-    _user: AuthedUser,
+    user: AuthedUser,
     Json(req): Json<InferenceProbeRequest>,
 ) -> Result<Json<InferenceProbeResponse>, ApiError> {
+    // 2026-05-16 — fix #7: enforce the Controller-only contract the
+    // module doc claims. Pre-fix the handler bound `_user` and
+    // discarded the role, so any authenticated user (including a
+    // future KnownLimited admin / read-only viewer role) could
+    // dispatch arbitrary prompts at the inference backend, see the
+    // raw model output, and stress-test prompt-prefill latency
+    // — none of which a non-Controller principal should be able to do.
+    // Mirrors the same `UserStore::get_by_id`-based role check every
+    // other admin route uses (`alerts`, `backends`, `mcp_admin`,
+    // `factory_reset`, `personality`, `oauth_admin`,
+    // `plugin_settings_admin`).
+    require_controller(&state, &user)?;
+
     let resolved = state
         .inference
         .resolve(&state.db, BackendPurpose::Standard)
@@ -351,6 +364,134 @@ pub async fn inference_probe_handler(
     }))
 }
 
+/// 2026-05-16 — fix #7: Controller-only role check. Same shape as
+/// `alerts::require_controller`, `backends::require_controller`,
+/// etc. Duplicated here rather than lifted to a shared module so
+/// fix #7's diff stays minimal; a follow-up can consolidate the
+/// seven copies of this helper at once.
+fn require_controller(state: &AppState, user: &AuthedUser) -> Result<(), ApiError> {
+    use execlaw_core::users::{UserRole, UserStore};
+    let row = UserStore::new(&state.db)
+        .get_by_id(&user.user_id)
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "db_error",
+            message: e.to_string(),
+        })?;
+    match row.map(|u| u.role) {
+        Some(UserRole::Controller) => Ok(()),
+        _ => Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            code: "controller_only",
+            message: "only a Controller can run the inference probe".into(),
+        }),
+    }
+}
+
 pub fn inference_probe_router() -> Router<AppState> {
     Router::new().route("/api/admin/inference/probe", post(inference_probe_handler))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routes::{build_router, test_app_state};
+    use axum::body::Body;
+    use axum::http::{HeaderValue, Method, Request, header};
+    use execlaw_core::users::{UserRole, UserRow, UserStore};
+    use tower::ServiceExt;
+
+    /// Helper mirroring `skills_admin::tests::seed_user_and_token`.
+    /// Inserts a user with the given role and mints an access token.
+    async fn seed_user_and_token(role: UserRole) -> (axum::Router, String) {
+        let state = test_app_state();
+        UserStore::new(&state.db)
+            .insert(&UserRow {
+                user_id: "u-probe-test".into(),
+                username: "probe-tester".into(),
+                display_name: "Probe Tester".into(),
+                email: None,
+                password_hash: "argon2-placeholder".into(),
+                role,
+                created_at: 0,
+                last_login_at: None,
+            })
+            .expect("insert user");
+        let token = state
+            .signer
+            .issue_access_token("u-probe-test", "session-test", 600)
+            .expect("issue token");
+        (build_router(state), format!("Bearer {token}"))
+    }
+
+    /// 2026-05-16 — fix #7: the doc comment says Controller-only, the
+    /// handler must actually enforce it. Pre-fix the handler bound
+    /// `_user: AuthedUser` and discarded the role — any authenticated
+    /// user (including the Operator/Viewer roles that the user-management
+    /// flow can mint) could POST to /api/admin/inference/probe and
+    /// run arbitrary prompts at the inference backend. With the fix,
+    /// non-Controller callers get 403 from `require_controller`.
+    #[tokio::test]
+    async fn inference_probe_rejects_non_controller_caller() {
+        let (app, bearer) = seed_user_and_token(UserRole::Operator).await;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/admin/inference/probe")
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )
+            .header(header::AUTHORIZATION, HeaderValue::from_str(&bearer).unwrap())
+            .body(Body::from(b"{}".to_vec()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "Operator role must NOT be able to run the inference probe"
+        );
+    }
+
+    /// Same coverage for Viewer — anyone below Controller is rejected.
+    #[tokio::test]
+    async fn inference_probe_rejects_viewer_caller() {
+        let (app, bearer) = seed_user_and_token(UserRole::Viewer).await;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/admin/inference/probe")
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )
+            .header(header::AUTHORIZATION, HeaderValue::from_str(&bearer).unwrap())
+            .body(Body::from(b"{}".to_vec()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Sanity: a Controller caller passes the role check. The probe
+    /// itself will surface 503 (no inference backend configured in
+    /// the test fixture), which proves the role check let the
+    /// request through — not 403 from `require_controller`.
+    #[tokio::test]
+    async fn inference_probe_passes_role_check_for_controller() {
+        let (app, bearer) = seed_user_and_token(UserRole::Controller).await;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/admin/inference/probe")
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )
+            .header(header::AUTHORIZATION, HeaderValue::from_str(&bearer).unwrap())
+            .body(Body::from(b"{}".to_vec()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Controller passes the role check; test fixture has no inference backend so 503 is the next gate"
+        );
+    }
 }

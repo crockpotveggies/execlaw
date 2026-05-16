@@ -1530,6 +1530,7 @@ mod tests {
             reasoning_enabled: false,
             spotlight: None,
             user_image_urls: Vec::new(),
+            max_tool_rounds: 16,
         };
         let res = s.forward_turn("g-missing", req).await;
         assert!(matches!(res, Err(ForwardError::NoRunner)));
@@ -1569,6 +1570,7 @@ mod tests {
             reasoning_enabled: false,
             spotlight: None,
             user_image_urls: Vec::new(),
+            max_tool_rounds: 16,
         };
         let res = s.forward_turn("g-dead", req).await;
         assert!(matches!(res, Err(ForwardError::RunnerGone)));

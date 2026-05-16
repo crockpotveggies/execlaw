@@ -62,11 +62,13 @@ impl CancelFlags {
 /// up `turn_id` here and forwards.
 pub type ToolResultRoutes = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<ToolCallResult>>>>;
 
-/// Hard upper bound on tool-call rounds before the runner gives up.
-/// The supervisor's policy engine enforces a tighter, configurable
-/// bound (`config.max_tool_rounds`); this is the runner's
-/// belt-and-suspenders cap so a misconfigured server can't pin the
-/// runner in an infinite loop.
+/// Belt-and-suspenders ceiling on tool-call rounds. The supervisor's
+/// per-turn cap arrives in `TurnRequest.max_tool_rounds`; we clamp it
+/// to this ceiling so a misconfigured server (or an older supervisor
+/// that doesn't set the field — `serde(default)` yields 16, never
+/// higher than this ceiling) can't pin the runner in an unbounded
+/// loop. The runner enforces `min(req.max_tool_rounds,
+/// RUNNER_MAX_TOOL_ROUNDS)`.
 pub const RUNNER_MAX_TOOL_ROUNDS: u32 = 24;
 
 pub async fn run_turn(
@@ -133,6 +135,10 @@ pub async fn run_turn(
     let completion_tokens: Option<u32> = None;
     let mut was_cancelled = false;
     let mut round: u32 = 0;
+    // 2026-05-16 — per-turn cap: take the supervisor's value and
+    // clamp to the hard ceiling. `req.max_tool_rounds` defaults to 16
+    // via `serde(default)` when an older supervisor omits the field.
+    let effective_max_rounds = req.max_tool_rounds.min(RUNNER_MAX_TOOL_ROUNDS);
     // 2026-05-12 — turn-timing instrumentation (runner-mediated
     // path, streaming). Same `agent::turn_timing` target as the
     // in-process executor so a downstream log aggregator can union
@@ -150,9 +156,9 @@ pub async fn run_turn(
     );
 
     loop {
-        if round >= RUNNER_MAX_TOOL_ROUNDS {
+        if round >= effective_max_rounds {
             return Err(anyhow!(
-                "runner hit RUNNER_MAX_TOOL_ROUNDS={RUNNER_MAX_TOOL_ROUNDS}; aborting turn"
+                "runner hit max_tool_rounds={effective_max_rounds} (ceiling {RUNNER_MAX_TOOL_ROUNDS}); aborting turn"
             ));
         }
         round += 1;

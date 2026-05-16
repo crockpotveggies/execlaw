@@ -44,24 +44,33 @@ pub(crate) const ALLOWED_ATTACHMENT_MIMES: &[&str] =
     &["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 
-/// Decode + persist every `InlineAttachmentRequest` in the send
-/// payload, returning the new attachment ids in input order. The
-/// web-composer path (POST /api/chats/{id}/messages) calls this;
-/// the inbound transport-bridge path (Signal etc.) calls
-/// [`persist_inbound_attachment_bytes`] directly, which both share
-/// the [`write_attachment_blob`] core.
-///
-/// Errors translate to `ApiError`-shaped 4xx so the SPA can surface
-/// the specific failure (mime unsupported / data URL invalid / too
-/// large) inline next to the offending chip.
-pub(crate) fn persist_inline_attachments(
-    state: &AppState,
-    cid: &ConversationId,
+/// 2026-05-16 — in-memory representation of an inline attachment
+/// after parse/validate but BEFORE any blob or `state_attachments`
+/// row is written. The two-phase split lets `send_message` drop
+/// (Blocked / UnknownPending parked / Rule-of-Two breach) or 4xx-out
+/// a turn without leaving orphan attachment rows or blob files
+/// behind. Pre-fix the persistence happened upfront, so a malformed
+/// caller could land bytes-on-disk + DB rows in a conversation they
+/// weren't authorized to send to.
+pub(crate) struct DecodedAttachment {
+    pub mime: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Phase A: parse + validate every `InlineAttachmentRequest` in the
+/// send payload. Returns one `DecodedAttachment` per input on
+/// success; on any failure returns the same `ApiError` the legacy
+/// `persist_inline_attachments` would have raised so the SPA's per-
+/// chip error surfacing is unchanged. NO DB write, NO blob file
+/// write happens here — the caller commits with
+/// [`commit_decoded_attachments`] after all identity / policy /
+/// trust gates pass.
+pub(crate) fn decode_inline_attachments(
     requests: &[InlineAttachmentRequest],
-) -> Result<Vec<String>, crate::routes::ApiError> {
+) -> Result<Vec<DecodedAttachment>, crate::routes::ApiError> {
     use base64::Engine;
 
-    let mut ids = Vec::with_capacity(requests.len());
+    let mut out = Vec::with_capacity(requests.len());
     for (idx, att) in requests.iter().enumerate() {
         let mime = att.mime.trim().to_lowercase();
         if !ALLOWED_ATTACHMENT_MIMES.contains(&mime.as_str()) {
@@ -131,7 +140,25 @@ pub(crate) fn persist_inline_attachments(
                 ),
             });
         }
-        let id = write_attachment_blob(state, cid, &mime, &bytes).map_err(|e| {
+        out.push(DecodedAttachment { mime, bytes });
+    }
+    Ok(out)
+}
+
+/// Phase B: persist every previously-decoded attachment. Writes the
+/// content-addressed blob and the `state_attachments` row, returning
+/// the fresh ids in input order. Failures during commit (disk full,
+/// DB error) flow back as `attachment_write_failed` 500s — by
+/// definition all input has already passed validation, so any error
+/// here is a server-side problem rather than caller input.
+pub(crate) fn commit_decoded_attachments(
+    state: &AppState,
+    cid: &ConversationId,
+    decoded: &[DecodedAttachment],
+) -> Result<Vec<String>, crate::routes::ApiError> {
+    let mut ids = Vec::with_capacity(decoded.len());
+    for (idx, d) in decoded.iter().enumerate() {
+        let id = write_attachment_blob(state, cid, &d.mime, &d.bytes).map_err(|e| {
             crate::routes::ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "attachment_write_failed",
@@ -559,4 +586,116 @@ pub(crate) fn extract_channel_origin(e: &EventRecord) -> Option<String> {
             }),
         _ => None,
     }
+}
+
+// =====================================================================
+// Data refs (2026-05-16)
+// =====================================================================
+//
+// A "data ref" is the host's mechanism for letting one tool's output
+// flow into another tool's input WITHOUT the model having to re-emit
+// the bytes. The chart-from-stock-history use case made the cost
+// concrete: the model emitting 125 NKE OHLC rows back into a
+// `chart.render` call took 120+ seconds of decode and timed out the
+// HTTP read at vLLM. The right answer is to never make the model
+// retype data it just received — store the value server-side under a
+// fresh id, give the model the id, and let it pass that id to the
+// next tool.
+//
+// Storage: piggybacks on `state_artifacts` with mime
+// `application/json` and `kind = "plugin_artifact"`. Inherits the
+// table's TTL + content-addressing for free.
+//
+// Resolution: see `tool_dispatch::resolve_data_refs` for the wire
+// shape (`{"$data_ref": "<id>"}`) and the recursive substitution
+// pass that runs before every tool invocation.
+
+/// Default TTL for data refs — long enough that a multi-round turn
+/// (tool A produces a ref → model reasons → tool B consumes it) has
+/// breathing room, short enough that abandoned refs don't pile up
+/// indefinitely on disk. The ephemeral sweeper culls expired rows
+/// + their on-disk bytes on its normal interval.
+pub(crate) const DATA_REF_DEFAULT_TTL_SECS: i64 = 60 * 60; // 1h
+
+/// Hard cap on a single data ref's JSON payload. Larger than the
+/// 10 MiB attachment cap because the use case (entire historical
+/// candle series, deep-research bibliographies, large search result
+/// sets) trends bigger than one image; small enough that a runaway
+/// plugin can't fill the artifacts dir with one tool call.
+pub(crate) const DATA_REF_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// Persist a JSON value as a data ref, returning the fresh attachment
+/// id. The id is a UUID stamped on `state_artifacts.id`; the bytes
+/// land in the same on-disk artifacts root as plugin-rendered chart
+/// PNGs etc. `ttl_seconds=None` uses [`DATA_REF_DEFAULT_TTL_SECS`].
+pub(crate) fn persist_data_ref(
+    state: &AppState,
+    plugin_id: &str,
+    value: &serde_json::Value,
+    ttl_seconds: Option<i64>,
+) -> Result<execlaw_core::attachments::PluginArtifactCreated, String> {
+    use execlaw_core::attachments::AttachmentStore;
+
+    let bytes = serde_json::to_vec(value).map_err(|e| format!("data_ref encode: {e}"))?;
+    if bytes.len() > DATA_REF_MAX_BYTES {
+        return Err(format!(
+            "data_ref payload {} bytes exceeds cap {}",
+            bytes.len(),
+            DATA_REF_MAX_BYTES
+        ));
+    }
+    let ttl = ttl_seconds.or(Some(DATA_REF_DEFAULT_TTL_SECS));
+    let now = chrono::Utc::now().timestamp();
+    let root = crate::host_caps_impl::builtin_artifacts_root_path();
+    let store = AttachmentStore::new(&state.db);
+    store
+        .insert_plugin_artifact(
+            &root,
+            plugin_id,
+            "data_ref.json",
+            "application/json",
+            &bytes,
+            ttl,
+            now,
+        )
+        .map_err(|e| format!("data_ref persist: {e}"))
+}
+
+/// Look up a data ref by id and parse its on-disk bytes as JSON.
+///
+/// Errors:
+///   * `data_ref '<id>' not found` — no `state_artifacts` row.
+///   * `data_ref '<id>' mime is '<mime>'` — the row exists but isn't a
+///     JSON ref (e.g. operator tried to point a `$data_ref` at a PNG
+///     chart attachment id).
+///   * `data_ref '<id>' expired` — the row's `expires_at` is past.
+///   * read / decode errors propagate verbatim.
+pub(crate) fn fetch_data_ref(
+    db: &execlaw_core::Database,
+    attachment_id: &str,
+) -> Result<serde_json::Value, String> {
+    use execlaw_core::attachments::AttachmentStore;
+    let store = AttachmentStore::new(db);
+    let row = store
+        .get_artifact(attachment_id)
+        .map_err(|e| format!("data_ref lookup: {e}"))?
+        .ok_or_else(|| format!("data_ref '{attachment_id}' not found"))?;
+    if row.mime_type != "application/json" {
+        return Err(format!(
+            "data_ref '{attachment_id}' mime is '{}' (expected application/json)",
+            row.mime_type
+        ));
+    }
+    if let Some(expires_at) = row.expires_at {
+        let now = chrono::Utc::now().timestamp();
+        if now > expires_at {
+            return Err(format!(
+                "data_ref '{attachment_id}' expired {}s ago",
+                now - expires_at
+            ));
+        }
+    }
+    let bytes =
+        std::fs::read(&row.path).map_err(|e| format!("data_ref read {}: {e}", row.path))?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("data_ref decode: {e}"))
 }
