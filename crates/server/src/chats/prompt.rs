@@ -667,17 +667,11 @@ pub(crate) fn build_tool_routing_prose(
             // prices. Top-level entry tells the model the chain
             // BEFORE it scans individual descriptions.
             "chart",
-            "* `chart.render` (built-in) — for ANY visualisation request, ALWAYS fetch real \
-             data via the matching data-source tool FIRST, then pipe the values into \
-             `chart.render`. Examples: stocks/ETFs/indices/crypto/FX → \
-             `yahoo_finance.historical_candles` first; weather → `open_meteo.forecast` / \
-             `.historical` first; anything else with an API → `web_fetch` first. When the \
-             data-source returned a `data_refs` object (any long series will), pass \
-             `points: {\"$data_ref\": \"<id>\"}` using the matching id — DO NOT retype the \
-             data into points; the host inflates the ref server-side. NEVER invent data \
-             points to chart — if you cannot fetch them, say so instead of fabricating. \
-             After the chart renders it shows inline; your follow-up reply should be one \
-             short line of context, NOT a recap of the data.",
+            "* `chart.render` (built-in) — visualisation. ALWAYS fetch real data first \
+             (stocks → `yahoo_finance.historical_candles`; weather → `open_meteo.*`; \
+             else `web_fetch`), then pipe via `points: {\"$data_ref\": \"<id>\"}` when \
+             the data source returned a `data_refs` map. Never invent points; never \
+             retype data into points. Reply with one short line after rendering.",
         ),
     ];
 

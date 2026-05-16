@@ -1,7 +1,16 @@
 [plugin]
 id = "finance-yahoo"
 name = "Yahoo Finance"
-version = "0.2.0"
+version = "0.2.1"
+# 0.2.1 (2026-05-16) — descriptions + tool-result _hint trimmed
+# hard. v0.2.0's verbose two-shape contract bloated the per-turn
+# tool catalog enough to push Qwen3.6-AWQ (with 100 tools loaded)
+# into the "answer with text instead of calling tools" failure
+# mode — the model literally typed "here's the chart" on Signal
+# without ever calling chart.render. Same protocol as 0.2.0
+# (inline ≤ 30, data_refs otherwise), just expressed in ~300
+# fewer characters per tool entry.
+#
 # 0.2.0 (2026-05-16) — historical_candles now returns data-ref ids
 # for the OHLC+volume series instead of inline candle arrays when
 # the series has > 30 points. Pipes into chart.render via
@@ -75,7 +84,7 @@ latency = "low"
 
 [[tools]]
 name = "yahoo_finance.historical_candles"
-description = """OHLC + volume candles for any Yahoo symbol. Args: { symbol: string (required), interval?: "1m"|"5m"|"15m"|"30m"|"1h"|"1d"|"1wk"|"1mo" (default "1d"), range?: "1d"|"5d"|"1mo"|"3mo"|"6mo"|"1y"|"2y"|"5y"|"10y"|"ytd"|"max" (default "1mo") }. Intraday intervals (sub-day) only go back ~30 days on Yahoo's side; daily+ goes back decades. Returns one of two shapes depending on length: (A) for series ≤ 30 candles, `{ symbol, interval, candle_count, candles: [{ t, open, high, low, close, volume }] }` with candles inline; (B) for longer series, `{ symbol, interval, candle_count, first_candle, last_candle, summary: { highest_high, lowest_low, first_close, last_close, pct_change }, data_refs: { candles, open_points, high_points, low_points, close_points, volume_points } }` where each `data_refs.*` is an opaque id pointing at the server-side data — pass `points: {"$data_ref": data_refs.close_points}` (or .open_points / .high_points / .low_points / .volume_points) into chart.render and the host inflates the array before the chart tool runs. NEVER retype the candle data into chart.render — the data_refs are how you avoid blowing up the model's output budget on long series."""
+description = """OHLC + volume candles for any Yahoo symbol. Args: `{ symbol, interval?, range? }`. Intraday intervals back ~30d; daily+ back decades. Returns `{ symbol, interval, candle_count, ... }`; short series (≤ 30) include `candles: [{t,o,h,l,c,v}]` inline, long series include `data_refs: { open_points, high_points, low_points, close_points, volume_points }` instead — pipe a ref into chart.render via `points: {"$data_ref": "<id>"}`."""
 schema = "schemas/historical_candles.json"
 trust_floor = "KnownLimited"
 latency = "medium"

@@ -900,7 +900,6 @@ fn extract_candles(body, symbol, interval) {
             "interval": interval,
             "candle_count": count,
             "candles":  out,
-            "_hint": "Series is short; candles are inline. Use them directly in chart.render's series[].points.",
         };
     }
 
@@ -967,7 +966,7 @@ fn extract_candles(body, symbol, interval) {
             "close_points":  close_ref["data_ref_id"],
             "volume_points": volume_ref["data_ref_id"],
         },
-        "_hint": "To chart, pass `points: {\"$data_ref\": data_refs.close_points}` (or .open/.high/.low/.volume) into chart.render. DO NOT retype the candles — the host resolves the ref server-side.",
+        "_hint": "chart.render: pass `points: {\"$data_ref\": data_refs.close_points}` (.open/.high/.low/.volume also). Don't retype.",
     }
 }
 

@@ -860,7 +860,7 @@ fn summarize_with_refs(resp) {
     }
 
     if any_refs {
-        resp["_hint"] = "Long timeseries — variable arrays replaced with data refs. To chart, pass `points: {\"$data_ref\": <block>.data_refs.<variable>_points}` into chart.render with `time_axis: true` (x is unix-ms; refs were built that way). Use each block's `summary` (min/max/first/last/count per variable) for non-charting answers.";
+        resp["_hint"] = "chart.render: `points: {\"$data_ref\": <block>.data_refs.<var>_points}`, `time_axis: true`. Use `summary` for non-chart answers.";
     }
     resp
 }

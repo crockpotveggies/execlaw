@@ -2194,15 +2194,12 @@ impl RenderChartTool {
                 // open_meteo, etc.) are visible in the catalog —
                 // listing them here is redundant.
                 description: concat!(
-                    "Render a line/bar/area/scatter chart from `series: [{name, points}]`; ",
-                    "set `time_axis: true` when x is Unix-ms. Returns inline SVG + a PNG attachment_id.\n",
-                    "FETCH REAL DATA FIRST via the appropriate tool (stock/weather/web/etc.) — NEVER invent points.\n",
-                    "DATA REFS: when the data source returned a `data_refs` object (e.g. ",
-                    "yahoo_finance.historical_candles for series > 30 points), pass `points: {\"$data_ref\": \"<id>\"}` ",
-                    "using the matching id from that map (.close_points, .open_points, etc.). DO NOT retype the ",
-                    "data into points — the host inflates the ref before this tool runs. Inline `[{x, y}]` ",
-                    "arrays are accepted too for short series. After it renders, your reply should be one short ",
-                    "line of context, not a recap."
+                    "Render line/bar/area/scatter chart. ",
+                    "Args: `{title?, kind?, series: [{name, points}], time_axis?}`. ",
+                    "`points` is either `[{x, y}]` (inline) OR `{\"$data_ref\": \"<id>\"}` ",
+                    "(pass an id from a previous tool's `data_refs` map; host inflates). ",
+                    "FETCH DATA FIRST (yahoo_finance / open_meteo / web_fetch) — never invent points. ",
+                    "Reply with one short line, not a data recap."
                 ).into(),
                 schema,
                 source: ToolSource::Builtin,
