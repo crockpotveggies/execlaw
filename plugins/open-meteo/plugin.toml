@@ -1,7 +1,22 @@
 [plugin]
 id = "open-meteo"
 name = "Open-Meteo Weather"
-version = "0.4.0"
+version = "0.5.0"
+# 0.5.0 (2026-05-16) — historical / seasonal / ensemble / climate
+# now route long-horizon responses (> 30 time-steps per block)
+# through the host's data-ref pipeline: per-variable {x,y} point
+# arrays are stashed server-side and returned as
+# `data_refs.<variable>_points` ids alongside a `summary`
+# (min/max/first/last/count) block. The agent passes
+# `points: {"$data_ref": "<id>"}` into `chart.render` with
+# `time_axis: true` — the host inflates the array before the
+# chart tool runs. Avoids the decode-budget blow-up that would
+# otherwise force the model to retype hundreds-to-thousands of
+# values back into the chart call. Short-horizon responses
+# (≤ 30 steps) still return inline arrays so the SPA's existing
+# weather widgets keep working. URL now sends
+# `&timeformat=unixtime` for those four tools so `time[i]` is a
+# numeric Unix-second value the rhai helper can scale to ms.
 description = "Free, key-less weather, marine, air-quality, seasonal, ensemble, flood and climate data via the Open-Meteo public APIs. Covers forecast/historical/marine/air-quality/seasonal/ensemble/flood/climate/geocoding/elevation endpoints. Chart rendering is provided by the host's native `chart.render` built-in tool (was `open_meteo.render_chart` before 2026-05-15)."
 author = "execlaw"
 license = "Apache-2.0"
@@ -56,7 +71,7 @@ latency = "low"
 
 [[tools]]
 name = "open_meteo.historical"
-description = """Historical weather (ERA5 reanalysis) for a date range. Use when the operator asks about past conditions ("how cold was it last Tuesday", "rainfall in March"). The archive lags real-time by ~5 days. Args: { latitude?: number, longitude?: number (BOTH default to the operator's pinned location from Settings → Plugins → Open-Meteo when omitted; only ASK the user for their location when neither was supplied AND the throw says no default is configured — never ask preemptively), start_date: "YYYY-MM-DD" (required), end_date: "YYYY-MM-DD" (required), hourly?: string[], daily?: string[], timezone?: string, temperature_unit?: string, wind_speed_unit?: string, precipitation_unit?: string }."""
+description = """Historical weather (ERA5 reanalysis) for a date range. Use when the operator asks about past conditions ("how cold was it last Tuesday", "rainfall in March"). The archive lags real-time by ~5 days. Args: { latitude?: number, longitude?: number (BOTH default to the operator's pinned location from Settings → Plugins → Open-Meteo when omitted; only ASK the user for their location when neither was supplied AND the throw says no default is configured — never ask preemptively), start_date: "YYYY-MM-DD" (required), end_date: "YYYY-MM-DD" (required), hourly?: string[], daily?: string[], timezone?: string, temperature_unit?: string, wind_speed_unit?: string, precipitation_unit?: string }. Returns one of two shapes depending on length: (A) ≤ 30 time-steps per block — inline `hourly`/`daily` blocks with full variable arrays; (B) > 30 steps — each block becomes `{ n, time_first, time_last, time_unit: "seconds_since_epoch_utc", summary: { <var>: {count, min, max, first, last} }, data_refs: { <var>_points: "<id>" } }` and the inline arrays are dropped. To chart long ranges, pass `points: {"$data_ref": <block>.data_refs.<var>_points}` with `time_axis: true` into chart.render; the host inflates the array server-side so you don't re-emit thousands of points."""
 schema = "schemas/historical.json"
 trust_floor = "KnownLimited"
 latency = "medium"
@@ -77,14 +92,14 @@ latency = "low"
 
 [[tools]]
 name = "open_meteo.seasonal"
-description = """Seasonal forecast (CFSv2 nine-month outlook). Use for "what's winter / summer looking like" style questions; expect coarse spatial + temporal resolution and only directional skill beyond ~6 weeks. Args: { latitude?: number, longitude?: number (BOTH default to the operator's pinned location from Settings → Plugins → Open-Meteo when omitted; only ASK the user for their location when neither was supplied AND the throw says no default is configured — never ask preemptively), six_hourly?: string[] (e.g. ["temperature_2m_member01","temperature_2m_member02",...]), daily?: string[], forecast_days?: int (1-275, default 92), temperature_unit?: string }."""
+description = """Seasonal forecast (CFSv2 nine-month outlook). Use for "what's winter / summer looking like" style questions; expect coarse spatial + temporal resolution and only directional skill beyond ~6 weeks. Args: { latitude?: number, longitude?: number (BOTH default to the operator's pinned location from Settings → Plugins → Open-Meteo when omitted; only ASK the user for their location when neither was supplied AND the throw says no default is configured — never ask preemptively), six_hourly?: string[] (e.g. ["temperature_2m_member01","temperature_2m_member02",...]), daily?: string[], forecast_days?: int (1-275, default 92), temperature_unit?: string }. Long horizons (> 30 steps per block) return `{ n, time_first, time_last, summary, data_refs: { <var>_points: "<id>" } }` per block — pass `points: {"$data_ref": <block>.data_refs.<var>_points}` into chart.render with `time_axis: true`; the host resolves the array server-side so you never re-emit it. Short horizons stay inline."""
 schema = "schemas/seasonal.json"
 trust_floor = "KnownLimited"
 latency = "medium"
 
 [[tools]]
 name = "open_meteo.ensemble"
-description = """Multi-member probabilistic forecast for a lat/lon. The response carries one series per ensemble member so the agent (or the chart renderer's band overlay) can show the spread. Use for "what's the uncertainty around the forecast" style questions. Args: { latitude?: number, longitude?: number (BOTH default to the operator's pinned location from Settings → Plugins → Open-Meteo when omitted; only ASK the user for their location when neither was supplied AND the throw says no default is configured — never ask preemptively), hourly?: string[], daily?: string[], models?: string[] (e.g. ["gfs_seamless","icon_seamless","ecmwf_ifs04"]), forecast_days?: int (1-35), temperature_unit?: string }."""
+description = """Multi-member probabilistic forecast for a lat/lon. The response carries one series per ensemble member (50+ members typical) so the agent (or the chart renderer's band overlay) can show the spread. Use for "what's the uncertainty around the forecast" style questions. Args: { latitude?: number, longitude?: number (BOTH default to the operator's pinned location from Settings → Plugins → Open-Meteo when omitted; only ASK the user for their location when neither was supplied AND the throw says no default is configured — never ask preemptively), hourly?: string[], daily?: string[], models?: string[] (e.g. ["gfs_seamless","icon_seamless","ecmwf_ifs04"]), forecast_days?: int (1-35), temperature_unit?: string }. Long horizons (> 30 steps per block) return one `data_ref` per per-member variable (e.g. `temperature_2m_member01_points`, `temperature_2m_member02_points`, ...). Pass any one into chart.render to plot a single member; layer many in a `series` array to render the spread. With `time_axis: true` chart.render reads the ref-supplied x-ms timestamps directly."""
 schema = "schemas/ensemble.json"
 trust_floor = "KnownLimited"
 latency = "medium"
@@ -98,7 +113,7 @@ latency = "medium"
 
 [[tools]]
 name = "open_meteo.climate"
-description = """Long-term climate projections (CMIP6, downscaled to ~10km). Use for "what does the climate look like in 2050" style questions. The agent should rarely default to this; mostly used when explicitly asked. Args: { latitude?: number, longitude?: number (BOTH default to the operator's pinned location from Settings → Plugins → Open-Meteo when omitted; only ASK the user for their location when neither was supplied AND the throw says no default is configured — never ask preemptively), start_date: "YYYY-MM-DD" (required), end_date: "YYYY-MM-DD" (required), models: string[] (required, e.g. ["MPI_ESM1_2_XR","EC_Earth3P_HR","FGOALS_f3_H"]), daily?: string[] (e.g. ["temperature_2m_mean","temperature_2m_max","temperature_2m_min","precipitation_sum"]), temperature_unit?: string, wind_speed_unit?: string }."""
+description = """Long-term climate projections (CMIP6, downscaled to ~10km). Use for "what does the climate look like in 2050" style questions. The agent should rarely default to this; mostly used when explicitly asked. Args: { latitude?: number, longitude?: number (BOTH default to the operator's pinned location from Settings → Plugins → Open-Meteo when omitted; only ASK the user for their location when neither was supplied AND the throw says no default is configured — never ask preemptively), start_date: "YYYY-MM-DD" (required), end_date: "YYYY-MM-DD" (required), models: string[] (required, e.g. ["MPI_ESM1_2_XR","EC_Earth3P_HR","FGOALS_f3_H"]), daily?: string[] (e.g. ["temperature_2m_mean","temperature_2m_max","temperature_2m_min","precipitation_sum"]), temperature_unit?: string, wind_speed_unit?: string }. Multi-decade ranges always return via data refs (`daily.data_refs.<var>_points`) — the inline arrays would otherwise be tens of thousands of values. Use the summary block (per-variable min/max/first/last over the entire range) for "what's the trend" questions; pipe the ref into chart.render with `time_axis: true` for the actual visualization."""
 schema = "schemas/climate.json"
 trust_floor = "KnownLimited"
 latency = "high"
