@@ -87,7 +87,7 @@ export function DynamicPluginPanel({
     onConfigChanged: _onConfigChanged,
     staticFallback,
 }: Props) {
-    const { getAccessToken } = useAuth();
+    const { getAccessToken, status: authStatus } = useAuth();
     const [state, setState] = useState<LoadState>({ kind: "loading" });
     const [reloadKey, setReloadKey] = useState(0);
 
@@ -96,6 +96,24 @@ export function DynamicPluginPanel({
     useEffect(() => {
         let cancelled = false;
         let blobUrl: string | null = null;
+
+        // 2026-05-16 — wait for the AuthProvider to settle before
+        // deciding whether the token is missing. Pre-fix, this
+        // useEffect ran on first mount with auth still in `loading`
+        // (the boot effect that hydrates accessTokenRef from
+        // localStorage hadn't fired yet — React runs child effects
+        // BEFORE parent effects), so `getAccessToken()` returned
+        // null and the panel locked into "operator is signed out"
+        // forever. Operator's only out was the manual Retry click.
+        //
+        // Now: while auth is still booting, stay in `loading`.
+        // When auth settles to `unauthenticated`, surface the
+        // signed-out error (the operator really is signed out).
+        // When auth becomes `authenticated`, run the fetch.
+        if (authStatus === "loading") {
+            setState({ kind: "loading" });
+            return;
+        }
         setState({ kind: "loading" });
 
         (async () => {
@@ -177,7 +195,7 @@ export function DynamicPluginPanel({
                 URL.revokeObjectURL(blobUrl);
             }
         };
-    }, [getAccessToken, pluginId, reloadKey]);
+    }, [getAccessToken, pluginId, reloadKey, authStatus]);
 
     if (state.kind === "loading") {
         return (
