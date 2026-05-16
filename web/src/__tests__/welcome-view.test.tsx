@@ -51,6 +51,6 @@ describe("WelcomeView", () => {
         const input = screen.getByTestId("composer-input") as HTMLTextAreaElement;
         fireEvent.change(input, { target: { value: "hi from welcome" } });
         fireEvent.keyDown(input, { key: "Enter", shiftKey: false });
-        expect(onSend).toHaveBeenCalledWith("hi from welcome");
+        expect(onSend).toHaveBeenCalledWith("hi from welcome", [], []);
     });
 });

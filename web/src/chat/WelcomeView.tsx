@@ -30,10 +30,14 @@ const SUGGESTIONS: ReadonlyArray<{ title: string; sub: string; prompt: string }>
     },
 ];
 
-import type { InlineAttachment } from "../api/endpoints";
+import type { InlineAttachment, SkillListEntry } from "../api/endpoints";
 
 interface Props {
-    onSend: (text: string, attachments: InlineAttachment[]) => Promise<void> | void;
+    onSend: (
+        text: string,
+        attachments: InlineAttachment[],
+        skillNames: string[],
+    ) => Promise<void> | void;
     /**
      * Phase 13.A — voice mic button surfaces here too so the
      * operator can start a voice conversation without typing
@@ -77,6 +81,13 @@ interface Props {
      * downscale. See `Composer.recommendedImageEdge`.
      */
     recommendedImageEdge?: number;
+    /**
+     * 2026-05-15 — lazy fetcher for the composer's "Attach skill"
+     * picker. Threaded through to Composer; see its prop docs for
+     * details. Optional (tests can omit; the menu item simply
+     * doesn't render).
+     */
+    getSkills?: () => Promise<SkillListEntry[]>;
 }
 
 export function WelcomeView({
@@ -89,6 +100,7 @@ export function WelcomeView({
     onToggleIncognito,
     multimodal,
     recommendedImageEdge,
+    getSkills,
 }: Props) {
     const auth = useAuth();
     // Stable accessor — passing a fresh `() => auth.getAccessToken()`
@@ -159,6 +171,7 @@ export function WelcomeView({
                     busy={busy}
                     multimodal={multimodal}
                     recommendedImageEdge={recommendedImageEdge}
+                    getSkills={getSkills}
                 />
             </div>
 
@@ -173,7 +186,7 @@ export function WelcomeView({
                         type="button"
                         className="execlaw-welcome__suggestion"
                         data-testid="welcome-suggestion"
-                        onClick={() => void onSend(s.prompt, [])}
+                        onClick={() => void onSend(s.prompt, [], [])}
                     >
                         <span className="execlaw-welcome__suggestion-title">
                             {s.title}

@@ -1398,6 +1398,144 @@ body {
     }
 }
 
+// 2026-05-15 — skill picker (composer `+` menu, second item)
+.execlaw-composer__attach-menu--skills {
+    min-width: 18rem;
+    max-width: 28rem;
+    max-height: 22rem;
+    overflow-y: auto;
+}
+
+.execlaw-composer__skill-picker-header {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.4rem 0.55rem;
+    color: $text-muted;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    border-bottom: 1px solid rgba($text-primary, 0.08);
+    margin-bottom: 0.25rem;
+}
+
+.execlaw-composer__skill-picker-back {
+    border: 0;
+    background: transparent;
+    color: $text-primary;
+    cursor: pointer;
+    padding: 0.1rem 0.3rem;
+    border-radius: 0.3rem;
+    line-height: 1;
+
+    &:hover,
+    &:focus-visible {
+        background-color: rgba($text-primary, 0.08);
+    }
+}
+
+.execlaw-composer__skill-picker-status {
+    padding: 0.6rem 0.65rem;
+    color: $text-muted;
+    font-size: 0.85rem;
+
+    &--error {
+        color: #f47878;
+    }
+}
+
+.execlaw-composer__skill-picker-item {
+    display: grid;
+    grid-template-columns: 1.1rem 1fr;
+    grid-template-rows: auto auto;
+    column-gap: 0.5rem;
+    width: 100%;
+    padding: 0.45rem 0.55rem;
+    border: 0;
+    border-radius: 0.4rem;
+    background-color: transparent;
+    color: $text-primary;
+    text-align: left;
+    cursor: pointer;
+
+    &:hover,
+    &:focus-visible {
+        background-color: rgba($text-primary, 0.08);
+    }
+
+    &.is-checked {
+        background-color: rgba($accent, 0.12);
+    }
+
+    i {
+        grid-row: 1 / span 2;
+        align-self: center;
+        font-size: 1rem;
+        color: $text-muted;
+    }
+}
+
+.execlaw-composer__skill-picker-name {
+    font-size: 0.875rem;
+    font-weight: 500;
+}
+
+.execlaw-composer__skill-picker-desc {
+    font-size: 0.75rem;
+    color: $text-muted;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+// Selected-skill chip in the composer's attachments row
+.execlaw-composer__skill-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.25rem 0.55rem;
+    background-color: rgba($accent, 0.15);
+    color: $text-primary;
+    border-radius: $radius-pill;
+    font-size: 0.78rem;
+
+    i {
+        color: color.adjust($accent, $lightness: 18%);
+    }
+}
+
+.execlaw-composer__skill-chip-name {
+    max-width: 12rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+// "applied: foo, bar" line under a user_msg bubble
+.execlaw-msg__applied-skills {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.3rem;
+    margin-top: 0.45rem;
+    font-size: 0.72rem;
+    color: $text-muted;
+
+    i {
+        color: color.adjust($accent, $lightness: 12%);
+    }
+}
+
+.execlaw-msg__applied-skills-label {
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.execlaw-msg__applied-skill-chip {
+    color: $text-primary;
+    font-family: monospace;
+}
+
 .execlaw-approval-card {
     background-color: rgba($accent, 0.08);
     border-radius: $radius-pill;

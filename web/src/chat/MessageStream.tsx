@@ -250,7 +250,21 @@ function MessageBubble({ message }: { message: MessageView }) {
     // 401 against the live server but doesn't affect those tests.
     const auth = useContext(AuthContext);
     const role = roleFor(message);
-    const text = message.text ?? renderToolFallback(message);
+    // 2026-05-15 — when the operator picked a skill from the
+    // composer's `+` menu, the server prepended a `<skill
+    // name="...">...</skill>\n\n` block onto the user_msg text
+    // before the model saw it. Strip those blocks here so the chat
+    // bubble shows only what the operator actually typed; the
+    // skills surface as chips below the bubble instead. Stripping
+    // is keyed off `applied_skill_names` being non-empty so we
+    // never accidentally trim text the user actually typed that
+    // happens to start with `<skill ...>`.
+    const appliedSkills = message.applied_skill_names ?? [];
+    const rawText = message.text ?? renderToolFallback(message);
+    const text =
+        appliedSkills.length > 0
+            ? stripSkillPrependBlock(rawText)
+            : rawText;
     const channelOrigin = readChannelOrigin(message);
 
     // Long messages render in full — see the file-header note for
@@ -372,9 +386,62 @@ function MessageBubble({ message }: { message: MessageView }) {
                     ) : (
                         <MarkdownContent text={text} />
                     ))}
+                {appliedSkills.length > 0 && (
+                    <div
+                        className="execlaw-msg__applied-skills"
+                        data-testid="message-applied-skills"
+                    >
+                        <i className="bi bi-stars" aria-hidden />
+                        <span className="execlaw-msg__applied-skills-label">
+                            applied:
+                        </span>
+                        {appliedSkills.map((name, i) => (
+                            <span
+                                key={name}
+                                className="execlaw-msg__applied-skill-chip"
+                                data-testid="message-applied-skill"
+                                data-skill-name={name}
+                            >
+                                {name}
+                                {i < appliedSkills.length - 1 ? "," : ""}
+                            </span>
+                        ))}
+                    </div>
+                )}
             </div>
         </div>
     );
+}
+
+/// Strip the leading `<skill name="...">...</skill>` blocks the
+/// server prepends onto a user_msg when the operator picked skills
+/// from the composer's `+` menu. The block format is fixed:
+///
+/// ```text
+/// <skill name="ns/short">
+/// {body}
+/// </skill>
+///
+/// {original user text}
+/// ```
+///
+/// We match one OR MORE leading blocks (multi-skill picks) followed
+/// by any blank lines, then return whatever's left. Caller only
+/// invokes this when `applied_skill_names` is non-empty so we never
+/// trim text the user typed that happens to look like a skill
+/// block.
+export function stripSkillPrependBlock(text: string): string {
+    // Greedy match for any number of consecutive `<skill name="X">
+    // ... </skill>` blocks at the very start of the text, plus any
+    // trailing whitespace before the user's actual content. The
+    // `[\s\S]*?` (non-greedy) inside each block stops at the first
+    // `</skill>` so we don't accidentally swallow user text that
+    // contains the literal substring.
+    const stripped = text.replace(
+        /^(<skill name="[^"]*">[\s\S]*?<\/skill>\s*)+/,
+        "",
+    );
+    return stripped;
 }
 
 function readChannelOrigin(m: MessageView): ChannelOrigin {

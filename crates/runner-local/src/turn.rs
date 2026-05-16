@@ -94,6 +94,14 @@ pub struct UserMessagePayload {
     /// code path round-trips consistently when replayed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachment_ids: Vec<String>,
+    /// 2026-05-15 — names of skills the operator picked from the
+    /// composer's `+` menu for the turn that produced this event.
+    /// The bodies are already prepended onto `text`; this field is
+    /// metadata only (audit / SPA chip rendering). Mirror of the
+    /// server-side `UserMessagePayload.applied_skill_names` so
+    /// payloads written by either crate round-trip consistently.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied_skill_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,14 +219,16 @@ impl TurnExecutor {
         sender_principal_id: Option<String>,
         cfg: &TurnConfig,
     ) -> Result<TurnSummary, TurnError> {
-        // Backward-compatible call site: no attachments. Internally
-        // routes to `run_turn_with_attachments` with empty vecs.
+        // Backward-compatible call site: no attachments, no skills.
+        // Internally routes to `run_turn_with_attachments` with empty
+        // vecs.
         self.run_turn_with_attachments(
             db,
             conversation_id,
             user_text,
             sender_principal_id,
             cfg,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         )
@@ -250,6 +260,7 @@ impl TurnExecutor {
         cfg: &TurnConfig,
         attachment_ids: Vec<String>,
         user_image_urls: Vec<String>,
+        applied_skill_names: Vec<String>,
     ) -> Result<TurnSummary, TurnError> {
         // 1. Record the inbound user message as its own event so it's in
         //    the log before we ask the model anything. The log is keyed
@@ -269,6 +280,7 @@ impl TurnExecutor {
                 sender_principal_id: sender_principal_id.clone(),
                 channel_origin: cfg.inbound_channel_origin.clone(),
                 attachment_ids: attachment_ids.clone(),
+                applied_skill_names: applied_skill_names.clone(),
             },
             sender_principal_id,
         )?;

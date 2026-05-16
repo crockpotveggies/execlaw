@@ -6,7 +6,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
-import { MessageStream } from "../chat/MessageStream";
+import { MessageStream, stripSkillPrependBlock } from "../chat/MessageStream";
 import {
     __resetChatStore,
     appendMessage,
@@ -357,5 +357,101 @@ describe("MessageStream", () => {
         });
         fireEvent.scroll(stream);
         expect(screen.queryByTestId("scroll-to-bottom")).toBeNull();
+    });
+
+    // ---- skill chip + prepend stripping (composer `+` menu) -----
+
+    /// When the operator picked skills via the composer's `+` menu,
+    /// the server prepends `<skill name="...">...</skill>` blocks
+    /// onto the user_msg text. The bubble must:
+    ///   * render only the original user text (blocks stripped), AND
+    ///   * surface the applied skill names as a chip below the
+    ///     bubble so the operator can see what shaped the response.
+    it("strips the prepended skill block from the bubble and renders chips", () => {
+        const prepended =
+            '<skill name="test/foo">\n' +
+            "Always answer in haiku.\n" +
+            "</skill>\n\n" +
+            "tell me a story";
+        appendMessage("conv-skill", {
+            ...baseMsg(1, prepended),
+            applied_skill_names: ["test/foo"],
+        } as never);
+        render(<MessageStream conversationId="conv-skill" />);
+        // Original user text reaches the bubble.
+        expect(screen.getByText(/tell me a story/)).toBeInTheDocument();
+        // Prepended block does NOT.
+        expect(screen.queryByText(/Always answer in haiku/)).toBeNull();
+        // Chip surfaces the applied skill name.
+        const chips = screen.getAllByTestId("message-applied-skill");
+        expect(chips).toHaveLength(1);
+        expect(chips[0].getAttribute("data-skill-name")).toBe("test/foo");
+    });
+
+    /// Multi-skill: every leading block strips; chips for all names
+    /// render in order.
+    it("strips multiple consecutive skill blocks and renders chips in order", () => {
+        const prepended =
+            '<skill name="test/alpha">\n' +
+            "alpha guidance\n" +
+            "</skill>\n\n" +
+            '<skill name="test/beta">\n' +
+            "beta guidance\n" +
+            "</skill>\n\n" +
+            "do the thing";
+        appendMessage("conv-multi", {
+            ...baseMsg(1, prepended),
+            applied_skill_names: ["test/alpha", "test/beta"],
+        } as never);
+        render(<MessageStream conversationId="conv-multi" />);
+        expect(screen.getByText(/do the thing/)).toBeInTheDocument();
+        expect(screen.queryByText(/alpha guidance/)).toBeNull();
+        expect(screen.queryByText(/beta guidance/)).toBeNull();
+        const chips = screen.getAllByTestId("message-applied-skill");
+        expect(chips.map((c) => c.getAttribute("data-skill-name"))).toEqual([
+            "test/alpha",
+            "test/beta",
+        ]);
+    });
+
+    /// Regression for "user typed text that looks like a skill block":
+    /// without `applied_skill_names` set, the bubble renders the raw
+    /// text verbatim. Stripping must be gated on the field being
+    /// non-empty so we never trim user content.
+    it("does NOT strip skill-shaped text when applied_skill_names is empty", () => {
+        const literal =
+            '<skill name="example/bad">should stay</skill>\n\nhi there';
+        setMessages("conv-no-skills", [baseMsg(1, literal)]);
+        render(<MessageStream conversationId="conv-no-skills" />);
+        // The literal user text is preserved (markdown renders the
+        // angle brackets as literal text since no html mode is on).
+        const stream = screen.getByTestId("message-stream");
+        expect(stream.textContent).toContain("should stay");
+        expect(screen.queryByTestId("message-applied-skills")).toBeNull();
+    });
+});
+
+describe("stripSkillPrependBlock", () => {
+    it("returns the original text unchanged when no skill block is present", () => {
+        expect(stripSkillPrependBlock("hello world")).toBe("hello world");
+    });
+
+    it("strips a single block plus the blank line separator", () => {
+        const t = '<skill name="ns/x">\nbody\n</skill>\n\nuser text';
+        expect(stripSkillPrependBlock(t)).toBe("user text");
+    });
+
+    it("strips multiple consecutive blocks", () => {
+        const t =
+            '<skill name="ns/a">a</skill>\n\n' +
+            '<skill name="ns/b">b</skill>\n\n' +
+            "go";
+        expect(stripSkillPrependBlock(t)).toBe("go");
+    });
+
+    it("only strips leading blocks, not blocks embedded in user text", () => {
+        const t = 'plain text\n\n<skill name="ns/x">should stay</skill>';
+        // No leading block → nothing stripped.
+        expect(stripSkillPrependBlock(t)).toBe(t);
     });
 });

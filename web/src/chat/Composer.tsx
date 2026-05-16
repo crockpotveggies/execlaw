@@ -11,7 +11,7 @@ import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 
 import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
 import Spinner from "react-bootstrap/Spinner";
-import type { InlineAttachment } from "../api/endpoints";
+import type { InlineAttachment, SkillListEntry } from "../api/endpoints";
 import type { VoiceReadiness } from "./useVoiceReadiness";
 import { VoiceCaptureButton } from "./VoiceCaptureButton";
 
@@ -40,7 +40,11 @@ interface Props {
      * `null` / `undefined` for normal web threads.
      */
     bridgedChannel?: string | null;
-    onSend: (text: string, attachments: InlineAttachment[]) => Promise<void> | void;
+    onSend: (
+        text: string,
+        attachments: InlineAttachment[],
+        skillNames: string[],
+    ) => Promise<void> | void;
     /**
      * 2026-05-15 — gates the image-attach affordance ( + button +
      * popup menu). When false (text-only backend / probe hasn't
@@ -49,6 +53,19 @@ interface Props {
      * shell sources this from `useBackendCapabilities`.
      */
     multimodal?: boolean;
+    /**
+     * 2026-05-15 — lazy fetcher for the "Attach skill" picker (the
+     * second item in the `+` menu). Returns the skills the operator
+     * can apply to the next outbound message. Called the first time
+     * the picker opens; result is cached locally for the rest of the
+     * Composer instance's lifetime. When `undefined` the skill menu
+     * item is hidden — settings/embed shells without auth can mount
+     * the Composer without surfacing a skill picker. Sourced from
+     * `useSkillList()` in the chat shell so Composer stays
+     * AuthProvider-independent (matching the same convention as
+     * `voiceReadiness`).
+     */
+    getSkills?: () => Promise<SkillListEntry[]>;
     /**
      * 2026-05-15 — target long-edge dimension for client-side
      * downscale before base64 encode. 0 / undefined ships the bytes
@@ -111,6 +128,7 @@ export function Composer({
     onStop,
     multimodal,
     recommendedImageEdge,
+    getSkills,
 }: Props) {
     // Bridged-channel short-circuit. Render a flat, non-interactive
     // notice in place of the composer chip. Mirrors the chip's
@@ -150,6 +168,17 @@ export function Composer({
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
     const attachMenuRef = useRef<HTMLDivElement | null>(null);
+    /// 2026-05-15 — skill picker state. `mode` toggles the dropdown
+    /// between the two-item top menu and the skill list view. The
+    /// available skills are fetched lazily on first picker open so
+    /// the Composer doesn't pay the round-trip on every chat-pane
+    /// mount. `selectedSkills` is sticky across keystrokes but
+    /// cleared on every send (per-turn semantics).
+    const [attachMenuMode, setAttachMenuMode] = useState<"root" | "skills">("root");
+    const [availableSkills, setAvailableSkills] = useState<SkillListEntry[] | null>(null);
+    const [skillsLoading, setSkillsLoading] = useState(false);
+    const [skillsError, setSkillsError] = useState<string | null>(null);
+    const [selectedSkills, setSelectedSkills] = useState<SkillListEntry[]>([]);
 
     // Auto-grow.
     useEffect(() => {
@@ -161,17 +190,23 @@ export function Composer({
 
     // Click-outside / Escape closes the + menu. Tracked here (not on
     // the trigger) so the menu stays open while the operator hovers
-    // its items.
+    // its items. Closing always resets back to the root view so the
+    // next open shows "Attach photo / Attach skill" rather than the
+    // skill list the operator was last in.
     useEffect(() => {
         if (!attachMenuOpen) return;
+        const close = () => {
+            setAttachMenuOpen(false);
+            setAttachMenuMode("root");
+        };
         const onPointer = (ev: MouseEvent) => {
             const root = attachMenuRef.current;
             if (root && !root.contains(ev.target as Node)) {
-                setAttachMenuOpen(false);
+                close();
             }
         };
         const onKey = (ev: globalThis.KeyboardEvent) => {
-            if (ev.key === "Escape") setAttachMenuOpen(false);
+            if (ev.key === "Escape") close();
         };
         document.addEventListener("mousedown", onPointer);
         document.addEventListener("keydown", onKey);
@@ -183,7 +218,48 @@ export function Composer({
 
     const onPickPhoto = () => {
         setAttachMenuOpen(false);
+        setAttachMenuMode("root");
         fileInputRef.current?.click();
+    };
+
+    /// Switch the menu into "skill picker" mode and lazy-load the
+    /// list on first open. Cached across opens for the rest of the
+    /// component's lifetime so the second open is instant. Errors
+    /// surface inline in the picker; the operator can dismiss the
+    /// menu and try again. Hidden entirely when the parent didn't
+    /// pass a `getSkills` callback.
+    const onPickSkill = () => {
+        if (!getSkills) return;
+        setAttachMenuMode("skills");
+        if (availableSkills !== null || skillsLoading) return;
+        setSkillsLoading(true);
+        setSkillsError(null);
+        getSkills()
+            .then((list) => {
+                setAvailableSkills(list);
+            })
+            .catch((e: unknown) => {
+                setSkillsError(
+                    e instanceof Error ? e.message : "failed to load skills",
+                );
+            })
+            .finally(() => setSkillsLoading(false));
+    };
+
+    /// Add or remove a skill from the staged set. Toggle by name
+    /// since the list might re-fetch and produce new object
+    /// identities for the same skill.
+    const toggleSkill = (skill: SkillListEntry) => {
+        setSelectedSkills((prev) => {
+            const has = prev.some((s) => s.name === skill.name);
+            return has
+                ? prev.filter((s) => s.name !== skill.name)
+                : [...prev, skill];
+        });
+    };
+
+    const removeSelectedSkill = (name: string) => {
+        setSelectedSkills((prev) => prev.filter((s) => s.name !== name));
     };
 
     const onFilesPicked = async (files: FileList | null) => {
@@ -233,10 +309,15 @@ export function Composer({
             mime: a.mime,
             data_url: a.dataUrl,
         }));
+        const skillNames = selectedSkills.map((s) => s.name);
         setText("");
         setAttachments([]);
+        // Per-turn semantics: the picker clears after each send so
+        // the operator's next message doesn't accidentally re-apply
+        // the same skill. They can re-select if they want sticky.
+        setSelectedSkills([]);
         try {
-            await onSend(trimmed, wire);
+            await onSend(trimmed, wire, skillNames);
         } finally {
             setSubmitting(false);
         }
@@ -271,7 +352,7 @@ export function Composer({
     return (
         <form onSubmit={submit} className="execlaw-composer__form">
             <div className="execlaw-composer__shell" data-testid="composer-shell">
-                {attachments.length > 0 && (
+                {(attachments.length > 0 || selectedSkills.length > 0) && (
                     <div
                         className="execlaw-composer__attachments"
                         data-testid="composer-attachments"
@@ -294,6 +375,32 @@ export function Composer({
                                     onClick={() => removeAttachment(a.localId)}
                                     aria-label={`Remove ${a.name}`}
                                     data-testid="composer-attachment-remove"
+                                >
+                                    <i className="bi bi-x" aria-hidden />
+                                </button>
+                            </div>
+                        ))}
+                        {selectedSkills.map((s) => (
+                            <div
+                                key={s.name}
+                                className="execlaw-composer__skill-chip"
+                                data-testid="composer-skill-chip"
+                                data-skill-name={s.name}
+                                title={s.description}
+                            >
+                                <i
+                                    className="bi bi-stars"
+                                    aria-hidden
+                                />
+                                <span className="execlaw-composer__skill-chip-name">
+                                    {s.name}
+                                </span>
+                                <button
+                                    type="button"
+                                    className="execlaw-composer__attachment-remove"
+                                    onClick={() => removeSelectedSkill(s.name)}
+                                    aria-label={`Remove skill ${s.name}`}
+                                    data-testid="composer-skill-chip-remove"
                                 >
                                     <i className="bi bi-x" aria-hidden />
                                 </button>
@@ -327,7 +434,7 @@ export function Composer({
                 />
                 <div className="execlaw-composer__tools">
                     <div className="execlaw-composer__tools-left">
-                        {multimodal && (
+                        {(multimodal || !!getSkills) && (
                             <div
                                 ref={attachMenuRef}
                                 className="execlaw-composer__attach-anchor"
@@ -336,9 +443,13 @@ export function Composer({
                                     type="button"
                                     variant="link"
                                     className="execlaw-composer__attach-btn"
-                                    onClick={() =>
-                                        setAttachMenuOpen((v) => !v)
-                                    }
+                                    onClick={() => {
+                                        setAttachMenuOpen((v) => !v);
+                                        // Always reopen on the root view —
+                                        // no surprise "still in skill list"
+                                        // state from the previous open.
+                                        setAttachMenuMode("root");
+                                    }}
                                     aria-label="Attach"
                                     aria-haspopup="menu"
                                     aria-expanded={attachMenuOpen}
@@ -347,25 +458,135 @@ export function Composer({
                                 >
                                     <i className="bi bi-plus-lg" aria-hidden />
                                 </Button>
-                                {attachMenuOpen && (
+                                {attachMenuOpen && attachMenuMode === "root" && (
                                     <div
                                         className="execlaw-composer__attach-menu"
                                         role="menu"
                                         data-testid="composer-attach-menu"
                                     >
-                                        <button
-                                            type="button"
-                                            role="menuitem"
-                                            className="execlaw-composer__attach-menu-item"
-                                            onClick={onPickPhoto}
-                                            data-testid="composer-attach-photo"
-                                        >
-                                            <i
-                                                className="bi bi-image"
-                                                aria-hidden
-                                            />
-                                            <span>Attach photo</span>
-                                        </button>
+                                        {multimodal && (
+                                            <button
+                                                type="button"
+                                                role="menuitem"
+                                                className="execlaw-composer__attach-menu-item"
+                                                onClick={onPickPhoto}
+                                                data-testid="composer-attach-photo"
+                                            >
+                                                <i
+                                                    className="bi bi-image"
+                                                    aria-hidden
+                                                />
+                                                <span>Attach photo</span>
+                                            </button>
+                                        )}
+                                        {getSkills && (
+                                            <button
+                                                type="button"
+                                                role="menuitem"
+                                                className="execlaw-composer__attach-menu-item"
+                                                onClick={onPickSkill}
+                                                data-testid="composer-attach-skill"
+                                            >
+                                                <i
+                                                    className="bi bi-stars"
+                                                    aria-hidden
+                                                />
+                                                <span>Attach skill</span>
+                                            </button>
+                                        )}
+                                    </div>
+                                )}
+                                {attachMenuOpen && attachMenuMode === "skills" && (
+                                    <div
+                                        className="execlaw-composer__attach-menu execlaw-composer__attach-menu--skills"
+                                        role="menu"
+                                        data-testid="composer-skill-picker"
+                                    >
+                                        <div className="execlaw-composer__skill-picker-header">
+                                            <button
+                                                type="button"
+                                                className="execlaw-composer__skill-picker-back"
+                                                onClick={() =>
+                                                    setAttachMenuMode("root")
+                                                }
+                                                aria-label="Back to attach menu"
+                                                data-testid="composer-skill-picker-back"
+                                            >
+                                                <i
+                                                    className="bi bi-chevron-left"
+                                                    aria-hidden
+                                                />
+                                            </button>
+                                            <span>Pick skills for this turn</span>
+                                        </div>
+                                        {skillsLoading && (
+                                            <div
+                                                className="execlaw-composer__skill-picker-status"
+                                                data-testid="composer-skill-picker-loading"
+                                            >
+                                                Loading…
+                                            </div>
+                                        )}
+                                        {skillsError && (
+                                            <div
+                                                className="execlaw-composer__skill-picker-status execlaw-composer__skill-picker-status--error"
+                                                data-testid="composer-skill-picker-error"
+                                            >
+                                                {skillsError}
+                                            </div>
+                                        )}
+                                        {availableSkills &&
+                                            availableSkills.length === 0 &&
+                                            !skillsLoading &&
+                                            !skillsError && (
+                                                <div
+                                                    className="execlaw-composer__skill-picker-status"
+                                                    data-testid="composer-skill-picker-empty"
+                                                >
+                                                    No skills available. Create one
+                                                    on the Skills page.
+                                                </div>
+                                            )}
+                                        {availableSkills &&
+                                            availableSkills.map((s) => {
+                                                const checked = selectedSkills.some(
+                                                    (sel) => sel.name === s.name,
+                                                );
+                                                return (
+                                                    <button
+                                                        type="button"
+                                                        role="menuitemcheckbox"
+                                                        aria-checked={checked}
+                                                        key={s.name}
+                                                        className={
+                                                            "execlaw-composer__skill-picker-item" +
+                                                            (checked
+                                                                ? " is-checked"
+                                                                : "")
+                                                        }
+                                                        onClick={() =>
+                                                            toggleSkill(s)
+                                                        }
+                                                        data-testid="composer-skill-picker-item"
+                                                        data-skill-name={s.name}
+                                                    >
+                                                        <i
+                                                            className={
+                                                                checked
+                                                                    ? "bi bi-check-square"
+                                                                    : "bi bi-square"
+                                                            }
+                                                            aria-hidden
+                                                        />
+                                                        <span className="execlaw-composer__skill-picker-name">
+                                                            {s.name}
+                                                        </span>
+                                                        <span className="execlaw-composer__skill-picker-desc">
+                                                            {s.description}
+                                                        </span>
+                                                    </button>
+                                                );
+                                            })}
                                     </div>
                                 )}
                                 <input

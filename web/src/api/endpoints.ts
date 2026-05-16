@@ -195,6 +195,16 @@ export interface MessageView {
      * `/api/attachments/<id>`. Empty/absent for every other kind.
      */
     attachments?: MessageAttachment[];
+    /**
+     * 2026-05-15 — names of skills the operator picked from the
+     * composer's `+` menu (second item) when sending this user_msg.
+     * The skill bodies were prepended to `text` server-side; the SPA
+     * strips those `<skill name="...">...</skill>` blocks for
+     * display (see `stripSkillPrependBlock`) and renders the names
+     * as a chip under the bubble. Empty/absent for every other
+     * message kind and for user_msg events sent without a skill.
+     */
+    applied_skill_names?: string[];
 }
 
 export interface MessageAttachment {
@@ -292,6 +302,13 @@ export interface SendMessageRequest {
     /// so subsequent history hydration can re-encode them as
     /// OpenAI vision content parts when the backend is multimodal.
     attachments?: InlineAttachment[];
+    /// 2026-05-15 — names of skills the operator picked from the
+    /// composer's `+` menu (second item, "Attach skill"). The server
+    /// resolves each to its current body and prepends `<skill
+    /// name="...">...</skill>` blocks above the user text before the
+    /// model sees it. Sticky for THIS turn only — the picker clears
+    /// after each send. Empty/absent means "no skills attached".
+    skill_names?: string[];
 }
 
 export interface InlineAttachment {
