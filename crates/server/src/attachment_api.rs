@@ -352,6 +352,32 @@ impl AttachmentApi for ServerAttachmentApi {
             },
         )
         .map_err(|e| ApiError::Storage(format!("emit chart card close: {e}")))?;
+
+        // 2026-05-16 — auto-bridge the chart's PNG to the
+        // conversation's originating transport (signal /
+        // whatsapp / discord / slack / future plugins —
+        // channel-agnostic via the registry). Same proven pattern
+        // deep-research uses for its report PDF
+        // (`bridge_research_pdf_to_originating_transport` in
+        // `crates/server/src/research/runner.rs`) and that
+        // `send_attachment` uses for the in-chat chip.
+        //
+        // For Signal-bridged conversations the operator's chat IS
+        // Signal — they're not going to look at the web UI to see
+        // the chart. The web-UI Chart card stays as a fallback if
+        // the bridge dispatch fails.
+        //
+        // No-op for web-only conversations (the bridge returns
+        // early when no transport binding exists). Best-effort:
+        // failures log but don't propagate — the web-UI Chart
+        // card has already committed.
+        //
+        // Caption: prefer the chart's title (operator-meaningful
+        // context) over the bare filename — same convention as
+        // `send_attachment`.
+        let bridge_caption = title.map(str::trim).filter(|s| !s.is_empty());
+        self.bridge_to_originating_transport(attachment_id, filename, bridge_caption)
+            .await;
         Ok(())
     }
 }
@@ -545,6 +571,88 @@ mod tests {
         let api = ServerAttachmentApi::new(db, bus, cid);
         let err = api.send("nope", None).await.unwrap_err();
         assert!(matches!(err, ApiError::NotFound(_)));
+    }
+
+    /// Regression for the chart.render → cards-path migration
+    /// (commit `d80a002`) + the auto-bridge wire-up
+    /// (Option A, this commit). The chart's CardOpened+CardClosed
+    /// pair MUST land on the event bus carrying the SVG +
+    /// attachment_id in `details`, so the SPA's CardStore picks
+    /// them up + the ChartCard renderer mounts.
+    ///
+    /// Bridge behavior is exercised on the `send_emits_…` test
+    /// path implicitly — emit_chart_card calls the SAME helper
+    /// (`bridge_to_originating_transport`) that `send` uses, and
+    /// that helper no-ops without a transport binding (as is the
+    /// case in this test fixture). The shared-helper structure
+    /// means a regression that breaks the bridge for charts would
+    /// also break it for `send_attachment` and trip THAT test.
+    #[tokio::test]
+    async fn emit_chart_card_lands_open_close_pair_with_svg_and_attachment_id() {
+        let db = fresh_db();
+        let cid = seed_conv(&db, "c-chart");
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        // No transports/plugin_host wired — the bridge step is a
+        // no-op so this test focuses on the card emit. A
+        // production-equivalent test that DID wire a mock
+        // PluginHost lives outside this scope (the same coverage
+        // gap the existing `send_emits_card_open_then_close_pair`
+        // test has — bridge integration is exercised end-to-end
+        // through real Signal / WhatsApp fixtures).
+        let api = ServerAttachmentApi::new(db, bus, cid);
+
+        api.emit_chart_card(
+            "art-chart-123",
+            "<svg width=\"720\" height=\"400\"><g/></svg>",
+            "AAPL_1mo.png",
+            Some("AAPL — last month"),
+            720,
+            400,
+        )
+        .await
+        .unwrap();
+
+        let evt1 = rx.try_recv().unwrap();
+        let evt2 = rx.try_recv().unwrap();
+        match evt1 {
+            crate::events::UiEvent::CardOpened {
+                card_kind, details, ..
+            } => {
+                assert_eq!(
+                    card_kind, "chart",
+                    "CardOpened MUST use kind='chart' so the SPA's \
+                     `getCardRenderer(\"chart\")` dispatches to \
+                     ChartCard.tsx (the cards-path renderer)",
+                );
+                // The renderer reads `details.svg` and
+                // `details.attachment_id`; pin both.
+                assert!(
+                    details
+                        .get("svg")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .contains("<svg"),
+                    "details.svg MUST be the inline SVG markup, got: {details}",
+                );
+                assert_eq!(
+                    details.get("attachment_id").and_then(|v| v.as_str()),
+                    Some("art-chart-123"),
+                );
+            }
+            other => panic!("expected CardOpened(kind=chart), got {other:?}"),
+        }
+        match evt2 {
+            crate::events::UiEvent::CardClosed {
+                state,
+                attachment_id,
+                ..
+            } => {
+                assert_eq!(state, "Completed");
+                assert_eq!(attachment_id.as_deref(), Some("art-chart-123"));
+            }
+            other => panic!("expected CardClosed, got {other:?}"),
+        }
     }
 
     #[tokio::test]
