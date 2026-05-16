@@ -807,8 +807,10 @@ impl NativeServiceController {
     ///   1. `$OLLAMA_BINARY` env var (operator override, used by the
     ///      e2e tests to inject a fake binary).
     ///   2. `PATH` lookup.
-    ///   3. Homebrew prefixes — Apple Silicon (`/opt/homebrew/bin/ollama`)
-    ///      first, then Intel-mac fallback (`/usr/local/bin/ollama`).
+    ///   3. Homebrew prefix on Apple Silicon (`/opt/homebrew/bin/ollama`).
+    ///      Intel-Mac brew (`/usr/local/bin/ollama`) is intentionally
+    ///      omitted — the project doesn't support Intel Macs (see
+    ///      README "supported targets").
     ///
     /// Returns an actionable error when nothing matches — the
     /// supervisor surfaces this verbatim to the SPA wizard so the
@@ -841,11 +843,14 @@ impl NativeServiceController {
         if let Some(p) = path_lookup("ollama") {
             return Ok(p);
         }
-        for candidate in ["/opt/homebrew/bin/ollama", "/usr/local/bin/ollama"] {
-            let path = PathBuf::from(candidate);
-            if path.exists() {
-                return Ok(path);
-            }
+        // Apple-Silicon Homebrew prefix only. Intel-Mac brew lives
+        // at `/usr/local/bin/` but execlaw doesn't support Intel
+        // Macs, so we don't probe it — a stray `/usr/local/bin/ollama`
+        // on a Linux host would be a host-administrator decision
+        // best handled via OLLAMA_BINARY rather than implicit pickup.
+        let homebrew = PathBuf::from("/opt/homebrew/bin/ollama");
+        if homebrew.exists() {
+            return Ok(homebrew);
         }
         Err(ServiceError::Invalid(
             "ollama binary not found — install with `brew install ollama`, or \

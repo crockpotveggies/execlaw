@@ -1,21 +1,17 @@
 name: CI
 
 # Compile + run tests on every push and every pull request, across the
-# three CI-active targets:
+# three supported targets:
 #
 #   x86_64-unknown-linux-gnu      — ubuntu-latest
 #   x86_64-pc-windows-msvc        — windows-latest
 #   aarch64-apple-darwin          — macos-14 (Apple Silicon runners)
 #
-# `x86_64-apple-darwin` is intentionally NOT in the matrix. The
-# project still claims it as a supported target in the README and
-# code paths, but GitHub-hosted Intel-Mac runners (macos-13) are on
-# a deprecation path and were spending most of their CI window
-# queued rather than running. Apple Silicon coverage exercises the
-# same `target_os = "macos"` cfg surface, so dropping the Intel
-# variant doesn't materially weaken signal — if/when GitHub ships
-# a stable Intel-Mac replacement runner, add it back as a fourth
-# matrix entry.
+# Intel macOS (`x86_64-apple-darwin`) is intentionally NOT supported.
+# The only macOS-specific code path that warrants a dedicated build
+# is Metal-accelerated inference via Ollama; that requires an Apple
+# GPU and Intel Macs don't have one. README + docs spell this out
+# under "supported targets."
 #
 # Default Cargo features (plaintext SQLite) are used so the matrix
 # builds cleanly without needing Strawberry Perl on Windows. The

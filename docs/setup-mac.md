@@ -1,6 +1,6 @@
 # execlaw on macOS (Apple Silicon)
 
-This page covers first-run setup on an Apple Silicon Mac (M1 / M2 / M3 / M4). Intel Macs follow the Linux-with-Docker-Desktop path documented in the main README — they don't have Metal-class GPUs that execlaw can target.
+This page covers first-run setup on an Apple Silicon Mac (M1 / M2 / M3 / M4). **Intel Macs are not supported** — the only macOS-specific code path that justifies a dedicated build is Metal-accelerated inference via Ollama, which requires an Apple GPU. Run execlaw on Linux or Windows if you're on an Intel Mac.
 
 ## Why Apple Silicon is special
 
@@ -19,9 +19,8 @@ So on Apple Silicon, execlaw's control plane spawns **Ollama as a native macOS s
    1. `$OLLAMA_BINARY` env var (operator override).
    2. `PATH` lookup.
    3. `/opt/homebrew/bin/ollama` (Apple Silicon brew prefix).
-   4. `/usr/local/bin/ollama` (Intel-mac brew prefix, kept for completeness).
 
-   If none of those resolve, the wizard surfaces an actionable error verbatim: `ollama binary not found — install with brew install ollama, or set OLLAMA_BINARY to an absolute path`.
+   The Intel-Mac brew prefix (`/usr/local/bin/`) is intentionally NOT probed — Intel Macs aren't supported. If none of the above resolve, the wizard surfaces an actionable error verbatim: `ollama binary not found — install with brew install ollama, or set OLLAMA_BINARY to an absolute path`.
 
 3. **Disk space.** Pick a model that fits in unified memory **and** has room on disk for the GGUF blob:
    - `qwen2.5:7b-instruct-q4_K_M` — ~4.4 GB on disk, ~5 GB RAM.

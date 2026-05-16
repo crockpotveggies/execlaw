@@ -158,8 +158,8 @@ jobs:
           body: |
             ## execlaw ${{ github.ref_name }} — macOS bundle
 
-            **Apple Silicon only.** Intel Macs follow the Linux-with-Docker path
-            (see [docs/setup-mac.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/setup-mac.md)).
+            **Apple Silicon only.** Intel Macs are not supported — run execlaw on
+            Linux or Windows instead (see [docs/setup-mac.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/setup-mac.md)).
 
             ### Install
             1. Download `execlaw_<version>_aarch64.dmg` below.

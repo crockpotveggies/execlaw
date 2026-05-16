@@ -356,8 +356,11 @@ cargo run -p execlaw -- replay <conversation_id> --at <seq>
 
 Requires Rust 1.85+ (edition 2024). Bare-metal targets:
 `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`,
-`x86_64-apple-darwin`, `aarch64-apple-darwin`. Service registration
-on each is handled by the
+`aarch64-apple-darwin`. Intel Macs (`x86_64-apple-darwin`) are
+explicitly **not** supported — the only macOS-specific code path
+that matters is Metal-accelerated inference via Ollama, which lives
+on Apple Silicon. Service registration on each supported target is
+handled by the
 [`service-manager`](https://crates.io/crates/service-manager) crate.
 
 ### Disk-space note
