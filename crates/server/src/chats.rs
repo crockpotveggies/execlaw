@@ -345,13 +345,7 @@ pub async fn send_message(
     // for tests that exercise the in-process path directly.
     let runner_eligible = state.runner_supervisor.is_some() && inference_for_turn.is_some();
     let runner_routed = if runner_eligible {
-        match resolve_chat_group(&state, &cid, &principal).await {
-            Ok(group_id) => Some(group_id),
-            Err(e) => {
-                tracing::warn!(error = %e, "runner routing skipped: group resolve failed");
-                None
-            }
-        }
+        resolve_runner_routed_group(&state, &cid, &principal).await
     } else {
         None
     };
@@ -1063,6 +1057,55 @@ async fn run_real_turn(
 /// principals)` directly when they land. The web case maps every
 /// controller-initiated chat to the same `(web, {controller})`
 /// group.
+/// 2026-05-16 — resolve which principal_group's runner a SPA
+/// send should execute on.
+///
+/// Lookup order:
+///
+///   1. **Conversation's bound `principal_group_id`** — when the
+///      conversation is already linked to a transport group (a
+///      Signal group, WhatsApp group, controller's Signal-DM
+///      thread, etc.), the turn runs on THAT group's runner. The
+///      Controller is one participant; the runner identity
+///      belongs to the conversation, not to the Controller. Pre-
+///      fix this path always returned the Controller's own group,
+///      so a Controller reply into a 5-person Signal group thread
+///      executed on the Controller's private runner — comingling
+///      KV cache, tool side-effects, and event traces with the
+///      Controller's other threads. Symmetric with the inbound
+///      side in `dispatch_external_turn`: both directions of a
+///      Signal-group thread now converge on the SAME runner.
+///
+///   2. **Fall back to `resolve_chat_group`** — fresh web-only
+///      conversation with no binding yet. `resolve_chat_group`
+///      mints + binds a Controller-only principal_group, so the
+///      next turn on this conversation hits step 1's fast path.
+///
+/// Returns `None` only when both lookups fail (DB error). Callers
+/// that get `None` should fall through to the in-process turn
+/// path rather than failing the request.
+pub(crate) async fn resolve_runner_routed_group(
+    state: &AppState,
+    cid: &ConversationId,
+    principal: &execlaw_core::principal::Principal,
+) -> Option<String> {
+    use execlaw_core::principal_groups::PrincipalGroupStore;
+    if let Some(g) = PrincipalGroupStore::new(&state.db)
+        .principal_group_id_for(cid.as_str())
+        .ok()
+        .flatten()
+    {
+        return Some(g);
+    }
+    match resolve_chat_group(state, cid, principal).await {
+        Ok(group_id) => Some(group_id),
+        Err(e) => {
+            tracing::warn!(error = %e, "runner routing skipped: group resolve failed");
+            None
+        }
+    }
+}
+
 async fn resolve_chat_group(
     state: &AppState,
     cid: &ConversationId,
@@ -2604,6 +2647,19 @@ pub async fn dispatch_routine_turn(
     let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
     // Phase 12.E — same per-turn resolver as send_message uses.
     let inference_for_turn = state.inference.resolve(&state.db, BackendPurpose::Standard);
+    // 2026-05-16 — KNOWN ASYMMETRY: this path does NOT route
+    // through `run_runner_turn`, only the in-process
+    // `run_tool_capable_turn` / `run_real_turn` arms. That means
+    // a routine firing against a Signal-group-bound conversation
+    // executes inside the SERVER process, not inside that group's
+    // dedicated runner container — sister to the
+    // send_message bug fixed in this same commit but bigger:
+    // adding runner routing here requires plumbing
+    // `ensure_for_group` + cancellation + the supervisor's
+    // `forward_turn` drain loop into the routine dispatcher. The
+    // user-facing impact is currently low (routines on
+    // transport-bridged conversations are rare; most routines
+    // target the Controller's web thread). Tracked as follow-up.
     // Routine timezone: each routine row stores its own IANA zone
     // (the scheduler uses it for cron evaluation). Read it once here
     // so the agent's per-turn context renders bare clock times in
@@ -3487,6 +3543,19 @@ pub async fn dispatch_clarification_turn(
 
     let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
     let inference_for_turn = state.inference.resolve(&state.db, BackendPurpose::Standard);
+    // 2026-05-16 — KNOWN ASYMMETRY (same as `dispatch_routine_turn`
+    // above): this path runs entirely in-process and never hits
+    // the runner supervisor, so a clarification firing against a
+    // Signal-group-bound conversation executes in the server
+    // rather than in that group's dedicated runner. send_message
+    // gained per-conversation runner routing in this same commit;
+    // wiring it here is a follow-up — the clarification path is
+    // load-light (one turn per research job that asks for
+    // disambiguation) so the asymmetry doesn't materially leak
+    // group state today, but the architectural invariant
+    // ("group conversations run on their own runner") is
+    // violated whenever a research clarification fires inside a
+    // multi-party Signal chat.
     // Synthetic clarification turn — no operator-supplied timezone.
     // The model just relays a question; date arithmetic isn't on
     // this path's hot list.
@@ -7483,5 +7552,131 @@ required_capabilities = []
         )
         .await;
         assert!(body["display_name"].is_null(), "explicit null must clear");
+    }
+
+    // ==================================================================
+    // resolve_runner_routed_group (2026-05-16)
+    //
+    // The Controller SPA-send path used to route every turn to the
+    // Controller's own runner regardless of whether the conversation
+    // was bridged onto a transport. Replies into a 5-person Signal
+    // group thread executed on the Controller's private runner,
+    // co-mingling group-chat KV cache + tool side-effects with the
+    // Controller's other threads. Fix: read the conversation's bound
+    // `principal_group_id` first; only fall back to `resolve_chat_group`
+    // when no binding exists yet.
+    //
+    // These tests pin both branches:
+    //   1. Binding present → return it (Signal-group runner case).
+    //   2. Binding absent → fall back AND leave a binding behind
+    //      (the second turn on this conversation hits branch 1).
+    // ==================================================================
+
+    fn controller_principal_for_test() -> execlaw_core::principal::Principal {
+        execlaw_core::principal::Principal {
+            id: execlaw_core::ids::PrincipalId::from("controller"),
+            identifiers: vec![],
+            trust_level: execlaw_core::principal::TrustLevel::Controller,
+            resolved_by: vec![],
+            metadata: serde_json::json!({}),
+            first_seen: chrono::Utc::now().timestamp(),
+            last_seen: None,
+            controller_notes: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_runner_routed_group_prefers_conversation_binding_over_controller_default() {
+        // Simulates a Signal-group thread the Controller is typing
+        // into via the SPA. The conversation is already bound to
+        // the group's principal_group (the inbound path bound it
+        // when the group first messaged). A SPA send must route
+        // onto the GROUP's runner — not re-resolve via
+        // resolve_chat_group (which always yields the Controller's
+        // group).
+        use execlaw_core::ids::PrincipalId;
+        use execlaw_core::principal_groups::{GroupKey, PrincipalGroupStore};
+
+        let state = test_app_state();
+        let cid = ConversationId::from("conv-signal-group-thread");
+        ensure_conversation_for(&state.db, &cid);
+
+        // Mint a Signal-group principal_group (someone other than
+        // the Controller — channel="signal", native_group_id set).
+        let pg_store = PrincipalGroupStore::new(&state.db);
+        let other = PrincipalId::from("pri_signal_someone");
+        let group = pg_store
+            .resolve(
+                &GroupKey {
+                    channel: "signal",
+                    native_group_id: Some("test-native-group"),
+                    principals: &[other.clone()],
+                    includes_controller: true,
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .unwrap();
+        pg_store
+            .bind_conversation(cid.as_str(), &group.group_id)
+            .unwrap();
+
+        let principal = controller_principal_for_test();
+        let resolved = super::resolve_runner_routed_group(&state, &cid, &principal).await;
+        assert_eq!(
+            resolved.as_deref(),
+            Some(group.group_id.as_str()),
+            "SPA send on a transport-bound conversation MUST route onto the bound \
+             principal_group's runner, not the Controller's default group",
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_runner_routed_group_falls_back_to_resolve_chat_group_for_unbound_conv() {
+        // Brand-new web-only conversation with no binding yet —
+        // the resolver mints + binds the Controller's group via
+        // `resolve_chat_group`. Side effect: the second call
+        // hits the binding fast path. This mirrors how a fresh
+        // SPA thread behaves on first send.
+        use execlaw_core::principal_groups::PrincipalGroupStore;
+
+        let state = test_app_state();
+        let cid = ConversationId::from("conv-fresh-unbound");
+        ensure_conversation_for(&state.db, &cid);
+
+        // Pre-condition: no binding.
+        let pg_store = PrincipalGroupStore::new(&state.db);
+        assert!(
+            pg_store
+                .principal_group_id_for(cid.as_str())
+                .unwrap()
+                .is_none(),
+            "test precondition: fresh conversation must start with no binding",
+        );
+
+        let principal = controller_principal_for_test();
+        let first = super::resolve_runner_routed_group(&state, &cid, &principal).await;
+        assert!(
+            first.is_some(),
+            "fallback to resolve_chat_group must yield SOME group_id"
+        );
+        let first_id = first.unwrap();
+
+        // Side effect: the conversation is now bound to that
+        // group, so the second call goes through the fast path
+        // and yields the same id without re-resolving.
+        let after_binding = pg_store.principal_group_id_for(cid.as_str()).unwrap();
+        assert_eq!(
+            after_binding.as_deref(),
+            Some(first_id.as_str()),
+            "first call must leave a binding behind so subsequent turns are O(1) lookup",
+        );
+
+        let second = super::resolve_runner_routed_group(&state, &cid, &principal).await;
+        assert_eq!(
+            second.as_deref(),
+            Some(first_id.as_str()),
+            "second call (binding now present) must return the same group_id via the \
+             fast path — NOT mint a duplicate via resolve_chat_group",
+        );
     }
 }
