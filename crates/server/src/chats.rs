@@ -2647,19 +2647,18 @@ pub async fn dispatch_routine_turn(
     let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
     // Phase 12.E — same per-turn resolver as send_message uses.
     let inference_for_turn = state.inference.resolve(&state.db, BackendPurpose::Standard);
-    // 2026-05-16 — KNOWN ASYMMETRY: this path does NOT route
-    // through `run_runner_turn`, only the in-process
-    // `run_tool_capable_turn` / `run_real_turn` arms. That means
-    // a routine firing against a Signal-group-bound conversation
-    // executes inside the SERVER process, not inside that group's
-    // dedicated runner container — sister to the
-    // send_message bug fixed in this same commit but bigger:
-    // adding runner routing here requires plumbing
-    // `ensure_for_group` + cancellation + the supervisor's
-    // `forward_turn` drain loop into the routine dispatcher. The
-    // user-facing impact is currently low (routines on
-    // transport-bridged conversations are rare; most routines
-    // target the Controller's web thread). Tracked as follow-up.
+    // 2026-05-16 — sister fix to `dispatch_external_turn`'s
+    // runner-routing branch (chats.rs ~line 3015). Pre-fix, this
+    // path always fell into `run_tool_capable_turn` / `run_real_turn`,
+    // so a routine fired against a Signal-group-bound conversation
+    // ran inside the server process instead of inside the group's
+    // dedicated runner — same isolation violation the send_message
+    // path used to have. Route to `run_runner_turn` when the
+    // conversation is already bound to a principal_group AND the
+    // supervisor + inference are available. No `resolve_chat_group`
+    // fallback here on purpose — a routine should not mint a
+    // Controller-only group as a side effect for an unbound
+    // conversation; let those keep using the in-process arms.
     // Routine timezone: each routine row stores its own IANA zone
     // (the scheduler uses it for cron evaluation). Read it once here
     // so the agent's per-turn context renders bare clock times in
@@ -2687,8 +2686,58 @@ pub async fn dispatch_routine_turn(
         crate::group_addressing::AddressedReason::EligibilityBypass,
     );
 
-    let result = match inference_for_turn {
-        Some(inference) if has_plugin_tools => {
+    let runner_routed_group: Option<String> =
+        if state.runner_supervisor.is_some() && inference_for_turn.is_some() {
+            use execlaw_core::principal_groups::PrincipalGroupStore;
+            match PrincipalGroupStore::new(&state.db).principal_group_id_for(cid.as_str()) {
+                Ok(opt) => opt,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "chats::dispatch_routine_turn",
+                        conversation_id = %cid.as_str(),
+                        error = %e,
+                        "runner routing skipped: principal_group lookup failed",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    let result = match (inference_for_turn, runner_routed_group.as_deref()) {
+        (Some(_inference), Some(group_id)) => {
+            let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
+                state.turn_cancel.clone(),
+                cid.as_str().to_owned(),
+            );
+            let cancel_flag = cancel_guard.flag.clone();
+            let res = run_runner_turn(RunnerTurnCtx {
+                state,
+                group_id,
+                cid: &cid,
+                user_text: prompt,
+                sender_principal_id: sender.clone(),
+                // Controller-authored cron firing — no untrusted
+                // content to spotlight.
+                spotlight_content: false,
+                cancel_flag,
+                caller_caps: caller_caps.clone(),
+                caller_trust,
+                // Controller-trust → planner/executor split is OFF.
+                planner_executor: false,
+                inbound_channel_origin: None,
+                caller_timezone: routine_tz_ref,
+                group_context: routine_group_ctx.clone(),
+                attachment_ids: Vec::new(),
+                // Routines don't surface a skill picker.
+                applied_skill_names: Vec::new(),
+            })
+            .await;
+            drop(cancel_guard);
+            res
+        }
+        (Some(inference), None) if has_plugin_tools => {
             run_tool_capable_turn(
                 state,
                 inference.clone(),
@@ -2712,7 +2761,7 @@ pub async fn dispatch_routine_turn(
             )
             .await
         }
-        Some(inference) => {
+        (Some(inference), None) => {
             // Spotlighting off: the prompt comes from the operator,
             // not from an external sender, so no untrusted-content
             // wrapping needed.
@@ -2747,7 +2796,7 @@ pub async fn dispatch_routine_turn(
             drop(cancel_guard);
             res
         }
-        None => run_stub_turn(
+        (None, _) => run_stub_turn(
             state,
             &cid,
             prompt,
@@ -3543,19 +3592,15 @@ pub async fn dispatch_clarification_turn(
 
     let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
     let inference_for_turn = state.inference.resolve(&state.db, BackendPurpose::Standard);
-    // 2026-05-16 — KNOWN ASYMMETRY (same as `dispatch_routine_turn`
-    // above): this path runs entirely in-process and never hits
-    // the runner supervisor, so a clarification firing against a
-    // Signal-group-bound conversation executes in the server
-    // rather than in that group's dedicated runner. send_message
-    // gained per-conversation runner routing in this same commit;
-    // wiring it here is a follow-up — the clarification path is
-    // load-light (one turn per research job that asks for
-    // disambiguation) so the asymmetry doesn't materially leak
-    // group state today, but the architectural invariant
-    // ("group conversations run on their own runner") is
-    // violated whenever a research clarification fires inside a
-    // multi-party Signal chat.
+    // 2026-05-16 — sister fix to `dispatch_external_turn` +
+    // `dispatch_routine_turn`. Route this synthetic
+    // orchestrator-fired turn through the conversation's bound
+    // runner so a research clarification firing inside a
+    // multi-party Signal chat executes in that group's dedicated
+    // container, not the shared server process. Same lookup-only
+    // shape: no `resolve_chat_group` fallback, because an unbound
+    // clarification has no business minting a Controller-only
+    // group on the side.
     // Synthetic clarification turn — no operator-supplied timezone.
     // The model just relays a question; date arithmetic isn't on
     // this path's hot list.
@@ -3570,8 +3615,56 @@ pub async fn dispatch_clarification_turn(
         cid,
         crate::group_addressing::AddressedReason::EligibilityBypass,
     );
-    let result = match inference_for_turn {
-        Some(inference) if has_plugin_tools => {
+    let runner_routed_group: Option<String> =
+        if state.runner_supervisor.is_some() && inference_for_turn.is_some() {
+            use execlaw_core::principal_groups::PrincipalGroupStore;
+            match PrincipalGroupStore::new(&state.db).principal_group_id_for(cid.as_str()) {
+                Ok(opt) => opt,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "chats::dispatch_clarification_turn",
+                        conversation_id = %cid.as_str(),
+                        error = %e,
+                        "runner routing skipped: principal_group lookup failed",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    let result = match (inference_for_turn, runner_routed_group.as_deref()) {
+        (Some(_inference), Some(group_id)) => {
+            let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
+                state.turn_cancel.clone(),
+                cid.as_str().to_owned(),
+            );
+            let cancel_flag = cancel_guard.flag.clone();
+            let res = run_runner_turn(RunnerTurnCtx {
+                state,
+                group_id,
+                cid,
+                user_text: &prompt,
+                sender_principal_id: sender.clone(),
+                // Server-authored orchestrator prompt — no untrusted
+                // content to spotlight.
+                spotlight_content: false,
+                cancel_flag,
+                caller_caps: caller_caps.clone(),
+                caller_trust,
+                // Controller-trust → planner/executor split is OFF.
+                planner_executor: false,
+                inbound_channel_origin: None,
+                caller_timezone,
+                group_context: synth_group_ctx.clone(),
+                attachment_ids: Vec::new(),
+                applied_skill_names: Vec::new(),
+            })
+            .await;
+            drop(cancel_guard);
+            res
+        }
+        (Some(inference), None) if has_plugin_tools => {
             run_tool_capable_turn(
                 state,
                 inference.clone(),
@@ -3594,7 +3687,7 @@ pub async fn dispatch_clarification_turn(
             )
             .await
         }
-        Some(inference) => {
+        (Some(inference), None) => {
             let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
                 state.turn_cancel.clone(),
                 cid.as_str().to_owned(),
@@ -3619,7 +3712,7 @@ pub async fn dispatch_clarification_turn(
             drop(cancel_guard);
             res
         }
-        None => run_stub_turn(
+        (None, _) => run_stub_turn(
             state,
             cid,
             &prompt,
