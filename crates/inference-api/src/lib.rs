@@ -12,8 +12,36 @@
 
 #![forbid(unsafe_code)]
 
+mod ollama;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Which wire protocol an [`InferenceClient`] speaks. The default —
+/// `OpenAICompat` — works for vLLM / llama-server / OpenArc / the
+/// vast majority of self-hosted endpoints. `Ollama` switches the
+/// client to Ollama's native `/api/chat` endpoint because the
+/// daemon's `/v1/chat/completions` shim has been observed to drop
+/// `tool_calls` on small models — the agent would see plain
+/// `content` text like `(web_search "…")` instead of a structured
+/// call. See `crates/inference-api/src/ollama.rs` for the
+/// translation layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferenceEngine {
+    /// vLLM, llama-server, OpenArc, or anything else that speaks
+    /// OpenAI's `/v1/chat/completions`. Default.
+    OpenAICompat,
+    /// Native Ollama daemon. Same URL, different path
+    /// (`/api/chat` instead of `/v1/chat/completions`); the
+    /// translation happens inside the client.
+    Ollama,
+}
+
+impl Default for InferenceEngine {
+    fn default() -> Self {
+        Self::OpenAICompat
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Model + chat types (OpenAI function-calling schema)
@@ -442,6 +470,12 @@ fn base_inference_http_client() -> reqwest::Client {
 pub struct InferenceClient {
     pub base_url: String,
     pub api_key: Option<String>,
+    /// Wire protocol the client speaks. `OpenAICompat` is the
+    /// default; callers (typically `inference_resolver` in the
+    /// server crate) flip to `Ollama` for Apple-Silicon backends
+    /// where the OpenAI-compat shim's tool-call extraction is
+    /// unreliable.
+    pub engine: InferenceEngine,
     http: reqwest::Client,
 }
 
@@ -480,12 +514,21 @@ impl InferenceClient {
         Self {
             base_url: base_url.into(),
             api_key: None,
+            engine: InferenceEngine::default(),
             http,
         }
     }
 
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
+        self
+    }
+
+    /// Builder hop that selects the wire protocol. Set to
+    /// [`InferenceEngine::Ollama`] for Apple-Silicon native
+    /// Ollama backends; defaults to OpenAI-compat otherwise.
+    pub fn with_engine(mut self, engine: InferenceEngine) -> Self {
+        self.engine = engine;
         self
     }
 
@@ -497,6 +540,19 @@ impl InferenceClient {
         &self,
         req: &ChatRequest,
     ) -> Result<ChatResponse, InferenceError> {
+        if self.engine == InferenceEngine::Ollama {
+            // Route to the native /api/chat endpoint. Ollama's
+            // OpenAI shim has been observed to drop tool_calls on
+            // small qwen quants — the native path returns them
+            // structured.
+            return ollama::chat_completions(
+                &self.http,
+                &self.base_url,
+                self.api_key.as_deref(),
+                req,
+            )
+            .await;
+        }
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         // 2026-05-12 — HTTP-layer timing instrumented on the
         // `agent::turn_timing` target so the operator can split
@@ -598,6 +654,20 @@ impl InferenceClient {
         InferenceError,
     > {
         use futures::StreamExt;
+
+        if self.engine == InferenceEngine::Ollama {
+            // Native NDJSON stream from /api/chat. The translation
+            // layer wraps each frame in a ChatStreamChunk so the
+            // upstream aggregator stays on its OpenAI-flavored
+            // consumer.
+            return ollama::chat_completions_stream(
+                &self.http,
+                &self.base_url,
+                self.api_key.as_deref(),
+                req,
+            )
+            .await;
+        }
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let mut r = self.http.post(&url).json(&ChatRequestStreaming(req));

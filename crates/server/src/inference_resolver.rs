@@ -31,7 +31,7 @@
 
 use execlaw_core::Database;
 use execlaw_core::backends::{BackendMode, BackendPurpose, BackendStore};
-use execlaw_inference_api::InferenceClient;
+use execlaw_inference_api::{InferenceClient, InferenceEngine};
 use std::sync::Arc;
 
 /// Fallback `model` id when the operator's backend row has no
@@ -152,9 +152,24 @@ impl InferenceResolver {
                 let endpoint = r.endpoint.clone().filter(|s| !s.trim().is_empty());
                 let row_model = extract_model_arg(&r.model_spec_json);
                 let reasoning_enabled = r.reasoning_enabled;
+                // Apple-Silicon Ollama backends speak through
+                // Ollama's native /api/chat endpoint rather than
+                // the OpenAI-compat shim — the shim drops
+                // tool_calls on small qwen quants. The
+                // `binary_hint: "ollama"` marker on the
+                // managed-row envelope (written by
+                // `backend_presets::materialise_spec`) is the
+                // discriminator.
+                let engine = if is_ollama_binary_hint(&r.model_spec_json) {
+                    InferenceEngine::Ollama
+                } else {
+                    InferenceEngine::OpenAICompat
+                };
                 match endpoint {
                     Some(url) => Some(ResolvedInference {
-                        client: Arc::new(InferenceClient::new(url.clone())),
+                        client: Arc::new(
+                            InferenceClient::new(url.clone()).with_engine(engine),
+                        ),
                         model_id: row_model
                             .or_else(|| self.bootstrap_model.clone())
                             .unwrap_or_else(|| DEFAULT_FALLBACK_MODEL.to_owned()),
@@ -217,6 +232,17 @@ impl InferenceResolver {
 /// Without the top-level check, Ollama rows fell through to the
 /// vLLM default ("QuantTrio/Qwen3.6-27B-AWQ") and Ollama 404'd at
 /// chat time.
+/// `true` when the row's `model_spec_json.binary_hint` declares
+/// the native runtime is Ollama. Used by `resolve()` to pick the
+/// Ollama-native client over the OpenAI-compat path. Case-
+/// insensitive; missing field → `false`.
+fn is_ollama_binary_hint(spec: &serde_json::Value) -> bool {
+    spec.get("binary_hint")
+        .and_then(|v| v.as_str())
+        .map(|s| s.eq_ignore_ascii_case("ollama"))
+        .unwrap_or(false)
+}
+
 fn extract_model_arg(spec: &serde_json::Value) -> Option<String> {
     // 1. Top-level `model` field (Ollama / future native engines).
     if let Some(s) = spec.get("model").and_then(|v| v.as_str()) {
