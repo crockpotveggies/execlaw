@@ -67,3 +67,62 @@ pub use mime::{
     mime_bundle_from_jupyter_data, ExecuteOutput, ExecuteResult, ExecuteStatus, MimeBundle,
     StreamName,
 };
+
+// ----------------------------------------------------------------
+// Process-wide service handle. 2026-05-18.
+//
+// `wire_python_sandbox` constructs the service in a spawned task
+// after the supervisor has the kernel-gateway sidecar healthy
+// (the wiring runs ~2s after axum::serve() comes up so it can wait
+// for fire_on_enable_for_all to spawn the container). The service
+// then needs to be reachable from request handlers — specifically
+// the `DELETE /api/chats/{id}` handler, which calls
+// `on_conversation_deleted` to delete `/work/<convo>/` from the
+// sidecar's bind-mount.
+//
+// AppState can't own the field directly because AppState is built
+// BEFORE wiring runs (the chicken-and-egg: AppState needs the
+// supervisor to be wired into routes, but wiring needs AppState to
+// be alive to read the supervisor handle). A process-wide
+// OnceLock keeps the API minimal: cli/main.rs calls
+// `set_service(svc)` exactly once after wiring succeeds; any
+// handler reads `service()` and degrades gracefully when None
+// (plugin not installed, sidecar not healthy, wiring failed).
+//
+// The OnceLock ALSO doubles as a liveness anchor for the service's
+// OutputWatcher (notify OS thread + tokio timer task). Without
+// something holding the Arc, Drop would run as soon as the
+// spawned-wiring-task exited and the watcher would stop publishing
+// streamed artifacts mid-execution. Single source of truth here
+// means we don't need a separate "keep this alive" static in
+// cli/main.rs anymore.
+
+use std::sync::Arc;
+use std::sync::OnceLock;
+
+static SERVICE: OnceLock<Arc<PythonSandboxService>> = OnceLock::new();
+
+/// Set the process-wide python-sandbox service handle. Called once
+/// from `cli/main.rs` after `wire_python_sandbox` returns a live
+/// service. Subsequent calls are silently ignored (OnceLock
+/// semantics) so a bug that calls this twice won't panic — but
+/// also won't replace the handle.
+pub fn set_service(svc: Arc<PythonSandboxService>) {
+    let _ = SERVICE.set(svc);
+}
+
+/// Read the process-wide python-sandbox service handle.
+///
+/// Returns `None` when:
+///   * the plugin isn't installed (boot wiring returned None)
+///   * the kernel-gateway sidecar never became healthy
+///   * wiring errored out
+///   * called from a test that doesn't boot the full server
+///
+/// Callers MUST degrade gracefully to "skip the sandbox-side
+/// work" rather than fail the request. The delete-thread handler,
+/// for instance, still deletes the conversation row + events even
+/// when the sidecar work-dir cleanup can't run.
+pub fn service() -> Option<Arc<PythonSandboxService>> {
+    SERVICE.get().cloned()
+}

@@ -309,9 +309,50 @@ pub(crate) fn commit_decoded_attachments(
     cid: &ConversationId,
     decoded: &[DecodedAttachment],
 ) -> Result<Vec<String>, crate::routes::ApiError> {
+    use execlaw_core::attachments::AttachmentStore;
+
+    // 2026-05-18 — suffix-on-conflict (audit-pass follow-up).
+    // Before persisting, build the set of already-used filenames
+    // on this conversation so colliding uploads land as
+    // `data (1).csv` rather than overwriting the first blob on
+    // disk during Phase-3 hydration. Without this fix, two
+    // uploads of `data.csv` would (a) leave the older row
+    // orphaned (no on-disk file), (b) tell the agent two files
+    // exist via the prose block's dedupe behavior — wait, the
+    // prose dedupes to ONE bullet, which is correct, but the
+    // operator legitimately attached two different files and one
+    // is silently lost. Better to keep both.
+    //
+    // Pre-existing filenames sourced from state_attachments;
+    // in-payload duplicates resolved against the running set as
+    // we walk `decoded` so two files named `data.csv` picked in
+    // a single send land as `data.csv` + `data (1).csv`.
+    let mut used: std::collections::HashSet<String> = AttachmentStore::new(&state.db)
+        .list_for_conversation(cid)
+        .map_err(|e| crate::routes::ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "attachment_write_failed",
+            message: format!("list existing attachments for collision check: {e}"),
+        })?
+        .into_iter()
+        .filter_map(|r| r.filename)
+        .collect();
+
     let mut ids = Vec::with_capacity(decoded.len());
     for (idx, d) in decoded.iter().enumerate() {
-        let id = write_attachment_blob(state, cid, &d.mime, &d.bytes, d.filename.as_deref())
+        // For images the filename is optional (vision content
+        // doesn't surface a name to the model). When absent, skip
+        // the collision check entirely — `write_attachment_blob`
+        // writes a content-addressed blob with no name.
+        let persisted_name = match d.filename.as_deref() {
+            Some(requested) if !requested.is_empty() => {
+                let resolved = unique_filename(requested, &used);
+                used.insert(resolved.clone());
+                Some(resolved)
+            }
+            _ => None,
+        };
+        let id = write_attachment_blob(state, cid, &d.mime, &d.bytes, persisted_name.as_deref())
             .map_err(|e| crate::routes::ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "attachment_write_failed",
@@ -320,6 +361,52 @@ pub(crate) fn commit_decoded_attachments(
         ids.push(id);
     }
     Ok(ids)
+}
+
+/// Resolve a filename collision by appending ` (N)` before the
+/// extension. Mirrors how every major OS file picker resolves
+/// the same case ("data.csv" → "data (1).csv" → "data (2).csv").
+///
+/// Preserves the extension (last `.<ext>` of ≤16 bytes) so the
+/// MIME-by-extension routing still works after the suffix. If
+/// the base has no recognizable extension, the counter goes at
+/// the very end (`notes` → `notes (1)`).
+///
+/// Bounded at 1000 iterations as a safety net — at that point
+/// something else is wrong (1000 collisions would imply a
+/// near-exact-name spammer or a runaway loop) and we fail loud
+/// rather than block forever. Returns the un-suffixed name as a
+/// fallback so the caller still proceeds; the agent will see
+/// the dedupe-in-prose code (gap 5 fix) kick in as a second line
+/// of defense.
+fn unique_filename(base: &str, used: &std::collections::HashSet<String>) -> String {
+    if !used.contains(base) {
+        return base.to_owned();
+    }
+    // Split into stem + extension. Same rule as sanitize_filename's
+    // truncation path: extension is the trailing `.<chars>` of
+    // ≤16 bytes, anything longer is treated as opaque suffix.
+    let (stem, ext) = match base.rsplit_once('.') {
+        Some((s, e)) if !e.is_empty() && e.len() <= 16 => (s, Some(e)),
+        _ => (base, None),
+    };
+    for n in 1..=1000 {
+        let candidate = match ext {
+            Some(e) => format!("{stem} ({n}).{e}"),
+            None => format!("{stem} ({n})"),
+        };
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+    }
+    tracing::warn!(
+        target: "chats::commit_decoded_attachments",
+        base = %base,
+        "filename collision counter exhausted at 1000; falling back to un-suffixed name. \
+         The hydration overwrite + prose dedupe will smooth this over but the operator may \
+         see a file silently replaced — escalate if this triggers in practice."
+    );
+    base.to_owned()
 }
 
 /// Shared core for persisting an attachment's raw bytes. Writes
@@ -1390,6 +1477,110 @@ mod tests {
         assert!(
             alpha_pos < middle_pos && middle_pos < zebra_pos,
             "files should be alphabetical:\n\n{block}",
+        );
+    }
+
+    // ------------------------------------------------------------
+    // Filename collision suffix-on-conflict tests (2026-05-18,
+    // remaining-work pass). Cover the cross-payload and
+    // in-payload collision cases via the pure `unique_filename`
+    // helper. The DB-touching `commit_decoded_attachments` is
+    // exercised by integration tests; here we lock the algorithm.
+    // ------------------------------------------------------------
+
+    #[test]
+    fn unique_filename_returns_base_when_no_collision() {
+        let used = std::collections::HashSet::new();
+        assert_eq!(unique_filename("data.csv", &used), "data.csv");
+    }
+
+    #[test]
+    fn unique_filename_appends_paren_one_on_first_collision() {
+        let used: std::collections::HashSet<String> =
+            ["data.csv".to_owned()].into_iter().collect();
+        assert_eq!(unique_filename("data.csv", &used), "data (1).csv");
+    }
+
+    #[test]
+    fn unique_filename_increments_through_existing_suffixes() {
+        let used: std::collections::HashSet<String> = [
+            "data.csv".to_owned(),
+            "data (1).csv".to_owned(),
+            "data (2).csv".to_owned(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(unique_filename("data.csv", &used), "data (3).csv");
+    }
+
+    #[test]
+    fn unique_filename_preserves_extension_for_pandas_routing() {
+        // pandas + open() rely on the extension. The suffix must
+        // go BEFORE the .csv, not after.
+        let used: std::collections::HashSet<String> =
+            ["report.pdf".to_owned()].into_iter().collect();
+        let result = unique_filename("report.pdf", &used);
+        assert!(result.ends_with(".pdf"), "extension lost: {result}");
+        assert_eq!(result, "report (1).pdf");
+    }
+
+    #[test]
+    fn unique_filename_handles_no_extension() {
+        // Files without a clear extension — counter goes at the
+        // very end.
+        let used: std::collections::HashSet<String> =
+            ["notes".to_owned()].into_iter().collect();
+        assert_eq!(unique_filename("notes", &used), "notes (1)");
+    }
+
+    #[test]
+    fn unique_filename_treats_huge_suffix_as_no_extension() {
+        // If the "extension" is itself >16 bytes, treat as opaque
+        // and counter at the end. Mirrors sanitize_filename's rule.
+        let base = "weird.thisisaverylongextension";
+        let used: std::collections::HashSet<String> =
+            [base.to_owned()].into_iter().collect();
+        let result = unique_filename(base, &used);
+        // Counter went at the end, not before the long suffix.
+        assert_eq!(result, format!("{base} (1)"));
+    }
+
+    #[test]
+    fn unique_filename_bails_out_after_1000_collisions() {
+        // Pathological case: someone seeded the conversation with
+        // every numbered variant. Returns the base name and lets
+        // the prose-dedupe + hydration handle it.
+        let mut used: std::collections::HashSet<String> =
+            ["data.csv".to_owned()].into_iter().collect();
+        for n in 1..=1000 {
+            used.insert(format!("data ({n}).csv"));
+        }
+        // After 1000 attempts the function returns base unchanged.
+        assert_eq!(unique_filename("data.csv", &used), "data.csv");
+    }
+
+    #[test]
+    fn unique_filename_50_collisions_stays_under_budget() {
+        // Per-call budget: O(N) walk. 50 existing collisions is a
+        // very heavy conversation (rare but plausible after a year
+        // of "data.csv" uploads). Must complete fast enough that
+        // the per-turn cost doesn't grow noticeably.
+        let used: std::collections::HashSet<String> = (0..=50)
+            .map(|n| {
+                if n == 0 {
+                    "data.csv".to_owned()
+                } else {
+                    format!("data ({n}).csv")
+                }
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let result = unique_filename("data.csv", &used);
+        let elapsed = started.elapsed();
+        assert_eq!(result, "data (51).csv");
+        assert!(
+            elapsed < std::time::Duration::from_millis(10),
+            "50-collision resolve took {elapsed:?} (budget: 10ms)",
         );
     }
 

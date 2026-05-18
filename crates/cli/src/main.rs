@@ -25,20 +25,17 @@
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::OnceLock;
 
 mod service;
 
-/// Holds the python-sandbox plugin's runtime service for the
-/// lifetime of the server process. Set exactly once during boot
-/// (the wiring in cmd_serve calls `wire_python_sandbox`); accessed
-/// implicitly via the four registered ToolImpls. The OnceLock
-/// keeps the Arc alive so the OutputWatcher's notify-thread + tokio
-/// timer task aren't dropped while there are still tools that
-/// reference them.
-static PYTHON_SANDBOX_SERVICE: OnceLock<
-    std::sync::Arc<execlaw_server::python_sandbox::PythonSandboxService>,
-> = OnceLock::new();
+// 2026-05-18 — process-wide python-sandbox service handle moved
+// into `execlaw_server::python_sandbox::SERVICE` so request handlers
+// (specifically the `DELETE /api/chats/{id}` handler that needs to
+// call `on_conversation_deleted`) can reach it. The cli used to
+// keep a local OnceLock here purely to keep the Arc alive across
+// the spawned wiring task; that role is now subsumed by the
+// server-crate static. See `python_sandbox::set_service` /
+// `python_sandbox::service()`.
 
 #[derive(Debug, Parser)]
 #[command(name = "execlaw", version, about = "execlaw control plane CLI")]
@@ -1983,9 +1980,16 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                 .await
                 {
                     Ok(Some(svc)) => {
-                        // Stash so Drop doesn't run mid-server. The
-                        // OnceLock ensures we only ever wire once.
-                        let _ = PYTHON_SANDBOX_SERVICE.set(svc);
+                        // Stash in the server-crate's process-wide
+                        // OnceLock so:
+                        //   1. Drop doesn't run mid-server (anchor
+                        //      for the OutputWatcher's threads).
+                        //   2. Request handlers can reach it via
+                        //      `python_sandbox::service()` — the
+                        //      delete-thread handler uses this to
+                        //      clean up `/work/<convo>/` on
+                        //      conversation delete.
+                        execlaw_server::python_sandbox::set_service(svc);
                     }
                     Ok(None) => {
                         // wire helper already logged the reason.

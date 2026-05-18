@@ -4499,6 +4499,28 @@ pub async fn delete_thread(
     // streaming for this thread halts cleanly rather than racing
     // against the row going away.
     state.turn_cancel.cancel(cid.as_str());
+    // 2026-05-18 — python-sandbox cleanup hook (Phase 8d). Deletes
+    // the sidecar's per-conversation work dir at
+    // `~/.execlaw/sidecars/python-sandbox/kernel-gateway/work/<cid>/`
+    // so disk doesn't accumulate dead conversation state. Also
+    // tears down the conversation's pooled kernel if any. Best-
+    // effort — `service()` returns None when the python-sandbox
+    // plugin isn't installed or its sidecar didn't come healthy
+    // at boot, in which case the delete still succeeds (there's
+    // nothing on disk to clean up).
+    //
+    // The cleanup spawns into the tokio runtime rather than
+    // awaiting inline so the HTTP response doesn't block on a slow
+    // `docker exec rm -rf` if the work dir is large; the handler
+    // returns immediately and the cleanup races to completion in
+    // the background. Errors are logged at WARN by the service
+    // itself.
+    if let Some(svc) = crate::python_sandbox::service() {
+        let cid_for_cleanup = cid.clone();
+        tokio::spawn(async move {
+            svc.on_conversation_deleted(&cid_for_cleanup).await;
+        });
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({
