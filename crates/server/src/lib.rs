@@ -50,6 +50,7 @@ pub mod plugin_settings_admin;
 pub mod plugin_webhook_routes;
 pub mod plugins;
 pub mod principal_admit;
+pub mod python_sandbox;
 pub mod research;
 pub mod research_admin;
 pub mod routes;

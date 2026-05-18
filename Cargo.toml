@@ -65,6 +65,11 @@ url = "2"
 # their public gateways). Enable rustls-tls-native-roots to match the
 # rustls + OS-trust-store choice reqwest already uses for OAuth.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+# Filesystem event watcher — Linux inotify, macOS FSEvents, Windows
+# ReadDirectoryChangesW. Used by python_sandbox's output watcher to
+# detect when the kernel writes into /work/<convo>/outputs/. We
+# implement our own debounce on top so we control timing.
+notify = "7"
 
 # --- storage ---
 # SQLCipher (encrypted SQLite) via bundled build with vendored OpenSSL.

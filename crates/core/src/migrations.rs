@@ -51,6 +51,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "plugin_health",
         sql: include_str!("../migrations/0005_plugin_health.sql"),
     },
+    Migration {
+        id: 6,
+        name: "add_attachments_filename",
+        sql: include_str!("../migrations/0006_add_attachments_filename.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -231,9 +236,11 @@ mod tests {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
         let runner = MigrationRunner::new(&db);
         let applied = runner.apply_all().unwrap();
-        // 2026-05-15: migration 5 adds plugin health columns. Update
-        // this list whenever a new migration is added to MIGRATIONS.
-        assert_eq!(applied, vec![1, 5]);
+        // 2026-05-15: migration 5 adds plugin health columns.
+        // 2026-05-18: migration 6 adds state_attachments.filename.
+        // Update this list whenever a new migration is added to
+        // MIGRATIONS.
+        assert_eq!(applied, vec![1, 5, 6]);
 
         // Spot-check: every documented table exists.
         let tables = vec![
@@ -307,7 +314,7 @@ mod tests {
         let runner = MigrationRunner::new(&db);
         let first = runner.apply_all().unwrap();
         let second = runner.apply_all().unwrap();
-        assert_eq!(first, vec![1, 5]);
+        assert_eq!(first, vec![1, 5, 6]);
         assert!(
             second.is_empty(),
             "rerun must not re-apply already-applied migrations"

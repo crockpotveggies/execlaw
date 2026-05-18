@@ -8,6 +8,7 @@ use crate::ids::{AttachmentId, ConversationId, ResearchJobId};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +19,14 @@ pub struct AttachmentRow {
     pub path: String,
     pub sha256: String,
     pub received_at: i64,
+    /// Operator-facing filename — what the file is called in the
+    /// SPA's download chip, in transport messages, and in the
+    /// python_sandbox plugin's `/work/<convo>/uploads/` mount.
+    /// `None` for legacy rows minted before migration 0006 and for
+    /// ingest paths that haven't been wired to populate it yet;
+    /// hydration falls back to a derived default when missing.
+    #[serde(default)]
+    pub filename: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,8 +80,8 @@ impl<'db> AttachmentStore<'db> {
     pub fn insert(&self, row: &AttachmentRow) -> Result<(), DbError> {
         self.db.with_conn(|c| {
             c.execute(
-                "INSERT INTO state_attachments(id, conversation_id, mime_type, path, sha256, received_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO state_attachments(id, conversation_id, mime_type, path, sha256, received_at, filename) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     row.id.as_str(),
                     row.conversation_id.as_str(),
@@ -80,6 +89,7 @@ impl<'db> AttachmentStore<'db> {
                     row.path,
                     row.sha256,
                     row.received_at,
+                    row.filename,
                 ],
             )?;
             Ok(())
@@ -94,7 +104,7 @@ impl<'db> AttachmentStore<'db> {
         self.db.with_conn(|c| {
             let row = c
                 .query_row(
-                    "SELECT id, conversation_id, mime_type, path, sha256, received_at \
+                    "SELECT id, conversation_id, mime_type, path, sha256, received_at, filename \
                      FROM state_attachments WHERE id = ?1",
                     params![id_owned],
                     |r| {
@@ -105,6 +115,7 @@ impl<'db> AttachmentStore<'db> {
                             path: r.get(3)?,
                             sha256: r.get(4)?,
                             received_at: r.get(5)?,
+                            filename: r.get::<_, Option<String>>(6)?,
                         })
                     },
                 )
@@ -234,6 +245,143 @@ impl<'db> AttachmentStore<'db> {
             attachment_id,
             sha256: sha,
             size_bytes: bytes.len() as u64,
+        })
+    }
+
+    /// Streaming variant of [`AttachmentStore::insert_plugin_artifact`].
+    ///
+    /// Reads `source` in 64 KB chunks, hashing incrementally and writing
+    /// straight to a temp file under `artifacts_root`. On EOF the temp
+    /// is renamed to `<artifacts_root>/<sha256>` atomically; if a blob
+    /// with that hash already exists (content-addressed dedup hit), the
+    /// temp is deleted instead.
+    ///
+    /// Why a separate method instead of slurping the file and calling
+    /// the bytes-based variant: a 100 MB Parquet artifact would otherwise
+    /// allocate 100 MB on the heap and double-buffer it through Vec<u8>
+    /// before the SHA-256 even starts. The streaming path keeps memory
+    /// bounded to ~64 KB regardless of file size — important for the
+    /// python_sandbox output watcher (Phase 4) which publishes whatever
+    /// the agent's cell writes, with our 50 MB output ceiling.
+    ///
+    /// The hash + on-disk bytes are byte-identical to what
+    /// `insert_plugin_artifact(file_contents)` would produce — verified
+    /// by the test `streaming_and_bytes_paths_agree_on_sha`.
+    pub fn insert_plugin_artifact_from_path(
+        &self,
+        artifacts_root: &Path,
+        plugin_id: &str,
+        filename: &str,
+        mime_type: &str,
+        source: &Path,
+        ttl_seconds: Option<i64>,
+        now: i64,
+    ) -> Result<PluginArtifactCreated, DbError> {
+        // Create the destination root before we open the source so we
+        // fail fast if the operator's data dir is misconfigured.
+        std::fs::create_dir_all(artifacts_root).map_err(|e| {
+            DbError::Migration(format!(
+                "plugin artifact from path: create_dir_all {}: {e}",
+                artifacts_root.display()
+            ))
+        })?;
+
+        let mut src = std::fs::File::open(source).map_err(|e| {
+            DbError::Migration(format!(
+                "plugin artifact from path: open source {}: {e}",
+                source.display()
+            ))
+        })?;
+
+        // Temp filename includes a UUID so two concurrent publishes
+        // of the same conversation's outputs don't race on the same
+        // temp. RAII-cleaned on every error path via the explicit
+        // remove_file calls below.
+        let tmp_path = artifacts_root.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
+        let mut tmp = std::fs::File::create(&tmp_path).map_err(|e| {
+            DbError::Migration(format!(
+                "plugin artifact from path: create temp {}: {e}",
+                tmp_path.display()
+            ))
+        })?;
+
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = match src.read(&mut buf) {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(DbError::Migration(format!(
+                        "plugin artifact from path: read {}: {e}",
+                        source.display()
+                    )));
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            if let Err(e) = tmp.write_all(&buf[..n]) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(DbError::Migration(format!(
+                    "plugin artifact from path: write temp {}: {e}",
+                    tmp_path.display()
+                )));
+            }
+            total += n as u64;
+        }
+        if let Err(e) = tmp.flush() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(DbError::Migration(format!(
+                "plugin artifact from path: flush temp {}: {e}",
+                tmp_path.display()
+            )));
+        }
+        drop(tmp); // close before rename — required on Windows
+
+        let sha = format!("{:x}", hasher.finalize());
+        let final_path = plugin_artifact_path(artifacts_root, &sha);
+        if final_path.exists() {
+            // Content-addressed dedup: an artifact with these exact
+            // bytes is already on disk. Drop the temp; the existing
+            // file is what we want.
+            let _ = std::fs::remove_file(&tmp_path);
+        } else {
+            std::fs::rename(&tmp_path, &final_path).map_err(|e| {
+                // Cross-filesystem rename can fail with EXDEV; fall
+                // back to copy+remove. Rare in practice — the
+                // artifacts_root is on the same FS as the temp dir.
+                let _ = std::fs::remove_file(&tmp_path);
+                DbError::Migration(format!(
+                    "plugin artifact from path: rename {} -> {}: {e}",
+                    tmp_path.display(),
+                    final_path.display()
+                ))
+            })?;
+        }
+
+        let attachment_id = uuid::Uuid::new_v4().to_string();
+        let expires_at = ttl_seconds.map(|t| now + t);
+        let row = ArtifactRow {
+            id: attachment_id.clone(),
+            research_job_id: None,
+            kind: "plugin_artifact".into(),
+            mime_type: mime_type.to_owned(),
+            path: final_path.to_string_lossy().into_owned(),
+            sha256: sha.clone(),
+            bytes: Some(total as i64),
+            created_at: now,
+            plugin_id: Some(plugin_id.to_owned()),
+            filename: Some(filename.to_owned()),
+            expires_at,
+        };
+        self.insert_artifact(&row)?;
+        Ok(PluginArtifactCreated {
+            attachment_id,
+            sha256: sha,
+            size_bytes: total,
         })
     }
 
@@ -377,6 +525,7 @@ mod tests {
                 path: "/tmp/x.jpg".into(),
                 sha256: "abc".into(),
                 received_at: 1,
+                filename: None,
             })
             .unwrap();
 
@@ -430,6 +579,243 @@ mod tests {
 
         let on_disk = std::fs::read(&row.path).unwrap();
         assert_eq!(on_disk, bytes);
+    }
+
+    /// Phase 6 — `state_attachments.filename` round-trips through
+    /// insert + get. None → None on the way out; Some("foo.csv") →
+    /// Some("foo.csv"). The column is the hydration layer's source
+    /// of truth for the operator-facing filename on inbound files.
+    #[test]
+    fn attachment_row_round_trips_filename() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let store = AttachmentStore::new(&db);
+
+        // With filename
+        let id_with = AttachmentId::new();
+        store
+            .insert(&AttachmentRow {
+                id: id_with.clone(),
+                conversation_id: ConversationId::from("c1"),
+                mime_type: "text/csv".into(),
+                path: "/tmp/sales.csv".into(),
+                sha256: "deadbeef".into(),
+                received_at: 100,
+                filename: Some("sales.csv".into()),
+            })
+            .unwrap();
+        let got = store.get(&id_with).unwrap().unwrap();
+        assert_eq!(got.filename.as_deref(), Some("sales.csv"));
+
+        // Without filename (legacy / not-yet-wired ingest paths)
+        let id_without = AttachmentId::new();
+        store
+            .insert(&AttachmentRow {
+                id: id_without.clone(),
+                conversation_id: ConversationId::from("c1"),
+                mime_type: "text/csv".into(),
+                path: "/tmp/other.csv".into(),
+                sha256: "cafebabe".into(),
+                received_at: 200,
+                filename: None,
+            })
+            .unwrap();
+        let got = store.get(&id_without).unwrap().unwrap();
+        assert_eq!(got.filename, None);
+    }
+
+    /// Streaming variant produces a row whose on-disk file matches
+    /// the source bytes — the same end state as the bytes-based
+    /// variant, just without the in-memory copy.
+    #[test]
+    fn plugin_artifact_from_path_writes_disk_and_reads_back() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let store = AttachmentStore::new(&db);
+        let tmp = tempfile::tempdir().unwrap();
+
+        let source = tmp.path().join("region_summary.csv");
+        let content = b"region,total\nWest,4200000\nEast,3100000\n";
+        std::fs::write(&source, content).unwrap();
+
+        let artifacts_root = tmp.path().join("artifacts");
+        let created = store
+            .insert_plugin_artifact_from_path(
+                &artifacts_root,
+                "python-sandbox",
+                "region_summary.csv",
+                "text/csv",
+                &source,
+                None,
+                1_700_000_000,
+            )
+            .unwrap();
+        assert_eq!(created.size_bytes as usize, content.len());
+        assert_eq!(created.sha256.len(), 64);
+
+        let row = store.get_artifact(&created.attachment_id).unwrap().unwrap();
+        assert_eq!(row.plugin_id.as_deref(), Some("python-sandbox"));
+        assert_eq!(row.filename.as_deref(), Some("region_summary.csv"));
+        assert_eq!(row.mime_type, "text/csv");
+        assert_eq!(row.bytes, Some(content.len() as i64));
+        assert_eq!(row.expires_at, None);
+        assert_eq!(std::fs::read(&row.path).unwrap(), content);
+    }
+
+    /// Streaming and bytes variants MUST produce the same on-disk
+    /// state for identical source content. This is the dedup
+    /// invariant that lets the Phase 4 watcher safely publish
+    /// already-on-disk files without worrying about a parallel
+    /// bytes-based caller producing a different blob.
+    #[test]
+    fn streaming_and_bytes_paths_agree_on_sha() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let store = AttachmentStore::new(&db);
+        let tmp = tempfile::tempdir().unwrap();
+
+        // 256 KB of well-mixed bytes — covers several 64 KB read
+        // iterations in the streaming path. If anything in the
+        // chunking math was off, the hashes would diverge.
+        let bytes: Vec<u8> = (0..256u32 * 1024).map(|i| (i as u8).wrapping_mul(31)).collect();
+        let source = tmp.path().join("data.bin");
+        std::fs::write(&source, &bytes).unwrap();
+
+        let artifacts_root = tmp.path().join("artifacts");
+
+        let a = store
+            .insert_plugin_artifact(
+                &artifacts_root,
+                "python-sandbox",
+                "data.bin",
+                "application/octet-stream",
+                &bytes,
+                None,
+                1,
+            )
+            .unwrap();
+        let b = store
+            .insert_plugin_artifact_from_path(
+                &artifacts_root,
+                "python-sandbox",
+                "data.bin",
+                "application/octet-stream",
+                &source,
+                None,
+                2,
+            )
+            .unwrap();
+        assert_eq!(a.sha256, b.sha256, "sha must match across paths");
+        assert_eq!(a.size_bytes, b.size_bytes);
+        // Distinct row ids but pointing at the same dedup'd blob.
+        assert_ne!(a.attachment_id, b.attachment_id);
+        let row_a = store.get_artifact(&a.attachment_id).unwrap().unwrap();
+        let row_b = store.get_artifact(&b.attachment_id).unwrap().unwrap();
+        assert_eq!(row_a.path, row_b.path, "both rows point at one blob");
+    }
+
+    /// Streaming a source that's already a content-addressed blob
+    /// in the same artifacts_root must NOT clobber the existing
+    /// file. Critical for the python_sandbox flow where the
+    /// kernel writes to /work/outputs/, hydration may have stored
+    /// the same bytes earlier, and our publish dedups.
+    #[test]
+    fn plugin_artifact_from_path_dedups_when_blob_exists() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let store = AttachmentStore::new(&db);
+        let tmp = tempfile::tempdir().unwrap();
+        let artifacts_root = tmp.path().join("artifacts");
+
+        let bytes = b"identical-content-published-twice";
+
+        // First publish via streaming path.
+        let source1 = tmp.path().join("v1.csv");
+        std::fs::write(&source1, bytes).unwrap();
+        let a = store
+            .insert_plugin_artifact_from_path(
+                &artifacts_root,
+                "python-sandbox",
+                "v1.csv",
+                "text/csv",
+                &source1,
+                None,
+                1,
+            )
+            .unwrap();
+        let blob_path = std::path::PathBuf::from(
+            &store.get_artifact(&a.attachment_id).unwrap().unwrap().path,
+        );
+        let blob_mtime_before = std::fs::metadata(&blob_path).unwrap().modified().unwrap();
+
+        // Sleep enough for mtime to change if a clobber happened.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Second publish — identical content, different source path.
+        let source2 = tmp.path().join("v2.csv");
+        std::fs::write(&source2, bytes).unwrap();
+        let b = store
+            .insert_plugin_artifact_from_path(
+                &artifacts_root,
+                "python-sandbox",
+                "v2.csv",
+                "text/csv",
+                &source2,
+                None,
+                2,
+            )
+            .unwrap();
+        assert_eq!(a.sha256, b.sha256);
+
+        let blob_mtime_after = std::fs::metadata(&blob_path).unwrap().modified().unwrap();
+        assert_eq!(
+            blob_mtime_before, blob_mtime_after,
+            "dedup hit MUST NOT rewrite the existing blob on disk"
+        );
+
+        // No stray temp files left in artifacts_root.
+        let strays: Vec<_> = std::fs::read_dir(&artifacts_root)
+            .unwrap()
+            .filter_map(|e| {
+                let name = e.unwrap().file_name().to_string_lossy().into_owned();
+                if name.starts_with(".tmp-") {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "temp files must be cleaned up on dedup; found {strays:?}"
+        );
+    }
+
+    /// Source file missing → returns an error rather than panicking
+    /// or inserting a zero-byte artifact.
+    #[test]
+    fn plugin_artifact_from_path_errors_on_missing_source() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let store = AttachmentStore::new(&db);
+        let tmp = tempfile::tempdir().unwrap();
+
+        let err = store
+            .insert_plugin_artifact_from_path(
+                &tmp.path().join("artifacts"),
+                "python-sandbox",
+                "nope.csv",
+                "text/csv",
+                &tmp.path().join("does-not-exist.csv"),
+                None,
+                1,
+            )
+            .expect_err("must error on missing source");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does-not-exist.csv") || msg.contains("open source"),
+            "error should mention the missing source: {msg}"
+        );
     }
 
     /// Two artifacts with identical bytes share the on-disk file

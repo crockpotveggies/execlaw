@@ -222,6 +222,11 @@ fn write_attachment_blob(
         path: path.to_string_lossy().into_owned(),
         sha256: sha,
         received_at: chrono::Utc::now().timestamp(),
+        // `filename` is populated later in the chats.rs ingress flow
+        // (other agent's work) when the original filename is in the
+        // card payload. Left None here so this helper stays mime+bytes
+        // only and doesn't grow another parameter.
+        filename: None,
     };
     AttachmentStore::new(&state.db)
         .insert(&row)

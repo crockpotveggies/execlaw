@@ -1,0 +1,29 @@
+# python-sandbox:fast — pinned for reproducibility (axiom #14: perf
+# benchmarks rely on stable wheel versions; drifting deps will move
+# the numbers and break regression detection).
+#
+# Re-pin via `pip-compile requirements.in -o requirements.txt` when
+# bumping; bump on a dedicated branch + re-run Criterion suite.
+
+# --- Kernel infrastructure ----------------------------------------
+jupyter_kernel_gateway==3.0.1
+ipykernel==6.30.0
+ipython==9.0.2
+
+# --- DataFrame stack (the whole point of `:fast`) -----------------
+pandas==2.2.3
+polars==1.40.1
+duckdb==1.5.0
+pyarrow==21.0.0
+numpy==2.2.0
+
+# --- Format I/O ---------------------------------------------------
+openpyxl==3.1.5
+
+# --- HTTP for user code -------------------------------------------
+httpx==0.28.1
+
+# --- Pandas datetime deps (explicit pin so user code can rely) ----
+python-dateutil==2.9.0
+pytz==2024.2
+tzdata==2024.2
