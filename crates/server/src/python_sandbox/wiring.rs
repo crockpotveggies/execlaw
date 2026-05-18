@@ -16,12 +16,12 @@
 //!     are NOT registered; subsequent agent calls to `python.*`
 //!     will hit "tool not found" until a restart.
 
+use crate::events::EventBus;
 use crate::python_sandbox::service::{PythonSandboxService, ServiceError, PLUGIN_ID};
 use crate::python_sandbox::tools::python_sandbox_tools;
 use crate::sidecar_supervisor::SidecarSupervisor;
 use execlaw_core::Database;
 use execlaw_plugin_host::HookRegistry;
-use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -47,6 +47,7 @@ pub async fn wire_python_sandbox(
     supervisor: &SidecarSupervisor,
     registry: &HookRegistry,
     db: &Database,
+    events: &EventBus,
     now_unix: i64,
 ) -> Result<Option<Arc<PythonSandboxService>>, WireError> {
     // Look up the supervisor-published port for the kernel-gateway
@@ -74,7 +75,13 @@ pub async fn wire_python_sandbox(
     // Artifacts root: shared with the rest of execlaw, env-overridable.
     let artifacts_root = crate::host_caps_impl::builtin_artifacts_root_path();
 
-    let service = PythonSandboxService::new(gateway_url, work_root, artifacts_root, db.clone())?;
+    let service = PythonSandboxService::new(
+        gateway_url,
+        work_root,
+        artifacts_root,
+        db.clone(),
+        events.clone(),
+    )?;
 
     let tools = python_sandbox_tools(service.clone());
     let count = tools.len();

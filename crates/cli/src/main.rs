@@ -1977,6 +1977,7 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                     sup,
                     plugin_host.registry(),
                     &db_for_wire,
+                    &state_for_wire.events,
                     now,
                 )
                 .await

@@ -375,6 +375,7 @@ mod tests {
             work,
             artifacts,
             db,
+            crate::events::EventBus::new(),
         )
         .expect("service constructs (watcher only touches disk)")
     }
@@ -494,7 +495,14 @@ mod tests {
         std::fs::create_dir_all(&work).unwrap();
         std::fs::create_dir_all(&artifacts).unwrap();
 
-        let svc = PythonSandboxService::new(url, work, artifacts, db).unwrap();
+        let svc = PythonSandboxService::new(
+            url,
+            work,
+            artifacts,
+            db,
+            crate::events::EventBus::new(),
+        )
+        .unwrap();
         let tools = python_sandbox_tools(svc.clone());
         let exec = tools
             .iter()
