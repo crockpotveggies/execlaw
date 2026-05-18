@@ -18,15 +18,20 @@
 use crate::cards::{close_card_and_broadcast, open_card_and_broadcast};
 use crate::events::EventBus;
 use crate::python_sandbox::client::{GatewayClient, GatewayError};
+use crate::python_sandbox::hydration::{
+    hydrate_uploads, AttachmentToHydrate, HydrateOpts, HydrationError,
+};
 use crate::python_sandbox::kernel_pool::KernelPool;
 use crate::python_sandbox::output_watcher::{OutputCreated, OutputWatcher, DEFAULT_DEBOUNCE};
 use execlaw_core::Database;
 use execlaw_core::attachments::AttachmentStore;
 use execlaw_core::cards::{CardAction, CardClosedPayload, CardKind, CardOpenedPayload, CardState};
 use execlaw_core::ids::ConversationId;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 pub const PLUGIN_ID: &str = "python-sandbox";
 
@@ -44,10 +49,36 @@ pub struct PythonSandboxService {
     pool: KernelPool,
     work_root: PathBuf,
     artifacts_root: PathBuf,
+    db: Database,
+    /// Conversations whose state_attachments have been hydrated into
+    /// /work/<convo>/uploads/ at least once this server lifetime.
+    /// Used by [`hydrate_if_needed`] to skip the work on every
+    /// execute. Repopulated from scratch on server restart — a
+    /// future enhancement could persist this so restart doesn't
+    /// re-copy the same files.
+    hydrated_convos: Arc<Mutex<HashSet<ConversationId>>>,
     _eviction_handle: tokio::task::JoinHandle<()>,
     // OutputWatcher dropped on Drop tears down its OS thread + tokio
     // timer. Kept named to make the lifetime obvious to readers.
     _watcher: OutputWatcher,
+}
+
+/// Error from the hydrate-on-first-execute path. Distinct from
+/// HydrationError so callers don't have to know about the DB-side.
+#[derive(Debug, Error)]
+pub enum HydrateOnExecuteError {
+    #[error("list state_attachments for {convo}: {source}")]
+    Db {
+        convo: String,
+        #[source]
+        source: execlaw_core::DbError,
+    },
+    #[error("hydrate uploads for {convo}: {source}")]
+    Hydrate {
+        convo: String,
+        #[source]
+        source: HydrationError,
+    },
 }
 
 impl PythonSandboxService {
@@ -91,6 +122,8 @@ impl PythonSandboxService {
             pool,
             work_root,
             artifacts_root,
+            db,
+            hydrated_convos: Arc::new(Mutex::new(HashSet::new())),
             _eviction_handle,
             _watcher: watcher,
         }))
@@ -105,6 +138,142 @@ impl PythonSandboxService {
     pub fn artifacts_root(&self) -> &Path {
         &self.artifacts_root
     }
+
+    /// Hydrate this conversation's uploaded attachments into
+    /// /work/<convo>/uploads/ if we haven't already this process
+    /// lifetime. Called from python.execute before the first
+    /// ensure_for so the kernel can immediately read user-supplied
+    /// files. Subsequent executes for the same convo skip this work
+    /// (the file copies are idempotent on size match anyway, but
+    /// the DB query + dir walk would be wasteful per turn).
+    pub async fn hydrate_if_needed(
+        &self,
+        convo: &ConversationId,
+    ) -> Result<(), HydrateOnExecuteError> {
+        {
+            let cache = self.hydrated_convos.lock().await;
+            if cache.contains(convo) {
+                return Ok(());
+            }
+        }
+        let convo_owned = convo.clone();
+        let db = self.db.clone();
+        let rows = tokio::task::spawn_blocking(move || {
+            AttachmentStore::new(&db).list_for_conversation(&convo_owned)
+        })
+        .await
+        .map_err(|e| HydrateOnExecuteError::Db {
+            convo: convo.as_str().to_string(),
+            source: execlaw_core::DbError::Migration(format!("join: {e}")),
+        })?
+        .map_err(|e| HydrateOnExecuteError::Db {
+            convo: convo.as_str().to_string(),
+            source: e,
+        })?;
+
+        if rows.is_empty() {
+            // Still mark hydrated so we don't redo the DB query on
+            // every execute for an attachment-less conversation.
+            self.hydrated_convos.lock().await.insert(convo.clone());
+            return Ok(());
+        }
+
+        let attachments: Vec<AttachmentToHydrate> = rows
+            .into_iter()
+            .map(|r| AttachmentToHydrate {
+                blob_path: PathBuf::from(&r.path),
+                filename: r
+                    .filename
+                    .unwrap_or_else(|| derive_default_filename(&r.mime_type, &r.sha256)),
+            })
+            .collect();
+
+        let work_root = self.work_root.clone();
+        let convo_for_blocking = convo.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            hydrate_uploads(
+                &work_root,
+                &convo_for_blocking,
+                &attachments,
+                HydrateOpts::default(),
+            )
+        })
+        .await
+        .map_err(|e| HydrateOnExecuteError::Hydrate {
+            convo: convo.as_str().to_string(),
+            source: HydrationError::Io {
+                path: self.work_root.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::Other, format!("join: {e}")),
+            },
+        })?
+        .map_err(|e| HydrateOnExecuteError::Hydrate {
+            convo: convo.as_str().to_string(),
+            source: e,
+        })?;
+
+        tracing::info!(
+            convo = %convo,
+            files = result.len(),
+            "python_sandbox hydrated conversation uploads"
+        );
+        self.hydrated_convos.lock().await.insert(convo.clone());
+        Ok(())
+    }
+
+    /// Hook for the chats.rs conversation-delete path: drop the
+    /// kernel server-side, remove the conversation's `/work/<convo>/`
+    /// subdir, clear our hydration cache entry. Idempotent —
+    /// no-op if nothing exists for this convo.
+    pub async fn on_conversation_deleted(&self, convo: &ConversationId) {
+        if let Err(e) = self.pool.drop_kernel(convo).await {
+            tracing::warn!(
+                ?e,
+                %convo,
+                "python_sandbox: drop_kernel during conversation delete failed; gateway will idle-cull"
+            );
+        }
+        let convo_root = self.work_root.join(convo.as_str());
+        if convo_root.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&convo_root) {
+                tracing::warn!(
+                    ?e,
+                    path = %convo_root.display(),
+                    "python_sandbox: removing /work/<convo>/ failed"
+                );
+            }
+        }
+        self.hydrated_convos.lock().await.remove(convo);
+        tracing::info!(%convo, "python_sandbox cleaned up after conversation delete");
+    }
+}
+
+/// Best-effort default filename when `state_attachments.filename`
+/// is NULL — usually an attachment minted before migration 0006 or
+/// by an ingest path that doesn't yet populate the column.
+///
+/// `attachment-<short_sha>.<ext_from_mime>` so the agent sees
+/// something predictable rather than the raw sha256. The 8-char
+/// prefix keeps it short while preserving uniqueness within one
+/// conversation (collision probability for ~10K attachments is
+/// negligible).
+fn derive_default_filename(mime: &str, sha: &str) -> String {
+    let short = sha.get(..8).unwrap_or(sha);
+    let ext = match mime {
+        "text/csv" => "csv",
+        "text/tab-separated-values" => "tsv",
+        "application/json" => "json",
+        "application/vnd.apache.parquet" => "parquet",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        "application/vnd.ms-excel" => "xls",
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "text/markdown" => "md",
+        "text/plain" => "txt",
+        "application/pdf" => "pdf",
+        _ => "bin",
+    };
+    format!("attachment-{short}.{ext}")
 }
 
 /// Run the path-based streaming publish for one watcher event.
@@ -304,6 +473,31 @@ fn guess_mime(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derive_default_filename_picks_extension_from_mime() {
+        assert_eq!(
+            derive_default_filename("text/csv", "abcdef1234567890"),
+            "attachment-abcdef12.csv"
+        );
+        assert_eq!(
+            derive_default_filename("application/vnd.apache.parquet", "feedfacedeadbeef"),
+            "attachment-feedface.parquet"
+        );
+        assert_eq!(
+            derive_default_filename("image/png", "abcd"),
+            "attachment-abcd.png"
+        );
+        assert_eq!(
+            derive_default_filename("application/octet-stream", "1234567890ab"),
+            "attachment-12345678.bin"
+        );
+        // Unknown mime → bin extension
+        assert_eq!(
+            derive_default_filename("totally/made-up", "12345678"),
+            "attachment-12345678.bin"
+        );
+    }
 
     #[test]
     fn guess_mime_covers_common_analyst_outputs() {

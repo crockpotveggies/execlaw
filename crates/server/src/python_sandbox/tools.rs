@@ -123,6 +123,20 @@ impl ToolImpl for PythonExecuteTool {
             .map(|ms| Duration::from_millis(ms.clamp(100, 600_000)))
             .unwrap_or(DEFAULT_EXECUTE_TIMEOUT);
 
+        // Hydrate this conversation's attachments into /work/<convo>/
+        // uploads/ on first execute. Idempotent; subsequent executes
+        // skip the DB query + disk walk via the service's cache.
+        // Hydration failures are best-effort — log + continue, so a
+        // missing blob doesn't block all execute calls. The kernel
+        // just won't see that file under /work/uploads/.
+        if let Err(e) = self.service.hydrate_if_needed(&ctx.conversation_id).await {
+            tracing::warn!(
+                ?e,
+                convo = %ctx.conversation_id,
+                "python_sandbox hydration failed; proceeding without uploaded files"
+            );
+        }
+
         let kernel = match self.service.pool().ensure_for(&ctx.conversation_id).await {
             Ok(k) => k,
             Err(e) => return ToolOutcome::err("kernel_spawn_failed", e.to_string()),

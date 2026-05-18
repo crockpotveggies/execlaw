@@ -96,6 +96,44 @@ impl<'db> AttachmentStore<'db> {
         })
     }
 
+    /// List every attachment for one conversation. Used by the
+    /// python-sandbox plugin's hydration step to materialize the
+    /// blobs into `/work/<convo>/uploads/` on first execute.
+    ///
+    /// Ordered by `received_at` ascending so the agent's mental
+    /// model (uploads listed in arrival order) matches the chat
+    /// scroll.
+    pub fn list_for_conversation(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Result<Vec<AttachmentRow>, DbError> {
+        let cid = conversation_id.as_str().to_owned();
+        self.db.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, conversation_id, mime_type, path, sha256, received_at, filename \
+                 FROM state_attachments \
+                 WHERE conversation_id = ?1 \
+                 ORDER BY received_at ASC",
+            )?;
+            let rows = stmt.query_map(params![cid], |r| {
+                Ok(AttachmentRow {
+                    id: AttachmentId::from(r.get::<_, String>(0)?),
+                    conversation_id: ConversationId::from(r.get::<_, String>(1)?),
+                    mime_type: r.get(2)?,
+                    path: r.get(3)?,
+                    sha256: r.get(4)?,
+                    received_at: r.get(5)?,
+                    filename: r.get::<_, Option<String>>(6)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
     /// Look up an attachment by id. Returns `None` if the row is
     /// missing — caller distinguishes "no such id" from "DB error"
     /// via Result + Option.
@@ -579,6 +617,56 @@ mod tests {
 
         let on_disk = std::fs::read(&row.path).unwrap();
         assert_eq!(on_disk, bytes);
+    }
+
+    #[test]
+    fn list_for_conversation_returns_only_that_convo_in_received_order() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let store = AttachmentStore::new(&db);
+
+        // Two convos, three rows each. Insert in mixed order, assert
+        // we get only one convo's rows back AND in received_at order.
+        let a = ConversationId::from("convo-a");
+        let b = ConversationId::from("convo-b");
+
+        for (cid, name, received_at) in [
+            (&a, "a1.csv", 100),
+            (&b, "b1.csv", 200),
+            (&a, "a2.csv", 50),
+            (&b, "b2.csv", 250),
+            (&a, "a3.csv", 150),
+        ] {
+            store
+                .insert(&AttachmentRow {
+                    id: AttachmentId::new(),
+                    conversation_id: cid.clone(),
+                    mime_type: "text/csv".into(),
+                    path: format!("/blobs/{name}"),
+                    sha256: format!("sha-{name}"),
+                    received_at,
+                    filename: Some(name.into()),
+                })
+                .unwrap();
+        }
+
+        let a_rows = store.list_for_conversation(&a).unwrap();
+        assert_eq!(a_rows.len(), 3);
+        // Ordered ascending by received_at: 50, 100, 150 → a2, a1, a3
+        assert_eq!(a_rows[0].filename.as_deref(), Some("a2.csv"));
+        assert_eq!(a_rows[1].filename.as_deref(), Some("a1.csv"));
+        assert_eq!(a_rows[2].filename.as_deref(), Some("a3.csv"));
+
+        let b_rows = store.list_for_conversation(&b).unwrap();
+        assert_eq!(b_rows.len(), 2);
+        assert_eq!(b_rows[0].filename.as_deref(), Some("b1.csv"));
+        assert_eq!(b_rows[1].filename.as_deref(), Some("b2.csv"));
+
+        // Cross-isolation: convo-c has no rows.
+        let c_rows = store
+            .list_for_conversation(&ConversationId::from("convo-c"))
+            .unwrap();
+        assert!(c_rows.is_empty());
     }
 
     /// Phase 6 — `state_attachments.filename` round-trips through
