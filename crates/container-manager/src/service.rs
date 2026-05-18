@@ -306,6 +306,86 @@ impl BollardServiceController {
             http,
         })
     }
+
+    /// Stream a `docker pull` against `image` and log progress.
+    ///
+    /// Extracted from `spawn` so the caller can short-circuit the
+    /// pull when `inspect_image` reports the image is already
+    /// present locally. Locally-built sidecar images
+    /// (e.g. `execlaw/python-sandbox-fast:0.1.0`) only ever live
+    /// on the operator's host — without the inspect short-circuit
+    /// `create_image` 404s against Docker Hub and every spawn
+    /// fails.
+    ///
+    /// Logging behavior preserved verbatim from the original
+    /// inline block: "image pull started" on entry, "image pull
+    /// progress" on every status-string change OR every 5s
+    /// heartbeat, "image pull complete" on success, warn + return
+    /// `ServiceError::Pull` on stream error.
+    async fn pull_image(
+        &self,
+        image: &str,
+        container_name: &str,
+    ) -> Result<(), ServiceError> {
+        use bollard::image::CreateImageOptions;
+        use futures_util::StreamExt;
+        let opts = CreateImageOptions {
+            from_image: image.to_owned(),
+            ..Default::default()
+        };
+        let mut pull = self.docker.create_image(Some(opts), None, None);
+        let mut last_log = std::time::Instant::now();
+        let mut last_status = String::new();
+        let mut event_count: u32 = 0;
+        let pull_started = std::time::Instant::now();
+        tracing::info!(
+            image = %image,
+            container = %container_name,
+            "image pull started"
+        );
+        while let Some(ev) = pull.next().await {
+            match ev {
+                Ok(info) => {
+                    event_count += 1;
+                    if let Some(status) = info.status.as_deref() {
+                        if status != last_status {
+                            tracing::info!(
+                                image = %image,
+                                layer = ?info.id,
+                                status = %status,
+                                event_count,
+                                "image pull progress"
+                            );
+                            last_status = status.to_owned();
+                            last_log = std::time::Instant::now();
+                        } else if last_log.elapsed() >= std::time::Duration::from_secs(5) {
+                            tracing::info!(
+                                image = %image,
+                                layer = ?info.id,
+                                status = %status,
+                                progress = ?info.progress,
+                                event_count,
+                                "image pull heartbeat"
+                            );
+                            last_log = std::time::Instant::now();
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(image = %image, "image pull failed: {e}");
+                    return Err(ServiceError::Pull(e.to_string()));
+                }
+            }
+        }
+        tracing::info!(
+            image = %image,
+            container = %container_name,
+            elapsed_secs = pull_started.elapsed().as_secs(),
+            event_count,
+            "image pull complete"
+        );
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -315,9 +395,7 @@ impl ServiceController for BollardServiceController {
             Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,
             StopContainerOptions,
         };
-        use bollard::image::CreateImageOptions;
         use bollard::secret::{DeviceRequest, HostConfig, HostConfigLogConfig, PortBinding};
-        use futures_util::StreamExt;
         use std::collections::HashMap;
 
         if spec.name.trim().is_empty() {
@@ -357,75 +435,34 @@ impl ServiceController for BollardServiceController {
             )
             .await;
 
-        // --- 2. Pull the image (no-op when cached, but Docker
-        // ALWAYS does a manifest check against the registry so
-        // even cached images take a few seconds — `:nightly` /
-        // `:latest` tags can take 30s+ when fresh layers are
-        // available). We log periodic progress so the supervisor
-        // doesn't appear "silent" during long pulls; without this
-        // an operator watching the SPA's Provisioning pill has no
-        // signal that work is happening.
-        let opts = CreateImageOptions {
-            from_image: spec.image.clone(),
-            ..Default::default()
-        };
-        let mut pull = self.docker.create_image(Some(opts), None, None);
-        let mut last_log = std::time::Instant::now();
-        let mut last_status = String::new();
-        let mut event_count: u32 = 0;
-        let pull_started = std::time::Instant::now();
-        tracing::info!(
-            image = %spec.image,
-            container = %spec.name,
-            "image pull started"
-        );
-        while let Some(ev) = pull.next().await {
-            match ev {
-                Ok(info) => {
-                    event_count += 1;
-                    // Log on status-string change (rare — "Pulling
-                    // fs layer", "Downloading", "Extracting") OR
-                    // every 5 seconds so a long download still
-                    // emits a heartbeat.
-                    if let Some(status) = info.status.as_deref() {
-                        if status != last_status {
-                            tracing::info!(
-                                image = %spec.image,
-                                layer = ?info.id,
-                                status = %status,
-                                event_count,
-                                "image pull progress"
-                            );
-                            last_status = status.to_owned();
-                            last_log = std::time::Instant::now();
-                        } else if last_log.elapsed() >= std::time::Duration::from_secs(5) {
-                            tracing::info!(
-                                image = %spec.image,
-                                layer = ?info.id,
-                                status = %status,
-                                progress = ?info.progress,
-                                event_count,
-                                "image pull heartbeat"
-                            );
-                            last_log = std::time::Instant::now();
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(image = %spec.image, "image pull failed: {e}");
-                    return Err(ServiceError::Pull(e.to_string()));
-                }
+        // --- 2. Pull the image — but first check if it's already
+        // present locally. Locally-built images (e.g. the
+        // python-sandbox sidecar built from
+        // `plugins/python-sandbox/Dockerfile`) live ONLY on the
+        // operator's host and don't exist on any public registry.
+        // Without this short-circuit, every spawn attempt fails
+        // with `Docker responded with status code 404: pull access
+        // denied for execlaw/python-sandbox-fast, repository does
+        // not exist`, even though the image is sitting right
+        // there in `docker images`.
+        //
+        // `inspect_image` returns Ok → image is local → skip the
+        // pull. Returns 404 (or any other error) → try the pull,
+        // which will surface its own diagnostics.
+        match self.docker.inspect_image(&spec.image).await {
+            Ok(_) => {
+                tracing::info!(
+                    image = %spec.image,
+                    container = %spec.name,
+                    "image already present locally — skipping pull"
+                );
+            }
+            Err(_) => {
+                self.pull_image(&spec.image, &spec.name).await?;
             }
         }
-        tracing::info!(
-            image = %spec.image,
-            container = %spec.name,
-            elapsed_secs = pull_started.elapsed().as_secs(),
-            event_count,
-            "image pull complete"
-        );
 
-        // --- 2. Build the container Config + HostConfig.
+        // --- 3. Build the container Config + HostConfig.
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
         let key = format!("{}/tcp", spec.container_port);
         port_bindings.insert(
