@@ -1298,6 +1298,57 @@ body {
     margin-bottom: 0.5rem;
 }
 
+// 2026-05-18 — drag-drop highlight. Applies to the composer shell
+// when a file drag is over it. Dashed outline + tinted bg signals
+// "valid drop target" without obscuring the textarea content the
+// operator is mid-typing. The transition smooths the entry but not
+// the exit (snappier feel on cancel).
+.execlaw-composer__shell--drag-over {
+    outline: 2px dashed var(--bs-primary);
+    outline-offset: 4px;
+    background-color: rgba(var(--bs-primary-rgb), 0.04);
+    transition: outline-color 120ms ease, background-color 120ms ease;
+}
+
+// Inline error banner inside the composer shell. Surfaces "this
+// drop included unsupported files" without a global toast (the
+// SPA doesn't have one). Auto-dismissable via the X button.
+.execlaw-composer__drop-error {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.5rem 0.75rem;
+    margin-bottom: 0.5rem;
+    border-radius: 0.4rem;
+    background-color: rgba(var(--bs-danger-rgb), 0.1);
+    border: 1px solid rgba(var(--bs-danger-rgb), 0.3);
+    color: var(--bs-danger);
+    font-size: 0.85rem;
+    line-height: 1.3;
+}
+
+.execlaw-composer__drop-error-dismiss {
+    flex-shrink: 0;
+    width: 1.5rem;
+    height: 1.5rem;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    border-radius: 999px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    opacity: 0.7;
+
+    &:hover,
+    &:focus-visible {
+        opacity: 1;
+        background-color: rgba(var(--bs-danger-rgb), 0.15);
+    }
+}
+
 .execlaw-composer__attachment-chip {
     position: relative;
     width: 4rem;
