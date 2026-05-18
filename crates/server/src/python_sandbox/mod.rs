@@ -40,6 +40,8 @@ pub mod tools;
 pub mod wiring;
 
 #[cfg(test)]
+mod adversarial;
+#[cfg(test)]
 mod bench_phase2;
 #[cfg(test)]
 mod bench_phase3;

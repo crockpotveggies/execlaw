@@ -152,3 +152,7 @@ execlaw-voice-pipeline = { path = "../voice-pipeline" }
 [[bench]]
 name = "server_hot_paths"
 harness = false
+
+[[bench]]
+name = "python_sandbox_hot_paths"
+harness = false
