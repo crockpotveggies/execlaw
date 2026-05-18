@@ -37,6 +37,7 @@ pub mod mime;
 pub mod output_watcher;
 pub mod service;
 pub mod tools;
+pub mod wiring;
 
 #[cfg(test)]
 mod bench_phase2;
@@ -57,6 +58,7 @@ pub use tools::{
     python_sandbox_tools, PythonExecuteTool, PythonInterruptTool, PythonListFilesTool,
     PythonResetTool,
 };
+pub use wiring::{wire_python_sandbox, WireError};
 pub use jupyter_protocol::{ExecutionState, JupyterEnvelope, JupyterHeader, KernelChannel, MsgType};
 pub use kernel_pool::{KernelPool, DEFAULT_IDLE_TIMEOUT};
 pub use mime::{

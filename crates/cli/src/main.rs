@@ -25,8 +25,20 @@
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::OnceLock;
 
 mod service;
+
+/// Holds the python-sandbox plugin's runtime service for the
+/// lifetime of the server process. Set exactly once during boot
+/// (the wiring in cmd_serve calls `wire_python_sandbox`); accessed
+/// implicitly via the four registered ToolImpls. The OnceLock
+/// keeps the Arc alive so the OutputWatcher's notify-thread + tokio
+/// timer task aren't dropped while there are still tools that
+/// reference them.
+static PYTHON_SANDBOX_SERVICE: OnceLock<
+    std::sync::Arc<execlaw_server::python_sandbox::PythonSandboxService>,
+> = OnceLock::new();
 
 #[derive(Debug, Parser)]
 #[command(name = "execlaw", version, about = "execlaw control plane CLI")]
@@ -1939,6 +1951,8 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     // adds blocking I/O to the boot path.
     {
         let plugin_host = state.plugin_host.clone();
+        let state_for_wire = state.clone();
+        let db_for_wire = db.clone();
         tokio::spawn(async move {
             // Small delay so the supervisor's first reconcile
             // pass has a chance to publish ports. Capped — if
@@ -1946,6 +1960,43 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
             // and let the plugin handle the None.
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             plugin_host.fire_on_enable_for_all().await;
+
+            // 2026-05-18 — Phase 8 wiring for the python-sandbox
+            // plugin. Constructs the PythonSandboxService against
+            // the kernel-gateway sidecar's published port and
+            // registers the four python.* tools as host-implemented
+            // builtins. No-op when the plugin isn't installed or
+            // the sidecar isn't healthy (warning logged from inside).
+            //
+            // Service is held in a `static` so its OutputWatcher
+            // (notify OS thread + tokio timer) stays alive for the
+            // server's lifetime. Drop happens on process exit.
+            if let Some(sup) = state_for_wire.sidecar_supervisor.as_ref() {
+                let now = chrono::Utc::now().timestamp();
+                match execlaw_server::python_sandbox::wire_python_sandbox(
+                    sup,
+                    plugin_host.registry(),
+                    &db_for_wire,
+                    now,
+                )
+                .await
+                {
+                    Ok(Some(svc)) => {
+                        // Stash so Drop doesn't run mid-server. The
+                        // OnceLock ensures we only ever wire once.
+                        let _ = PYTHON_SANDBOX_SERVICE.set(svc);
+                    }
+                    Ok(None) => {
+                        // wire helper already logged the reason.
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            ?e,
+                            "python_sandbox wiring failed; python.* tools unavailable this boot"
+                        );
+                    }
+                }
+            }
         });
     }
 
