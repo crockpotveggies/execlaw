@@ -99,6 +99,14 @@ const Panel: PluginPanelComponent = (props: PluginPanelProps) => {
 
     const [sidecar, setSidecar] = useState<SidecarView | null>(null);
     const [sidecarError, setSidecarError] = useState<string | null>(null);
+    // 2026-05-18 — separate "has a fetch ever completed" from "is
+    // there a row in the response". A plain `sidecar === null` check
+    // can't distinguish "haven't fetched yet" from "fetched, no
+    // matching row" — the panel was stuck on "Loading…" forever in
+    // the latter case (which fires when the sidecar plugin is
+    // installed but isn't registered as a supervised container yet,
+    // or when an id mismatch made `.find()` miss).
+    const [sidecarLoaded, setSidecarLoaded] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
     const [idleTimeout, setIdleTimeout] = useState<number>(
@@ -119,14 +127,19 @@ const Panel: PluginPanelComponent = (props: PluginPanelProps) => {
                 "/api/admin/sidecars",
             );
             const found = resp.sidecars.find(
-                (s) => s.plugin_id === identity.pluginId && s.name === SIDECAR_NAME,
+                (s) => s.plugin_id === identity.id && s.name === SIDECAR_NAME,
             );
             setSidecar(found ?? null);
             setSidecarError(null);
         } catch (e) {
             setSidecarError(e instanceof Error ? e.message : String(e));
+        } finally {
+            // Flip the "loaded" flag regardless of success / miss /
+            // error so the render path can exit "Loading…" and
+            // show either the chip or an explicit empty state.
+            setSidecarLoaded(true);
         }
-    }, [bridge, identity.pluginId]);
+    }, [bridge, identity.id]);
 
     useEffect(() => {
         void refreshSidecar();
@@ -145,7 +158,7 @@ const Panel: PluginPanelComponent = (props: PluginPanelProps) => {
             try {
                 const r = await bridge.fetchJson<SettingValueResponse>(
                     "GET",
-                    `/api/admin/plugins/${identity.pluginId}/settings/${key}`,
+                    `/api/admin/plugins/${identity.id}/settings/${key}`,
                 );
                 return r.value;
             } catch (e) {
@@ -186,7 +199,7 @@ const Panel: PluginPanelComponent = (props: PluginPanelProps) => {
         return () => {
             cancelled = true;
         };
-    }, [bridge, identity.pluginId]);
+    }, [bridge, identity.id]);
 
     const onSave = useCallback(
         async (e: React.FormEvent) => {
@@ -224,12 +237,12 @@ const Panel: PluginPanelComponent = (props: PluginPanelProps) => {
                 await Promise.all([
                     bridge.fetchJson<unknown>(
                         "PUT",
-                        `/api/admin/plugins/${identity.pluginId}/settings/kernel_idle_timeout_seconds`,
+                        `/api/admin/plugins/${identity.id}/settings/kernel_idle_timeout_seconds`,
                         { value: String(idleTimeout) },
                     ),
                     bridge.fetchJson<unknown>(
                         "PUT",
-                        `/api/admin/plugins/${identity.pluginId}/settings/max_output_bytes`,
+                        `/api/admin/plugins/${identity.id}/settings/max_output_bytes`,
                         { value: String(maxOutput) },
                     ),
                 ]);
@@ -243,7 +256,7 @@ const Panel: PluginPanelComponent = (props: PluginPanelProps) => {
                 setSaving(false);
             }
         },
-        [bridge, identity.pluginId, idleTimeout, maxOutput],
+        [bridge, identity.id, idleTimeout, maxOutput],
     );
 
     return (
@@ -256,12 +269,12 @@ const Panel: PluginPanelComponent = (props: PluginPanelProps) => {
 
             {/* --- Sidecar status ------------------------------- */}
             <h3 className="h6 mb-2">Kernel gateway</h3>
-            {sidecar === null && sidecarError === null ? (
+            {!sidecarLoaded ? (
                 <div className="execlaw-muted small mb-3">Loading sidecar status…</div>
             ) : (
                 <SidecarStatusBlock
                     sidecarLabel={SIDECAR_NAME}
-                    status={sidecar?.status ?? "unknown"}
+                    status={sidecar?.status ?? "not_registered"}
                     rpcUrl={sidecar?.rpc_url ?? null}
                     fetchError={sidecarError}
                     testidPrefix="python-sandbox"
