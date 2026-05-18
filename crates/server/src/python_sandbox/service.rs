@@ -256,7 +256,26 @@ impl PythonSandboxService {
 /// prefix keeps it short while preserving uniqueness within one
 /// conversation (collision probability for ~10K attachments is
 /// negligible).
-fn derive_default_filename(mime: &str, sha: &str) -> String {
+/// Derive a stable display + on-disk filename for an attachment row
+/// whose `filename` column is null (legacy rows that pre-date
+/// migration 0006, or transport-bridge ingest paths that don't
+/// surface an original filename). The same value is used in TWO
+/// places — they MUST match exactly:
+///
+///   * `crate::python_sandbox::service` hydration writes the blob
+///     to `/work/<convo>/uploads/<this name>`.
+///   * `crate::chats::attachments::build_attached_files_block` lists
+///     the same name to the agent in the per-turn prose block so
+///     it knows what to `open()` / `pandas.read_csv()`.
+///
+/// Format: `attachment-<8-hex-prefix-of-sha256>.<mime-derived-ext>`.
+/// The 8-hex prefix collisions only after ~4 billion attachments
+/// per conversation (sha256 short prefix), which is comfortably
+/// beyond v1 scope; if the operator hits it they'll see an
+/// overwrite, not a misroute. The mime→ext table accepts the v1
+/// allowlist; unknown MIMEs fall back to `.bin` so the agent at
+/// least gets a fileish reference.
+pub(crate) fn derive_default_filename(mime: &str, sha: &str) -> String {
     let short = sha.get(..8).unwrap_or(sha);
     let ext = match mime {
         "text/csv" => "csv",

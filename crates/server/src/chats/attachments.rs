@@ -230,8 +230,10 @@ pub(crate) fn decode_inline_attachments(
 /// Strip path separators + leading dots from an operator-supplied
 /// filename so a hostile or careless payload can't traverse out of
 /// `/work/<convo>/uploads/`. Returns the file's basename, with
-/// `/` and `\` collapsed to the trailing component and a leading
-/// `.` (hidden-file marker on Unix) trimmed. Empty / all-dots input
+/// `/` and `\` collapsed to the trailing component, a leading
+/// `.` (hidden-file marker on Unix) trimmed, and the result capped
+/// at 255 bytes — the filename limit on most POSIX filesystems and
+/// the Windows MAX_PATH segment cap. Empty / all-dots input
 /// returns the empty string; the caller treats that as "missing
 /// filename" and rejects.
 ///
@@ -240,6 +242,12 @@ pub(crate) fn decode_inline_attachments(
 /// a canonicalized work root. This is the first-line filter so the
 /// SPA's chip + agent context block don't show a path-shaped name.
 fn sanitize_filename(raw: &str) -> String {
+    /// Common FS segment cap on both Linux (ext4 / btrfs / xfs all
+    /// at 255) and Windows (MAX_PATH segment). Truncation preserves
+    /// the extension when possible so the MIME-vs-extension match
+    /// at the python kernel still works.
+    const MAX_FILENAME_BYTES: usize = 255;
+
     let trimmed = raw.trim();
     // Take whatever's after the last separator.
     let last_sep = trimmed
@@ -249,7 +257,45 @@ fn sanitize_filename(raw: &str) -> String {
     let basename = &trimmed[last_sep..];
     // Strip leading dots so "..\foo" doesn't survive as "..foo"
     // after sep-stripping a path like `foo\..\bar`.
-    basename.trim_start_matches('.').to_owned()
+    let stripped = basename.trim_start_matches('.');
+
+    if stripped.len() <= MAX_FILENAME_BYTES {
+        return stripped.to_owned();
+    }
+    // Truncate at the byte cap, preserving any extension (last
+    // `.<chars>`) so pandas' MIME-by-extension routing still works.
+    // Extension preservation is best-effort: if the extension is
+    // itself wildly long (>16 bytes), give up and hard-truncate —
+    // the operator gets a usable-shaped name, not a perfect one.
+    let extension = stripped.rsplit_once('.').and_then(|(_, ext)| {
+        if !ext.is_empty() && ext.len() <= 16 {
+            Some(ext)
+        } else {
+            None
+        }
+    });
+    match extension {
+        Some(ext) => {
+            // Reserve space for ".<ext>" + nul-margin.
+            let dot_ext_len = ext.len() + 1;
+            let stem_budget = MAX_FILENAME_BYTES.saturating_sub(dot_ext_len);
+            // `stripped` is guaranteed to start with the stem; slice
+            // at a UTF-8 char boundary to avoid panicking on multibyte
+            // chars in the middle of an oversize name.
+            let mut stem_end = stem_budget.min(stripped.len() - dot_ext_len);
+            while !stripped.is_char_boundary(stem_end) && stem_end > 0 {
+                stem_end -= 1;
+            }
+            format!("{}.{}", &stripped[..stem_end], ext)
+        }
+        None => {
+            let mut end = MAX_FILENAME_BYTES;
+            while !stripped.is_char_boundary(end) && end > 0 {
+                end -= 1;
+            }
+            stripped[..end].to_owned()
+        }
+    }
 }
 
 /// Phase B: persist every previously-decoded attachment. Writes the
@@ -607,11 +653,73 @@ pub(crate) fn build_attached_files_block(
             return None;
         }
     };
-    let non_image: Vec<_> = rows
-        .into_iter()
-        .filter(|r| !is_image_mime(&r.mime_type))
-        .collect();
+    let python_available = state
+        .plugin_host
+        .registry()
+        .lookup_any("python.execute")
+        .is_some();
+    format_attached_files_block(&rows, python_available, Some(cid.as_str()))
+}
+
+/// Pure formatter for the attached-files prose block. Separated
+/// from [`build_attached_files_block`] so unit tests can exercise
+/// every branch (image filter, python-unavailable gate, filename
+/// fallback) without standing up a full `AppState` + tokio runtime.
+/// The wrapper's only job is to source the inputs from live state.
+///
+/// `python_available` reflects whether `python.execute` is in the
+/// runtime tool catalog. When false, returns None — telling the
+/// agent files are at `/work/uploads/` when python-sandbox isn't
+/// installed would be a lie (hydration only runs with the sidecar
+/// healthy).
+///
+/// `cid_for_log` is only used for the debug-log breadcrumb when
+/// the python-unavailable gate fires; `None` skips the log (test
+/// path).
+pub(crate) fn format_attached_files_block(
+    rows: &[execlaw_core::attachments::AttachmentRow],
+    python_available: bool,
+    cid_for_log: Option<&str>,
+) -> Option<String> {
+    let non_image: Vec<&execlaw_core::attachments::AttachmentRow> =
+        rows.iter().filter(|r| !is_image_mime(&r.mime_type)).collect();
     if non_image.is_empty() {
+        return None;
+    }
+    // 2026-05-18 — dedupe by hydrated filename. If the operator
+    // attaches `data.csv` on turn 1 + `data.csv` again on turn 3
+    // (different content, both sha256-content-addressed in the
+    // blob store), hydration writes /work/uploads/data.csv with
+    // the latter blob's bytes — the first is silently
+    // overwritten. Listing both rows in the prose would tell the
+    // agent two files exist when only one does, which the agent
+    // catches mid-turn ("FileNotFoundError: data (1).csv") and
+    // gets confused. Keep the most-recent row per filename
+    // (rows are returned ordered by received_at ASC; iterate +
+    // overwrite into a BTreeMap keyed by name).
+    use std::collections::BTreeMap;
+    let mut latest_by_name: BTreeMap<String, &execlaw_core::attachments::AttachmentRow> =
+        BTreeMap::new();
+    for r in &non_image {
+        let display_name = match r.filename.as_deref() {
+            Some(name) if !name.is_empty() => name.to_owned(),
+            _ => crate::python_sandbox::service::derive_default_filename(
+                &r.mime_type,
+                &r.sha256,
+            ),
+        };
+        latest_by_name.insert(display_name, *r);
+    }
+    if !python_available {
+        if let Some(cid) = cid_for_log {
+            tracing::debug!(
+                target: "chats::attached_files_block",
+                conversation_id = %cid,
+                attachment_count = non_image.len(),
+                "skipping attached-files block — python.execute is not in the tool catalog \
+                 (python-sandbox plugin not installed or kernel-gateway sidecar not healthy)",
+            );
+        }
         return None;
     }
     let mut out = String::from(
@@ -622,14 +730,12 @@ pub(crate) fn build_attached_files_block(
          when the operator asks about them. Do NOT re-prompt the operator for the contents; \
          read the file directly.\n\n",
     );
-    for r in &non_image {
-        // Fall back to a derived name if the filename column is null
-        // (legacy rows + transport-bridge uploads). Hydration uses the
-        // same fallback so the path here matches what's on disk.
-        let display_name = r
-            .filename
-            .as_deref()
-            .unwrap_or_else(|| derive_filename_from_path_or_id(r));
+    // Iterate the deduped map. Order doesn't matter to the agent
+    // (the model uses the filenames, not their position), and
+    // BTreeMap gives stable alphabetical order so the same set of
+    // attachments produces the same prose across turns — useful
+    // for KV-cache reuse.
+    for (display_name, r) in &latest_by_name {
         let size = std::fs::metadata(&r.path).map(|m| m.len()).unwrap_or(0);
         out.push_str(&format!(
             "* `{name}` ({mime}, {size} bytes) — available at `/work/uploads/{name}` \
@@ -640,24 +746,6 @@ pub(crate) fn build_attached_files_block(
         ));
     }
     Some(out)
-}
-
-/// Derive a stable display filename when `state_attachments.filename`
-/// is null (legacy + inbound-transport rows). Mirrors the rule
-/// `python_sandbox::hydration` uses so the prose-block path matches
-/// the on-disk filename a sidecar hydration produces. Prefers the
-/// blob path's basename; falls back to a `attachment-<8 chars of id>`
-/// pattern.
-fn derive_filename_from_path_or_id(row: &execlaw_core::attachments::AttachmentRow) -> &str {
-    if let Some(stem) = std::path::Path::new(&row.path)
-        .file_name()
-        .and_then(|s| s.to_str())
-    {
-        if !stem.is_empty() {
-            return stem;
-        }
-    }
-    row.id.as_str()
 }
 
 /// Pull the attachment-ids list off a `user_msg` payload. Empty for
@@ -1095,6 +1183,277 @@ mod tests {
             !routing.contains("python.execute"),
             "routing prose must NOT mention python.execute when python.* tools are absent:\n\n{routing}",
         );
+    }
+
+    // ------------------------------------------------------------
+    // Phase C audit-pass tests (2026-05-18). Cover the formatting
+    // function, filename length cap, and the cross-module name
+    // contract with the hydration helper.
+    // ------------------------------------------------------------
+
+    use execlaw_core::attachments::AttachmentRow;
+    use execlaw_core::ids::{AttachmentId, ConversationId};
+
+    fn row(filename: Option<&str>, mime: &str, sha: &str) -> AttachmentRow {
+        AttachmentRow {
+            id: AttachmentId::new(),
+            conversation_id: ConversationId::new(),
+            mime_type: mime.to_owned(),
+            // Path that almost certainly doesn't exist on disk —
+            // size lookup falls through to 0 via the `.unwrap_or(0)`
+            // in `format_attached_files_block`, which is fine for
+            // pure-format tests (we assert text shape, not byte
+            // counts).
+            path: format!("nonexistent-blob-{sha}"),
+            sha256: sha.to_owned(),
+            received_at: 0,
+            filename: filename.map(|s| s.to_owned()),
+        }
+    }
+
+    #[test]
+    fn format_block_returns_none_when_no_non_image_rows() {
+        let rows = [
+            row(None, "image/png", "shapng"),
+            row(None, "image/jpeg", "shajpg"),
+        ];
+        assert!(
+            format_attached_files_block(&rows, true, None).is_none(),
+            "block should be None when all rows are images",
+        );
+    }
+
+    #[test]
+    fn format_block_returns_none_when_python_unavailable() {
+        let rows = [row(Some("data.csv"), "text/csv", "sha1")];
+        assert!(
+            format_attached_files_block(&rows, false, None).is_none(),
+            "block must be None when python.execute is not in the tool catalog \
+             (agent would otherwise emit a tool call that doesn't exist)",
+        );
+    }
+
+    #[test]
+    fn format_block_lists_only_non_image_rows() {
+        let rows = [
+            row(Some("photo.png"), "image/png", "shapng"),
+            row(Some("data.csv"), "text/csv", "shacsv"),
+            row(Some("notes.md"), "text/markdown", "shamd"),
+        ];
+        let block = format_attached_files_block(&rows, true, None)
+            .expect("block should be present");
+        assert!(block.contains("data.csv"));
+        assert!(block.contains("notes.md"));
+        assert!(
+            !block.contains("photo.png"),
+            "image rows should NOT appear in the prose block (they ride vision content):\n\n{block}",
+        );
+    }
+
+    #[test]
+    fn format_block_mentions_python_uploads_path_for_each_file() {
+        let rows = [row(Some("data.csv"), "text/csv", "sha1")];
+        let block = format_attached_files_block(&rows, true, None).unwrap();
+        assert!(
+            block.contains("/work/uploads/data.csv"),
+            "block must tell the agent the exact path the file appears at:\n\n{block}",
+        );
+        assert!(
+            block.contains("`python.execute`"),
+            "block must namespace-attribute the tool so the model knows what to call",
+        );
+    }
+
+    #[test]
+    fn format_block_falls_back_to_hydration_compatible_name_when_filename_null() {
+        // Critical contract: when state_attachments.filename is null
+        // (legacy / transport-bridge rows), the prose block must
+        // tell the agent the SAME filename hydration writes to disk.
+        // Otherwise the agent's open() calls would 404.
+        let rows = [row(None, "text/csv", "abcd1234ffffffff")];
+        let block = format_attached_files_block(&rows, true, None).unwrap();
+        // Hydration uses `derive_default_filename(mime, sha)` →
+        // `attachment-<8 hex>.<ext>`. Block must match.
+        let expected_name =
+            crate::python_sandbox::service::derive_default_filename("text/csv", "abcd1234ffffffff");
+        assert_eq!(expected_name, "attachment-abcd1234.csv");
+        assert!(
+            block.contains(&expected_name),
+            "block must use the same fallback name as hydration; got:\n\n{block}",
+        );
+        assert!(
+            block.contains(&format!("/work/uploads/{expected_name}")),
+            "block must reference the path the file ACTUALLY ends up at",
+        );
+    }
+
+    #[test]
+    fn format_block_blank_filename_falls_back_to_derived() {
+        // An empty-string filename (vs null) should also trip the
+        // fallback — the operator-facing chip path empty-checks too.
+        let rows = [row(Some(""), "application/json", "deadbeefcafebabe")];
+        let block = format_attached_files_block(&rows, true, None).unwrap();
+        assert!(block.contains("attachment-deadbeef.json"));
+    }
+
+    // ---- filename length cap (audit pass) ----
+
+    #[test]
+    fn sanitize_caps_filename_at_255_bytes() {
+        let too_long = "a".repeat(300);
+        let out = sanitize_filename(&too_long);
+        assert!(
+            out.len() <= 255,
+            "sanitize must cap filename to 255 bytes; got {} bytes",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn sanitize_preserves_extension_when_truncating() {
+        // The mime-by-extension routing in pandas needs the extension
+        // intact. Truncate the stem, not the suffix.
+        let raw = format!("{}.csv", "x".repeat(300));
+        let out = sanitize_filename(&raw);
+        assert!(out.ends_with(".csv"), "extension lost: {out}");
+        assert!(out.len() <= 255);
+    }
+
+    #[test]
+    fn sanitize_handles_multibyte_truncation_safely() {
+        // Multibyte UTF-8 in the middle of the byte cap must not
+        // panic (slicing on a non-char-boundary would).
+        let raw = "🎵".repeat(100); // 400 bytes, each char is 4
+        let out = sanitize_filename(&raw);
+        assert!(out.len() <= 255);
+        // Validity: must still be valid UTF-8 (the type system
+        // guarantees this — but the test asserts non-empty after
+        // truncation as a regression hedge).
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn sanitize_huge_extension_gives_up_gracefully() {
+        // If the "extension" is itself huge, fall through to a
+        // hard truncate rather than emit a name where the stem
+        // is empty + the ext is the entire content.
+        let raw = format!("a.{}", "z".repeat(300));
+        let out = sanitize_filename(&raw);
+        assert!(out.len() <= 255);
+    }
+
+    // ---- cross-module contract test ----
+
+    #[test]
+    fn format_block_dedupes_same_filename_to_one_line() {
+        // The operator uploads data.csv twice in the same
+        // conversation (different content). Hydration writes
+        // /work/uploads/data.csv with the second blob — the first
+        // is silently overwritten. The prose block must NOT list
+        // both rows, because the agent's open("data.csv") will
+        // only ever see one file. Two listings would confuse the
+        // model (it'd hunt for "data (1).csv" or "data_2.csv" and
+        // hit FileNotFoundError).
+        let r1 = row(Some("data.csv"), "text/csv", "sha-1");
+        let r2 = row(Some("data.csv"), "text/csv", "sha-2");
+        let block = format_attached_files_block(&[r1, r2], true, None).unwrap();
+        // Each kept row emits one bullet line. That line mentions
+        // the filename twice (the backtick-wrapped name + the
+        // `/work/uploads/<name>` path). So one bullet = two
+        // substring hits of `data.csv`. Dedupe means: NOT four hits.
+        let occurrences = block.matches("data.csv").count();
+        assert_eq!(
+            occurrences, 2,
+            "after dedupe by filename, data.csv must appear in exactly one bullet \
+             (= 2 substring hits: name + path). Block:\n\n{block}",
+        );
+        // Sanity: also assert only one bullet line.
+        let bullets = block.lines().filter(|l| l.starts_with("* ")).count();
+        assert_eq!(bullets, 1, "dedupe should leave one bullet, got {bullets}");
+    }
+
+    #[test]
+    fn format_block_orders_files_alphabetically_for_kv_cache_stability() {
+        // Same set of attachments must produce the same prose
+        // across turns so the KV-cache prefix doesn't invalidate
+        // for cosmetic reasons. BTreeMap iteration gives stable
+        // alphabetical order; lock the behavior here.
+        let rows = [
+            row(Some("zebra.csv"), "text/csv", "sha-z"),
+            row(Some("alpha.csv"), "text/csv", "sha-a"),
+            row(Some("middle.csv"), "text/csv", "sha-m"),
+        ];
+        let block = format_attached_files_block(&rows, true, None).unwrap();
+        let alpha_pos = block.find("alpha.csv").unwrap();
+        let middle_pos = block.find("middle.csv").unwrap();
+        let zebra_pos = block.find("zebra.csv").unwrap();
+        assert!(
+            alpha_pos < middle_pos && middle_pos < zebra_pos,
+            "files should be alphabetical:\n\n{block}",
+        );
+    }
+
+    #[test]
+    fn format_block_50_attachments_stays_under_budget() {
+        // Per-turn budget guard (axiom #14 spirit, not Criterion-grade
+        // since this isn't a true hot path). Format-block runs once
+        // per agent turn. 50 attachments is a comfortably-high
+        // operator-side ceiling; anything beyond that and the model's
+        // context budget is the real bottleneck. 50 ms is enough
+        // headroom for CI noise + Windows tempdir overhead but tight
+        // enough to catch a regression that accidentally introduces
+        // a network call or quadratic loop.
+        let rows: Vec<_> = (0..50)
+            .map(|i| {
+                row(
+                    Some(&format!("file-{i:02}.csv")),
+                    "text/csv",
+                    &format!("sha-{i:064}"),
+                )
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let block = format_attached_files_block(&rows, true, None).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            block.lines().filter(|l| l.starts_with("* ")).count() == 50,
+            "all 50 rows should produce bullets",
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "50-row format block took {elapsed:?} (budget: 50ms)",
+        );
+    }
+
+    #[test]
+    fn fallback_name_matches_hydration_helper_for_every_v1_mime() {
+        // Lock the contract: the prose block's fallback name and
+        // the hydration writer's filename are produced by the SAME
+        // function call. If one diverges, the agent's open() path
+        // breaks silently. This test would catch a refactor that
+        // copy-pasted the logic into two places that drift.
+        let sha = "1234567890abcdef".to_owned();
+        for mime in [
+            "text/csv",
+            "text/tab-separated-values",
+            "application/json",
+            "text/plain",
+            "text/markdown",
+            "application/pdf",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel",
+        ] {
+            let derived =
+                crate::python_sandbox::service::derive_default_filename(mime, &sha);
+            // Build a row with NULL filename + this mime; block
+            // must reference exactly `derived`.
+            let rows = [row(None, mime, &sha)];
+            let block = format_attached_files_block(&rows, true, None).unwrap();
+            assert!(
+                block.contains(&derived),
+                "mime {mime}: block missing derived name {derived}",
+            );
+        }
     }
 
     #[test]

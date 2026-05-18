@@ -611,15 +611,19 @@ export function Composer({
                 <div className="execlaw-composer__tools">
                     <div className="execlaw-composer__tools-left">
                         {/*
-                          Attach-trigger gate. 2026-05-18: "Attach
-                          file" is always available, so the + button
-                          is now always rendered. The submenu items
-                          are individually gated on the underlying
-                          capability (multimodal for photos, getSkills
-                          for skills, always for files).
+                          Attach-trigger anchor. 2026-05-18: "Attach
+                          file" is always available (data files don't
+                          need a vision-capable backend), so the +
+                          button is now unconditionally rendered. The
+                          submenu items are individually gated on the
+                          underlying capability (multimodal for photos,
+                          getSkills for skills, always-on for files).
+                          The previous `{(multimodal || !!getSkills) &&`
+                          wrapper would hide the + button entirely on
+                          a text-only backend without skills, which
+                          would also hide the file-attach affordance.
                         */}
-                        {true && (
-                            <div
+                        <div
                                 ref={attachMenuRef}
                                 className="execlaw-composer__attach-anchor"
                             >
@@ -835,7 +839,6 @@ export function Composer({
                                     data-testid="composer-data-file-input"
                                 />
                             </div>
-                        )}
                     </div>
                     <div className="execlaw-composer__tools-right">
                         {/*
