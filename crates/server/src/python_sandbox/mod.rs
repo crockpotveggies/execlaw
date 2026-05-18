@@ -35,6 +35,8 @@ pub mod jupyter_protocol;
 pub mod kernel_pool;
 pub mod mime;
 pub mod output_watcher;
+pub mod service;
+pub mod tools;
 
 #[cfg(test)]
 mod bench_phase2;
@@ -50,6 +52,11 @@ pub use hydration::{
     hydrate_uploads, uploads_dir, AttachmentToHydrate, HydratedFile, HydrateOpts, HydrationError,
 };
 pub use output_watcher::{OutputCreated, OutputWatcher, WatchError, DEFAULT_DEBOUNCE};
+pub use service::{PythonSandboxService, ServiceError, PLUGIN_ID};
+pub use tools::{
+    python_sandbox_tools, PythonExecuteTool, PythonInterruptTool, PythonListFilesTool,
+    PythonResetTool,
+};
 pub use jupyter_protocol::{ExecutionState, JupyterEnvelope, JupyterHeader, KernelChannel, MsgType};
 pub use kernel_pool::{KernelPool, DEFAULT_IDLE_TIMEOUT};
 pub use mime::{
