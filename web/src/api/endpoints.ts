@@ -503,6 +503,13 @@ export interface PluginSummary {
     /// renders a settings page for (today: any [[oauth_accounts]]).
     /// Drives the gear icon on the Plugins page row.
     has_settings_ui: boolean;
+    /// True when the plugin's manifest declares one or more
+    /// `[[services]]` entries (sidecar containers). The config page
+    /// uses this together with the preflight Docker check to
+    /// render a "Docker not available" warning on Apple-Silicon
+    /// hosts where the wizard skipped Docker but the plugin needs
+    /// it.
+    has_sidecars?: boolean;
     /// Operator-facing one-liner from `[plugin].description` in the
     /// manifest. The Plugins page row renders this under the title
     /// with a single-line ellipsis truncation. May be omitted by

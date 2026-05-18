@@ -67,6 +67,17 @@ pub struct PluginSummary {
     /// `[[settings_fields]]` lands later and flips this true for
     /// plugins with operator-editable knobs but no OAuth.
     pub has_settings_ui: bool,
+    /// True when the plugin's manifest declares one or more
+    /// `[[services]]` entries — sidecar containers the supervisor
+    /// must spawn for the plugin to function. The SPA reads this on
+    /// the plugin config page and, when Docker is unreachable
+    /// (e.g. an Apple-Silicon install where the wizard skipped the
+    /// Docker step), renders a "Docker required for this plugin"
+    /// warning above the dynamic panel so the operator isn't left
+    /// staring at a sidecar that never comes healthy. Plugins that
+    /// declare zero services (Discord, open-meteo) keep this
+    /// `false` and the warning never appears.
+    pub has_sidecars: bool,
     /// Operator-facing one-liner from `[plugin].description`. The
     /// SPA renders this under the row title (single line, ellipsis
     /// truncated). `None` when the manifest omits the field or the
@@ -306,6 +317,17 @@ fn manifest_has_settings_ui(m: &execlaw_plugin_sdk::PluginManifest) -> bool {
     !m.oauth_accounts.is_empty() || !m.ui_panels.is_empty()
 }
 
+/// Predicate for `PluginSummary.has_sidecars`. Pulled out as a tiny
+/// helper so a unit test can pin "services declared ⇒ true" without
+/// going through the full DB-backed list_handler integration. A
+/// plugin declaring `[[services]]` is one the sidecar supervisor
+/// must spawn through Docker — used by the SPA's plugin config
+/// page to render a "Docker missing" warning when the daemon is
+/// unreachable.
+fn manifest_has_sidecars(m: &execlaw_plugin_sdk::PluginManifest) -> bool {
+    !m.services.is_empty()
+}
+
 /// `GET /api/admin/plugins`
 #[utoipa::path(
     get,
@@ -333,6 +355,16 @@ pub async fn list_handler(State(state): State<AppState>) -> impl IntoResponse {
                         .as_ref()
                         .map(manifest_has_settings_ui)
                         .unwrap_or(false);
+                    // Mirror `has_settings_ui`'s tolerance of an
+                    // unparseable manifest: default to `false`
+                    // (assume no sidecars) rather than failing the
+                    // whole list. The operator will still see the
+                    // row; the Docker-required warning just won't
+                    // fire for this single broken plugin.
+                    let has_sidecars = parsed
+                        .as_ref()
+                        .map(manifest_has_sidecars)
+                        .unwrap_or(false);
                     let description = parsed
                         .as_ref()
                         .and_then(|m| m.plugin.description.clone())
@@ -345,6 +377,7 @@ pub async fn list_handler(State(state): State<AppState>) -> impl IntoResponse {
                         installed_at: r.installed_at,
                         updated_at: r.updated_at,
                         has_settings_ui,
+                        has_sidecars,
                         description,
                         health_status: r.health_status,
                         health_message: r.health_message,
@@ -775,6 +808,57 @@ latency = "low"
         )
         .unwrap();
         assert!(!manifest_has_settings_ui(&neither));
+    }
+
+    /// Pin the `manifest_has_sidecars` rule: a manifest with any
+    /// `[[services]]` entry must report `true`, and manifests
+    /// without one must report `false`. The Docker-missing warning
+    /// on the plugin config page reads this field, so a regression
+    /// here either spams the warning for sidecar-free plugins
+    /// (false positive) or silences it for plugins that genuinely
+    /// can't run (false negative — operator sees a stuck plugin
+    /// with no signal why).
+    #[test]
+    fn manifest_has_sidecars_true_when_services_declared() {
+        let with_services = execlaw_plugin_sdk::PluginManifest::parse(
+            r#"
+[plugin]
+id = "python-sandbox"
+name = "Python Sandbox"
+version = "0.1.0"
+
+[[services]]
+name = "kernel-gateway"
+image = "execlaw/python-sandbox-fast:0.1.0"
+
+[services.sidecar]
+rpc_port = 8888
+health_path = "/api/kernels"
+"#,
+        )
+        .unwrap();
+        assert!(
+            manifest_has_sidecars(&with_services),
+            "plugins declaring [[services]] must trigger the Docker warning",
+        );
+
+        let no_services = execlaw_plugin_sdk::PluginManifest::parse(
+            r#"
+[plugin]
+id = "open-meteo"
+name = "Open-Meteo"
+version = "0.5.0"
+
+[[tools]]
+name = "open_meteo.current"
+latency = "low"
+"#,
+        )
+        .unwrap();
+        assert!(
+            !manifest_has_sidecars(&no_services),
+            "plugins without [[services]] must NOT trigger the Docker warning",
+        );
     }
 
     /// A plugin with no `[[ui_panels]]` blocks contributes nothing — the
