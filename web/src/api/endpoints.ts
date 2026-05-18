@@ -210,6 +210,22 @@ export interface MessageView {
 export interface MessageAttachment {
     id: string;
     mime: string;
+    /**
+     * 2026-05-18 — populated server-side from
+     * `state_attachments.filename`, with a derived fallback for
+     * legacy rows. Required by MessageStream's file-chip render
+     * path so non-image attachments (CSV, PDF, JSON, etc.) show
+     * the operator-uploaded name + a Download link instead of
+     * an `<img>` that fails to load.
+     */
+    filename?: string | null;
+    /**
+     * 2026-05-18 — blob size in bytes, used by the file-chip
+     * "data.csv (5.2 KB)" display. 0 means the size lookup
+     * failed (the server returns 0 on stat failure rather than
+     * failing the whole list-messages call).
+     */
+    size_bytes?: number;
 }
 
 export interface MessagesListResponse {

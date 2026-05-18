@@ -687,6 +687,29 @@ pub(crate) fn encode_attachments_as_data_urls(
             );
             continue;
         }
+        // 2026-05-18 — CRITICAL: only IMAGE mime types ride the
+        // vision-content path. Non-image attachments (CSV / PDF /
+        // JSON / etc.) live on disk and the agent learns about
+        // them via `build_attached_files_block`'s prose context
+        // (Phase C). Encoding a CSV as a `data:text/csv;base64,...`
+        // and shoving it into the OpenAI vision array fails at
+        // the inference backend with:
+        //   Failed to load image: cannot identify image file
+        //   <_io.BytesIO object>
+        // — and the operator's "summarize this csv" turn 500s.
+        // This filter was missing in the original encoder; every
+        // attachment was treated as an image.
+        if !is_image_mime(&row.mime_type) {
+            tracing::debug!(
+                target: "chats::encode_attachments",
+                attachment_id = %id_str,
+                mime = %row.mime_type,
+                "skipping non-image attachment for vision-content array — \
+                 agent will reach the file via python.execute against \
+                 /work/uploads/",
+            );
+            continue;
+        }
         match std::fs::read(&row.path) {
             Ok(bytes) => {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -885,9 +908,25 @@ pub(crate) fn hydrate_message_attachments(
         let att_id = execlaw_core::ids::AttachmentId::from(id.as_str());
         match store.get(&att_id) {
             Ok(Some(row)) if row.conversation_id.as_str() == cid.as_str() => {
+                // Fallback to `derive_default_filename` for legacy
+                // rows so the SPA chip still has SOMETHING to show.
+                // Matches the prose-block fallback so the agent's
+                // "Attached files" view + the user's message chip
+                // show the same name.
+                let filename = row.filename.clone().or_else(|| {
+                    Some(crate::python_sandbox::service::derive_default_filename(
+                        &row.mime_type,
+                        &row.sha256,
+                    ))
+                });
+                let size_bytes = std::fs::metadata(&row.path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
                 out.push(MessageAttachmentView {
                     id: id.clone(),
                     mime: row.mime_type,
+                    filename,
+                    size_bytes,
                 });
             }
             _ => {}
@@ -1614,6 +1653,170 @@ mod tests {
             elapsed < std::time::Duration::from_millis(50),
             "50-row format block took {elapsed:?} (budget: 50ms)",
         );
+    }
+
+    // ------------------------------------------------------------
+    // Vision-content encoder filter (2026-05-18 hotfix).
+    //
+    // Live bug: a CSV upload 500'd the agent turn because the
+    // encoder was packaging the CSV bytes as a `data:text/csv;
+    // base64,...` URL and shoving it into the OpenAI vision array.
+    // The inference backend choked with "Failed to load image:
+    // cannot identify image file <_io.BytesIO object>".
+    //
+    // Fix: only image-MIME rows feed the vision array. Non-image
+    // attachments stay on disk and reach the agent via the
+    // `build_attached_files_block` prose context + python.execute.
+    // ------------------------------------------------------------
+
+    // These tests use an in-memory DB. The encoder also reads
+    // blob bytes from disk — we stub the path with a real
+    // tempfile so the "read failed" warn doesn't fire.
+
+    use execlaw_core::attachments::{AttachmentRow as CoreAttachmentRow, AttachmentStore};
+    use execlaw_core::db::{Database, DbConfig};
+    use execlaw_core::ids::{AttachmentId as CoreAttachmentId, ConversationId as CoreConvoId};
+    use execlaw_core::migrations::MigrationRunner;
+
+    fn open_test_db() -> Database {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        db
+    }
+
+    fn insert_row_with_bytes(
+        db: &Database,
+        cid: &CoreConvoId,
+        mime: &str,
+        bytes: &[u8],
+        filename: Option<&str>,
+    ) -> (String, tempfile::NamedTempFile) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), bytes).unwrap();
+        let id = CoreAttachmentId::new();
+        AttachmentStore::new(db)
+            .insert(&CoreAttachmentRow {
+                id: id.clone(),
+                conversation_id: cid.clone(),
+                mime_type: mime.to_owned(),
+                path: tmp.path().to_string_lossy().into_owned(),
+                sha256: format!("sha-test-{}", id.as_str()),
+                received_at: 0,
+                filename: filename.map(|s| s.to_owned()),
+            })
+            .unwrap();
+        (id.as_str().to_owned(), tmp)
+    }
+
+    #[test]
+    fn encoder_includes_image_attachments() {
+        let db = open_test_db();
+        let cid = CoreConvoId::new();
+        let (id, _keep) =
+            insert_row_with_bytes(&db, &cid, "image/png", &[0x89, 0x50, 0x4e, 0x47], None);
+        let urls = encode_attachments_as_data_urls(&db, &cid, &[id]);
+        assert_eq!(urls.len(), 1, "image must reach the vision array");
+        assert!(urls[0].starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn encoder_skips_csv_attachments() {
+        // The bug: previously this returned a `data:text/csv;
+        // base64,...` URL which the inference backend rejected as
+        // a malformed image.
+        let db = open_test_db();
+        let cid = CoreConvoId::new();
+        let (id, _keep) =
+            insert_row_with_bytes(&db, &cid, "text/csv", b"a,b\n1,2\n", Some("data.csv"));
+        let urls = encode_attachments_as_data_urls(&db, &cid, &[id]);
+        assert!(
+            urls.is_empty(),
+            "CSV must NOT enter the vision array — agent learns about it via the \
+             attached-files prose block instead. urls={urls:?}",
+        );
+    }
+
+    #[test]
+    fn encoder_skips_every_non_image_mime() {
+        let db = open_test_db();
+        let cid = CoreConvoId::new();
+        let mut ids = Vec::new();
+        let mut keep_alive = Vec::new();
+        for mime in [
+            "text/csv",
+            "text/tab-separated-values",
+            "application/json",
+            "text/plain",
+            "text/markdown",
+            "application/pdf",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-excel",
+        ] {
+            let (id, keep) = insert_row_with_bytes(&db, &cid, mime, b"...", Some("file"));
+            ids.push(id);
+            keep_alive.push(keep);
+        }
+        let urls = encode_attachments_as_data_urls(&db, &cid, &ids);
+        assert!(
+            urls.is_empty(),
+            "all data MIMEs must be excluded from vision; got {} url(s)",
+            urls.len()
+        );
+    }
+
+    #[test]
+    fn encoder_includes_images_and_excludes_files_in_mixed_payload() {
+        let db = open_test_db();
+        let cid = CoreConvoId::new();
+        let (img_id, _keep1) =
+            insert_row_with_bytes(&db, &cid, "image/jpeg", &[0xff, 0xd8, 0xff], None);
+        let (csv_id, _keep2) =
+            insert_row_with_bytes(&db, &cid, "text/csv", b"x,y\n", Some("data.csv"));
+        let urls = encode_attachments_as_data_urls(&db, &cid, &[img_id, csv_id]);
+        assert_eq!(urls.len(), 1, "exactly the image must survive the filter");
+        assert!(urls[0].starts_with("data:image/jpeg;base64,"));
+    }
+
+    // ------------------------------------------------------------
+    // MessageAttachmentView projection — filename + size_bytes
+    // surface so the SPA can render the file chip correctly.
+    // ------------------------------------------------------------
+
+    #[test]
+    fn hydrate_message_attachments_passes_filename_through() {
+        let db = open_test_db();
+        let cid = CoreConvoId::new();
+        let (id, _keep) =
+            insert_row_with_bytes(&db, &cid, "text/csv", b"a,b\n1,2\n", Some("report.csv"));
+        let views = hydrate_message_attachments(&db, &cid, &[id]);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].mime, "text/csv");
+        assert_eq!(views[0].filename.as_deref(), Some("report.csv"));
+        assert!(
+            views[0].size_bytes > 0,
+            "size should be the blob's on-disk size (got {})",
+            views[0].size_bytes
+        );
+    }
+
+    #[test]
+    fn hydrate_message_attachments_falls_back_to_derived_name() {
+        // Legacy / transport rows with no `filename` column should
+        // still get a usable name from the same `derive_default_filename`
+        // helper hydration uses on disk. Otherwise the SPA chip
+        // would show "attachment" generically and a click would
+        // download with a meaningless name.
+        let db = open_test_db();
+        let cid = CoreConvoId::new();
+        let (id, _keep) =
+            insert_row_with_bytes(&db, &cid, "text/csv", b"a\n", None);
+        let views = hydrate_message_attachments(&db, &cid, &[id]);
+        assert_eq!(views.len(), 1);
+        assert!(views[0]
+            .filename
+            .as_deref()
+            .map(|f| f.starts_with("attachment-") && f.ends_with(".csv"))
+            .unwrap_or(false));
     }
 
     #[test]

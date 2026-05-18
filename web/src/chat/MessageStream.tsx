@@ -44,6 +44,48 @@ import "./components/WeatherDailyComponent";
 import "./components/PythonExecuteComponent";
 import { useChatState } from "./store";
 
+// 2026-05-18 — helpers for the file-vs-image branching when
+// rendering attachments under user message bubbles. Image MIMEs
+// mirror the server's `ALLOWED_ATTACHMENT_MIMES` image subset;
+// anything else takes the file-chip path.
+const IMAGE_MIME_SET: ReadonlySet<string> = new Set([
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+]);
+function isImageMime(m: string): boolean {
+    return IMAGE_MIME_SET.has(m);
+}
+
+/// Bootstrap-icons class for a non-image attachment chip. Mirrors
+/// the Composer's `fileIconForMime` so a CSV looks the same in the
+/// composer preview and the rendered message.
+function fileIconForMime(mime: string): string {
+    if (mime === "application/pdf") return "bi bi-file-earmark-pdf";
+    if (mime === "text/csv" || mime === "text/tab-separated-values")
+        return "bi bi-file-earmark-spreadsheet";
+    if (
+        mime ===
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+        mime === "application/vnd.ms-excel"
+    )
+        return "bi bi-file-earmark-excel";
+    if (mime === "application/json") return "bi bi-file-earmark-code";
+    if (mime === "text/markdown") return "bi bi-markdown";
+    if (mime === "text/plain") return "bi bi-file-earmark-text";
+    return "bi bi-file-earmark";
+}
+
+/// Compact byte-size formatter for the message-attachment chip.
+/// Matches the Composer's `formatBytes` style ("5.2 KB", "1.4 MB").
+function formatBytes(n: number): string {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+    return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
 interface Props {
     conversationId: string;
     /**
@@ -377,13 +419,48 @@ function MessageBubble({ message }: { message: MessageView }) {
                                       a.id,
                                       auth?.getAccessToken() ?? null,
                                   );
+                            // 2026-05-18 — branch on MIME. Non-image
+                            // attachments (CSV / PDF / JSON / etc.)
+                            // can't render as `<img>` — the browser
+                            // shows the alt text "attached image" and
+                            // the operator sees a broken visual. File
+                            // chip with icon + filename + download
+                            // link is the correct affordance for the
+                            // non-vision path.
+                            if (isImageMime(a.mime)) {
+                                return (
+                                    <img
+                                        key={a.id}
+                                        src={src}
+                                        alt="attached image"
+                                        className="execlaw-msg__attachment-image"
+                                    />
+                                );
+                            }
                             return (
-                                <img
+                                <a
                                     key={a.id}
-                                    src={src}
-                                    alt="attached image"
-                                    className="execlaw-msg__attachment-image"
-                                />
+                                    href={src}
+                                    download={a.filename ?? undefined}
+                                    className="execlaw-msg__attachment-file"
+                                    data-testid="message-attachment-file"
+                                    data-mime={a.mime}
+                                    title={`${a.filename ?? "file"} · ${a.mime}`}
+                                >
+                                    <i
+                                        className={fileIconForMime(a.mime)}
+                                        aria-hidden
+                                    />
+                                    <span className="execlaw-msg__attachment-file-name">
+                                        {a.filename ?? "attachment"}
+                                    </span>
+                                    {typeof a.size_bytes === "number" &&
+                                        a.size_bytes > 0 && (
+                                            <span className="execlaw-msg__attachment-file-size">
+                                                {formatBytes(a.size_bytes)}
+                                            </span>
+                                        )}
+                                </a>
                             );
                         })}
                     </div>

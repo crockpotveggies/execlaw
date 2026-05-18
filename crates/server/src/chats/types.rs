@@ -233,6 +233,18 @@ pub struct MessageView {
 pub struct MessageAttachmentView {
     pub id: String,
     pub mime: String,
+    /// 2026-05-18 — operator-facing filename from
+    /// `state_attachments.filename`. Required by the SPA's
+    /// MessageStream to render non-image attachments as file
+    /// chips (icon + filename + download link) instead of as
+    /// `<img>` tags. `None` for legacy rows and for
+    /// transport-inbound rows that never carried a filename.
+    pub filename: Option<String>,
+    /// Blob size in bytes — surfaced so the SPA chip can show
+    /// "data.csv (5.2 KB)" without a second round-trip. Best-
+    /// effort: a stat failure on disk returns 0 (rather than
+    /// failing the whole list-messages call).
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
