@@ -22,6 +22,7 @@ use tauri::{
     ActivationPolicy, AppHandle, Manager, WebviewUrl, WebviewWindowBuilder,
 };
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_opener::OpenerExt;
 use tokio::sync::Mutex;
 
 use crate::server_status::{self, ServerStatus};
@@ -167,17 +168,21 @@ pub fn run() {
             approve.set_enabled(false)?;
             approve.set_text("(no action required)")?;
 
+            // Menu bar icon — embed the 44px (@2x) template PNG at
+            // build time so it ships in the binary, no I/O at boot.
+            // `icon_as_template(true)` tells macOS this is a template
+            // image (black + alpha) and to recolor it to the system
+            // text color so it adapts to light/dark menu bars. The
+            // source SVG is monochrome (#1a1a1a on transparent) so
+            // sips' PNG export is already a valid template.
+            let tray_image =
+                tauri::image::Image::from_bytes(include_bytes!("../icons/tray@2x.png"))
+                    .unwrap_or_else(|_| tauri::image::Image::new_owned(vec![0u8; 4], 1, 1));
             let _tray = TrayIconBuilder::with_id("execlaw-tray")
                 .menu(&menu)
                 .menu_on_left_click(true)
-                .icon(app.default_window_icon().cloned().unwrap_or_else(|| {
-                    // Fallback for the case where Tauri couldn't
-                    // load the bundled icon — render an empty 1x1
-                    // image so the tray still appears. The bundle
-                    // ships icons/icon.icns; this branch should
-                    // only fire in cargo-run-from-source dev.
-                    tauri::image::Image::new_owned(vec![0u8; 4], 1, 1)
-                }))
+                .icon(tray_image)
+                .icon_as_template(true)
                 .on_menu_event(handle_menu_event)
                 .on_tray_icon_event(|_tray, event| {
                     // Left-click already opens the menu via

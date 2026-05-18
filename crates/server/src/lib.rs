@@ -43,6 +43,7 @@ pub mod oauth_admin;
 pub mod oauth_provider;
 pub mod oauth_sweeper;
 pub mod observability;
+pub mod ollama_puller;
 pub mod personality;
 pub mod plugin_admin_routes;
 pub mod plugin_lifecycle;

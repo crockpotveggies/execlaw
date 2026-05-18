@@ -199,14 +199,34 @@ impl InferenceResolver {
     }
 }
 
-/// Pull the `--model=…` argument out of a backend row's
-/// `model_spec_json`. Tolerates both `["--model=X"]` and
-/// `["--model", "X"]` shapes (different operator workflows write
-/// them differently). Returns `None` when no model arg is present
-/// so the caller can fall back to the bootstrap or the default.
+/// Pull the configured model id out of a backend row's
+/// `model_spec_json`. Tries three locations in order:
+///
+///   1. A top-level `"model"` field. The Apple-Silicon Ollama
+///      preset writes the tag here (see `materialise_spec` in
+///      `backend_presets.rs` — Ollama's spawn args are just
+///      `["serve"]`, the model isn't a CLI flag). Native engines
+///      that ship after Ollama (MLX, llama-server) use the same
+///      slot.
+///   2. `args` containing `--model=X` (single-token form).
+///   3. `args` containing `--model X` (two-token form, vLLM's
+///      default invocation).
+///
+/// Returns `None` when none of the three are present so the
+/// resolver falls back to the bootstrap or `DEFAULT_FALLBACK_MODEL`.
+/// Without the top-level check, Ollama rows fell through to the
+/// vLLM default ("QuantTrio/Qwen3.6-27B-AWQ") and Ollama 404'd at
+/// chat time.
 fn extract_model_arg(spec: &serde_json::Value) -> Option<String> {
+    // 1. Top-level `model` field (Ollama / future native engines).
+    if let Some(s) = spec.get("model").and_then(|v| v.as_str()) {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_owned());
+        }
+    }
     let args = spec.get("args")?.as_array()?;
-    // First pass: `--model=X` form.
+    // 2. `--model=X` form.
     for a in args {
         if let Some(s) = a.as_str() {
             if let Some(rest) = s.strip_prefix("--model=") {
@@ -217,7 +237,7 @@ fn extract_model_arg(spec: &serde_json::Value) -> Option<String> {
             }
         }
     }
-    // Second pass: `--model` followed by a value.
+    // 3. `--model` followed by a value.
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
         if a.as_str() == Some("--model") {
@@ -412,6 +432,61 @@ mod tests {
         assert_eq!(
             super::extract_model_arg(&serde_json::json!({
                 "args": ["--model="]
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_model_arg_reads_top_level_model_field_first() {
+        // The Apple-Silicon Ollama preset writes the tag at the
+        // top level (`model_spec_json.model`) rather than as a
+        // CLI arg — Ollama's `serve` invocation doesn't take a
+        // --model flag. Without this branch the resolver fell
+        // through to DEFAULT_FALLBACK_MODEL (a vLLM HF id) and
+        // Ollama 404'd at chat time.
+        assert_eq!(
+            super::extract_model_arg(&serde_json::json!({
+                "runtime": "native",
+                "binary_hint": "ollama",
+                "args": ["serve"],
+                "model": "qwen2.5:14b-instruct-q4_K_M",
+            })),
+            Some("qwen2.5:14b-instruct-q4_K_M".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_model_arg_top_level_takes_precedence_over_model_arg() {
+        // Defensive: a future row that has BOTH the top-level
+        // field AND a stale `--model=` arg should resolve to the
+        // top-level value (which is what the wizard is writing
+        // today). Keeps the precedence stable if someone
+        // hand-edits a row.
+        assert_eq!(
+            super::extract_model_arg(&serde_json::json!({
+                "model": "qwen2.5:14b-instruct-q4_K_M",
+                "args": ["--model=Qwen3.6-27B"],
+            })),
+            Some("qwen2.5:14b-instruct-q4_K_M".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_model_arg_skips_blank_top_level_model() {
+        // An empty-string `model` field shouldn't trap the
+        // resolver into sending the empty string — fall through
+        // to args / bootstrap as if the field were absent.
+        assert_eq!(
+            super::extract_model_arg(&serde_json::json!({
+                "model": "",
+                "args": ["--model=Qwen3.6-27B"],
+            })),
+            Some("Qwen3.6-27B".to_owned())
+        );
+        assert_eq!(
+            super::extract_model_arg(&serde_json::json!({
+                "model": "   ",
             })),
             None
         );

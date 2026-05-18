@@ -8,10 +8,17 @@ gen/schemas/
 bin/*
 !bin/.gitkeep
 !bin/README.md
-# Generated icon set — created from icon.png via `cargo tauri icon`.
-# The source PNG is committed (icons/source.png); generated .icns
-# and platform PNGs are not.
+# Generated icon set — rendered from the SVG sources under
+# assets/ by scripts/build-mac.sh step 4. Sources (SVG, .icon
+# package) live in /assets; the rendered binary artefacts are
+# regenerated on every build so we don't bloat git with PNGs that
+# drift from the SVG truth.
 icons/icon.icns
+icons/icon.png
+icons/tray.png
+icons/tray@2x.png
+icons/dmg-background.png
+icons/dmg-background@2x.png
 icons/Square*Logo.png
 icons/StoreLogo.png
 icons/[0-9]*x[0-9]*.png

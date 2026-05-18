@@ -164,6 +164,32 @@ export function SetupWizard() {
         }
     }, [getToken]);
 
+    // Apple Silicon: skip the Docker step entirely. Docker Desktop on
+    // Apple Silicon runs containers inside a Linux microVM with zero
+    // Metal access, so the managed-backend path that justifies the
+    // Docker check is unusable on this hardware — inference runs
+    // natively via Ollama instead (see docs/setup-mac.md). Without
+    // this guard the wizard surfaces a misleading "Docker Desktop not
+    // detected" warning even though the Backend step would have
+    // routed the operator to the Apple-Silicon Ollama panel anyway.
+    //
+    // `effectiveStep` short-circuits the render so we never flash the
+    // Docker UI for a frame between the preflight resolving and the
+    // useEffect committing setStep("backend"). The useEffect still
+    // fires so the actual `step` state catches up — the stepper
+    // indicator and Skip/Continue handlers read `step`, not the
+    // derived value, so they need real state. STEP_ORDER also hides
+    // "Docker" from the timeline so the stepper reads 2/2.
+    const hasAppleGpu =
+        preflight?.gpus?.some((g) => g.vendor === "Apple") ?? false;
+    const effectiveStep: WizardStep =
+        step === "docker" && hasAppleGpu ? "backend" : step;
+    useEffect(() => {
+        if (step === "docker" && hasAppleGpu) {
+            setStep("backend");
+        }
+    }, [step, hasAppleGpu]);
+
     const finish = useCallback(() => {
         // Same shrink + fade as the original single-screen wizard.
         // The "complete" path runs after a successful backend save:
@@ -198,13 +224,13 @@ export function SetupWizard() {
         <div className="execlaw-auth-shell">
             <div ref={ref} className="execlaw-auth-card">
                 <h1 className="execlaw-brand h4 mb-1">execlaw</h1>
-                <SetupStepIndicator step={step} preflight={preflight} />
-                {step === "account" && (
+                <SetupStepIndicator step={effectiveStep} preflight={preflight} />
+                {effectiveStep === "account" && (
                     <AccountStep
                         onComplete={() => setStep("docker")}
                     />
                 )}
-                {step === "docker" && (
+                {effectiveStep === "docker" && (
                     <DockerStep
                         preflight={preflight}
                         loading={preflightLoading}
@@ -214,7 +240,7 @@ export function SetupWizard() {
                         onSkip={() => setStep("backend")}
                     />
                 )}
-                {step === "backend" && (
+                {effectiveStep === "backend" && (
                     <BackendStep
                         getToken={getToken}
                         preflight={preflight}
@@ -249,7 +275,15 @@ function SetupStepIndicator({
     step: WizardStep;
     preflight: PreflightResponse | null;
 }) {
-    const currentIdx = STEP_ORDER.indexOf(step);
+    // Apple Silicon: hide the Docker step from the timeline since the
+    // wizard auto-skips past it — see the parent's auto-skip useEffect.
+    // Without this filter the stepper would render 3 dots but only 2
+    // are ever reachable, leaving an "upcoming" gray Docker dot the
+    // operator can't navigate to.
+    const hasAppleGpu =
+        preflight?.gpus?.some((g) => g.vendor === "Apple") ?? false;
+    const steps = STEP_ORDER.filter((s) => !(s === "docker" && hasAppleGpu));
+    const currentIdx = steps.indexOf(step);
     const dockerOk = preflight?.docker.available === true;
 
     function statusFor(idx: number, key: WizardStep): StepStatus {
@@ -272,7 +306,7 @@ function SetupStepIndicator({
             role="list"
             aria-label="Setup progress"
         >
-            {STEP_ORDER.map((s, i) => {
+            {steps.map((s, i) => {
                 const status = statusFor(i, s);
                 return (
                     <div
