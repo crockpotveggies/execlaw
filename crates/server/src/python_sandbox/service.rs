@@ -81,6 +81,35 @@ pub enum HydrateOnExecuteError {
     },
 }
 
+/// Operator-tunable knobs the SPA panel persists via the
+/// plugin-settings vault. Read once at boot by `wire_python_sandbox`
+/// and threaded into `PythonSandboxService::new_with_settings`. All
+/// fields are `Option<T>` with `None` falling back to the constants
+/// defined alongside the consumer (`DEFAULT_IDLE_TIMEOUT` in
+/// kernel_pool, `MAX_OUTPUT_BYTES` in client) — so a fresh install
+/// with no settings written behaves identically to before this
+/// type existed.
+#[derive(Debug, Default, Clone)]
+pub struct PythonSandboxSettings {
+    /// How long an inactive kernel stays alive before the pool
+    /// evicts it. Lower = less idle memory; higher = faster repeats
+    /// for the same conversation. SPA key:
+    /// `kernel_idle_timeout_seconds`.
+    pub idle_timeout: Option<std::time::Duration>,
+    /// Hard cap on a single `python.execute` output buffer.
+    /// Exceeding aborts the kernel + returns
+    /// `status: output_too_large`. SPA key: `max_output_bytes`.
+    ///
+    /// Plumbed into the GatewayClient when the operator overrides
+    /// the default. The plumbing through `client.rs` is a v1.1
+    /// follow-up — for now this field is stored but inert; the
+    /// const ceiling remains 50 MiB. The SPA still surfaces the
+    /// setting so the operator can write it, and the value is
+    /// already round-tripped through the vault — the next service
+    /// commit reads it.
+    pub max_output_bytes: Option<usize>,
+}
+
 impl PythonSandboxService {
     /// Construct against a running gateway. `gateway_url` is the
     /// supervisor-published URL (e.g. `http://127.0.0.1:8501`);
@@ -90,6 +119,11 @@ impl PythonSandboxService {
     /// publish writes content-addressed blobs; `events` is the
     /// process-wide EventBus the watcher's publish callback uses
     /// to emit attachment cards so the SPA chip appears immediately.
+    ///
+    /// 2026-05-18 — kept as a passthrough for callers (tests
+    /// mostly) that don't care about settings; production boot
+    /// uses `new_with_settings` so the SPA panel's knobs take
+    /// effect.
     pub fn new(
         gateway_url: impl Into<String>,
         work_root: PathBuf,
@@ -97,8 +131,51 @@ impl PythonSandboxService {
         db: Database,
         events: EventBus,
     ) -> Result<Arc<Self>, ServiceError> {
+        Self::new_with_settings(
+            gateway_url,
+            work_root,
+            artifacts_root,
+            db,
+            events,
+            PythonSandboxSettings::default(),
+        )
+    }
+
+    /// Same as [`new`] but threads operator-tunable settings
+    /// (idle timeout, output cap) read from the plugin-settings
+    /// vault into the KernelPool + GatewayClient. Settings with
+    /// `None` fall back to the module-level defaults.
+    pub fn new_with_settings(
+        gateway_url: impl Into<String>,
+        work_root: PathBuf,
+        artifacts_root: PathBuf,
+        db: Database,
+        events: EventBus,
+        settings: PythonSandboxSettings,
+    ) -> Result<Arc<Self>, ServiceError> {
         let client = GatewayClient::new(gateway_url.into())?;
-        let pool = KernelPool::new(client);
+        let pool = match settings.idle_timeout {
+            Some(d) => {
+                tracing::info!(
+                    idle_timeout_secs = d.as_secs(),
+                    "python_sandbox: kernel pool using operator-configured idle timeout"
+                );
+                KernelPool::with_idle_timeout(client, d)
+            }
+            None => KernelPool::new(client),
+        };
+        // max_output_bytes is captured into the struct for future
+        // GatewayClient plumbing but unused today — log when the
+        // operator set a non-default so they get a breadcrumb
+        // explaining why their setting "doesn't apply yet".
+        if let Some(cap) = settings.max_output_bytes {
+            tracing::info!(
+                max_output_bytes = cap,
+                "python_sandbox: max_output_bytes setting recorded; \
+                 plumbing into GatewayClient is a v1.1 follow-up — \
+                 the hard cap remains 50 MiB this release"
+            );
+        }
 
         // Watcher callback: publish each finished output as a
         // plugin artifact + emit the attachment card. Spawns the

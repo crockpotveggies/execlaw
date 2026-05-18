@@ -127,3 +127,16 @@ size, mime }], outputs: [{ name, size, mime }] }."""
 [runtime]
 tier = "script"
 source = "main.rhai"
+
+# 2026-05-18 — SPA settings page. The host's plugin-discovery sets
+# `has_settings_ui = true` whenever `[[ui_panels]]` is non-empty,
+# which surfaces a gear icon next to the plugin row in
+# /settings/plugins. Click → DynamicPluginPanel fetches
+# `panel.js` from `GET /api/admin/plugins/python-sandbox/ui/panel.js`
+# (authenticated; Controller-only) and dynamic-imports it at runtime.
+# The panel source lives at `ui/panel.tsx`; build via:
+#   node scripts/build-plugin-ui.mjs python-sandbox
+# The produced `ui/panel.js` ships inside the dist ZIP.
+[[ui_panels]]
+mount = "admin/plugins/python-sandbox"
+entry = "ui/panel.js"

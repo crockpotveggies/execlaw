@@ -55,7 +55,7 @@ pub use hydration::{
     hydrate_uploads, uploads_dir, AttachmentToHydrate, HydratedFile, HydrateOpts, HydrationError,
 };
 pub use output_watcher::{OutputCreated, OutputWatcher, WatchError, DEFAULT_DEBOUNCE};
-pub use service::{PythonSandboxService, ServiceError, PLUGIN_ID};
+pub use service::{PythonSandboxService, PythonSandboxSettings, ServiceError, PLUGIN_ID};
 pub use tools::{
     python_sandbox_tools, PythonExecuteTool, PythonInterruptTool, PythonListFilesTool,
     PythonResetTool,

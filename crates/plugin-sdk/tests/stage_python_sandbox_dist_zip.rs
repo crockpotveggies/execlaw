@@ -99,4 +99,37 @@ fn dist_python_sandbox_zip_stages_cleanly() {
         .expect("[runtime] must be declared");
     assert_eq!(runtime.tier, "script");
     assert_eq!(runtime.source.as_deref(), Some("main.rhai"));
+
+    // 2026-05-18 — UI panel declared. Drives `has_settings_ui=true`
+    // on the SPA's PluginsPage so the gear icon appears and the
+    // operator can reach /settings/plugins/python-sandbox. Without
+    // this entry the dynamic-panel loader 404s and the operator
+    // sees a blank settings page.
+    assert_eq!(
+        staged.manifest.ui_panels.len(),
+        1,
+        "plugin.toml must declare exactly one [[ui_panels]] entry"
+    );
+    let panel = &staged.manifest.ui_panels[0];
+    assert_eq!(panel.mount, "admin/plugins/python-sandbox");
+    assert_eq!(panel.entry, "ui/panel.js");
+
+    // Built panel.js must be packaged in the zip. The build step
+    // `node scripts/build-plugin-ui.mjs python-sandbox` produces
+    // it; missing here means someone forgot to run the build
+    // before packaging. `stage_zip` extracts everything into the
+    // staged tempdir; we check the file landed at the manifest-
+    // declared `entry` path with non-zero size.
+    let panel_path = staged.tempdir.path().join(&panel.entry);
+    assert!(
+        panel_path.exists(),
+        "panel entry not found in staged zip at {} \
+         (forgot `node scripts/build-plugin-ui.mjs python-sandbox`?)",
+        panel_path.display()
+    );
+    let panel_size = std::fs::metadata(&panel_path).expect("panel size").len();
+    assert!(
+        panel_size > 0,
+        "packaged panel.js is empty — esbuild produced 0 bytes?"
+    );
 }
