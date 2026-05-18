@@ -210,6 +210,13 @@ pub struct AppState {
     /// Same noop default + production-spawn pattern as
     /// `skill_capture`.
     pub reuse_update: execlaw_skills::ReuseUpdateSink,
+    /// Operator data directory (`~/.execlaw/` on a default macOS
+    /// install). Required by the bundled-plugins endpoints so they
+    /// can resolve `<data_dir>/bundled-plugins/<file>` without
+    /// re-walking through the keyring / config layer on every
+    /// request. Tests default to a tempdir; production threads the
+    /// real path through from `cli/main.rs::cmd_serve`.
+    pub data_dir: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for AppState {

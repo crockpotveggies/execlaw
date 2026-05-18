@@ -24,6 +24,7 @@ pub mod auth_extract;
 pub mod backend_presets;
 pub mod backend_supervisor;
 pub mod backends;
+pub mod bundled_plugins;
 pub mod cards;
 pub mod chat_alert;
 pub mod chats;

@@ -35,6 +35,14 @@ jobs:
       # workflow_dispatch runs (non-tag) just upload artifacts to
       # the run; the release step is skipped via the `if:` guard.
       contents: write
+      # `id-token: write` + `attestations: write` are required by
+      # `actions/attest-build-provenance@v2` so a downstream
+      # auditor can run `gh attestation verify execlaw_*.dmg
+      # --owner ${{ github.repository_owner }}` and confirm the
+      # artefact was built by this exact workflow at this exact
+      # commit. Free; no secrets needed.
+      id-token: write
+      attestations: write
 
     steps:
       - name: Checkout
@@ -77,6 +85,16 @@ jobs:
       - name: Build bundle
         run: ./scripts/build-mac.sh
 
+      - name: Package plugin ZIPs
+        # Every plugin under `plugins/*/` with a parseable
+        # `plugin.toml` gets a `dist/<id>-<version>.zip` plus a
+        # SHA-256 sidecar. The `build-mac.sh` step above also
+        # invokes this so the same ZIPs land in the .app's
+        # `Contents/Resources/plugins/`; running it again here is
+        # idempotent and gives us a clean `dist/` to attach to
+        # the GitHub Release.
+        run: ./scripts/package-plugins.sh
+
       - name: Locate bundle outputs
         id: outputs
         # The `.dmg` filename includes the version from
@@ -114,6 +132,40 @@ jobs:
           path: ${{ steps.outputs.outputs.dmg }}
           if-no-files-found: error
           retention-days: 90
+
+      - name: Upload plugin ZIPs
+        # Bundle all plugin ZIPs into a single workflow artifact
+        # (so a `gh run download` grabs them in one shot) AND
+        # attach them individually to the GitHub Release below.
+        uses: actions/upload-artifact@v4
+        with:
+          name: execlaw-plugins
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: warn
+          retention-days: 90
+
+      # ----- Provenance attestation -----
+      # `actions/attest-build-provenance@v2` produces a verifiable
+      # in-toto SLSA provenance statement linking the artifact's
+      # SHA-256 to this workflow run. Stored on GitHub; an end
+      # user can `gh attestation verify <file> --owner
+      # ${{ github.repository_owner }}` to confirm the artifact
+      # came from this repo + this exact workflow. Free, no
+      # secrets, no setup. Runs on every build (workflow_dispatch
+      # + tag) so dev-ad-hoc downloads are also verifiable.
+      - name: Attest DMG provenance
+        if: steps.outputs.outputs.dmg != ''
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.outputs.outputs.dmg }}
+
+      - name: Attest plugin ZIP provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          # Glob-supported — each ZIP gets its own attestation.
+          subject-path: "dist/*.zip"
 
       # ----- Release path -----
       # The remaining steps only fire on a tag push. workflow_dispatch
@@ -173,7 +225,34 @@ jobs:
 
             SHA-256: `${{ steps.checksum.outputs.sha256 }}`
 
+            ---
+
+            ### Bundled plugins
+
+            Every plugin in this repo is packaged as a standalone ZIP and
+            attached below alongside its SHA-256 sidecar. The macOS app
+            ships these same ZIPs in its `Contents/Resources/plugins/`
+            directory, so once you've installed `execlaw.app` the SPA
+            already knows about them — open **Settings → Plugins** and
+            you'll see a "Bundled" section listing each plugin with a
+            one-click install button (no separate download required).
+            Operators on Linux / Windows can download the ZIPs from this
+            release page and drag them onto the same Plugins page.
+
+            ### Verify provenance (optional)
+
+            Every artefact on this page is signed with a SLSA build-
+            provenance attestation. Confirm the binary you downloaded
+            was built by this exact workflow at this exact commit:
+
+            ```bash
+            gh attestation verify execlaw_<version>_aarch64.dmg \
+                --owner ${{ github.repository_owner }}
+            ```
+
           files: |
             ${{ steps.outputs.outputs.dmg }}
             ${{ steps.checksum.outputs.sha_file }}
+            dist/*.zip
+            dist/*.zip.sha256
           fail_on_unmatched_files: true

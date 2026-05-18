@@ -27,7 +27,7 @@
     "longDescription": "execlaw is a self-hosted agent platform with persistent memory, hook-based plugins, and per-conversation runner containers. The menu bar app supervises the local control plane and opens the chat UI.",
     "icon": ["icons/icon.icns"],
     "externalBin": ["bin/execlaw"],
-    "resources": [],
+    "resources": ["resources/plugins/*.zip"],
     "macOS": {
       "minimumSystemVersion": "13.0",
       "frameworks": [],

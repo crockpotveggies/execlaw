@@ -761,6 +761,7 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::runner_rpc::register_runner),
         )
         .merge(crate::plugins::plugins_router())
+        .merge(crate::bundled_plugins::bundled_plugins_router())
         .merge(crate::plugin_admin_routes::admin_routes_router())
         .merge(crate::plugin_webhook_routes::webhook_routes_router())
         .merge(crate::approvals::approvals_router())
@@ -924,6 +925,14 @@ pub fn test_app_state() -> AppState {
         skill_capture: execlaw_skills::AutoCaptureSink::noop(),
         // Phase D.3 — same noop pattern for the reuse-update sink.
         reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
+        // Tests don't run the bundled-plugins mirror; point at a
+        // unique tempdir-style path so the endpoints can still
+        // resolve `<data_dir>/bundled-plugins/...` deterministically
+        // without writing into a real user dir.
+        data_dir: std::env::temp_dir().join(format!(
+            "execlaw-test-data-{}",
+            uuid::Uuid::new_v4()
+        )),
     }
 }
 

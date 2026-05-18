@@ -10,8 +10,11 @@ import Spinner from "react-bootstrap/Spinner";
 import {
     disablePlugin,
     enablePlugin,
+    installBundledPlugin,
     installPlugin,
+    listBundledPlugins,
     listPlugins,
+    type BundledPlugin,
     type PluginSummary,
 } from "../api/endpoints";
 import { ApiError } from "../api/client";
@@ -63,6 +66,8 @@ export function PluginsPage() {
             <h3 className="h6 mb-3">Plugins</h3>
 
             <InstallCard onInstalled={fetchList} />
+
+            <BundledPluginsCard onInstalled={fetchList} installedPlugins={plugins} />
 
             <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
@@ -278,6 +283,200 @@ function InstallCard({ onInstalled }: { onInstalled: () => Promise<void> }) {
                 <div className="execlaw-muted small mt-2">
                     Installed {lastInstalled}.
                 </div>
+            )}
+        </div>
+    );
+}
+
+/// Surface ZIPs that the .app shipped (or the operator dropped
+/// into `~/.execlaw/bundled-plugins/` by hand on Linux/Windows) as
+/// a one-click install list. The native HTML file picker has no
+/// API for setting an initial directory — even Tauri's
+/// `<input type=file>` is the OS-native chooser and goes wherever
+/// the OS last remembered. Instead of fighting that, we surface
+/// the available bundled ZIPs DIRECTLY here so the operator
+/// doesn't have to remember where they live.
+function BundledPluginsCard({
+    onInstalled,
+    installedPlugins,
+}: {
+    onInstalled: () => Promise<void>;
+    installedPlugins: PluginSummary[] | null;
+}) {
+    const auth = useAuth();
+    const getToken = auth.getAccessToken;
+    const [items, setItems] = useState<BundledPlugin[] | null>(null);
+    const [busyFile, setBusyFile] = useState<string | null>(null);
+    const [error, setError] = useState<string | null>(null);
+    const [lastInstalled, setLastInstalled] = useState<string | null>(null);
+
+    const refresh = useCallback(async () => {
+        try {
+            const r = await listBundledPlugins(getToken);
+            setItems(r.plugins);
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+            setItems([]);
+        }
+    }, [getToken]);
+
+    useEffect(() => {
+        void refresh();
+        // Re-list after every fresh `installedPlugins` snapshot so
+        // the row badges (Installed / Available) reflect the new
+        // state without a manual reload.
+    }, [refresh, installedPlugins]);
+
+    const runInstall = useCallback(
+        async (entry: BundledPlugin) => {
+            setBusyFile(entry.file);
+            setError(null);
+            try {
+                // Always default to `reject`; the SPA prompts and
+                // retries with `upgrade` only if the operator
+                // confirms a replace. Matches the upload-path UX.
+                try {
+                    const r = await installBundledPlugin(
+                        entry.file,
+                        getToken,
+                        "reject",
+                    );
+                    setLastInstalled(`${r.plugin_id} v${r.version}`);
+                } catch (err) {
+                    const isConflict =
+                        err instanceof ApiError && err.code === "conflict";
+                    if (isConflict) {
+                        const ok = window.confirm(
+                            `${entry.plugin_id ?? entry.file} is already installed. ` +
+                                "Replace it with this bundled ZIP? OAuth tokens + " +
+                                "plugin-specific config survive the upgrade.",
+                        );
+                        if (!ok) {
+                            setError("Install cancelled.");
+                            return;
+                        }
+                        const r = await installBundledPlugin(
+                            entry.file,
+                            getToken,
+                            "upgrade",
+                        );
+                        setLastInstalled(`${r.plugin_id} v${r.version}`);
+                    } else {
+                        throw err;
+                    }
+                }
+                await onInstalled();
+                await refresh();
+            } catch (e) {
+                setError(e instanceof Error ? e.message : String(e));
+            } finally {
+                setBusyFile(null);
+            }
+        },
+        [getToken, onInstalled, refresh],
+    );
+
+    if (items !== null && items.length === 0) {
+        // No bundled ZIPs available on this host. Hide the whole
+        // card rather than render an empty section; the upload
+        // path above is sufficient.
+        return null;
+    }
+
+    return (
+        <div
+            className="execlaw-card mb-3"
+            data-testid="plugins-bundled-card"
+        >
+            <div className="execlaw-card__title">Bundled with this build</div>
+            <div className="execlaw-muted small mb-2">
+                These plugin ZIPs ship inside the macOS app (or were dropped
+                into <code>~/.execlaw/bundled-plugins/</code> by hand) — click
+                Install on any row to add the plugin without searching for the
+                file.
+            </div>
+            <ErrorBanner
+                message={error}
+                onDismiss={() => setError(null)}
+                className="mb-2"
+            />
+            {lastInstalled && !error && (
+                <div className="execlaw-muted small mb-2">
+                    Installed {lastInstalled}.
+                </div>
+            )}
+            {items === null ? (
+                <div className="execlaw-muted small">
+                    Loading bundled plugins…
+                </div>
+            ) : (
+                items.map((p) => (
+                    <div
+                        key={p.file}
+                        className="d-flex align-items-center gap-2 py-1"
+                        data-testid="plugins-bundled-row"
+                    >
+                        <div className="flex-grow-1">
+                            <div className="d-flex align-items-baseline gap-2">
+                                <strong>
+                                    {p.plugin_id ?? p.file}
+                                </strong>
+                                {p.version && (
+                                    <span className="execlaw-muted small">
+                                        v{p.version}
+                                    </span>
+                                )}
+                                <span className="execlaw-muted small">
+                                    · {Math.max(1, Math.round(p.size_bytes / 1024))} KB
+                                </span>
+                                {p.already_installed && (
+                                    <span
+                                        className="execlaw-trust-badge is-known"
+                                        title="A plugin with this id is already installed"
+                                    >
+                                        installed
+                                    </span>
+                                )}
+                            </div>
+                            {p.description && (
+                                <div className="execlaw-muted small text-truncate">
+                                    {p.description}
+                                </div>
+                            )}
+                        </div>
+                        <Button
+                            variant={
+                                p.already_installed
+                                    ? "outline-secondary"
+                                    : "outline-primary"
+                            }
+                            size="sm"
+                            onClick={() => void runInstall(p)}
+                            disabled={busyFile !== null}
+                            data-testid="plugins-bundled-install"
+                        >
+                            {busyFile === p.file ? (
+                                <Spinner size="sm" animation="border" />
+                            ) : p.already_installed ? (
+                                <>
+                                    <i
+                                        className="bi bi-arrow-repeat me-1"
+                                        aria-hidden
+                                    />
+                                    Reinstall
+                                </>
+                            ) : (
+                                <>
+                                    <i
+                                        className="bi bi-download me-1"
+                                        aria-hidden
+                                    />
+                                    Install
+                                </>
+                            )}
+                        </Button>
+                    </div>
+                ))
             )}
         </div>
     );

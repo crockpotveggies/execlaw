@@ -117,6 +117,27 @@ sips -s format png -Z 44 "$ICON_SVG_MONO" --out "$ICONS_DIR/tray@2x.png" >/dev/n
 sips -s format png -Z 660 "$DMG_BG_SVG" --out "$ICONS_DIR/dmg-background.png" >/dev/null
 sips -s format png -Z 1320 "$DMG_BG_SVG" --out "$ICONS_DIR/dmg-background@2x.png" >/dev/null
 
+echo "==> Step 4b: package plugin ZIPs + stage them into the bundle"
+# Build every plugin under `plugins/*/` into `dist/<id>-<version>.zip`
+# and copy the ZIPs into `desktop-macos/src-tauri/resources/plugins/`.
+# `tauri.conf.json`'s `bundle.resources` glob lifts them into
+# `Contents/Resources/plugins/` at bundle time; the server's
+# first-run bootstrap copies them out into
+# `~/.execlaw/bundled-plugins/` so the SPA's "Install plugin" page
+# can list them with a one-click install button (no separate
+# download needed). The CI macOS workflow also calls
+# `package-plugins.sh` on its own so the resulting `dist/*.zip`
+# files attach to the GitHub Release for Linux / Windows operators
+# who'd otherwise have no way to grab them.
+./scripts/package-plugins.sh
+PLUGIN_STAGE_DIR="$TAURI_DIR/resources/plugins"
+rm -rf "$PLUGIN_STAGE_DIR"
+mkdir -p "$PLUGIN_STAGE_DIR"
+# Only the ZIPs themselves ship inside the .app; the .sha256
+# sidecars stay in dist/ for the release attachments.
+cp dist/*.zip "$PLUGIN_STAGE_DIR/"
+echo "  staged $(ls "$PLUGIN_STAGE_DIR" | wc -l | tr -d ' ') ZIPs into $PLUGIN_STAGE_DIR"
+
 echo "==> Step 5: tauri build"
 (
     cd "$TAURI_DIR"

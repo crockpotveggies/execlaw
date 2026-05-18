@@ -1264,6 +1264,27 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     let (db, db_config) = open_db_with_config(&db_path, no_encrypt)?;
     execlaw_core::MigrationRunner::new(&db).apply_all()?;
 
+    // Resolve the data directory once at boot so downstream code
+    // (bundled-plugins mirror, settings paths, etc.) doesn't have
+    // to re-derive it. `db_path` always lives under the data dir
+    // by construction (cli/main.rs::default_db_path returns
+    // `<data_dir>/execlaw.db`); pull the parent and fall back to
+    // `default_data_dir()` for operators who explicitly pointed
+    // --db elsewhere.
+    let data_dir = db_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(default_data_dir);
+    let _ = std::fs::create_dir_all(&data_dir);
+
+    // Mirror any plugin ZIPs that ship inside the .app's
+    // Contents/Resources/plugins/ into <data_dir>/bundled-plugins/.
+    // Idempotent + best-effort — see crates/server/src/bundled_plugins.rs.
+    // Linux/Windows installs (no .app shell, no env override) are
+    // a silent no-op; operators drop ZIPs into that directory by
+    // hand and the SPA's "Bundled" section still lists them.
+    execlaw_server::bundled_plugins::mirror_bundled_plugins_into_data_dir(&data_dir);
+
     // Bind address resolution (precedence: CLI flag > DB > default).
     // The DB-stored value comes from Settings → General; making it
     // authoritative here is what allows the SPA's "takes effect on
@@ -1808,6 +1829,7 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         research_supervisor: Some(research_supervisor.clone()),
         skill_capture: skill_capture_sink,
         reuse_update: reuse_update_sink,
+        data_dir: data_dir.clone(),
     };
 
     // Phase B (channel-plugin surface): wire the host-capabilities

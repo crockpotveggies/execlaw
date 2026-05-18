@@ -285,7 +285,7 @@ pub async fn install_handler(
 /// logged but doesn't fail the operator's request — the worst case
 /// is Settings → Tools renders stale until the next call (or next
 /// server boot, which always runs the same sync).
-fn sync_after_lifecycle_change(state: &AppState, plugin_id: &str) {
+pub(crate) fn sync_after_lifecycle_change(state: &AppState, plugin_id: &str) {
     let now = chrono::Utc::now().timestamp();
     if let Err(e) =
         crate::tool_sync::mark_plugin_tools_removed(&state.db, plugin_id, &state.plugin_host, now)
@@ -611,7 +611,7 @@ pub fn plugins_router() -> Router<AppState> {
 // ---------------------------------------------------------------------------
 
 /// Recursive directory copy for the cross-device-rename fallback.
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;

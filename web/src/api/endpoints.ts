@@ -617,6 +617,63 @@ export async function installPlugin(
     return (await resp.json()) as InstallPluginResponse;
 }
 
+// ---- /api/admin/plugins/bundled ----------------------------------
+
+/// One entry in the bundled-plugins listing — a ZIP that lives
+/// under `~/.execlaw/bundled-plugins/`. Populated either by the
+/// macOS .app's boot-time mirror (Contents/Resources/plugins/ →
+/// data dir) or by an operator dropping a ZIP into that directory
+/// by hand. The SPA renders these on the Plugins page so the
+/// operator can install with a single click instead of finding +
+/// uploading the file.
+export interface BundledPlugin {
+    file: string;
+    plugin_id: string | null;
+    version: string | null;
+    description?: string | null;
+    size_bytes: number;
+    /// True when a plugin with this `plugin_id` is already
+    /// installed (regardless of version). Drives the SPA's
+    /// button label (Install vs Reinstall / Upgrade).
+    already_installed: boolean;
+}
+
+export interface BundledPluginListResponse {
+    plugins: BundledPlugin[];
+}
+
+export async function listBundledPlugins(
+    tokenAccessor: () => string | null,
+): Promise<BundledPluginListResponse> {
+    return apiFetch<BundledPluginListResponse>(
+        "/api/admin/plugins/bundled",
+        {},
+        tokenAccessor,
+    );
+}
+
+/// Install a specific bundled ZIP by filename. The backend
+/// resolves it against `~/.execlaw/bundled-plugins/` and routes
+/// through the same staging + install pipeline as the upload path.
+/// Pass `ifExisting: "upgrade"` to replace an existing install
+/// with the same id; the default `"reject"` returns a 409 if
+/// there's a conflict so the SPA can prompt.
+export async function installBundledPlugin(
+    file: string,
+    tokenAccessor: () => string | null,
+    ifExisting: "reject" | "upgrade" = "reject",
+): Promise<InstallPluginResponse> {
+    const params = new URLSearchParams({ file });
+    if (ifExisting === "upgrade") {
+        params.set("if_existing", "upgrade");
+    }
+    return apiFetch<InstallPluginResponse>(
+        `/api/admin/plugins/install-bundled?${params.toString()}`,
+        { method: "POST" },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/hardware ------------------------------------------
 
 export interface HardwareGpu {
