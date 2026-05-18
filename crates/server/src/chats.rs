@@ -274,7 +274,20 @@ pub async fn send_message(
     //   TurnExecutor path (supports multi-round tool_call loop with
     //   ChainedToolDispatch routing to the plugin host).
     let text_for_broadcast = req.text.clone();
-    let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
+    // `all_tools` returns plugin-owned tools only — built-ins are in
+    // a separate map (see HookRegistry::all_builtins). On a fresh
+    // install with no plugins installed (e.g. the Apple-Silicon
+    // wizard finishing without manually adding Signal/Discord/etc.)
+    // a check that only consults `all_tools()` returns empty even
+    // when the agent has 28+ core built-in tools available, sending
+    // the operator straight into `run_real_turn` with `tools: None`
+    // and a model that responds "I'll fetch that for you" without
+    // ever emitting a tool call. Combine both so the tool-capable
+    // path engages whenever there's ANY tool surface the agent can
+    // call.
+    let registry_for_tools = state.plugin_host.registry();
+    let has_plugin_tools = !registry_for_tools.all_tools().is_empty()
+        || !registry_for_tools.all_builtins().is_empty();
     let caller_caps: Vec<String> = policy
         .capability_set
         .iter()

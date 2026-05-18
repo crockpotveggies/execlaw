@@ -84,13 +84,35 @@ struct OllamaOptions {
     /// for much more, so forwarding is required to get a useful cap.
     #[serde(skip_serializing_if = "Option::is_none")]
     num_predict: Option<u32>,
+    /// Context window size. Ollama's default of 4096 is well below
+    /// what the agent needs — a typical tool-bearing turn has a
+    /// system prompt (~3 KB) + 36 tool schemas (~3 KB) + history,
+    /// and lands around 6-8 K tokens. With `num_ctx=4096` Ollama
+    /// silently truncates the middle (`keep=4 new=4096`), which
+    /// drops the tool schemas while keeping recent tool_result
+    /// payloads — the model knows the tool name from chat-template
+    /// scaffolding but no longer has the schema or earlier results
+    /// in view, so it re-queries indefinitely. 16384 covers every
+    /// realistic agent turn for the Apple-Silicon Qwen2.5 family
+    /// (3B/14B/32B all support ≥32K natively) at a few hundred MB
+    /// of extra KV-cache memory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_ctx: Option<u32>,
 }
 
 impl OllamaOptions {
     fn is_empty(&self) -> bool {
-        self.temperature.is_none() && self.num_predict.is_none()
+        self.temperature.is_none() && self.num_predict.is_none() && self.num_ctx.is_none()
     }
 }
+
+/// Conservative context-window size for the Apple-Silicon Ollama
+/// path. Big enough to fit the agent's system prompt + full tool
+/// catalog + several rounds of tool results; small enough that the
+/// KV cache stays in a few hundred MB. Qwen2.5 supports up to 32K
+/// natively, but most agent turns finish well under 12K — 16K is
+/// the sweet spot.
+const DEFAULT_NUM_CTX: u32 = 16384;
 
 /// Ollama's message shape on the wire — close enough to OpenAI's
 /// that we serialize a borrowed view rather than cloning. `name`
@@ -190,6 +212,7 @@ fn build_request<'a>(req: &'a ChatRequest, stream: bool) -> OllamaChatRequest<'a
         options: OllamaOptions {
             temperature: req.temperature,
             num_predict: req.max_tokens,
+            num_ctx: Some(DEFAULT_NUM_CTX),
         },
     }
 }
@@ -656,13 +679,20 @@ mod tests {
         let temp = serialized["options"]["temperature"].as_f64().unwrap();
         assert!((temp - 0.3).abs() < 1e-5, "temperature drift: {temp}");
         assert_eq!(serialized["options"]["num_predict"], 256);
+        // num_ctx is pinned on every request — see DEFAULT_NUM_CTX
+        // doc for the rationale.
+        assert_eq!(serialized["options"]["num_ctx"], DEFAULT_NUM_CTX);
         assert_eq!(serialized["tools"][0]["function"]["name"], "web_search");
         assert_eq!(serialized["messages"][0]["role"], "user");
         assert_eq!(serialized["messages"][0]["content"], "hi");
     }
 
     #[test]
-    fn build_request_omits_options_when_no_temperature_or_max_tokens() {
+    fn build_request_always_sets_num_ctx_to_keep_tools_in_window() {
+        // Even when the caller doesn't specify temperature or
+        // max_tokens, we must pin num_ctx so Ollama doesn't fall
+        // back to its 4096-token default and truncate the agent's
+        // tool catalog out of the middle of the prompt.
         let req = ChatRequest {
             model: ModelId("qwen2.5:7b".into()),
             messages: vec![ChatMessage::user("hi")],
@@ -675,10 +705,13 @@ mod tests {
             guided_decoding_backend: None,
         };
         let serialized = serde_json::to_value(build_request(&req, false)).unwrap();
-        assert!(
-            !serialized.as_object().unwrap().contains_key("options"),
-            "options key must be skipped when both fields are None to avoid sending empty {{}}"
+        assert_eq!(
+            serialized["options"]["num_ctx"], DEFAULT_NUM_CTX,
+            "num_ctx must always be sent (default {DEFAULT_NUM_CTX}) — Ollama's 4096 default truncates tool schemas"
         );
+        // The other fields stay optional and absent when not set.
+        assert!(serialized["options"].get("temperature").is_none());
+        assert!(serialized["options"].get("num_predict").is_none());
     }
 
     #[test]

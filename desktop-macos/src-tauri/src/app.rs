@@ -220,11 +220,42 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app, event| {
-            // Don't quit when the last window closes — we're a
-            // menu bar app, the tray is the only persistent UI.
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                api.prevent_exit();
+        .run(|app, event| {
+            match &event {
+                // Don't quit when the last window closes — we're a
+                // menu bar app, the tray is the only persistent UI.
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    api.prevent_exit();
+                }
+                // Window-lifecycle policy flip: when the chat window
+                // is destroyed (operator closed it), drop the app
+                // back to Accessory so the Dock icon disappears and
+                // ⌘-Tab stops showing us. The reverse transition
+                // (Accessory → Regular) happens in open_chat_window
+                // when the window is first created or re-shown.
+                //
+                // We listen for `Destroyed` specifically — Tauri
+                // destroys the window object on close-request unless
+                // a handler intercepts. CloseRequested fires first
+                // but the window is still alive at that point;
+                // flipping the policy then leaves a brief flash of a
+                // dockless half-open window. Destroyed is the clean
+                // signal that the window is fully gone.
+                tauri::RunEvent::WindowEvent {
+                    label,
+                    event: tauri::WindowEvent::Destroyed,
+                    ..
+                } if label == "chat" => {
+                    if let Err(e) =
+                        app.set_activation_policy(ActivationPolicy::Accessory)
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            "post-close set_activation_policy(Accessory) failed"
+                        );
+                    }
+                }
+                _ => {}
             }
         });
 }
@@ -250,9 +281,34 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
 }
 
 /// Open (or focus) the chat UI window pointed at the local server.
+///
+/// macOS quirk: with `ActivationPolicy::Accessory` the app is
+/// excluded from Dock + ⌘-Tab cycle, and Tauri's
+/// `window.set_focus()` alone won't elevate the window above other
+/// apps' windows when execlaw isn't the frontmost app. The
+/// operator clicks "Open execlaw" expecting the window to surface,
+/// not just gain "focus" behind whatever Slack tab they were
+/// looking at. We call `-[NSApplication activateIgnoringOtherApps:]`
+/// explicitly so the WindowServer hoists our window even though we
+/// have no Dock presence.
 fn open_chat_window(app: &AppHandle) {
+    // Flip to Regular BEFORE showing so the WindowServer assigns the
+    // chat window a Dock-managed slot from the start. If we stayed
+    // Accessory the window would appear but the Dock icon would
+    // never light up, ⌘-Tab would skip us, and Mission Control
+    // wouldn't list the window as one of the operator's open apps.
+    // The RunEvent::WindowEvent::Destroyed handler flips back to
+    // Accessory once the operator closes the window.
+    if let Err(e) = app.set_activation_policy(ActivationPolicy::Regular) {
+        tracing::warn!(
+            error = %e,
+            "set_activation_policy(Regular) failed; window may not surface in Dock"
+        );
+    }
+
     if let Some(window) = app.get_webview_window("chat") {
         let _ = window.show();
+        activate_app_ignoring_others();
         let _ = window.set_focus();
         return;
     }
@@ -266,8 +322,40 @@ fn open_chat_window(app: &AppHandle) {
         .inner_size(1280.0, 800.0)
         .min_inner_size(900.0, 600.0)
         .resizable(true);
-    if let Err(e) = build.build() {
-        tracing::error!(error = %e, "failed to open chat window");
+    match build.build() {
+        Ok(window) => {
+            // First-time create — activate AFTER the WKWebView's
+            // NSWindow is in the window list. Tauri returns from
+            // build() once the window has been created on the main
+            // thread, so this ordering is safe.
+            activate_app_ignoring_others();
+            let _ = window.set_focus();
+        }
+        Err(e) => tracing::error!(error = %e, "failed to open chat window"),
+    }
+}
+
+/// Equivalent to `NSApp.activate(ignoringOtherApps: true)`. Required
+/// for accessory apps to bring their windows above whatever the
+/// operator was previously looking at.
+fn activate_app_ignoring_others() {
+    use objc2::msg_send;
+    use objc2::runtime::AnyClass;
+    let Some(cls) = AnyClass::get("NSApplication") else {
+        tracing::warn!("NSApplication class not available — activate skipped");
+        return;
+    };
+    // SAFETY: `+[NSApplication sharedApplication]` returns the
+    // singleton; `-[NSApplication activateIgnoringOtherApps:]` is a
+    // void method on the main thread. Tauri menu-event handlers run
+    // on the main thread, so this call is well-typed.
+    unsafe {
+        let app: *mut objc2::runtime::AnyObject = msg_send![cls, sharedApplication];
+        if app.is_null() {
+            tracing::warn!("NSApp sharedApplication returned nil — activate skipped");
+            return;
+        }
+        let _: () = msg_send![app, activateIgnoringOtherApps: true];
     }
 }
 
