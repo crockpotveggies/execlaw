@@ -151,10 +151,21 @@ impl ToolImpl for PythonExecuteTool {
             Ok(r) => r,
             Err(e) => return ToolOutcome::err("execute_failed", e.to_string()),
         };
-        match serde_json::to_value(&result) {
-            Ok(v) => ToolOutcome::Ok(v),
-            Err(e) => ToolOutcome::err("serialize_result_failed", e.to_string()),
+        // Inject `chat_component_kind` so the SPA's chatComponentRegistry
+        // routes this tool_result to PythonExecuteComponent rather than
+        // the default raw-JSON renderer. Sibling field of the
+        // ExecuteResult fields — doesn't disturb the existing shape.
+        let mut value = match serde_json::to_value(&result) {
+            Ok(v) => v,
+            Err(e) => return ToolOutcome::err("serialize_result_failed", e.to_string()),
+        };
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "chat_component_kind".to_string(),
+                Value::String("python_execute".to_string()),
+            );
         }
+        ToolOutcome::Ok(value)
     }
 }
 
@@ -537,6 +548,9 @@ mod tests {
         };
         assert_eq!(result["status"], "ok");
         assert_eq!(result["execution_count"], 1);
+        // SPA dispatch hint: the chat-component registry routes this
+        // tool_result to PythonExecuteComponent.tsx via this kind.
+        assert_eq!(result["chat_component_kind"], "python_execute");
         // outputs[0] is ExecuteResult kind with text/plain "2".
         let outputs = result["outputs"].as_array().unwrap();
         let er = outputs

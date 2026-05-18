@@ -41,10 +41,21 @@ import {
 import "./components/ChartInlineComponent";
 import "./components/WeatherCurrentComponent";
 import "./components/WeatherDailyComponent";
+import "./components/PythonExecuteComponent";
 import { useChatState } from "./store";
 
 interface Props {
     conversationId: string;
+    /**
+     * 2026-05-16 — when false, `tool_use` / `tool_result` messages
+     * are filtered out of the stream entirely (not just hidden via
+     * CSS — dropped from the items list so the DOM stays small).
+     * Default `true` preserves historical behaviour for tests + any
+     * caller that doesn't thread the toggle. The operator flips
+     * this via the chat header's view-filter popup; the preference
+     * persists across reloads (see `useToolResultsVisible`).
+     */
+    showToolResults?: boolean;
 }
 
 /** Pixel slack on the at-bottom check. Browsers can leave a fractional
@@ -58,7 +69,7 @@ type StreamItem =
     | { kind: "message"; message: MessageView; sortKey: number }
     | { kind: "card"; card: Card; sortKey: number };
 
-export function MessageStream({ conversationId }: Props) {
+export function MessageStream({ conversationId, showToolResults = true }: Props) {
     const messages = useChatState(
         (s) => s.messages[conversationId] ?? null,
     );
@@ -70,6 +81,12 @@ export function MessageStream({ conversationId }: Props) {
         const acc: StreamItem[] = [];
         if (messages) {
             for (const m of messages) {
+                // 2026-05-16 — tool_use / tool_result bubbles are
+                // typically raw JSON / monospace dumps that crowd
+                // the transcript when the operator just wants the
+                // agent's prose. The chat header's view filter
+                // gates them on/off; default is on.
+                if (!showToolResults && isToolKind(m.kind)) continue;
                 acc.push({ kind: "message", message: m, sortKey: m.seq });
             }
         }
@@ -97,7 +114,7 @@ export function MessageStream({ conversationId }: Props) {
         }
         acc.sort((a, b) => a.sortKey - b.sortKey);
         return acc;
-    }, [messages, cards]);
+    }, [messages, cards, showToolResults]);
     const scrollRef = useRef<HTMLDivElement | null>(null);
     const [isAtBottom, setIsAtBottom] = useState(true);
 
