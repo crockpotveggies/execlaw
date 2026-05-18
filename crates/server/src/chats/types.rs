@@ -107,14 +107,26 @@ pub(crate) const MAX_PREPEND_SKILL_BYTES: usize = 32 * 1024;
 /// upload endpoint for the common Phase-1 case.
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 pub struct InlineAttachmentRequest {
-    /// IANA mime type. Restricted server-side to the image family
-    /// today (`image/png`, `image/jpeg`, `image/webp`, `image/gif`).
-    /// Non-image mime types fail with `attachment_mime_unsupported`.
+    /// IANA mime type. Server-side acceptlist:
+    ///   * Image: `image/png|jpeg|webp|gif` (routed to vision content).
+    ///   * Data: `text/csv|tab-separated-values|plain|markdown`,
+    ///     `application/json|pdf|xlsx|xls` (routed only to
+    ///     `state_attachments` + python-sandbox hydration; agent
+    ///     learns via per-turn context block).
+    /// Anything else fails with `attachment_mime_unsupported`.
     pub mime: String,
     /// `data:<mime>;base64,<bytes>` URL. The mime in this URL must
     /// match the `mime` field above; mismatches fail with
     /// `attachment_data_url_invalid`.
     pub data_url: String,
+    /// 2026-05-18 — original filename from the OS file picker
+    /// (e.g. `quarterly-revenue.csv`). Required for non-image
+    /// attachments so Phase-3 hydration can drop the file at
+    /// `/work/<convo>/uploads/<filename>` and the agent can
+    /// reference it by name. Optional for images — they land in
+    /// vision content where the filename isn't user-facing.
+    #[serde(default)]
+    pub filename: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]

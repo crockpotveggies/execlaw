@@ -33,15 +33,64 @@ use crate::state::AppState;
 /// per image, comfortably above what the SPA pre-resizes to (~1 MiB
 /// on a 1024px JPEG) but small enough that an accidental "drop a
 /// 50 MB raw" doesn't blow up the request body parser or vLLM's
-/// per-image budget.
+/// per-image budget. Also applies to non-image attachments (CSV,
+/// JSON, etc.) routed to the python-sandbox kernel via Phase 3
+/// hydration.
 pub(crate) const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 
-/// Allowed mime types for composer-attached images. Anything outside
-/// this set fails with `attachment_mime_unsupported` so a malformed
-/// SPA upload doesn't end up routed to a vision model that rejects
-/// the format. Order doesn't matter — substring `eq` lookup.
-pub(crate) const ALLOWED_ATTACHMENT_MIMES: &[&str] =
-    &["image/png", "image/jpeg", "image/webp", "image/gif"];
+/// Allowed mime types for composer-attached files. Originally
+/// images-only for the vision-content path; expanded 2026-05-18 to
+/// cover the "feed this to pandas / read this PDF" cases the
+/// python-sandbox plugin enables. Order doesn't matter — substring
+/// `eq` lookup against the lowercased declared mime.
+///
+/// Splits conceptually into two groups (no enforced split; the
+/// down-stream code paths handle each correctly):
+///
+///   * **Image MIMEs** → land as vision content parts on the LLM
+///     request, just like before. Agent "sees" them directly.
+///   * **Data MIMEs** → land only on disk in `state_attachments` and
+///     get hydrated to `/work/<convo_id>/uploads/<filename>` by
+///     the python-sandbox sidecar (Phase 3). Agent learns about
+///     them via the per-turn `[Attached files: …]` context block
+///     (Phase C of this work) so it knows to call `python.execute`
+///     with pandas / pdf-readers / etc.
+///
+/// **NOT** included by design: executables (`.exe`, `.dll`, `.sh`,
+/// `.bat`), source code (`.py`, `.js`) — the v1 scope is "data the
+/// agent operates ON", not "scripts the agent runs". Sandbox
+/// isolation would technically contain a bad script, but exposing
+/// the upload pipe to executables makes the threat model harder to
+/// reason about. Operators who really need this can land it as a
+/// follow-up with explicit opt-in.
+pub(crate) const ALLOWED_ATTACHMENT_MIMES: &[&str] = &[
+    // Image family (vision-content path).
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    // Tabular / structured data (pandas-friendly).
+    "text/csv",
+    "text/tab-separated-values",
+    "application/json",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", // .xlsx
+    "application/vnd.ms-excel",                                          // .xls
+    // Plain text + markdown (readable by python.execute via open()).
+    "text/plain",
+    "text/markdown",
+    // Documents.
+    "application/pdf",
+];
+
+/// `true` if the mime is in the image group — used by callers that
+/// need to fan out only images to the vision-content path while
+/// non-image attachments stay on disk for python-sandbox hydration.
+pub(crate) fn is_image_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    )
+}
 
 
 /// 2026-05-16 — in-memory representation of an inline attachment
@@ -52,9 +101,18 @@ pub(crate) const ALLOWED_ATTACHMENT_MIMES: &[&str] =
 /// behind. Pre-fix the persistence happened upfront, so a malformed
 /// caller could land bytes-on-disk + DB rows in a conversation they
 /// weren't authorized to send to.
+#[cfg_attr(test, derive(Debug))]
 pub(crate) struct DecodedAttachment {
     pub mime: String,
     pub bytes: Vec<u8>,
+    /// 2026-05-18 — operator-facing original filename from the SPA
+    /// file picker (`InlineAttachmentRequest.filename`). Required
+    /// for non-image MIMEs so hydration can write the blob to
+    /// `/work/<convo>/uploads/<filename>` under the original name
+    /// (the agent references it by name in `python.execute`). For
+    /// images it's optional — they land in vision content where
+    /// the filename isn't user-visible.
+    pub filename: Option<String>,
 }
 
 /// Phase A: parse + validate every `InlineAttachmentRequest` in the
@@ -140,9 +198,58 @@ pub(crate) fn decode_inline_attachments(
                 ),
             });
         }
-        out.push(DecodedAttachment { mime, bytes });
+        // Non-image MIMEs MUST carry a filename — hydration needs
+        // it to write the blob to the kernel's `/work/<convo>/
+        // uploads/<filename>` mount under the operator's chosen
+        // name. Images can skip it (vision content doesn't surface
+        // filenames). Sanitize away path separators on the way
+        // through so a malicious or sloppy payload can't write to
+        // `/work/<convo>/uploads/../../etc/passwd` (hydration also
+        // re-checks, but defense in depth).
+        let filename = att.filename.as_ref().map(|s| sanitize_filename(s));
+        if !is_image_mime(&mime) && filename.as_deref().map(|s| s.is_empty()).unwrap_or(true) {
+            return Err(crate::routes::ApiError {
+                status: StatusCode::BAD_REQUEST,
+                code: "attachment_filename_required",
+                message: format!(
+                    "attachment #{idx}: filename is required for non-image MIME '{mime}' \
+                     so the python-sandbox sidecar can hydrate the file under its \
+                     original name"
+                ),
+            });
+        }
+        out.push(DecodedAttachment {
+            mime,
+            bytes,
+            filename,
+        });
     }
     Ok(out)
+}
+
+/// Strip path separators + leading dots from an operator-supplied
+/// filename so a hostile or careless payload can't traverse out of
+/// `/work/<convo>/uploads/`. Returns the file's basename, with
+/// `/` and `\` collapsed to the trailing component and a leading
+/// `.` (hidden-file marker on Unix) trimmed. Empty / all-dots input
+/// returns the empty string; the caller treats that as "missing
+/// filename" and rejects.
+///
+/// Intentionally minimal — full canonicalization happens in the
+/// hydration path which also re-joins through `Path::join` against
+/// a canonicalized work root. This is the first-line filter so the
+/// SPA's chip + agent context block don't show a path-shaped name.
+fn sanitize_filename(raw: &str) -> String {
+    let trimmed = raw.trim();
+    // Take whatever's after the last separator.
+    let last_sep = trimmed
+        .rfind(|c: char| c == '/' || c == '\\')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let basename = &trimmed[last_sep..];
+    // Strip leading dots so "..\foo" doesn't survive as "..foo"
+    // after sep-stripping a path like `foo\..\bar`.
+    basename.trim_start_matches('.').to_owned()
 }
 
 /// Phase B: persist every previously-decoded attachment. Writes the
@@ -158,13 +265,12 @@ pub(crate) fn commit_decoded_attachments(
 ) -> Result<Vec<String>, crate::routes::ApiError> {
     let mut ids = Vec::with_capacity(decoded.len());
     for (idx, d) in decoded.iter().enumerate() {
-        let id = write_attachment_blob(state, cid, &d.mime, &d.bytes).map_err(|e| {
-            crate::routes::ApiError {
+        let id = write_attachment_blob(state, cid, &d.mime, &d.bytes, d.filename.as_deref())
+            .map_err(|e| crate::routes::ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "attachment_write_failed",
                 message: format!("attachment #{idx}: {e}"),
-            }
-        })?;
+            })?;
         ids.push(id);
     }
     Ok(ids)
@@ -191,6 +297,7 @@ fn write_attachment_blob(
     cid: &ConversationId,
     mime: &str,
     bytes: &[u8],
+    filename: Option<&str>,
 ) -> Result<String, String> {
     use execlaw_core::attachments::{AttachmentRow, AttachmentStore};
     use execlaw_core::ids::AttachmentId;
@@ -222,11 +329,14 @@ fn write_attachment_blob(
         path: path.to_string_lossy().into_owned(),
         sha256: sha,
         received_at: chrono::Utc::now().timestamp(),
-        // `filename` is populated later in the chats.rs ingress flow
-        // (other agent's work) when the original filename is in the
-        // card payload. Left None here so this helper stays mime+bytes
-        // only and doesn't grow another parameter.
-        filename: None,
+        // 2026-05-18 — populated from the SPA composer's file picker
+        // (`InlineAttachmentRequest.filename`) for non-image MIMEs so
+        // python-sandbox hydration can land the file at
+        // `/work/<convo>/uploads/<filename>`. Sanitized at decode
+        // (path separators stripped, leading dots trimmed) before
+        // reaching here. None for images and for inbound-transport
+        // attachments that don't carry an original filename.
+        filename: filename.map(|s| s.to_owned()),
     };
     AttachmentStore::new(&state.db)
         .insert(&row)
@@ -385,7 +495,13 @@ pub(crate) async fn persist_inbound_attachments(
             );
             continue;
         }
-        match write_attachment_blob(state, cid, &reported_mime, &bytes) {
+        // Inbound transport attachments today are image-only (filter
+        // at the top of this fn ensures that). No filename is carried
+        // by the transport metas, so `filename=None` here — the agent
+        // sees these as vision content, not as files to operate on.
+        // If a future transport surfaces non-image attachments + a
+        // filename, plumb `att.filename` (or equivalent) here.
+        match write_attachment_blob(state, cid, &reported_mime, &bytes, None) {
             Ok(id) => ids.push(id),
             Err(e) => {
                 tracing::warn!(
@@ -455,6 +571,93 @@ pub(crate) fn encode_attachments_as_data_urls(
         }
     }
     out
+}
+
+/// 2026-05-18 — assemble the per-turn "Attached files" prose block
+/// the agent sees alongside the time / trust / channel context.
+/// Lists every NON-image attachment on the conversation (images
+/// land as vision content parts and don't need a prose mention),
+/// with the path they appear at inside the python-sandbox kernel
+/// so the agent can call `python.execute` against them by name.
+///
+/// Returns `None` when the conversation has no non-image
+/// attachments — the caller skips appending so the turn prompt
+/// doesn't grow an empty section.
+///
+/// Why conversation-scoped (not turn-scoped): attachments uploaded
+/// on turn N persist in `state_attachments` + on disk for the
+/// whole conversation. On turn N+1 ("make a chart from that csv")
+/// the file is still accessible in `/work/uploads/`, so the agent
+/// needs to keep being reminded it exists.
+pub(crate) fn build_attached_files_block(
+    state: &AppState,
+    cid: &ConversationId,
+) -> Option<String> {
+    use execlaw_core::attachments::AttachmentStore;
+
+    let rows = match AttachmentStore::new(&state.db).list_for_conversation(cid) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                target: "chats::attached_files_block",
+                conversation_id = %cid.as_str(),
+                error = %e,
+                "list_for_conversation failed; agent will not be told about attached files this turn",
+            );
+            return None;
+        }
+    };
+    let non_image: Vec<_> = rows
+        .into_iter()
+        .filter(|r| !is_image_mime(&r.mime_type))
+        .collect();
+    if non_image.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "## Attached files\n\n\
+         The operator has attached the following files to this conversation. They are \
+         available at the paths below inside the python sandbox — call `python.execute` \
+         with `open()` / `pandas.read_csv()` / `PyPDF2.PdfReader()` / etc. as appropriate \
+         when the operator asks about them. Do NOT re-prompt the operator for the contents; \
+         read the file directly.\n\n",
+    );
+    for r in &non_image {
+        // Fall back to a derived name if the filename column is null
+        // (legacy rows + transport-bridge uploads). Hydration uses the
+        // same fallback so the path here matches what's on disk.
+        let display_name = r
+            .filename
+            .as_deref()
+            .unwrap_or_else(|| derive_filename_from_path_or_id(r));
+        let size = std::fs::metadata(&r.path).map(|m| m.len()).unwrap_or(0);
+        out.push_str(&format!(
+            "* `{name}` ({mime}, {size} bytes) — available at `/work/uploads/{name}` \
+             in `python.execute`\n",
+            name = display_name,
+            mime = r.mime_type,
+            size = size,
+        ));
+    }
+    Some(out)
+}
+
+/// Derive a stable display filename when `state_attachments.filename`
+/// is null (legacy + inbound-transport rows). Mirrors the rule
+/// `python_sandbox::hydration` uses so the prose-block path matches
+/// the on-disk filename a sidecar hydration produces. Prefers the
+/// blob path's basename; falls back to a `attachment-<8 chars of id>`
+/// pattern.
+fn derive_filename_from_path_or_id(row: &execlaw_core::attachments::AttachmentRow) -> &str {
+    if let Some(stem) = std::path::Path::new(&row.path)
+        .file_name()
+        .and_then(|s| s.to_str())
+    {
+        if !stem.is_empty() {
+            return stem;
+        }
+    }
+    row.id.as_str()
 }
 
 /// Pull the attachment-ids list off a `user_msg` payload. Empty for
@@ -703,4 +906,207 @@ pub(crate) fn fetch_data_ref(
     let bytes =
         std::fs::read(&row.path).map_err(|e| format!("data_ref read {}: {e}", row.path))?;
     serde_json::from_slice(&bytes).map_err(|e| format!("data_ref decode: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the MIME-widening + filename-passthrough work
+    //! that landed alongside the python-sandbox attach-file UX
+    //! (2026-05-18). These exercise the parse/validate layer only;
+    //! the persistence layer is covered by integration tests in
+    //! `crates/server/tests/chats_*.rs` and the e2e SPA-to-disk path
+    //! lives in `crates/server/src/python_sandbox/hydration.rs`.
+    //!
+    //! Coverage rationale (see project_extensive_testing axiom #13):
+    //!   * every newly-accepted MIME has a happy-path test
+    //!   * every newly-rejected MIME (executables, source code) has
+    //!     a rejection test
+    //!   * filename sanitization covers the path-traversal attack
+    //!     surface end-to-end
+    //!   * filename-required-for-non-images gates the contract that
+    //!     hydration relies on
+
+    use super::*;
+    use crate::chats::types::InlineAttachmentRequest;
+    use base64::Engine;
+
+    fn req(mime: &str, body: &[u8], filename: Option<&str>) -> InlineAttachmentRequest {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(body);
+        InlineAttachmentRequest {
+            mime: mime.to_owned(),
+            data_url: format!("data:{mime};base64,{b64}"),
+            filename: filename.map(|s| s.to_owned()),
+        }
+    }
+
+    #[test]
+    fn accepts_every_image_mime_with_no_filename() {
+        for mime in ["image/png", "image/jpeg", "image/webp", "image/gif"] {
+            let r = req(mime, b"fake-image-bytes", None);
+            let out = decode_inline_attachments(&[r]).unwrap_or_else(|e| {
+                panic!("image mime {mime} rejected: {}", e.message);
+            });
+            assert_eq!(out.len(), 1, "mime {mime}");
+            assert_eq!(out[0].mime, mime, "mime preserved");
+            assert!(out[0].filename.is_none(), "image mime {mime} doesn't require filename");
+        }
+    }
+
+    #[test]
+    fn accepts_every_data_mime_with_filename() {
+        for (mime, fname) in [
+            ("text/csv", "data.csv"),
+            ("text/tab-separated-values", "data.tsv"),
+            ("application/json", "config.json"),
+            ("text/plain", "notes.txt"),
+            ("text/markdown", "readme.md"),
+            ("application/pdf", "report.pdf"),
+            (
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "book.xlsx",
+            ),
+            ("application/vnd.ms-excel", "legacy.xls"),
+        ] {
+            let r = req(mime, b"placeholder-bytes", Some(fname));
+            let out = decode_inline_attachments(&[r]).unwrap_or_else(|e| {
+                panic!("data mime {mime} rejected: {}", e.message);
+            });
+            assert_eq!(out.len(), 1, "mime {mime}");
+            assert_eq!(out[0].filename.as_deref(), Some(fname));
+        }
+    }
+
+    #[test]
+    fn rejects_executable_mimes() {
+        for mime in [
+            "application/x-msdownload",   // .exe
+            "application/x-sh",           // .sh
+            "application/javascript",     // .js
+            "application/x-python-code",  // .pyc
+            "application/x-executable",
+        ] {
+            let r = req(mime, b"...", Some("payload"));
+            let err = decode_inline_attachments(&[r]).expect_err(&format!(
+                "executable mime {mime} should have been rejected"
+            ));
+            assert_eq!(err.code, "attachment_mime_unsupported");
+        }
+    }
+
+    #[test]
+    fn rejects_data_mime_without_filename() {
+        let r = req("text/csv", b"a,b\n1,2\n", None);
+        let err = decode_inline_attachments(&[r]).expect_err("missing filename should reject");
+        assert_eq!(err.code, "attachment_filename_required");
+    }
+
+    #[test]
+    fn rejects_data_mime_with_empty_filename() {
+        let r = req("text/csv", b"a,b\n1,2\n", Some("   "));
+        let err = decode_inline_attachments(&[r]).expect_err("blank filename should reject");
+        assert_eq!(err.code, "attachment_filename_required");
+    }
+
+    #[test]
+    fn sanitize_strips_path_separators() {
+        assert_eq!(sanitize_filename("/etc/passwd"), "passwd");
+        assert_eq!(sanitize_filename("\\windows\\system32\\bad.exe"), "bad.exe");
+        assert_eq!(sanitize_filename("../../etc/shadow"), "shadow");
+        assert_eq!(sanitize_filename("clean.csv"), "clean.csv");
+        // Leading dots stripped so "..\\foo" → "foo" via combined behaviour.
+        assert_eq!(sanitize_filename("..foo.csv"), "foo.csv");
+        // Whitespace trimmed.
+        assert_eq!(sanitize_filename("  spaced.txt  "), "spaced.txt");
+    }
+
+    #[test]
+    fn decoded_filename_is_sanitized() {
+        // A hostile payload tries to escape /work/<convo>/uploads/
+        // by claiming the filename is `../../etc/passwd`. The
+        // decoder strips path separators before the value reaches
+        // hydration.
+        let r = req("text/csv", b"a,b\n", Some("../../etc/passwd"));
+        let out = decode_inline_attachments(&[r]).unwrap();
+        assert_eq!(out[0].filename.as_deref(), Some("passwd"));
+    }
+
+    #[test]
+    fn is_image_mime_matches_only_the_four_image_types() {
+        assert!(is_image_mime("image/png"));
+        assert!(is_image_mime("image/jpeg"));
+        assert!(is_image_mime("image/webp"));
+        assert!(is_image_mime("image/gif"));
+        assert!(!is_image_mime("text/csv"));
+        assert!(!is_image_mime("application/pdf"));
+        assert!(!is_image_mime("image/svg+xml")); // intentionally not in v1
+        assert!(!is_image_mime(""));
+    }
+
+    #[test]
+    fn oversize_attachment_is_rejected_regardless_of_mime() {
+        let big = vec![0u8; MAX_ATTACHMENT_BYTES + 1];
+        let r = req("text/csv", &big, Some("big.csv"));
+        let err = decode_inline_attachments(&[r]).expect_err("oversize should reject");
+        assert_eq!(err.code, "attachment_too_large");
+    }
+
+    /// Phase C: the per-turn "Attached files" prose block lives in
+    /// `build_attached_files_block`. We can't easily mock the
+    /// `AppState` it consumes, so the test exercises the formatting
+    /// helpers + the static text expectations the routing prose
+    /// relies on. The behavior of "list_for_conversation skips
+    /// images and returns non-image rows" is covered by the
+    /// `AttachmentStore` tests in `crates/core`.
+
+    #[test]
+    fn routing_prose_advertises_python_when_python_tools_present() {
+        // When the python-sandbox plugin is installed, the routing
+        // prose should include the `python` family guidance so the
+        // model knows to reach for it (not just inherit the generic
+        // "plugin-prefixed tool" line).
+        let routing = crate::chats::build_tool_routing_prose(
+            &[],
+            &[
+                "python.execute".to_owned(),
+                "python.reset".to_owned(),
+                "python.interrupt".to_owned(),
+                "python.list_files".to_owned(),
+            ],
+        );
+        assert!(
+            routing.contains("python.execute"),
+            "routing prose should mention python.execute when python.* tools registered:\n\n{routing}",
+        );
+        assert!(
+            routing.contains("/work/uploads/"),
+            "routing prose should mention the uploads path so the agent knows where attached files live:\n\n{routing}",
+        );
+    }
+
+    #[test]
+    fn routing_prose_omits_python_when_python_tools_absent() {
+        // Other plugins shouldn't see the python guidance — it'd
+        // mislead the model into looking for tools it doesn't have.
+        let routing = crate::chats::build_tool_routing_prose(
+            &[],
+            &["signal.send_message".to_owned()],
+        );
+        assert!(
+            !routing.contains("python.execute"),
+            "routing prose must NOT mention python.execute when python.* tools are absent:\n\n{routing}",
+        );
+    }
+
+    #[test]
+    fn declared_mime_must_match_data_url_mime() {
+        // Operator says "csv" but data URL says "exe" — reject.
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"...");
+        let r = InlineAttachmentRequest {
+            mime: "text/csv".to_owned(),
+            data_url: format!("data:application/x-msdownload;base64,{b64}"),
+            filename: Some("data.csv".to_owned()),
+        };
+        let err = decode_inline_attachments(&[r]).expect_err("mime mismatch should reject");
+        assert_eq!(err.code, "attachment_data_url_invalid");
+    }
 }

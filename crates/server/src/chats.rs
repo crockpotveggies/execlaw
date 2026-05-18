@@ -54,9 +54,9 @@ pub use types::{
 // `pub(crate)` is sufficient (and avoids the `pub use` error on a
 // `pub(crate)` item).
 pub(crate) use attachments::{
-    encode_attachments_as_data_urls, extract_applied_skill_names, extract_attachment_ids,
-    extract_channel_origin, extract_text, fetch_data_ref, hydrate_message_attachments,
-    persist_data_ref, persist_inbound_attachments,
+    build_attached_files_block, encode_attachments_as_data_urls, extract_applied_skill_names,
+    extract_attachment_ids, extract_channel_origin, extract_text, fetch_data_ref,
+    hydrate_message_attachments, persist_data_ref, persist_inbound_attachments,
 };
 pub(crate) use prompt::{assemble_system_prompt, build_tool_routing_prose, humanise_tool_call};
 // 2026-05-16 — small utilities split out into `chats/helpers.rs`.
@@ -770,7 +770,7 @@ async fn run_real_turn(
     // No routing prose: this path doesn't ship a tool catalogue.
     // Turn context still helps — even a no-tool answer benefits
     // from "what time is it" awareness.
-    let turn_context = build_turn_context_prose(
+    let mut turn_context = build_turn_context_prose(
         chrono::Utc::now(),
         cid.as_str(),
         sender_principal_id.as_deref(),
@@ -779,6 +779,15 @@ async fn run_real_turn(
         caller_timezone,
         group_context.as_ref(),
     );
+    // 2026-05-18 — Phase C of the python-sandbox attach-file UX:
+    // tell the agent about any non-image attachments on this
+    // conversation so it knows to reach for python.execute against
+    // /work/uploads/<filename>. Best-effort — query failure is
+    // logged + skipped.
+    if let Some(block) = build_attached_files_block(state, cid) {
+        turn_context.push_str("\n\n");
+        turn_context.push_str(&block);
+    }
     let composed_system = assemble_system_prompt(
         &state.db,
         Some(cid.as_str()),
@@ -1664,7 +1673,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
     // Per-turn context — wall-clock + identity facts the model
     // would otherwise have to ask a tool for. Always emitted; cost
     // is negligible vs. the LLM round-trip (delta #3).
-    let turn_context = build_turn_context_prose(
+    let mut turn_context = build_turn_context_prose(
         chrono::Utc::now(),
         cid.as_str(),
         sender_principal_id.as_deref(),
@@ -1673,6 +1682,14 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         caller_timezone,
         group_context.as_ref(),
     );
+    // 2026-05-18 — Phase C of the python-sandbox attach-file UX.
+    // Runner turns (this path) are the most common place CSV /
+    // PDF / etc. flow through — the agent has tools and can act
+    // on the file. Block-build is best-effort; logged on failure.
+    if let Some(block) = build_attached_files_block(state, cid) {
+        turn_context.push_str("\n\n");
+        turn_context.push_str(&block);
+    }
     let composed_system = assemble_system_prompt(
         &state.db,
         Some(cid.as_str()),
@@ -2320,7 +2337,7 @@ async fn run_tool_capable_turn(
     let prompt_started_at = std::time::Instant::now();
     let routing_prose =
         build_tool_routing_prose(&tool_view.builtin_names, &tool_view.plugin_tool_names);
-    let turn_context = build_turn_context_prose(
+    let mut turn_context = build_turn_context_prose(
         chrono::Utc::now(),
         cid.as_str(),
         sender_principal_id.as_deref(),
@@ -2329,6 +2346,13 @@ async fn run_tool_capable_turn(
         caller_timezone,
         group_context.as_ref(),
     );
+    // 2026-05-18 — Phase C: announce non-image attachments to the
+    // agent. Third call site (the run_agent_turn path); same
+    // best-effort semantics as the other two.
+    if let Some(block) = build_attached_files_block(state, cid) {
+        turn_context.push_str("\n\n");
+        turn_context.push_str(&block);
+    }
     let composed_system_prompt = assemble_system_prompt(
         &state.db,
         Some(cid.as_str()),

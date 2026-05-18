@@ -673,6 +673,28 @@ pub(crate) fn build_tool_routing_prose(
              the data source returned a `data_refs` map. Never invent points; never \
              retype data into points. Reply with one short line after rendering.",
         ),
+        (
+            // 2026-05-18 — added when the python-sandbox plugin was
+            // wired (Phase 8). Without this the model treated
+            // `python.execute` as a "plugin-prefixed" tool with the
+            // generic "read its description" prose, and operators
+            // had to babysit every "summarize this csv" turn through
+            // multiple back-and-forth nudges. Surfaces the workflow
+            // BEFORE the model scans individual descriptions:
+            // attachments are real files at /work/uploads/, the
+            // kernel persists across turns in a conversation, and
+            // chart-rendering pairs naturally with pandas.
+            "python",
+            "* `python.execute` (+ `python.list_files` / `python.reset` / `python.interrupt`) — \
+             run Python inside a sandboxed Jupyter kernel scoped to this conversation. \
+             Files the operator attached appear at `/work/uploads/<filename>` (see the \
+             'Attached files' block above when present). Files YOUR code writes to \
+             `/work/outputs/` get auto-surfaced to the operator as download chips. The \
+             kernel keeps variables / imports across calls within the same conversation. \
+             Use for: parsing CSV/JSON/PDF, pandas analysis, plotting (matplotlib → \
+             auto-rendered inline), any \"compute / transform / chart this data\" task. \
+             Prefer this over guessing values or asking the operator to summarize a file.",
+        ),
     ];
 
     // 2026-05-15 — built-in tool namespaces that look plugin-like
@@ -680,7 +702,15 @@ pub(crate) fn build_tool_routing_prose(
     // Catch these BEFORE the plugin-namespace bucketing so they don't
     // get the misleading "comes from the X plugin" prose. The
     // matching `routing_lines` entry above carries the right guidance.
-    const BUILTIN_NAMESPACES: &[&str] = &["chart"];
+    //
+    // 2026-05-18 — `python` joined the list. The python-sandbox
+    // plugin's tools are technically supplied by a plugin manifest,
+    // BUT they register via `wire_python_sandbox`'s `register_builtin`
+    // calls (against a live kernel-gateway sidecar) so DB rows show
+    // `source = builtin`. From a routing-prose standpoint they
+    // deserve the curated entry above, not the generic "comes from
+    // the python plugin" line.
+    const BUILTIN_NAMESPACES: &[&str] = &["chart", "python"];
 
     // Bucket every tool by its family prefix.
     let mut present: BTreeSet<&str> = BTreeSet::new();

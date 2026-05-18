@@ -314,6 +314,15 @@ export interface SendMessageRequest {
 export interface InlineAttachment {
     mime: string;
     data_url: string;
+    /**
+     * 2026-05-18 — original filename from the OS file picker.
+     * Required by the server for non-image attachments (CSV / JSON /
+     * PDF / etc.) so the python-sandbox sidecar can hydrate the
+     * file at `/work/<convo>/uploads/<filename>` under its
+     * operator-chosen name. Optional for images — vision content
+     * doesn't surface filenames to the model.
+     */
+    filename?: string;
 }
 
 export interface SendMessageResponse {
