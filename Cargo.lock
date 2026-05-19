@@ -1663,6 +1663,7 @@ dependencies = [
  "fs4",
  "futures",
  "hex",
+ "hmac",
  "hyper",
  "jsonwebtoken",
  "mime_guess",

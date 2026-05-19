@@ -405,12 +405,11 @@ pub struct AdminRouteDecl {
 
 /// Public webhook route a plugin exposes for receiving callbacks
 /// from third-party services (e.g. wuzapi → execlaw event POSTs).
-/// Mounted by the host under
-/// `/api/webhooks/{plugin_id}{path}` — UNAUTHENTICATED at the HTTP
-/// layer because external callers can't hold execlaw JWTs. The
-/// plugin's handler is responsible for verifying the request's
-/// authenticity (typically a secret token in the URL query string
-/// matched against a vault-stored value).
+/// Mounted by the host under `/api/webhooks/{plugin_id}{path}` —
+/// no execlaw JWT is checked (external callers can't hold one).
+/// Authentication is described by the optional `auth` field below
+/// and enforced by the host BEFORE the request is published to the
+/// automation bus or dispatched to the plugin's handler.
 ///
 /// ```toml
 /// [[webhook_routes]]
@@ -418,6 +417,7 @@ pub struct AdminRouteDecl {
 /// path   = "/event"
 /// handler = "on_webhook_event"
 /// description = "wuzapi posts WhatsApp message events here."
+/// auth = { kind = "query_token", query = "token", vault_key = "webhook_secret" }
 /// ```
 ///
 /// The Rhai handler signature mirrors `[[admin_routes]]` —
@@ -426,11 +426,12 @@ pub struct AdminRouteDecl {
 /// (JSON-serialised). Throw to surface a 500.
 ///
 /// **Security**: this surface is reachable from anyone who can
-/// hit the host's bind address. Plugin handlers MUST validate the
-/// caller's identity before doing anything stateful — the typical
-/// pattern is a `?token={secret}` query param compared against a
-/// `vault_get("webhook_secret")` value with a constant-time
-/// comparison.
+/// hit the host's bind address. Declare `auth` so the host (not
+/// the handler) enforces the check before any side effect. Omitting
+/// `auth` is permitted for backward compatibility but logs a
+/// `webhook_route_auth_unset` warning at plugin enable and leaves
+/// the handler solely responsible for validating the caller —
+/// migrate to a declared `auth` mode as soon as practical.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WebhookRouteDecl {
     pub method: String,
@@ -438,6 +439,48 @@ pub struct WebhookRouteDecl {
     pub handler: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Host-enforced authentication declaration. When set, the
+    /// webhook dispatcher validates the request BEFORE publishing
+    /// to the automation bus or invoking the handler. When unset,
+    /// behavior falls back to the legacy "handler validates" model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<WebhookAuthDecl>,
+}
+
+/// How the host should authenticate an inbound webhook before
+/// publishing it to the automation bus or dispatching the handler.
+///
+/// All variants resolve their secret via the plugin's vault
+/// (`vault_secrets` table, scoped to the plugin id) so the operator
+/// can rotate the secret without code changes. Comparisons are
+/// constant-time. A missing or empty vault value is treated as an
+/// authentication failure (NOT as "no auth required").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WebhookAuthDecl {
+    /// Match `?<query>=<value>` constant-time against the plugin's
+    /// vault entry `vault_key`. The query field is redacted from
+    /// the automation-bus payload before persistence.
+    QueryToken {
+        /// Query-string key the secret travels in. Typically `token`.
+        query: String,
+        /// Name of the per-plugin vault row holding the expected secret.
+        vault_key: String,
+    },
+    /// Compute `HMAC-SHA256(vault[vault_key], body)` and compare
+    /// against the request header `header`. Accepts both raw hex
+    /// and `sha256=<hex>` (GitHub's `X-Hub-Signature-256` style).
+    HmacSha256Header {
+        /// HTTP header carrying the signature, e.g. `X-Hub-Signature-256`.
+        header: String,
+        /// Name of the per-plugin vault row holding the shared secret.
+        vault_key: String,
+    },
+    /// Explicit opt-out: declare that this route is not host-authenticated
+    /// and the handler is solely responsible for validating the caller.
+    /// Distinct from omitting `auth` only in that no deprecation warning
+    /// is logged — operators have acknowledged the model.
+    None,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
