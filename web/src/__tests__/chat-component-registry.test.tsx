@@ -1,16 +1,34 @@
 // Tests for the chat-component registry + the open-meteo-flavoured
 // renderers that ship in the SPA build.
 
-import { afterEach, describe, expect, it } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { render, screen, waitFor } from "@testing-library/react";
+import { AuthContext } from "../auth/AuthContext";
 import {
     detectChatComponent,
     getChatComponent,
     registerChatComponent,
 } from "../chat/chatComponentRegistry";
+
+// 2026-05-19 — the chart-inline download link resolves a signed
+// URL on mount instead of using a raw JWT in the query string.
+// Mock the helper so tests can assert the rendered URL.
+vi.mock("../api/signedDownloadUrl", () => ({
+    signDownloadUrl: vi.fn(
+        async (path: string) =>
+            `${path}?exp=9999999999&user=u-test&sig=deadbeef`,
+    ),
+}));
+
 import "../chat/components/ChartInlineComponent";
 import "../chat/components/WeatherCurrentComponent";
 import "../chat/components/WeatherDailyComponent";
+
+function fakeAuth(): React.ContextType<typeof AuthContext> {
+    return {
+        getAccessToken: () => "header.payload.signature",
+    } as unknown as React.ContextType<typeof AuthContext>;
+}
 
 describe("detectChatComponent", () => {
     it("returns null for empty or non-JSON text", () => {
@@ -86,20 +104,31 @@ describe("ChartInline component", () => {
         expect(fig.innerHTML).toContain("<title>Test</title>");
     });
 
-    it("renders the title and a download link when given an attachment_id", () => {
+    it("renders the title and a download link when given an attachment_id", async () => {
         const Chart = getChatComponent("chart")!;
         render(
-            <Chart
-                data={{
-                    chat_component_kind: "chart",
-                    svg: "<svg/>",
-                    title: "Forecast",
-                    attachment_id: "att-2",
-                }}
-            />,
+            <AuthContext.Provider value={fakeAuth()}>
+                <Chart
+                    data={{
+                        chat_component_kind: "chart",
+                        svg: "<svg/>",
+                        title: "Forecast",
+                        attachment_id: "att-2",
+                    }}
+                />
+            </AuthContext.Provider>,
         );
-        const link = screen.getByTestId("chart-inline-download");
-        expect(link).toHaveAttribute("href", "/api/attachments/att-2");
+        await waitFor(() => {
+            const link = screen.getByTestId(
+                "chart-inline-download",
+            ) as HTMLAnchorElement;
+            expect(link.getAttribute("href") ?? "").toContain(
+                "/api/attachments/att-2",
+            );
+            expect(link.getAttribute("href") ?? "").toContain("sig=");
+            // Audit bar: no raw JWT in the URL.
+            expect(link.getAttribute("href") ?? "").not.toMatch(/access_token=/);
+        });
     });
 
     it("renders the fallback when the SVG is missing", () => {

@@ -34,6 +34,8 @@ pub mod cards;
 pub mod chat_alert;
 pub mod chats;
 pub mod docs;
+pub mod download_urls;
+pub mod downloads_admin;
 pub mod events;
 pub mod factory_reset;
 pub mod generic_inbound;

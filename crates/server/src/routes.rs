@@ -766,6 +766,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::plugin_webhook_routes::webhook_routes_router())
         .merge(crate::approvals::approvals_router())
         .merge(crate::attachments_admin::attachments_router())
+        .merge(crate::downloads_admin::downloads_router())
         .merge(crate::observability::observability_router())
         .merge(crate::backends::backends_router())
         .merge(crate::alerts::alerts_router())

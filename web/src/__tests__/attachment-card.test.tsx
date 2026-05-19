@@ -4,14 +4,32 @@
 // `send_attachment` — agent emits one to deliver a file (e.g. a
 // research PDF) inline. Renders as a compact chip with filename +
 // mime + size + a Download button that hits
-// `/api/attachments/<attachment_id>`.
+// `/api/attachments/<attachment_id>` via a server-signed URL.
 
-import { describe, expect, it } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { render, screen, waitFor } from "@testing-library/react";
 import { AttachmentCard } from "../cards/AttachmentCard";
 import { AuthContext } from "../auth/AuthContext";
 import { getCardRenderer } from "../cards/CardRenderer";
 import type { Card } from "../cards/types";
+
+// Mock the signed-URL helper. Tests assert that the renderer calls
+// it with the correct `path` and renders the returned URL into the
+// download link's `href`. The 2026-05-19 security fix replaced the
+// pre-fix `?access_token=<jwt>` query-string pattern with this
+// server-mediated flow.
+vi.mock("../api/signedDownloadUrl", () => ({
+    signDownloadUrl: vi.fn(
+        async (path: string) =>
+            `${path}?exp=9999999999&user=u-test&sig=deadbeefcafebabe`,
+    ),
+}));
+
+import { signDownloadUrl } from "../api/signedDownloadUrl";
+
+afterEach(() => {
+    vi.mocked(signDownloadUrl).mockClear();
+});
 
 function makeAttachmentCard(extras: Partial<Card> = {}): Card {
     return {
@@ -41,6 +59,12 @@ function makeAttachmentCard(extras: Partial<Card> = {}): Card {
     };
 }
 
+function fakeAuth(): React.ContextType<typeof AuthContext> {
+    return {
+        getAccessToken: () => "header.payload.signature",
+    } as unknown as React.ContextType<typeof AuthContext>;
+}
+
 describe("AttachmentCard renderer", () => {
     it("registers under the `attachment` kind", () => {
         // Side-effect import already ran — getCardRenderer must
@@ -63,81 +87,64 @@ describe("AttachmentCard renderer", () => {
         expect(size).toMatch(/KB|MB/);
     });
 
-    it("renders a Download button that links to the server URL with `download` attribute", () => {
-        render(<AttachmentCard card={makeAttachmentCard()} />);
-        const link = screen.getByTestId(
-            "card-attachment-download",
-        ) as HTMLAnchorElement;
-        expect(link.getAttribute("href")).toBe("/api/attachments/att-9");
-        expect(link.getAttribute("download")).toBe("report.pdf");
-    });
-
-    /// 2026-05-04 regression: clicking Download used to 401
-    /// because browsers don't carry the Authorization header on
-    /// `<a download>` link navigations. Fix: append the
-    /// operator's current JWT as `?access_token=…` so the
-    /// server's AuthedUser extractor can read it from the query
-    /// string (it falls back there when the header is absent).
-    it("appends ?access_token=<jwt> to the download href when an AuthProvider is mounted", () => {
-        const fakeAuth = {
-            // Only the methods this test path uses; cast to the
-            // full type so the consumer doesn't need every field.
-            getAccessToken: () => "header.payload.signature",
-        } as unknown as React.ContextType<typeof AuthContext>;
+    /// 2026-05-19 — clicking Download must hit a SIGNED URL, not a
+    /// raw JWT in the query string. The renderer issues
+    /// `POST /api/downloads/sign` on mount with the attachment
+    /// path, then puts the returned URL in the link's href.
+    it("renders Download button with the server-signed URL", async () => {
         render(
-            <AuthContext.Provider value={fakeAuth}>
+            <AuthContext.Provider value={fakeAuth()}>
                 <AttachmentCard card={makeAttachmentCard()} />
             </AuthContext.Provider>,
         );
-        const link = screen.getByTestId(
+        const link = (await screen.findByTestId(
             "card-attachment-download",
-        ) as HTMLAnchorElement;
-        const href = link.getAttribute("href") ?? "";
-        expect(href).toContain("/api/attachments/att-9");
-        expect(href).toContain("access_token=header.payload.signature");
+        )) as HTMLAnchorElement;
+        await waitFor(() => {
+            expect(link.getAttribute("href")).toBe(
+                "/api/attachments/att-9?exp=9999999999&user=u-test&sig=deadbeefcafebabe",
+            );
+        });
+        expect(signDownloadUrl).toHaveBeenCalledWith(
+            "/api/attachments/att-9",
+            expect.any(Function),
+        );
+        expect(link.getAttribute("download")).toBe("report.pdf");
     });
 
-    it("preserves existing query strings when appending the token (uses & separator)", () => {
-        const fakeAuth = {
-            getAccessToken: () => "abc.def.ghi",
-        } as unknown as React.ContextType<typeof AuthContext>;
-        const card = makeAttachmentCard({
-            details: {
-                attachment_id: "att-9",
-                filename: "report.pdf",
-                mime_type: "application/pdf",
-                // download_url already has a query string.
-                download_url: "/api/attachments/att-9?disposition=inline",
-            },
-        });
+    it("never emits a raw `?access_token=` JWT in the download href", async () => {
         render(
-            <AuthContext.Provider value={fakeAuth}>
-                <AttachmentCard card={card} />
+            <AuthContext.Provider value={fakeAuth()}>
+                <AttachmentCard card={makeAttachmentCard()} />
             </AuthContext.Provider>,
         );
-        const link = screen.getByTestId(
+        const link = (await screen.findByTestId(
             "card-attachment-download",
-        ) as HTMLAnchorElement;
-        const href = link.getAttribute("href") ?? "";
-        expect(href).toContain("disposition=inline");
-        expect(href).toContain("&access_token=abc.def.ghi");
+        )) as HTMLAnchorElement;
+        await waitFor(() => {
+            expect(link.getAttribute("href")).toBeTruthy();
+        });
+        // The audit's hard rule: a full-access JWT must never travel
+        // through the URL. Belt-and-suspenders regression bar.
+        expect(link.getAttribute("href") ?? "").not.toMatch(/access_token=/);
+        expect(link.getAttribute("href") ?? "").not.toContain(
+            "header.payload.signature",
+        );
     });
 
-    it("renders the bare URL when no AuthProvider is mounted (test-environment safety)", () => {
-        // Production always has a provider; tests sometimes don't.
-        // The renderer must not throw and must produce a navigable
-        // URL even without a token (the click 401s, but the chip
-        // renders).
+    it("hides the Download button when no AuthProvider is mounted (cannot sign)", () => {
+        // Production always has a provider; some unit tests don't.
+        // Without auth there's no `getAccessToken`, so the sign call
+        // can't run — the chip renders without a button rather than
+        // emitting an unauthenticated href.
         render(<AttachmentCard card={makeAttachmentCard()} />);
-        const link = screen.getByTestId(
-            "card-attachment-download",
-        ) as HTMLAnchorElement;
-        expect(link.getAttribute("href")).toBe("/api/attachments/att-9");
+        expect(screen.queryByTestId("card-attachment-download")).toBeNull();
+        expect(signDownloadUrl).not.toHaveBeenCalled();
     });
 
-    it("falls back to deriving the URL from attachment_id if download_url missing", () => {
-        // Defensive: legacy events that don't include `download_url`
-        // should still produce a working button.
+    it("falls back to deriving the URL from attachment_id if download_url missing", async () => {
+        // Defensive: legacy events without `download_url` still
+        // produce a working button.
         const card = makeAttachmentCard({
             details: {
                 attachment_id: "att-only",
@@ -145,11 +152,23 @@ describe("AttachmentCard renderer", () => {
                 mime_type: "application/pdf",
             },
         });
-        render(<AttachmentCard card={card} />);
-        const link = screen.getByTestId(
+        render(
+            <AuthContext.Provider value={fakeAuth()}>
+                <AttachmentCard card={card} />
+            </AuthContext.Provider>,
+        );
+        await waitFor(() => {
+            expect(signDownloadUrl).toHaveBeenCalledWith(
+                "/api/attachments/att-only",
+                expect.any(Function),
+            );
+        });
+        const link = (await screen.findByTestId(
             "card-attachment-download",
-        ) as HTMLAnchorElement;
-        expect(link.getAttribute("href")).toBe("/api/attachments/att-only");
+        )) as HTMLAnchorElement;
+        expect(link.getAttribute("href") ?? "").toContain(
+            "/api/attachments/att-only",
+        );
     });
 
     it("shows a caption above the chip when set", () => {

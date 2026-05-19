@@ -11,9 +11,10 @@
 //     surfaces them sorted by `opened_at` so MessageStream can
 //     interleave them with messages chronologically.
 
-import { describe, expect, it, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { describe, expect, it, beforeEach, vi } from "vitest";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { renderHook, act } from "@testing-library/react";
+import { AuthContext } from "../auth/AuthContext";
 import { ResearchCard } from "../cards/ResearchCard";
 import { getCardRenderer } from "../cards/CardRenderer";
 import {
@@ -23,6 +24,22 @@ import {
     useCardsForConversation,
 } from "../cards/cardStore";
 import type { Card, CardEvent } from "../cards/types";
+
+// 2026-05-19 — the Download button now resolves a server-signed
+// URL on mount instead of pasting a raw JWT in the query string.
+// Mock the helper so the test asserts the signed URL gets rendered.
+vi.mock("../api/signedDownloadUrl", () => ({
+    signDownloadUrl: vi.fn(
+        async (path: string) =>
+            `${path}?exp=9999999999&user=u-test&sig=deadbeef`,
+    ),
+}));
+
+function fakeAuth(): React.ContextType<typeof AuthContext> {
+    return {
+        getAccessToken: () => "header.payload.signature",
+    } as unknown as React.ContextType<typeof AuthContext>;
+}
 
 beforeEach(() => {
     __resetCardStore();
@@ -186,16 +203,28 @@ describe("ResearchCard renderer", () => {
     /// attachment_id set. Same code path for live (CardClosed
     /// payload's attachment_id field) and replayed (cardStore
     /// hydration via listCards projection).
-    it("renders an inline Download button when state=Completed and attachment_id is set", () => {
+    it("renders an inline Download button when state=Completed and attachment_id is set", async () => {
         const card = makeResearchCard({
             state: "Completed",
             attachment_id: "att-abc",
         });
-        render(<ResearchCard card={card} />);
-        const dl = screen.getByTestId("card-research-download-link");
-        expect(dl).toBeTruthy();
-        expect(dl.getAttribute("href")).toContain("/api/attachments/att-abc");
-        expect(dl.getAttribute("download")).not.toBeNull();
+        render(
+            <AuthContext.Provider value={fakeAuth()}>
+                <ResearchCard card={card} />
+            </AuthContext.Provider>,
+        );
+        await waitFor(() => {
+            const dl = screen.getByTestId(
+                "card-research-download-link",
+            ) as HTMLAnchorElement;
+            expect(dl.getAttribute("href")).toContain(
+                "/api/attachments/att-abc",
+            );
+            expect(dl.getAttribute("href") ?? "").toContain("sig=");
+            // Audit bar: no raw JWT may travel through the URL.
+            expect(dl.getAttribute("href") ?? "").not.toMatch(/access_token=/);
+            expect(dl.getAttribute("download")).not.toBeNull();
+        });
     });
 
     it("does NOT render the Download button while the card is still Running", () => {
@@ -212,7 +241,7 @@ describe("ResearchCard renderer", () => {
     /// AND inside details. DownloadButton reads either route so
     /// a wire-edge that drops the top-level field doesn't kill
     /// the link. Asserts the details fallback works.
-    it("renders Download button when attachment_id is only in details", () => {
+    it("renders Download button when attachment_id is only in details", async () => {
         const card = makeResearchCard({
             state: "Completed",
             attachment_id: null, // top-level missing
@@ -222,11 +251,19 @@ describe("ResearchCard renderer", () => {
                 phase: "Complete",
             },
         });
-        render(<ResearchCard card={card} />);
-        const dl = screen.getByTestId("card-research-download-link");
-        expect(dl.getAttribute("href")).toContain(
-            "/api/attachments/att-from-details",
+        render(
+            <AuthContext.Provider value={fakeAuth()}>
+                <ResearchCard card={card} />
+            </AuthContext.Provider>,
         );
+        await waitFor(() => {
+            const dl = screen.getByTestId(
+                "card-research-download-link",
+            ) as HTMLAnchorElement;
+            expect(dl.getAttribute("href") ?? "").toContain(
+                "/api/attachments/att-from-details",
+            );
+        });
     });
 
     it("does NOT render the Download button when attachment_id is missing", () => {
