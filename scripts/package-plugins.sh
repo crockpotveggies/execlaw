@@ -33,6 +33,20 @@ cd "$REPO_ROOT"
 DIST_DIR="dist"
 mkdir -p "$DIST_DIR"
 
+# Make sure the root devDependencies (specifically `esbuild`, which
+# `scripts/build-plugin-ui.mjs` imports) are installed. The
+# per-platform build scripts (`build-mac.sh`, `build-linux.sh`,
+# `build-windows.ps1`) only run `npm ci` under `web/`, which doesn't
+# populate the root `node_modules`. On a fresh clone — including CI
+# runners with a cold cache — the next step would fail with
+# `Cannot find package 'esbuild'`. `npm ci` honours
+# `package-lock.json` and is a no-op when `node_modules/` is
+# already in sync.
+if [[ ! -d node_modules ]] || [[ ! -d node_modules/esbuild ]]; then
+    echo "==> Step 0: install root devDependencies (esbuild for plugin UI build)"
+    npm ci --no-audit --no-fund
+fi
+
 echo "==> Step 1: build every plugin's UI panel"
 # `--all` only rebuilds plugins that declare ui_panels; the rest
 # are no-ops. Failure here would propagate; that's intentional —
