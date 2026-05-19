@@ -125,7 +125,7 @@ Output lands at
   sudo apt install \
       libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
       librsvg2-dev librsvg2-bin libgtk-3-dev libsoup-3.0-dev \
-      libssl-dev pkg-config build-essential
+      libssl-dev pkg-config build-essential zip
   ```
 
 - Rust 1.85+ with `x86_64-unknown-linux-gnu` (the host default

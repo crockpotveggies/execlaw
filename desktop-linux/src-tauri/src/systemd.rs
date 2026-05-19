@@ -131,15 +131,6 @@ pub async fn query() -> UnitStatus {
     UnitStatus::from_is_active(&stdout)
 }
 
-/// Whether the tray should expose a "Reinstall via the .deb /
-/// AppImage" action. True only when the systemd unit is missing,
-/// which means the operator either uninstalled it manually with
-/// `systemctl --user disable` + `rm ~/.config/systemd/user/execlaw.service`
-/// or never ran the first-launch register flow.
-pub fn requires_install_action(s: UnitStatus) -> bool {
-    matches!(s, UnitStatus::NotInstalled)
-}
-
 /// Register the systemd user unit by shelling out to the bundled
 /// `execlaw` CLI. The CLI's `service install --user` writes
 /// `~/.config/systemd/user/execlaw.service` via the
@@ -336,13 +327,4 @@ mod tests {
         assert_eq!(UnitStatus::from_is_active("  failed  "), UnitStatus::Failed);
     }
 
-    #[test]
-    fn requires_install_action_only_for_not_installed() {
-        assert!(requires_install_action(UnitStatus::NotInstalled));
-        assert!(!requires_install_action(UnitStatus::Running));
-        assert!(!requires_install_action(UnitStatus::Stopped));
-        assert!(!requires_install_action(UnitStatus::Failed));
-        assert!(!requires_install_action(UnitStatus::Pending));
-        assert!(!requires_install_action(UnitStatus::Error));
-    }
 }

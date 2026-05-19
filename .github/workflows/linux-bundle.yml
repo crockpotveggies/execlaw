@@ -67,7 +67,8 @@ jobs:
             libsoup-3.0-dev \
             libssl-dev \
             pkg-config \
-            build-essential
+            build-essential \
+            zip
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

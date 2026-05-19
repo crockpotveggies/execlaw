@@ -8,12 +8,15 @@
 #   - Node 20+        (Vite + SPA build)
 #   - System libs    — `libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev`,
 #                       `librsvg2-dev`, `libgtk-3-dev`, `libsoup-3.0-dev`,
-#                       `build-essential`, `pkg-config`, `libssl-dev`.
+#                       `build-essential`, `pkg-config`, `libssl-dev`, `zip`.
 #                       The CI workflow installs these via apt; on a dev
 #                       host run the one-liner in `desktop-linux/README.md`.
 #   - rsvg-convert  — `librsvg2-bin` package (for SVG → PNG icon rendering).
 #                       Cheaper + more accurate than ImageMagick for our
 #                       single SVG source.
+#   - zip           — used by `scripts/package-plugins.sh`. Ships in the
+#                       `zip` package; not pulled in by default on
+#                       minbase Ubuntu images.
 #
 # Outputs:
 #   desktop-linux/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/execlaw_<version>_amd64.deb
@@ -36,7 +39,7 @@ PLUGIN_STAGE_DIR="$TAURI_DIR/resources/plugins"
 
 # Probe required tools up front so the operator gets a clear error
 # instead of a 200-line cargo / tauri trace deep in the build.
-for bin in cargo node npm rsvg-convert; do
+for bin in cargo node npm rsvg-convert zip; do
     if ! command -v "$bin" >/dev/null 2>&1; then
         echo "error: missing required tool '$bin' on PATH" >&2
         echo "    install via your distro's package manager — see desktop-linux/README.md" >&2
