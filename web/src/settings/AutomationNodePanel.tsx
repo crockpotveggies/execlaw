@@ -199,6 +199,10 @@ function KindForm({
             );
         case "AskAgent":
             return <AskAgentForm node={node} onChange={onChange} />;
+        case "Notify":
+            return <NotifyForm node={node} onChange={onChange} />;
+        case "CallPlugin":
+            return <CallPluginForm node={node} onChange={onChange} />;
         default:
             return (
                 <div className="small text-danger">
@@ -417,5 +421,200 @@ function ExitToolRow({
                 className="small"
             />
         </div>
+    );
+}
+
+const SEVERITIES = ["Critical", "Error", "Warning", "Info"] as const;
+type Severity = (typeof SEVERITIES)[number];
+
+function NotifyForm({
+    node,
+    onChange,
+}: {
+    node: NodeDef;
+    onChange: (updated: NodeDef) => void;
+}) {
+    const cfg = (node.config ?? {}) as Record<string, unknown>;
+    const title = (cfg.title as string | undefined) ?? "";
+    const detail = (cfg.detail as string | undefined) ?? "";
+    const severity = ((cfg.severity as string | undefined) ?? "Warning") as Severity;
+    const source = (cfg.source as string | undefined) ?? "";
+
+    const update = (next: Record<string, unknown>) =>
+        onChange({ ...node, config: { ...cfg, ...next } });
+
+    return (
+        <>
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">Title</Form.Label>
+                <Form.Control
+                    type="text"
+                    size="sm"
+                    value={title}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                        update({ title: e.target.value })
+                    }
+                    placeholder="Motion detected in {{event.payload.zone}}"
+                    spellCheck={false}
+                    className="small"
+                    data-testid="node-panel-notify-title"
+                />
+                <div className="small text-muted mt-1">
+                    Required. Supports <code>{`{{event.payload.x}}`}</code>{" "}
+                    templating.
+                </div>
+            </Form.Group>
+
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">Detail</Form.Label>
+                <Form.Control
+                    as="textarea"
+                    rows={2}
+                    size="sm"
+                    value={detail}
+                    onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                        update({ detail: e.target.value })
+                    }
+                    placeholder="Longer description of the alert"
+                    spellCheck={false}
+                    className="small"
+                    data-testid="node-panel-notify-detail"
+                />
+            </Form.Group>
+
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">Severity</Form.Label>
+                <Form.Select
+                    size="sm"
+                    value={severity}
+                    onChange={(e: ChangeEvent<HTMLSelectElement>) =>
+                        update({ severity: e.target.value })
+                    }
+                    data-testid="node-panel-notify-severity"
+                >
+                    {SEVERITIES.map((s) => (
+                        <option key={s} value={s}>
+                            {s}
+                        </option>
+                    ))}
+                </Form.Select>
+            </Form.Group>
+
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">
+                    Source (optional)
+                </Form.Label>
+                <Form.Control
+                    type="text"
+                    size="sm"
+                    value={source}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                        update({ source: e.target.value })
+                    }
+                    placeholder="automation:ring-watch"
+                    className="font-monospace small"
+                    data-testid="node-panel-notify-source"
+                />
+                <div className="small text-muted mt-1">
+                    Used for alert dedup. Defaults to{" "}
+                    <code>automation:&lt;node_id&gt;</code> when blank.
+                </div>
+            </Form.Group>
+        </>
+    );
+}
+
+function CallPluginForm({
+    node,
+    onChange,
+}: {
+    node: NodeDef;
+    onChange: (updated: NodeDef) => void;
+}) {
+    const cfg = (node.config ?? {}) as Record<string, unknown>;
+    const tool = (cfg.tool as string | undefined) ?? "";
+    const args = (cfg.args as Record<string, unknown> | undefined) ?? {};
+
+    // We render args as JSON in a textarea so authors can edit a
+    // free-shape object. On change we attempt a parse â€” invalid JSON
+    // is shown but not committed, so the user can keep typing
+    // without losing other fields.
+    const [argsDraft, setArgsDraft] = useState(JSON.stringify(args, null, 2));
+    const [argsErr, setArgsErr] = useState<string | null>(null);
+
+    const update = (next: Record<string, unknown>) =>
+        onChange({ ...node, config: { ...cfg, ...next } });
+
+    const commitArgs = () => {
+        try {
+            const parsed = JSON.parse(argsDraft);
+            if (
+                parsed === null ||
+                typeof parsed !== "object" ||
+                Array.isArray(parsed)
+            ) {
+                setArgsErr("args must be a JSON object");
+                return;
+            }
+            setArgsErr(null);
+            update({ args: parsed });
+        } catch (e) {
+            setArgsErr((e as Error).message);
+        }
+    };
+
+    return (
+        <>
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">Tool</Form.Label>
+                <Form.Control
+                    type="text"
+                    size="sm"
+                    value={tool}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                        update({ tool: e.target.value })
+                    }
+                    placeholder="signal.send_message"
+                    spellCheck={false}
+                    className="font-monospace small"
+                    data-testid="node-panel-callplugin-tool"
+                />
+                <div className="small text-muted mt-1">
+                    Registered tool name (see the Tools admin page for the
+                    full list).
+                </div>
+            </Form.Group>
+
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">
+                    Args (JSON object)
+                </Form.Label>
+                <Form.Control
+                    as="textarea"
+                    rows={5}
+                    size="sm"
+                    value={argsDraft}
+                    onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                        setArgsDraft(e.target.value)
+                    }
+                    onBlur={commitArgs}
+                    spellCheck={false}
+                    className="font-monospace small"
+                    data-testid="node-panel-callplugin-args"
+                />
+                {argsErr && (
+                    <div
+                        className="small text-danger mt-1"
+                        data-testid="node-panel-callplugin-args-error"
+                    >
+                        {argsErr}
+                    </div>
+                )}
+                <div className="small text-muted mt-1">
+                    String leaves support <code>{`{{event.payload.x}}`}</code>{" "}
+                    templating at run time.
+                </div>
+            </Form.Group>
+        </>
     );
 }

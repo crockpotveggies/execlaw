@@ -197,6 +197,137 @@ describe("AutomationNodePanel — AskAgent form", () => {
     });
 });
 
+describe("AutomationNodePanel — Notify form", () => {
+    const notifyNode: NodeDef = {
+        id: "alert1",
+        kind: "Notify",
+        config: {
+            title: "Motion in {{event.payload.zone}}",
+            detail: "",
+            severity: "Warning",
+        },
+    };
+
+    it("renders title + severity dropdown + propagates edits", () => {
+        const onChange = vi.fn();
+        render(
+            <AutomationNodePanel
+                node={notifyNode}
+                definition={baseDef}
+                onChange={onChange}
+                onRename={vi.fn()}
+                onDelete={vi.fn()}
+                onClose={vi.fn()}
+            />,
+        );
+        const title = screen.getByTestId("node-panel-notify-title") as HTMLInputElement;
+        expect(title.value).toBe("Motion in {{event.payload.zone}}");
+        fireEvent.change(title, { target: { value: "New title" } });
+        expect(onChange).toHaveBeenCalledWith(
+            expect.objectContaining({
+                config: expect.objectContaining({ title: "New title" }),
+            }),
+        );
+
+        const sev = screen.getByTestId("node-panel-notify-severity") as HTMLSelectElement;
+        expect(sev.value).toBe("Warning");
+        fireEvent.change(sev, { target: { value: "Critical" } });
+        expect(onChange).toHaveBeenCalledWith(
+            expect.objectContaining({
+                config: expect.objectContaining({ severity: "Critical" }),
+            }),
+        );
+    });
+});
+
+describe("AutomationNodePanel — CallPlugin form", () => {
+    const cpNode: NodeDef = {
+        id: "call1",
+        kind: "CallPlugin",
+        config: {
+            tool: "signal.send_message",
+            args: { to: "+15551234", body: "hi" },
+        },
+    };
+
+    it("renders tool input + JSON args textarea", () => {
+        const onChange = vi.fn();
+        render(
+            <AutomationNodePanel
+                node={cpNode}
+                definition={baseDef}
+                onChange={onChange}
+                onRename={vi.fn()}
+                onDelete={vi.fn()}
+                onClose={vi.fn()}
+            />,
+        );
+        const tool = screen.getByTestId("node-panel-callplugin-tool") as HTMLInputElement;
+        expect(tool.value).toBe("signal.send_message");
+        fireEvent.change(tool, { target: { value: "whatsapp.send_message" } });
+        expect(onChange).toHaveBeenCalledWith(
+            expect.objectContaining({
+                config: expect.objectContaining({ tool: "whatsapp.send_message" }),
+            }),
+        );
+
+        const args = screen.getByTestId("node-panel-callplugin-args") as HTMLTextAreaElement;
+        expect(args.value).toContain("+15551234");
+    });
+
+    it("commits args on blur only when the JSON parses to an object", () => {
+        const onChange = vi.fn();
+        render(
+            <AutomationNodePanel
+                node={cpNode}
+                definition={baseDef}
+                onChange={onChange}
+                onRename={vi.fn()}
+                onDelete={vi.fn()}
+                onClose={vi.fn()}
+            />,
+        );
+        const args = screen.getByTestId("node-panel-callplugin-args") as HTMLTextAreaElement;
+        // Bad JSON: nothing committed, error visible.
+        fireEvent.change(args, { target: { value: "{ not json" } });
+        fireEvent.blur(args);
+        expect(onChange).not.toHaveBeenCalled();
+        expect(
+            screen.getByTestId("node-panel-callplugin-args-error"),
+        ).toBeInTheDocument();
+
+        // Good JSON: committed via onChange.
+        fireEvent.change(args, { target: { value: '{"x": 1}' } });
+        fireEvent.blur(args);
+        expect(onChange).toHaveBeenCalledWith(
+            expect.objectContaining({
+                config: expect.objectContaining({ args: { x: 1 } }),
+            }),
+        );
+    });
+
+    it("rejects array args (must be an object, not a list)", () => {
+        const onChange = vi.fn();
+        render(
+            <AutomationNodePanel
+                node={cpNode}
+                definition={baseDef}
+                onChange={onChange}
+                onRename={vi.fn()}
+                onDelete={vi.fn()}
+                onClose={vi.fn()}
+            />,
+        );
+        const args = screen.getByTestId("node-panel-callplugin-args") as HTMLTextAreaElement;
+        fireEvent.change(args, { target: { value: "[1,2,3]" } });
+        fireEvent.blur(args);
+        expect(onChange).not.toHaveBeenCalled();
+        expect(
+            screen.getByTestId("node-panel-callplugin-args-error"),
+        ).toBeInTheDocument();
+    });
+});
+
 describe("AutomationNodePanel — delete + close", () => {
     it("calls onDelete with the node id when the delete button is clicked", () => {
         const onDelete = vi.fn();

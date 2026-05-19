@@ -498,8 +498,10 @@ pub async fn test_run(
     // so the admin handler doesn't park a runtime worker.
     let db = state.db.clone();
     let pool = state.automation_agent_pool.clone();
+    let plugin_host = Some(state.plugin_host.clone());
     let result = tokio::task::spawn_blocking(move || {
-        automation_runtime::dry_run(&db, &pool, &automation, &event)
+        let ctx = automation_runtime::ExecutorContext::new(db, pool, plugin_host);
+        automation_runtime::dry_run(&ctx, &automation, &event)
     })
     .await
     .map_err(|e| ApiError {

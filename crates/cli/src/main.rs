@@ -1834,8 +1834,11 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         execlaw_server::automation_bus::AutomationBus::spawn(
             db.clone(),
             execlaw_server::automation_runtime::build_handler(
-                db.clone(),
-                automation_agent_pool.clone(),
+                execlaw_server::automation_runtime::ExecutorContext::new(
+                    db.clone(),
+                    automation_agent_pool.clone(),
+                    Some(plugin_host.clone()),
+                ),
             ),
             automation_bus_stop.clone(),
         );

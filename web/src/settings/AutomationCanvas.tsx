@@ -112,6 +112,13 @@ function bodyFor(n: NodeDef): string | undefined {
             return shorten(cfg.expr as string | undefined);
         case "AskAgent":
             return shorten(cfg.prompt as string | undefined);
+        case "Notify": {
+            const title = (cfg.title as string | undefined) ?? "";
+            const sev = (cfg.severity as string | undefined) ?? "Warning";
+            return shorten(`[${sev}] ${title}`);
+        }
+        case "CallPlugin":
+            return shorten((cfg.tool as string | undefined) ?? "");
         default:
             return undefined;
     }
@@ -263,6 +270,17 @@ function defaultConfigFor(kind: NodeKind): unknown {
                         args_schema: { type: "object" },
                     },
                 ],
+            };
+        case "Notify":
+            return {
+                title: "Alert",
+                detail: "",
+                severity: "Warning",
+            };
+        case "CallPlugin":
+            return {
+                tool: "",
+                args: {},
             };
         default:
             return {};
@@ -439,6 +457,8 @@ const PALETTE_KINDS: NodeKind[] = [
     "Branch",
     "Terminal",
     "AskAgent",
+    "Notify",
+    "CallPlugin",
 ];
 
 function NodePalette() {

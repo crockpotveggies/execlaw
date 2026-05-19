@@ -33,6 +33,8 @@ const STYLES: Record<string, KindStyle> = {
     Branch: { bg: "#ede9fe", border: "#7c3aed", icon: "bi-signpost-split" },
     Terminal: { bg: "#f3f4f6", border: "#6b7280", icon: "bi-stop-circle" },
     AskAgent: { bg: "#ffedd5", border: "#ea580c", icon: "bi-robot" },
+    Notify: { bg: "#fee2e2", border: "#dc2626", icon: "bi-bell-fill" },
+    CallPlugin: { bg: "#dbeafe", border: "#2563eb", icon: "bi-puzzle" },
 };
 
 function nodeShellStyle(
@@ -150,6 +152,30 @@ export function AskAgentNode(props: NodeProps) {
     );
 }
 
+export function NotifyNode(props: NodeProps) {
+    const data = props.data as unknown as CanvasNodeData;
+    return (
+        <div style={nodeShellStyle("Notify", !!data.selected)} data-testid={`node-${props.id}`}>
+            <Handle type="target" position={Position.Top} />
+            <NodeHeader kind="Notify" label={data.label} />
+            <NodeDetail detail={data.detail} />
+            <Handle type="source" position={Position.Bottom} />
+        </div>
+    );
+}
+
+export function CallPluginNode(props: NodeProps) {
+    const data = props.data as unknown as CanvasNodeData;
+    return (
+        <div style={nodeShellStyle("CallPlugin", !!data.selected)} data-testid={`node-${props.id}`}>
+            <Handle type="target" position={Position.Top} />
+            <NodeHeader kind="CallPlugin" label={data.label} />
+            <NodeDetail detail={data.detail} />
+            <Handle type="source" position={Position.Bottom} />
+        </div>
+    );
+}
+
 /** Map ReactFlow `type` string → React component for `nodeTypes`. */
 export const NODE_TYPES = {
     Trigger: TriggerNode,
@@ -158,6 +184,8 @@ export const NODE_TYPES = {
     Branch: BranchNode,
     Terminal: TerminalNode,
     AskAgent: AskAgentNode,
+    Notify: NotifyNode,
+    CallPlugin: CallPluginNode,
 } as const;
 
 export const KIND_ICONS: Record<string, string> = {
@@ -166,6 +194,8 @@ export const KIND_ICONS: Record<string, string> = {
     Branch: STYLES.Branch.icon,
     Terminal: STYLES.Terminal.icon,
     AskAgent: STYLES.AskAgent.icon,
+    Notify: STYLES.Notify.icon,
+    CallPlugin: STYLES.CallPlugin.icon,
 };
 
 export const KIND_COLORS: Record<string, string> = {
@@ -174,4 +204,6 @@ export const KIND_COLORS: Record<string, string> = {
     Branch: STYLES.Branch.border,
     Terminal: STYLES.Terminal.border,
     AskAgent: STYLES.AskAgent.border,
+    Notify: STYLES.Notify.border,
+    CallPlugin: STYLES.CallPlugin.border,
 };

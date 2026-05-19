@@ -109,6 +109,8 @@ impl NodeKind {
                 | NodeKind::Branch
                 | NodeKind::Terminal
                 | NodeKind::AskAgent
+                | NodeKind::Notify
+                | NodeKind::CallPlugin
         )
     }
 }
@@ -358,6 +360,54 @@ pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
             let _ = cfg.reasoning_tools;
             let _ = cfg.effective_max_turns();
         }
+        if matches!(n.kind, NodeKind::Notify) {
+            // title is required + non-empty; severity (if present)
+            // must parse to a known variant. detail + source are free.
+            let title = n
+                .config
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if title.trim().is_empty() {
+                return Err(AutomationError::Validation(format!(
+                    "Notify node '{}': config.title is required and must be a non-empty string",
+                    n.id
+                )));
+            }
+            if let Some(sev) = n.config.get("severity").and_then(|v| v.as_str())
+                && crate::alerts::Severity::parse(sev).is_none()
+            {
+                return Err(AutomationError::Validation(format!(
+                    "Notify node '{}': unknown severity '{}' (expected Critical|Error|Warning|Info)",
+                    n.id, sev
+                )));
+            }
+        }
+        if matches!(n.kind, NodeKind::CallPlugin) {
+            // tool is required + non-empty. args is optional (defaults
+            // to empty object at runtime); when present it must be an
+            // object so we can apply template rendering recursively.
+            let tool = n
+                .config
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if tool.trim().is_empty() {
+                return Err(AutomationError::Validation(format!(
+                    "CallPlugin node '{}': config.tool is required (registered tool name)",
+                    n.id
+                )));
+            }
+            if let Some(args) = n.config.get("args")
+                && !args.is_object()
+            {
+                return Err(AutomationError::Validation(format!(
+                    "CallPlugin node '{}': config.args must be a JSON object (got {})",
+                    n.id,
+                    args_kind(args),
+                )));
+            }
+        }
     }
     for e in &def.edges {
         if e.from != TRIGGER_SENTINEL && !ids.contains(&e.from) {
@@ -400,6 +450,19 @@ pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
         ));
     }
     Ok(())
+}
+
+/// Lower-cased JSON-type label for validator error messages, so the
+/// operator sees "got string" rather than `String("…")`.
+fn args_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 pub struct AutomationStore<'a> {
@@ -784,6 +847,132 @@ mod tests {
         });
         let err = validate(&def).unwrap_err();
         assert!(format!("{err}").contains("AskAgent config"));
+    }
+
+    /// Build a minimal `trigger -> notify -> terminal` def for the
+    /// Notify validator tests (M6).
+    fn notify_def(cfg: serde_json::Value) -> AutomationDef {
+        AutomationDef {
+            trigger: TriggerDef {
+                kind: BusEventKind::WebhookReceived,
+                when: None,
+            },
+            nodes: vec![
+                NodeDef {
+                    id: "alert".into(),
+                    kind: NodeKind::Notify,
+                    config: cfg,
+                    position: None,
+                },
+                NodeDef {
+                    id: "end".into(),
+                    kind: NodeKind::Terminal,
+                    config: serde_json::json!({}),
+                    position: None,
+                },
+            ],
+            edges: vec![
+                EdgeDef {
+                    from: TRIGGER_SENTINEL.into(),
+                    to: "alert".into(),
+                    when: None,
+                },
+                EdgeDef {
+                    from: "alert".into(),
+                    to: "end".into(),
+                    when: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_notify_node() {
+        let def = notify_def(serde_json::json!({
+            "title": "Hello",
+            "severity": "Info",
+        }));
+        validate(&def).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_notify_with_missing_title() {
+        let def = notify_def(serde_json::json!({}));
+        let err = validate(&def).unwrap_err();
+        assert!(format!("{err}").contains("config.title"));
+    }
+
+    #[test]
+    fn validate_rejects_notify_with_unknown_severity() {
+        let def = notify_def(serde_json::json!({
+            "title": "x",
+            "severity": "Catastrophic",
+        }));
+        let err = validate(&def).unwrap_err();
+        assert!(format!("{err}").contains("severity"));
+    }
+
+    /// Build a minimal `trigger -> call_plugin -> terminal` def for
+    /// the CallPlugin validator tests (M6).
+    fn call_plugin_def(cfg: serde_json::Value) -> AutomationDef {
+        AutomationDef {
+            trigger: TriggerDef {
+                kind: BusEventKind::WebhookReceived,
+                when: None,
+            },
+            nodes: vec![
+                NodeDef {
+                    id: "call".into(),
+                    kind: NodeKind::CallPlugin,
+                    config: cfg,
+                    position: None,
+                },
+                NodeDef {
+                    id: "end".into(),
+                    kind: NodeKind::Terminal,
+                    config: serde_json::json!({}),
+                    position: None,
+                },
+            ],
+            edges: vec![
+                EdgeDef {
+                    from: TRIGGER_SENTINEL.into(),
+                    to: "call".into(),
+                    when: None,
+                },
+                EdgeDef {
+                    from: "call".into(),
+                    to: "end".into(),
+                    when: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_call_plugin_node() {
+        let def = call_plugin_def(serde_json::json!({
+            "tool": "signal.send_message",
+            "args": {"to": "+15551234", "body": "hi"},
+        }));
+        validate(&def).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_call_plugin_with_missing_tool() {
+        let def = call_plugin_def(serde_json::json!({"args": {}}));
+        let err = validate(&def).unwrap_err();
+        assert!(format!("{err}").contains("config.tool"));
+    }
+
+    #[test]
+    fn validate_rejects_call_plugin_with_non_object_args() {
+        let def = call_plugin_def(serde_json::json!({
+            "tool": "x",
+            "args": "not-an-object",
+        }));
+        let err = validate(&def).unwrap_err();
+        assert!(format!("{err}").contains("args"));
     }
 
     #[test]

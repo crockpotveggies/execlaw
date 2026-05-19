@@ -32,17 +32,49 @@
 use crate::automation_agent::{AskAgentRequest, AutomationsAgentPool};
 use crate::automation_bus::EventHandler;
 use execlaw_core::Database;
+use execlaw_core::alerts::{AlertRow, AlertStatus, AlertStore, Severity};
 use execlaw_core::automation_bus::{BusEventRow, Event as BusEvent};
 use execlaw_core::automation_runs::{AutomationRunStatus, AutomationRunStore, StepTrace};
 use execlaw_core::automations::{
     AutomationDef, AutomationRow, AutomationStore, END_SENTINEL, NodeDef, NodeKind,
     TRIGGER_SENTINEL, TriggerDef, parse_ask_agent_config,
 };
+use execlaw_core::ids::AlertId;
+use execlaw_plugin_host::PluginHost;
 use rhai::{Dynamic, Engine, Scope};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, warn};
+
+/// Per-run handles for the side-effect executors. Threaded into
+/// [`execute_node`] so M4-and-beyond kinds (Notify, CallPlugin, …)
+/// can reach the relevant subsystem without us re-plumbing every
+/// signature each time we land a new kind.
+#[derive(Clone)]
+pub struct ExecutorContext {
+    pub db: Database,
+    pub pool: AutomationsAgentPool,
+    /// Optional so tests that don't exercise CallPlugin can wire the
+    /// runtime without spinning up a full plugin host. A `None` here
+    /// turns CallPlugin into a clean per-node error rather than a
+    /// runtime panic.
+    pub plugin_host: Option<PluginHost>,
+}
+
+impl ExecutorContext {
+    pub fn new(
+        db: Database,
+        pool: AutomationsAgentPool,
+        plugin_host: Option<PluginHost>,
+    ) -> Self {
+        Self {
+            db,
+            pool,
+            plugin_host,
+        }
+    }
+}
 
 /// Construct an [`EventHandler`] that drives the automation matcher
 /// + executor against `db`. Drop this into `AutomationBus::spawn` in
@@ -54,10 +86,9 @@ use tracing::{debug, warn};
 /// is never invoked â€” but it must always be present so the runtime
 /// has a well-defined behavior for AskAgent regardless of LLM
 /// availability.
-pub fn build_handler(db: Database, agent_pool: AutomationsAgentPool) -> EventHandler {
+pub fn build_handler(ctx: ExecutorContext) -> EventHandler {
     Arc::new(move |row: BusEventRow| {
-        let db = db.clone();
-        let pool = agent_pool.clone();
+        let ctx = ctx.clone();
         Box::pin(async move {
             // SQLite + Rhai are sync; the agent pool's invocation is
             // async but we bridge across `block_on` inside the
@@ -65,7 +96,7 @@ pub fn build_handler(db: Database, agent_pool: AutomationsAgentPool) -> EventHan
             // is the semaphore acquire + the model HTTP round-trip,
             // both of which we want to serialize per-run anyway).
             if let Err(e) = tokio::task::spawn_blocking(move || {
-                run_matching_automations(&db, &pool, &row);
+                run_matching_automations(&ctx, &row);
             })
             .await
             {
@@ -77,8 +108,8 @@ pub fn build_handler(db: Database, agent_pool: AutomationsAgentPool) -> EventHan
 
 /// Top-level matcher: list enabled automations for the event's kind,
 /// filter by trigger predicate, run each that matches.
-fn run_matching_automations(db: &Database, pool: &AutomationsAgentPool, evt: &BusEventRow) {
-    let store = AutomationStore::new(db);
+fn run_matching_automations(ctx: &ExecutorContext, evt: &BusEventRow) {
+    let store = AutomationStore::new(&ctx.db);
     let matched = match store.list_enabled_for_kind(evt.kind) {
         Ok(rows) => rows,
         Err(e) => {
@@ -104,7 +135,7 @@ fn run_matching_automations(db: &Database, pool: &AutomationsAgentPool, evt: &Bu
             );
             continue;
         }
-        run_one(db, pool, &automation, evt, &event_ctx);
+        run_one(ctx, &automation, evt, &event_ctx);
     }
 }
 
@@ -140,13 +171,12 @@ fn trigger_matches(trigger: &TriggerDef, event_ctx: &serde_json::Value) -> bool 
 }
 
 fn run_one(
-    db: &Database,
-    pool: &AutomationsAgentPool,
+    ctx: &ExecutorContext,
     automation: &AutomationRow,
     evt: &BusEventRow,
     event_ctx: &serde_json::Value,
 ) {
-    let run_store = AutomationRunStore::new(db);
+    let run_store = AutomationRunStore::new(&ctx.db);
     let started_at = chrono::Utc::now().timestamp_millis();
     let run_id = match run_store.insert_pending(&automation.id, &evt.id, started_at) {
         Ok(id) => id,
@@ -181,7 +211,7 @@ fn run_one(
             );
         }
     };
-    let outcome = execute_graph(&automation.definition, &mut state, pool, &mut trace_sink);
+    let outcome = execute_graph(&automation.definition, &mut state, ctx, &mut trace_sink);
     let finished_at = chrono::Utc::now().timestamp_millis();
     let final_status = match outcome {
         ExecOutcome::Success => AutomationRunStatus::Success,
@@ -215,12 +245,10 @@ pub struct DryRunResult {
 /// Callers that don't want to hit the model should swap the pool's
 /// invoker (the M3 test fixtures show how â€” `StubAgentInvoker`).
 pub fn dry_run(
-    db: &Database,
-    pool: &AutomationsAgentPool,
+    ctx: &ExecutorContext,
     automation: &AutomationRow,
     sample: &BusEventRow,
 ) -> DryRunResult {
-    let _ = db; // currently unused â€” reserved for M5 features that read state
     let event_ctx = event_context(sample);
     let mut state: HashMap<String, serde_json::Value> = HashMap::new();
     state.insert("event".to_string(), event_ctx);
@@ -228,7 +256,7 @@ pub fn dry_run(
     let outcome = execute_graph(
         &automation.definition,
         &mut state,
-        pool,
+        ctx,
         &mut |t: StepTrace| traces.push(t),
     );
     DryRunResult {
@@ -261,7 +289,7 @@ pub enum ExecOutcome {
 fn execute_graph(
     def: &AutomationDef,
     state: &mut HashMap<String, serde_json::Value>,
-    pool: &AutomationsAgentPool,
+    ctx: &ExecutorContext,
     trace_sink: &mut dyn FnMut(StepTrace),
 ) -> ExecOutcome {
     let mut current = TRIGGER_SENTINEL.to_string();
@@ -296,7 +324,7 @@ fn execute_graph(
 
         let start = Instant::now();
         let input_snapshot = snapshot_state(state);
-        let exec_result = execute_node(node, state, pool);
+        let exec_result = execute_node(node, state, ctx);
         let ms = start.elapsed().as_millis() as u64;
 
         match exec_result {
@@ -408,7 +436,7 @@ enum NodeOutcome {
 fn execute_node(
     node: &NodeDef,
     state: &HashMap<String, serde_json::Value>,
-    pool: &AutomationsAgentPool,
+    ctx: &ExecutorContext,
 ) -> NodeOutcome {
     match node.kind {
         NodeKind::Filter => execute_filter(node, state),
@@ -421,11 +449,191 @@ fn execute_node(
             NodeOutcome::Output(serde_json::json!({}))
         }
         NodeKind::Terminal => NodeOutcome::Terminal,
-        NodeKind::AskAgent => execute_ask_agent(node, state, pool),
+        NodeKind::AskAgent => execute_ask_agent(node, state, &ctx.pool),
+        NodeKind::Notify => execute_notify(node, state, &ctx.db),
+        NodeKind::CallPlugin => execute_call_plugin(node, state, ctx.plugin_host.as_ref()),
         _ => NodeOutcome::Error(format!(
             "node kind '{}' not implemented in this milestone",
             node.kind.as_str()
         )),
+    }
+}
+
+/// Notify (M6) â€” insert a row into `state_alerts` via
+/// [`AlertStore::insert_firing`]. The alert's `source` defaults to
+/// `automation:<node_id>` so operators can fingerprint-dedup against
+/// the producing flow.
+///
+/// Config (validated upstream):
+/// ```text
+/// { "title": string,
+///   "detail": optional string,
+///   "severity": "Critical" | "Error" | "Warning" | "Info",
+///   "source": optional string }
+/// ```
+///
+/// Template substitution: `title` and `detail` pass through
+/// [`render_template`] so the alert can reference `{{event.payload.x}}`
+/// and upstream node outputs.
+///
+/// Output: `{ "alert_id": "<id>" }` â€” downstream nodes can route on
+/// alert_id presence if they want to ack the notification.
+fn execute_notify(
+    node: &NodeDef,
+    state: &HashMap<String, serde_json::Value>,
+    db: &Database,
+) -> NodeOutcome {
+    let cfg = &node.config;
+    let title_raw = match cfg.get("title").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => {
+            return NodeOutcome::Error(
+                "Notify node missing or empty config.title (must be a non-empty string)".into(),
+            );
+        }
+    };
+    let detail_raw = cfg.get("detail").and_then(|v| v.as_str());
+    let severity = match cfg.get("severity").and_then(|v| v.as_str()) {
+        Some(s) => match Severity::parse(s) {
+            Some(sev) => sev,
+            None => {
+                return NodeOutcome::Error(format!(
+                    "Notify node: unknown severity '{s}' (expected Critical|Error|Warning|Info)"
+                ));
+            }
+        },
+        None => Severity::Warning, // Sensible default: louder than Info, less alarming than Error.
+    };
+    let source = cfg
+        .get("source")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("automation:{}", node.id));
+
+    let title = render_template(title_raw, state);
+    let detail = detail_raw.map(|d| render_template(d, state));
+
+    // Fingerprint = `<source>::<title>` so re-firing the same alert
+    // bumps occurrence_count instead of creating dup rows. Author can
+    // make the fingerprint unique-per-instance by embedding
+    // `{{event.id}}` in the title.
+    let fingerprint = format!("{}::{}", source, title);
+    let now = chrono::Utc::now().timestamp_millis();
+    let id = AlertId::new();
+    let row = AlertRow {
+        id: id.clone(),
+        fingerprint,
+        severity,
+        source,
+        title,
+        detail,
+        context_json: None,
+        status: AlertStatus::Firing,
+        first_seen_at: now,
+        last_seen_at: now,
+        occurrence_count: 1,
+        resolved_at: None,
+        resolved_by: None,
+        ack_at: None,
+        ack_by: None,
+        snooze_until: None,
+        incident_id: None,
+        actions_json: None,
+    };
+    let store = AlertStore::new(db);
+    match store.insert_firing(&row) {
+        Ok(()) => NodeOutcome::Output(serde_json::json!({
+            "alert_id": id.as_str(),
+        })),
+        Err(e) => NodeOutcome::Error(format!("Notify: insert_firing failed: {e}")),
+    }
+}
+
+/// CallPlugin (M6) â€” dispatch to a plugin-registered tool by name.
+/// Reuses [`PluginHost::call_tool`] which is the same path the
+/// LLM-callable tool registry uses.
+///
+/// Config:
+/// ```text
+/// { "tool": string,           // registered tool name, e.g. "signal.send_message"
+///   "args": object }          // passed verbatim to the tool
+/// ```
+///
+/// Auth posture: automations run with controller privileges (admin-
+/// authored, system-context), so we pass `caps=["*"]` (wildcard) and
+/// `trust="Controller"`. This is consistent with the routine
+/// subsystem's auth posture.
+///
+/// Output: the tool's raw return value â€” downstream nodes can pluck
+/// fields out via `{{node_id.field}}`.
+fn execute_call_plugin(
+    node: &NodeDef,
+    state: &HashMap<String, serde_json::Value>,
+    plugin_host: Option<&PluginHost>,
+) -> NodeOutcome {
+    let cfg = &node.config;
+    let tool = match cfg.get("tool").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.to_owned(),
+        _ => {
+            return NodeOutcome::Error(
+                "CallPlugin node missing or empty config.tool (must be a registered tool name)"
+                    .into(),
+            );
+        }
+    };
+    // Args default to an empty object so authors can omit the field
+    // for parameterless tools.
+    let args_raw = cfg.get("args").cloned().unwrap_or(serde_json::json!({}));
+    // Template-render any string leaves in the args so the author can
+    // reference `{{event.payload.x}}` without hand-stringifying first.
+    let args = render_template_in_value(&args_raw, state);
+
+    let Some(host) = plugin_host else {
+        return NodeOutcome::Error(
+            "CallPlugin: no plugin host wired into the runtime (tests without plugin support \
+             reach this branch â€” production builds always have one)"
+                .into(),
+        );
+    };
+
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => {
+            return NodeOutcome::Error(
+                "CallPlugin: no tokio runtime in scope (executor must run under spawn_blocking)"
+                    .into(),
+            );
+        }
+    };
+    let result = handle.block_on(host.call_tool(&tool, args, &["*"], Some("Controller")));
+    match result {
+        Ok(v) => NodeOutcome::Output(v),
+        Err(e) => NodeOutcome::Error(format!("CallPlugin '{tool}' failed: {e}")),
+    }
+}
+
+/// Recursively apply [`render_template`] to every string leaf in a
+/// JSON value. Used by CallPlugin so the operator can stash
+/// `{{event.payload.x}}` references inside the args object's fields
+/// rather than having to pre-bake them via a Transform node.
+fn render_template_in_value(
+    v: &serde_json::Value,
+    state: &HashMap<String, serde_json::Value>,
+) -> serde_json::Value {
+    match v {
+        serde_json::Value::String(s) => serde_json::Value::String(render_template(s, state)),
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(|x| render_template_in_value(x, state)).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, val) in map {
+                out.insert(k.clone(), render_template_in_value(val, state));
+            }
+            serde_json::Value::Object(out)
+        }
+        // Numbers, bools, null pass through unchanged.
+        other => other.clone(),
     }
 }
 
@@ -761,6 +969,19 @@ mod tests {
         )))
     }
 
+    /// Executor context for tests that don't exercise CallPlugin â€”
+    /// i.e., the default for Filter/Transform/Branch/Terminal/Notify
+    /// flows. `Notify` writes through the wired DB; CallPlugin tests
+    /// supply a plugin host via [`ExecutorContext::new`] directly.
+    fn noop_ctx(db: &Database) -> ExecutorContext {
+        ExecutorContext::new(db.clone(), noop_pool(), None)
+    }
+
+    /// Context with a specific agent pool wired (for AskAgent tests).
+    fn agent_ctx(db: &Database, pool: AutomationsAgentPool) -> ExecutorContext {
+        ExecutorContext::new(db.clone(), pool, None)
+    }
+
     fn stub_pool(call: ExitToolCall) -> AutomationsAgentPool {
         AutomationsAgentPool::new(Arc::new(StubAgentInvoker::ok(call)))
     }
@@ -868,7 +1089,7 @@ mod tests {
             )
             .unwrap();
 
-        run_matching_automations(&db, &noop_pool(), &evt);
+        run_matching_automations(&noop_ctx(&db), &evt);
 
         let runs = run_store.list_for_automation(&row.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
@@ -896,7 +1117,7 @@ mod tests {
             )
             .unwrap();
 
-        run_matching_automations(&db, &noop_pool(), &evt);
+        run_matching_automations(&noop_ctx(&db), &evt);
 
         let runs = run_store.list_for_automation(&row.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
@@ -943,7 +1164,7 @@ mod tests {
 
         for id in ["e-ring", "e-slack"] {
             let evt = store.get(id).unwrap().unwrap();
-            run_matching_automations(&db, &noop_pool(), &evt);
+            run_matching_automations(&noop_ctx(&db), &evt);
         }
         let _ = run_store;
 
@@ -1028,7 +1249,7 @@ mod tests {
             )
             .unwrap();
 
-        run_matching_automations(&db, &noop_pool(), &evt);
+        run_matching_automations(&noop_ctx(&db), &evt);
         let runs = run_store.list_for_automation(&row.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, AutomationRunStatus::Success);
@@ -1070,7 +1291,7 @@ mod tests {
             )
             .unwrap();
 
-        run_matching_automations(&db, &noop_pool(), &evt);
+        run_matching_automations(&noop_ctx(&db), &evt);
         let runs = run_store.list_for_automation(&row.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, AutomationRunStatus::Failed);
@@ -1103,7 +1324,7 @@ mod tests {
             )
             .unwrap();
 
-        run_matching_automations(&db, &noop_pool(), &evt);
+        run_matching_automations(&noop_ctx(&db), &evt);
         assert!(
             run_store
                 .list_for_automation(&row.id, 10)
@@ -1164,7 +1385,7 @@ mod tests {
         let stop = std::sync::Arc::new(Notify::new());
         let (bus, tasks) = AutomationBus::spawn(
             db.clone(),
-            build_handler(db.clone(), noop_pool()),
+            build_handler(noop_ctx(&db)),
             stop.clone(),
         );
 
@@ -1296,7 +1517,8 @@ mod tests {
         let db_for_blocking = db.clone();
         let evt_for_blocking = evt.clone();
         tokio::task::spawn_blocking(move || {
-            run_matching_automations(&db_for_blocking, &pool, &evt_for_blocking);
+            let ctx = agent_ctx(&db_for_blocking, pool);
+            run_matching_automations(&ctx, &evt_for_blocking);
         })
         .await
         .unwrap();
@@ -1348,7 +1570,8 @@ mod tests {
         let db_for_blocking = db.clone();
         let evt_for_blocking = evt.clone();
         tokio::task::spawn_blocking(move || {
-            run_matching_automations(&db_for_blocking, &pool, &evt_for_blocking);
+            let ctx = agent_ctx(&db_for_blocking, pool);
+            run_matching_automations(&ctx, &evt_for_blocking);
         })
         .await
         .unwrap();
@@ -1388,7 +1611,8 @@ mod tests {
         let db_for_blocking = db.clone();
         let evt_for_blocking = evt.clone();
         tokio::task::spawn_blocking(move || {
-            run_matching_automations(&db_for_blocking, &pool, &evt_for_blocking);
+            let ctx = agent_ctx(&db_for_blocking, pool);
+            run_matching_automations(&ctx, &evt_for_blocking);
         })
         .await
         .unwrap();
@@ -1549,7 +1773,8 @@ mod tests {
         let db_for_blocking = db.clone();
         let evt_for_blocking = evt.clone();
         tokio::task::spawn_blocking(move || {
-            run_matching_automations(&db_for_blocking, &pool, &evt_for_blocking);
+            let ctx = agent_ctx(&db_for_blocking, pool);
+            run_matching_automations(&ctx, &evt_for_blocking);
         })
         .await
         .unwrap();
@@ -1655,7 +1880,8 @@ mod tests {
         let db_for_blocking = db.clone();
         let evt_for_blocking = evt.clone();
         tokio::task::spawn_blocking(move || {
-            run_matching_automations(&db_for_blocking, &pool, &evt_for_blocking);
+            let ctx = agent_ctx(&db_for_blocking, pool);
+            run_matching_automations(&ctx, &evt_for_blocking);
         })
         .await
         .unwrap();
@@ -1703,7 +1929,7 @@ mod tests {
         let stop = std::sync::Arc::new(Notify::new());
         let (bus, tasks) = AutomationBus::spawn(
             db.clone(),
-            build_handler(db.clone(), noop_pool()),
+            build_handler(noop_ctx(&db)),
             stop.clone(),
         );
 
@@ -1725,5 +1951,290 @@ mod tests {
 
         stop.notify_waiters();
         tasks.join().await;
+    }
+
+    // ----------------------- Notify (M6) ------------------------------
+
+    /// Build trigger â†’ notify â†’ terminal.
+    fn def_notify(notify_cfg: serde_json::Value) -> AutomationDef {
+        AutomationDef {
+            trigger: TriggerDef {
+                kind: BusEventKind::WebhookReceived,
+                when: None,
+            },
+            nodes: vec![
+                NodeDef {
+                    id: "alert".into(),
+                    kind: NodeKind::Notify,
+                    config: notify_cfg,
+                    position: None,
+                },
+                NodeDef {
+                    id: "end".into(),
+                    kind: NodeKind::Terminal,
+                    config: serde_json::json!({}),
+                    position: None,
+                },
+            ],
+            edges: vec![
+                EdgeDef {
+                    from: TRIGGER_SENTINEL.into(),
+                    to: "alert".into(),
+                    when: None,
+                },
+                EdgeDef {
+                    from: "alert".into(),
+                    to: "end".into(),
+                    when: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn notify_node_inserts_alert_row_and_run_succeeds() {
+        use execlaw_core::alerts::{AlertStatus, AlertStore};
+
+        let db = fresh_db();
+        let auto_store = AutomationStore::new(&db);
+        let run_store = AutomationRunStore::new(&db);
+        let evt = seed_bus_event(&db, "e1", serde_json::json!({"zone": "driveway"}));
+
+        let def = def_notify(serde_json::json!({
+            "title": "Motion in {{event.payload.zone}}",
+            "detail": "An automation tripped",
+            "severity": "Warning",
+        }));
+        let row = auto_store
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: "notify-1".into(),
+                    enabled: true,
+                    definition: def,
+                },
+                1000,
+            )
+            .unwrap();
+
+        run_matching_automations(&noop_ctx(&db), &evt);
+
+        let runs = run_store.list_for_automation(&row.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, AutomationRunStatus::Success);
+
+        let store = AlertStore::new(&db);
+        let alerts = store.list(None, None).unwrap();
+        assert_eq!(alerts.len(), 1);
+        let a = &alerts[0];
+        // Template substituted on title.
+        assert_eq!(a.title, "Motion in driveway");
+        assert_eq!(a.detail.as_deref(), Some("An automation tripped"));
+        assert_eq!(a.status, AlertStatus::Firing);
+        // Default source = `automation:<node_id>`.
+        assert_eq!(a.source, "automation:alert");
+    }
+
+    #[test]
+    fn notify_node_with_missing_title_fails_validation() {
+        use execlaw_core::automations::{AutomationError, validate};
+
+        let def = def_notify(serde_json::json!({})); // no title
+        match validate(&def) {
+            Err(AutomationError::Validation(msg)) => {
+                assert!(
+                    msg.contains("config.title"),
+                    "expected title error, got: {msg}"
+                );
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notify_node_with_bad_severity_fails_validation() {
+        use execlaw_core::automations::{AutomationError, validate};
+
+        let def = def_notify(serde_json::json!({
+            "title": "x",
+            "severity": "Catastrophic",
+        }));
+        match validate(&def) {
+            Err(AutomationError::Validation(msg)) => {
+                assert!(msg.contains("severity"), "expected severity error, got: {msg}");
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notify_node_dedupes_re_firing_via_fingerprint() {
+        use execlaw_core::alerts::AlertStore;
+
+        let db = fresh_db();
+        let auto_store = AutomationStore::new(&db);
+        let evt1 = seed_bus_event(&db, "e1", serde_json::json!({"zone": "driveway"}));
+        let evt2 = seed_bus_event(&db, "e2", serde_json::json!({"zone": "driveway"}));
+
+        let def = def_notify(serde_json::json!({
+            "title": "Motion in {{event.payload.zone}}",
+        }));
+        auto_store
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: "notify-dup".into(),
+                    enabled: true,
+                    definition: def,
+                },
+                1000,
+            )
+            .unwrap();
+
+        // Same fingerprint â†’ second firing bumps occurrence_count, no
+        // new row.
+        run_matching_automations(&noop_ctx(&db), &evt1);
+        run_matching_automations(&noop_ctx(&db), &evt2);
+
+        let alerts = AlertStore::new(&db).list(None, None).unwrap();
+        assert_eq!(alerts.len(), 1, "dedup must collapse same-fingerprint firings");
+        assert_eq!(alerts[0].occurrence_count, 2);
+    }
+
+    // ----------------------- CallPlugin (M6) ---------------------------
+
+    /// Build trigger â†’ call_plugin â†’ terminal.
+    fn def_call_plugin(cfg: serde_json::Value) -> AutomationDef {
+        AutomationDef {
+            trigger: TriggerDef {
+                kind: BusEventKind::WebhookReceived,
+                when: None,
+            },
+            nodes: vec![
+                NodeDef {
+                    id: "call".into(),
+                    kind: NodeKind::CallPlugin,
+                    config: cfg,
+                    position: None,
+                },
+                NodeDef {
+                    id: "end".into(),
+                    kind: NodeKind::Terminal,
+                    config: serde_json::json!({}),
+                    position: None,
+                },
+            ],
+            edges: vec![
+                EdgeDef {
+                    from: TRIGGER_SENTINEL.into(),
+                    to: "call".into(),
+                    when: None,
+                },
+                EdgeDef {
+                    from: "call".into(),
+                    to: "end".into(),
+                    when: None,
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn call_plugin_without_plugin_host_surfaces_clear_error() {
+        let db = fresh_db();
+        let auto_store = AutomationStore::new(&db);
+        let run_store = AutomationRunStore::new(&db);
+        let evt = seed_bus_event(&db, "e1", serde_json::json!({}));
+
+        let def = def_call_plugin(serde_json::json!({
+            "tool": "signal.send_message",
+            "args": {"to": "+15551234", "body": "hello"},
+        }));
+        let row = auto_store
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: "call-no-host".into(),
+                    enabled: true,
+                    definition: def,
+                },
+                1000,
+            )
+            .unwrap();
+
+        // noop_ctx wires plugin_host = None â€” the CallPlugin executor
+        // must turn that into a per-node error (not a panic).
+        let db2 = db.clone();
+        let evt2 = evt.clone();
+        tokio::task::spawn_blocking(move || run_matching_automations(&noop_ctx(&db2), &evt2))
+            .await
+            .unwrap();
+
+        let runs = run_store.list_for_automation(&row.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, AutomationRunStatus::Failed);
+        let trace = &runs[0].step_traces[0];
+        assert!(
+            trace
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("no plugin host"),
+            "expected plugin-host error, got: {:?}",
+            trace.error
+        );
+    }
+
+    #[test]
+    fn call_plugin_with_empty_tool_fails_validation() {
+        use execlaw_core::automations::{AutomationError, validate};
+
+        let def = def_call_plugin(serde_json::json!({"tool": ""}));
+        match validate(&def) {
+            Err(AutomationError::Validation(msg)) => {
+                assert!(msg.contains("config.tool"), "got: {msg}");
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_plugin_with_non_object_args_fails_validation() {
+        use execlaw_core::automations::{AutomationError, validate};
+
+        let def = def_call_plugin(serde_json::json!({"tool": "x", "args": "not-an-object"}));
+        match validate(&def) {
+            Err(AutomationError::Validation(msg)) => {
+                assert!(msg.contains("args"), "got: {msg}");
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_template_in_value_substitutes_string_leaves_recursively() {
+        let mut state = HashMap::new();
+        state.insert(
+            "event".to_string(),
+            serde_json::json!({"payload": {"to": "+15551234"}}),
+        );
+        let v = serde_json::json!({
+            "to": "{{event.payload.to}}",
+            "body": "hi",
+            "meta": {"src": "auto:{{event.payload.to}}"},
+            "tags": ["a", "{{event.payload.to}}"],
+            "n": 7,
+        });
+        let out = render_template_in_value(&v, &state);
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "to": "+15551234",
+                "body": "hi",
+                "meta": {"src": "auto:+15551234"},
+                "tags": ["a", "+15551234"],
+                "n": 7,
+            })
+        );
     }
 }
