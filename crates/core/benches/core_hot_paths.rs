@@ -1592,7 +1592,9 @@ fn bench_automation_bus(c: &mut Criterion) {
                 received_at: black_box(i as i64),
                 payload: serde_json::json!({"i": i}),
             };
-            BusEventStore::new(black_box(&db)).publish(&evt, false).unwrap()
+            BusEventStore::new(black_box(&db))
+                .publish(&evt, false)
+                .unwrap()
         });
     });
 

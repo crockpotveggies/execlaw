@@ -506,8 +506,7 @@ pub async fn advance_job_handler(
                 }
             } else {
                 // prior == Gathering; pull the persisted notes back.
-                let notes_row = match ResearchJobStore::new(&db_for_notes).get(&id_for_task)
-                {
+                let notes_row = match ResearchJobStore::new(&db_for_notes).get(&id_for_task) {
                     Ok(Some(r)) => r,
                     _ => return,
                 };
@@ -515,8 +514,7 @@ pub async fn advance_job_handler(
                     .notes_json
                     .as_ref()
                     .and_then(|b| {
-                        rmp_serde::from_slice::<Vec<execlaw_core::research::ResearchNote>>(b)
-                            .ok()
+                        rmp_serde::from_slice::<Vec<execlaw_core::research::ResearchNote>>(b).ok()
                     })
                     .unwrap_or_default();
                 if let Err(e) = crate::research::runner::run_synthesize_phase(
@@ -1128,11 +1126,18 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         // Advance returned; the spawned task is racing the cleanup.
-        // Poll the registry briefly — without the fix, the entry
-        // would linger forever; with the fix, it's gone within a
-        // few hundred ms (gather connect-error + cleanup).
+        // Poll the registry — without the fix, the entry would
+        // linger forever; with the fix it's gone within a few
+        // hundred ms on a typical Linux/macOS host (the connect to
+        // 127.0.0.1:1 returns ECONNREFUSED immediately). Windows is
+        // less predictable: WSAConnectByName / WSAConnect against an
+        // unlistened-on loopback port can wait for the full TCP
+        // SYN-retransmit cycle (~30 s) before giving up. Pad the
+        // budget to 60 s on Windows; on Unix-likes the fix's
+        // happy-path completes in well under the original 4 s window.
+        let max_polls = if cfg!(windows) { 1200 } else { 80 };
         let mut cleared = false;
-        for _ in 0..80 {
+        for _ in 0..max_polls {
             if !registry.contains_key(id.as_str()) {
                 cleared = true;
                 break;

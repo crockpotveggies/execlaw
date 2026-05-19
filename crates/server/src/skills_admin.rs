@@ -762,8 +762,14 @@ mod tests {
         let req = Request::builder()
             .method(Method::POST)
             .uri("/api/admin/skills")
-            .header(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))
-            .header(header::AUTHORIZATION, HeaderValue::from_str(bearer).unwrap())
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )
+            .header(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(bearer).unwrap(),
+            )
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -885,8 +891,7 @@ mod tests {
     async fn oversized_body_returns_413() {
         let (app, bearer) = seed_user_and_token(UserRole::Controller).await;
         // MAX_BODY_BYTES = 256 KiB; ship one byte over.
-        let oversized =
-            "a".repeat((execlaw_skills::MAX_BODY_BYTES as usize) + 1);
+        let oversized = "a".repeat((execlaw_skills::MAX_BODY_BYTES as usize) + 1);
         let (status, body) = post_create(
             app,
             &bearer,
@@ -908,7 +913,10 @@ mod tests {
         let req = Request::builder()
             .method(Method::POST)
             .uri("/api/admin/skills")
-            .header(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )
             .body(Body::from(
                 serde_json::to_vec(&serde_json::json!({
                     "name": "test/foo",
@@ -925,10 +933,7 @@ mod tests {
 
 pub fn skills_admin_router() -> Router<AppState> {
     Router::new()
-        .route(
-            "/api/admin/skills",
-            get(list_handler).post(create_handler),
-        )
+        .route("/api/admin/skills", get(list_handler).post(create_handler))
         .route(
             "/api/admin/skills/config",
             get(get_config_handler).put(update_config_handler),

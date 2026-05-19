@@ -322,11 +322,7 @@ impl BollardServiceController {
     /// progress" on every status-string change OR every 5s
     /// heartbeat, "image pull complete" on success, warn + return
     /// `ServiceError::Pull` on stream error.
-    async fn pull_image(
-        &self,
-        image: &str,
-        container_name: &str,
-    ) -> Result<(), ServiceError> {
+    async fn pull_image(&self, image: &str, container_name: &str) -> Result<(), ServiceError> {
         use bollard::image::CreateImageOptions;
         use futures_util::StreamExt;
         let opts = CreateImageOptions {

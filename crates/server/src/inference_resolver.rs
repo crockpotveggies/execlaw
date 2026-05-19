@@ -167,9 +167,7 @@ impl InferenceResolver {
                 };
                 match endpoint {
                     Some(url) => Some(ResolvedInference {
-                        client: Arc::new(
-                            InferenceClient::new(url.clone()).with_engine(engine),
-                        ),
+                        client: Arc::new(InferenceClient::new(url.clone()).with_engine(engine)),
                         model_id: row_model
                             .or_else(|| self.bootstrap_model.clone())
                             .unwrap_or_else(|| DEFAULT_FALLBACK_MODEL.to_owned()),

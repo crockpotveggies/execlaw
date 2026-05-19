@@ -765,7 +765,9 @@ mod tests {
         // 256 KB of well-mixed bytes — covers several 64 KB read
         // iterations in the streaming path. If anything in the
         // chunking math was off, the hashes would diverge.
-        let bytes: Vec<u8> = (0..256u32 * 1024).map(|i| (i as u8).wrapping_mul(31)).collect();
+        let bytes: Vec<u8> = (0..256u32 * 1024)
+            .map(|i| (i as u8).wrapping_mul(31))
+            .collect();
         let source = tmp.path().join("data.bin");
         std::fs::write(&source, &bytes).unwrap();
 
@@ -831,9 +833,8 @@ mod tests {
                 1,
             )
             .unwrap();
-        let blob_path = std::path::PathBuf::from(
-            &store.get_artifact(&a.attachment_id).unwrap().unwrap().path,
-        );
+        let blob_path =
+            std::path::PathBuf::from(&store.get_artifact(&a.attachment_id).unwrap().unwrap().path);
         let blob_mtime_before = std::fs::metadata(&blob_path).unwrap().modified().unwrap();
 
         // Sleep enough for mtime to change if a clobber happened.

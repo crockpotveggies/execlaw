@@ -193,7 +193,8 @@ mod tests {
 
     #[test]
     fn pull_chunk_deserializes_progress_line() {
-        let line = br#"{"status":"downloading","digest":"sha256:abc","total":1024,"completed":512}"#;
+        let line =
+            br#"{"status":"downloading","digest":"sha256:abc","total":1024,"completed":512}"#;
         let p: PullChunk = serde_json::from_slice(line).unwrap();
         assert_eq!(p.status, "downloading");
         assert_eq!(p.total, Some(1024));

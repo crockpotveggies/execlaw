@@ -16,16 +16,16 @@
 //! regressions. Each bench's expected order-of-magnitude is noted
 //! in its body.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use execlaw_core::attachments::AttachmentStore;
 use execlaw_core::db::{Database, DbConfig};
 use execlaw_core::ids::ConversationId;
 use execlaw_core::migrations::MigrationRunner;
 use execlaw_server::python_sandbox::hydration::{
-    hydrate_uploads, AttachmentToHydrate, HydrateOpts,
+    AttachmentToHydrate, HydrateOpts, hydrate_uploads,
 };
 use execlaw_server::python_sandbox::mime::{
-    mime_bundle_from_jupyter_data, ExecuteOutput, MimeBundle, StreamName,
+    ExecuteOutput, MimeBundle, StreamName, mime_bundle_from_jupyter_data,
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -136,7 +136,9 @@ fn bench_approx_bytes(c: &mut Criterion) {
             },
             MimeBundle {
                 mime_type: "text/html".into(),
-                data: json!("<table border=\"1\"><tr><th>a</th><th>b</th></tr><tr><td>1</td><td>3</td></tr><tr><td>2</td><td>4</td></tr></table>"),
+                data: json!(
+                    "<table border=\"1\"><tr><th>a</th><th>b</th></tr><tr><td>1</td><td>3</td></tr><tr><td>2</td><td>4</td></tr></table>"
+                ),
             },
         ],
     };
@@ -195,12 +197,7 @@ fn bench_streaming_publish(c: &mut Criterion) {
                 let artifacts_root = dir.path().join("artifacts");
                 (db, dir, blob, artifacts_root)
             },
-            |(db, _dir, blob, artifacts_root): (
-                Database,
-                tempfile::TempDir,
-                PathBuf,
-                PathBuf,
-            )| {
+            |(db, _dir, blob, artifacts_root): (Database, tempfile::TempDir, PathBuf, PathBuf)| {
                 let store = AttachmentStore::new(&db);
                 let r = store
                     .insert_plugin_artifact_from_path(

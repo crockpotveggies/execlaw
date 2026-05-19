@@ -45,7 +45,7 @@ mod types;
 // with the event log, not part of the public surface.
 pub use prompt::{GroupTurnContext, build_turn_context_prose, resolve_group_turn_context};
 pub use types::{
-    InlineAttachmentRequest, IncognitoTurnMessage, ListQuery, MessageAttachmentView, MessageView,
+    IncognitoTurnMessage, InlineAttachmentRequest, ListQuery, MessageAttachmentView, MessageView,
     MessagesListResponse, PatchThreadRequest, PatchThreadResponse, SendMessageRequest,
     SendMessageResponse, ThreadListResponse, ThreadSummaryView,
 };
@@ -64,12 +64,12 @@ pub(crate) use prompt::{assemble_system_prompt, build_tool_routing_prose, humani
 // consumed by `crate::generic_inbound`; `rewrite_url_for_container`
 // is consumed by callers outside chats (cli). Everything else is
 // crate-internal.
-pub use helpers::{apply_auto_display_name, ensure_conversation_for};
 pub(crate) use helpers::{
     BusPhaseObserver, IdlePhaseGuard, ensure_conversation, err_500, event_log,
     refresh_conversation_kind, resolve_skill_prepend, rewrite_url_for_container,
     rewrite_url_with_alias, sanitize_generated_title, strip_think_blocks,
 };
+pub use helpers::{apply_auto_display_name, ensure_conversation_for};
 use types::{
     ColdContactPayload, MAX_PREPEND_SKILL_BYTES, RealModelTurnPayload, StubModelTurnPayload,
     UserMessagePayload, deserialize_optional_field,
@@ -286,8 +286,8 @@ pub async fn send_message(
     // path engages whenever there's ANY tool surface the agent can
     // call.
     let registry_for_tools = state.plugin_host.registry();
-    let has_plugin_tools = !registry_for_tools.all_tools().is_empty()
-        || !registry_for_tools.all_builtins().is_empty();
+    let has_plugin_tools =
+        !registry_for_tools.all_tools().is_empty() || !registry_for_tools.all_builtins().is_empty();
     let caller_caps: Vec<String> = policy
         .capability_set
         .iter()
@@ -1478,9 +1478,7 @@ fn build_runner_history_messages(
                         EventKind::ToolUse => ev
                             .decode_payload::<ToolUsePayload>()
                             .ok()
-                            .map(|p| {
-                                p.tool_name.len() + p.args_json.to_string().len()
-                            })
+                            .map(|p| p.tool_name.len() + p.args_json.to_string().len())
                             .unwrap_or(0),
                         EventKind::ToolResult => ev
                             .decode_payload::<ToolResultPayload>()
@@ -1732,12 +1730,8 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
     // `ModelTurn` that closes it.
     let budget = execlaw_core::history_budget::load_max_history_tokens(&state.db)
         .unwrap_or(execlaw_core::history_budget::DEFAULT_HISTORY_TOKENS);
-    let hist_messages: Vec<ChatMessage> = build_runner_history_messages(
-        &history,
-        user_seq,
-        spotlight.as_ref(),
-        budget,
-    );
+    let hist_messages: Vec<ChatMessage> =
+        build_runner_history_messages(&history, user_seq, spotlight.as_ref(), budget);
     // Bookkeeping log so an operator can confirm how many turns
     // survived the budget.
     tracing::debug!(
@@ -2003,8 +1997,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
                             tool = %tool_name,
                             "failed to encode tool_use event; aborting turn",
                         );
-                        error_message =
-                            Some(format!("encode tool_use: {e}"));
+                        error_message = Some(format!("encode tool_use: {e}"));
                         break;
                     }
                 }
@@ -2619,7 +2612,6 @@ async fn handle_cold_contact(
         .into_response()
 }
 
-
 /// Result of a routine-triggered turn dispatch.
 #[derive(Debug, Clone)]
 pub struct RoutineDispatchOutcome {
@@ -2861,7 +2853,6 @@ pub async fn dispatch_routine_turn(
     }
     mapped
 }
-
 
 /// Phase 4 — cold-contact handler scoped to a non-HTTP caller (the
 /// Signal inbound consumer). Mirrors the existing `handle_cold_contact`
@@ -3812,7 +3803,6 @@ pub async fn dispatch_clarification_turn(
     mapped
 }
 
-
 /// `POST /api/chats/:id/stop` — flip the in-flight turn's cancel
 /// flag. The streaming chat handler observes the flag between SSE
 /// chunks and exits early; whatever has been generated so far is
@@ -4480,7 +4470,6 @@ pub async fn generate_title(
         .into_response()
 }
 
-
 /// `DELETE /api/chats/:id` — hard-delete a conversation. Wipes the
 /// event log + the conversation row in one transaction. Idempotent:
 /// removing a non-existent thread returns 200 with `existed=false`.
@@ -4543,7 +4532,6 @@ pub async fn delete_thread(
     )
         .into_response()
 }
-
 
 // Attachment helpers (persist_inline_attachments, write_attachment_blob,
 // persist_inbound_attachments, encode_attachments_as_data_urls,
@@ -6475,8 +6463,7 @@ required_capabilities = []
             "planner/executor split MUST strip all tools (§9.2 invariant)"
         );
         assert!(
-            with_split_on.builtin_names.is_empty()
-                && with_split_on.plugin_tool_names.is_empty(),
+            with_split_on.builtin_names.is_empty() && with_split_on.plugin_tool_names.is_empty(),
             "name lists must also be empty when the split fires (otherwise routing prose leaks tool names)"
         );
     }
@@ -6487,9 +6474,7 @@ required_capabilities = []
     /// dispatch. Mirrors `ChainedToolDispatch::check_access`.
     #[test]
     fn build_runner_tool_catalog_filters_by_tool_access_row() {
-        use execlaw_core::tool_access::{
-            ToolAccessSeed, ToolAccessStore, ToolSource,
-        };
+        use execlaw_core::tool_access::{ToolAccessSeed, ToolAccessStore, ToolSource};
 
         let state = test_app_state();
         let manifest = execlaw_plugin_sdk::PluginManifest::parse(
@@ -6552,7 +6537,11 @@ required_capabilities = []
             "missing-row tool must be allow-by-default"
         );
         // Routing-prose names track declarations.
-        assert!(!limited.plugin_tool_names.contains(&"controller_only_tool".to_owned()));
+        assert!(
+            !limited
+                .plugin_tool_names
+                .contains(&"controller_only_tool".to_owned())
+        );
         assert!(limited.plugin_tool_names.contains(&"open_tool".to_owned()));
 
         // Controller caller: both tools appear.
@@ -6655,7 +6644,11 @@ required_capabilities = []
             "built-in with no capability requirements must survive"
         );
         // Routing-prose builtin_names tracks the filtered declarations.
-        assert!(!limited.builtin_names.contains(&"memory_write_test".to_owned()));
+        assert!(
+            !limited
+                .builtin_names
+                .contains(&"memory_write_test".to_owned())
+        );
         assert!(limited.builtin_names.contains(&"no_caps_test".to_owned()));
 
         // Controller wildcard — both visible.

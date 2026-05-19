@@ -126,10 +126,8 @@ mod tests {
         let db = fresh_db();
         seed(&db, "webhook:ring", 15);
         // Long interval — the test relies on `kick` to trigger.
-        let sweeper = AutomationSuggestionsSweeper::with_interval(
-            db.clone(),
-            Duration::from_secs(60 * 60),
-        );
+        let sweeper =
+            AutomationSuggestionsSweeper::with_interval(db.clone(), Duration::from_secs(60 * 60));
         let stop = Arc::new(Notify::new());
         let stop_clone = stop.clone();
         let sweeper_clone = sweeper.clone();
@@ -149,10 +147,8 @@ mod tests {
     async fn stop_drains_a_final_sweep() {
         let db = fresh_db();
         seed(&db, "webhook:final", 15);
-        let sweeper = AutomationSuggestionsSweeper::with_interval(
-            db.clone(),
-            Duration::from_secs(60 * 60),
-        );
+        let sweeper =
+            AutomationSuggestionsSweeper::with_interval(db.clone(), Duration::from_secs(60 * 60));
         let stop = Arc::new(Notify::new());
         let stop_clone = stop.clone();
         let sweeper_clone = sweeper.clone();

@@ -92,7 +92,6 @@ pub(crate) fn is_image_mime(mime: &str) -> bool {
     )
 }
 
-
 /// 2026-05-16 — in-memory representation of an inline attachment
 /// after parse/validate but BEFORE any blob or `state_attachments`
 /// row is written. The two-phase split lets `send_message` drop
@@ -745,10 +744,7 @@ pub(crate) fn encode_attachments_as_data_urls(
 /// whole conversation. On turn N+1 ("make a chart from that csv")
 /// the file is still accessible in `/work/uploads/`, so the agent
 /// needs to keep being reminded it exists.
-pub(crate) fn build_attached_files_block(
-    state: &AppState,
-    cid: &ConversationId,
-) -> Option<String> {
+pub(crate) fn build_attached_files_block(state: &AppState, cid: &ConversationId) -> Option<String> {
     use execlaw_core::attachments::AttachmentStore;
 
     let rows = match AttachmentStore::new(&state.db).list_for_conversation(cid) {
@@ -791,8 +787,10 @@ pub(crate) fn format_attached_files_block(
     python_available: bool,
     cid_for_log: Option<&str>,
 ) -> Option<String> {
-    let non_image: Vec<&execlaw_core::attachments::AttachmentRow> =
-        rows.iter().filter(|r| !is_image_mime(&r.mime_type)).collect();
+    let non_image: Vec<&execlaw_core::attachments::AttachmentRow> = rows
+        .iter()
+        .filter(|r| !is_image_mime(&r.mime_type))
+        .collect();
     if non_image.is_empty() {
         return None;
     }
@@ -813,10 +811,7 @@ pub(crate) fn format_attached_files_block(
     for r in &non_image {
         let display_name = match r.filename.as_deref() {
             Some(name) if !name.is_empty() => name.to_owned(),
-            _ => crate::python_sandbox::service::derive_default_filename(
-                &r.mime_type,
-                &r.sha256,
-            ),
+            _ => crate::python_sandbox::service::derive_default_filename(&r.mime_type, &r.sha256),
         };
         latest_by_name.insert(display_name, *r);
     }
@@ -919,9 +914,7 @@ pub(crate) fn hydrate_message_attachments(
                         &row.sha256,
                     ))
                 });
-                let size_bytes = std::fs::metadata(&row.path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let size_bytes = std::fs::metadata(&row.path).map(|m| m.len()).unwrap_or(0);
                 out.push(MessageAttachmentView {
                     id: id.clone(),
                     mime: row.mime_type,
@@ -1117,8 +1110,7 @@ pub(crate) fn fetch_data_ref(
             ));
         }
     }
-    let bytes =
-        std::fs::read(&row.path).map_err(|e| format!("data_ref read {}: {e}", row.path))?;
+    let bytes = std::fs::read(&row.path).map_err(|e| format!("data_ref read {}: {e}", row.path))?;
     serde_json::from_slice(&bytes).map_err(|e| format!("data_ref decode: {e}"))
 }
 
@@ -1162,7 +1154,10 @@ mod tests {
             });
             assert_eq!(out.len(), 1, "mime {mime}");
             assert_eq!(out[0].mime, mime, "mime preserved");
-            assert!(out[0].filename.is_none(), "image mime {mime} doesn't require filename");
+            assert!(
+                out[0].filename.is_none(),
+                "image mime {mime} doesn't require filename"
+            );
         }
     }
 
@@ -1193,16 +1188,15 @@ mod tests {
     #[test]
     fn rejects_executable_mimes() {
         for mime in [
-            "application/x-msdownload",   // .exe
-            "application/x-sh",           // .sh
-            "application/javascript",     // .js
-            "application/x-python-code",  // .pyc
+            "application/x-msdownload",  // .exe
+            "application/x-sh",          // .sh
+            "application/javascript",    // .js
+            "application/x-python-code", // .pyc
             "application/x-executable",
         ] {
             let r = req(mime, b"...", Some("payload"));
-            let err = decode_inline_attachments(&[r]).expect_err(&format!(
-                "executable mime {mime} should have been rejected"
-            ));
+            let err = decode_inline_attachments(&[r])
+                .expect_err(&format!("executable mime {mime} should have been rejected"));
             assert_eq!(err.code, "attachment_mime_unsupported");
         }
     }
@@ -1301,10 +1295,8 @@ mod tests {
     fn routing_prose_omits_python_when_python_tools_absent() {
         // Other plugins shouldn't see the python guidance — it'd
         // mislead the model into looking for tools it doesn't have.
-        let routing = crate::chats::build_tool_routing_prose(
-            &[],
-            &["signal.send_message".to_owned()],
-        );
+        let routing =
+            crate::chats::build_tool_routing_prose(&[], &["signal.send_message".to_owned()]);
         assert!(
             !routing.contains("python.execute"),
             "routing prose must NOT mention python.execute when python.* tools are absent:\n\n{routing}",
@@ -1366,8 +1358,8 @@ mod tests {
             row(Some("data.csv"), "text/csv", "shacsv"),
             row(Some("notes.md"), "text/markdown", "shamd"),
         ];
-        let block = format_attached_files_block(&rows, true, None)
-            .expect("block should be present");
+        let block =
+            format_attached_files_block(&rows, true, None).expect("block should be present");
         assert!(block.contains("data.csv"));
         assert!(block.contains("notes.md"));
         assert!(
@@ -1535,8 +1527,7 @@ mod tests {
 
     #[test]
     fn unique_filename_appends_paren_one_on_first_collision() {
-        let used: std::collections::HashSet<String> =
-            ["data.csv".to_owned()].into_iter().collect();
+        let used: std::collections::HashSet<String> = ["data.csv".to_owned()].into_iter().collect();
         assert_eq!(unique_filename("data.csv", &used), "data (1).csv");
     }
 
@@ -1567,8 +1558,7 @@ mod tests {
     fn unique_filename_handles_no_extension() {
         // Files without a clear extension — counter goes at the
         // very end.
-        let used: std::collections::HashSet<String> =
-            ["notes".to_owned()].into_iter().collect();
+        let used: std::collections::HashSet<String> = ["notes".to_owned()].into_iter().collect();
         assert_eq!(unique_filename("notes", &used), "notes (1)");
     }
 
@@ -1577,8 +1567,7 @@ mod tests {
         // If the "extension" is itself >16 bytes, treat as opaque
         // and counter at the end. Mirrors sanitize_filename's rule.
         let base = "weird.thisisaverylongextension";
-        let used: std::collections::HashSet<String> =
-            [base.to_owned()].into_iter().collect();
+        let used: std::collections::HashSet<String> = [base.to_owned()].into_iter().collect();
         let result = unique_filename(base, &used);
         // Counter went at the end, not before the long suffix.
         assert_eq!(result, format!("{base} (1)"));
@@ -1808,15 +1797,16 @@ mod tests {
         // download with a meaningless name.
         let db = open_test_db();
         let cid = CoreConvoId::new();
-        let (id, _keep) =
-            insert_row_with_bytes(&db, &cid, "text/csv", b"a\n", None);
+        let (id, _keep) = insert_row_with_bytes(&db, &cid, "text/csv", b"a\n", None);
         let views = hydrate_message_attachments(&db, &cid, &[id]);
         assert_eq!(views.len(), 1);
-        assert!(views[0]
-            .filename
-            .as_deref()
-            .map(|f| f.starts_with("attachment-") && f.ends_with(".csv"))
-            .unwrap_or(false));
+        assert!(
+            views[0]
+                .filename
+                .as_deref()
+                .map(|f| f.starts_with("attachment-") && f.ends_with(".csv"))
+                .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -1837,8 +1827,7 @@ mod tests {
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             "application/vnd.ms-excel",
         ] {
-            let derived =
-                crate::python_sandbox::service::derive_default_filename(mime, &sha);
+            let derived = crate::python_sandbox::service::derive_default_filename(mime, &sha);
             // Build a row with NULL filename + this mime; block
             // must reference exactly `derived`.
             let rows = [row(None, mime, &sha)];

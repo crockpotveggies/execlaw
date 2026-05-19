@@ -142,8 +142,8 @@ pub fn hydrate_uploads(
         if !is_safe_filename(&a.filename) {
             return Err(HydrationError::UnsafeFilename(a.filename.clone()));
         }
-        let blob_meta = fs::metadata(&a.blob_path)
-            .map_err(|e| HydrationError::io(&a.blob_path, e))?;
+        let blob_meta =
+            fs::metadata(&a.blob_path).map_err(|e| HydrationError::io(&a.blob_path, e))?;
         if !blob_meta.is_file() {
             return Err(HydrationError::BlobNotFile(a.blob_path.clone()));
         }
@@ -258,7 +258,9 @@ mod tests {
 
     /// Lay out a fake blob store + work root in a tempdir and return
     /// (work_root, blob_paths_by_name).
-    fn temp_setup(blobs: &[(&str, &[u8])]) -> (tempfile::TempDir, PathBuf, Vec<AttachmentToHydrate>) {
+    fn temp_setup(
+        blobs: &[(&str, &[u8])],
+    ) -> (tempfile::TempDir, PathBuf, Vec<AttachmentToHydrate>) {
         let dir = tempfile::tempdir().unwrap();
         let blob_root = dir.path().join("blobs");
         let work_root = dir.path().join("work");
@@ -287,8 +289,8 @@ mod tests {
             ("notes.txt", b"hello world\n"),
         ]);
         let c = convo("convo-1");
-        let out = hydrate_uploads(&work_root, &c, &attachments, HydrateOpts::default())
-            .expect("hydrate");
+        let out =
+            hydrate_uploads(&work_root, &c, &attachments, HydrateOpts::default()).expect("hydrate");
         assert_eq!(out.len(), 2);
 
         let csv_path = uploads_dir(&work_root, &c).join("sales.csv");
@@ -386,14 +388,24 @@ mod tests {
         let rogue = uploads_dir(&work_root, &c).join("rogue.csv");
         fs::write(&rogue, b"r").unwrap();
         hydrate_uploads(&work_root, &c, &attachments, HydrateOpts::default()).unwrap();
-        assert!(rogue.exists(), "rogue must survive when cleanup_orphans=false");
+        assert!(
+            rogue.exists(),
+            "rogue must survive when cleanup_orphans=false"
+        );
     }
 
     #[test]
     fn rejects_path_traversal_filenames() {
         let (_g, work_root, mut attachments) = temp_setup(&[("dummy.csv", b"x")]);
         let c = convo("trav");
-        for evil in ["../etc/passwd", "..\\windows\\system32", "../a", "a/b", "a\\b", ""] {
+        for evil in [
+            "../etc/passwd",
+            "..\\windows\\system32",
+            "../a",
+            "a/b",
+            "a\\b",
+            "",
+        ] {
             attachments[0].filename = evil.into();
             let err = hydrate_uploads(&work_root, &c, &attachments, HydrateOpts::default())
                 .expect_err(&format!("must reject {evil:?}"));
@@ -421,7 +433,13 @@ mod tests {
     #[test]
     fn per_convo_dirs_are_isolated() {
         let (dir, work_root, attachments) = temp_setup(&[("file.csv", b"a")]);
-        hydrate_uploads(&work_root, &convo("convo-a"), &attachments, HydrateOpts::default()).unwrap();
+        hydrate_uploads(
+            &work_root,
+            &convo("convo-a"),
+            &attachments,
+            HydrateOpts::default(),
+        )
+        .unwrap();
 
         // Different convo, different file.
         let other_blob = dir.path().join("blobs").join("blob-other");
@@ -430,13 +448,35 @@ mod tests {
             blob_path: other_blob,
             filename: "other.csv".into(),
         }];
-        hydrate_uploads(&work_root, &convo("convo-b"), &other_attachments, HydrateOpts::default()).unwrap();
+        hydrate_uploads(
+            &work_root,
+            &convo("convo-b"),
+            &other_attachments,
+            HydrateOpts::default(),
+        )
+        .unwrap();
 
-        assert!(uploads_dir(&work_root, &convo("convo-a")).join("file.csv").exists());
-        assert!(uploads_dir(&work_root, &convo("convo-b")).join("other.csv").exists());
+        assert!(
+            uploads_dir(&work_root, &convo("convo-a"))
+                .join("file.csv")
+                .exists()
+        );
+        assert!(
+            uploads_dir(&work_root, &convo("convo-b"))
+                .join("other.csv")
+                .exists()
+        );
         // Cross-isolation: A's file must not appear in B's dir.
-        assert!(!uploads_dir(&work_root, &convo("convo-b")).join("file.csv").exists());
-        assert!(!uploads_dir(&work_root, &convo("convo-a")).join("other.csv").exists());
+        assert!(
+            !uploads_dir(&work_root, &convo("convo-b"))
+                .join("file.csv")
+                .exists()
+        );
+        assert!(
+            !uploads_dir(&work_root, &convo("convo-a"))
+                .join("other.csv")
+                .exists()
+        );
     }
 
     #[test]

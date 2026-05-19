@@ -931,10 +931,7 @@ pub fn test_app_state() -> AppState {
         // unique tempdir-style path so the endpoints can still
         // resolve `<data_dir>/bundled-plugins/...` deterministically
         // without writing into a real user dir.
-        data_dir: std::env::temp_dir().join(format!(
-            "execlaw-test-data-{}",
-            uuid::Uuid::new_v4()
-        )),
+        data_dir: std::env::temp_dir().join(format!("execlaw-test-data-{}", uuid::Uuid::new_v4())),
         // M1 of Automations — stub bus that writes durably but doesn't
         // dispatch. Tests exercising end-to-end dispatch should use
         // `AutomationBus::spawn` inside a `#[tokio::test]` (the

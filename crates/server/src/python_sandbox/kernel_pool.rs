@@ -76,10 +76,7 @@ impl KernelPool {
     /// Get the conversation's kernel id, spawning one if needed.
     /// Bumps `last_used` so an active conversation never gets
     /// evicted underneath itself.
-    pub async fn ensure_for(
-        &self,
-        convo: &ConversationId,
-    ) -> Result<KernelId, GatewayError> {
+    pub async fn ensure_for(&self, convo: &ConversationId) -> Result<KernelId, GatewayError> {
         // Fast path: cached.
         {
             let mut state = self.inner.state.lock().await;

@@ -209,11 +209,7 @@ pub struct ExecuteReplyContent {
 /// Session id is also per-call (we don't multiplex multiple requests
 /// over a single session because we open one WS per execute, not a
 /// long-lived shared connection).
-pub fn build_execute_request(
-    msg_id: &str,
-    session: &str,
-    code: &str,
-) -> JupyterEnvelope {
+pub fn build_execute_request(msg_id: &str, session: &str, code: &str) -> JupyterEnvelope {
     JupyterEnvelope {
         header: JupyterHeader {
             msg_id: msg_id.to_string(),
@@ -223,8 +219,7 @@ pub fn build_execute_request(
             version: "5.3".to_string(),
             // Jupyter spec allows either `+00:00` or `Z` suffix; we
             // emit `Z` to match what the kernel itself sends.
-            date: chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            date: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
         },
         parent_header: None,
         metadata: serde_json::json!({}),

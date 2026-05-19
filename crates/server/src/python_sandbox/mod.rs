@@ -49,24 +49,26 @@ mod bench_phase3;
 mod bench_phase4;
 
 pub use client::{
-    GatewayClient, GatewayError, KernelId, KernelInfo, DEFAULT_EXECUTE_TIMEOUT, MAX_OUTPUT_BYTES,
+    DEFAULT_EXECUTE_TIMEOUT, GatewayClient, GatewayError, KernelId, KernelInfo, MAX_OUTPUT_BYTES,
 };
 pub use hydration::{
-    hydrate_uploads, uploads_dir, AttachmentToHydrate, HydratedFile, HydrateOpts, HydrationError,
+    AttachmentToHydrate, HydrateOpts, HydratedFile, HydrationError, hydrate_uploads, uploads_dir,
 };
-pub use output_watcher::{OutputCreated, OutputWatcher, WatchError, DEFAULT_DEBOUNCE};
-pub use service::{PythonSandboxService, PythonSandboxSettings, ServiceError, PLUGIN_ID};
-pub use tools::{
-    python_sandbox_tools, PythonExecuteTool, PythonInterruptTool, PythonListFilesTool,
-    PythonResetTool,
+pub use jupyter_protocol::{
+    ExecutionState, JupyterEnvelope, JupyterHeader, KernelChannel, MsgType,
 };
-pub use wiring::{wire_python_sandbox, WireError};
-pub use jupyter_protocol::{ExecutionState, JupyterEnvelope, JupyterHeader, KernelChannel, MsgType};
-pub use kernel_pool::{KernelPool, DEFAULT_IDLE_TIMEOUT};
+pub use kernel_pool::{DEFAULT_IDLE_TIMEOUT, KernelPool};
 pub use mime::{
-    mime_bundle_from_jupyter_data, ExecuteOutput, ExecuteResult, ExecuteStatus, MimeBundle,
-    StreamName,
+    ExecuteOutput, ExecuteResult, ExecuteStatus, MimeBundle, StreamName,
+    mime_bundle_from_jupyter_data,
 };
+pub use output_watcher::{DEFAULT_DEBOUNCE, OutputCreated, OutputWatcher, WatchError};
+pub use service::{PLUGIN_ID, PythonSandboxService, PythonSandboxSettings, ServiceError};
+pub use tools::{
+    PythonExecuteTool, PythonInterruptTool, PythonListFilesTool, PythonResetTool,
+    python_sandbox_tools,
+};
+pub use wiring::{WireError, wire_python_sandbox};
 
 // ----------------------------------------------------------------
 // Process-wide service handle. 2026-05-18.

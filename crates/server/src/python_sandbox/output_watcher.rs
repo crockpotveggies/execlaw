@@ -104,11 +104,7 @@ impl OutputWatcher {
     /// for each file under `<work_root>/<convo>/outputs/` once it
     /// has been quiescent for `debounce`. Callback MUST be cheap;
     /// for async work spawn a tokio task inside it.
-    pub fn start<F>(
-        work_root: PathBuf,
-        debounce: Duration,
-        callback: F,
-    ) -> Result<Self, WatchError>
+    pub fn start<F>(work_root: PathBuf, debounce: Duration, callback: F) -> Result<Self, WatchError>
     where
         F: Fn(OutputCreated) + Send + Sync + 'static,
     {
@@ -120,9 +116,7 @@ impl OutputWatcher {
                 work_root.display()
             )))
         })?;
-        let work_root = work_root
-            .canonicalize()
-            .unwrap_or(work_root.clone());
+        let work_root = work_root.canonicalize().unwrap_or(work_root.clone());
 
         let pending: Arc<Mutex<HashMap<PathBuf, PendingEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -243,8 +237,7 @@ impl OutputWatcher {
                         }
                         // Size stable for the full debounce window.
                         // Fire and remove.
-                        if let Some((convo, size)) = resolve_output(&work_root_for_timer, &path)
-                        {
+                        if let Some((convo, size)) = resolve_output(&work_root_for_timer, &path) {
                             to_fire.push((path.clone(), convo, size));
                         }
                         map.remove(&path);
@@ -333,7 +326,10 @@ mod tests {
     #[test]
     fn is_in_outputs_dir_accepts_real_layout() {
         let root = PathBuf::from("/work");
-        assert!(is_in_outputs_dir(&root, Path::new("/work/c-1/outputs/a.csv")));
+        assert!(is_in_outputs_dir(
+            &root,
+            Path::new("/work/c-1/outputs/a.csv")
+        ));
         assert!(is_in_outputs_dir(
             &root,
             Path::new("/work/c-1/outputs/sub/a.png")
@@ -344,9 +340,15 @@ mod tests {
     fn is_in_outputs_dir_rejects_other_layouts() {
         let root = PathBuf::from("/work");
         // uploads is not ours
-        assert!(!is_in_outputs_dir(&root, Path::new("/work/c-1/uploads/a.csv")));
+        assert!(!is_in_outputs_dir(
+            &root,
+            Path::new("/work/c-1/uploads/a.csv")
+        ));
         // scratch at convo root
-        assert!(!is_in_outputs_dir(&root, Path::new("/work/c-1/scratch.txt")));
+        assert!(!is_in_outputs_dir(
+            &root,
+            Path::new("/work/c-1/scratch.txt")
+        ));
         // outside any convo
         assert!(!is_in_outputs_dir(&root, Path::new("/work/loose.txt")));
         // outside work_root entirely
@@ -361,10 +363,7 @@ mod tests {
     /// `std::thread::sleep` here would starve the timer and the
     /// callback would never fire — verified the hard way the first
     /// time this test was written.
-    async fn await_until_async<F: FnMut() -> bool>(
-        mut predicate: F,
-        timeout: Duration,
-    ) -> bool {
+    async fn await_until_async<F: FnMut() -> bool>(mut predicate: F, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if predicate() {

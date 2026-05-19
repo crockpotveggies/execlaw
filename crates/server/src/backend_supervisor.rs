@@ -1133,9 +1133,7 @@ impl BackendSupervisor {
                                                 &self.db,
                                                 row.purpose,
                                                 "(native Ollama)",
-                                                &format!(
-                                                    "Ollama pull of {model_id} failed: {err}"
-                                                ),
+                                                &format!("Ollama pull of {model_id} failed: {err}"),
                                             );
                                             continue;
                                         }
@@ -1165,9 +1163,7 @@ impl BackendSupervisor {
                                                 model = %model_id,
                                                 "Ollama model not in cache; starting /api/pull"
                                             );
-                                            let task = spawn_ollama_pull_task(
-                                                host_port, &model_id,
-                                            );
+                                            let task = spawn_ollama_pull_task(host_port, &model_id);
                                             slot.download_task = Some(task);
                                             slot.stage = LifecycleStage::DownloadingModel;
                                             slot.status = ServiceStatus::Pulling;
@@ -1487,10 +1483,8 @@ fn spawn_ollama_pull_task(host_port: u16, model_id: &str) -> DownloadTaskState {
     let failure_clone = failure.clone();
     let progress_clone = progress.clone();
     tokio::spawn(async move {
-        let result = crate::ollama_puller::pull_model(
-            host_port,
-            &model_id_owned,
-            |completed, total| {
+        let result =
+            crate::ollama_puller::pull_model(host_port, &model_id_owned, |completed, total| {
                 // try_lock so a contended progress mirror doesn't
                 // back-pressure the streaming HTTP body parser.
                 // Missing an update is fine — the supervisor reads
@@ -1503,9 +1497,8 @@ fn spawn_ollama_pull_task(host_port: u16, model_id: &str) -> DownloadTaskState {
                         file_count: 1,
                     });
                 }
-            },
-        )
-        .await;
+            })
+            .await;
         if let Err(e) = result {
             *failure_clone.lock().await = Some(e.to_string());
         }

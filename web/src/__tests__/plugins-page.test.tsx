@@ -150,6 +150,15 @@ describe("PluginsPage", () => {
             return new Response("{}", { status: 200 });
         });
         mountPage();
+        // The redesigned install card hides the file picker behind a
+        // "From file…" toggle (commit 62c1b8d). Click the toggle
+        // first, then assert the form contents appear.
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("plugin-install-toggle-file"),
+            ).toBeInTheDocument();
+        });
+        fireEvent.click(screen.getByTestId("plugin-install-toggle-file"));
         await waitFor(() => {
             expect(
                 screen.getByTestId("plugin-install-file"),

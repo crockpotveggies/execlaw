@@ -115,11 +115,7 @@ impl ExecuteOutput {
                 ename,
                 evalue,
                 traceback,
-            } => {
-                ename.len()
-                    + evalue.len()
-                    + traceback.iter().map(String::len).sum::<usize>()
-            }
+            } => ename.len() + evalue.len() + traceback.iter().map(String::len).sum::<usize>(),
         }
     }
 }
@@ -349,8 +345,8 @@ mod tests {
     #[test]
     fn approx_bytes_counts_error_fields() {
         let o = ExecuteOutput::Error {
-            ename: "ValueError".into(),     // 10
-            evalue: "bad input".into(),     // 9
+            ename: "ValueError".into(),               // 10
+            evalue: "bad input".into(),               // 9
             traceback: vec!["a".into(), "bc".into()], // 1 + 2
         };
         assert_eq!(o.approx_bytes(), 10 + 9 + 1 + 2);
@@ -363,10 +359,7 @@ mod tests {
         // re-execute produces byte-identical tool_results.
         let mut data = serde_json::Map::new();
         data.insert("text/plain".into(), json!("   a  b\n0  1  3"));
-        data.insert(
-            "text/html".into(),
-            json!("<table>...</table>"),
-        );
+        data.insert("text/html".into(), json!("<table>...</table>"));
         let bundle = mime_bundle_from_jupyter_data(&data);
         assert_eq!(bundle.len(), 2);
         assert_eq!(bundle[0].mime_type, "text/html");

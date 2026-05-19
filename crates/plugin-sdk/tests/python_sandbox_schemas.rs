@@ -24,8 +24,7 @@ fn every_python_sandbox_tool_schema_exists_and_parses() {
     let plugin_root = workspace.join("plugins/python-sandbox");
     let manifest_src = std::fs::read_to_string(plugin_root.join("plugin.toml"))
         .expect("plugin.toml must be readable");
-    let manifest: PluginManifest =
-        toml::from_str(&manifest_src).expect("plugin.toml must parse");
+    let manifest: PluginManifest = toml::from_str(&manifest_src).expect("plugin.toml must parse");
 
     // Every tool declares a schema path; each one must exist + parse.
     for tool in &manifest.tools {
@@ -58,7 +57,8 @@ fn every_python_sandbox_tool_schema_exists_and_parses() {
                 )
             });
         assert_eq!(
-            draft, "https://json-schema.org/draft/2020-12/schema",
+            draft,
+            "https://json-schema.org/draft/2020-12/schema",
             "schema {} targets draft {}; execlaw standardizes on draft/2020-12",
             path.display(),
             draft

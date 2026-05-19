@@ -361,10 +361,7 @@ pub async fn list_handler(State(state): State<AppState>) -> impl IntoResponse {
                     // whole list. The operator will still see the
                     // row; the Docker-required warning just won't
                     // fire for this single broken plugin.
-                    let has_sidecars = parsed
-                        .as_ref()
-                        .map(manifest_has_sidecars)
-                        .unwrap_or(false);
+                    let has_sidecars = parsed.as_ref().map(manifest_has_sidecars).unwrap_or(false);
                     let description = parsed
                         .as_ref()
                         .and_then(|m| m.plugin.description.clone())
@@ -611,7 +608,10 @@ pub fn plugins_router() -> Router<AppState> {
 // ---------------------------------------------------------------------------
 
 /// Recursive directory copy for the cross-device-rename fallback.
-pub(crate) fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn copy_dir_recursive(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;

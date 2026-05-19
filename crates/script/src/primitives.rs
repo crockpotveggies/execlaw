@@ -1937,9 +1937,7 @@ fn register_host_create_data_ref(engine: &mut Engine, plugin_id: &str, host_caps
     let pid = plugin_id.to_owned();
     engine.register_fn(
         "host_create_data_ref",
-        move |json_str: ImmutableString,
-              ttl_seconds: i64|
-              -> Result<Dynamic, Box<EvalAltResult>> {
+        move |json_str: ImmutableString, ttl_seconds: i64| -> Result<Dynamic, Box<EvalAltResult>> {
             let caps = match host_caps.get() {
                 Some(c) => c.clone(),
                 None => return Err(host_cap_unavailable_err(&pid, "host_create_data_ref")),
@@ -1964,10 +1962,7 @@ fn register_host_create_data_ref(engine: &mut Engine, plugin_id: &str, host_caps
             // store so whitespace and key order survive verbatim).
             if let Err(e) = serde_json::from_str::<serde_json::Value>(payload) {
                 return Err(Box::new(EvalAltResult::ErrorRuntime(
-                    format!(
-                        "[{pid}] host_create_data_ref: payload is not valid JSON: {e}"
-                    )
-                    .into(),
+                    format!("[{pid}] host_create_data_ref: payload is not valid JSON: {e}").into(),
                     rhai::Position::NONE,
                 )));
             }

@@ -20,7 +20,7 @@ use execlaw_core::tool::{
     Capability, ToolCtx, ToolDescriptor, ToolImpl, ToolLatency, ToolOutcome, ToolSource,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -325,7 +325,10 @@ fn list_dir(dir: &std::path::Path) -> Vec<Value> {
         // The MIME placeholder above is wrong — fixing inline:
         if let Some(last) = out.last_mut() {
             if let Some(obj) = last.as_object_mut() {
-                obj.insert("mime".to_string(), Value::String(guess_mime_for_listing(&name)));
+                obj.insert(
+                    "mime".to_string(),
+                    Value::String(guess_mime_for_listing(&name)),
+                );
             }
         }
     }
@@ -362,9 +365,7 @@ fn guess_mime_for_listing(name: &str) -> String {
 /// expects. Each tool holds an `Arc<PythonSandboxService>` so calls
 /// from different concurrent turns share the same kernel pool +
 /// output watcher.
-pub fn python_sandbox_tools(
-    service: Arc<PythonSandboxService>,
-) -> Vec<Arc<dyn ToolImpl>> {
+pub fn python_sandbox_tools(service: Arc<PythonSandboxService>) -> Vec<Arc<dyn ToolImpl>> {
     vec![
         Arc::new(PythonExecuteTool::new(service.clone())),
         Arc::new(PythonResetTool::new(service.clone())),
@@ -520,14 +521,9 @@ mod tests {
         std::fs::create_dir_all(&work).unwrap();
         std::fs::create_dir_all(&artifacts).unwrap();
 
-        let svc = PythonSandboxService::new(
-            url,
-            work,
-            artifacts,
-            db,
-            crate::events::EventBus::new(),
-        )
-        .unwrap();
+        let svc =
+            PythonSandboxService::new(url, work, artifacts, db, crate::events::EventBus::new())
+                .unwrap();
         let tools = python_sandbox_tools(svc.clone());
         let exec = tools
             .iter()

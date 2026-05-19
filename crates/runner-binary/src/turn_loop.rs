@@ -670,9 +670,11 @@ pub async fn run_turn(
             // the tool side; tool defensive parsers (e.g.
             // chart.render's `defensive_unstringify_spec_fields`)
             // that recover from almost-valid input never trip this.
-            if let Some(note) =
-                build_malformed_args_retry_note(&assistant_calls, &malformed_this_round, &errored_this_round)
-            {
+            if let Some(note) = build_malformed_args_retry_note(
+                &assistant_calls,
+                &malformed_this_round,
+                &errored_this_round,
+            ) {
                 tracing::info!(
                     target: "runner::turn_loop",
                     turn_id = %req.turn_id,
@@ -944,7 +946,13 @@ pub(crate) fn emit_failure_snapshot(s: FailureSnapshot<'_>) {
             let safe_id: String = s
                 .turn_id
                 .chars()
-                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
                 .collect();
             let path = format!("{dir}/{safe_id}.json");
             // Full text in the disk archive (the log preview is

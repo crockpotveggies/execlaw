@@ -18,7 +18,7 @@
 
 use crate::events::EventBus;
 use crate::python_sandbox::service::{
-    PythonSandboxService, PythonSandboxSettings, ServiceError, PLUGIN_ID,
+    PLUGIN_ID, PythonSandboxService, PythonSandboxSettings, ServiceError,
 };
 use crate::python_sandbox::tools::python_sandbox_tools;
 use crate::sidecar_supervisor::SidecarSupervisor;
@@ -82,8 +82,7 @@ pub async fn wire_python_sandbox(
 
     // Per-(plugin, sidecar) state root — matches the supervisor's
     // bind-mount source for `state://work`.
-    let sidecar_state =
-        crate::sidecar_supervisor::plugin_state_root(PLUGIN_ID).join(SIDECAR_NAME);
+    let sidecar_state = crate::sidecar_supervisor::plugin_state_root(PLUGIN_ID).join(SIDECAR_NAME);
     let work_root = sidecar_state.join("work");
     // Artifacts root: shared with the rest of execlaw, env-overridable.
     let artifacts_root = crate::host_caps_impl::builtin_artifacts_root_path();

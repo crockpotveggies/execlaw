@@ -328,7 +328,6 @@ pub(crate) fn err_500(msg: &str) -> axum::response::Response {
         .into_response()
 }
 
-
 /// Resolve operator-picked skill names to a single prepended block
 /// that gets prefixed onto the user text before the model sees it.
 /// Returns the prepended block (empty `String` when no skills were

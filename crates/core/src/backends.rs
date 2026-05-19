@@ -414,7 +414,10 @@ mod tests {
     #[test]
     fn purpose_all_lists_every_enum_value() {
         let names: Vec<_> = BackendPurpose::all().iter().map(|p| p.as_str()).collect();
-        assert_eq!(names, vec!["Standard", "Small", "VoiceSTT", "VoiceTTS"]);
+        assert_eq!(
+            names,
+            vec!["Standard", "Small", "VoiceSTT", "VoiceTTS", "Vision"]
+        );
     }
 
     #[test]

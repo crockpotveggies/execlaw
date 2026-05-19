@@ -35,11 +35,7 @@ fn dist_python_sandbox_zip_stages_cleanly() {
     // Four tools, all host_implemented.
     assert_eq!(staged.manifest.tools.len(), 4);
     assert!(
-        staged
-            .manifest
-            .tools
-            .iter()
-            .all(|t| t.host_implemented),
+        staged.manifest.tools.iter().all(|t| t.host_implemented),
         "every python-sandbox tool must be host_implemented = true \
          (dispatch happens in Rust, not in main.rhai)"
     );
@@ -73,7 +69,10 @@ fn dist_python_sandbox_zip_stages_cleanly() {
         .iter()
         .find(|s| s.name == "kernel-gateway")
         .expect("[[services]] kernel-gateway missing");
-    let sidecar = kg.sidecar.as_ref().expect("kernel-gateway must declare [services.sidecar]");
+    let sidecar = kg
+        .sidecar
+        .as_ref()
+        .expect("kernel-gateway must declare [services.sidecar]");
     assert_eq!(sidecar.rpc_port, 8888);
     assert_eq!(sidecar.rpc_health_path, "/api/kernels");
 

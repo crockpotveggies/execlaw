@@ -528,8 +528,10 @@ mod tests {
             Capability::McpAdmin,
             Capability::SubagentSpawn,
         ] {
-            assert!(check_builtin_capability(c, &caps).is_ok(),
-                "Controller wildcard must satisfy any built-in capability ({c:?})");
+            assert!(
+                check_builtin_capability(c, &caps).is_ok(),
+                "Controller wildcard must satisfy any built-in capability ({c:?})"
+            );
         }
     }
 

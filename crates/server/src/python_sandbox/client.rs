@@ -22,8 +22,7 @@ use crate::python_sandbox::jupyter_protocol::{
     ExecutionState, JupyterEnvelope, StatusContent, StreamContent,
 };
 use crate::python_sandbox::mime::{
-    mime_bundle_from_jupyter_data, ExecuteOutput, ExecuteResult, ExecuteStatus,
-    StreamName,
+    ExecuteOutput, ExecuteResult, ExecuteStatus, StreamName, mime_bundle_from_jupyter_data,
 };
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -224,11 +223,7 @@ impl GatewayClient {
     /// running cell actually stop." Idempotent on a not-running
     /// kernel.
     pub async fn interrupt_kernel(&self, id: &KernelId) -> Result<(), GatewayError> {
-        let url = format!(
-            "{}/api/kernels/{}/interrupt",
-            self.inner.base,
-            id.as_str()
-        );
+        let url = format!("{}/api/kernels/{}/interrupt", self.inner.base, id.as_str());
         let resp = self.inner.http.post(&url).send().await?;
         decode_empty(resp).await
     }
@@ -239,11 +234,7 @@ impl GatewayClient {
     /// delete + create, and the id stability matters because our
     /// per-conversation map is keyed on it.
     pub async fn restart_kernel(&self, id: &KernelId) -> Result<KernelInfo, GatewayError> {
-        let url = format!(
-            "{}/api/kernels/{}/restart",
-            self.inner.base,
-            id.as_str()
-        );
+        let url = format!("{}/api/kernels/{}/restart", self.inner.base, id.as_str());
         let resp = self.inner.http.post(&url).send().await?;
         decode_json(resp).await
     }
@@ -299,7 +290,8 @@ impl GatewayClient {
             max_frame_size: Some(128 * 1024 * 1024),
             ..Default::default()
         };
-        let connect_fut = tokio_tungstenite::connect_async_with_config(&ws_url, Some(ws_config), false);
+        let connect_fut =
+            tokio_tungstenite::connect_async_with_config(&ws_url, Some(ws_config), false);
         let (ws_stream, _) = match tokio::time::timeout_at(deadline, connect_fut).await {
             Err(_) => return Ok(timeout_result(Vec::new(), 0, start)),
             Ok(Err(e)) => return Err(GatewayError::Ws(e.to_string())),
@@ -532,10 +524,7 @@ fn handle_envelope(
                     // bug and shouldn't pollute outputs.
                     _ => return,
                 };
-                outputs.push(ExecuteOutput::Stream {
-                    name,
-                    text: c.text,
-                });
+                outputs.push(ExecuteOutput::Stream { name, text: c.text });
             }
         }
         "error" => {
@@ -629,7 +618,10 @@ mod tests {
     fn ws_url_transforms_https_to_wss() {
         let c = GatewayClient::new("https://gateway.example.com:9443").unwrap();
         let url = c.ws_channels_url(&KernelId("abc".into()));
-        assert_eq!(url, "wss://gateway.example.com:9443/api/kernels/abc/channels");
+        assert_eq!(
+            url,
+            "wss://gateway.example.com:9443/api/kernels/abc/channels"
+        );
     }
 
     #[test]
@@ -840,11 +832,7 @@ mod tests {
         // stream messages, so the running counter trips somewhere
         // inside the flood.
         let r = c
-            .execute(
-                &kernel,
-                "print('x' * 60_000_000)",
-                Duration::from_secs(30),
-            )
+            .execute(&kernel, "print('x' * 60_000_000)", Duration::from_secs(30))
             .await
             .expect("execute should not error");
         assert!(

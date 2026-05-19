@@ -54,7 +54,7 @@ fn bench_one(label: &str, size: usize) {
         .insert_plugin_artifact_from_path(
             &artifacts,
             "bench",
-            "data2.bin",       // different filename so we get a new row
+            "data2.bin", // different filename so we get a new row
             "application/octet-stream",
             &source,
             None,
@@ -82,10 +82,10 @@ fn bench_one(label: &str, size: usize) {
 #[ignore]
 fn phase5_streaming_throughput_vs_bytes() {
     println!();
-    bench_one("tiny",        1_000);          // 1 KB
-    bench_one("small",       100_000);        // 100 KB
-    bench_one("typical",     2_000_000);      // 2 MB CSV
-    bench_one("medium",      10_000_000);     // 10 MB
-    bench_one("large",       50_000_000);     // 50 MB (our output cap)
+    bench_one("tiny", 1_000); // 1 KB
+    bench_one("small", 100_000); // 100 KB
+    bench_one("typical", 2_000_000); // 2 MB CSV
+    bench_one("medium", 10_000_000); // 10 MB
+    bench_one("large", 50_000_000); // 50 MB (our output cap)
     // Skipping >50 MB by default — Phase 4 caps cell outputs there.
 }

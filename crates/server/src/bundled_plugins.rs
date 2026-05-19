@@ -120,10 +120,9 @@ pub fn mirror_bundled_plugins_into_data_dir(data_dir: &Path) {
         // weak fingerprint (collisions theoretically possible) but
         // good enough — a plugin upgrade ALWAYS changes ZIP bytes.
         if dest_path.exists() {
-            if let (Ok(src_meta), Ok(dest_meta)) = (
-                std::fs::metadata(&path),
-                std::fs::metadata(&dest_path),
-            ) {
+            if let (Ok(src_meta), Ok(dest_meta)) =
+                (std::fs::metadata(&path), std::fs::metadata(&dest_path))
+            {
                 if src_meta.len() == dest_meta.len() {
                     skipped += 1;
                     continue;

@@ -38,11 +38,7 @@ pub fn sweep_once(
     let cutoff = now_unix.saturating_sub(retention_secs).max(0);
     let n = BusEventStore::new(db).purge_dispatched_older_than(cutoff)?;
     if n > 0 {
-        debug!(
-            rows = n,
-            cutoff_unix = cutoff,
-            "bus event retention sweep"
-        );
+        debug!(rows = n, cutoff_unix = cutoff, "bus event retention sweep");
     }
     Ok(n)
 }

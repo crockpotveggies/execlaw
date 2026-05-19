@@ -11,7 +11,7 @@
 
 #![cfg(test)]
 
-use super::hydration::{hydrate_uploads, AttachmentToHydrate, HydrateOpts};
+use super::hydration::{AttachmentToHydrate, HydrateOpts, hydrate_uploads};
 use execlaw_core::ids::ConversationId;
 use std::fs;
 use std::path::PathBuf;
@@ -54,9 +54,9 @@ fn bench_size(label: &str, blob_size: usize, n: usize) {
 #[ignore]
 fn phase3_hydration_latency_bench() {
     println!();
-    bench_size("tiny",      1_000,          5);     // 5 small text files
-    bench_size("small_csv", 100_000,        3);     // 3x 100KB CSVs
-    bench_size("typical",   2_000_000,      3);     // 3x 2MB CSV (a "small data" scenario)
-    bench_size("large_csv", 50_000_000,     1);     // single 50MB CSV (analyst common-case ceiling)
-    bench_size("many",      10_000,        50);     // 50 small files (chat with lots of attachments)
+    bench_size("tiny", 1_000, 5); // 5 small text files
+    bench_size("small_csv", 100_000, 3); // 3x 100KB CSVs
+    bench_size("typical", 2_000_000, 3); // 3x 2MB CSV (a "small data" scenario)
+    bench_size("large_csv", 50_000_000, 1); // single 50MB CSV (analyst common-case ceiling)
+    bench_size("many", 10_000, 50); // 50 small files (chat with lots of attachments)
 }

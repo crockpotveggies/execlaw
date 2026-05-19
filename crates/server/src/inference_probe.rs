@@ -36,9 +36,7 @@ use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::post;
 use execlaw_core::backends::BackendPurpose;
-use execlaw_inference_api::{
-    ChatMessage, ChatRequest, FunctionDecl, ModelId, ToolDeclaration,
-};
+use execlaw_inference_api::{ChatMessage, ChatRequest, FunctionDecl, ModelId, ToolDeclaration};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
@@ -146,9 +144,9 @@ pub async fn inference_probe_handler(
     let client = resolved.client;
     let model_id = resolved.model_id;
 
-    let system_prompt = req.system_prompt.unwrap_or_else(|| {
-        "You are a diagnostic probe target. Respond concisely.".to_owned()
-    });
+    let system_prompt = req
+        .system_prompt
+        .unwrap_or_else(|| "You are a diagnostic probe target. Respond concisely.".to_owned());
     let user_text = req
         .user_text
         .unwrap_or_else(|| "Say hello in one short sentence.".to_owned());
@@ -276,8 +274,7 @@ pub async fn inference_probe_handler(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
-    let mut idle_interval =
-        tokio::time::interval(std::time::Duration::from_secs(idle_warn_secs));
+    let mut idle_interval = tokio::time::interval(std::time::Duration::from_secs(idle_warn_secs));
     idle_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     idle_interval.tick().await;
 
@@ -441,7 +438,10 @@ mod tests {
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
             )
-            .header(header::AUTHORIZATION, HeaderValue::from_str(&bearer).unwrap())
+            .header(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&bearer).unwrap(),
+            )
             .body(Body::from(b"{}".to_vec()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -463,7 +463,10 @@ mod tests {
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
             )
-            .header(header::AUTHORIZATION, HeaderValue::from_str(&bearer).unwrap())
+            .header(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&bearer).unwrap(),
+            )
             .body(Body::from(b"{}".to_vec()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -484,7 +487,10 @@ mod tests {
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
             )
-            .header(header::AUTHORIZATION, HeaderValue::from_str(&bearer).unwrap())
+            .header(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&bearer).unwrap(),
+            )
             .body(Body::from(b"{}".to_vec()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();

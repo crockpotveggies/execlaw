@@ -1822,23 +1822,23 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     // the same instance. Future call sites (chat / routines /
     // research) wire the same handle for cross-consumer slicing.
     let inference_metrics = execlaw_server::inference_metrics::InferenceMetrics::new();
-    let automation_agent_pool = execlaw_server::automation_agent::AutomationsAgentPool::new(
-        std::sync::Arc::new(
+    let automation_agent_pool =
+        execlaw_server::automation_agent::AutomationsAgentPool::new(std::sync::Arc::new(
             execlaw_server::automation_agent::InferenceAgentInvoker::new_with_metrics(
                 db.clone(),
                 inference.clone(),
                 inference_metrics.clone(),
             ),
-        ),
-    );
-    let (automation_bus, automation_bus_tasks) = execlaw_server::automation_bus::AutomationBus::spawn(
-        db.clone(),
-        execlaw_server::automation_runtime::build_handler(
+        ));
+    let (automation_bus, automation_bus_tasks) =
+        execlaw_server::automation_bus::AutomationBus::spawn(
             db.clone(),
-            automation_agent_pool.clone(),
-        ),
-        automation_bus_stop.clone(),
-    );
+            execlaw_server::automation_runtime::build_handler(
+                db.clone(),
+                automation_agent_pool.clone(),
+            ),
+            automation_bus_stop.clone(),
+        );
 
     let state = execlaw_server::AppState {
         db: db.clone(),

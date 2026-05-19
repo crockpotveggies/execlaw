@@ -11,9 +11,9 @@
 
 #![cfg(test)]
 
-use super::output_watcher::{OutputWatcher, DEFAULT_DEBOUNCE};
+use super::output_watcher::{DEFAULT_DEBOUNCE, OutputWatcher};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 #[tokio::test]
@@ -69,13 +69,9 @@ async fn phase4_burst_no_drops() {
     let root = dir.path().to_path_buf();
     let count = Arc::new(AtomicU32::new(0));
     let count_for_cb = count.clone();
-    let _w = OutputWatcher::start(
-        root.clone(),
-        Duration::from_millis(200),
-        move |_e| {
-            count_for_cb.fetch_add(1, Ordering::SeqCst);
-        },
-    )
+    let _w = OutputWatcher::start(root.clone(), Duration::from_millis(200), move |_e| {
+        count_for_cb.fetch_add(1, Ordering::SeqCst);
+    })
     .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -96,7 +92,10 @@ async fn phase4_burst_no_drops() {
         "\nphase 4 burst: wrote {N} files in {:?}, callback fired {fired} times",
         burst_time
     );
-    assert_eq!(fired, N, "every distinct file must produce exactly one callback");
+    assert_eq!(
+        fired, N,
+        "every distinct file must produce exactly one callback"
+    );
 }
 
 #[tokio::test]
@@ -109,13 +108,9 @@ async fn phase4_chunked_write_coalesces_to_one_callback() {
     let root = dir.path().to_path_buf();
     let count = Arc::new(AtomicU32::new(0));
     let count_for_cb = count.clone();
-    let _w = OutputWatcher::start(
-        root.clone(),
-        Duration::from_millis(300),
-        move |_e| {
-            count_for_cb.fetch_add(1, Ordering::SeqCst);
-        },
-    )
+    let _w = OutputWatcher::start(root.clone(), Duration::from_millis(300), move |_e| {
+        count_for_cb.fetch_add(1, Ordering::SeqCst);
+    })
     .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -136,8 +131,6 @@ async fn phase4_chunked_write_coalesces_to_one_callback() {
     // Wait debounce + margin.
     tokio::time::sleep(Duration::from_millis(700)).await;
     let fired = count.load(Ordering::SeqCst);
-    println!(
-        "\nphase 4 chunked write (32x 32KB writes, ~5ms apart): callback fired {fired} times"
-    );
+    println!("\nphase 4 chunked write (32x 32KB writes, ~5ms apart): callback fired {fired} times");
     assert_eq!(fired, 1, "chunked writes must coalesce to one callback");
 }

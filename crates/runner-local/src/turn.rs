@@ -643,10 +643,7 @@ impl TurnExecutor {
 /// Loses the "parallel calls in one round" grouping (we emit one
 /// assistant per call); parallel calls at temp 0.3 are rare on
 /// Qwen3.5 27B-AWQ.
-fn hydrate_messages(
-    events: &[EventRecord],
-    spotlight_delim: Option<&str>,
-) -> Vec<ChatMessage> {
+fn hydrate_messages(events: &[EventRecord], spotlight_delim: Option<&str>) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = Vec::new();
 
     for ev in events {
@@ -1143,10 +1140,10 @@ mod tests {
     /// model into reading "past tool calls" as "future".
     #[test]
     fn hydrate_messages_emits_openai_compliant_tool_order() {
+        use super::{ModelTurnPayload, ToolResultPayload, ToolUsePayload, UserMessagePayload};
         use execlaw_core::events::{EventKind, EventRecord};
         use execlaw_core::ids::{ConversationId, EventSeq};
         use execlaw_inference_api::Role;
-        use super::{ModelTurnPayload, ToolResultPayload, ToolUsePayload, UserMessagePayload};
 
         let cid = ConversationId::from("c");
         let user_ev = EventRecord::new(
@@ -1202,10 +1199,8 @@ mod tests {
         )
         .unwrap();
 
-        let messages = super::hydrate_messages(
-            &[user_ev, tool_use_ev, tool_result_ev, model_turn_ev],
-            None,
-        );
+        let messages =
+            super::hydrate_messages(&[user_ev, tool_use_ev, tool_result_ev, model_turn_ev], None);
         assert_eq!(messages.len(), 4);
         // OpenAI-compliant: user → assistant(tool_calls) → tool → assistant(final).
         assert!(matches!(messages[0].role, Role::User));
@@ -1221,10 +1216,7 @@ mod tests {
         // The terminal ModelTurn assistant has no tool_calls.
         assert!(messages[3].tool_calls.is_empty());
         assert_eq!(
-            messages[3]
-                .content
-                .as_ref()
-                .map(|c| c.as_text().to_owned()),
+            messages[3].content.as_ref().map(|c| c.as_text().to_owned()),
             Some("here is the chart".to_owned()),
         );
     }
@@ -1239,9 +1231,9 @@ mod tests {
     /// independent of mock-server plumbing.
     #[test]
     fn hydrate_messages_wraps_user_msgs_when_spotlight_delim_set() {
+        use super::{ModelTurnPayload, UserMessagePayload};
         use execlaw_core::events::{EventKind, EventRecord};
         use execlaw_core::ids::{ConversationId, EventSeq};
-        use super::{ModelTurnPayload, UserMessagePayload};
 
         let cid = ConversationId::from("c");
         let user_ev = EventRecord::new(

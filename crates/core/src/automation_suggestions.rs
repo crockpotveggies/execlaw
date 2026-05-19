@@ -199,7 +199,9 @@ impl<'a> SuggestionStore<'a> {
             })?;
             for row in rows {
                 let (id, kind, source) = row?;
-                let entry = by_pair.entry((kind, source)).or_insert_with(|| (0, Vec::new()));
+                let entry = by_pair
+                    .entry((kind, source))
+                    .or_insert_with(|| (0, Vec::new()));
                 entry.0 += 1;
                 if entry.1.len() < SAMPLE_EVENT_CAP {
                     entry.1.push(id);
@@ -227,15 +229,9 @@ impl<'a> SuggestionStore<'a> {
     fn muted_pairs(&self) -> Result<HashSet<(BusEventKind, String)>, SuggestionError> {
         let mut out = HashSet::new();
         self.db.with_conn(|c| {
-            let mut stmt = c.prepare(
-                "SELECT kind, source FROM state_automation_muted_patterns",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                ))
-            })?;
+            let mut stmt = c.prepare("SELECT kind, source FROM state_automation_muted_patterns")?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             for row in rows {
                 let (kind, source) = row?;
                 out.insert((BusEventKind::parse(&kind), source));
@@ -245,11 +241,7 @@ impl<'a> SuggestionStore<'a> {
         Ok(out)
     }
 
-    fn upsert_pending(
-        &self,
-        cand: &Candidate,
-        now: i64,
-    ) -> Result<(), SuggestionError> {
+    fn upsert_pending(&self, cand: &Candidate, now: i64) -> Result<(), SuggestionError> {
         let id = Uuid::new_v4().to_string();
         let kind_str = cand.kind.as_str();
         let samples = serde_json::to_string(&cand.sample_event_ids)?;
@@ -467,11 +459,7 @@ fn row_to_suggestion(r: &rusqlite::Row<'_>) -> rusqlite::Result<SuggestionRow> {
         None => None,
         Some(s) if s.trim().is_empty() => None,
         Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                9,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
+            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
         })?),
     };
     Ok(SuggestionRow {
@@ -583,8 +571,8 @@ mod tests {
     #[test]
     fn sweep_skips_kinds_with_an_enabled_automation() {
         use crate::automations::{
-            AutomationDef, AutomationStore, AutomationUpsert, EdgeDef, NodeDef, NodeKind, TriggerDef,
-            END_SENTINEL, TRIGGER_SENTINEL,
+            AutomationDef, AutomationStore, AutomationUpsert, END_SENTINEL, EdgeDef, NodeDef,
+            NodeKind, TRIGGER_SENTINEL, TriggerDef,
         };
         let db = fresh_db();
         let store = SuggestionStore::new(&db);
@@ -619,7 +607,10 @@ mod tests {
             )
             .unwrap();
         let written = store.sweep(now).unwrap();
-        assert_eq!(written, 0, "kind with existing automation must not produce suggestions");
+        assert_eq!(
+            written, 0,
+            "kind with existing automation must not produce suggestions"
+        );
     }
 
     #[test]
@@ -733,8 +724,7 @@ mod tests {
     #[test]
     fn set_draft_definition_round_trips_and_only_targets_pending() {
         use crate::automations::{
-            AutomationDef, EdgeDef, NodeDef, NodeKind, TriggerDef, END_SENTINEL,
-            TRIGGER_SENTINEL,
+            AutomationDef, END_SENTINEL, EdgeDef, NodeDef, NodeKind, TRIGGER_SENTINEL, TriggerDef,
         };
         let db = fresh_db();
         let store = SuggestionStore::new(&db);
@@ -770,8 +760,7 @@ mod tests {
     #[test]
     fn list_pending_includes_draft_when_set() {
         use crate::automations::{
-            AutomationDef, EdgeDef, NodeDef, NodeKind, TriggerDef, END_SENTINEL,
-            TRIGGER_SENTINEL,
+            AutomationDef, END_SENTINEL, EdgeDef, NodeDef, NodeKind, TRIGGER_SENTINEL, TriggerDef,
         };
         let db = fresh_db();
         let store = SuggestionStore::new(&db);

@@ -561,9 +561,7 @@ impl<B: BuiltinTools + 'static> ToolDispatch for ChainedToolDispatch<B> {
         if let Some(tool) = self.host.registry().builtin(tool_name) {
             let caps: Vec<&str> = self.caller_caps.iter().map(|s| s.as_str()).collect();
             for c in &tool.descriptor().capabilities {
-                if let Err(missing) =
-                    execlaw_policy::trust::check_builtin_capability(*c, &caps)
-                {
+                if let Err(missing) = execlaw_policy::trust::check_builtin_capability(*c, &caps) {
                     return Err(format!(
                         "not authorized: tool '{tool_name}' requires capability \
                          '{missing}' not in caller's set"
@@ -700,11 +698,7 @@ fn resolve_data_refs(
 
     let mut changed = false;
     let walked = walk(args, db, &mut changed)?;
-    if changed {
-        Ok(Some(walked))
-    } else {
-        Ok(None)
-    }
+    if changed { Ok(Some(walked)) } else { Ok(None) }
 }
 
 /// An empty built-ins set — useful when the server is serving turns
@@ -1264,8 +1258,8 @@ mod tests {
     async fn builtin_capability_gate_denies_caller_missing_required_cap() {
         use async_trait::async_trait;
         use execlaw_core::tool::{
-            Capability, ToolCtx, ToolDescriptor, ToolImpl, ToolLatency,
-            ToolOutcome, ToolSource as CoreToolSource,
+            Capability, ToolCtx, ToolDescriptor, ToolImpl, ToolLatency, ToolOutcome,
+            ToolSource as CoreToolSource,
         };
 
         struct MemoryWriter {
@@ -1322,8 +1316,8 @@ mod tests {
     async fn builtin_capability_gate_allows_caller_with_required_cap() {
         use async_trait::async_trait;
         use execlaw_core::tool::{
-            Capability, ToolCtx, ToolDescriptor, ToolImpl, ToolLatency,
-            ToolOutcome, ToolSource as CoreToolSource,
+            Capability, ToolCtx, ToolDescriptor, ToolImpl, ToolLatency, ToolOutcome,
+            ToolSource as CoreToolSource,
         };
 
         struct MemoryWriter {
@@ -1379,8 +1373,8 @@ mod tests {
     async fn builtin_capability_gate_wildcard_passes_mcp_admin() {
         use async_trait::async_trait;
         use execlaw_core::tool::{
-            Capability, ToolCtx, ToolDescriptor, ToolImpl, ToolLatency,
-            ToolOutcome, ToolSource as CoreToolSource,
+            Capability, ToolCtx, ToolDescriptor, ToolImpl, ToolLatency, ToolOutcome,
+            ToolSource as CoreToolSource,
         };
 
         struct McpTool {
@@ -1522,7 +1516,10 @@ mod tests {
         let out = resolve_data_refs(&args, &db).unwrap();
         // No substitution happened because the inner object had two
         // keys → returned None (no change).
-        assert!(out.is_none(), "wrapper with extra keys must NOT be treated as a ref");
+        assert!(
+            out.is_none(),
+            "wrapper with extra keys must NOT be treated as a ref"
+        );
     }
 
     #[test]

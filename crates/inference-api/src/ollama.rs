@@ -49,10 +49,7 @@ use serde::{Deserialize, Serialize};
 /// `…:8101/v1/` is handled the same as `…:8101/v1`.
 fn daemon_root(base_url: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
-    trimmed
-        .strip_suffix("/v1")
-        .unwrap_or(trimmed)
-        .to_owned()
+    trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -236,9 +233,8 @@ fn translate_message(m: &ChatMessage) -> OllamaMessage<'_> {
                 // wants the parsed VALUE. Parse on the way out; on
                 // bad-JSON fall back to a string-wrapped object so
                 // Ollama at least sees the raw text.
-                arguments: serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| {
-                    serde_json::Value::String(tc.function.arguments.clone())
-                }),
+                arguments: serde_json::from_str(&tc.function.arguments)
+                    .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone())),
             },
         })
         .collect();
@@ -280,10 +276,7 @@ fn content_to_plain(c: &crate::MessageContent) -> String {
 /// `ChatResponse` the rest of execlaw consumes. The mapping is
 /// total — every Ollama field with a meaningful equivalent is
 /// surfaced; fields with no equivalent (e.g. `total_duration`) drop.
-fn response_to_openai(
-    raw: OllamaChatResponse,
-    request_model: &ModelId,
-) -> ChatResponse {
+fn response_to_openai(raw: OllamaChatResponse, request_model: &ModelId) -> ChatResponse {
     let usage = if raw.prompt_eval_count.is_some() || raw.eval_count.is_some() {
         Some(Usage {
             prompt_tokens: raw.prompt_eval_count.unwrap_or(0),
@@ -387,9 +380,7 @@ pub(crate) async fn chat_completions(
     }
     let text = resp.text().await?;
     let raw: OllamaChatResponse = serde_json::from_str(&text).map_err(|e| {
-        InferenceError::Decode(format!(
-            "bad /api/chat response: {e} — body: {text}"
-        ))
+        InferenceError::Decode(format!("bad /api/chat response: {e} — body: {text}"))
     })?;
     Ok(response_to_openai(raw, &req.model))
 }
@@ -404,9 +395,7 @@ pub(crate) async fn chat_completions_stream(
     api_key: Option<&str>,
     req: &ChatRequest,
 ) -> Result<
-    std::pin::Pin<
-        Box<dyn futures::Stream<Item = Result<ChatStreamChunk, InferenceError>> + Send>,
-    >,
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatStreamChunk, InferenceError>> + Send>>,
     InferenceError,
 > {
     use futures::StreamExt;
@@ -471,16 +460,8 @@ where
                     }
                     match serde_json::from_str::<OllamaStreamFrame>(trimmed) {
                         Ok(frame) => {
-                            let chunk = frame_to_chunk(
-                                frame,
-                                &id,
-                                &model,
-                                &mut emitted_role,
-                            );
-                            return Some((
-                                Ok(chunk),
-                                (s, state, id, model, emitted_role),
-                            ));
+                            let chunk = frame_to_chunk(frame, &id, &model, &mut emitted_role);
+                            return Some((Ok(chunk), (s, state, id, model, emitted_role)));
                         }
                         Err(e) => {
                             return Some((
@@ -512,16 +493,9 @@ where
                                 if let Ok(frame) =
                                     serde_json::from_str::<OllamaStreamFrame>(trimmed)
                                 {
-                                    let chunk = frame_to_chunk(
-                                        frame,
-                                        &id,
-                                        &model,
-                                        &mut emitted_role,
-                                    );
-                                    return Some((
-                                        Ok(chunk),
-                                        (s, state, id, model, emitted_role),
-                                    ));
+                                    let chunk =
+                                        frame_to_chunk(frame, &id, &model, &mut emitted_role);
+                                    return Some((Ok(chunk), (s, state, id, model, emitted_role)));
                                 }
                             }
                         }
@@ -640,10 +614,22 @@ mod tests {
 
     #[test]
     fn daemon_root_strips_v1_suffix() {
-        assert_eq!(daemon_root("http://127.0.0.1:8101/v1"), "http://127.0.0.1:8101");
-        assert_eq!(daemon_root("http://127.0.0.1:8101/v1/"), "http://127.0.0.1:8101");
-        assert_eq!(daemon_root("http://127.0.0.1:8101"), "http://127.0.0.1:8101");
-        assert_eq!(daemon_root("http://localhost:8101/v1"), "http://localhost:8101");
+        assert_eq!(
+            daemon_root("http://127.0.0.1:8101/v1"),
+            "http://127.0.0.1:8101"
+        );
+        assert_eq!(
+            daemon_root("http://127.0.0.1:8101/v1/"),
+            "http://127.0.0.1:8101"
+        );
+        assert_eq!(
+            daemon_root("http://127.0.0.1:8101"),
+            "http://127.0.0.1:8101"
+        );
+        assert_eq!(
+            daemon_root("http://localhost:8101/v1"),
+            "http://localhost:8101"
+        );
     }
 
     #[test]
@@ -823,13 +809,7 @@ mod tests {
             Some("web_search")
         );
         // Arguments stringified as JSON.
-        let args_str = tc
-            .function
-            .as_ref()
-            .unwrap()
-            .arguments
-            .as_deref()
-            .unwrap();
+        let args_str = tc.function.as_ref().unwrap().arguments.as_deref().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(args_str).unwrap();
         assert_eq!(parsed["q"], "VAN");
     }
@@ -838,7 +818,8 @@ mod tests {
     async fn ndjson_to_chat_chunks_handles_split_lines_across_byte_chunks() {
         // TCP reads can split a line in half. Make sure the buffer
         // re-assembles correctly before parsing.
-        let frame = r#"{"message":{"role":"assistant","content":"hi"},"done":true,"done_reason":"stop"}"#;
+        let frame =
+            r#"{"message":{"role":"assistant","content":"hi"},"done":true,"done_reason":"stop"}"#;
         let with_newline = format!("{frame}\n");
         let bytes = with_newline.as_bytes();
         // Split right in the middle of the JSON.

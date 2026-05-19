@@ -16,18 +16,23 @@ const BUDGETS_BYTES = {
     // User-facing payload only — `.map` files are excluded because
     // sourcemaps don't ship as part of the cold-load path; they're
     // dev-tool artifacts shipped alongside for debugging. Currently
-    // ~2 MB: ~775 KB JS + ~340 KB CSS + ~310 KB bootstrap-icons
+    // ~2.3 MB: ~1.04 MB JS + ~360 KB CSS + ~310 KB bootstrap-icons
     // fonts + ~600 KB IBM Plex Sans variants (every weight × every
     // subset × woff/woff2). Trim @fontsource subsets to bring this
-    // down — that's the cheapest win once we cross 2.5 MB.
-    total: 2500 * 1024,
-    // JS only (the cold-load critical path). Currently ~845 KB —
-    // bootstrap + react + GSAP + react-bootstrap account for most
-    // of it. Tighten via tree-shaking / code-splitting before
-    // raising this further. Last raise: 800 → 900 KB after the
-    // React 18 → 19 + react-router-dom 6 → 7 bumps added ~54 KB
-    // to the cold-load JS.
-    js: 900 * 1024,
+    // down — that's the cheapest win once we cross 2.7 MB.
+    total: 2700 * 1024,
+    // JS only (the cold-load critical path). Currently ~1.04 MB —
+    // bootstrap + react + GSAP + react-bootstrap + ReactFlow
+    // (Automations canvas) account for most of it. Tighten via
+    // tree-shaking / code-splitting before raising this further.
+    // Last raise: 900 KB → 1100 KB to absorb the Automations
+    // milestone (M4c ReactFlow canvas + M5 InferencePage
+    // observability + agent-drafted suggestions surface). The
+    // single-chunk vite output makes a `dist/assets/index-*.js`
+    // that's 1.04 MB on disk; code-splitting `routes/Automations`
+    // + its detail page into a lazy chunk would let us tighten
+    // back to ~900 KB without losing those features.
+    js: 1100 * 1024,
     // CSS only. Bootstrap + bootstrap-icons together land near 300 KB
     // out-of-the-box; the budget is cushioned to ~400 KB so we notice
     // when we've added ANOTHER 100 KB of CSS — at that point we should

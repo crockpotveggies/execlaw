@@ -97,7 +97,11 @@ async fn syntax_error_returns_error_status_and_keeps_kernel_usable() {
     let kernel = c.create_kernel("python3").await.unwrap().id;
 
     let r = c
-        .execute(&kernel, "this is not valid python !!", Duration::from_secs(10))
+        .execute(
+            &kernel,
+            "this is not valid python !!",
+            Duration::from_secs(10),
+        )
         .await
         .unwrap();
     assert!(
@@ -105,11 +109,17 @@ async fn syntax_error_returns_error_status_and_keeps_kernel_usable() {
         "syntax error should produce Error, got {:?}",
         r.status
     );
-    let saw_error = r.outputs.iter().any(|o| matches!(o, ExecuteOutput::Error { .. }));
+    let saw_error = r
+        .outputs
+        .iter()
+        .any(|o| matches!(o, ExecuteOutput::Error { .. }));
     assert!(saw_error, "must include an Error output");
 
     // Kernel must still work after a syntax error.
-    let r2 = c.execute(&kernel, "2 + 2", Duration::from_secs(10)).await.unwrap();
+    let r2 = c
+        .execute(&kernel, "2 + 2", Duration::from_secs(10))
+        .await
+        .unwrap();
     assert!(
         matches!(r2.status, ExecuteStatus::Ok),
         "kernel must be usable after syntax error"
@@ -125,7 +135,11 @@ async fn missing_import_returns_error_with_traceback() {
     let kernel = c.create_kernel("python3").await.unwrap().id;
 
     let r = c
-        .execute(&kernel, "import this_module_does_not_exist_xyz123", Duration::from_secs(10))
+        .execute(
+            &kernel,
+            "import this_module_does_not_exist_xyz123",
+            Duration::from_secs(10),
+        )
         .await
         .unwrap();
     assert!(matches!(r.status, ExecuteStatus::Error));
@@ -133,7 +147,9 @@ async fn missing_import_returns_error_with_traceback() {
         .outputs
         .iter()
         .find_map(|o| match o {
-            ExecuteOutput::Error { ename, traceback, .. } => Some((ename.as_str(), traceback)),
+            ExecuteOutput::Error {
+                ename, traceback, ..
+            } => Some((ename.as_str(), traceback)),
             _ => None,
         })
         .expect("must have an Error output");
@@ -278,11 +294,7 @@ async fn cell_under_output_cap_completes_ok() {
     // 40 MB — comfortably under the 50 MB cap. Single print; the
     // kernel sends one stream message.
     let r = c
-        .execute(
-            &kernel,
-            "print('x' * 40_000_000)",
-            Duration::from_secs(30),
-        )
+        .execute(&kernel, "print('x' * 40_000_000)", Duration::from_secs(30))
         .await
         .unwrap();
     assert!(

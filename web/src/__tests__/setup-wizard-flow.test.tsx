@@ -9,7 +9,7 @@
 // payload for both managed and external paths.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
 import { SetupWizard } from "../routes/SetupWizard";
 import { AuthProvider } from "../auth/AuthContext";
@@ -820,15 +820,12 @@ describe("SetupWizard — multi-step flow", () => {
         });
         mountWizard();
         await fillAndSubmitAccount();
-        // Docker is unavailable on this fixture — wizard surfaces the
-        // missing-Docker step. Skip past it (Apple path doesn't need
-        // Docker).
-        await waitFor(() => {
-            expect(
-                screen.getByTestId("setup-docker-missing"),
-            ).toBeInTheDocument();
-        });
-        fireEvent.click(screen.getByTestId("setup-docker-skip"));
+        // When `preflight.gpus` contains an Apple entry, the wizard
+        // auto-advances past the docker step (see
+        // `SetupWizard.tsx` line ~187 — `useEffect` setStep("backend")
+        // when hasAppleGpu). docker-missing renders transiently while
+        // preflight is pending; the test waits for backend-form
+        // directly to avoid racing the auto-advance.
         await waitFor(() => {
             expect(screen.getByTestId("setup-backend-form")).toBeInTheDocument();
         });
@@ -871,12 +868,8 @@ describe("SetupWizard — multi-step flow", () => {
         });
         mountWizard();
         await fillAndSubmitAccount();
-        await waitFor(() => {
-            expect(
-                screen.getByTestId("setup-docker-missing"),
-            ).toBeInTheDocument();
-        });
-        fireEvent.click(screen.getByTestId("setup-docker-skip"));
+        // Apple-GPU auto-advance: see comment on the sibling test
+        // above. Wait directly for backend-form.
         await waitFor(() => {
             expect(screen.getByTestId("setup-backend-form")).toBeInTheDocument();
         });
@@ -945,26 +938,57 @@ describe("SetupWizard — multi-step flow", () => {
         });
         mountWizard();
         await fillAndSubmitAccount();
-        await waitFor(() => {
-            expect(
-                screen.getByTestId("setup-docker-missing"),
-            ).toBeInTheDocument();
-        });
-        fireEvent.click(screen.getByTestId("setup-docker-skip"));
+        // Apple-GPU auto-advance: see comment on the sibling test
+        // above. Wait directly for backend-form.
         await waitFor(() => {
             expect(screen.getByTestId("setup-backend-form")).toBeInTheDocument();
         });
-        fireEvent.click(screen.getByTestId("setup-backend-submit"));
-        // Wizard advances to chat shell on success.
-        await waitFor(() => {
-            expect(screen.getByTestId("chat-shell")).toBeInTheDocument();
+        // The model select defaults to the first option via a
+        // useEffect (UnifiedBackendForm.tsx:506) — wait for it to
+        // populate before clicking submit. In the racy multi-test
+        // run that effect's microtask can land AFTER the click,
+        // leaving `modelId` empty and the submit handler silently
+        // setting an "Pick a model" error without firing the PUT.
+        const modelSelect = await waitFor(() => {
+            const sel = screen.getByTestId(
+                "setup-backend-model-select",
+            ) as HTMLSelectElement;
+            expect(sel.value).not.toEqual("");
+            return sel;
         });
-        const put = calls.find(
-            (c) =>
-                c.url === "/api/admin/backends/Standard" &&
-                c.init?.method === "PUT",
-        )!;
-        expect(put).toBeDefined();
+        // Explicit re-select keeps the assertion deterministic
+        // regardless of effect ordering.
+        await act(async () => {
+            fireEvent.change(modelSelect, {
+                target: { value: modelSelect.options[0].value },
+            });
+        });
+        // Submit the form inside `act()` so React flushes the
+        // setState calls in `submit()` (setSubmitting(true), etc.)
+        // before we start the async `waitFor` poll.
+        await act(async () => {
+            fireEvent.click(screen.getByTestId("setup-backend-submit"));
+        });
+        // Wait for the PUT to land FIRST, then for the
+        // navigate-after-dismiss to surface chat-shell.
+        const put = await waitFor(
+            () => {
+                const hit = calls.find(
+                    (c) =>
+                        c.url === "/api/admin/backends/Standard" &&
+                        c.init?.method === "PUT",
+                );
+                expect(hit).toBeDefined();
+                return hit!;
+            },
+            { timeout: 4000 },
+        );
+        await waitFor(
+            () => {
+                expect(screen.getByTestId("chat-shell")).toBeInTheDocument();
+            },
+            { timeout: 4000 },
+        );
         const body = JSON.parse((put.init?.body as string) ?? "{}");
         expect(body.mode).toBe("managed");
         expect(body.inference_backend).toBe("service-ollama");

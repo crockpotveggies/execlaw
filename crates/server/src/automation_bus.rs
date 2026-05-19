@@ -176,10 +176,7 @@ impl AutomationBus {
     /// Use this from in-process producers (automation side effects,
     /// plugin emits) to avoid producer-consumer deadlock through
     /// the channel.
-    pub async fn publish_internal(
-        &self,
-        evt: Event,
-    ) -> Result<PublishOutcome, BusEventError> {
+    pub async fn publish_internal(&self, evt: Event) -> Result<PublishOutcome, BusEventError> {
         let store = BusEventStore::new(&self.inner.db);
         store.publish(&evt, true)
     }
@@ -227,6 +224,26 @@ async fn dispatcher_loop(
     handler: EventHandler,
     stop: Arc<Notify>,
 ) {
+    // Register a stop watcher BEFORE doing any synchronous work.
+    // `Notify::notify_waiters()` is fire-and-forget — if it fires
+    // before we've reached a `.notified().await`, the wake-up is
+    // silently lost. The crash-recovery scan below can hold this
+    // task for many milliseconds (one DB round-trip per pending
+    // row, then a handler dispatch each); a stop arriving during
+    // that window would deadlock the dispatcher forever (the main
+    // loop's `stop.notified()` would race against `rx.recv()`
+    // without anyone ever notifying it). Spawning a watcher task
+    // registers the Notify waiter immediately so any subsequent
+    // `notify_waiters()` reaches us reliably. The watcher task
+    // costs ~1 µs / few hundred bytes and ends as soon as the
+    // first stop fires; the main loop polls its JoinHandle.
+    let mut stop_watcher = tokio::spawn({
+        let stop = stop.clone();
+        async move {
+            stop.notified().await;
+        }
+    });
+
     // Crash recovery: drain any rows persisted by a previous process
     // before the live mpsc starts pumping. Pulls both lanes (external
     // + internal) so the first poller tick has less work to do.
@@ -248,7 +265,7 @@ async fn dispatcher_loop(
     info!("automation bus dispatcher running");
     loop {
         tokio::select! {
-            _ = stop.notified() => {
+            _ = &mut stop_watcher => {
                 info!("automation bus dispatcher: stop received, draining");
                 rx.close();
                 while let Some(id) = rx.recv().await {
@@ -288,12 +305,7 @@ async fn dispatcher_loop(
 /// With the M1 no-op handler this is invisible; M2's automation
 /// matcher will either (a) unclaim on shutdown or (b) track a
 /// separate `completed_at` so retention only sweeps fully-run rows.
-async fn dispatch_one(
-    db: &Database,
-    handler: &EventHandler,
-    workers: &Arc<Semaphore>,
-    id: String,
-) {
+async fn dispatch_one(db: &Database, handler: &EventHandler, workers: &Arc<Semaphore>, id: String) {
     let row = match BusEventStore::new(db).get(&id) {
         Ok(Some(r)) => r,
         Ok(None) => {
@@ -348,6 +360,23 @@ async fn internal_poller_loop(
     poll_interval: Duration,
     stop: Arc<Notify>,
 ) {
+    // Same race-shield as `dispatcher_loop`: register the Notify
+    // waiter via a spawned watcher BEFORE any other synchronous
+    // setup. `Notify::notify_waiters()` is fire-and-forget; if it
+    // fires between `tokio::spawn(internal_poller_loop(...))` and
+    // the first `.notified().await` poll inside the main loop, the
+    // wake-up is lost and this task hangs forever waiting on the
+    // next stop (which never comes). Empirically caught by the
+    // Windows test run where parallel #[tokio::test] runtimes
+    // compete for OS threads and the poller's first scheduling
+    // slot lands AFTER the test's stop.notify_waiters() call.
+    let mut stop_watcher = tokio::spawn({
+        let stop = stop.clone();
+        async move {
+            stop.notified().await;
+        }
+    });
+
     let mut tick = tokio::time::interval(poll_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Burn the immediate-fire tick that interval emits on construction.
@@ -358,7 +387,7 @@ async fn internal_poller_loop(
     );
     loop {
         tokio::select! {
-            _ = stop.notified() => {
+            _ = &mut stop_watcher => {
                 info!("automation bus internal poller: stop received, exiting");
                 return;
             }
@@ -480,7 +509,10 @@ mod tests {
             "dispatcher should deliver both events",
         );
         // Order on the channel is FIFO from publish order.
-        assert_eq!(*seen.lock().unwrap(), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
 
         // Both events should be marked dispatched.
         let store = BusEventStore::new(&db);
@@ -600,8 +632,8 @@ mod tests {
         let (bus, tasks) = AutomationBus::spawn_with_config(
             db.clone(),
             slow_handler,
-            1, // channel capacity
-            1, // worker concurrency
+            1,                       // channel capacity
+            1,                       // worker concurrency
             Duration::from_secs(60), // poller off-path
             stop.clone(),
         );

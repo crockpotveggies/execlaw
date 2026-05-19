@@ -726,11 +726,7 @@ impl SidecarSupervisor {
                         // banner stays visible. Return from this
                         // reconcile_slot pass — the supervisor's
                         // outer loop will check us again next tick.
-                        self.transition_status(
-                            &sidecar.name,
-                            slot,
-                            ServiceStatus::Pulling,
-                        );
+                        self.transition_status(&sidecar.name, slot, ServiceStatus::Pulling);
                         return;
                     }
                     // Build terminated — drop the task either way,
@@ -779,11 +775,7 @@ impl SidecarSupervisor {
                                 sidecar.plugin_id.clone(),
                             );
                             slot.build_task = Some(task);
-                            self.transition_status(
-                                &sidecar.name,
-                                slot,
-                                ServiceStatus::Pulling,
-                            );
+                            self.transition_status(&sidecar.name, slot, ServiceStatus::Pulling);
                             // First reconcile after kick: leave
                             // the spawn for the next tick. The
                             // build runs in tokio::spawn so the
@@ -1155,8 +1147,8 @@ fn spawn_image_build_task(
     let done_clone = done.clone();
     let failure_clone = failure.clone();
     tokio::spawn(async move {
-        let extended_path = std::env::var("PATH")
-            .unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".to_string());
+        let extended_path =
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".to_string());
         let extended_path = format!(
             "/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:{extended_path}"
         );
