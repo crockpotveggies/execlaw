@@ -71,6 +71,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "automation_suggestions",
         sql: include_str!("../migrations/0009_automation_suggestions.sql"),
     },
+    Migration {
+        id: 10,
+        name: "suggestion_drafts",
+        sql: include_str!("../migrations/0010_suggestion_drafts.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -263,7 +268,7 @@ mod tests {
         // discovery surface on the /automations landing page).
         // Update this list whenever a new migration is added to
         // MIGRATIONS.
-        assert_eq!(applied, vec![1, 5, 6, 7, 8, 9]);
+        assert_eq!(applied, vec![1, 5, 6, 7, 8, 9, 10]);
 
         // Spot-check: every documented table exists.
         let tables = vec![
@@ -342,7 +347,7 @@ mod tests {
         let runner = MigrationRunner::new(&db);
         let first = runner.apply_all().unwrap();
         let second = runner.apply_all().unwrap();
-        assert_eq!(first, vec![1, 5, 6, 7, 8, 9]);
+        assert_eq!(first, vec![1, 5, 6, 7, 8, 9, 10]);
         assert!(
             second.is_empty(),
             "rerun must not re-apply already-applied migrations"

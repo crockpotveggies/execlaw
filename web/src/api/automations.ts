@@ -117,6 +117,10 @@ export interface SuggestionView {
     suggested_name: string;
     created_at: number;
     updated_at: number;
+    /** M5: present when an agent-drafting path populated a seed
+     *  graph the editor can pre-fill. `null` for plain pattern-
+     *  detected suggestions. */
+    draft_definition?: AutomationDef | null;
 }
 
 // ---- Endpoints ----
@@ -213,6 +217,17 @@ export async function dismissSuggestion(
     await apiFetch<unknown>(
         `${BASE}/suggestions/${encodeURIComponent(id)}/dismiss`,
         { method: "POST", body: {} },
+        tokenAccessor,
+    );
+}
+
+export async function getSuggestion(
+    id: string,
+    tokenAccessor: () => string | null,
+): Promise<SuggestionView> {
+    return apiFetch<SuggestionView>(
+        `${BASE}/suggestions/${encodeURIComponent(id)}`,
+        {},
         tokenAccessor,
     );
 }

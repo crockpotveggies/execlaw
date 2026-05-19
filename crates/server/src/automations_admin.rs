@@ -53,6 +53,10 @@ pub fn router() -> Router<AppState> {
             post(action_suggestion),
         )
         .route(
+            "/api/admin/automations/suggestions/{id}",
+            get(get_suggestion),
+        )
+        .route(
             "/api/admin/automations/{id}",
             get(get_one).put(update).delete(delete_one),
         )
@@ -185,6 +189,11 @@ pub struct SuggestionDto {
     pub suggested_name: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// M5: agent-drafted seed for the editor handoff. `None` for
+    /// plain pattern-detected suggestions; `Some(_)` when an agent
+    /// drafting path has populated a graph the operator can review
+    /// and tweak.
+    pub draft_definition: Option<execlaw_core::automations::AutomationDef>,
 }
 
 // ---------------------------------------------------------------------------
@@ -508,9 +517,41 @@ async fn list_suggestions(
                 suggested_name: r.suggested_name,
                 created_at: r.created_at,
                 updated_at: r.updated_at,
+                draft_definition: r.draft_definition,
             })
             .collect(),
     ))
+}
+
+/// M5: GET one suggestion by id. Used by the editor's "Review and
+/// create" handoff to fetch the draft when present.
+async fn get_suggestion(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuggestionDto>, ApiError> {
+    let r = SuggestionStore::new(&state.db)
+        .get(&id)
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "suggestion_get_failed",
+            message: format!("{e}"),
+        })?
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "suggestion_not_found",
+            message: format!("no suggestion with id '{id}'"),
+        })?;
+    Ok(Json(SuggestionDto {
+        id: r.id,
+        kind: r.kind,
+        source: r.source,
+        event_count: r.event_count,
+        sample_event_ids: r.sample_event_ids,
+        suggested_name: r.suggested_name,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+        draft_definition: r.draft_definition,
+    }))
 }
 
 async fn dismiss_suggestion(

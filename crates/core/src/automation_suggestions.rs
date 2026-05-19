@@ -20,7 +20,7 @@
 //! and stuffs the proposal into a follow-on column.
 
 use crate::automation_bus::BusEventKind;
-use crate::automations::AutomationStore;
+use crate::automations::{AutomationDef, AutomationStore};
 use crate::db::{Database, DbError};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -90,6 +90,13 @@ pub struct SuggestionRow {
     pub status: SuggestionStatus,
     pub created_at: i64,
     pub updated_at: i64,
+    /// M5: agent-drafted seed `AutomationDef` for the "Review and
+    /// create" handoff. `None` for plain pattern-detected
+    /// suggestions; `Some(_)` once an agent-drafting path populates
+    /// the column. The editor pre-fills the JSON definition from
+    /// this when present.
+    #[serde(default)]
+    pub draft_definition: Option<AutomationDef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,7 +284,7 @@ impl<'a> SuggestionStore<'a> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, kind, source, event_count, sample_event_ids, suggested_name, \
-                        status, created_at, updated_at \
+                        status, created_at, updated_at, draft_definition \
                  FROM state_automation_suggestions \
                  WHERE status = 'pending' \
                  ORDER BY event_count DESC, updated_at DESC",
@@ -296,7 +303,7 @@ impl<'a> SuggestionStore<'a> {
         let row = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, kind, source, event_count, sample_event_ids, suggested_name, \
-                        status, created_at, updated_at \
+                        status, created_at, updated_at, draft_definition \
                  FROM state_automation_suggestions WHERE id = ?1",
             )?;
             let r = stmt.query_row([id], row_to_suggestion).ok();
@@ -374,6 +381,34 @@ impl<'a> SuggestionStore<'a> {
         Ok(rows)
     }
 
+    /// M5: persist an agent-drafted `AutomationDef` for a pending
+    /// suggestion. Callers are the deferred agent-drafting path —
+    /// the sweep + an `AgentInvoker` produce the draft and call
+    /// this. The SPA's "Review and create" handoff reads the column
+    /// and seeds the editor with the draft instead of an empty graph.
+    ///
+    /// Idempotent: passing the same id+def twice produces no further
+    /// row changes. Returns `Ok(false)` when no pending suggestion
+    /// exists for the id (caller may have raced a dismiss/action).
+    pub fn set_draft_definition(
+        &self,
+        id: &str,
+        def: &AutomationDef,
+        now: i64,
+    ) -> Result<bool, SuggestionError> {
+        let payload = serde_json::to_string(def)?;
+        let n = self.db.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE state_automation_suggestions \
+                 SET draft_definition = ?2, updated_at = ?3 \
+                 WHERE id = ?1 AND status = 'pending'",
+                params![id, &payload, now],
+            )?;
+            Ok(n)
+        })?;
+        Ok(n > 0)
+    }
+
     /// Un-mute a pattern. Called by the (future) settings UI; also
     /// useful for tests.
     pub fn unmute(&self, kind: BusEventKind, source: &str) -> Result<bool, SuggestionError> {
@@ -424,6 +459,21 @@ fn row_to_suggestion(r: &rusqlite::Row<'_>) -> rusqlite::Result<SuggestionRow> {
             format!("unknown suggestion status: {status_str}").into(),
         )
     })?;
+    // M5: optional draft definition column. Absence is the normal
+    // case (pure pattern-detected suggestions); presence means an
+    // agent-drafting path has populated a seed for the editor.
+    let draft_str: Option<String> = r.get(9)?;
+    let draft_definition: Option<AutomationDef> = match draft_str {
+        None => None,
+        Some(s) if s.trim().is_empty() => None,
+        Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                9,
+                rusqlite::types::Type::Text,
+                Box::new(e),
+            )
+        })?),
+    };
     Ok(SuggestionRow {
         id: r.get(0)?,
         kind: BusEventKind::parse(&r.get::<_, String>(1)?),
@@ -434,6 +484,7 @@ fn row_to_suggestion(r: &rusqlite::Row<'_>) -> rusqlite::Result<SuggestionRow> {
         status,
         created_at: r.get(7)?,
         updated_at: r.get(8)?,
+        draft_definition,
     })
 }
 
@@ -677,6 +728,79 @@ mod tests {
         assert!(store.list_muted().unwrap().is_empty());
         // Idempotent.
         assert!(!store.unmute(BusEventKind::WebhookReceived, "x").unwrap());
+    }
+
+    #[test]
+    fn set_draft_definition_round_trips_and_only_targets_pending() {
+        use crate::automations::{
+            AutomationDef, EdgeDef, NodeDef, NodeKind, TriggerDef, END_SENTINEL,
+            TRIGGER_SENTINEL,
+        };
+        let db = fresh_db();
+        let store = SuggestionStore::new(&db);
+        let now = 1_000_000;
+        seed_events(&db, "webhook:drafty", 15, now * 1000);
+        store.sweep(now).unwrap();
+        let id = store.list_pending().unwrap()[0].id.clone();
+        let def = AutomationDef {
+            trigger: TriggerDef {
+                kind: BusEventKind::WebhookReceived,
+                when: None,
+            },
+            nodes: vec![NodeDef {
+                id: "end".into(),
+                kind: NodeKind::Terminal,
+                config: serde_json::json!({}),
+            }],
+            edges: vec![EdgeDef {
+                from: TRIGGER_SENTINEL.into(),
+                to: "end".into(),
+                when: None,
+            }],
+        };
+        assert!(store.set_draft_definition(&id, &def, now + 1).unwrap());
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(row.draft_definition, Some(def.clone()));
+        // Dismissing flips status away from pending; the setter must
+        // reject further writes against the now-non-pending row.
+        store.dismiss(&id, now + 2).unwrap();
+        assert!(!store.set_draft_definition(&id, &def, now + 3).unwrap());
+    }
+
+    #[test]
+    fn list_pending_includes_draft_when_set() {
+        use crate::automations::{
+            AutomationDef, EdgeDef, NodeDef, NodeKind, TriggerDef, END_SENTINEL,
+            TRIGGER_SENTINEL,
+        };
+        let db = fresh_db();
+        let store = SuggestionStore::new(&db);
+        let now = 1_000_000;
+        seed_events(&db, "webhook:drafty", 15, now * 1000);
+        store.sweep(now).unwrap();
+        let id = store.list_pending().unwrap()[0].id.clone();
+        // Default: no draft.
+        assert!(store.list_pending().unwrap()[0].draft_definition.is_none());
+        // Set draft → list_pending surfaces it.
+        let def = AutomationDef {
+            trigger: TriggerDef {
+                kind: BusEventKind::WebhookReceived,
+                when: None,
+            },
+            nodes: vec![NodeDef {
+                id: "end".into(),
+                kind: NodeKind::Terminal,
+                config: serde_json::json!({}),
+            }],
+            edges: vec![EdgeDef {
+                from: TRIGGER_SENTINEL.into(),
+                to: "end".into(),
+                when: None,
+            }],
+        };
+        store.set_draft_definition(&id, &def, now + 1).unwrap();
+        let listed = store.list_pending().unwrap();
+        assert_eq!(listed[0].draft_definition, Some(def));
     }
 
     #[test]

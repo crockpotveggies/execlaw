@@ -28,6 +28,7 @@ import {
     deleteAutomation,
     emptyAutomationDef,
     getAutomation,
+    getSuggestion,
     kindLabel,
     listAutomationRuns,
     listRecentBusEvents,
@@ -85,6 +86,12 @@ export function AutomationDetailPage({ id }: Props) {
     // "review suggestion" hand-off so the new automation starts on
     // the right trigger.
     const seedKind = (params.get("kind") as BusEventKind | null) ?? null;
+    // M5: when the handoff carried `?suggestion=<id>`, the editor
+    // fetches that suggestion and — if it has a `draft_definition`
+    // (agent-drafted seed) — uses that as the JSON instead of the
+    // empty graph. Falls back to `emptyAutomationDef(seedKind)` when
+    // there's no draft.
+    const suggestionId = params.get("suggestion");
 
     useEffect(() => {
         let cancelled = false;
@@ -92,9 +99,28 @@ export function AutomationDetailPage({ id }: Props) {
             setError(null);
             try {
                 if (isNew) {
-                    const seedDef = emptyAutomationDef(seedKind ?? undefined);
+                    // Try the draft path first when the handoff
+                    // carried a suggestion id. A missing draft, a
+                    // resolution error, or a non-pending suggestion
+                    // all fall through to the empty-seed default
+                    // without surfacing a user-facing error — the
+                    // page is still usable; the draft was just a
+                    // nice-to-have.
+                    let seedDef = emptyAutomationDef(seedKind ?? undefined);
+                    let seedName = "";
+                    if (suggestionId) {
+                        try {
+                            const s = await getSuggestion(suggestionId, token);
+                            if (s.draft_definition) {
+                                seedDef = s.draft_definition;
+                            }
+                            seedName = s.suggested_name;
+                        } catch {
+                            // Silent fallback to empty seed.
+                        }
+                    }
                     if (!cancelled) {
-                        setName("");
+                        setName(seedName);
                         setEnabled(true);
                         setDefJson(JSON.stringify(seedDef, null, 2));
                         setRuns([]);
@@ -123,7 +149,7 @@ export function AutomationDetailPage({ id }: Props) {
         return () => {
             cancelled = true;
         };
-    }, [id, isNew, seedKind, token]);
+    }, [id, isNew, seedKind, suggestionId, token]);
 
     const onSave = useCallback(async () => {
         setError(null);
