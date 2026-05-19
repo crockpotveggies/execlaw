@@ -1625,9 +1625,81 @@ fn bench_automation_bus(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Automation suggestions (M4a) — sweep + recent-events lookup. The sweep
+// runs daily but the per-tick cost matters under busy buses. The
+// recent-events query backs the editor's sample-payload picker, hit
+// every time the test-run drawer opens.
+//
+// M5 baseline (in-memory SQLite, Windows dev box, single-threaded):
+//   * sweep_1024_events_4_sources:     ~272 µs / call
+//   * list_recent_for_kind_50_of_1024: ~26 µs / call (~520 ns / row)
+//
+// Budgets (10× the measured baseline for regression headroom):
+//   * sweep:                ≤ 3 ms p99
+//   * list_recent_for_kind: ≤ 300 µs p99
+//
+// Both indexed: the sweep groups by (kind, source) via the
+// kind+received_at index; list_recent_for_kind hits the same index
+// in reverse with LIMIT. No sort step, so cost scales linearly with
+// the limit, not total rows.
+// ---------------------------------------------------------------------------
+
+fn bench_automation_suggestions(c: &mut Criterion) {
+    use execlaw_core::automation_bus::{BusEventKind, BusEventStore, Event as BusEvent};
+    use execlaw_core::automation_suggestions::SuggestionStore;
+    let db = fresh_db();
+    // Seed 1024 events across 4 sources (256 each) so the sweep has
+    // 4 candidate patterns to evaluate.
+    let now_ms = 1_700_000_000_000_i64;
+    {
+        let bus = BusEventStore::new(&db);
+        for source_idx in 0..4 {
+            let source = format!("webhook:src-{source_idx}");
+            for i in 0..256 {
+                bus.publish(
+                    &BusEvent {
+                        id: format!("seed-{source_idx}-{i}"),
+                        kind: BusEventKind::WebhookReceived,
+                        source: source.clone(),
+                        received_at: now_ms + (source_idx * 1000 + i) as i64,
+                        payload: serde_json::json!({"i": i}),
+                    },
+                    false,
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    let mut group = c.benchmark_group("automation_suggestions");
+
+    // sweep — daily worker hot path
+    group.bench_function("sweep_1024_events_4_sources", |b| {
+        b.iter(|| {
+            SuggestionStore::new(black_box(&db))
+                .sweep(black_box(now_ms / 1_000))
+                .unwrap()
+        });
+    });
+
+    // list_recent_for_kind(50) — sample-payload picker hot path
+    group.throughput(Throughput::Elements(50));
+    group.bench_function("list_recent_for_kind_50_of_1024", |b| {
+        b.iter(|| {
+            BusEventStore::new(black_box(&db))
+                .list_recent_for_kind(BusEventKind::WebhookReceived, 50)
+                .unwrap()
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_automation_bus,
+    bench_automation_suggestions,
     bench_hmac,
     bench_idempotency_key,
     bench_event_record_encode_decode,

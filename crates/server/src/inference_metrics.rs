@@ -94,6 +94,14 @@ impl InferenceMetrics {
     /// call, records the duration + outcome after, and decrements
     /// `in_flight`. Generic over the call's `Result<T, E>` shape so
     /// any inference consumer can pass its native result type.
+    ///
+    /// **Panic-safe.** If the wrapped future panics, the
+    /// [`InflightGuard`] RAII handle decrements `in_flight` during
+    /// unwind so the counter doesn't leak. The other counters
+    /// (total_calls, total_failures, durations) only update on
+    /// normal completion — a panicked call isn't "completed" in
+    /// any meaningful sense, so it's correctly absent from the
+    /// totals.
     pub async fn observe<T, E, F>(
         &self,
         consumer: InferenceConsumer,
@@ -102,17 +110,26 @@ impl InferenceMetrics {
     where
         F: Future<Output = Result<T, E>>,
     {
+        let start = Instant::now();
         {
             let mut g = self.inner.lock().unwrap();
             g.entry(consumer).or_default().in_flight += 1;
         }
-        let start = Instant::now();
+        // RAII: ensures `in_flight` decrements on any exit path,
+        // including a panic propagating through `.await`.
+        let _guard = InflightGuard {
+            metrics: self,
+            consumer,
+        };
         let result = fut.await;
         let ms = start.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        // Normal-completion bookkeeping. The guard's drop handles
+        // in_flight; we only do the "this call ended cleanly" stats
+        // here, so a panic short-circuits these without leaving
+        // partial state.
         {
             let mut g = self.inner.lock().unwrap();
             let c = g.entry(consumer).or_default();
-            c.in_flight = c.in_flight.saturating_sub(1);
             c.total_calls += 1;
             if result.is_err() {
                 c.total_failures += 1;
@@ -147,6 +164,27 @@ impl InferenceMetrics {
             .collect();
         consumers.sort_by_key(|c| c.consumer.as_str());
         MetricsSnapshot { consumers }
+    }
+}
+
+/// RAII guard that decrements `in_flight` on drop. Panic-safe: if
+/// the awaited future unwinds through `observe`, the guard's drop
+/// still runs, leaving the in-flight counter consistent.
+struct InflightGuard<'a> {
+    metrics: &'a InferenceMetrics,
+    consumer: InferenceConsumer,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        // `lock().unwrap()` panicking inside drop is the only failure
+        // mode and it'd be a poison error — which only happens if
+        // another panic already poisoned the mutex. Letting drop
+        // double-panic in that case aborts the process, which is
+        // the desired behavior (the metrics state is suspect anyway).
+        let mut g = self.metrics.inner.lock().unwrap();
+        let c = g.entry(self.consumer).or_default();
+        c.in_flight = c.in_flight.saturating_sub(1);
     }
 }
 
@@ -283,6 +321,36 @@ mod tests {
         // With one sample, both percentiles are that sample.
         assert_eq!(p50, p95);
         assert!(p50 >= 10);
+    }
+
+    #[tokio::test]
+    async fn observe_decrements_in_flight_when_wrapped_future_panics() {
+        // Panic-safety: even if the LLM call panics mid-flight, the
+        // RAII guard must decrement in_flight so the counter
+        // converges to 0 after the panic propagates.
+        use futures::FutureExt;
+        let m = InferenceMetrics::new();
+        let m_clone = m.clone();
+        let res = std::panic::AssertUnwindSafe(async move {
+            m_clone
+                .observe::<&str, &str, _>(InferenceConsumer::Automations, async {
+                    panic!("simulated LLM crash");
+                })
+                .await
+        })
+        .catch_unwind()
+        .await;
+        assert!(res.is_err(), "panic must propagate through observe");
+        // total_calls is NOT incremented on panic (the call didn't
+        // complete), but in_flight is back to 0.
+        let snap = m.snapshot();
+        let auto = snap
+            .consumers
+            .iter()
+            .find(|c| c.consumer == InferenceConsumer::Automations)
+            .unwrap();
+        assert_eq!(auto.in_flight, 0, "guard must decrement on panic");
+        assert_eq!(auto.total_calls, 0, "panicked call must not count toward totals");
     }
 
     #[tokio::test]
