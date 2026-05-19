@@ -316,30 +316,69 @@ fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {
 /// quit, dockerd not started) reads as `available: false` — which
 /// is the right answer for the wizard's "can we manage backends?"
 /// question.
+///
+/// PATH handling: the launchd-spawned server inherits the minimal
+/// default PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), which does NOT
+/// include `/usr/local/bin/` or `/opt/homebrew/bin/`. Docker
+/// Desktop installs the CLI at `/usr/local/bin/docker` →
+/// `/Applications/Docker.app/Contents/Resources/bin/docker`, so
+/// `Command::new("docker")` returns `program not found` even
+/// though the daemon is up and the sidecar supervisor (which uses
+/// the Unix socket via Bollard) can talk to it just fine. We try
+/// `docker` on PATH first for the dev-shell case, then fall back
+/// to absolute paths at the well-known install locations. The
+/// first one that exits 0 wins.
 fn detect_docker() -> DockerStatus {
+    // PATH probe first — covers `cargo run` from a dev shell and
+    // operators who put docker somewhere non-standard but in PATH.
+    if let Some(s) = try_docker_at("docker") {
+        return s;
+    }
+    // Absolute-path fallbacks for the launchd-spawn case where
+    // PATH is minimal. Order matters: macOS Docker Desktop's
+    // symlink at /usr/local/bin/docker is the most common; the
+    // brew-installed `docker` CLI on Apple-Silicon brew lives at
+    // /opt/homebrew/bin/docker; the .app's internal bin directory
+    // works as a last resort even without the /usr/local/ symlink.
+    for path in [
+        "/usr/local/bin/docker",
+        "/opt/homebrew/bin/docker",
+        "/Applications/Docker.app/Contents/Resources/bin/docker",
+    ] {
+        if let Some(s) = try_docker_at(path) {
+            return s;
+        }
+    }
+    DockerStatus {
+        available: false,
+        version: None,
+    }
+}
+
+/// Run `<binary> info --format '{{.ServerVersion}}'` and translate
+/// the result into `Option<DockerStatus>`. Returns `Some` when the
+/// command exited 0 (Docker is reachable) and `None` otherwise so
+/// the caller can fall through to the next candidate path.
+fn try_docker_at(binary: &str) -> Option<DockerStatus> {
     use std::process::Command;
-    let output = Command::new("docker")
+    let output = Command::new(binary)
         .arg("info")
         .arg("--format")
         .arg("{{.ServerVersion}}")
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            let version = String::from_utf8_lossy(&o.stdout).trim().to_owned();
-            DockerStatus {
-                available: true,
-                version: if version.is_empty() {
-                    None
-                } else {
-                    Some(version)
-                },
-            }
-        }
-        _ => DockerStatus {
-            available: false,
-            version: None,
-        },
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Some(DockerStatus {
+        available: true,
+        version: if version.is_empty() {
+            None
+        } else {
+            Some(version)
+        },
+    })
 }
 
 /// Probe whether Ollama is installed and runnable. Two-step check

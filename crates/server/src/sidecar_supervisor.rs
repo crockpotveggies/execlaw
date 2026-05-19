@@ -670,6 +670,32 @@ impl SidecarSupervisor {
                 container_port: sidecar.rpc_port,
                 ..Default::default()
             };
+            // Plugin sidecars typically declare images like
+            // `execlaw/python-sandbox-fast:0.1.0` that only exist
+            // locally — operators don't `docker push` to a public
+            // registry. When the image isn't present, fall through
+            // to a local `docker build` against the plugin's stage
+            // dir BEFORE the spawn attempt. Otherwise Bollard's
+            // pull fails with a 404 and the supervisor parks the
+            // slot at CrashLooping after MAX_RESTART_ATTEMPTS for
+            // a problem an automatic build would have solved in
+            // ~30 seconds. Skip when `stage_path` is None (test
+            // fixtures register sidecars without a build context;
+            // those use prebuilt mock images).
+            if let Some(stage) = sidecar.stage_path.as_ref() {
+                if let Err(e) =
+                    ensure_sidecar_image_built(&sidecar.image, stage, &sidecar.plugin_id).await
+                {
+                    warn!(
+                        sidecar = %sidecar.name,
+                        plugin_id = %sidecar.plugin_id,
+                        image = %sidecar.image,
+                        error = %e,
+                        "sidecar image build skipped/failed; continuing to spawn — \
+                         Bollard will report the pull failure if the image isn't local",
+                    );
+                }
+            }
             match self.controller.spawn(&spec).await {
                 Ok(handle) => {
                     info!(
@@ -978,6 +1004,135 @@ impl SidecarSupervisor {
 /// `execlaw-…` convention finds sidecars where they expect.
 fn container_name(plugin_id: &str, name: &str) -> String {
     format!("execlaw-sidecar-{plugin_id}-{name}")
+}
+
+/// Build the sidecar's Docker image from the plugin's stage dir
+/// when it's not already present locally. Skips the build when
+/// `docker image inspect <image>` exits 0 — that's the
+/// short-circuit that lets a subsequent operator-paced rebuild
+/// (`docker build -t <image>` from the dev shell) survive a
+/// supervisor restart.
+///
+/// Plugin sidecars almost always declare images that exist ONLY on
+/// the operator's host — `execlaw/python-sandbox-fast:0.1.0` isn't
+/// on Docker Hub, and `docker pull` 404s instead of falling
+/// through to a local build. This helper closes that gap: when
+/// the image is missing AND the plugin's stage dir contains a
+/// `Dockerfile`, we shell out to `docker build` against that
+/// context. Returns `Ok(())` on either "image already present" or
+/// "build succeeded"; an `Err(String)` triggers the supervisor's
+/// existing warn-and-continue path so the operator still sees the
+/// downstream pull-404 message and knows the underlying issue.
+async fn ensure_sidecar_image_built(
+    image: &str,
+    stage_path: &std::path::Path,
+    plugin_id: &str,
+) -> Result<(), String> {
+    let docker = resolve_docker_binary().ok_or_else(|| {
+        "docker CLI not found on PATH or known install locations \
+         (/usr/local/bin, /opt/homebrew/bin, /Applications/Docker.app/...)"
+            .to_string()
+    })?;
+
+    // 1. Check whether the image is already present locally.
+    //    `docker image inspect` exits 0 on hit, non-zero on miss.
+    let inspect = tokio::process::Command::new(&docker)
+        .arg("image")
+        .arg("inspect")
+        .arg(image)
+        .output()
+        .await
+        .map_err(|e| format!("could not invoke `docker image inspect`: {e}"))?;
+    if inspect.status.success() {
+        debug!(
+            image,
+            plugin_id, "sidecar image already present locally; skipping build",
+        );
+        return Ok(());
+    }
+
+    // 2. Image is missing — try to build from the plugin's stage
+    //    dir. Confirm a Dockerfile exists before we run the
+    //    build; otherwise we'd surface a noisier "no such file"
+    //    error from docker itself.
+    let dockerfile = stage_path.join("Dockerfile");
+    if !dockerfile.exists() {
+        return Err(format!(
+            "image `{image}` is not local and {} has no Dockerfile to build from",
+            stage_path.display()
+        ));
+    }
+
+    info!(
+        image,
+        plugin_id,
+        context = %stage_path.display(),
+        "sidecar image missing locally; running `docker build`",
+    );
+    // PATH must include the Docker Desktop bin dir so BuildKit
+    // can find its credential helper (`docker-credential-desktop`)
+    // when resolving `FROM python:3.12-alpine` against Docker Hub.
+    // launchd's default PATH is `/usr/bin:/bin:/usr/sbin:/sbin` —
+    // missing both `/usr/local/bin/` (macOS Docker Desktop
+    // symlink) and `/opt/homebrew/bin/` (Apple-Silicon brew).
+    // Without this the build dies fast with `error getting
+    // credentials - exec: "docker-credential-desktop": executable
+    // file not found in $PATH`.
+    let extended_path = std::env::var("PATH")
+        .unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".to_string());
+    let extended_path = format!(
+        "/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:{extended_path}"
+    );
+    let status = tokio::process::Command::new(&docker)
+        .arg("build")
+        .arg("-t")
+        .arg(image)
+        .arg(stage_path.as_os_str())
+        .env("PATH", &extended_path)
+        .status()
+        .await
+        .map_err(|e| format!("could not invoke `docker build`: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "`docker build` for {image} exited non-zero ({:?}); \
+             run the build manually with `docker build -t {image} {}` \
+             to see the full output",
+            status.code(),
+            stage_path.display(),
+        ));
+    }
+    info!(image, plugin_id, "sidecar image build complete");
+    Ok(())
+}
+
+/// Resolve a usable `docker` binary path. Mirrors the absolute-
+/// path fallbacks in `setup_preflight::detect_docker` since the
+/// launchd-spawned server inherits a minimal PATH (`/usr/bin:
+/// /bin:/usr/sbin:/sbin`) that excludes both `/usr/local/bin`
+/// (Docker Desktop's symlink) and `/opt/homebrew/bin` (brew's
+/// docker CLI). Returns the first path whose `-v` invocation
+/// exits 0; `None` when no candidate works.
+fn resolve_docker_binary() -> Option<String> {
+    use std::process::Command;
+    for candidate in [
+        "docker",
+        "/usr/local/bin/docker",
+        "/opt/homebrew/bin/docker",
+        "/Applications/Docker.app/Contents/Resources/bin/docker",
+    ] {
+        // NOT `?` — a failed lookup on one candidate (e.g.
+        // `docker` not on launchd's PATH) must fall through to
+        // the next, not short-circuit out of the whole function.
+        // Pre-fix this returned None on the first miss and the
+        // sidecar supervisor never tried `/usr/local/bin/docker`,
+        // leaving python-sandbox stuck on a pull-404.
+        if let Ok(out) = Command::new(candidate).arg("-v").output() {
+            if out.status.success() {
+                return Some(candidate.to_owned());
+            }
+        }
+    }
+    None
 }
 
 /// Translate a sidecar's [`MountDecl`] entries into the
