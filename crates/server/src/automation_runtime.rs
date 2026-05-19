@@ -166,7 +166,22 @@ fn run_one(
     let mut state: HashMap<String, serde_json::Value> = HashMap::new();
     state.insert("event".to_string(), event_ctx.clone());
 
-    let outcome = execute_graph(&automation.definition, &mut state, pool, &run_store, &run_id);
+    // Inline trace sink: each node-boundary advance calls
+    // `run_store.append_trace(run_id, &trace)`. The closure indirection
+    // is what lets the same executor body power both live runs (DB
+    // checkpointing) and dry runs (in-memory Vec sink) without
+    // duplication.
+    let mut trace_sink = |trace: StepTrace| {
+        if let Err(e) = run_store.append_trace(&run_id, &trace) {
+            warn!(
+                error = %e,
+                run_id = %run_id,
+                node_id = %trace.node_id,
+                "automation runtime: failed to append step trace",
+            );
+        }
+    };
+    let outcome = execute_graph(&automation.definition, &mut state, pool, &mut trace_sink);
     let finished_at = chrono::Utc::now().timestamp_millis();
     let final_status = match outcome {
         ExecOutcome::Success => AutomationRunStatus::Success,
@@ -182,8 +197,52 @@ fn run_one(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExecOutcome {
+/// Result of a [`dry_run`] — outcome + captured per-node trace.
+/// The HTTP `POST /test-run` endpoint serializes this directly.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DryRunResult {
+    pub outcome: ExecOutcome,
+    pub step_traces: Vec<StepTrace>,
+}
+
+/// Run the executor against an automation + a synthetic / captured
+/// event, capturing per-node traces in memory. Does NOT persist a
+/// run row — used by the editor's "Test run" button so the operator
+/// can iterate on a definition without polluting `state_automation_runs`.
+///
+/// The agent pool is reused, so an `AskAgent` node in a test run will
+/// actually invoke the LLM through the same path as live dispatch.
+/// Callers that don't want to hit the model should swap the pool's
+/// invoker (the M3 test fixtures show how — `StubAgentInvoker`).
+pub fn dry_run(
+    db: &Database,
+    pool: &AutomationsAgentPool,
+    automation: &AutomationRow,
+    sample: &BusEventRow,
+) -> DryRunResult {
+    let _ = db; // currently unused — reserved for M5 features that read state
+    let event_ctx = event_context(sample);
+    let mut state: HashMap<String, serde_json::Value> = HashMap::new();
+    state.insert("event".to_string(), event_ctx);
+    let mut traces: Vec<StepTrace> = Vec::new();
+    let outcome = execute_graph(
+        &automation.definition,
+        &mut state,
+        pool,
+        &mut |t: StepTrace| traces.push(t),
+    );
+    DryRunResult {
+        outcome,
+        step_traces: traces,
+    }
+}
+
+/// Public terminal state for one walk through the graph. Live runs
+/// translate this into [`AutomationRunStatus`]; dry runs return it
+/// to the caller verbatim alongside the captured traces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecOutcome {
     Success,
     Skipped,
     Failed,
@@ -191,12 +250,17 @@ enum ExecOutcome {
 
 /// Walk the graph from `TRIGGER_SENTINEL` until we hit an end
 /// condition. State is mutated in place as nodes write outputs.
+///
+/// The trace sink is invoked at each node boundary BEFORE the run
+/// advances. Live runs pass a closure that checkpoints the trace into
+/// SQLite via `AutomationRunStore::append_trace`; dry runs pass a
+/// closure that pushes into a `Vec<StepTrace>`. Same executor body
+/// powers both paths.
 fn execute_graph(
     def: &AutomationDef,
     state: &mut HashMap<String, serde_json::Value>,
     pool: &AutomationsAgentPool,
-    run_store: &AutomationRunStore<'_>,
-    run_id: &str,
+    trace_sink: &mut dyn FnMut(StepTrace),
 ) -> ExecOutcome {
     let mut current = TRIGGER_SENTINEL.to_string();
     // Defense in depth — refuse to walk pathologically long graphs.
@@ -215,7 +279,7 @@ fn execute_graph(
                     ms: 0,
                     error: Some(msg),
                 };
-                let _ = run_store.append_trace(run_id, &trace);
+                trace_sink(trace);
                 return ExecOutcome::Failed;
             }
         };
@@ -242,7 +306,7 @@ fn execute_graph(
                     ms,
                     error: None,
                 };
-                let _ = run_store.append_trace(run_id, &trace);
+                trace_sink(trace);
                 state.insert(node.id.clone(), value);
                 current = node.id.clone();
             }
@@ -254,7 +318,7 @@ fn execute_graph(
                     ms,
                     error: None,
                 };
-                let _ = run_store.append_trace(run_id, &trace);
+                trace_sink(trace);
                 return ExecOutcome::Skipped;
             }
             NodeOutcome::Terminal => {
@@ -265,7 +329,7 @@ fn execute_graph(
                     ms,
                     error: None,
                 };
-                let _ = run_store.append_trace(run_id, &trace);
+                trace_sink(trace);
                 return ExecOutcome::Success;
             }
             NodeOutcome::Error(msg) => {
@@ -276,7 +340,7 @@ fn execute_graph(
                     ms,
                     error: Some(msg),
                 };
-                let _ = run_store.append_trace(run_id, &trace);
+                trace_sink(trace);
                 return ExecOutcome::Failed;
             }
         }
@@ -289,7 +353,7 @@ fn execute_graph(
         ms: 0,
         error: Some(format!("automation exceeded {max_hops} hops; suspected cycle")),
     };
-    let _ = run_store.append_trace(run_id, &trace);
+    trace_sink(trace);
     ExecOutcome::Failed
 }
 

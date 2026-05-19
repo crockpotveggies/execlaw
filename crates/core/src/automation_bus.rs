@@ -262,6 +262,52 @@ impl<'a> BusEventStore<'a> {
         Ok(row)
     }
 
+    /// Return the last `limit` events of a given kind, newest first.
+    /// Backs the editor's "sample payload" picker (M4c) — when the
+    /// operator wants to test-run an automation, they pick from a
+    /// dropdown of recently-observed events of the matching kind so
+    /// they don't have to hand-craft the payload.
+    pub fn list_recent_for_kind(
+        &self,
+        kind: BusEventKind,
+        limit: i64,
+    ) -> Result<Vec<BusEventRow>, BusEventError> {
+        let kind_str = kind.as_str();
+        let rows = self.db.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, kind, source, received_at, payload, internal, dispatched_at \
+                 FROM state_bus_events \
+                 WHERE kind = ?1 \
+                 ORDER BY received_at DESC \
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![kind_str, limit], |r| {
+                let row_id: String = r.get(0)?;
+                let payload_str: String = r.get(4)?;
+                let payload: serde_json::Value = match serde_json::from_str(&payload_str) {
+                    Ok(v) => v,
+                    Err(_) => serde_json::Value::Null,
+                };
+                let internal_flag: i64 = r.get(5)?;
+                Ok(BusEventRow {
+                    id: row_id,
+                    kind: BusEventKind::parse(&r.get::<_, String>(1)?),
+                    source: r.get(2)?,
+                    received_at: r.get(3)?,
+                    payload,
+                    internal: internal_flag != 0,
+                    dispatched_at: r.get(6)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })?;
+        Ok(rows)
+    }
+
     /// Return the IDs of rows the dispatcher still owes work for,
     /// oldest first. Workhorse for two paths:
     ///

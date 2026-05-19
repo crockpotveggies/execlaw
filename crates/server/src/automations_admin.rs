@@ -23,14 +23,15 @@
 //! human-readable message verbatim — operators get actionable
 //! feedback without spelunking the trace.
 
+use crate::automation_runtime;
 use crate::routes::ApiError;
 use crate::state::AppState;
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use axum::routing::{delete, get, post, put};
-use execlaw_core::automation_bus::BusEventKind;
+use execlaw_core::automation_bus::{BusEventKind, BusEventRow, BusEventStore};
 use execlaw_core::automation_runs::AutomationRunStore;
 use execlaw_core::automation_suggestions::SuggestionStore;
 use execlaw_core::automations::{
@@ -58,6 +59,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/admin/automations/{id}/enable", post(enable))
         .route("/api/admin/automations/{id}/disable", post(disable))
         .route("/api/admin/automations/{id}/runs", get(list_runs))
+        .route("/api/admin/automations/{id}/test-run", post(test_run))
+        .route("/api/admin/automations/recent-events", get(list_recent_events))
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +115,64 @@ pub struct MetricsDto {
     pub runs_24h: i64,
     pub success_rate_24h: Option<f64>, // None when no runs in window
     pub untriaged_kinds_24h: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecentBusEventDto {
+    pub id: String,
+    pub kind: BusEventKind,
+    pub source: String,
+    pub received_at: i64,
+    pub payload: serde_json::Value,
+}
+
+impl From<BusEventRow> for RecentBusEventDto {
+    fn from(r: BusEventRow) -> Self {
+        Self {
+            id: r.id,
+            kind: r.kind,
+            source: r.source,
+            received_at: r.received_at,
+            payload: r.payload,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecentEventsQuery {
+    pub kind: BusEventKind,
+    #[serde(default = "default_recent_limit")]
+    pub limit: i64,
+}
+
+fn default_recent_limit() -> i64 {
+    50
+}
+
+/// Body for the test-run endpoint. Two modes:
+///
+///   1. `event_id` — resolve a captured event from `state_bus_events`.
+///      Use this when picking from the "recent events" dropdown.
+///   2. `sample_event` — synthesize an event from scratch. Use this
+///      when no captured event is suitable (e.g., the operator wants
+///      to test against a hypothetical payload).
+///
+/// One of the two MUST be set. If both are set, `event_id` wins so
+/// the operator's edit of the picked event's payload doesn't silently
+/// re-resolve.
+#[derive(Debug, Deserialize)]
+pub struct TestRunRequest {
+    #[serde(default)]
+    pub event_id: Option<String>,
+    #[serde(default)]
+    pub sample_event: Option<SampleEventBody>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SampleEventBody {
+    pub kind: BusEventKind,
+    pub source: String,
+    pub payload: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -248,6 +309,90 @@ async fn toggle(state: &AppState, id: &str, enabled: bool) -> Result<StatusCode,
             message: format!("no automation with id '{id}'"),
         })
     }
+}
+
+async fn list_recent_events(
+    State(state): State<AppState>,
+    Query(q): Query<RecentEventsQuery>,
+) -> Result<Json<Vec<RecentBusEventDto>>, ApiError> {
+    let limit = q.limit.clamp(1, 200);
+    let rows = BusEventStore::new(&state.db)
+        .list_recent_for_kind(q.kind, limit)
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "recent_events_failed",
+            message: format!("{e}"),
+        })?;
+    Ok(Json(rows.into_iter().map(RecentBusEventDto::from).collect()))
+}
+
+async fn test_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<TestRunRequest>,
+) -> Result<Json<automation_runtime::DryRunResult>, ApiError> {
+    // Resolve the automation up front so a bad id 404s before we
+    // touch the bus store.
+    let auto_store = AutomationStore::new(&state.db);
+    let automation = auto_store
+        .get(&id)
+        .map_err(automation_err)?
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "automation_not_found",
+            message: format!("no automation with id '{id}'"),
+        })?;
+    // Resolve the event — captured or synthesized.
+    let event = match (req.event_id.as_deref(), req.sample_event) {
+        (Some(eid), _) => BusEventStore::new(&state.db)
+            .get(eid)
+            .map_err(|e| ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "bus_event_lookup_failed",
+                message: format!("{e}"),
+            })?
+            .ok_or_else(|| ApiError {
+                status: StatusCode::NOT_FOUND,
+                code: "bus_event_not_found",
+                message: format!("no bus event with id '{eid}'"),
+            })?,
+        (None, Some(s)) => {
+            // Synthesize a non-persisted BusEventRow. ID is
+            // informational (the dry-run path never writes it back).
+            BusEventRow {
+                id: format!("test-run:{}", uuid::Uuid::new_v4()),
+                kind: s.kind,
+                source: s.source,
+                received_at: chrono::Utc::now().timestamp_millis(),
+                payload: s.payload,
+                internal: false,
+                dispatched_at: None,
+            }
+        }
+        (None, None) => {
+            return Err(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                code: "test_run_missing_event",
+                message: "either event_id or sample_event must be set".into(),
+            });
+        }
+    };
+    // The dry-run path holds the calling tokio worker for the
+    // duration of the executor (which may invoke the agent pool
+    // synchronously via `block_on`). Push it onto a blocking thread
+    // so the admin handler doesn't park a runtime worker.
+    let db = state.db.clone();
+    let pool = state.automation_agent_pool.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        automation_runtime::dry_run(&db, &pool, &automation, &event)
+    })
+    .await
+    .map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "test_run_spawn_failed",
+        message: format!("{e}"),
+    })?;
+    Ok(Json(result))
 }
 
 async fn list_runs(
@@ -730,6 +875,207 @@ mod tests {
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["source"], "webhook:ring");
         assert_eq!(arr[0]["event_count"], 15);
+    }
+
+    #[tokio::test]
+    async fn test_run_with_sample_event_returns_dry_run_result() {
+        // E2E for the M4c test-run endpoint: create an automation
+        // with a Filter that always passes, then POST a synthetic
+        // event; the result carries the in-memory step trace + a
+        // success outcome AND no run row lands on disk.
+        let state = test_app_state();
+        let app = router().with_state(state.clone());
+        // Create the automation.
+        let def = AutomationDef {
+            trigger: TriggerDef {
+                kind: BusEventKind::WebhookReceived,
+                when: None,
+            },
+            nodes: vec![
+                NodeDef {
+                    id: "f1".into(),
+                    kind: NodeKind::Filter,
+                    config: serde_json::json!({"expr": "true"}),
+                },
+                NodeDef {
+                    id: "end".into(),
+                    kind: NodeKind::Terminal,
+                    config: serde_json::json!({}),
+                },
+            ],
+            edges: vec![
+                EdgeDef {
+                    from: TRIGGER_SENTINEL.into(),
+                    to: "f1".into(),
+                    when: None,
+                },
+                EdgeDef {
+                    from: "f1".into(),
+                    to: "end".into(),
+                    when: None,
+                },
+            ],
+        };
+        let (_, body) = json_req(
+            app.clone(),
+            "POST",
+            "/api/admin/automations",
+            Some(&CreateAutomationRequest {
+                name: "test-run-target".into(),
+                enabled: true,
+                definition: def,
+            }),
+        )
+        .await;
+        let id = body["id"].as_str().unwrap().to_string();
+        // POST test-run with a synthesized event.
+        let trbody = serde_json::json!({
+            "sample_event": {
+                "kind": "webhook.received",
+                "source": "test",
+                "payload": {"k": "v"}
+            }
+        });
+        let (status, result) = json_req(
+            app,
+            "POST",
+            &format!("/api/admin/automations/{id}/test-run"),
+            Some(&trbody),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result["outcome"], "success");
+        let steps = result["step_traces"].as_array().unwrap();
+        assert!(steps.iter().any(|t| t["node_id"] == "f1"));
+        // Crucially: no run row was persisted for this dry run.
+        use execlaw_core::automation_runs::AutomationRunStore;
+        let runs = AutomationRunStore::new(&state.db)
+            .list_for_automation(&id, 10)
+            .unwrap();
+        assert_eq!(runs.len(), 0, "dry run must NOT persist a run row");
+    }
+
+    #[tokio::test]
+    async fn test_run_requires_event_id_or_sample_event() {
+        let app = app();
+        let (_, body) = json_req(
+            app.clone(),
+            "POST",
+            "/api/admin/automations",
+            Some(&CreateAutomationRequest {
+                name: "x".into(),
+                enabled: true,
+                definition: AutomationDef {
+                    trigger: TriggerDef {
+                        kind: BusEventKind::WebhookReceived,
+                        when: None,
+                    },
+                    nodes: vec![NodeDef {
+                        id: "end".into(),
+                        kind: NodeKind::Terminal,
+                        config: serde_json::json!({}),
+                    }],
+                    edges: vec![EdgeDef {
+                        from: TRIGGER_SENTINEL.into(),
+                        to: "end".into(),
+                        when: None,
+                    }],
+                },
+            }),
+        )
+        .await;
+        let id = body["id"].as_str().unwrap().to_string();
+        let (status, body) = json_req(
+            app,
+            "POST",
+            &format!("/api/admin/automations/{id}/test-run"),
+            Some(&serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "test_run_missing_event");
+    }
+
+    #[tokio::test]
+    async fn test_run_unknown_automation_returns_404() {
+        let app = app();
+        let (status, _) = json_req(
+            app,
+            "POST",
+            "/api/admin/automations/no-such-id/test-run",
+            Some(&serde_json::json!({
+                "sample_event": {
+                    "kind": "webhook.received",
+                    "source": "x",
+                    "payload": {}
+                }
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn recent_events_filters_by_kind_and_respects_limit_clamp() {
+        let state = test_app_state();
+        let bus = execlaw_core::automation_bus::BusEventStore::new(&state.db);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        // Seed 6 webhook events + 2 routine events.
+        for i in 0..6 {
+            bus.publish(
+                &execlaw_core::automation_bus::Event {
+                    id: format!("wh-{i}"),
+                    kind: BusEventKind::WebhookReceived,
+                    source: "x".into(),
+                    received_at: now_ms - i,
+                    payload: serde_json::json!({"i": i}),
+                },
+                false,
+            )
+            .unwrap();
+        }
+        for i in 0..2 {
+            bus.publish(
+                &execlaw_core::automation_bus::Event {
+                    id: format!("rt-{i}"),
+                    kind: BusEventKind::RoutineFired,
+                    source: "x".into(),
+                    received_at: now_ms - i,
+                    payload: serde_json::json!({}),
+                },
+                false,
+            )
+            .unwrap();
+        }
+        let app = router().with_state(state);
+        // Kind filter respected.
+        let (status, body) = json_req::<()>(
+            app.clone(),
+            "GET",
+            "/api/admin/automations/recent-events?kind=webhook.received",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_array().unwrap().len(), 6);
+        // Limit clamps to [1, 200].
+        let (_, body) = json_req::<()>(
+            app.clone(),
+            "GET",
+            "/api/admin/automations/recent-events?kind=webhook.received&limit=3",
+            None,
+        )
+        .await;
+        assert_eq!(body.as_array().unwrap().len(), 3);
+        // Limit=0 clamps to 1, not 0.
+        let (_, body) = json_req::<()>(
+            app,
+            "GET",
+            "/api/admin/automations/recent-events?kind=webhook.received&limit=0",
+            None,
+        )
+        .await;
+        assert_eq!(body.as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

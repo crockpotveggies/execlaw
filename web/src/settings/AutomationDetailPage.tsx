@@ -1,14 +1,10 @@
-// /automations/:id detail page (M4b).
+// /automations/:id detail page (M4b + M4c).
 //
-// Two panes:
-//
-//   * Top: name + enabled toggle + definition editor (JSON textarea in
-//     this milestone; React Flow canvas in a follow-up). The editor
-//     parses on save and forwards the server's validator message
-//     verbatim on a 400.
-//
-//   * Bottom: run history drawer (last 100 runs, per-step trace
-//     expandable inline). Read-only.
+//   * Header: name + enabled toggle + Save/Delete.
+//   * Editor: view toggle (Canvas | Code) over the same AutomationDef.
+//   * Test run: collapsible drawer with sample-event picker + inline
+//     trace of a non-persisted dry run.
+//   * Run history: last 100 runs, per-step trace expandable inline.
 //
 // The `id` prop carries either an existing automation id OR the
 // literal "new" (used by the suggestion-action handoff). When `id`
@@ -26,16 +22,23 @@ import Form from "react-bootstrap/Form";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
+import { AutomationCanvas } from "./AutomationCanvas";
 import {
     createAutomation,
     deleteAutomation,
     emptyAutomationDef,
     getAutomation,
+    kindLabel,
     listAutomationRuns,
+    listRecentBusEvents,
+    testRunAutomation,
     updateAutomation,
     type AutomationDef,
     type AutomationRunView,
     type BusEventKind,
+    type DryRunResult,
+    type RecentBusEvent,
+    type StepTrace,
 } from "../api/automations";
 
 interface Props {
@@ -58,6 +61,25 @@ export function AutomationDetailPage({ id }: Props) {
     const [error, setError] = useState<string | null>(null);
     const [busy, setBusy] = useState<boolean>(false);
     const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
+    // M4c additions:
+    const [view, setView] = useState<"canvas" | "code">("canvas");
+    const [testRunOpen, setTestRunOpen] = useState<boolean>(false);
+    const [recentEvents, setRecentEvents] = useState<RecentBusEvent[]>([]);
+    const [selectedEventId, setSelectedEventId] = useState<string>("");
+    const [testRunResult, setTestRunResult] = useState<DryRunResult | null>(null);
+    const [testRunBusy, setTestRunBusy] = useState<boolean>(false);
+
+    // Parsed definition for canvas rendering. `null` when the JSON
+    // textarea contains invalid syntax — we render an inline parse
+    // error instead of a broken canvas.
+    const parsedDef = useMemo<{ def: AutomationDef | null; err: string | null }>(() => {
+        if (defJson.trim() === "") return { def: null, err: null };
+        try {
+            return { def: JSON.parse(defJson) as AutomationDef, err: null };
+        } catch (e) {
+            return { def: null, err: (e as Error).message };
+        }
+    }, [defJson]);
 
     // Seed for create-mode — accept ?kind=<bus_event_kind> from the
     // "review suggestion" hand-off so the new automation starts on
@@ -132,6 +154,63 @@ export function AutomationDetailPage({ id }: Props) {
             setBusy(false);
         }
     }, [defJson, name, enabled, isNew, id, token, navigate]);
+
+    // Load the recent-events dropdown for the current trigger kind
+    // whenever the test-run drawer is open. Cheap; runs on mount-of-
+    // drawer-open + whenever the trigger kind in the JSON changes.
+    useEffect(() => {
+        if (!testRunOpen) return;
+        const kind = parsedDef.def?.trigger?.kind;
+        if (!kind) return;
+        let cancelled = false;
+        listRecentBusEvents(kind, 50, token)
+            .then((rows) => {
+                if (!cancelled) setRecentEvents(rows);
+            })
+            .catch((e) => {
+                if (!cancelled) {
+                    setError(
+                        `Failed to load recent events for sample picker: ${(e as Error).message}`,
+                    );
+                }
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [testRunOpen, parsedDef.def, token]);
+
+    const onTestRun = useCallback(async () => {
+        if (isNew) {
+            setError("Save the automation before test-running.");
+            return;
+        }
+        if (!parsedDef.def) {
+            setError(
+                "Definition is not valid JSON — fix and switch to code view to see the parse error.",
+            );
+            return;
+        }
+        setTestRunBusy(true);
+        setError(null);
+        setTestRunResult(null);
+        try {
+            const body = selectedEventId
+                ? { event_id: selectedEventId }
+                : {
+                      sample_event: {
+                          kind: parsedDef.def.trigger.kind,
+                          source: "test-run",
+                          payload: {},
+                      },
+                  };
+            const result = await testRunAutomation(id, body, token);
+            setTestRunResult(result);
+        } catch (e) {
+            setError((e as Error).message || "Test run failed");
+        } finally {
+            setTestRunBusy(false);
+        }
+    }, [id, isNew, parsedDef.def, selectedEventId, token]);
 
     const onDelete = useCallback(async () => {
         if (isNew) return;
@@ -209,28 +288,81 @@ export function AutomationDetailPage({ id }: Props) {
                 </div>
             </div>
 
-            <Form.Group className="mb-3">
-                <Form.Label className="small text-muted mb-1">
-                    Definition (JSON)
-                </Form.Label>
-                <Form.Control
-                    as="textarea"
-                    value={defJson}
-                    onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
-                        setDefJson(e.target.value)
-                    }
-                    rows={18}
-                    spellCheck={false}
-                    className="font-monospace small"
-                    data-testid="automation-def-textarea"
-                />
-                <div className="small text-muted mt-1">
-                    Trigger + typed nodes + edges. Server validates on save —
-                    a 400 surfaces the validator's message inline. The visual
-                    canvas editor lands in a follow-up; the JSON shape is the
-                    source of truth.
+            <div className="d-flex justify-content-between align-items-end mb-2">
+                <div className="small text-muted">
+                    Definition — toggle Canvas / Code. JSON is the source of
+                    truth; canvas is a deterministic rendering of the same
+                    structure.
                 </div>
-            </Form.Group>
+                <div
+                    className="btn-group btn-group-sm"
+                    role="group"
+                    aria-label="Editor view toggle"
+                    data-testid="automation-view-toggle"
+                >
+                    <Button
+                        variant={view === "canvas" ? "primary" : "outline-primary"}
+                        size="sm"
+                        onClick={() => setView("canvas")}
+                        data-testid="automation-view-canvas"
+                    >
+                        <i className="bi bi-diagram-3 me-1" aria-hidden /> Canvas
+                    </Button>
+                    <Button
+                        variant={view === "code" ? "primary" : "outline-primary"}
+                        size="sm"
+                        onClick={() => setView("code")}
+                        data-testid="automation-view-code"
+                    >
+                        <i className="bi bi-braces me-1" aria-hidden /> Code
+                    </Button>
+                </div>
+            </div>
+
+            {view === "canvas" ? (
+                parsedDef.def ? (
+                    <AutomationCanvas definition={parsedDef.def} />
+                ) : (
+                    <div
+                        className="border rounded p-3 small text-danger"
+                        data-testid="automation-canvas-parse-error"
+                    >
+                        Definition is not valid JSON. Switch to Code view to
+                        fix it. ({parsedDef.err})
+                    </div>
+                )
+            ) : (
+                <Form.Group className="mb-3">
+                    <Form.Control
+                        as="textarea"
+                        value={defJson}
+                        onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                            setDefJson(e.target.value)
+                        }
+                        rows={18}
+                        spellCheck={false}
+                        className="font-monospace small"
+                        data-testid="automation-def-textarea"
+                    />
+                    <div className="small text-muted mt-1">
+                        Server validates on save — a 400 surfaces the
+                        validator's message inline.
+                    </div>
+                </Form.Group>
+            )}
+
+            {!isNew && (
+                <TestRunDrawer
+                    isOpen={testRunOpen}
+                    onToggle={() => setTestRunOpen((v) => !v)}
+                    recentEvents={recentEvents}
+                    selectedEventId={selectedEventId}
+                    onSelectEvent={setSelectedEventId}
+                    onRun={onTestRun}
+                    busy={testRunBusy}
+                    result={testRunResult}
+                />
+            )}
 
             {!isNew && (
                 <RunsDrawer
@@ -241,6 +373,137 @@ export function AutomationDetailPage({ id }: Props) {
                     }
                 />
             )}
+        </div>
+    );
+}
+
+interface TestRunDrawerProps {
+    isOpen: boolean;
+    onToggle: () => void;
+    recentEvents: RecentBusEvent[];
+    selectedEventId: string;
+    onSelectEvent: (id: string) => void;
+    onRun: () => void;
+    busy: boolean;
+    result: DryRunResult | null;
+}
+
+function TestRunDrawer({
+    isOpen,
+    onToggle,
+    recentEvents,
+    selectedEventId,
+    onSelectEvent,
+    onRun,
+    busy,
+    result,
+}: TestRunDrawerProps) {
+    return (
+        <section className="mt-4" data-testid="test-run-drawer">
+            <div className="d-flex justify-content-between align-items-center">
+                <h3 className="h6 mb-0">
+                    <i className="bi bi-play-circle me-1" aria-hidden />
+                    Test run
+                </h3>
+                <Button
+                    variant="link"
+                    size="sm"
+                    onClick={onToggle}
+                    data-testid="test-run-toggle"
+                >
+                    {isOpen ? "Hide" : "Show"}
+                </Button>
+            </div>
+            {isOpen && (
+                <div className="border rounded p-3 mt-2">
+                    <Form.Group className="mb-2">
+                        <Form.Label className="small text-muted mb-1">
+                            Sample event
+                        </Form.Label>
+                        <Form.Select
+                            size="sm"
+                            value={selectedEventId}
+                            onChange={(e) => onSelectEvent(e.target.value)}
+                            data-testid="test-run-event-picker"
+                        >
+                            <option value="">— Synthesize empty payload —</option>
+                            {recentEvents.map((ev) => (
+                                <option key={ev.id} value={ev.id}>
+                                    {kindLabel(ev.kind)} · {ev.source} ·{" "}
+                                    {new Date(ev.received_at).toLocaleString()}
+                                </option>
+                            ))}
+                        </Form.Select>
+                        <div className="small text-muted mt-1">
+                            Pick from the last 50 events of this trigger's kind.
+                            "Synthesize" runs against an empty-payload event of
+                            the trigger kind — useful for shape-only smoke tests.
+                        </div>
+                    </Form.Group>
+                    <Button
+                        variant="primary"
+                        size="sm"
+                        disabled={busy}
+                        onClick={onRun}
+                        data-testid="test-run-go"
+                    >
+                        {busy ? "Running…" : "Run"}
+                    </Button>
+                    {result && <TestRunResultView result={result} />}
+                </div>
+            )}
+        </section>
+    );
+}
+
+function TestRunResultView({ result }: { result: DryRunResult }) {
+    const variant =
+        result.outcome === "success"
+            ? "success"
+            : result.outcome === "failed"
+              ? "danger"
+              : "secondary";
+    return (
+        <div className="mt-3" data-testid="test-run-result">
+            <div className="mb-2">
+                <span
+                    className={`badge bg-${variant}-subtle text-${variant}-emphasis`}
+                    data-testid={`test-run-outcome-${result.outcome}`}
+                >
+                    {result.outcome}
+                </span>
+                <span className="small text-muted ms-2">
+                    {result.step_traces.length} step(s)
+                </span>
+            </div>
+            <table className="table table-sm align-middle mb-0">
+                <thead>
+                    <tr>
+                        <th>Node</th>
+                        <th>ms</th>
+                        <th>Output / error</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {result.step_traces.map((t: StepTrace, i: number) => (
+                        <tr key={`${t.node_id}-${i}`}>
+                            <td className="font-monospace small">{t.node_id}</td>
+                            <td className="small text-muted">{t.ms}</td>
+                            <td>
+                                {t.error ? (
+                                    <span className="text-danger small">
+                                        {t.error}
+                                    </span>
+                                ) : (
+                                    <pre className="small mb-0">
+                                        {JSON.stringify(t.output, null, 0)}
+                                    </pre>
+                                )}
+                            </td>
+                        </tr>
+                    ))}
+                </tbody>
+            </table>
         </div>
     );
 }

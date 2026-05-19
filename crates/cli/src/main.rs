@@ -1824,7 +1824,10 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     );
     let (automation_bus, automation_bus_tasks) = execlaw_server::automation_bus::AutomationBus::spawn(
         db.clone(),
-        execlaw_server::automation_runtime::build_handler(db.clone(), automation_agent_pool),
+        execlaw_server::automation_runtime::build_handler(
+            db.clone(),
+            automation_agent_pool.clone(),
+        ),
         automation_bus_stop.clone(),
     );
 
@@ -1856,6 +1859,7 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         reuse_update: reuse_update_sink,
         data_dir: data_dir.clone(),
         automation_bus,
+        automation_agent_pool,
     };
     // We don't await `automation_bus_tasks` — letting the spawned
     // dispatcher + poller run for the process lifetime. The `stop`

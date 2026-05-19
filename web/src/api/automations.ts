@@ -228,6 +228,59 @@ export async function actionSuggestion(
     );
 }
 
+// ---- Test-run + sample payloads (M4c) ----
+
+export type ExecOutcome = "success" | "skipped" | "failed";
+
+export interface DryRunResult {
+    outcome: ExecOutcome;
+    step_traces: StepTrace[];
+}
+
+export interface RecentBusEvent {
+    id: string;
+    kind: BusEventKind;
+    source: string;
+    received_at: number;
+    payload: unknown;
+}
+
+export interface SampleEventBody {
+    kind: BusEventKind;
+    source: string;
+    payload: unknown;
+}
+
+export interface TestRunRequest {
+    event_id?: string;
+    sample_event?: SampleEventBody;
+}
+
+export async function testRunAutomation(
+    id: string,
+    body: TestRunRequest,
+    tokenAccessor: () => string | null,
+): Promise<DryRunResult> {
+    return apiFetch<DryRunResult>(
+        `${BASE}/${encodeURIComponent(id)}/test-run`,
+        { method: "POST", body },
+        tokenAccessor,
+    );
+}
+
+export async function listRecentBusEvents(
+    kind: BusEventKind,
+    limit: number,
+    tokenAccessor: () => string | null,
+): Promise<RecentBusEvent[]> {
+    const q = new URLSearchParams({ kind, limit: String(limit) });
+    return apiFetch<RecentBusEvent[]>(
+        `${BASE}/recent-events?${q.toString()}`,
+        {},
+        tokenAccessor,
+    );
+}
+
 // ---- Helpers for templated defaults the UI uses ----
 
 /** Minimal valid graph: trigger → Terminal. Used as the seed when the
