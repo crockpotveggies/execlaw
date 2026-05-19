@@ -21,7 +21,14 @@ pub fn router() -> Router<AppState> {
     Router::new().route("/api/admin/inference/metrics", get(metrics))
 }
 
-async fn metrics(State(state): State<AppState>) -> Result<Json<MetricsSnapshot>, ApiError> {
+#[utoipa::path(
+    get,
+    path = "/api/admin/inference/metrics",
+    responses((status = 200, description = "Per-consumer inference call counters + p50/p95 latencies", body = MetricsSnapshot)),
+    security(("bearer_jwt" = [])),
+    tag = "inference"
+)]
+pub async fn metrics(State(state): State<AppState>) -> Result<Json<MetricsSnapshot>, ApiError> {
     Ok(Json(state.inference_metrics.snapshot()))
 }
 
@@ -87,10 +94,7 @@ mod tests {
             .iter()
             .find(|c| c["consumer"] == "automations")
             .unwrap();
-        let chat = consumers
-            .iter()
-            .find(|c| c["consumer"] == "chat")
-            .unwrap();
+        let chat = consumers.iter().find(|c| c["consumer"] == "chat").unwrap();
         assert_eq!(auto["total_calls"], 2);
         assert_eq!(chat["total_calls"], 1);
     }

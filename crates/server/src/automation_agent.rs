@@ -71,9 +71,7 @@ pub const DEFAULT_POOL_CONCURRENCY: usize = 1;
 /// — operators should be able to read it and know what to do.
 #[derive(Debug, Error)]
 pub enum AskAgentError {
-    #[error(
-        "AskAgent: no inference backend configured. Configure a model in Settings > Backends."
-    )]
+    #[error("AskAgent: no inference backend configured. Configure a model in Settings > Backends.")]
     NoLlmConfigured,
     #[error(
         "AskAgent: this automation requires vision (image attachments present) but the configured model is text-only. Configure a vision-capable model in Settings > Backends, or remove the attachments."
@@ -82,10 +80,7 @@ pub enum AskAgentError {
     #[error(
         "AskAgent: the agent did not call any exit tool within {max_turns} turn(s). Authors should make the prompt unambiguously require one of: {tool_names}."
     )]
-    NoExitToolCalled {
-        max_turns: u32,
-        tool_names: String,
-    },
+    NoExitToolCalled { max_turns: u32, tool_names: String },
     #[error("AskAgent: the agent called an unknown tool '{name}' (not one of: {valid})")]
     UnknownExitToolCalled { name: String, valid: String },
     #[error("AskAgent: agent tool-call arguments not valid JSON: {0}")]
@@ -313,11 +308,11 @@ impl AgentInvoker for InferenceAgentInvoker {
 fn model_id_is_vision_capable(model_id: &str) -> bool {
     let lower = model_id.to_ascii_lowercase();
     const PATTERNS: &[&str] = &[
-        "vl",          // qwen2.5-vl, qwen3.5-vl, qwen3-vl
-        "vision",      // llama-3.2-vision
-        "llava",       // llava-*
-        "pixtral",     // pixtral-12b
-        "internvl",    // internvl-*
+        "vl",       // qwen2.5-vl, qwen3.5-vl, qwen3-vl
+        "vision",   // llama-3.2-vision
+        "llava",    // llava-*
+        "pixtral",  // pixtral-12b
+        "internvl", // internvl-*
         "phi-3.5-vision",
         "phi-3-vision",
     ];
@@ -487,10 +482,7 @@ mod tests {
         }
         #[async_trait]
         impl AgentInvoker for DelayedStub {
-            async fn invoke(
-                &self,
-                _req: &AskAgentRequest,
-            ) -> Result<ExitToolCall, AskAgentError> {
+            async fn invoke(&self, _req: &AskAgentRequest) -> Result<ExitToolCall, AskAgentError> {
                 let now = self
                     .in_flight
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -548,10 +540,7 @@ mod tests {
         }
         #[async_trait]
         impl AgentInvoker for DelayedStub {
-            async fn invoke(
-                &self,
-                _req: &AskAgentRequest,
-            ) -> Result<ExitToolCall, AskAgentError> {
+            async fn invoke(&self, _req: &AskAgentRequest) -> Result<ExitToolCall, AskAgentError> {
                 let now = self
                     .in_flight
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -589,7 +578,10 @@ mod tests {
             tokio::spawn(async move { p3.invoke(&r3).await }),
         );
         let m = max_observed.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(m >= 2 && m <= 2, "pool=2 should peak at 2 concurrent, got {m}");
+        assert!(
+            m >= 2 && m <= 2,
+            "pool=2 should peak at 2 concurrent, got {m}"
+        );
     }
 
     #[test]
@@ -613,7 +605,7 @@ mod tests {
     #[test]
     fn model_id_vision_heuristic_rejects_text_only_models() {
         for id in [
-            "QuantTrio/Qwen3.5-27B-AWQ",       // current default — text only
+            "QuantTrio/Qwen3.5-27B-AWQ", // current default — text only
             "meta-llama/Llama-3.1-8B-Instruct",
             "mistralai/Mistral-7B-Instruct-v0.3",
             "google/gemma-2-9b-it",
@@ -646,9 +638,7 @@ mod tests {
     /// operator's configuration is the source of truth.
     #[tokio::test]
     async fn inference_invoker_routes_to_vision_backend_when_attachments_present() {
-        use execlaw_core::backends::{
-            BackendMode, BackendPurpose, BackendStore, BackendUpsert,
-        };
+        use execlaw_core::backends::{BackendMode, BackendPurpose, BackendStore, BackendUpsert};
         let db = test_db();
         // Seed a Vision row pointing at a bogus URL (the invoker
         // routes there but the actual HTTP call will fail — that's

@@ -21,9 +21,10 @@ use crate::db::{Database, DbError};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub enum AutomationRunStatus {
     Pending,
     Running,
@@ -61,15 +62,17 @@ impl AutomationRunStatus {
 
 /// One entry in `step_traces`. Written before the runtime advances
 /// past the node — node-boundary checkpointing.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct StepTrace {
     pub node_id: String,
     /// JSON snapshot of the inputs the node saw — used for replay /
     /// debugging. Authors of large-payload nodes should be aware
     /// this gets persisted.
+    #[schema(value_type = Object)]
     pub input: serde_json::Value,
     /// JSON output of the node. For Terminal / Filter (drop) nodes
     /// this is `null`.
+    #[schema(value_type = Object)]
     pub output: serde_json::Value,
     /// Wall-clock duration of the node in milliseconds.
     pub ms: u64,
@@ -78,7 +81,7 @@ pub struct StepTrace {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct AutomationRunRow {
     pub id: String,
     pub automation_id: String,
@@ -132,11 +135,7 @@ impl<'a> AutomationRunStore<'a> {
     /// Append a step trace + flip the run to `running` if it was
     /// `pending`. Idempotent on traces — callers are responsible
     /// for calling once per node-boundary advance.
-    pub fn append_trace(
-        &self,
-        run_id: &str,
-        trace: &StepTrace,
-    ) -> Result<(), AutomationRunError> {
+    pub fn append_trace(&self, run_id: &str, trace: &StepTrace) -> Result<(), AutomationRunError> {
         let trace_json = serde_json::to_string(trace)?;
         self.db.with_conn(|c| {
             // SQLite json_insert appends to an array via $[#]; the `#`
@@ -192,8 +191,8 @@ impl<'a> AutomationRunStore<'a> {
                         )
                     })?;
                     let traces_str: String = r.get(4)?;
-                    let step_traces: Vec<StepTrace> = serde_json::from_str(&traces_str)
-                        .map_err(|e| {
+                    let step_traces: Vec<StepTrace> =
+                        serde_json::from_str(&traces_str).map_err(|e| {
                             rusqlite::Error::FromSqlConversionFailure(
                                 4,
                                 rusqlite::types::Type::Text,
@@ -239,13 +238,14 @@ impl<'a> AutomationRunStore<'a> {
                     )
                 })?;
                 let traces_str: String = r.get(4)?;
-                let step_traces: Vec<StepTrace> = serde_json::from_str(&traces_str).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        4,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?;
+                let step_traces: Vec<StepTrace> =
+                    serde_json::from_str(&traces_str).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
                 Ok(AutomationRunRow {
                     id: r.get(0)?,
                     automation_id: r.get(1)?,
@@ -362,7 +362,10 @@ mod tests {
         };
         store.append_trace(&id, &trace).unwrap();
         let row = store.get(&id).unwrap().unwrap();
-        assert_eq!(row.step_traces[0].error.as_deref(), Some("rhai parse failure at line 1: oops"));
+        assert_eq!(
+            row.step_traces[0].error.as_deref(),
+            Some("rhai parse failure at line 1: oops")
+        );
     }
 
     #[test]

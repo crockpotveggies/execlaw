@@ -24,6 +24,7 @@
 //! feedback without spelunking the trace.
 
 use crate::automation_runtime;
+use crate::automation_runtime::DryRunResult;
 use crate::routes::ApiError;
 use crate::state::AppState;
 use axum::Router;
@@ -32,12 +33,13 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use axum::routing::{delete, get, post, put};
 use execlaw_core::automation_bus::{BusEventKind, BusEventRow, BusEventStore};
-use execlaw_core::automation_runs::AutomationRunStore;
+use execlaw_core::automation_runs::{AutomationRunRow, AutomationRunStore};
 use execlaw_core::automation_suggestions::SuggestionStore;
 use execlaw_core::automations::{
     AutomationDef, AutomationError, AutomationRow, AutomationStore, AutomationUpsert,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, ToSchema};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -64,14 +66,17 @@ pub fn router() -> Router<AppState> {
         .route("/api/admin/automations/{id}/disable", post(disable))
         .route("/api/admin/automations/{id}/runs", get(list_runs))
         .route("/api/admin/automations/{id}/test-run", post(test_run))
-        .route("/api/admin/automations/recent-events", get(list_recent_events))
+        .route(
+            "/api/admin/automations/recent-events",
+            get(list_recent_events),
+        )
 }
 
 // ---------------------------------------------------------------------------
 // DTOs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AutomationDto {
     pub id: String,
     pub name: String,
@@ -94,7 +99,7 @@ impl From<AutomationRow> for AutomationDto {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateAutomationRequest {
     pub name: String,
     #[serde(default = "default_true")]
@@ -106,14 +111,14 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateAutomationRequest {
     pub name: String,
     pub enabled: bool,
     pub definition: AutomationDef,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct MetricsDto {
     pub active_count: i64,
     pub runs_24h: i64,
@@ -121,12 +126,13 @@ pub struct MetricsDto {
     pub untriaged_kinds_24h: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct RecentBusEventDto {
     pub id: String,
     pub kind: BusEventKind,
     pub source: String,
     pub received_at: i64,
+    #[schema(value_type = Object)]
     pub payload: serde_json::Value,
 }
 
@@ -142,7 +148,8 @@ impl From<BusEventRow> for RecentBusEventDto {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct RecentEventsQuery {
     pub kind: BusEventKind,
     #[serde(default = "default_recent_limit")]
@@ -164,7 +171,7 @@ fn default_recent_limit() -> i64 {
 /// One of the two MUST be set. If both are set, `event_id` wins so
 /// the operator's edit of the picked event's payload doesn't silently
 /// re-resolve.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct TestRunRequest {
     #[serde(default)]
     pub event_id: Option<String>,
@@ -172,14 +179,15 @@ pub struct TestRunRequest {
     pub sample_event: Option<SampleEventBody>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SampleEventBody {
     pub kind: BusEventKind,
     pub source: String,
+    #[schema(value_type = Object)]
     pub payload: serde_json::Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SuggestionDto {
     pub id: String,
     pub kind: BusEventKind,
@@ -200,14 +208,32 @@ pub struct SuggestionDto {
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn list(State(state): State<AppState>) -> Result<Json<Vec<AutomationDto>>, ApiError> {
+#[utoipa::path(
+    get,
+    path = "/api/admin/automations",
+    responses((status = 200, description = "All automations", body = [AutomationDto])),
+    security(("bearer_jwt" = [])),
+    tag = "automations"
+)]
+pub async fn list(State(state): State<AppState>) -> Result<Json<Vec<AutomationDto>>, ApiError> {
     let rows = AutomationStore::new(&state.db)
         .list_all()
         .map_err(automation_err)?;
     Ok(Json(rows.into_iter().map(AutomationDto::from).collect()))
 }
 
-async fn create(
+#[utoipa::path(
+    post,
+    path = "/api/admin/automations",
+    request_body = CreateAutomationRequest,
+    responses(
+        (status = 201, description = "Created", body = AutomationDto),
+        (status = 400, description = "Validation failed"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "automations"
+)]
+pub async fn create(
     State(state): State<AppState>,
     Json(req): Json<CreateAutomationRequest>,
 ) -> Result<(StatusCode, Json<AutomationDto>), ApiError> {
@@ -226,7 +252,18 @@ async fn create(
     Ok((StatusCode::CREATED, Json(AutomationDto::from(row))))
 }
 
-async fn get_one(
+#[utoipa::path(
+    get,
+    path = "/api/admin/automations/{id}",
+    params(("id" = String, Path, description = "Automation id")),
+    responses(
+        (status = 200, description = "Automation", body = AutomationDto),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "automations"
+)]
+pub async fn get_one(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<AutomationDto>, ApiError> {
@@ -241,7 +278,20 @@ async fn get_one(
     Ok(Json(AutomationDto::from(row)))
 }
 
-async fn update(
+#[utoipa::path(
+    put,
+    path = "/api/admin/automations/{id}",
+    params(("id" = String, Path, description = "Automation id")),
+    request_body = UpdateAutomationRequest,
+    responses(
+        (status = 200, description = "Updated", body = AutomationDto),
+        (status = 400, description = "Validation failed"),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "automations"
+)]
+pub async fn update(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateAutomationRequest>,
@@ -272,7 +322,18 @@ async fn update(
     Ok(Json(AutomationDto::from(row)))
 }
 
-async fn delete_one(
+#[utoipa::path(
+    delete,
+    path = "/api/admin/automations/{id}",
+    params(("id" = String, Path, description = "Automation id")),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "automations"
+)]
+pub async fn delete_one(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
@@ -290,14 +351,36 @@ async fn delete_one(
     }
 }
 
-async fn enable(
+#[utoipa::path(
+    post,
+    path = "/api/admin/automations/{id}/enable",
+    params(("id" = String, Path, description = "Automation id")),
+    responses(
+        (status = 204, description = "Enabled"),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "automations"
+)]
+pub async fn enable(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     toggle(&state, &id, true).await
 }
 
-async fn disable(
+#[utoipa::path(
+    post,
+    path = "/api/admin/automations/{id}/disable",
+    params(("id" = String, Path, description = "Automation id")),
+    responses(
+        (status = 204, description = "Disabled"),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "automations"
+)]
+pub async fn disable(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
@@ -320,7 +403,15 @@ async fn toggle(state: &AppState, id: &str, enabled: bool) -> Result<StatusCode,
     }
 }
 
-async fn list_recent_events(
+#[utoipa::path(
+    get,
+    path = "/api/admin/automations/recent-events",
+    params(RecentEventsQuery),
+    responses((status = 200, description = "Recent bus events for the requested kind", body = [RecentBusEventDto])),
+    security(("bearer_jwt" = [])),
+    tag = "automations"
+)]
+pub async fn list_recent_events(
     State(state): State<AppState>,
     Query(q): Query<RecentEventsQuery>,
 ) -> Result<Json<Vec<RecentBusEventDto>>, ApiError> {
@@ -332,10 +423,25 @@ async fn list_recent_events(
             code: "recent_events_failed",
             message: format!("{e}"),
         })?;
-    Ok(Json(rows.into_iter().map(RecentBusEventDto::from).collect()))
+    Ok(Json(
+        rows.into_iter().map(RecentBusEventDto::from).collect(),
+    ))
 }
 
-async fn test_run(
+#[utoipa::path(
+    post,
+    path = "/api/admin/automations/{id}/test-run",
+    params(("id" = String, Path, description = "Automation id")),
+    request_body = TestRunRequest,
+    responses(
+        (status = 200, description = "Dry-run result", body = DryRunResult),
+        (status = 400, description = "Missing event_id or sample_event"),
+        (status = 404, description = "Automation or event not found"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "automations"
+)]
+pub async fn test_run(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<TestRunRequest>,
@@ -404,7 +510,15 @@ async fn test_run(
     Ok(Json(result))
 }
 
-async fn list_runs(
+#[utoipa::path(
+    get,
+    path = "/api/admin/automations/{id}/runs",
+    params(("id" = String, Path, description = "Automation id")),
+    responses((status = 200, description = "Recent runs (last 100)", body = [AutomationRunRow])),
+    security(("bearer_jwt" = [])),
+    tag = "automations"
+)]
+pub async fn list_runs(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -418,7 +532,14 @@ async fn list_runs(
     Ok(Json(serde_json::to_value(runs).unwrap_or_default()))
 }
 
-async fn metrics(State(state): State<AppState>) -> Result<Json<MetricsDto>, ApiError> {
+#[utoipa::path(
+    get,
+    path = "/api/admin/automations/metrics",
+    responses((status = 200, description = "Aggregate cards for the landing page", body = MetricsDto)),
+    security(("bearer_jwt" = [])),
+    tag = "automations"
+)]
+pub async fn metrics(State(state): State<AppState>) -> Result<Json<MetricsDto>, ApiError> {
     let now = chrono::Utc::now().timestamp_millis();
     let window_24h_ms = 24 * 60 * 60 * 1000_i64;
     let cutoff_ms = now.saturating_sub(window_24h_ms);
@@ -496,7 +617,14 @@ async fn metrics(State(state): State<AppState>) -> Result<Json<MetricsDto>, ApiE
     Ok(Json(dto))
 }
 
-async fn list_suggestions(
+#[utoipa::path(
+    get,
+    path = "/api/admin/automations/suggestions",
+    responses((status = 200, description = "Pending suggestions (high-volume untriaged event kinds)", body = [SuggestionDto])),
+    security(("bearer_jwt" = [])),
+    tag = "automations"
+)]
+pub async fn list_suggestions(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<SuggestionDto>>, ApiError> {
     let rows = SuggestionStore::new(&state.db)
@@ -525,7 +653,18 @@ async fn list_suggestions(
 
 /// M5: GET one suggestion by id. Used by the editor's "Review and
 /// create" handoff to fetch the draft when present.
-async fn get_suggestion(
+#[utoipa::path(
+    get,
+    path = "/api/admin/automations/suggestions/{id}",
+    params(("id" = String, Path, description = "Suggestion id")),
+    responses(
+        (status = 200, description = "Suggestion (including draft definition if present)", body = SuggestionDto),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "automations"
+)]
+pub async fn get_suggestion(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SuggestionDto>, ApiError> {
@@ -554,7 +693,18 @@ async fn get_suggestion(
     }))
 }
 
-async fn dismiss_suggestion(
+#[utoipa::path(
+    post,
+    path = "/api/admin/automations/suggestions/{id}/dismiss",
+    params(("id" = String, Path, description = "Suggestion id")),
+    responses(
+        (status = 204, description = "Dismissed; pattern is now muted"),
+        (status = 404, description = "Suggestion not pending or not found"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "automations"
+)]
+pub async fn dismiss_suggestion(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
@@ -577,7 +727,18 @@ async fn dismiss_suggestion(
     }
 }
 
-async fn action_suggestion(
+#[utoipa::path(
+    post,
+    path = "/api/admin/automations/suggestions/{id}/action",
+    params(("id" = String, Path, description = "Suggestion id")),
+    responses(
+        (status = 204, description = "Marked as actioned"),
+        (status = 404, description = "Suggestion not pending or not found"),
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "automations"
+)]
+pub async fn action_suggestion(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
@@ -630,7 +791,7 @@ mod tests {
     use axum::http::{Request, header};
     use execlaw_core::automation_bus::{BusEventKind, BusEventStore, Event as BusEvent};
     use execlaw_core::automations::{
-        AutomationDef, EdgeDef, NodeDef, NodeKind, TriggerDef, END_SENTINEL, TRIGGER_SENTINEL,
+        AutomationDef, END_SENTINEL, EdgeDef, NodeDef, NodeKind, TRIGGER_SENTINEL, TriggerDef,
     };
     use tower::ServiceExt;
 
@@ -802,9 +963,13 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        let (_, body) =
-            json_req::<()>(app.clone(), "GET", &format!("/api/admin/automations/{id}"), None)
-                .await;
+        let (_, body) = json_req::<()>(
+            app.clone(),
+            "GET",
+            &format!("/api/admin/automations/{id}"),
+            None,
+        )
+        .await;
         assert_eq!(body["enabled"], false);
         let (status, _) = json_req::<()>(
             app.clone(),
@@ -834,17 +999,16 @@ mod tests {
         )
         .await;
         let id = body["id"].as_str().unwrap().to_string();
-        let (status, _) =
-            json_req::<()>(app.clone(), "DELETE", &format!("/api/admin/automations/{id}"), None)
-                .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
         let (status, _) = json_req::<()>(
-            app,
+            app.clone(),
             "DELETE",
             &format!("/api/admin/automations/{id}"),
             None,
         )
         .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) =
+            json_req::<()>(app, "DELETE", &format!("/api/admin/automations/{id}"), None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -879,8 +1043,7 @@ mod tests {
             .unwrap();
         }
         let app = router().with_state(state);
-        let (_, body) =
-            json_req::<()>(app, "GET", "/api/admin/automations/metrics", None).await;
+        let (_, body) = json_req::<()>(app, "GET", "/api/admin/automations/metrics", None).await;
         assert_eq!(body["untriaged_kinds_24h"], 1);
     }
 

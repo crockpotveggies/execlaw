@@ -25,6 +25,7 @@ use crate::db::{Database, DbError};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use utoipa::ToSchema;
 
 /// Kinds of events flowing through the automation bus.
 ///
@@ -39,7 +40,7 @@ use thiserror::Error;
 /// `state_bus_events`, so the matcher SQL
 /// `json_extract(definition, '$.trigger.kind') = state_bus_events.kind`
 /// works without a translation table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 pub enum BusEventKind {
     /// A webhook arrived at `/api/webhooks/{plugin_id}/...`. Fired
     /// alongside the existing plugin Rhai handler dispatch — the bus
@@ -157,11 +158,7 @@ impl<'a> BusEventStore<'a> {
     /// the in-process mpsc channel; `true` means the SQLite poller
     /// will pick it up (used by in-process producers to avoid
     /// producer-consumer deadlock through the channel).
-    pub fn publish(
-        &self,
-        evt: &Event,
-        internal: bool,
-    ) -> Result<PublishOutcome, BusEventError> {
+    pub fn publish(&self, evt: &Event, internal: bool) -> Result<PublishOutcome, BusEventError> {
         let payload = serde_json::to_string(&evt.payload)?;
         let kind = evt.kind.as_str();
         let internal_flag: i64 = if internal { 1 } else { 0 };
@@ -198,11 +195,7 @@ impl<'a> BusEventStore<'a> {
     /// the caller who gets `true` should invoke the handler. Without
     /// this guard, a crash-recovery scan racing a live mpsc delivery
     /// of the same row would fire the handler twice.
-    pub fn mark_dispatched(
-        &self,
-        id: &str,
-        dispatched_at: i64,
-    ) -> Result<bool, BusEventError> {
+    pub fn mark_dispatched(&self, id: &str, dispatched_at: i64) -> Result<bool, BusEventError> {
         let n = self.db.with_conn(|c| {
             let n = c.execute(
                 "UPDATE state_bus_events SET dispatched_at = ?2 \
@@ -345,10 +338,7 @@ impl<'a> BusEventStore<'a> {
     /// Retention sweep: delete dispatched rows older than the cutoff.
     /// Pending rows are NEVER swept regardless of age — retention
     /// should not paper over a stuck dispatcher.
-    pub fn purge_dispatched_older_than(
-        &self,
-        cutoff_unix: i64,
-    ) -> Result<usize, BusEventError> {
+    pub fn purge_dispatched_older_than(&self, cutoff_unix: i64) -> Result<usize, BusEventError> {
         let n = self.db.with_conn(|c| {
             let n = c.execute(
                 "DELETE FROM state_bus_events \
@@ -407,12 +397,18 @@ mod tests {
         let second = Event {
             id: "evt-1".into(),
             kind: BusEventKind::PluginEmit,           // different
-            source: "different".into(),                // different
-            received_at: 999,                          // different
+            source: "different".into(),               // different
+            received_at: 999,                         // different
             payload: serde_json::json!({"k2": "v2"}), // different
         };
-        assert_eq!(store.publish(&first, false).unwrap(), PublishOutcome::Inserted);
-        assert_eq!(store.publish(&second, false).unwrap(), PublishOutcome::Duplicate);
+        assert_eq!(
+            store.publish(&first, false).unwrap(),
+            PublishOutcome::Inserted
+        );
+        assert_eq!(
+            store.publish(&second, false).unwrap(),
+            PublishOutcome::Duplicate
+        );
         let row = store.get("evt-1").unwrap().unwrap();
         // PK conflict does NOT overwrite — operator intent is
         // preserved by the producer's choice of stable ID.
@@ -460,9 +456,15 @@ mod tests {
     fn fetch_pending_returns_only_undispatched_oldest_first() {
         let db = fresh_db();
         let store = BusEventStore::new(&db);
-        store.publish(&sample_event("a", "src", 300), false).unwrap();
-        store.publish(&sample_event("b", "src", 100), false).unwrap();
-        store.publish(&sample_event("c", "src", 200), false).unwrap();
+        store
+            .publish(&sample_event("a", "src", 300), false)
+            .unwrap();
+        store
+            .publish(&sample_event("b", "src", 100), false)
+            .unwrap();
+        store
+            .publish(&sample_event("c", "src", 200), false)
+            .unwrap();
         assert!(store.mark_dispatched("b", 1).unwrap());
         let ids = store.fetch_pending(false, 10).unwrap();
         assert_eq!(ids, vec!["c".to_string(), "a".to_string()]);
@@ -472,8 +474,12 @@ mod tests {
     fn fetch_pending_respects_internal_only_filter() {
         let db = fresh_db();
         let store = BusEventStore::new(&db);
-        store.publish(&sample_event("ext", "src", 100), false).unwrap();
-        store.publish(&sample_event("int", "src", 200), true).unwrap();
+        store
+            .publish(&sample_event("ext", "src", 100), false)
+            .unwrap();
+        store
+            .publish(&sample_event("int", "src", 200), true)
+            .unwrap();
         let all = store.fetch_pending(false, 10).unwrap();
         let internal = store.fetch_pending(true, 10).unwrap();
         assert_eq!(all, vec!["ext".to_string(), "int".to_string()]);
@@ -596,7 +602,11 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        assert_eq!(inserted.load(Ordering::SeqCst), 1, "exactly one INSERT wins");
+        assert_eq!(
+            inserted.load(Ordering::SeqCst),
+            1,
+            "exactly one INSERT wins"
+        );
         assert_eq!(duplicate.load(Ordering::SeqCst), 15);
         // First writer's row is what's persisted — we can't predict
         // *which* thread won, but exactly one did. Spot-check the

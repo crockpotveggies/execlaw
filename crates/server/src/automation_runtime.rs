@@ -35,8 +35,8 @@ use execlaw_core::Database;
 use execlaw_core::automation_bus::{BusEventRow, Event as BusEvent};
 use execlaw_core::automation_runs::{AutomationRunStatus, AutomationRunStore, StepTrace};
 use execlaw_core::automations::{
-    AutomationDef, AutomationRow, AutomationStore, END_SENTINEL, NodeDef, NodeKind, TRIGGER_SENTINEL,
-    TriggerDef, parse_ask_agent_config,
+    AutomationDef, AutomationRow, AutomationStore, END_SENTINEL, NodeDef, NodeKind,
+    TRIGGER_SENTINEL, TriggerDef, parse_ask_agent_config,
 };
 use rhai::{Dynamic, Engine, Scope};
 use std::collections::HashMap;
@@ -199,7 +199,7 @@ fn run_one(
 
 /// Result of a [`dry_run`] — outcome + captured per-node trace.
 /// The HTTP `POST /test-run` endpoint serializes this directly.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct DryRunResult {
     pub outcome: ExecOutcome,
     pub step_traces: Vec<StepTrace>,
@@ -240,7 +240,9 @@ pub fn dry_run(
 /// Public terminal state for one walk through the graph. Live runs
 /// translate this into [`AutomationRunStatus`]; dry runs return it
 /// to the caller verbatim alongside the captured traces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecOutcome {
     Success,
@@ -351,7 +353,9 @@ fn execute_graph(
         input: serde_json::Value::Null,
         output: serde_json::Value::Null,
         ms: 0,
-        error: Some(format!("automation exceeded {max_hops} hops; suspected cycle")),
+        error: Some(format!(
+            "automation exceeded {max_hops} hops; suspected cycle"
+        )),
     };
     trace_sink(trace);
     ExecOutcome::Failed
@@ -491,10 +495,7 @@ fn execute_ask_agent(
 ///
 /// Scoped to `AskAgent` for M3a. M4 may apply the same rendering to
 /// Notify's `message` and HttpFetch's `url`/`body`.
-pub(crate) fn render_template(
-    s: &str,
-    state: &HashMap<String, serde_json::Value>,
-) -> String {
+pub(crate) fn render_template(s: &str, state: &HashMap<String, serde_json::Value>) -> String {
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -512,9 +513,7 @@ pub(crate) fn render_template(
                 j += 1;
             }
             if let Some(end) = found {
-                let path = std::str::from_utf8(&bytes[i + 2..end])
-                    .unwrap_or("")
-                    .trim();
+                let path = std::str::from_utf8(&bytes[i + 2..end]).unwrap_or("").trim();
                 match lookup_path(path, state) {
                     Some(v) => {
                         out.push_str(&value_to_string(&v));
@@ -572,7 +571,9 @@ fn value_to_string(v: &serde_json::Value) -> String {
 
 fn execute_filter(node: &NodeDef, state: &HashMap<String, serde_json::Value>) -> NodeOutcome {
     let Some(expr) = node.config.get("expr").and_then(|v| v.as_str()) else {
-        return NodeOutcome::Error("Filter node missing config.expr (must be Rhai bool expression)".into());
+        return NodeOutcome::Error(
+            "Filter node missing config.expr (must be Rhai bool expression)".into(),
+        );
     };
     let mut scope = build_scope_from_state(state);
     match eval_bool(expr, &mut scope) {
@@ -584,7 +585,9 @@ fn execute_filter(node: &NodeDef, state: &HashMap<String, serde_json::Value>) ->
 
 fn execute_transform(node: &NodeDef, state: &HashMap<String, serde_json::Value>) -> NodeOutcome {
     let Some(expr) = node.config.get("expr").and_then(|v| v.as_str()) else {
-        return NodeOutcome::Error("Transform node missing config.expr (must be Rhai expression)".into());
+        return NodeOutcome::Error(
+            "Transform node missing config.expr (must be Rhai expression)".into(),
+        );
     };
     let mut scope = build_scope_from_state(state);
     match eval_value(expr, &mut scope) {
@@ -792,12 +795,8 @@ mod tests {
             "payload": {"zone": "driveway", "confidence": 0.92},
         });
         let mut scope = build_scope_with_event(&event);
-        assert!(
-            eval_bool(r#"event.payload.zone == "driveway""#, &mut scope).unwrap()
-        );
-        assert!(
-            eval_bool("event.payload.confidence > 0.5", &mut scope).unwrap()
-        );
+        assert!(eval_bool(r#"event.payload.zone == "driveway""#, &mut scope).unwrap());
+        assert!(eval_bool("event.payload.confidence > 0.5", &mut scope).unwrap());
     }
 
     #[test]
@@ -1028,11 +1027,19 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, AutomationRunStatus::Success);
         // event.payload.n = 10, doubled = 20 > 15, so we hit `big` not `small`.
-        let trace_ids: Vec<_> = runs[0].step_traces.iter().map(|t| t.node_id.clone()).collect();
+        let trace_ids: Vec<_> = runs[0]
+            .step_traces
+            .iter()
+            .map(|t| t.node_id.clone())
+            .collect();
         assert!(trace_ids.contains(&"big".to_string()));
         assert!(!trace_ids.contains(&"small".to_string()));
         // Check the transform output landed in state for the edge predicate.
-        let double_trace = runs[0].step_traces.iter().find(|t| t.node_id == "double").unwrap();
+        let double_trace = runs[0]
+            .step_traces
+            .iter()
+            .find(|t| t.node_id == "double")
+            .unwrap();
         assert_eq!(double_trace.output, serde_json::json!({"doubled": 20}));
     }
 
@@ -1062,7 +1069,13 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, AutomationRunStatus::Failed);
         let trace = &runs[0].step_traces[0];
-        assert!(trace.error.as_deref().unwrap_or("").contains("missing config.expr"));
+        assert!(
+            trace
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("missing config.expr")
+        );
     }
 
     #[test]
@@ -1085,7 +1098,12 @@ mod tests {
             .unwrap();
 
         run_matching_automations(&db, &noop_pool(), &evt);
-        assert!(run_store.list_for_automation(&row.id, 10).unwrap().is_empty());
+        assert!(
+            run_store
+                .list_for_automation(&row.id, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1355,9 +1373,8 @@ mod tests {
             .unwrap();
 
         // Pool that always errors.
-        let pool = AutomationsAgentPool::new(Arc::new(StubAgentInvoker::err(
-            "simulated llm timeout",
-        )));
+        let pool =
+            AutomationsAgentPool::new(Arc::new(StubAgentInvoker::err("simulated llm timeout")));
         let db_for_blocking = db.clone();
         let evt_for_blocking = evt.clone();
         tokio::task::spawn_blocking(move || {
@@ -1394,9 +1411,15 @@ mod tests {
                 "payload": {"zone": "driveway", "n": 7, "active": true}
             }),
         );
-        assert_eq!(render_template("zone={{event.payload.zone}}", &state), "zone=driveway");
+        assert_eq!(
+            render_template("zone={{event.payload.zone}}", &state),
+            "zone=driveway"
+        );
         assert_eq!(render_template("n={{event.payload.n}}", &state), "n=7");
-        assert_eq!(render_template("on={{event.payload.active}}", &state), "on=true");
+        assert_eq!(
+            render_template("on={{event.payload.active}}", &state),
+            "on=true"
+        );
         assert_eq!(
             render_template("id={{ event.id }} n={{event.payload.n}}", &state),
             "id=evt-1 n=7"
@@ -1408,10 +1431,7 @@ mod tests {
         let mut state = HashMap::new();
         state.insert("event".to_string(), serde_json::json!({"id": "x"}));
         // Unknown root.
-        assert_eq!(
-            render_template("hi {{nope.x}}", &state),
-            "hi {{nope.x}}"
-        );
+        assert_eq!(render_template("hi {{nope.x}}", &state), "hi {{nope.x}}");
         // Known root, unknown leaf.
         assert_eq!(
             render_template("hi {{event.missing}}", &state),
@@ -1442,10 +1462,7 @@ mod tests {
         }
         #[async_trait]
         impl AgentInvoker for CapturingInvoker {
-            async fn invoke(
-                &self,
-                req: &AskAgentRequest,
-            ) -> Result<ExitToolCall, AskAgentError> {
+            async fn invoke(&self, req: &AskAgentRequest) -> Result<ExitToolCall, AskAgentError> {
                 *self.captured.lock().unwrap() = Some(req.clone());
                 Ok(ExitToolCall {
                     name: "notify".into(),
@@ -1525,9 +1542,16 @@ mod tests {
         .await
         .unwrap();
 
-        let req = captured.lock().unwrap().clone().expect("invoker should have been called");
+        let req = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("invoker should have been called");
         assert_eq!(req.config.prompt, "Animal in driveway?");
-        assert_eq!(req.config.attachments, vec!["data:image/png;base64,AAAA".to_string()]);
+        assert_eq!(
+            req.config.attachments,
+            vec!["data:image/png;base64,AAAA".to_string()]
+        );
     }
 
     #[tokio::test]

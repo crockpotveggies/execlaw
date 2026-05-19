@@ -26,11 +26,12 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use utoipa::ToSchema;
 
 /// Caller-supplied tag identifying who's driving the inference call.
 /// Snapshot endpoint slices by this so an operator can tell whether
 /// chat, research, or automations is the heavy hitter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum InferenceConsumer {
     /// The user-facing chat turn loop.
@@ -102,11 +103,7 @@ impl InferenceMetrics {
     /// normal completion — a panicked call isn't "completed" in
     /// any meaningful sense, so it's correctly absent from the
     /// totals.
-    pub async fn observe<T, E, F>(
-        &self,
-        consumer: InferenceConsumer,
-        fut: F,
-    ) -> Result<T, E>
+    pub async fn observe<T, E, F>(&self, consumer: InferenceConsumer, fut: F) -> Result<T, E>
     where
         F: Future<Output = Result<T, E>>,
     {
@@ -188,12 +185,12 @@ impl Drop for InflightGuard<'_> {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MetricsSnapshot {
     pub consumers: Vec<ConsumerSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ConsumerSnapshot {
     pub consumer: InferenceConsumer,
     pub in_flight: usize,
@@ -230,9 +227,7 @@ mod tests {
     #[tokio::test]
     async fn observe_records_a_successful_call() {
         let m = InferenceMetrics::new();
-        let result = m
-            .observe(InferenceConsumer::Automations, ok_call(5))
-            .await;
+        let result = m.observe(InferenceConsumer::Automations, ok_call(5)).await;
         assert!(result.is_ok());
         let snap = m.snapshot();
         let auto = snap
@@ -250,9 +245,7 @@ mod tests {
     #[tokio::test]
     async fn observe_records_failures_separately() {
         let m = InferenceMetrics::new();
-        let _ = m
-            .observe(InferenceConsumer::Chat, err_call(1))
-            .await;
+        let _ = m.observe(InferenceConsumer::Chat, err_call(1)).await;
         let _ = m.observe(InferenceConsumer::Chat, ok_call(1)).await;
         let snap = m.snapshot();
         let c = snap
@@ -267,9 +260,7 @@ mod tests {
     #[tokio::test]
     async fn in_flight_decrements_when_call_ends_even_on_error() {
         let m = InferenceMetrics::new();
-        let _ = m
-            .observe(InferenceConsumer::Research, err_call(1))
-            .await;
+        let _ = m.observe(InferenceConsumer::Research, err_call(1)).await;
         let snap = m.snapshot();
         let r = snap
             .consumers
@@ -282,7 +273,9 @@ mod tests {
     #[tokio::test]
     async fn snapshot_groups_by_consumer() {
         let m = InferenceMetrics::new();
-        m.observe(InferenceConsumer::Chat, ok_call(1)).await.unwrap();
+        m.observe(InferenceConsumer::Chat, ok_call(1))
+            .await
+            .unwrap();
         m.observe(InferenceConsumer::Automations, ok_call(1))
             .await
             .unwrap();
@@ -350,7 +343,10 @@ mod tests {
             .find(|c| c.consumer == InferenceConsumer::Automations)
             .unwrap();
         assert_eq!(auto.in_flight, 0, "guard must decrement on panic");
-        assert_eq!(auto.total_calls, 0, "panicked call must not count toward totals");
+        assert_eq!(
+            auto.total_calls, 0,
+            "panicked call must not count toward totals"
+        );
     }
 
     #[tokio::test]

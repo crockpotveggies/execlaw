@@ -21,6 +21,7 @@ use crate::db::{Database, DbError};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// Reserved node-id sentinels. The runtime treats them specially.
@@ -31,7 +32,7 @@ pub const END_SENTINEL: &str = "END";
 /// stored in the JSON but rejected by the validator with a
 /// not-yet-implemented error — so a future schema bump can land
 /// without breaking persisted definitions that pre-declared them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 pub enum NodeKind {
     /// Drop the run if the Rhai expression evaluates falsy.
     Filter,
@@ -118,12 +119,13 @@ impl NodeKind {
 /// to fill in. The agent's chosen tool name becomes the node's edge-
 /// routing key; the args become the node's output (available to
 /// downstream `{{ask_agent.args.*}}` references).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct ExitToolDef {
     pub name: String,
     pub description: String,
     /// JSON Schema for the tool's arguments. Pass through to the
     /// `tools[].function.parameters` field of the chat request.
+    #[schema(value_type = Object)]
     pub args_schema: serde_json::Value,
 }
 
@@ -136,7 +138,7 @@ pub struct ExitToolDef {
 ///   * First exit-tool call wins; later calls in the same turn are logged and ignored.
 ///   * Missing exit-tool call by `max_turns` → node fails.
 ///   * Vision-required attachments on a text-only model → node fails fast.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct AskAgentConfig {
     /// The user-message body sent to the agent. Rendered as-is (no
     /// templating in M3 — author writes the literal prompt or uses
@@ -177,7 +179,7 @@ pub fn parse_ask_agent_config(config: &serde_json::Value) -> Result<AskAgentConf
         .map_err(|e| format!("AskAgent config: {e}"))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct TriggerDef {
     /// The bus-event kind to subscribe to.
     pub kind: BusEventKind,
@@ -188,7 +190,7 @@ pub struct TriggerDef {
     pub when: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct NodeDef {
     pub id: String,
     pub kind: NodeKind,
@@ -197,11 +199,13 @@ pub struct NodeDef {
     ///   * Transform: `{ "expr": "<rhai value>" }`
     ///   * Branch:    `{ "cases": [{ "when": "<rhai bool>", "edge": "<node_id>" }, ...] }`
     ///   * Terminal:  `{}`
+    ///   * AskAgent:  see `AskAgentConfig`
     #[serde(default)]
+    #[schema(value_type = Object)]
     pub config: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct EdgeDef {
     /// Source: a node id, or `TRIGGER_SENTINEL` for the entry edge.
     pub from: String,
@@ -214,7 +218,7 @@ pub struct EdgeDef {
     pub when: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct AutomationDef {
     pub trigger: TriggerDef,
     pub nodes: Vec<NodeDef>,
@@ -306,8 +310,7 @@ pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
         // typed struct so a missing field surfaces at save time, not
         // at first-run.
         if matches!(n.kind, NodeKind::AskAgent) {
-            let cfg = parse_ask_agent_config(&n.config)
-                .map_err(AutomationError::Validation)?;
+            let cfg = parse_ask_agent_config(&n.config).map_err(AutomationError::Validation)?;
             if cfg.prompt.trim().is_empty() {
                 return Err(AutomationError::Validation(format!(
                     "AskAgent node '{}': prompt is empty",
@@ -373,7 +376,11 @@ pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
     }
     // Exactly one entry edge from the trigger sentinel — otherwise
     // the run has no starting point.
-    let entry_edges = def.edges.iter().filter(|e| e.from == TRIGGER_SENTINEL).count();
+    let entry_edges = def
+        .edges
+        .iter()
+        .filter(|e| e.from == TRIGGER_SENTINEL)
+        .count();
     if entry_edges == 0 {
         return Err(AutomationError::Validation(
             "no edge from trigger — automation has no entry point".into(),
@@ -399,10 +406,7 @@ impl<'a> AutomationStore<'a> {
         now: i64,
     ) -> Result<AutomationRow, AutomationError> {
         validate(&req.definition)?;
-        let id = req
-            .id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let id = req.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
         let def_json = serde_json::to_string(&req.definition)?;
         let enabled_flag: i64 = if req.enabled { 1 } else { 0 };
         self.db.with_conn(|c| {
@@ -419,8 +423,7 @@ impl<'a> AutomationStore<'a> {
             )?;
             Ok(())
         })?;
-        self.get(&id)?
-            .ok_or_else(|| AutomationError::NotFound(id))
+        self.get(&id)?.ok_or_else(|| AutomationError::NotFound(id))
     }
 
     pub fn get(&self, id: &str) -> Result<Option<AutomationRow>, AutomationError> {
@@ -432,12 +435,14 @@ impl<'a> AutomationStore<'a> {
             let r = stmt
                 .query_row([id], |r| {
                     let def_str: String = r.get(3)?;
-                    let definition: AutomationDef = serde_json::from_str(&def_str)
-                        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        ))?;
+                    let definition: AutomationDef =
+                        serde_json::from_str(&def_str).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?;
                     let enabled_flag: i64 = r.get(2)?;
                     Ok(AutomationRow {
                         id: r.get(0)?,
@@ -534,21 +539,13 @@ impl<'a> AutomationStore<'a> {
 
     pub fn delete(&self, id: &str) -> Result<bool, AutomationError> {
         let n = self.db.with_conn(|c| {
-            let n = c.execute(
-                "DELETE FROM state_automations WHERE id = ?1",
-                params![id],
-            )?;
+            let n = c.execute("DELETE FROM state_automations WHERE id = ?1", params![id])?;
             Ok(n)
         })?;
         Ok(n > 0)
     }
 
-    pub fn set_enabled(
-        &self,
-        id: &str,
-        enabled: bool,
-        now: i64,
-    ) -> Result<bool, AutomationError> {
+    pub fn set_enabled(&self, id: &str, enabled: bool, now: i64) -> Result<bool, AutomationError> {
         let flag: i64 = if enabled { 1 } else { 0 };
         let n = self.db.with_conn(|c| {
             let n = c.execute(
