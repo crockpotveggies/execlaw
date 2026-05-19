@@ -56,6 +56,11 @@ pub fn host_port_for(purpose: BackendPurpose) -> u16 {
         BackendPurpose::Small => 8102,
         BackendPurpose::VoiceStt => 8103,
         BackendPurpose::VoiceTts => 8104,
+        // 2026-05-17 (M5) — Vision purpose slot. Continues the 81xx
+        // run; gives the supervisor a stable port for managed VL
+        // backends (Qwen-VL / Pixtral / LLaVA / etc.) without
+        // colliding with vLLM's default 8000.
+        BackendPurpose::Vision => 8105,
     }
 }
 

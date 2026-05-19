@@ -76,6 +76,7 @@ fn build_state(transcript: &'static str) -> AppState {
             "execlaw-test-{}",
             uuid::Uuid::new_v4()
         )),
+        inference_metrics: execlaw_server::inference_metrics::InferenceMetrics::new(),
     }
 }
 

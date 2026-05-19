@@ -187,6 +187,7 @@ fn build_app(stage_root: PathBuf) -> (axum::Router, AppState) {
             "execlaw-test-{}",
             uuid::Uuid::new_v4()
         )),
+        inference_metrics: execlaw_server::inference_metrics::InferenceMetrics::new(),
     };
     // Wire host capabilities into the script engine — without this
     // the Rhai script's vault_get / vault_put / sidecar_url all

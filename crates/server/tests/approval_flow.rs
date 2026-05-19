@@ -69,6 +69,7 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
             "execlaw-test-{}",
             uuid::Uuid::new_v4()
         )),
+        inference_metrics: execlaw_server::inference_metrics::InferenceMetrics::new(),
     };
     (execlaw_server::routes::build_router(state.clone()), state)
 }

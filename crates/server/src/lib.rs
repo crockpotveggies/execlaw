@@ -26,6 +26,8 @@ pub mod automation_bus;
 pub mod automation_runtime;
 pub mod automation_suggestions_sweeper;
 pub mod automations_admin;
+pub mod inference_admin;
+pub mod inference_metrics;
 pub mod backend_presets;
 pub mod backend_supervisor;
 pub mod backends;

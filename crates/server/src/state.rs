@@ -3,6 +3,7 @@
 use crate::automation_agent::AutomationsAgentPool;
 use crate::automation_bus::AutomationBus;
 use crate::events::EventBus;
+use crate::inference_metrics::InferenceMetrics;
 use execlaw_core::Database;
 use execlaw_plugin_host::PluginHost;
 use std::sync::Arc;
@@ -234,6 +235,14 @@ pub struct AppState {
     /// under the hood, so a test-run honors the pool's concurrency
     /// cap alongside live runs.
     pub automation_agent_pool: AutomationsAgentPool,
+    /// M5 — per-consumer inference observability. Wrapping LLM
+    /// calls with `metrics.observe(consumer, fut)` records
+    /// in_flight, totals, and per-call latency for the
+    /// `/admin/inference` page. Always present (cheap default
+    /// constructor); call sites that haven't been wired yet
+    /// continue to call the inference client directly without
+    /// observation — adding them is the M5 incremental rollout.
+    pub inference_metrics: InferenceMetrics,
 }
 
 impl std::fmt::Debug for AppState {

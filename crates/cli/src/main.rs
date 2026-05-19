@@ -1816,11 +1816,20 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     // inference backend is configured, AskAgent fails fast with
     // `NoLlmConfigured` rather than silently hanging.
     let automation_bus_stop = std::sync::Arc::new(tokio::sync::Notify::new());
+    // M5 — shared inference metrics handle. Threaded into the
+    // automations agent invoker (Automations consumer attribution)
+    // and stored on AppState so the `/admin/inference` page reads
+    // the same instance. Future call sites (chat / routines /
+    // research) wire the same handle for cross-consumer slicing.
+    let inference_metrics = execlaw_server::inference_metrics::InferenceMetrics::new();
     let automation_agent_pool = execlaw_server::automation_agent::AutomationsAgentPool::new(
-        std::sync::Arc::new(execlaw_server::automation_agent::InferenceAgentInvoker::new(
-            db.clone(),
-            inference.clone(),
-        )),
+        std::sync::Arc::new(
+            execlaw_server::automation_agent::InferenceAgentInvoker::new_with_metrics(
+                db.clone(),
+                inference.clone(),
+                inference_metrics.clone(),
+            ),
+        ),
     );
     let (automation_bus, automation_bus_tasks) = execlaw_server::automation_bus::AutomationBus::spawn(
         db.clone(),
@@ -1860,6 +1869,9 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         data_dir: data_dir.clone(),
         automation_bus,
         automation_agent_pool,
+        // M5 — same handle as the automations invoker holds, so the
+        // `/admin/inference` snapshot endpoint sees AskAgent calls.
+        inference_metrics,
     };
     // We don't await `automation_bus_tasks` — letting the spawned
     // dispatcher + poller run for the process lifetime. The `stop`

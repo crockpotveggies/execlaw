@@ -34,6 +34,7 @@
 //! and surfaced in errors so a `max_turns > 1` flow degrades
 //! observably rather than silently dropping the extra rounds).
 
+use crate::inference_metrics::{InferenceConsumer, InferenceMetrics};
 use crate::inference_resolver::InferenceResolver;
 use async_trait::async_trait;
 use execlaw_core::Database;
@@ -220,32 +221,84 @@ impl AgentInvoker for StubAgentInvoker {
 pub struct InferenceAgentInvoker {
     db: Database,
     inference: Arc<InferenceResolver>,
+    metrics: InferenceMetrics,
 }
 
 impl InferenceAgentInvoker {
+    /// Construct with a fresh metrics handle. Production wires the
+    /// shared AppState `inference_metrics` here via [`new_with_metrics`]
+    /// so the `/admin/inference` snapshot endpoint sees the
+    /// `Automations` consumer slice; this default exists so tests
+    /// don't need to plumb metrics through every fixture.
     pub fn new(db: Database, inference: Arc<InferenceResolver>) -> Self {
-        Self { db, inference }
+        Self::new_with_metrics(db, inference, InferenceMetrics::new())
+    }
+
+    pub fn new_with_metrics(
+        db: Database,
+        inference: Arc<InferenceResolver>,
+        metrics: InferenceMetrics,
+    ) -> Self {
+        Self {
+            db,
+            inference,
+            metrics,
+        }
     }
 }
 
 #[async_trait]
 impl AgentInvoker for InferenceAgentInvoker {
     async fn invoke(&self, req: &AskAgentRequest) -> Result<ExitToolCall, AskAgentError> {
-        let resolved = self
-            .inference
-            .resolve(&self.db, BackendPurpose::Standard)
-            .ok_or(AskAgentError::NoLlmConfigured)?;
-        // Vision capability check. We do the cheap heuristic check
-        // first (model id pattern) so the common no-vision case
-        // doesn't need a round-trip to /v1/models.
-        if !req.config.attachments.is_empty()
-            && !model_id_is_vision_capable(&resolved.model_id)
-        {
-            return Err(AskAgentError::VisionRequiredButTextOnlyModel {
-                model_id: resolved.model_id.clone(),
-            });
-        }
-        do_invoke(&resolved.client, &resolved.model_id, &req.config).await
+        // Routing precedence when attachments are present (M5 vision):
+        //
+        //   1. If `BackendPurpose::Vision` resolves to a backend row,
+        //      use it. The operator opted in by configuring the row;
+        //      we trust them and skip the model-id heuristic entirely.
+        //   2. Else, resolve `Standard` and apply the heuristic check
+        //      from M3a — vision-required + text-only-by-name fails
+        //      fast with the operator-actionable message.
+        //
+        // No attachments: always Standard, no capability check.
+        let resolved = if req.config.attachments.is_empty() {
+            self.inference
+                .resolve(&self.db, BackendPurpose::Standard)
+                .ok_or(AskAgentError::NoLlmConfigured)?
+        } else {
+            // Vision routing: only honor a Vision row that actually
+            // came from `config_backends` (`source == "db"`). The
+            // resolver's `bootstrap_resolved` fallback would otherwise
+            // route Vision through the Standard bootstrap URL, which
+            // defeats the purpose — the operator's "I have a vision
+            // model" intent only exists when a real DB row is present.
+            let vision = self
+                .inference
+                .resolve(&self.db, BackendPurpose::Vision)
+                .filter(|r| r.source == "db");
+            match vision {
+                Some(v) => v,
+                None => {
+                    let standard = self
+                        .inference
+                        .resolve(&self.db, BackendPurpose::Standard)
+                        .ok_or(AskAgentError::NoLlmConfigured)?;
+                    if !model_id_is_vision_capable(&standard.model_id) {
+                        return Err(AskAgentError::VisionRequiredButTextOnlyModel {
+                            model_id: standard.model_id.clone(),
+                        });
+                    }
+                    standard
+                }
+            }
+        };
+        // M5 — wrap the chat-completions call with the metrics
+        // observer so `/admin/inference` can attribute load to the
+        // Automations consumer.
+        self.metrics
+            .observe(InferenceConsumer::Automations, async {
+                do_invoke(&resolved.client, &resolved.model_id, &req.config).await
+            })
+            .await
     }
 }
 
@@ -585,6 +638,58 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AskAgentError::NoLlmConfigured));
+    }
+
+    /// M5: when a Vision backend row is configured AND attachments
+    /// are present, the invoker routes to it directly — no heuristic
+    /// fallback, no fail-fast on the Standard model's name. The
+    /// operator's configuration is the source of truth.
+    #[tokio::test]
+    async fn inference_invoker_routes_to_vision_backend_when_attachments_present() {
+        use execlaw_core::backends::{
+            BackendMode, BackendPurpose, BackendStore, BackendUpsert,
+        };
+        let db = test_db();
+        // Seed a Vision row pointing at a bogus URL (the invoker
+        // routes there but the actual HTTP call will fail — that's
+        // fine, this test verifies routing, not transport). The URL
+        // failure surfaces as `LlmFailure`, not
+        // `VisionRequiredButTextOnlyModel` — proving the vision row
+        // was selected.
+        BackendStore::new(&db)
+            .upsert(
+                &BackendUpsert {
+                    purpose: BackendPurpose::Vision,
+                    inference_backend: "external".into(),
+                    model_spec_json: serde_json::json!({
+                        "args": ["--model=Qwen/Qwen2.5-VL-7B-Instruct"]
+                    }),
+                    gpu_id: None,
+                    endpoint: Some("http://127.0.0.1:1".into()),
+                    notes: None,
+                    reasoning_enabled: false,
+                    mode: BackendMode::External,
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .unwrap();
+        let resolver = Arc::new(InferenceResolver::new(None));
+        let invoker = InferenceAgentInvoker::new(db, resolver);
+        let err = invoker
+            .invoke(&AskAgentRequest {
+                config: cfg_with_image(),
+            })
+            .await
+            .unwrap_err();
+        // Vision row WAS selected → no VisionRequiredButTextOnlyModel.
+        // The bogus URL produces an LlmFailure.
+        match err {
+            AskAgentError::LlmFailure(_) => {}
+            AskAgentError::VisionRequiredButTextOnlyModel { .. } => panic!(
+                "vision row was configured — invoker should not fail with VisionRequiredButTextOnlyModel",
+            ),
+            other => panic!("expected LlmFailure (bogus URL), got {other:?}"),
+        }
     }
 
     #[tokio::test]
