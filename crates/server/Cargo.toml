@@ -56,6 +56,13 @@ dashmap.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
 rmp-serde.workspace = true
+# M2 of Automations — Rhai is the expression language for Filter
+# / Transform / Branch nodes. The execlaw-script crate uses it for
+# plugin scripts; we need a direct dep here so `automation_runtime.rs`
+# can construct its own sandboxed engine without the plugin-tier
+# capabilities (no HTTP, no host caps — just expression eval over
+# a JSON context). Workspace pin (`1.21`, features `std,sync,serde`).
+rhai.workspace = true
 
 # Phase 13.C — voice STT/TTS adapters POST audio to the managed
 # faster-whisper / Kokoro containers. Multipart for the WAV upload,

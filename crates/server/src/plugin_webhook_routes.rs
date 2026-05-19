@@ -187,6 +187,53 @@ async fn dispatch_handler(
         "body": body_value,
     });
 
+    // M1 of Automations — emit a `WebhookReceived` event on the
+    // durable automation bus alongside (NOT instead of) the existing
+    // plugin Rhai handler dispatch. The bus emission is best-effort:
+    // a failure to publish must NOT block webhook handling, since the
+    // upstream caller has no idea this bus even exists. Dedup key is
+    // a deterministic hash over (plugin_id, method, path, body) so
+    // upstream retries collapse into one event.
+    //
+    // We do the publish BEFORE invoking the handler so a slow / hung
+    // handler doesn't delay automation observability, but AFTER body
+    // parsing so the payload field carries the same shape the plugin
+    // sees.
+    {
+        use sha2::{Digest, Sha256};
+        let dedup_id = {
+            let mut h = Sha256::new();
+            h.update(plugin_id.as_bytes());
+            h.update(b":");
+            h.update(upper.as_bytes());
+            h.update(b":");
+            h.update(path_with_slash.as_bytes());
+            h.update(b":");
+            h.update(&body);
+            format!("webhook:{plugin_id}:{:x}", h.finalize())
+        };
+        let evt = execlaw_core::automation_bus::Event {
+            id: dedup_id,
+            kind: execlaw_core::automation_bus::BusEventKind::WebhookReceived,
+            source: format!("webhook:{plugin_id}"),
+            received_at: chrono::Utc::now().timestamp_millis(),
+            payload: serde_json::json!({
+                "plugin_id": plugin_id,
+                "method": upper,
+                "path": path_with_slash,
+                "query": query_value.clone(),
+                "body": body_value.clone(),
+            }),
+        };
+        if let Err(e) = state.automation_bus.publish(evt).await {
+            tracing::warn!(
+                plugin_id = %plugin_id,
+                error = %e,
+                "automation bus: webhook publish failed (handler dispatch continues)",
+            );
+        }
+    }
+
     use execlaw_script::primitives_glue::json_to_rhai;
     let dyn_args = vec![json_to_rhai(&args)];
     let result = plugin

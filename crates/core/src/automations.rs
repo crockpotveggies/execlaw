@@ -1,0 +1,922 @@
+//! Automations data model + store (M2 of Automations).
+//!
+//! Owns `state_automations`. An automation is a typed graph:
+//!
+//!   * Exactly one [`TriggerDef`] (the bus-event kind + optional
+//!     payload-match predicate).
+//!   * N typed [`NodeDef`]s — Filter / Transform / Branch / Terminal
+//!     in M2; AskAgent / CallPlugin / HttpFetch / Notify reserved.
+//!   * Directed [`EdgeDef`]s connecting nodes (and the synthetic
+//!     `"trigger"` and `"END"` sentinels).
+//!
+//! The whole definition serializes to JSON and rides in the
+//! `definition` column. Mutations go through [`AutomationStore::upsert`]
+//! which runs the validator pre-write (so a malformed graph never
+//! lands on disk). The runtime in `execlaw-server` reads back via
+//! [`AutomationStore::list_for_kind`] (matcher hot path) and
+//! [`AutomationStore::get`] (full-fetch on dispatch).
+
+use crate::automation_bus::BusEventKind;
+use crate::db::{Database, DbError};
+use rusqlite::params;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use uuid::Uuid;
+
+/// Reserved node-id sentinels. The runtime treats them specially.
+pub const TRIGGER_SENTINEL: &str = "trigger";
+pub const END_SENTINEL: &str = "END";
+
+/// The kinds we know how to execute as of M2. Reserved kinds are
+/// stored in the JSON but rejected by the validator with a
+/// not-yet-implemented error — so a future schema bump can land
+/// without breaking persisted definitions that pre-declared them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NodeKind {
+    /// Drop the run if the Rhai expression evaluates falsy.
+    Filter,
+    /// Run the Rhai expression for its value; the result becomes
+    /// the node's `output`, available to downstream `{{<node_id>.*}}`
+    /// templates.
+    Transform,
+    /// Multi-way switch: each `case` is a (Rhai-expr, edge-target).
+    /// The first matching case picks the outgoing edge. If none
+    /// match the node fails — author should provide a default
+    /// (`when: "true"`) case.
+    Branch,
+    /// Explicit no-op end. Optional — a node with no outgoing edges
+    /// also ends the run.
+    Terminal,
+    // Reserved (validator rejects with NotYetImplemented):
+    AskAgent,
+    CallPlugin,
+    AppendToChat,
+    HttpFetch,
+    Notify,
+    AwaitApproval,
+    CallAutomation,
+    Parallel,
+    Join,
+}
+
+impl NodeKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NodeKind::Filter => "Filter",
+            NodeKind::Transform => "Transform",
+            NodeKind::Branch => "Branch",
+            NodeKind::Terminal => "Terminal",
+            NodeKind::AskAgent => "AskAgent",
+            NodeKind::CallPlugin => "CallPlugin",
+            NodeKind::AppendToChat => "AppendToChat",
+            NodeKind::HttpFetch => "HttpFetch",
+            NodeKind::Notify => "Notify",
+            NodeKind::AwaitApproval => "AwaitApproval",
+            NodeKind::CallAutomation => "CallAutomation",
+            NodeKind::Parallel => "Parallel",
+            NodeKind::Join => "Join",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "Filter" => Some(NodeKind::Filter),
+            "Transform" => Some(NodeKind::Transform),
+            "Branch" => Some(NodeKind::Branch),
+            "Terminal" => Some(NodeKind::Terminal),
+            "AskAgent" => Some(NodeKind::AskAgent),
+            "CallPlugin" => Some(NodeKind::CallPlugin),
+            "AppendToChat" => Some(NodeKind::AppendToChat),
+            "HttpFetch" => Some(NodeKind::HttpFetch),
+            "Notify" => Some(NodeKind::Notify),
+            "AwaitApproval" => Some(NodeKind::AwaitApproval),
+            "CallAutomation" => Some(NodeKind::CallAutomation),
+            "Parallel" => Some(NodeKind::Parallel),
+            "Join" => Some(NodeKind::Join),
+            _ => None,
+        }
+    }
+
+    /// `true` for kinds the M2 executor knows how to run. Reserved
+    /// kinds (AskAgent etc.) round-trip through persistence but
+    /// fail at validate-time with `NotYetImplemented`.
+    pub fn is_implemented(&self) -> bool {
+        matches!(
+            self,
+            NodeKind::Filter
+                | NodeKind::Transform
+                | NodeKind::Branch
+                | NodeKind::Terminal
+                | NodeKind::AskAgent
+        )
+    }
+}
+
+/// One exit tool the agent must choose between to terminate the
+/// `AskAgent` turn. The tool's `args_schema` is OpenAI-style JSON
+/// Schema, surfaced verbatim to the model so it knows what arguments
+/// to fill in. The agent's chosen tool name becomes the node's edge-
+/// routing key; the args become the node's output (available to
+/// downstream `{{ask_agent.args.*}}` references).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExitToolDef {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for the tool's arguments. Pass through to the
+    /// `tools[].function.parameters` field of the chat request.
+    pub args_schema: serde_json::Value,
+}
+
+/// Strongly-typed AskAgent node config. Persisted as `node.config`
+/// JSON; parsed by the runtime at execute time.
+///
+/// Locked decisions from v3.2:
+///   * Per-flow `reasoning_tools` palette (subset of `KnownLimited.allowed_tools`).
+///   * `max_turns` defaults to 3 (single-turn enforced in M3a; multi-turn loop in a follow-up).
+///   * First exit-tool call wins; later calls in the same turn are logged and ignored.
+///   * Missing exit-tool call by `max_turns` → node fails.
+///   * Vision-required attachments on a text-only model → node fails fast.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AskAgentConfig {
+    /// The user-message body sent to the agent. Rendered as-is (no
+    /// templating in M3 — author writes the literal prompt or uses
+    /// upstream Transform nodes to compose it).
+    pub prompt: String,
+    /// Attachment refs. Today each entry is either a `data:` URL or
+    /// an `https://` URL the model can fetch. Empty for text-only
+    /// turns; non-empty turns are vision-required and probe the
+    /// model's capability before sending.
+    #[serde(default)]
+    pub attachments: Vec<String>,
+    /// Reasoning-time tool palette. Must be a subset of the
+    /// `KnownLimited` trust profile's `allowed_tools` (enforced at
+    /// invoke time). Empty in M3a since multi-turn-with-tool-calls
+    /// is a follow-up; reserved so author intent persists.
+    #[serde(default)]
+    pub reasoning_tools: Vec<String>,
+    /// Synthesized terminal tools the agent must choose between.
+    /// Exactly one will be picked; its name routes the outgoing
+    /// edge and its args become the node's output.
+    pub exit_tools: Vec<ExitToolDef>,
+    /// Per-node `max_turns` override. `None` means "use the default
+    /// (3)". M3a treats anything ≥ 1 as a single-turn call.
+    #[serde(default)]
+    pub max_turns: Option<u32>,
+}
+
+impl AskAgentConfig {
+    pub fn effective_max_turns(&self) -> u32 {
+        self.max_turns.unwrap_or(3).max(1)
+    }
+}
+
+/// Parse an AskAgent node's `config` JSON. Returns `Err(_)` with a
+/// descriptive message that the validator + runtime surface verbatim.
+pub fn parse_ask_agent_config(config: &serde_json::Value) -> Result<AskAgentConfig, String> {
+    serde_json::from_value::<AskAgentConfig>(config.clone())
+        .map_err(|e| format!("AskAgent config: {e}"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TriggerDef {
+    /// The bus-event kind to subscribe to.
+    pub kind: BusEventKind,
+    /// Optional payload-match predicate, as a Rhai expression
+    /// evaluated against `{ event: { id, kind, source, payload } }`.
+    /// `None` means "match every event of this kind".
+    #[serde(default)]
+    pub when: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NodeDef {
+    pub id: String,
+    pub kind: NodeKind,
+    /// Kind-specific config. Schema:
+    ///   * Filter:    `{ "expr": "<rhai bool>" }`
+    ///   * Transform: `{ "expr": "<rhai value>" }`
+    ///   * Branch:    `{ "cases": [{ "when": "<rhai bool>", "edge": "<node_id>" }, ...] }`
+    ///   * Terminal:  `{}`
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EdgeDef {
+    /// Source: a node id, or `TRIGGER_SENTINEL` for the entry edge.
+    pub from: String,
+    /// Destination: a node id, or `END_SENTINEL` for terminal.
+    pub to: String,
+    /// Optional Rhai bool predicate. `None` = unconditional edge.
+    /// Evaluated against the same scope as Filter/Transform plus
+    /// the source node's output bound as `<from>`.
+    #[serde(default)]
+    pub when: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AutomationDef {
+    pub trigger: TriggerDef,
+    pub nodes: Vec<NodeDef>,
+    pub edges: Vec<EdgeDef>,
+}
+
+/// Stored row.
+#[derive(Debug, Clone)]
+pub struct AutomationRow {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub definition: AutomationDef,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AutomationUpsert {
+    /// `None` on create, `Some` on update.
+    pub id: Option<String>,
+    pub name: String,
+    pub enabled: bool,
+    pub definition: AutomationDef,
+}
+
+#[derive(Debug, Error)]
+pub enum AutomationError {
+    #[error(transparent)]
+    Db(#[from] DbError),
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("definition encode: {0}")]
+    Encode(#[from] serde_json::Error),
+    #[error("validation: {0}")]
+    Validation(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+}
+
+/// Validate an automation definition against the M2 executor's
+/// expectations. Run at upsert time so malformed defs never persist;
+/// also called by the validator endpoint for live editor feedback.
+///
+/// Rules:
+///   * Every node `id` is non-empty and unique within the graph.
+///   * Reserved sentinels (`trigger`, `END`) are not used as node
+///     ids (they're edge endpoints only).
+///   * Every `from`/`to` in edges either matches a node id or is
+///     a sentinel.
+///   * Every node has at least one outgoing edge OR is `Terminal`.
+///     (A non-Terminal node with no outgoing edges runs to no-op
+///     end; we reject as ambiguous — the author probably forgot
+///     an edge.)
+///   * All node kinds are implemented (rejects AskAgent / Notify /
+///     etc. with NotYetImplemented).
+///
+/// Rhai expression *syntax* is NOT validated here — that requires
+/// constructing an engine, which lives in the server crate. The
+/// server-side validator at the API/runtime layer rejects malformed
+/// Rhai. Persisting a parseable JSON with bad Rhai is harmless: the
+/// run fails the first time it's exercised.
+pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
+    use std::collections::HashSet;
+    let mut ids = HashSet::with_capacity(def.nodes.len());
+    for n in &def.nodes {
+        if n.id.is_empty() {
+            return Err(AutomationError::Validation("empty node id".into()));
+        }
+        if n.id == TRIGGER_SENTINEL || n.id == END_SENTINEL {
+            return Err(AutomationError::Validation(format!(
+                "node id '{}' is reserved",
+                n.id
+            )));
+        }
+        if !ids.insert(n.id.clone()) {
+            return Err(AutomationError::Validation(format!(
+                "duplicate node id '{}'",
+                n.id
+            )));
+        }
+        if !n.kind.is_implemented() {
+            return Err(AutomationError::Validation(format!(
+                "node kind '{}' not yet implemented (reserved in v3.2 design, lands in a later milestone)",
+                n.kind.as_str()
+            )));
+        }
+        // Kind-specific shape checks. We re-parse the config into the
+        // typed struct so a missing field surfaces at save time, not
+        // at first-run.
+        if matches!(n.kind, NodeKind::AskAgent) {
+            let cfg = parse_ask_agent_config(&n.config)
+                .map_err(AutomationError::Validation)?;
+            if cfg.prompt.trim().is_empty() {
+                return Err(AutomationError::Validation(format!(
+                    "AskAgent node '{}': prompt is empty",
+                    n.id
+                )));
+            }
+            if cfg.exit_tools.is_empty() {
+                return Err(AutomationError::Validation(format!(
+                    "AskAgent node '{}': exit_tools is empty (the agent must have at least one tool to call)",
+                    n.id
+                )));
+            }
+            let mut tool_names = std::collections::HashSet::new();
+            for t in &cfg.exit_tools {
+                if t.name.trim().is_empty() {
+                    return Err(AutomationError::Validation(format!(
+                        "AskAgent node '{}': exit tool with empty name",
+                        n.id
+                    )));
+                }
+                if !tool_names.insert(t.name.clone()) {
+                    return Err(AutomationError::Validation(format!(
+                        "AskAgent node '{}': duplicate exit tool name '{}'",
+                        n.id, t.name
+                    )));
+                }
+            }
+            // Reasoning_tools is reserved in M3a — author can declare
+            // intent but we don't surface those tools to the model yet.
+            // Document this implicitly: empty list is fine, non-empty
+            // is also fine (forward-compatible).
+            let _ = cfg.reasoning_tools;
+            let _ = cfg.effective_max_turns();
+        }
+    }
+    for e in &def.edges {
+        if e.from != TRIGGER_SENTINEL && !ids.contains(&e.from) {
+            return Err(AutomationError::Validation(format!(
+                "edge.from references unknown node '{}'",
+                e.from
+            )));
+        }
+        if e.to != END_SENTINEL && !ids.contains(&e.to) {
+            return Err(AutomationError::Validation(format!(
+                "edge.to references unknown node '{}'",
+                e.to
+            )));
+        }
+    }
+    // Every non-Terminal node must have ≥1 outgoing edge OR be the
+    // explicit end (i.e., have Terminal kind).
+    for n in &def.nodes {
+        if matches!(n.kind, NodeKind::Terminal) {
+            continue;
+        }
+        let has_outgoing = def.edges.iter().any(|e| e.from == n.id);
+        if !has_outgoing {
+            return Err(AutomationError::Validation(format!(
+                "node '{}' has no outgoing edge and is not Terminal (orphaned)",
+                n.id
+            )));
+        }
+    }
+    // Exactly one entry edge from the trigger sentinel — otherwise
+    // the run has no starting point.
+    let entry_edges = def.edges.iter().filter(|e| e.from == TRIGGER_SENTINEL).count();
+    if entry_edges == 0 {
+        return Err(AutomationError::Validation(
+            "no edge from trigger — automation has no entry point".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub struct AutomationStore<'a> {
+    db: &'a Database,
+}
+
+impl<'a> AutomationStore<'a> {
+    pub fn new(db: &'a Database) -> Self {
+        Self { db }
+    }
+
+    /// Insert or update. Mints a fresh ULID on create; passes through
+    /// the operator-supplied id on update.
+    pub fn upsert(
+        &self,
+        req: &AutomationUpsert,
+        now: i64,
+    ) -> Result<AutomationRow, AutomationError> {
+        validate(&req.definition)?;
+        let id = req
+            .id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let def_json = serde_json::to_string(&req.definition)?;
+        let enabled_flag: i64 = if req.enabled { 1 } else { 0 };
+        self.db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO state_automations \
+                 (id, name, enabled, definition, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   name = excluded.name, \
+                   enabled = excluded.enabled, \
+                   definition = excluded.definition, \
+                   updated_at = excluded.updated_at",
+                params![&id, &req.name, enabled_flag, &def_json, now],
+            )?;
+            Ok(())
+        })?;
+        self.get(&id)?
+            .ok_or_else(|| AutomationError::NotFound(id))
+    }
+
+    pub fn get(&self, id: &str) -> Result<Option<AutomationRow>, AutomationError> {
+        let row = self.db.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, name, enabled, definition, created_at, updated_at \
+                 FROM state_automations WHERE id = ?1",
+            )?;
+            let r = stmt
+                .query_row([id], |r| {
+                    let def_str: String = r.get(3)?;
+                    let definition: AutomationDef = serde_json::from_str(&def_str)
+                        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        ))?;
+                    let enabled_flag: i64 = r.get(2)?;
+                    Ok(AutomationRow {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        enabled: enabled_flag != 0,
+                        definition,
+                        created_at: r.get(4)?,
+                        updated_at: r.get(5)?,
+                    })
+                })
+                .ok();
+            Ok(r)
+        })?;
+        Ok(row)
+    }
+
+    pub fn list_all(&self) -> Result<Vec<AutomationRow>, AutomationError> {
+        let rows = self.db.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, name, enabled, definition, created_at, updated_at \
+                 FROM state_automations ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                let def_str: String = r.get(3)?;
+                let definition: AutomationDef = serde_json::from_str(&def_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                let enabled_flag: i64 = r.get(2)?;
+                Ok(AutomationRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    enabled: enabled_flag != 0,
+                    definition,
+                    created_at: r.get(4)?,
+                    updated_at: r.get(5)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })?;
+        Ok(rows)
+    }
+
+    /// Matcher hot path — enabled automations whose trigger kind
+    /// matches. The expression index `idx_automations_enabled_trigger_kind`
+    /// keeps this cheap regardless of total automation count.
+    pub fn list_enabled_for_kind(
+        &self,
+        kind: BusEventKind,
+    ) -> Result<Vec<AutomationRow>, AutomationError> {
+        let kind_str = kind.as_str();
+        let rows = self.db.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, name, enabled, definition, created_at, updated_at \
+                 FROM state_automations \
+                 WHERE enabled = 1 \
+                   AND json_extract(definition, '$.trigger.kind') = ?1 \
+                 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map([kind_str], |r| {
+                let def_str: String = r.get(3)?;
+                let definition: AutomationDef = serde_json::from_str(&def_str).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                let enabled_flag: i64 = r.get(2)?;
+                Ok(AutomationRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    enabled: enabled_flag != 0,
+                    definition,
+                    created_at: r.get(4)?,
+                    updated_at: r.get(5)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })?;
+        Ok(rows)
+    }
+
+    pub fn delete(&self, id: &str) -> Result<bool, AutomationError> {
+        let n = self.db.with_conn(|c| {
+            let n = c.execute(
+                "DELETE FROM state_automations WHERE id = ?1",
+                params![id],
+            )?;
+            Ok(n)
+        })?;
+        Ok(n > 0)
+    }
+
+    pub fn set_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+        now: i64,
+    ) -> Result<bool, AutomationError> {
+        let flag: i64 = if enabled { 1 } else { 0 };
+        let n = self.db.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE state_automations SET enabled = ?2, updated_at = ?3 \
+                 WHERE id = ?1",
+                params![id, flag, now],
+            )?;
+            Ok(n)
+        })?;
+        Ok(n > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DbConfig;
+    use crate::migrations::MigrationRunner;
+
+    fn fresh_db() -> Database {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        db
+    }
+
+    fn linear_def() -> AutomationDef {
+        AutomationDef {
+            trigger: TriggerDef {
+                kind: BusEventKind::WebhookReceived,
+                when: None,
+            },
+            nodes: vec![
+                NodeDef {
+                    id: "f1".into(),
+                    kind: NodeKind::Filter,
+                    config: serde_json::json!({"expr": "true"}),
+                },
+                NodeDef {
+                    id: "end".into(),
+                    kind: NodeKind::Terminal,
+                    config: serde_json::json!({}),
+                },
+            ],
+            edges: vec![
+                EdgeDef {
+                    from: TRIGGER_SENTINEL.into(),
+                    to: "f1".into(),
+                    when: None,
+                },
+                EdgeDef {
+                    from: "f1".into(),
+                    to: "end".into(),
+                    when: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn validate_accepts_minimal_linear_graph() {
+        validate(&linear_def()).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_node_ids() {
+        let mut def = linear_def();
+        def.nodes.push(NodeDef {
+            id: "f1".into(), // dup
+            kind: NodeKind::Terminal,
+            config: serde_json::json!({}),
+        });
+        let err = validate(&def).unwrap_err();
+        assert!(matches!(err, AutomationError::Validation(_)));
+        assert!(format!("{err}").contains("duplicate node id"));
+    }
+
+    #[test]
+    fn validate_rejects_reserved_sentinels_as_ids() {
+        let mut def = linear_def();
+        def.nodes[0].id = TRIGGER_SENTINEL.into();
+        let err = validate(&def).unwrap_err();
+        assert!(format!("{err}").contains("reserved"));
+    }
+
+    #[test]
+    fn validate_rejects_edge_to_unknown_node() {
+        let mut def = linear_def();
+        def.edges.push(EdgeDef {
+            from: "f1".into(),
+            to: "nowhere".into(),
+            when: None,
+        });
+        let err = validate(&def).unwrap_err();
+        assert!(format!("{err}").contains("edge.to references unknown node"));
+    }
+
+    #[test]
+    fn validate_rejects_orphaned_node() {
+        let mut def = linear_def();
+        def.nodes.push(NodeDef {
+            id: "orphan".into(),
+            kind: NodeKind::Filter,
+            config: serde_json::json!({"expr": "true"}),
+        });
+        let err = validate(&def).unwrap_err();
+        assert!(format!("{err}").contains("orphaned"));
+    }
+
+    #[test]
+    fn validate_rejects_unimplemented_kinds() {
+        let mut def = linear_def();
+        // HttpFetch + Notify are still reserved in M3a.
+        def.nodes[0].kind = NodeKind::HttpFetch;
+        let err = validate(&def).unwrap_err();
+        assert!(format!("{err}").contains("not yet implemented"));
+    }
+
+    fn ask_agent_def() -> AutomationDef {
+        AutomationDef {
+            trigger: TriggerDef {
+                kind: BusEventKind::WebhookReceived,
+                when: None,
+            },
+            nodes: vec![
+                NodeDef {
+                    id: "ask".into(),
+                    kind: NodeKind::AskAgent,
+                    config: serde_json::json!({
+                        "prompt": "Look at the image",
+                        "attachments": [],
+                        "reasoning_tools": [],
+                        "exit_tools": [
+                            {
+                                "name": "notify",
+                                "description": "Call on animal detection",
+                                "args_schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "species": {"type": "string"}
+                                    }
+                                }
+                            },
+                            {
+                                "name": "ignore",
+                                "description": "Call when no animal",
+                                "args_schema": {"type": "object"}
+                            }
+                        ]
+                    }),
+                },
+                NodeDef {
+                    id: "end".into(),
+                    kind: NodeKind::Terminal,
+                    config: serde_json::json!({}),
+                },
+            ],
+            edges: vec![
+                EdgeDef {
+                    from: TRIGGER_SENTINEL.into(),
+                    to: "ask".into(),
+                    when: None,
+                },
+                EdgeDef {
+                    from: "ask".into(),
+                    to: "end".into(),
+                    when: Some(r#"ask.tool == "notify""#.into()),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_ask_agent_node() {
+        validate(&ask_agent_def()).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_ask_agent_with_empty_prompt() {
+        let mut def = ask_agent_def();
+        let mut cfg = parse_ask_agent_config(&def.nodes[0].config).unwrap();
+        cfg.prompt = "   ".into();
+        def.nodes[0].config = serde_json::to_value(&cfg).unwrap();
+        let err = validate(&def).unwrap_err();
+        assert!(format!("{err}").contains("prompt is empty"));
+    }
+
+    #[test]
+    fn validate_rejects_ask_agent_with_empty_exit_tools() {
+        let mut def = ask_agent_def();
+        let mut cfg = parse_ask_agent_config(&def.nodes[0].config).unwrap();
+        cfg.exit_tools.clear();
+        def.nodes[0].config = serde_json::to_value(&cfg).unwrap();
+        let err = validate(&def).unwrap_err();
+        assert!(format!("{err}").contains("exit_tools is empty"));
+    }
+
+    #[test]
+    fn validate_rejects_ask_agent_with_duplicate_exit_tool_names() {
+        let mut def = ask_agent_def();
+        let mut cfg = parse_ask_agent_config(&def.nodes[0].config).unwrap();
+        cfg.exit_tools.push(ExitToolDef {
+            name: "notify".into(),
+            description: "duplicate!".into(),
+            args_schema: serde_json::json!({}),
+        });
+        def.nodes[0].config = serde_json::to_value(&cfg).unwrap();
+        let err = validate(&def).unwrap_err();
+        assert!(format!("{err}").contains("duplicate exit tool name"));
+    }
+
+    #[test]
+    fn validate_rejects_ask_agent_with_malformed_config() {
+        let mut def = ask_agent_def();
+        def.nodes[0].config = serde_json::json!({
+            "prompt": "hi"
+            // missing exit_tools — required field
+        });
+        let err = validate(&def).unwrap_err();
+        assert!(format!("{err}").contains("AskAgent config"));
+    }
+
+    #[test]
+    fn ask_agent_config_default_max_turns_is_three() {
+        let cfg = AskAgentConfig {
+            prompt: "x".into(),
+            attachments: vec![],
+            reasoning_tools: vec![],
+            exit_tools: vec![ExitToolDef {
+                name: "ok".into(),
+                description: "".into(),
+                args_schema: serde_json::json!({}),
+            }],
+            max_turns: None,
+        };
+        assert_eq!(cfg.effective_max_turns(), 3);
+    }
+
+    #[test]
+    fn validate_rejects_no_trigger_edge() {
+        let mut def = linear_def();
+        def.edges.retain(|e| e.from != TRIGGER_SENTINEL);
+        let err = validate(&def).unwrap_err();
+        assert!(format!("{err}").contains("no edge from trigger"));
+    }
+
+    #[test]
+    fn upsert_round_trips_definition() {
+        let db = fresh_db();
+        let store = AutomationStore::new(&db);
+        let row = store
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: "ring-watch".into(),
+                    enabled: true,
+                    definition: linear_def(),
+                },
+                1000,
+            )
+            .unwrap();
+        let fetched = store.get(&row.id).unwrap().unwrap();
+        assert_eq!(fetched.name, "ring-watch");
+        assert!(fetched.enabled);
+        assert_eq!(fetched.definition, linear_def());
+        assert_eq!(fetched.created_at, 1000);
+        assert_eq!(fetched.updated_at, 1000);
+    }
+
+    #[test]
+    fn upsert_rejects_invalid_definition() {
+        let db = fresh_db();
+        let store = AutomationStore::new(&db);
+        let mut bad = linear_def();
+        bad.edges.clear(); // no trigger edge
+        let err = store
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: "broken".into(),
+                    enabled: true,
+                    definition: bad,
+                },
+                1000,
+            )
+            .unwrap_err();
+        assert!(matches!(err, AutomationError::Validation(_)));
+        // And the row was never written.
+        assert_eq!(store.list_all().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn list_enabled_for_kind_filters_correctly() {
+        let db = fresh_db();
+        let store = AutomationStore::new(&db);
+        // Two automations on WebhookReceived, one on RoutineFired,
+        // one disabled.
+        for (name, kind, enabled) in [
+            ("wh-1", BusEventKind::WebhookReceived, true),
+            ("wh-2", BusEventKind::WebhookReceived, true),
+            ("rt-1", BusEventKind::RoutineFired, true),
+            ("wh-disabled", BusEventKind::WebhookReceived, false),
+        ] {
+            let mut def = linear_def();
+            def.trigger.kind = kind;
+            store
+                .upsert(
+                    &AutomationUpsert {
+                        id: None,
+                        name: name.into(),
+                        enabled,
+                        definition: def,
+                    },
+                    1000,
+                )
+                .unwrap();
+        }
+        let webhook = store
+            .list_enabled_for_kind(BusEventKind::WebhookReceived)
+            .unwrap();
+        assert_eq!(webhook.len(), 2);
+        let routine = store
+            .list_enabled_for_kind(BusEventKind::RoutineFired)
+            .unwrap();
+        assert_eq!(routine.len(), 1);
+        let socket = store
+            .list_enabled_for_kind(BusEventKind::SocketMessage)
+            .unwrap();
+        assert_eq!(socket.len(), 0);
+    }
+
+    #[test]
+    fn set_enabled_toggles_flag() {
+        let db = fresh_db();
+        let store = AutomationStore::new(&db);
+        let row = store
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: "toggle".into(),
+                    enabled: true,
+                    definition: linear_def(),
+                },
+                1000,
+            )
+            .unwrap();
+        assert!(store.set_enabled(&row.id, false, 2000).unwrap());
+        assert!(!store.get(&row.id).unwrap().unwrap().enabled);
+        assert!(store.set_enabled(&row.id, true, 3000).unwrap());
+        assert!(store.get(&row.id).unwrap().unwrap().enabled);
+    }
+
+    #[test]
+    fn delete_removes_row() {
+        let db = fresh_db();
+        let store = AutomationStore::new(&db);
+        let row = store
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: "ephemeral".into(),
+                    enabled: true,
+                    definition: linear_def(),
+                },
+                1000,
+            )
+            .unwrap();
+        assert!(store.delete(&row.id).unwrap());
+        assert!(store.get(&row.id).unwrap().is_none());
+        assert!(!store.delete(&row.id).unwrap()); // idempotent
+    }
+}

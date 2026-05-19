@@ -56,6 +56,21 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "add_attachments_filename",
         sql: include_str!("../migrations/0006_add_attachments_filename.sql"),
     },
+    Migration {
+        id: 7,
+        name: "automation_bus",
+        sql: include_str!("../migrations/0007_automation_bus.sql"),
+    },
+    Migration {
+        id: 8,
+        name: "automations",
+        sql: include_str!("../migrations/0008_automations.sql"),
+    },
+    Migration {
+        id: 9,
+        name: "automation_suggestions",
+        sql: include_str!("../migrations/0009_automation_suggestions.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -238,9 +253,17 @@ mod tests {
         let applied = runner.apply_all().unwrap();
         // 2026-05-15: migration 5 adds plugin health columns.
         // 2026-05-18: migration 6 adds state_attachments.filename.
+        // 2026-05-17: migration 7 adds state_bus_events (M1 of
+        // Automations: the durable event-bus substrate).
+        // 2026-05-17: migration 8 adds state_automations +
+        // state_automation_runs (M2 of Automations: persistent
+        // automation defs + run history).
+        // 2026-05-17: migration 9 adds state_automation_suggestions
+        // + state_automation_muted_patterns (M4 of Automations: the
+        // discovery surface on the /automations landing page).
         // Update this list whenever a new migration is added to
         // MIGRATIONS.
-        assert_eq!(applied, vec![1, 5, 6]);
+        assert_eq!(applied, vec![1, 5, 6, 7, 8, 9]);
 
         // Spot-check: every documented table exists.
         let tables = vec![
@@ -291,6 +314,11 @@ mod tests {
             "state_transport_bindings",
             "memory_promotions",
             "memory_reflections",
+            "state_bus_events",
+            "state_automations",
+            "state_automation_runs",
+            "state_automation_suggestions",
+            "state_automation_muted_patterns",
         ];
         db.with_conn(|c| {
             for t in &tables {
@@ -314,7 +342,7 @@ mod tests {
         let runner = MigrationRunner::new(&db);
         let first = runner.apply_all().unwrap();
         let second = runner.apply_all().unwrap();
-        assert_eq!(first, vec![1, 5, 6]);
+        assert_eq!(first, vec![1, 5, 6, 7, 8, 9]);
         assert!(
             second.is_empty(),
             "rerun must not re-apply already-applied migrations"

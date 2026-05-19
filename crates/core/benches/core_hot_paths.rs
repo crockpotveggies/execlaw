@@ -11,6 +11,7 @@
 //! A regression >10% on any of these blocks a merge.
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use execlaw_core::automation_bus::{BusEventKind, BusEventStore, Event as BusEvent};
 use execlaw_core::backends::{BackendMode, BackendPurpose, BackendStore, BackendUpsert};
 use execlaw_core::conversation::{
     ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
@@ -1519,8 +1520,114 @@ fn bench_transport_binding_store(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Automation bus (M1) — `BusEventStore` hot paths. Every webhook + routine
+// fire goes through `publish`; the dispatcher hits `mark_dispatched` once
+// per event; the recovery + poller hit `fetch_pending` on every wake.
+//
+// M1 baseline numbers (in-memory SQLite, Windows dev box, single-threaded):
+//   * publish_external:                     ~2.6 µs / call
+//   * mark_dispatched_already_claimed:      ~1.7 µs / call
+//   * fetch_pending(256 of 1024 pending):   ~3.9 ms / call (~15 µs / row)
+//
+// Budgets (10× the measured baseline gives generous regression headroom):
+//   * publish:           ≤ 30 µs p99
+//   * mark_dispatched:   ≤ 20 µs p99
+//   * fetch_pending(N):  ≤ 40 ms p99 for N=256
+//
+// The fetch_pending cost is dominated by the sort step — the partial index
+// `idx_bus_events_pending` is on `(internal, received_at)`, which serves the
+// `internal_only=true` path optimally but forces an internal-merge sort for
+// the `internal_only=false` path. M2 has the option to add a second partial
+// index `(received_at) WHERE dispatched_at IS NULL` if poller throughput
+// becomes a concern (today: 1 tick per 100ms × 4ms work = 4% CPU, fine).
+// ---------------------------------------------------------------------------
+
+fn bench_automation_bus(c: &mut Criterion) {
+    let db = fresh_db();
+    let store = BusEventStore::new(&db);
+
+    // Pre-seed: one row to claim (mark_dispatched bench) + many rows to
+    // page through (fetch_pending bench). Each bench function runs many
+    // iterations; we want the table state stable across iterations.
+    let claim_evt = BusEvent {
+        id: "bench-claim".into(),
+        kind: BusEventKind::WebhookReceived,
+        source: "bench".into(),
+        received_at: 0,
+        payload: serde_json::json!({"k": "v"}),
+    };
+    store.publish(&claim_evt, false).unwrap();
+
+    // Seed 1024 pending rows so `fetch_pending` measures the realistic
+    // case of "many available, return up to N".
+    for i in 0..1024 {
+        store
+            .publish(
+                &BusEvent {
+                    id: format!("seed-{i}"),
+                    kind: BusEventKind::WebhookReceived,
+                    source: "bench-seed".into(),
+                    received_at: i as i64,
+                    payload: serde_json::json!({"i": i}),
+                },
+                false,
+            )
+            .unwrap();
+    }
+
+    let mut group = c.benchmark_group("automation_bus");
+
+    // publish — the write path. Each iteration writes a fresh id so the
+    // INSERT actually fires (PK collisions don't measure the same path).
+    group.bench_function("publish_external", |b| {
+        let mut i = 0u64;
+        b.iter(|| {
+            let id = format!("bench-pub-{i}");
+            i += 1;
+            let evt = BusEvent {
+                id,
+                kind: BusEventKind::WebhookReceived,
+                source: "bench".into(),
+                received_at: black_box(i as i64),
+                payload: serde_json::json!({"i": i}),
+            };
+            BusEventStore::new(black_box(&db)).publish(&evt, false).unwrap()
+        });
+    });
+
+    // mark_dispatched — the claim path. We use the WHERE clause's
+    // already-claimed semantics: after the first iteration claims the
+    // row, every subsequent call returns `false` quickly. That measures
+    // the no-op UPDATE cost, which is what the dispatcher sees most
+    // often (claim races on pending rows are rare).
+    group.bench_function("mark_dispatched_already_claimed", |b| {
+        // Make sure it's claimed first.
+        let _ = BusEventStore::new(&db).mark_dispatched("bench-claim", 1);
+        b.iter(|| {
+            BusEventStore::new(black_box(&db))
+                .mark_dispatched(black_box("bench-claim"), 1)
+                .unwrap()
+        });
+    });
+
+    // fetch_pending(256) — what the poller + recovery scan call on
+    // every wake. Throughput-friendly metric (ids returned).
+    group.throughput(Throughput::Elements(256));
+    group.bench_function("fetch_pending_256_of_1024", |b| {
+        b.iter(|| {
+            BusEventStore::new(black_box(&db))
+                .fetch_pending(false, 256)
+                .unwrap()
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_automation_bus,
     bench_hmac,
     bench_idempotency_key,
     bench_event_record_encode_decode,

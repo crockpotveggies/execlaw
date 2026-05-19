@@ -55,7 +55,7 @@ fn build_state(transcript: &'static str) -> AppState {
         )),
         plugin_host: PluginHost::new(db.clone(), HookRegistry::new(), stage_root),
         webauthn: None,
-        mcp_host: execlaw_server::mcp_host::McpHost::new(db),
+        mcp_host: execlaw_server::mcp_host::McpHost::new(db.clone()),
         backend_supervisor: None,
         voice_sessions: execlaw_server::voice_session::VoiceSessionRegistry::new(events.clone()),
         voice_runtime: VoiceRuntime::new(events, stt, tts),
@@ -66,6 +66,7 @@ fn build_state(transcript: &'static str) -> AppState {
         host_transports: execlaw_server::transport_registry::HostTransportRegistry::new(),
         skill_capture: execlaw_skills::AutoCaptureSink::noop(),
         reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
+        automation_bus: execlaw_server::automation_bus::AutomationBus::stub(db),
     }
 }
 

@@ -248,6 +248,12 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                     testId="sidebar-routines"
                 />
                 <SidebarNavLink
+                    to="/automations"
+                    icon="bi-lightning-charge-fill"
+                    label="Automations"
+                    testId="sidebar-automations"
+                />
+                <SidebarNavLink
                     to="/research"
                     icon="bi-binoculars"
                     label="Research"

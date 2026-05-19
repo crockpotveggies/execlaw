@@ -1803,6 +1803,31 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
             inference.clone(),
         );
 
+    // M1/M2/M3 of Automations — spawn the durable event bus before
+    // constructing AppState so the dispatcher + poller are live
+    // before the first ingress (webhook routes mount after this
+    // point). The handler runs the automation matcher: for each
+    // delivered event, it looks up enabled automations whose
+    // trigger.kind matches, evaluates trigger.when predicates, and
+    // executes the typed graph. M3 adds the `AskAgent` node, which
+    // delegates to the `AutomationsAgentPool`. The pool wraps
+    // `InferenceAgentInvoker` (real LLM via the inference resolver)
+    // and bounds concurrency at the locked default (1). When no
+    // inference backend is configured, AskAgent fails fast with
+    // `NoLlmConfigured` rather than silently hanging.
+    let automation_bus_stop = std::sync::Arc::new(tokio::sync::Notify::new());
+    let automation_agent_pool = execlaw_server::automation_agent::AutomationsAgentPool::new(
+        std::sync::Arc::new(execlaw_server::automation_agent::InferenceAgentInvoker::new(
+            db.clone(),
+            inference.clone(),
+        )),
+    );
+    let (automation_bus, automation_bus_tasks) = execlaw_server::automation_bus::AutomationBus::spawn(
+        db.clone(),
+        execlaw_server::automation_runtime::build_handler(db.clone(), automation_agent_pool),
+        automation_bus_stop.clone(),
+    );
+
     let state = execlaw_server::AppState {
         db: db.clone(),
         // Stash the exact config we just opened with so the
@@ -1830,7 +1855,14 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         skill_capture: skill_capture_sink,
         reuse_update: reuse_update_sink,
         data_dir: data_dir.clone(),
+        automation_bus,
     };
+    // We don't await `automation_bus_tasks` — letting the spawned
+    // dispatcher + poller run for the process lifetime. The `stop`
+    // notify is held by the same shutdown path that drives the rest
+    // of the sweepers (`sweep_stop`); we link them below so a SIGTERM
+    // drains everything together.
+    drop(automation_bus_tasks);
 
     // Phase B (channel-plugin surface): wire the host-capabilities
     // arc into the script engine NOW that AppState exists. The
@@ -1938,6 +1970,43 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         let routine_run_sweeper =
             execlaw_core::routine_run_retention::RoutineRunRetentionSweeper::new(db.clone());
         tokio::spawn(async move { routine_run_sweeper.run(stop).await });
+    }
+
+    // M1 of Automations — retention sweep for `state_bus_events`.
+    // Only dispatched rows are eligible (the sweeper's underlying
+    // store call enforces this); pending rows are preserved
+    // regardless of age so a stuck dispatcher stays visible.
+    // 2-hour cadence matches `EventRetentionSweeper`.
+    {
+        let stop = sweep_stop.clone();
+        let bus_event_sweeper =
+            execlaw_core::bus_event_retention::BusEventRetentionSweeper::new(db.clone());
+        tokio::spawn(async move { bus_event_sweeper.run(stop).await });
+    }
+    // M4 of Automations — daily sweep that populates
+    // `state_automation_suggestions`. Groups recent bus events by
+    // (kind, source), surfaces high-volume patterns that have no
+    // matching enabled automation, and skips muted patterns.
+    // The landing page reads from this table; agent-drafted
+    // suggestions (M5) plug in at the same seam.
+    {
+        let stop = sweep_stop.clone();
+        let sugg_sweeper =
+            execlaw_server::automation_suggestions_sweeper::AutomationSuggestionsSweeper::new(
+                db.clone(),
+            );
+        tokio::spawn(async move { sugg_sweeper.run(stop).await });
+    }
+    // Link the automation bus's dispatcher + poller into the same
+    // shutdown signal as the sweepers — a SIGTERM drains the bus
+    // alongside everything else.
+    {
+        let stop = sweep_stop.clone();
+        let bus_stop = automation_bus_stop.clone();
+        tokio::spawn(async move {
+            stop.notified().await;
+            bus_stop.notify_waiters();
+        });
     }
 
     // Phase 12.C — backend supervisor reconcile loop. Only spawns

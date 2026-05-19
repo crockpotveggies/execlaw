@@ -1671,6 +1671,7 @@ dependencies = [
  "rand 0.8.6",
  "regex",
  "reqwest",
+ "rhai",
  "rmp-serde",
  "rusqlite",
  "rust-embed",

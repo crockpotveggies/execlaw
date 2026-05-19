@@ -772,6 +772,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::trust_policy::trust_policy_router())
         .merge(crate::my_identities::my_identities_router())
         .merge(crate::routines::routines_router())
+        .merge(crate::automations_admin::router())
         .merge(crate::personality::personality_router())
         .merge(crate::runners_admin::runners_admin_router())
         .merge(crate::inference_probe::inference_probe_router())
@@ -885,7 +886,7 @@ pub fn test_app_state() -> AppState {
         // when needed. Leaving this `None` means count_for_user
         // returns 0 and the password-only login path is exercised.
         webauthn: None,
-        mcp_host: crate::mcp_host::McpHost::new(db),
+        mcp_host: crate::mcp_host::McpHost::new(db.clone()),
         // Tests don't have Docker; supervisor stays None and the
         // routes report 503 if exercised. Tests that DO want a
         // mock-backed supervisor construct AppState manually.
@@ -933,6 +934,11 @@ pub fn test_app_state() -> AppState {
             "execlaw-test-data-{}",
             uuid::Uuid::new_v4()
         )),
+        // M1 of Automations — stub bus that writes durably but doesn't
+        // dispatch. Tests exercising end-to-end dispatch should use
+        // `AutomationBus::spawn` inside a `#[tokio::test]` (the
+        // automation_bus module's own tests do this).
+        automation_bus: crate::automation_bus::AutomationBus::stub(db.clone()),
     }
 }
 

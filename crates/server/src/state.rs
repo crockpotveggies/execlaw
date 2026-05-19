@@ -1,5 +1,6 @@
 //! Shared application state.
 
+use crate::automation_bus::AutomationBus;
 use crate::events::EventBus;
 use execlaw_core::Database;
 use execlaw_plugin_host::PluginHost;
@@ -217,6 +218,15 @@ pub struct AppState {
     /// request. Tests default to a tempdir; production threads the
     /// real path through from `cli/main.rs::cmd_serve`.
     pub data_dir: std::path::PathBuf,
+    /// M1 of Automations — durable event bus for external signals
+    /// (webhooks, sockets, plugin emits, routine fires). Always
+    /// present: `cmd_serve` spawns the real bus with the M1 no-op
+    /// handler; `routes::test_app_state` constructs a stub bus
+    /// whose `publish` still writes durably but no dispatcher
+    /// drives it. Distinct from `events: EventBus` above — that one
+    /// is the in-process SPA-broadcast bus; this one is the durable
+    /// inbox for automation triggers.
+    pub automation_bus: AutomationBus,
 }
 
 impl std::fmt::Debug for AppState {
