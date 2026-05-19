@@ -168,6 +168,34 @@ jobs:
           # the repo root.
           command: check advisories bans licenses sources
 
+  # Semgrep static-analysis pass for security-sensitive patterns.
+  # Currently advisory (continue-on-error: true) — findings surface
+  # in CI logs but don't block merges. Tighten to required once the
+  # ruleset stabilizes and the false-positive rate drops.
+  #
+  # Today's rules (.semgrep/rust-sql-format.yml):
+  #   * rust-sql-format-interpolation — flags `format!` whose first
+  #     argument contains a SQL verb AND a `{}` placeholder. Audit
+  #     2026-05 recommended this as a regression guardrail.
+  #   * rust-rusqlite-format-arg — flags `format!` values passed into
+  #     rusqlite's execute / query / prepare methods.
+  #
+  # To silence a finding the reviewer has confirmed is safe, add a
+  # `// nosemgrep: <rule-id>` comment with a one-line reason on the
+  # line above the offending call.
+  semgrep:
+    name: semgrep
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Semgrep
+        run: pip install --user semgrep
+
+      - name: Run SQL-format guardrail
+        run: semgrep --config .semgrep/rust-sql-format.yml --error crates/
+
   # Code-coverage job is currently disabled — re-enable when we wire
   # up a CODECOV_TOKEN or otherwise restore the lcov upload pipeline.
   # The previous job ran cargo-llvm-cov over the workspace and pushed
