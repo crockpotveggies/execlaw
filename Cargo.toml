@@ -27,16 +27,18 @@ members = [
     "crates/skills",
     "crates/model-adapter",
 ]
-# Tauri desktop wrappers (macOS .app + Windows .exe-installer) are
-# built with their own Rust toolchain via `cargo tauri build` (which
-# adds the WebView2 / WKWebView linkage and bundles assets) — keep
-# them out of the main workspace so a plain `cargo check` on any host
-# doesn't try to compile the platform-specific Apple-framework /
-# WebView2 bindings. Each desktop crate is gated on its respective
+# Tauri desktop wrappers (macOS .app + Windows .exe-installer +
+# Linux .deb) are built with their own Rust toolchain via
+# `cargo tauri build` (which adds the WebView2 / WKWebView /
+# webkit2gtk linkage and bundles assets) — keep them out of the
+# main workspace so a plain `cargo check` on any host doesn't try
+# to compile the platform-specific Apple-framework / WebView2 /
+# GTK bindings. Each desktop crate is gated on its respective
 # `cfg(target_os = …)` internally and won't link on the wrong host.
 exclude = [
     "desktop-macos/src-tauri",
     "desktop-windows/src-tauri",
+    "desktop-linux/src-tauri",
 ]
 
 [workspace.package]

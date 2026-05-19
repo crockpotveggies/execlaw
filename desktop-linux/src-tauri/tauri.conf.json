@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "execlaw",
+  "version": "0.1.0",
+  "identifier": "com.execlaw.app",
+  "mainBinaryName": "execlaw-tray",
+  "build": {
+    "beforeBuildCommand": "",
+    "beforeDevCommand": "",
+    "devUrl": "http://127.0.0.1:3031",
+    "frontendDist": "../placeholder-frontend"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [],
+    "security": {
+      "csp": null,
+      "capabilities": []
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb"],
+    "category": "DeveloperTool",
+    "shortDescription": "Self-hosted Rust agent platform — Linux notification-area app.",
+    "longDescription": "execlaw is a self-hosted agent platform with persistent memory, hook-based plugins, and per-conversation runner containers. The Linux tray app supervises the local control plane (registered as a systemd --user service) and opens the chat UI.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png"
+    ],
+    "externalBin": ["bin/execlaw"],
+    "resources": ["resources/plugins/*.zip"],
+    "linux": {
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libayatana-appindicator3-1",
+          "libgtk-3-0"
+        ]
+      }
+    }
+  }
+}

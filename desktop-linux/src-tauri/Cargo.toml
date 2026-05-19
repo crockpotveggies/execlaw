@@ -1,0 +1,64 @@
+[package]
+name = "execlaw-tray-linux"
+version = "0.1.0"
+description = "execlaw Linux notification-area app — registers a systemd user service via the bundled CLI and hosts the WebView."
+authors = ["Justin Long <justinelgenlong@gmail.com>"]
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/justinelgenlong/execlaw"
+rust-version = "1.85"
+
+# This crate is intentionally OUTSIDE the workspace at the repo root —
+# see the `exclude` entry in `/Cargo.toml`. Tauri pulls in Linux-only
+# webkit2gtk + GTK bindings; keeping it out of the workspace lets
+# `cargo check -p execlaw-*` stay fast on macOS / Windows dev hosts
+# (mirrors what `desktop-macos/src-tauri` and `desktop-windows/src-tauri`
+# already do for their respective platforms).
+
+[lib]
+name = "execlaw_tray_linux_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "execlaw-tray"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri 2 — tray-icon ships in core but is feature-gated; image-png
+# decodes the tray icon at runtime. Linux SNI (StatusNotifierItem) is
+# PNG-based, same as the macOS template image but rendered in color
+# without the template-tinting macOS does.
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process"] }
+# Loopback-only — server lives on 127.0.0.1:3031. Mirrors the macOS /
+# Windows tray's reqwest config so behavior is identical across
+# platforms.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Linux-only deps. No FFI to libsystemd needed: the tray queries
+# service state by shelling out to `systemctl --user`, which is
+# always available on a systemd host and avoids carrying a
+# libsystemd-dev build-time dep. The `[target.…]` block keeps these
+# from leaking into a Windows / macOS `cargo check` should the
+# workspace-exclude ever get accidentally lifted.
+[target.'cfg(target_os = "linux")'.dependencies]
+# (intentionally empty — see above)
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
