@@ -1,0 +1,71 @@
+[package]
+name = "execlaw-tray-win"
+version = "0.1.0"
+description = "execlaw Windows notification-area app — query SCM status, host the WebView, surface restart/uninstall."
+authors = ["Justin Long <justinelgenlong@gmail.com>"]
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/justinelgenlong/execlaw"
+rust-version = "1.85"
+
+# This crate is intentionally OUTSIDE the workspace at the repo root —
+# see the `exclude` entry in `/Cargo.toml`. Tauri pulls in Windows-only
+# WebView2 + `windows-service` bindings; keeping it out of the
+# workspace lets `cargo check -p execlaw-*` stay fast on macOS / Linux
+# dev hosts (mirrors what `desktop-macos/src-tauri` already does for
+# the macOS bundle).
+
+[lib]
+name = "execlaw_tray_win_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "execlaw-tray"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri 2 — tray-icon ships in core but is feature-gated; image-ico
+# decodes the tray icon at runtime (Windows uses .ico, not .png like
+# macOS's template menu-bar image).
+tauri = { version = "2", features = ["tray-icon", "image-ico", "image-png"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# Loopback-only — server lives on 127.0.0.1:3031. Mirrors the macOS
+# tray's reqwest config so behavior is identical across platforms.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Windows-only — we read SCM (Service Control Manager) state via the
+# `windows-service` crate so the tray can show "Service: Running /
+# Stopped / Paused" without shelling out to `sc.exe query`. The CLI's
+# `service::install` / `service::start` already use the same crate to
+# install / control the service, so the dependency surface is
+# consistent across the install path and the status read.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-service = "0.7"
+# Used by the "Restart service" menu item to call back into the
+# bundled `execlaw.exe service restart`, which requires elevation —
+# we re-launch ourselves via ShellExecuteW with the `runas` verb so
+# the UAC consent dialog fires automatically.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

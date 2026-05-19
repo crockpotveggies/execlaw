@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "execlaw",
+  "version": "0.1.0",
+  "identifier": "com.execlaw.app",
+  "mainBinaryName": "execlaw-tray",
+  "build": {
+    "beforeBuildCommand": "",
+    "beforeDevCommand": "",
+    "devUrl": "http://127.0.0.1:3031",
+    "frontendDist": "../placeholder-frontend"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [],
+    "security": {
+      "csp": null,
+      "capabilities": []
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "category": "DeveloperTool",
+    "shortDescription": "Self-hosted Rust agent platform — Windows notification-area app.",
+    "longDescription": "execlaw is a self-hosted agent platform with persistent memory, hook-based plugins, and per-conversation runner containers. The Windows tray app supervises the local control plane (registered as a Windows service) and opens the chat UI.",
+    "icon": ["icons/icon.ico"],
+    "externalBin": ["bin/execlaw"],
+    "resources": ["resources/plugins/*.zip"],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "displayLanguageSelector": false,
+        "languages": ["English"],
+        "installMode": "perMachine",
+        "installerIcon": "icons/icon.ico",
+        "installerHooks": "installer/hooks.nsh"
+      }
+    }
+  }
+}

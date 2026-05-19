@@ -1,0 +1,24 @@
+# Tauri build artefacts.
+target/
+gen/
+# Tauri 2 writes runtime-generated capability schemas here on first build.
+gen/schemas/
+# The bundled execlaw.exe lands under bin/ via scripts/build-windows.ps1.
+# Track only the README; the .gitkeep guards an otherwise-empty dir.
+bin/*
+!bin/.gitkeep
+!bin/README.md
+# Plugin ZIPs staged into Contents/resources/plugins at bundle
+# time. Built fresh by scripts/build-windows.ps1 on every release
+# build, so committing them would just create drift.
+resources/plugins/
+
+# Generated icon set — rendered from the SVG sources under
+# assets/ by scripts/build-windows.ps1. Sources (SVG) live in
+# /assets; the rendered binary artefacts are regenerated on every
+# build so we don't bloat git with PNGs / ICOs that drift from the
+# SVG truth.
+icons/icon.ico
+icons/icon.png
+icons/tray.ico
+icons/*.png
