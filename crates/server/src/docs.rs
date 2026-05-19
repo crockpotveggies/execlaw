@@ -22,11 +22,17 @@ use crate::approvals::{
     IdentifierSummary, PendingApprovalSummary, PendingApprovalsResponse, PrincipalListResponse,
     PrincipalSummary,
 };
+use crate::automation_runtime::{DryRunResult, ExecOutcome};
+use crate::automations_admin::{
+    AutomationDto, CreateAutomationRequest, MetricsDto, RecentBusEventDto, SampleEventBody,
+    SuggestionDto, TestRunRequest, UpdateAutomationRequest,
+};
 use crate::backend_presets::{BackendPreset, PresetField, PresetWithFlag, PresetsResponse};
 use crate::backends::{
     BackendListEntry, BackendListResponse, BackendLogsResponse, BackendStatusResponse, BackendView,
     UpsertBackendRequest,
 };
+use crate::inference_metrics::{ConsumerSnapshot, InferenceConsumer, MetricsSnapshot};
 use crate::mcp_admin::{McpServerListResponse, McpServerView, McpServerWriteRequest};
 use crate::my_identities::{
     AddIdentifierRequest, AvailableTransportView, AvailableTransportsResponse, IdentifierView,
@@ -52,17 +58,6 @@ use crate::routines::{
     PreviewRequest, PreviewResponse, RoutineListResponse, RoutineRunListResponse, RoutineRunView,
     RoutineView, UpsertRoutineRequest,
 };
-use crate::automations_admin::{
-    AutomationDto, CreateAutomationRequest, MetricsDto, RecentBusEventDto, SampleEventBody,
-    SuggestionDto, TestRunRequest, UpdateAutomationRequest,
-};
-use crate::automation_runtime::{DryRunResult, ExecOutcome};
-use crate::inference_metrics::{ConsumerSnapshot, InferenceConsumer, MetricsSnapshot};
-use execlaw_core::automation_bus::BusEventKind;
-use execlaw_core::automation_runs::{AutomationRunRow, AutomationRunStatus, StepTrace};
-use execlaw_core::automations::{
-    AskAgentConfig, AutomationDef, EdgeDef, ExitToolDef, NodeDef, NodeKind, TriggerDef,
-};
 use crate::runners_admin::{GroupRunnerListResponse, GroupRunnerView};
 use crate::settings_general::{GeneralSettingsView, UpdateGeneralSettingsRequest};
 use crate::settings_research::{ResearchSettingsView, UpdateResearchSettingsRequest};
@@ -71,6 +66,11 @@ use crate::tools_admin::{ToolListResponse, ToolView, UpdateToolPolicyRequest};
 use crate::trust_policy::{TrustPolicyView, UpdateTrustPolicyRequest};
 use crate::users::{
     ChangePasswordRequest, InviteUserRequest, ResetPasswordRequest, UserListResponse, UserView,
+};
+use execlaw_core::automation_bus::BusEventKind;
+use execlaw_core::automation_runs::{AutomationRunRow, AutomationRunStatus, StepTrace};
+use execlaw_core::automations::{
+    AskAgentConfig, AutomationDef, EdgeDef, ExitToolDef, NodeDef, NodeKind, TriggerDef,
 };
 use utoipa::Modify;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
