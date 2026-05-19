@@ -1,77 +1,84 @@
-// ReactFlow visualization of an `AutomationDef` (M4c).
+// ReactFlow editor for an `AutomationDef` (M5 canvas-editor v2).
 //
-// Renders the trigger as a synthetic node at the top, the typed nodes
-// in a top-to-bottom layout, and the edges with optional `when`-clause
-// labels. Nodes are draggable for visual rearrangement (positions are
-// local to the canvas — not persisted; the JSON view remains the
-// source of truth for the definition).
+// Controlled-mode wrapper: the parent owns the `AutomationDef` and
+// passes a `onChange(def)` callback. Every canvas mutation —
+// drag-to-reposition, drag-to-create-edge, click-to-edit-via-panel,
+// delete-on-keyboard, drop-from-palette — flows through that single
+// setter so the JSON view stays a faithful round-trip of the canvas.
 //
-// Read-only display in this iteration: no add/remove/edit affordances
-// on the canvas itself. Use the JSON view for structural edits. A
-// future iteration can layer config-on-click and drag-to-create-edge
-// onto this base.
+// Node positions persist on `NodeDef.position`. Drags batched at
+// dragstop so we don't fire 60+ updates per move.
 
 import {
     Background,
     Controls,
     MiniMap,
     ReactFlow,
+    ReactFlowProvider,
+    useReactFlow,
+    type Connection,
     type Edge,
     type Node,
+    type NodeChange,
+    type EdgeChange,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { useMemo } from "react";
-import type { AutomationDef, NodeDef } from "../api/automations";
-
-interface Props {
-    definition: AutomationDef;
-}
+import { useCallback, useMemo, useRef, useState } from "react";
+import {
+    AutomationNodePanel,
+} from "./AutomationNodePanel";
+import {
+    KIND_COLORS,
+    KIND_ICONS,
+    NODE_TYPES,
+    type CanvasNodeData,
+} from "./automation-nodes";
+import type {
+    AutomationDef,
+    NodeDef,
+    NodeKind,
+} from "../api/automations";
 
 const TRIGGER_NODE_ID = "__trigger__";
-const END_NODE_ID = "__end__";
 const X_CENTER = 240;
 const ROW_HEIGHT = 100;
 
+interface Props {
+    definition: AutomationDef;
+    /** When `null`, the canvas is read-only (no editing affordances).
+     *  When set, every canvas mutation flows through this callback. */
+    onChange?: ((next: AutomationDef) => void) | null;
+}
+
 /**
- * Build ReactFlow nodes + edges from our internal `AutomationDef`.
- *
- * Layout strategy: rank nodes by reachability from the trigger
- * (BFS from `trigger` through the edges), place each rank in its
- * own row. Stable across re-renders given the same definition —
- * the operator's drag-to-rearrange in the canvas doesn't persist,
- * but a save → reload returns to the deterministic layout.
+ * BFS-rank layout used as the *fallback* when a node has no
+ * `position`. Once the operator drags the node, `NodeDef.position`
+ * gets set and BFS is no longer consulted for it.
  */
-function buildGraph(def: AutomationDef): { nodes: Node[]; edges: Edge[] } {
+function defaultPosition(
+    def: AutomationDef,
+    nodeId: string,
+): { x: number; y: number } {
     const ranks = new Map<string, number>();
     ranks.set("trigger", 0);
-    // BFS to assign rank to each node based on shortest-path distance
-    // from the trigger sentinel.
-    const queue: Array<{ id: string; depth: number }> = [
-        { id: "trigger", depth: 0 },
-    ];
+    const queue: Array<{ id: string; depth: number }> = [{ id: "trigger", depth: 0 }];
     while (queue.length > 0) {
         const { id, depth } = queue.shift()!;
         for (const e of def.edges) {
             if (e.from === id) {
-                const target = e.to;
-                if (!ranks.has(target) || ranks.get(target)! > depth + 1) {
-                    ranks.set(target, depth + 1);
-                    queue.push({ id: target, depth: depth + 1 });
+                if (!ranks.has(e.to) || ranks.get(e.to)! > depth + 1) {
+                    ranks.set(e.to, depth + 1);
+                    queue.push({ id: e.to, depth: depth + 1 });
                 }
             }
         }
     }
-
-    // Group node ids by rank for horizontal spreading within a row.
     const byRank: Map<number, string[]> = new Map();
     for (const [id, rank] of ranks.entries()) {
         const arr = byRank.get(rank) ?? [];
         arr.push(id);
         byRank.set(rank, arr);
     }
-    // Any node without an in-edge from the trigger graph still needs
-    // to render — pin orphans to a fallback rank below the deepest
-    // reached so they're visible but visibly orphaned.
     const maxRank = Math.max(0, ...ranks.values());
     let orphanRank = maxRank + 1;
     for (const n of def.nodes) {
@@ -83,136 +90,413 @@ function buildGraph(def: AutomationDef): { nodes: Node[]; edges: Edge[] } {
             orphanRank += 1;
         }
     }
+    const rank = ranks.get(nodeId) ?? 0;
+    const row = byRank.get(rank) ?? [];
+    const idx = row.indexOf(nodeId);
+    const offset = (idx - (row.length - 1) / 2) * 220;
+    return { x: X_CENTER + offset, y: rank * ROW_HEIGHT };
+}
 
-    const positionFor = (id: string): { x: number; y: number } => {
-        const rank = ranks.get(id) ?? 0;
-        const row = byRank.get(rank) ?? [];
-        const idx = row.indexOf(id);
-        const offset = (idx - (row.length - 1) / 2) * 220;
-        return { x: X_CENTER + offset, y: rank * ROW_HEIGHT };
-    };
+function shorten(s: string | undefined): string {
+    if (!s) return "";
+    const trimmed = s.trim();
+    if (trimmed.length <= 60) return trimmed;
+    return `${trimmed.slice(0, 57)}…`;
+}
 
+function bodyFor(n: NodeDef): string | undefined {
+    const cfg = (n.config ?? {}) as Record<string, unknown>;
+    switch (n.kind) {
+        case "Filter":
+        case "Transform":
+            return shorten(cfg.expr as string | undefined);
+        case "AskAgent":
+            return shorten(cfg.prompt as string | undefined);
+        default:
+            return undefined;
+    }
+}
+
+function buildGraph(
+    def: AutomationDef,
+    selectedNodeId: string | null,
+): { nodes: Node[]; edges: Edge[] } {
     const triggerNode: Node = {
         id: TRIGGER_NODE_ID,
-        position: positionFor("trigger"),
-        data: { label: `Trigger: ${def.trigger.kind}` },
-        type: "input",
-        style: triggerStyle,
+        position: def.nodes.find((n) => n.id === "trigger")?.position ??
+            defaultPosition(def, "trigger"),
+        data: {
+            label: def.trigger.kind,
+            detail: def.trigger.when ?? undefined,
+            sentinel: "trigger",
+        } satisfies CanvasNodeData,
+        type: "Trigger",
+        draggable: true,
     };
-
-    const typedNodes: Node[] = def.nodes.map((n: NodeDef) => ({
+    const typedNodes: Node[] = def.nodes.map((n) => ({
         id: n.id,
-        position: positionFor(n.id),
-        data: { label: nodeLabel(n) },
-        type: n.kind === "Terminal" ? "output" : "default",
-        style: styleForKind(n.kind),
+        position: n.position ?? defaultPosition(def, n.id),
+        data: {
+            label: n.id,
+            detail: bodyFor(n),
+            selected: selectedNodeId === n.id,
+        } satisfies CanvasNodeData,
+        type: n.kind,
+        draggable: true,
+        selected: selectedNodeId === n.id,
     }));
-
-    // If any edge points at the END sentinel, render a synthetic END
-    // node so the operator sees the flow terminating explicitly.
-    const hasEndEdge = def.edges.some((e) => e.to === "END");
-    const endNode: Node | null = hasEndEdge
-        ? {
-              id: END_NODE_ID,
-              position: { x: X_CENTER, y: (maxRank + 1) * ROW_HEIGHT },
-              data: { label: "END" },
-              type: "output",
-              style: endStyle,
-          }
-        : null;
+    const nodes: Node[] = [triggerNode, ...typedNodes];
 
     const edges: Edge[] = def.edges.map((e, i) => ({
         id: `e-${i}-${e.from}-${e.to}`,
         source: e.from === "trigger" ? TRIGGER_NODE_ID : e.from,
-        target: e.to === "END" ? END_NODE_ID : e.to,
+        target: e.to,
         label: e.when ?? undefined,
         labelStyle: { fontSize: 11, fill: "#444" },
         labelBgStyle: { fill: "#fff", fillOpacity: 0.85 },
         style: { stroke: "#888", strokeWidth: 1.5 },
         animated: e.when !== null && e.when !== undefined,
     }));
-
-    const nodes: Node[] = [triggerNode, ...typedNodes];
-    if (endNode) nodes.push(endNode);
     return { nodes, edges };
 }
 
-function nodeLabel(n: NodeDef): string {
-    // Show a short, kind-specific label so the canvas reads at a
-    // glance instead of just listing ids.
-    const cfg = (n.config ?? {}) as Record<string, unknown>;
-    switch (n.kind) {
-        case "Filter":
-            return `Filter\n${shorten(cfg.expr as string | undefined)}`;
-        case "Transform":
-            return `Transform\n${shorten(cfg.expr as string | undefined)}`;
-        case "Branch":
-            return `Branch\n${n.id}`;
-        case "Terminal":
-            return `Terminal\n${n.id}`;
-        case "AskAgent": {
-            const prompt = cfg.prompt as string | undefined;
-            return `AskAgent\n${shorten(prompt)}`;
-        }
-        default:
-            return `${n.kind}\n${n.id}`;
-    }
-}
-
-function shorten(s: string | undefined): string {
-    if (!s) return "(no expr)";
-    const trimmed = s.trim();
-    if (trimmed.length <= 36) return trimmed;
-    return `${trimmed.slice(0, 33)}…`;
-}
-
-const triggerStyle = {
-    background: "#e7f1ff",
-    border: "1px solid #4a8cff",
-    fontSize: 12,
-    padding: 6,
-    whiteSpace: "pre-line" as const,
-};
-const endStyle = {
-    background: "#f3f4f6",
-    border: "1px solid #6b7280",
-    fontSize: 12,
-    padding: 6,
-};
-function styleForKind(kind: NodeDef["kind"]) {
-    const base = {
-        fontSize: 12,
-        padding: 6,
-        whiteSpace: "pre-line" as const,
+export function withUpdatedPosition(
+    def: AutomationDef,
+    id: string,
+    pos: { x: number; y: number },
+): AutomationDef {
+    return {
+        ...def,
+        nodes: def.nodes.map((n) =>
+            n.id === id ? { ...n, position: { x: pos.x, y: pos.y } } : n,
+        ),
     };
+}
+
+export function withRemovedNode(def: AutomationDef, id: string): AutomationDef {
+    if (id === TRIGGER_NODE_ID || id === "trigger") return def;
+    return {
+        ...def,
+        nodes: def.nodes.filter((n) => n.id !== id),
+        edges: def.edges.filter((e) => e.from !== id && e.to !== id),
+    };
+}
+
+export function withRemovedEdge(def: AutomationDef, edgeId: string): AutomationDef {
+    return {
+        ...def,
+        edges: def.edges.filter((_, i) => {
+            const e = def.edges[i];
+            return `e-${i}-${e.from}-${e.to}` !== edgeId;
+        }),
+    };
+}
+
+export function withAddedEdge(
+    def: AutomationDef,
+    from: string,
+    to: string,
+): AutomationDef {
+    const normalizedFrom = from === TRIGGER_NODE_ID ? "trigger" : from;
+    // Reject duplicates and self-loops.
+    if (normalizedFrom === to) return def;
+    if (def.edges.some((e) => e.from === normalizedFrom && e.to === to)) {
+        return def;
+    }
+    return {
+        ...def,
+        edges: [
+            ...def.edges,
+            { from: normalizedFrom, to, when: null },
+        ],
+    };
+}
+
+export function withRenamedNode(
+    def: AutomationDef,
+    oldId: string,
+    newId: string,
+): AutomationDef {
+    return {
+        ...def,
+        nodes: def.nodes.map((n) => (n.id === oldId ? { ...n, id: newId } : n)),
+        edges: def.edges.map((e) => ({
+            ...e,
+            from: e.from === oldId ? newId : e.from,
+            to: e.to === oldId ? newId : e.to,
+        })),
+    };
+}
+
+export function withUpdatedNode(def: AutomationDef, updated: NodeDef): AutomationDef {
+    return {
+        ...def,
+        nodes: def.nodes.map((n) => (n.id === updated.id ? updated : n)),
+    };
+}
+
+function withAddedNode(def: AutomationDef, n: NodeDef): AutomationDef {
+    return { ...def, nodes: [...def.nodes, n] };
+}
+
+function mintId(def: AutomationDef, kind: NodeKind): string {
+    const prefix = kind.toLowerCase();
+    let i = 1;
+    while (def.nodes.some((n) => n.id === `${prefix}${i}`)) i += 1;
+    return `${prefix}${i}`;
+}
+
+function defaultConfigFor(kind: NodeKind): unknown {
     switch (kind) {
         case "Filter":
-            return { ...base, background: "#fef9c3", border: "1px solid #ca8a04" };
+            return { expr: "true" };
         case "Transform":
-            return { ...base, background: "#dcfce7", border: "1px solid #16a34a" };
-        case "Branch":
-            return { ...base, background: "#ede9fe", border: "1px solid #7c3aed" };
-        case "Terminal":
-            return { ...base, background: "#f3f4f6", border: "1px solid #6b7280" };
+            return { expr: "#{}" };
         case "AskAgent":
-            return { ...base, background: "#ffedd5", border: "1px solid #ea580c" };
+            return {
+                prompt: "Decide.",
+                attachments: [],
+                exit_tools: [
+                    {
+                        name: "ok",
+                        description: "Default outcome",
+                        args_schema: { type: "object" },
+                    },
+                ],
+            };
         default:
-            return { ...base, background: "#fff", border: "1px dashed #999" };
+            return {};
     }
 }
 
-export function AutomationCanvas({ definition }: Props) {
-    const { nodes, edges } = useMemo(() => buildGraph(definition), [definition]);
+function CanvasInner({ definition, onChange }: Props) {
+    const reactFlow = useReactFlow();
+    const wrapperRef = useRef<HTMLDivElement | null>(null);
+    const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+    const editable = !!onChange;
+
+    const { nodes, edges } = useMemo(
+        () => buildGraph(definition, selectedNodeId),
+        [definition, selectedNodeId],
+    );
+
+    // Position updates: ReactFlow fires `position` changes during the
+    // drag (intermediate) AND on dragstop. We only persist on stop —
+    // intermediate positions are visual-only.
+    const onNodesChange = useCallback(
+        (changes: NodeChange[]) => {
+            if (!onChange) return;
+            for (const ch of changes) {
+                if (ch.type === "position" && ch.dragging === false && ch.position) {
+                    const nodeId = ch.id === TRIGGER_NODE_ID ? "trigger" : ch.id;
+                    onChange(withUpdatedPosition(definition, nodeId, ch.position));
+                }
+                if (ch.type === "remove") {
+                    onChange(withRemovedNode(definition, ch.id));
+                    if (selectedNodeId === ch.id) setSelectedNodeId(null);
+                }
+                if (ch.type === "select") {
+                    if (ch.selected && ch.id !== TRIGGER_NODE_ID) {
+                        setSelectedNodeId(ch.id);
+                    } else if (!ch.selected && selectedNodeId === ch.id) {
+                        setSelectedNodeId(null);
+                    }
+                }
+            }
+        },
+        [definition, onChange, selectedNodeId],
+    );
+
+    const onEdgesChange = useCallback(
+        (changes: EdgeChange[]) => {
+            if (!onChange) return;
+            for (const ch of changes) {
+                if (ch.type === "remove") {
+                    onChange(withRemovedEdge(definition, ch.id));
+                }
+            }
+        },
+        [definition, onChange],
+    );
+
+    const onConnect = useCallback(
+        (params: Connection) => {
+            if (!onChange) return;
+            if (!params.source || !params.target) return;
+            onChange(withAddedEdge(definition, params.source, params.target));
+        },
+        [definition, onChange],
+    );
+
+    const onDrop = useCallback(
+        (e: React.DragEvent<HTMLDivElement>) => {
+            if (!onChange) return;
+            e.preventDefault();
+            const kind = e.dataTransfer.getData("application/x-execlaw-kind") as
+                | NodeKind
+                | "";
+            if (!kind) return;
+            const wrapper = wrapperRef.current;
+            if (!wrapper) return;
+            const bounds = wrapper.getBoundingClientRect();
+            const pos = reactFlow.screenToFlowPosition({
+                x: e.clientX - bounds.left,
+                y: e.clientY - bounds.top,
+            });
+            const id = mintId(definition, kind);
+            const newNode: NodeDef = {
+                id,
+                kind,
+                config: defaultConfigFor(kind) as Record<string, unknown>,
+                position: { x: pos.x, y: pos.y },
+            };
+            onChange(withAddedNode(definition, newNode));
+            setSelectedNodeId(id);
+        },
+        [definition, onChange, reactFlow],
+    );
+
+    const onDragOver = useCallback((e: React.DragEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+    }, []);
+
+    const selectedNode = useMemo<NodeDef | null>(() => {
+        if (!selectedNodeId) return null;
+        return definition.nodes.find((n) => n.id === selectedNodeId) ?? null;
+    }, [definition, selectedNodeId]);
+
+    const onNodeChange = useCallback(
+        (updated: NodeDef) => {
+            if (!onChange) return;
+            onChange(withUpdatedNode(definition, updated));
+        },
+        [definition, onChange],
+    );
+
+    const onRename = useCallback(
+        (oldId: string, newId: string) => {
+            if (!onChange) return;
+            onChange(withRenamedNode(definition, oldId, newId));
+            setSelectedNodeId(newId);
+        },
+        [definition, onChange],
+    );
+
+    const onDelete = useCallback(
+        (id: string) => {
+            if (!onChange) return;
+            onChange(withRemovedNode(definition, id));
+            setSelectedNodeId(null);
+        },
+        [definition, onChange],
+    );
+
     return (
         <div
-            style={{ width: "100%", height: "520px" }}
+            ref={wrapperRef}
+            style={{ width: "100%", height: "560px", position: "relative" }}
             data-testid="automation-canvas"
+            onDrop={onDrop}
+            onDragOver={onDragOver}
         >
-            <ReactFlow nodes={nodes} edges={edges} fitView fitViewOptions={{ padding: 0.2 }}>
+            <ReactFlow
+                nodes={nodes}
+                edges={edges}
+                nodeTypes={NODE_TYPES}
+                onNodesChange={onNodesChange}
+                onEdgesChange={onEdgesChange}
+                onConnect={editable ? onConnect : undefined}
+                nodesDraggable={editable}
+                nodesConnectable={editable}
+                elementsSelectable={editable}
+                deleteKeyCode={editable ? ["Backspace", "Delete"] : null}
+                fitView
+                fitViewOptions={{ padding: 0.2 }}
+            >
                 <Background />
-                <Controls position="bottom-left" />
+                <Controls position="bottom-left" showInteractive={false} />
                 <MiniMap pannable zoomable />
             </ReactFlow>
+            {editable && <NodePalette />}
+            {editable && selectedNode && (
+                <AutomationNodePanel
+                    node={selectedNode}
+                    definition={definition}
+                    onChange={onNodeChange}
+                    onRename={onRename}
+                    onDelete={onDelete}
+                    onClose={() => setSelectedNodeId(null)}
+                />
+            )}
         </div>
+    );
+}
+
+const PALETTE_KINDS: NodeKind[] = [
+    "Filter",
+    "Transform",
+    "Branch",
+    "Terminal",
+    "AskAgent",
+];
+
+function NodePalette() {
+    return (
+        <div
+            style={{
+                position: "absolute",
+                bottom: 12,
+                left: 12,
+                background: "white",
+                border: "1px solid #ddd",
+                borderRadius: 8,
+                padding: 8,
+                display: "flex",
+                gap: 6,
+                zIndex: 5,
+                boxShadow: "0 2px 6px rgba(0,0,0,0.08)",
+            }}
+            data-testid="node-palette"
+        >
+            <div className="small text-muted me-2 align-self-center">Drag:</div>
+            {PALETTE_KINDS.map((kind) => (
+                <PaletteTile key={kind} kind={kind} />
+            ))}
+        </div>
+    );
+}
+
+function PaletteTile({ kind }: { kind: NodeKind }) {
+    return (
+        <div
+            draggable
+            onDragStart={(e) => {
+                e.dataTransfer.setData("application/x-execlaw-kind", kind);
+                e.dataTransfer.effectAllowed = "move";
+            }}
+            style={{
+                border: `1px dashed ${KIND_COLORS[kind] ?? "#888"}`,
+                borderRadius: 4,
+                padding: "4px 8px",
+                fontSize: 11,
+                cursor: "grab",
+                background: "#fafafa",
+                userSelect: "none",
+            }}
+            data-testid={`palette-${kind}`}
+            title={`Drag a ${kind} node onto the canvas`}
+        >
+            <i className={`bi ${KIND_ICONS[kind] ?? "bi-square"} me-1`} aria-hidden />
+            {kind}
+        </div>
+    );
+}
+
+export function AutomationCanvas(props: Props) {
+    return (
+        <ReactFlowProvider>
+            <CanvasInner {...props} />
+        </ReactFlowProvider>
     );
 }

@@ -1,6 +1,6 @@
-//! Admin HTTP API for Automations (M4 backend).
+﻿//! Admin HTTP API for Automations (M4 backend).
 //!
-//! Mounted under `/api/admin/automations*` — controller-gated like
+//! Mounted under `/api/admin/automations*` â€” controller-gated like
 //! the rest of the admin surface. Endpoints:
 //!
 //! | Method | Path                                       | Purpose                                        |
@@ -20,7 +20,7 @@
 //!
 //! Validation: every write goes through `AutomationStore::upsert`
 //! which runs the M2 validator. A 400 surfaces the validator's
-//! human-readable message verbatim — operators get actionable
+//! human-readable message verbatim â€” operators get actionable
 //! feedback without spelunking the trace.
 
 use crate::automation_runtime;
@@ -162,9 +162,9 @@ fn default_recent_limit() -> i64 {
 
 /// Body for the test-run endpoint. Two modes:
 ///
-///   1. `event_id` — resolve a captured event from `state_bus_events`.
+///   1. `event_id` â€” resolve a captured event from `state_bus_events`.
 ///      Use this when picking from the "recent events" dropdown.
-///   2. `sample_event` — synthesize an event from scratch. Use this
+///   2. `sample_event` â€” synthesize an event from scratch. Use this
 ///      when no captured event is suitable (e.g., the operator wants
 ///      to test against a hypothetical payload).
 ///
@@ -457,7 +457,7 @@ pub async fn test_run(
             code: "automation_not_found",
             message: format!("no automation with id '{id}'"),
         })?;
-    // Resolve the event — captured or synthesized.
+    // Resolve the event â€” captured or synthesized.
     let event = match (req.event_id.as_deref(), req.sample_event) {
         (Some(eid), _) => BusEventStore::new(&state.db)
             .get(eid)
@@ -805,6 +805,7 @@ mod tests {
                 id: "end".into(),
                 kind: NodeKind::Terminal,
                 config: serde_json::json!({}),
+                position: None,
             }],
             edges: vec![EdgeDef {
                 from: TRIGGER_SENTINEL.into(),
@@ -913,7 +914,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         // ApiError serializes to {"error": {"code": ..., "message": ...}}
-        // — see routes::ApiError::into_response.
+        // â€” see routes::ApiError::into_response.
         assert_eq!(body["error"]["code"], "automation_invalid");
         assert!(
             body["error"]["message"]
@@ -1100,11 +1101,13 @@ mod tests {
                     id: "f1".into(),
                     kind: NodeKind::Filter,
                     config: serde_json::json!({"expr": "true"}),
+                    position: None,
                 },
                 NodeDef {
                     id: "end".into(),
                     kind: NodeKind::Terminal,
                     config: serde_json::json!({}),
+                    position: None,
                 },
             ],
             edges: vec![
@@ -1178,6 +1181,7 @@ mod tests {
                         id: "end".into(),
                         kind: NodeKind::Terminal,
                         config: serde_json::json!({}),
+                        position: None,
                     }],
                     edges: vec![EdgeDef {
                         from: TRIGGER_SENTINEL.into(),

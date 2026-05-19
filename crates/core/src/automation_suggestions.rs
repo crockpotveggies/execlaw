@@ -1,18 +1,18 @@
-//! Automation suggestions — the discovery surface for the
+﻿//! Automation suggestions â€” the discovery surface for the
 //! `/automations` landing page (M4).
 //!
 //! The daily sweep scans `state_bus_events`, groups by `(kind,
 //! source)`, and surfaces patterns that meet all of:
 //!
 //!   * Window: events arrived within the last `SWEEP_WINDOW_DAYS`.
-//!   * Threshold: ≥ `MIN_EVENT_COUNT` distinct events.
+//!   * Threshold: â‰¥ `MIN_EVENT_COUNT` distinct events.
 //!   * No matching enabled automation for the kind that would have
 //!     consumed those events.
 //!   * The `(kind, source)` is not in `state_automation_muted_patterns`.
 //!
 //! For each surviving pattern, the sweep upserts a `pending` row in
 //! `state_automation_suggestions`. The unique index on
-//! `(kind, source, status)` keeps the sweep idempotent — re-running
+//! `(kind, source, status)` keeps the sweep idempotent â€” re-running
 //! updates the existing row instead of duplicating.
 //!
 //! The agent-drafted variant (M5) plugs in at the same seam: it
@@ -28,7 +28,7 @@ use std::collections::HashSet;
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Default sweep cadence — once per day. Suggestions are a discovery
+/// Default sweep cadence â€” once per day. Suggestions are a discovery
 /// surface, not an alerting one; daily is plenty of freshness.
 pub const DEFAULT_SWEEP_INTERVAL_SECS: u64 = 24 * 60 * 60;
 
@@ -38,7 +38,7 @@ pub const DEFAULT_SWEEP_INTERVAL_SECS: u64 = 24 * 60 * 60;
 pub const SWEEP_WINDOW_DAYS: i64 = 7;
 
 /// Threshold: a `(kind, source)` pattern must produce at least this
-/// many events in the window to be worth suggesting. Conservative —
+/// many events in the window to be worth suggesting. Conservative â€”
 /// noise-floor protection.
 pub const MIN_EVENT_COUNT: i64 = 10;
 
@@ -49,7 +49,7 @@ pub const SAMPLE_EVENT_CAP: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SuggestionStatus {
-    /// Active suggestion — surfaces on the landing page.
+    /// Active suggestion â€” surfaces on the landing page.
     Pending,
     /// Operator dismissed it. The `(kind, source)` is also written
     /// into `state_automation_muted_patterns` so future sweeps skip.
@@ -126,7 +126,7 @@ impl<'a> SuggestionStore<'a> {
     }
 
     /// Run one sweep pass. Returns the number of suggestion rows
-    /// upserted (created OR refreshed). Pure-ish — `now_unix` is
+    /// upserted (created OR refreshed). Pure-ish â€” `now_unix` is
     /// caller-supplied for test determinism.
     pub fn sweep(&self, now_unix: i64) -> Result<usize, SuggestionError> {
         let window_start = now_unix.saturating_sub(SWEEP_WINDOW_DAYS * 86_400);
@@ -157,7 +157,7 @@ impl<'a> SuggestionStore<'a> {
             // Skip the pattern if the operator already has an enabled
             // automation for this kind. Strictly speaking we'd also
             // want a per-source match, but in practice a kind-level
-            // match is the right signal — once you have a Ring
+            // match is the right signal â€” once you have a Ring
             // automation, the bus's ring webhooks are no longer
             // "untriaged" from the operator's perspective.
             if active_kinds.contains(cand.kind.as_str()) {
@@ -220,7 +220,7 @@ impl<'a> SuggestionStore<'a> {
                 });
             }
         }
-        // Stable order — biggest first so the editor lands the most
+        // Stable order â€” biggest first so the editor lands the most
         // impactful suggestion at the top.
         out.sort_by(|a, b| b.event_count.cmp(&a.event_count));
         Ok(out)
@@ -374,7 +374,7 @@ impl<'a> SuggestionStore<'a> {
     }
 
     /// M5: persist an agent-drafted `AutomationDef` for a pending
-    /// suggestion. Callers are the deferred agent-drafting path —
+    /// suggestion. Callers are the deferred agent-drafting path â€”
     /// the sweep + an `AgentInvoker` produce the draft and call
     /// this. The SPA's "Review and create" handoff reads the column
     /// and seeds the editor with the draft instead of an empty graph.
@@ -426,7 +426,7 @@ pub struct Candidate {
 /// Default name for a sweep-generated suggestion. Operators rename
 /// in the editor; this is the placeholder.
 fn derive_suggested_name(kind: BusEventKind, source: &str) -> String {
-    // Strip the namespace prefix from sources like `webhook:ring` →
+    // Strip the namespace prefix from sources like `webhook:ring` â†’
     // `ring` so the displayed name reads naturally.
     let short_source = source.split(':').last().unwrap_or(source);
     match kind {
@@ -511,7 +511,7 @@ mod tests {
     fn sweep_surfaces_high_volume_pattern_with_no_matching_automation() {
         let db = fresh_db();
         let store = SuggestionStore::new(&db);
-        // Seed 15 events from `ring` at "now" — passes threshold.
+        // Seed 15 events from `ring` at "now" â€” passes threshold.
         let now = 1_000_000;
         seed_events(&db, "webhook:ring", 15, now * 1000);
         let written = store.sweep(now).unwrap();
@@ -529,7 +529,7 @@ mod tests {
         let db = fresh_db();
         let store = SuggestionStore::new(&db);
         let now = 1_000_000;
-        // 9 events — under the threshold of 10.
+        // 9 events â€” under the threshold of 10.
         seed_events(&db, "webhook:slow", 9, now * 1000);
         let written = store.sweep(now).unwrap();
         assert_eq!(written, 0);
@@ -595,6 +595,7 @@ mod tests {
                             id: "end".into(),
                             kind: NodeKind::Terminal,
                             config: serde_json::json!({}),
+                            position: None,
                         }],
                         edges: vec![EdgeDef {
                             from: TRIGGER_SENTINEL.into(),
@@ -641,7 +642,7 @@ mod tests {
         }
         store.sweep(now + 1).unwrap();
         let pending = store.list_pending().unwrap();
-        // Still one suggestion — refreshed in place.
+        // Still one suggestion â€” refreshed in place.
         assert_eq!(pending.len(), 1);
         assert!(
             pending[0].event_count >= 35,
@@ -668,7 +669,7 @@ mod tests {
         // Mute row exists.
         let muted = store.list_muted().unwrap();
         assert_eq!(muted.len(), 1);
-        // Re-sweep — must not resurface the dismissed pattern.
+        // Re-sweep â€” must not resurface the dismissed pattern.
         let bus = BusEventStore::new(&db);
         for i in 100..110 {
             bus.publish(
@@ -741,6 +742,7 @@ mod tests {
                 id: "end".into(),
                 kind: NodeKind::Terminal,
                 config: serde_json::json!({}),
+                position: None,
             }],
             edges: vec![EdgeDef {
                 from: TRIGGER_SENTINEL.into(),
@@ -770,7 +772,7 @@ mod tests {
         let id = store.list_pending().unwrap()[0].id.clone();
         // Default: no draft.
         assert!(store.list_pending().unwrap()[0].draft_definition.is_none());
-        // Set draft → list_pending surfaces it.
+        // Set draft â†’ list_pending surfaces it.
         let def = AutomationDef {
             trigger: TriggerDef {
                 kind: BusEventKind::WebhookReceived,
@@ -780,6 +782,7 @@ mod tests {
                 id: "end".into(),
                 kind: NodeKind::Terminal,
                 config: serde_json::json!({}),
+                position: None,
             }],
             edges: vec![EdgeDef {
                 from: TRIGGER_SENTINEL.into(),

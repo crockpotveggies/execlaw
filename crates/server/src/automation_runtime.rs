@@ -1,15 +1,15 @@
-//! Automation runtime — matcher + executor (M2 of Automations).
+﻿//! Automation runtime â€” matcher + executor (M2 of Automations).
 //!
 //! Plugs into the M1 bus by providing an [`EventHandler`] that
 //! `cmd_serve` installs in place of [`noop_handler`]. For each
 //! delivered event, the handler:
 //!
 //!   1. Looks up enabled automations whose `trigger.kind` matches the
-//!      event's kind ([`AutomationStore::list_enabled_for_kind`] —
+//!      event's kind ([`AutomationStore::list_enabled_for_kind`] â€”
 //!      indexed lookup).
 //!   2. Evaluates each automation's optional `trigger.when` Rhai
-//!      predicate against the event context. Predicate `false` →
-//!      skip; `true` (or absent) → schedule a run.
+//!      predicate against the event context. Predicate `false` â†’
+//!      skip; `true` (or absent) â†’ schedule a run.
 //!   3. Mints a pending [`AutomationRunRow`] and walks the typed
 //!      graph node-by-node, checkpointing each step via
 //!      [`AutomationRunStore::append_trace`] before advancing.
@@ -21,7 +21,7 @@
 //! mean the run is over.
 //!
 //! Expression evaluation uses a freshly-constructed [`rhai::Engine`]
-//! per call with tight sandbox limits — no host capabilities, no I/O.
+//! per call with tight sandbox limits â€” no host capabilities, no I/O.
 //! Filter/Transform/Branch are the only kinds that exercise it in M2.
 //!
 //! Concurrency: the handler runs on the bus's worker pool. Each
@@ -51,7 +51,7 @@ use tracing::{debug, warn};
 /// The `agent_pool` is the seam that lets cmd_serve plug in the real
 /// LLM-backed `InferenceAgentInvoker` while tests use a
 /// `StubAgentInvoker`. Without an `AskAgent` node in a flow, the pool
-/// is never invoked — but it must always be present so the runtime
+/// is never invoked â€” but it must always be present so the runtime
 /// has a well-defined behavior for AskAgent regardless of LLM
 /// availability.
 pub fn build_handler(db: Database, agent_pool: AutomationsAgentPool) -> EventHandler {
@@ -61,7 +61,7 @@ pub fn build_handler(db: Database, agent_pool: AutomationsAgentPool) -> EventHan
         Box::pin(async move {
             // SQLite + Rhai are sync; the agent pool's invocation is
             // async but we bridge across `block_on` inside the
-            // spawn_blocking thread (cheap — the only awaiting work
+            // spawn_blocking thread (cheap â€” the only awaiting work
             // is the semaphore acquire + the model HTTP round-trip,
             // both of which we want to serialize per-run anyway).
             if let Err(e) = tokio::task::spawn_blocking(move || {
@@ -197,7 +197,7 @@ fn run_one(
     }
 }
 
-/// Result of a [`dry_run`] — outcome + captured per-node trace.
+/// Result of a [`dry_run`] â€” outcome + captured per-node trace.
 /// The HTTP `POST /test-run` endpoint serializes this directly.
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct DryRunResult {
@@ -207,20 +207,20 @@ pub struct DryRunResult {
 
 /// Run the executor against an automation + a synthetic / captured
 /// event, capturing per-node traces in memory. Does NOT persist a
-/// run row — used by the editor's "Test run" button so the operator
+/// run row â€” used by the editor's "Test run" button so the operator
 /// can iterate on a definition without polluting `state_automation_runs`.
 ///
 /// The agent pool is reused, so an `AskAgent` node in a test run will
 /// actually invoke the LLM through the same path as live dispatch.
 /// Callers that don't want to hit the model should swap the pool's
-/// invoker (the M3 test fixtures show how — `StubAgentInvoker`).
+/// invoker (the M3 test fixtures show how â€” `StubAgentInvoker`).
 pub fn dry_run(
     db: &Database,
     pool: &AutomationsAgentPool,
     automation: &AutomationRow,
     sample: &BusEventRow,
 ) -> DryRunResult {
-    let _ = db; // currently unused — reserved for M5 features that read state
+    let _ = db; // currently unused â€” reserved for M5 features that read state
     let event_ctx = event_context(sample);
     let mut state: HashMap<String, serde_json::Value> = HashMap::new();
     state.insert("event".to_string(), event_ctx);
@@ -265,7 +265,7 @@ fn execute_graph(
     trace_sink: &mut dyn FnMut(StepTrace),
 ) -> ExecOutcome {
     let mut current = TRIGGER_SENTINEL.to_string();
-    // Defense in depth — refuse to walk pathologically long graphs.
+    // Defense in depth â€” refuse to walk pathologically long graphs.
     // The validator should already reject cycles in M3+, but for
     // now we cap at 256 hops.
     let max_hops = 256;
@@ -347,7 +347,7 @@ fn execute_graph(
             }
         }
     }
-    // Hit the hop cap — record a failure and bail.
+    // Hit the hop cap â€” record a failure and bail.
     let trace = StepTrace {
         node_id: "(executor)".into(),
         input: serde_json::Value::Null,
@@ -397,11 +397,11 @@ fn pick_next_edge(
 enum NodeOutcome {
     /// Node produced a value; bind under the node's id and advance.
     Output(serde_json::Value),
-    /// Filter said no — terminate the run as `Skipped`.
+    /// Filter said no â€” terminate the run as `Skipped`.
     Drop,
-    /// Explicit Terminal node — terminate as `Success`.
+    /// Explicit Terminal node â€” terminate as `Success`.
     Terminal,
-    /// Node failed at runtime — terminate as `Failed`.
+    /// Node failed at runtime â€” terminate as `Failed`.
     Error(String),
 }
 
@@ -414,7 +414,7 @@ fn execute_node(
         NodeKind::Filter => execute_filter(node, state),
         NodeKind::Transform => execute_transform(node, state),
         NodeKind::Branch => {
-            // Branch is a no-op routing junction — outputs an empty
+            // Branch is a no-op routing junction â€” outputs an empty
             // map so downstream `{{branch.*}}` references resolve
             // without surprises. The actual branching lives in the
             // outgoing edges' `when` clauses.
@@ -429,7 +429,7 @@ fn execute_node(
     }
 }
 
-/// AskAgent (M3) — delegates to the [`AutomationsAgentPool`]. The
+/// AskAgent (M3) â€” delegates to the [`AutomationsAgentPool`]. The
 /// pool's semaphore bounds in-flight invocations; the invoker
 /// translates the request into a single chat-completion call
 /// (production) or a scripted reply (tests).
@@ -444,7 +444,7 @@ fn execute_node(
 /// authors can write `{{event.payload.image_url}}` in the JSON
 /// definition and have it resolved against the run's state map.
 ///
-/// M3a single-turn limitation: `max_turns` ≥ 1 is treated as 1.
+/// M3a single-turn limitation: `max_turns` â‰¥ 1 is treated as 1.
 /// The framework is sized for multi-turn (the invoker exposes the
 /// effective turn count) but the loop body is a follow-up.
 fn execute_ask_agent(
@@ -519,7 +519,7 @@ pub(crate) fn render_template(s: &str, state: &HashMap<String, serde_json::Value
                         out.push_str(&value_to_string(&v));
                     }
                     None => {
-                        // Preserve the literal — visible breakage is
+                        // Preserve the literal â€” visible breakage is
                         // better than silent dropping.
                         out.push_str(&s[i..end + 2]);
                     }
@@ -603,7 +603,7 @@ fn execute_transform(node: &NodeDef, state: &HashMap<String, serde_json::Value>)
 // only need pure expressions.
 // ---------------------------------------------------------------------------
 
-/// Sandbox limits — same shape as the script-tier plugin engine but
+/// Sandbox limits â€” same shape as the script-tier plugin engine but
 /// halved (we're evaluating one-line predicates, not whole plugins).
 const RHAI_MAX_OPS: u64 = 100_000;
 const RHAI_MAX_CALL_DEPTH: usize = 32;
@@ -753,11 +753,11 @@ mod tests {
     }
 
     /// Pool used by tests that don't exercise AskAgent. Calling
-    /// `invoke` on it returns an error — fine, no test reaches that
+    /// `invoke` on it returns an error â€” fine, no test reaches that
     /// path. Keeps the runtime signature uniform.
     fn noop_pool() -> AutomationsAgentPool {
         AutomationsAgentPool::new(Arc::new(StubAgentInvoker::err(
-            "noop pool — test should not exercise AskAgent",
+            "noop pool â€” test should not exercise AskAgent",
         )))
     }
 
@@ -813,7 +813,7 @@ mod tests {
         assert!(eval_bool("this is not valid rhai 1 + +", &mut scope).is_err());
     }
 
-    /// Build a definition: trigger → filter → terminal.
+    /// Build a definition: trigger â†’ filter â†’ terminal.
     fn def_filter_pass(filter_expr: &str) -> AutomationDef {
         AutomationDef {
             trigger: TriggerDef {
@@ -825,11 +825,13 @@ mod tests {
                     id: "f1".into(),
                     kind: NodeKind::Filter,
                     config: serde_json::json!({"expr": filter_expr}),
+                    position: None,
                 },
                 NodeDef {
                     id: "end".into(),
                     kind: NodeKind::Terminal,
                     config: serde_json::json!({}),
+                    position: None,
                 },
             ],
             edges: vec![
@@ -958,8 +960,8 @@ mod tests {
         let run_store = AutomationRunStore::new(&db);
         let evt = seed_bus_event(&db, "e1", serde_json::json!({"n": 10}));
 
-        // trigger → transform (doubles event.payload.n) → branch on result
-        // → terminal-a if doubled > 15 else terminal-b
+        // trigger â†’ transform (doubles event.payload.n) â†’ branch on result
+        // â†’ terminal-a if doubled > 15 else terminal-b
         let def = AutomationDef {
             trigger: TriggerDef {
                 kind: BusEventKind::WebhookReceived,
@@ -970,21 +972,25 @@ mod tests {
                     id: "double".into(),
                     kind: NodeKind::Transform,
                     config: serde_json::json!({"expr": "#{ doubled: event.payload.n * 2 }"}),
+                    position: None,
                 },
                 NodeDef {
                     id: "branch".into(),
                     kind: NodeKind::Branch,
                     config: serde_json::json!({}),
+                    position: None,
                 },
                 NodeDef {
                     id: "big".into(),
                     kind: NodeKind::Terminal,
                     config: serde_json::json!({}),
+                    position: None,
                 },
                 NodeDef {
                     id: "small".into(),
                     kind: NodeKind::Terminal,
                     config: serde_json::json!({}),
+                    position: None,
                 },
             ],
             edges: vec![
@@ -1109,7 +1115,7 @@ mod tests {
     #[test]
     fn rhai_sandbox_blocks_runaway_loops() {
         let mut scope = Scope::new();
-        // Multiplicative cost expression — the operator-set limit
+        // Multiplicative cost expression â€” the operator-set limit
         // (`set_max_operations`) should abort this.
         let result = eval_value("let s = 0; for i in 0..1_000_000 { s += i; } s", &mut scope);
         assert!(result.is_err(), "runaway expression must be rejected");
@@ -1139,6 +1145,7 @@ mod tests {
             id: "f1".into(),
             kind: NodeKind::Transform,
             config: serde_json::json!({"expr": "#{ zone: event.payload.zone }"}),
+            position: None,
         };
         def.trigger.when = Some(r#"event.source == "ring""#.into());
         let row = auto_store
@@ -1171,7 +1178,7 @@ mod tests {
         };
         bus.publish(evt).await.unwrap();
 
-        // Poll for the run row — handler runs on spawn_blocking, so
+        // Poll for the run row â€” handler runs on spawn_blocking, so
         // we allow a generous deadline.
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let mut found = None;
@@ -1225,16 +1232,19 @@ mod tests {
                             }
                         ]
                     }),
+                    position: None,
                 },
                 NodeDef {
                     id: "did-notify".into(),
                     kind: NodeKind::Terminal,
                     config: serde_json::json!({}),
+                    position: None,
                 },
                 NodeDef {
                     id: "did-ignore".into(),
                     kind: NodeKind::Terminal,
                     config: serde_json::json!({}),
+                    position: None,
                 },
             ],
             edges: vec![
@@ -1502,11 +1512,13 @@ mod tests {
                             {"name": "ignore", "description": "no",  "args_schema": {"type":"object"}}
                         ]
                     }),
+                    position: None,
                 },
                 NodeDef {
                     id: "end".into(),
                     kind: NodeKind::Terminal,
                     config: serde_json::json!({}),
+                    position: None,
                 },
             ],
             edges: vec![
@@ -1556,8 +1568,8 @@ mod tests {
 
     #[tokio::test]
     async fn ring_use_case_with_text_only_model_fails_with_clear_error() {
-        // The locked Ring use case: webhook with image → AskAgent
-        // with attachments → text-only model in inference resolver →
+        // The locked Ring use case: webhook with image â†’ AskAgent
+        // with attachments â†’ text-only model in inference resolver â†’
         // VisionRequiredButTextOnlyModel surfaces in the run trace
         // with operator-actionable guidance.
         use crate::automation_agent::InferenceAgentInvoker;
@@ -1595,11 +1607,13 @@ mod tests {
                             {"name": "ignore", "description": "No animal", "args_schema": {"type":"object"}}
                         ]
                     }),
+                    position: None,
                 },
                 NodeDef {
                     id: "end".into(),
                     kind: NodeKind::Terminal,
                     config: serde_json::json!({}),
+                    position: None,
                 },
             ],
             edges: vec![
@@ -1628,7 +1642,7 @@ mod tests {
             .unwrap();
 
         // Configure a resolver that returns the current text-only
-        // default model — the capability check should reject the
+        // default model â€” the capability check should reject the
         // request before the bogus URL is ever contacted.
         let bootstrap = Arc::new(InferenceClient::new("http://127.0.0.1:1"));
         let mut resolver = crate::inference_resolver::InferenceResolver::new(Some(bootstrap));
@@ -1693,7 +1707,7 @@ mod tests {
             stop.clone(),
         );
 
-        // Publish a WebhookReceived event — wrong kind, must not trigger.
+        // Publish a WebhookReceived event â€” wrong kind, must not trigger.
         bus.publish(BusEvent {
             id: "e-webhook".into(),
             kind: BusEventKind::WebhookReceived,

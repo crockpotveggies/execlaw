@@ -347,7 +347,12 @@ export function AutomationDetailPage({ id }: Props) {
 
             {view === "canvas" ? (
                 parsedDef.def ? (
-                    <AutomationCanvas definition={parsedDef.def} />
+                    <AutomationCanvas
+                        definition={parsedDef.def}
+                        onChange={(nextDef) =>
+                            setDefJson(JSON.stringify(nextDef, null, 2))
+                        }
+                    />
                 ) : (
                     <div
                         className="border rounded p-3 small text-danger"

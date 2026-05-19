@@ -38,11 +38,26 @@ export interface TriggerDef {
     when?: string | null;
 }
 
+export interface NodePosition {
+    x: number;
+    y: number;
+}
+
+export interface ExitToolDef {
+    name: string;
+    description: string;
+    args_schema?: unknown;
+}
+
 export interface NodeDef {
     id: string;
     kind: NodeKind;
     /** Kind-specific config (Rhai expr, AskAgent prompt + exit_tools, etc.). */
     config: unknown;
+    /** Persisted canvas coordinates. Optional — server returns
+     *  undefined for nodes saved before canvas-editor v2; the SPA
+     *  falls back to BFS layout for those. */
+    position?: NodePosition | null;
 }
 
 export interface EdgeDef {

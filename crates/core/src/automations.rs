@@ -1,10 +1,10 @@
-//! Automations data model + store (M2 of Automations).
+﻿//! Automations data model + store (M2 of Automations).
 //!
 //! Owns `state_automations`. An automation is a typed graph:
 //!
 //!   * Exactly one [`TriggerDef`] (the bus-event kind + optional
 //!     payload-match predicate).
-//!   * N typed [`NodeDef`]s — Filter / Transform / Branch / Terminal
+//!   * N typed [`NodeDef`]s â€” Filter / Transform / Branch / Terminal
 //!     in M2; AskAgent / CallPlugin / HttpFetch / Notify reserved.
 //!   * Directed [`EdgeDef`]s connecting nodes (and the synthetic
 //!     `"trigger"` and `"END"` sentinels).
@@ -30,7 +30,7 @@ pub const END_SENTINEL: &str = "END";
 
 /// The kinds we know how to execute as of M2. Reserved kinds are
 /// stored in the JSON but rejected by the validator with a
-/// not-yet-implemented error — so a future schema bump can land
+/// not-yet-implemented error â€” so a future schema bump can land
 /// without breaking persisted definitions that pre-declared them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 pub enum NodeKind {
@@ -42,10 +42,10 @@ pub enum NodeKind {
     Transform,
     /// Multi-way switch: each `case` is a (Rhai-expr, edge-target).
     /// The first matching case picks the outgoing edge. If none
-    /// match the node fails — author should provide a default
+    /// match the node fails â€” author should provide a default
     /// (`when: "true"`) case.
     Branch,
-    /// Explicit no-op end. Optional — a node with no outgoing edges
+    /// Explicit no-op end. Optional â€” a node with no outgoing edges
     /// also ends the run.
     Terminal,
     // Reserved (validator rejects with NotYetImplemented):
@@ -136,12 +136,12 @@ pub struct ExitToolDef {
 ///   * Per-flow `reasoning_tools` palette (subset of `KnownLimited.allowed_tools`).
 ///   * `max_turns` defaults to 3 (single-turn enforced in M3a; multi-turn loop in a follow-up).
 ///   * First exit-tool call wins; later calls in the same turn are logged and ignored.
-///   * Missing exit-tool call by `max_turns` → node fails.
-///   * Vision-required attachments on a text-only model → node fails fast.
+///   * Missing exit-tool call by `max_turns` â†’ node fails.
+///   * Vision-required attachments on a text-only model â†’ node fails fast.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct AskAgentConfig {
     /// The user-message body sent to the agent. Rendered as-is (no
-    /// templating in M3 — author writes the literal prompt or uses
+    /// templating in M3 â€” author writes the literal prompt or uses
     /// upstream Transform nodes to compose it).
     pub prompt: String,
     /// Attachment refs. Today each entry is either a `data:` URL or
@@ -161,7 +161,7 @@ pub struct AskAgentConfig {
     /// edge and its args become the node's output.
     pub exit_tools: Vec<ExitToolDef>,
     /// Per-node `max_turns` override. `None` means "use the default
-    /// (3)". M3a treats anything ≥ 1 as a single-turn call.
+    /// (3)". M3a treats anything â‰¥ 1 as a single-turn call.
     #[serde(default)]
     pub max_turns: Option<u32>,
 }
@@ -203,6 +203,19 @@ pub struct NodeDef {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub config: serde_json::Value,
+    /// Optional canvas-coordinate hint for the SPA's ReactFlow
+    /// editor. `None` means "the editor computes a default layout";
+    /// `Some({x, y})` is the operator's manual placement, persisted so
+    /// reloads land on the same canvas layout. The runtime ignores
+    /// this field â€” it's purely UI metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<NodePosition>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct NodePosition {
+    pub x: f64,
+    pub y: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
@@ -271,12 +284,12 @@ pub enum AutomationError {
 ///     a sentinel.
 ///   * Every node has at least one outgoing edge OR is `Terminal`.
 ///     (A non-Terminal node with no outgoing edges runs to no-op
-///     end; we reject as ambiguous — the author probably forgot
+///     end; we reject as ambiguous â€” the author probably forgot
 ///     an edge.)
 ///   * All node kinds are implemented (rejects AskAgent / Notify /
 ///     etc. with NotYetImplemented).
 ///
-/// Rhai expression *syntax* is NOT validated here — that requires
+/// Rhai expression *syntax* is NOT validated here â€” that requires
 /// constructing an engine, which lives in the server crate. The
 /// server-side validator at the API/runtime layer rejects malformed
 /// Rhai. Persisting a parseable JSON with bad Rhai is harmless: the
@@ -338,7 +351,7 @@ pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
                     )));
                 }
             }
-            // Reasoning_tools is reserved in M3a — author can declare
+            // Reasoning_tools is reserved in M3a â€” author can declare
             // intent but we don't surface those tools to the model yet.
             // Document this implicitly: empty list is fine, non-empty
             // is also fine (forward-compatible).
@@ -360,7 +373,7 @@ pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
             )));
         }
     }
-    // Every non-Terminal node must have ≥1 outgoing edge OR be the
+    // Every non-Terminal node must have â‰¥1 outgoing edge OR be the
     // explicit end (i.e., have Terminal kind).
     for n in &def.nodes {
         if matches!(n.kind, NodeKind::Terminal) {
@@ -374,7 +387,7 @@ pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
             )));
         }
     }
-    // Exactly one entry edge from the trigger sentinel — otherwise
+    // Exactly one entry edge from the trigger sentinel â€” otherwise
     // the run has no starting point.
     let entry_edges = def
         .edges
@@ -383,7 +396,7 @@ pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
         .count();
     if entry_edges == 0 {
         return Err(AutomationError::Validation(
-            "no edge from trigger — automation has no entry point".into(),
+            "no edge from trigger â€” automation has no entry point".into(),
         ));
     }
     Ok(())
@@ -493,7 +506,7 @@ impl<'a> AutomationStore<'a> {
         Ok(rows)
     }
 
-    /// Matcher hot path — enabled automations whose trigger kind
+    /// Matcher hot path â€” enabled automations whose trigger kind
     /// matches. The expression index `idx_automations_enabled_trigger_kind`
     /// keeps this cheap regardless of total automation count.
     pub fn list_enabled_for_kind(
@@ -582,11 +595,13 @@ mod tests {
                     id: "f1".into(),
                     kind: NodeKind::Filter,
                     config: serde_json::json!({"expr": "true"}),
+                    position: None,
                 },
                 NodeDef {
                     id: "end".into(),
                     kind: NodeKind::Terminal,
                     config: serde_json::json!({}),
+                    position: None,
                 },
             ],
             edges: vec![
@@ -616,6 +631,7 @@ mod tests {
             id: "f1".into(), // dup
             kind: NodeKind::Terminal,
             config: serde_json::json!({}),
+            position: None,
         });
         let err = validate(&def).unwrap_err();
         assert!(matches!(err, AutomationError::Validation(_)));
@@ -649,6 +665,7 @@ mod tests {
             id: "orphan".into(),
             kind: NodeKind::Filter,
             config: serde_json::json!({"expr": "true"}),
+            position: None,
         });
         let err = validate(&def).unwrap_err();
         assert!(format!("{err}").contains("orphaned"));
@@ -695,11 +712,13 @@ mod tests {
                             }
                         ]
                     }),
+                    position: None,
                 },
                 NodeDef {
                     id: "end".into(),
                     kind: NodeKind::Terminal,
                     config: serde_json::json!({}),
+                    position: None,
                 },
             ],
             edges: vec![
@@ -761,7 +780,7 @@ mod tests {
         let mut def = ask_agent_def();
         def.nodes[0].config = serde_json::json!({
             "prompt": "hi"
-            // missing exit_tools — required field
+            // missing exit_tools â€” required field
         });
         let err = validate(&def).unwrap_err();
         assert!(format!("{err}").contains("AskAgent config"));

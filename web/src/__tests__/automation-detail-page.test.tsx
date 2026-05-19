@@ -17,9 +17,18 @@ vi.mock("@xyflow/react", () => ({
     ReactFlow: ({ children }: { children?: React.ReactNode }) => (
         <div data-testid="mock-reactflow">{children}</div>
     ),
+    ReactFlowProvider: ({ children }: { children?: React.ReactNode }) => (
+        <>{children}</>
+    ),
     Background: () => null,
     Controls: () => null,
     MiniMap: () => null,
+    Handle: () => null,
+    Position: { Top: "top", Bottom: "bottom", Left: "left", Right: "right" },
+    addEdge: (_c: unknown, edges: unknown[]) => edges,
+    useReactFlow: () => ({
+        screenToFlowPosition: ({ x, y }: { x: number; y: number }) => ({ x, y }),
+    }),
 }));
 vi.mock("@xyflow/react/dist/style.css", () => ({}));
 
