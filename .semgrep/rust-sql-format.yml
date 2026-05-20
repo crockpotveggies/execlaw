@@ -33,13 +33,15 @@ rules:
       on the line above and a one-line reason.
     paths:
       include:
-        - "crates/**/*.rs"
+        - "**/crates/**/*.rs"
       exclude:
         # Test files frequently build SQL strings for fixture seeding
         # using the same format! pattern. We don't ship test code; the
-        # production constraint is what matters.
-        - "crates/**/tests/**"
-        - "crates/**/benches/**"
+        # production constraint is what matters. (Anchored with `**/`
+        # to comply with semgrepignore v2 — see the deprecation warning
+        # semgrep prints without the prefix.)
+        - "**/crates/**/tests/**"
+        - "**/crates/**/benches/**"
         - "**/*_test.rs"
         - "**/tests.rs"
     patterns:
@@ -48,7 +50,18 @@ rules:
           - pattern: format!("$SQL")
       - metavariable-regex:
           metavariable: $SQL
-          regex: '(?i).*\b(SELECT|INSERT|UPDATE|DELETE|REPLACE|MERGE|TRUNCATE)\b.*\{.*\}.*'
+          # Case-SENSITIVE on purpose. Project convention is uppercase
+          # SQL keywords (`SELECT … FROM …`), and every real SQL site
+          # in the codebase follows it. Dropping the previous `(?i)`
+          # flag means error-message `format!`s like
+          # `format!("delete user: {e}")` or
+          # `format!("mcp insert: {e}")` — which contain a lowercase
+          # SQL verb purely by coincidence — stop tripping the lint.
+          # The companion `rust-rusqlite-format-arg` rule below stays
+          # case-insensitive (and pattern-anchored on rusqlite calls)
+          # so lowercase SQL that actually lands in `execute(...)` /
+          # `query(...)` is still caught.
+          regex: '.*\b(SELECT|INSERT|UPDATE|DELETE|REPLACE|MERGE|TRUNCATE)\b.*\{.*\}.*'
 
   # Variant: catch the case where the formatted string is passed
   # directly to a SQL-execution method. Independent rule so the
@@ -69,10 +82,10 @@ rules:
       input").
     paths:
       include:
-        - "crates/**/*.rs"
+        - "**/crates/**/*.rs"
       exclude:
-        - "crates/**/tests/**"
-        - "crates/**/benches/**"
+        - "**/crates/**/tests/**"
+        - "**/crates/**/benches/**"
         - "**/*_test.rs"
         - "**/tests.rs"
     patterns:

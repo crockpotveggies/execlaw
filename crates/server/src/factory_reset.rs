@@ -666,6 +666,13 @@ mod tests {
             let count: i64 = state
                 .db
                 .with_conn(|c| {
+                    // `{table}` is a literal from the
+                    // `expected_seeded` array a few lines up — closed
+                    // `&'static str` set, no external input.
+                    // Test-only post-reset verification helper.
+                    // (Single-line chain so both nosemgrep targets
+                    // resolve to the same source line.)
+                    // nosemgrep: rust-sql-format-interpolation, rust-rusqlite-format-arg
                     let n: i64 = c
                         .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                         .map_err(|e| execlaw_core::DbError::Config(e.to_string()))?;

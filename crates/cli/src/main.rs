@@ -1102,6 +1102,13 @@ fn cmd_backup(to: PathBuf, db_path: PathBuf, no_encrypt: bool) -> anyhow::Result
     // encryption posture by default, so a snapshot can be restored
     // by any process holding the master key.
     db.with_conn(|c| {
+        // VACUUM INTO requires the destination as an inline string
+        // literal (rusqlite's `?` placeholders don't substitute for
+        // path positions in SQLite DDL). Path comes from the
+        // admin-only `--to` CLI flag and is SQL-quote-escaped via
+        // `replace('\'', "''")` to neutralise embedded single quotes.
+        // Not reachable by untrusted input.
+        // nosemgrep: rust-rusqlite-format-arg
         c.execute_batch(&format!("VACUUM INTO '{}'", to_str.replace('\'', "''")))?;
         Ok(())
     })
