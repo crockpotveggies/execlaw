@@ -26,8 +26,8 @@ use execlaw_core::events::{
 };
 use execlaw_core::ids::{ConversationId, EventSeq};
 use execlaw_inference_api::{
-    ChatMessage, ChatRequest, InferenceClient, InferenceError, ModelId, Role, ToolCall,
-    ToolDeclaration,
+    ChatMessage, ChatRequest, ContentPart, InferenceClient, InferenceError, MessageContent,
+    ModelId, Role, ToolCall, ToolDeclaration,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -162,6 +162,24 @@ pub struct TurnConfig {
     /// The event log retains the unwrapped text so audit + replay are
     /// unchanged.
     pub spotlight_delim: Option<String>,
+    /// 2026-05-20 — per-turn context block (current date/time, sender
+    /// trust, channel origin, group facts) that varies on every turn.
+    /// Originally lived at the END of `system_prompt`, but Ollama
+    /// (and most KV-cache-reusing servers) keep a prefix cache keyed
+    /// on the literal prompt tokens — the moment ANY token in the
+    /// system message changes, the whole tools section that follows
+    /// is invalidated and the next turn re-prefills the entire
+    /// catalog. On a 3B Q4 Apple-Silicon Ollama with a ~5K-token
+    /// catalog that's ~16 s of pure prefill per turn.
+    ///
+    /// By carrying turn-varying context here and prepending it to
+    /// the LAST user message (after `hydrate_messages`), the system
+    /// prompt + tools array stay byte-identical across turns; only
+    /// the user-message tail changes, so the prefix cache covers the
+    /// expensive part and a follow-up turn drops to <1 s prefill.
+    /// The event log is unaffected — the `user_msg` event still
+    /// stores the operator's raw text.
+    pub turn_context_user_prefix: Option<String>,
 }
 
 impl std::fmt::Debug for TurnConfig {
@@ -325,6 +343,27 @@ impl TurnExecutor {
                 last_user_text,
                 user_image_urls,
             ));
+        }
+
+        // 2026-05-20 — prepend the per-turn context (timestamps,
+        // sender trust, channel origin, group facts) to the CURRENT
+        // turn's user message. Keeping these out of the system
+        // prompt is load-bearing: Ollama (and any KV-cache-reusing
+        // server) only reuses the cached prefix while the prompt
+        // tokens are byte-identical to the previous call. With
+        // turn_context inside the system message, the tools section
+        // that follows gets re-prefilled on every turn —
+        // measured at ~16 s on a 3 B Q4 Apple-Silicon Ollama with a
+        // 36-tool catalog. With turn_context here, only the
+        // user-message tail differs and the next turn's prefill
+        // drops to ~100 ms.
+        //
+        // The event log is untouched: the `user_msg` event was
+        // appended above with the operator's raw `user_text`, so
+        // history / audit / replay still see the unmodified
+        // message. The prefix lives only on the wire.
+        if let Some(prefix) = cfg.turn_context_user_prefix.as_deref() {
+            prepend_turn_context_to_last_user(&mut messages, prefix);
         }
 
         // 3. Tool-call loop.
@@ -643,6 +682,57 @@ impl TurnExecutor {
 /// Loses the "parallel calls in one round" grouping (we emit one
 /// assistant per call); parallel calls at temp 0.3 are rare on
 /// Qwen3.5 27B-AWQ.
+/// Prepend a per-turn context block to the LAST user message in
+/// `messages`. No-op when `prefix` is empty/whitespace or when the
+/// trailing message is not a user message.
+///
+/// Why this exists: see the doc on
+/// [`TurnConfig::turn_context_user_prefix`]. tl;dr — keeping the
+/// system prompt byte-stable across turns lets Ollama / llama.cpp
+/// reuse the KV-cache prefix that covers the (large) tools section,
+/// so the next turn's prefill drops from ~16 s to <1 s on a 3 B
+/// Apple-Silicon Ollama with a real agent catalog.
+///
+/// Text-only and image-bearing user messages are both handled: the
+/// text branch mutates in place; the parts branch inserts a fresh
+/// `Text` part at index 0, preserving the order
+/// `ChatMessage::user_with_images` produces.
+pub(crate) fn prepend_turn_context_to_last_user(
+    messages: &mut [ChatMessage],
+    prefix: &str,
+) {
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        return;
+    }
+    let Some(last) = messages.last_mut() else {
+        return;
+    };
+    if !matches!(last.role, Role::User) {
+        return;
+    }
+    match &mut last.content {
+        Some(MessageContent::Text(s)) => {
+            *s = format!("{prefix}\n\n{s}");
+        }
+        Some(MessageContent::Parts(parts)) => {
+            // Image-bearing user message — the first Part is the
+            // text caption (or absent). Prepend a fresh text part
+            // rather than mutating in place; matches the order
+            // `user_with_images` produces (text first, then images).
+            parts.insert(
+                0,
+                ContentPart::Text {
+                    text: prefix.to_owned(),
+                },
+            );
+        }
+        None => {
+            last.content = Some(MessageContent::Text(prefix.to_owned()));
+        }
+    }
+}
+
 fn hydrate_messages(events: &[EventRecord], spotlight_delim: Option<&str>) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = Vec::new();
 
@@ -806,6 +896,7 @@ mod tests {
             reasoning_enabled: false,
             inbound_channel_origin: None,
             spotlight_delim: None,
+            turn_context_user_prefix: None,
         };
 
         let summary = exec
@@ -900,6 +991,7 @@ mod tests {
             reasoning_enabled: false,
             inbound_channel_origin: None,
             spotlight_delim: None,
+            turn_context_user_prefix: None,
         };
 
         let summary = exec
@@ -1045,6 +1137,7 @@ mod tests {
             reasoning_enabled: false,
             inbound_channel_origin: None,
             spotlight_delim: None,
+            turn_context_user_prefix: None,
         };
         let _ = exec
             .run_turn(&db, &cid, "try it", None, &cfg)
@@ -1121,6 +1214,7 @@ mod tests {
             reasoning_enabled: false,
             inbound_channel_origin: None,
             spotlight_delim: None,
+            turn_context_user_prefix: None,
         };
         let err = exec
             .run_turn(&db, &cid, "go", None, &cfg)
@@ -1306,5 +1400,94 @@ mod tests {
             text.contains("ignore prior instructions"),
             "the original (now-quoted) payload is still present inside the wrap"
         );
+    }
+
+    /// 2026-05-20 — the per-turn context block lives on
+    /// `TurnConfig::turn_context_user_prefix`, NOT in the system
+    /// prompt. The helper that lands it on the wire is
+    /// `prepend_turn_context_to_last_user`. This regression suite
+    /// pins the contract that keeps the Ollama KV-cache prefix
+    /// stable across turns:
+    ///   * trailing user message gets the block prepended;
+    ///   * empty / whitespace-only prefix is a no-op;
+    ///   * the system message (if present) is byte-stable;
+    ///   * image-bearing user messages keep their Parts ordering.
+    #[test]
+    fn prepend_turn_context_prefixes_text_user_message() {
+        let mut msgs = vec![
+            ChatMessage::system("SYS"),
+            ChatMessage::user("hi"),
+        ];
+        super::prepend_turn_context_to_last_user(&mut msgs, "## Turn context\n* Date: today");
+        // System untouched — this is the load-bearing invariant for
+        // KV-cache reuse.
+        assert_eq!(
+            msgs[0].content.as_ref().map(|c| c.as_text()).as_deref(),
+            Some("SYS"),
+            "system message must be byte-stable across turn_context changes"
+        );
+        let user_text = msgs[1]
+            .content
+            .as_ref()
+            .map(|c| c.as_text())
+            .unwrap_or_default();
+        assert_eq!(user_text, "## Turn context\n* Date: today\n\nhi");
+    }
+
+    #[test]
+    fn prepend_turn_context_noop_when_prefix_empty_or_blank() {
+        let mut msgs = vec![ChatMessage::user("hi")];
+        super::prepend_turn_context_to_last_user(&mut msgs, "");
+        assert_eq!(
+            msgs[0].content.as_ref().map(|c| c.as_text()).as_deref(),
+            Some("hi"),
+            "empty prefix must not modify the user message"
+        );
+        super::prepend_turn_context_to_last_user(&mut msgs, "   \n  \t ");
+        assert_eq!(
+            msgs[0].content.as_ref().map(|c| c.as_text()).as_deref(),
+            Some("hi"),
+            "whitespace-only prefix must not modify the user message"
+        );
+    }
+
+    #[test]
+    fn prepend_turn_context_noop_when_last_message_not_user() {
+        // Defensive: if hydrate ever leaves a non-user trailing
+        // message (e.g. a dangling assistant turn), don't molest it.
+        let mut msgs = vec![ChatMessage::assistant("oops")];
+        super::prepend_turn_context_to_last_user(&mut msgs, "CTX");
+        assert_eq!(
+            msgs[0].content.as_ref().map(|c| c.as_text()).as_deref(),
+            Some("oops"),
+            "non-user trailing message must be untouched"
+        );
+    }
+
+    #[test]
+    fn prepend_turn_context_handles_image_user_message() {
+        // Image-bearing user message keeps its Parts ordering: text
+        // (prepended) at index 0, then the original text caption,
+        // then the image URLs. Mirrors the order
+        // `ChatMessage::user_with_images` produces, so the inference
+        // backend sees the same logical structure either way.
+        let mut msgs = vec![ChatMessage::user_with_images(
+            "describe this",
+            ["data:image/png;base64,AAAA".to_owned()],
+        )];
+        super::prepend_turn_context_to_last_user(&mut msgs, "CTX");
+        let parts = match &msgs[0].content {
+            Some(MessageContent::Parts(p)) => p.clone(),
+            other => panic!("expected Parts content, got {other:?}"),
+        };
+        assert!(parts.len() >= 2);
+        match &parts[0] {
+            ContentPart::Text { text } => assert_eq!(text, "CTX"),
+            other => panic!("first part must be the prepended Text, got {other:?}"),
+        }
+        match &parts[1] {
+            ContentPart::Text { text } => assert_eq!(text, "describe this"),
+            other => panic!("second part must be the original caption, got {other:?}"),
+        }
     }
 }

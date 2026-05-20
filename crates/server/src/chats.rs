@@ -2383,12 +2383,26 @@ async fn run_tool_capable_turn(
         turn_context.push_str("\n\n");
         turn_context.push_str(&block);
     }
+    // 2026-05-20 — DO NOT pass `turn_context` into the system prompt.
+    // It contains the wall-clock timestamp and per-turn facts, which
+    // would change the system-message tokens on every call. Most
+    // KV-cache-reusing inference servers (Ollama / llama.cpp /
+    // vLLM-with-prefix-cache-on) keep a single cached prefix; once
+    // even one token in the system block changes, the entire tools
+    // section that follows is re-prefilled. Measured cost on a 3 B
+    // Q4 Apple-Silicon Ollama with a 36-tool catalog: ~16 s of
+    // prefill per turn for a single "hi". Empty `turn_context` arg
+    // here lets the assembler skip the trailing section; we instead
+    // carry the same text on `TurnConfig::turn_context_user_prefix`
+    // so the executor prepends it to the CURRENT turn's user
+    // message — system+tools stay byte-identical across turns,
+    // prefix cache amortises, follow-up turns drop to <1 s prefill.
     let composed_system_prompt = assemble_system_prompt(
         &state.db,
         Some(cid.as_str()),
         &state.config.system_prompt,
         &routing_prose,
-        &turn_context,
+        "",
     );
     let prompt_ms = prompt_started_at.elapsed().as_millis() as u64;
     tracing::debug!(
@@ -2398,6 +2412,7 @@ async fn run_tool_capable_turn(
         system_prompt_chars = composed_system_prompt.chars().count(),
         routing_prose_chars = routing_prose.chars().count(),
         turn_context_chars = turn_context.chars().count(),
+        turn_context_carried_via_user_prefix = true,
         "system prompt assembled"
     );
     // 2026-05-16 — spotlight delimiter (§7.4). Mirrors the runner
@@ -2434,6 +2449,15 @@ async fn run_tool_capable_turn(
         reasoning_enabled: resolved.reasoning_enabled,
         inbound_channel_origin: inbound_channel_origin.map(|s| s.to_owned()),
         spotlight_delim,
+        // Carry the per-turn context here so the executor can prepend
+        // it to the LAST user message (the operator's current "hi" /
+        // request). See the comment on `composed_system_prompt`
+        // above + the doc on `TurnConfig::turn_context_user_prefix`.
+        turn_context_user_prefix: if turn_context.trim().is_empty() {
+            None
+        } else {
+            Some(turn_context.clone())
+        },
     };
     let exec_started_at = std::time::Instant::now();
     tracing::debug!(
