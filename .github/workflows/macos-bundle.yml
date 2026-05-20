@@ -229,19 +229,18 @@ jobs:
 
             ### Bundled plugins
 
-            Every plugin in this repo is packaged as a standalone ZIP and
-            attached below alongside its SHA-256 sidecar. The macOS app
-            ships these same ZIPs in its `Contents/Resources/plugins/`
-            directory, so once you've installed `execlaw.app` the SPA
-            already knows about them — open **Settings → Plugins** and
-            you'll see a "Bundled" section listing each plugin with a
-            one-click install button (no separate download required).
-            Operators on Linux / Windows can download the ZIPs from this
-            release page and drag them onto the same Plugins page.
+            Every plugin in this repo is packaged as a ZIP and bundled
+            **inside** the `.app` at `Contents/Resources/plugins/`. You
+            don't need to download anything else — once `execlaw.app` is
+            in `/Applications`, open **Settings → Plugins** and the SPA's
+            "Bundled" section lists each one with a one-click install
+            button. (Linux and Windows operators get the same set of
+            plugins inside their respective installers — see the `.deb`
+            and `-setup.exe` assets attached to this release.)
 
             ### Verify provenance (optional)
 
-            Every artefact on this page is signed with a SLSA build-
+            The `.dmg` on this page is signed with a SLSA build-
             provenance attestation. Confirm the binary you downloaded
             was built by this exact workflow at this exact commit:
 
@@ -253,6 +252,4 @@ jobs:
           files: |
             ${{ steps.outputs.outputs.dmg }}
             ${{ steps.checksum.outputs.sha_file }}
-            dist/*.zip
-            dist/*.zip.sha256
           fail_on_unmatched_files: true

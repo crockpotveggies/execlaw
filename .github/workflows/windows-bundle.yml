@@ -204,10 +204,13 @@ jobs:
           generate_release_notes: false
           name: "execlaw ${{ github.ref_name }}"
           # Append-only — uploads new files to the existing draft
-          # release without overwriting the macOS-side notes.
+          # release without overwriting the macOS-side notes. Plugin
+          # ZIPs are intentionally NOT attached here: they're already
+          # bundled inside the .exe installer's `resources\plugins\`
+          # directory, so a second copy on the Releases page would
+          # just be noise. The ZIPs still get a workflow-artifact
+          # upload above (for `gh run download`) and SLSA provenance.
           files: |
             ${{ steps.outputs.outputs.exe }}
             ${{ steps.checksum.outputs.sha_file }}
-            dist/*.zip
-            dist/*.zip.sha256
           fail_on_unmatched_files: true
