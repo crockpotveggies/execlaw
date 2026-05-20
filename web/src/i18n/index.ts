@@ -25,6 +25,28 @@ export type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
 export const DEFAULT_LANGUAGE: SupportedLanguage = "en";
 export const LANGUAGE_STORAGE_KEY = "execlaw.preferred-language";
 
+// Display metadata for each supported language. `label` is the
+// native endonym (rendered in dropdown options); `short` is the
+// 2-letter chip shown in the compact floating switcher. Used by
+// both the floating LanguageSwitcher (Login + SetupWizard) and the
+// inline picker in Settings → General.
+export interface LanguageOption {
+    value: SupportedLanguage;
+    label: string;
+    short: string;
+}
+
+export const LANGUAGE_OPTIONS: ReadonlyArray<LanguageOption> = [
+    { value: "en", label: "English", short: "EN" },
+    { value: "es", label: "Español", short: "ES" },
+    { value: "fr", label: "Français", short: "FR" },
+    { value: "de", label: "Deutsch", short: "DE" },
+    { value: "it", label: "Italiano", short: "IT" },
+    { value: "nl", label: "Nederlands", short: "NL" },
+    { value: "pl", label: "Polski", short: "PL" },
+    { value: "pt", label: "Português", short: "PT" },
+];
+
 const localeLoaders: Record<
     Exclude<SupportedLanguage, "en">,
     () => Promise<{ default: Record<string, unknown> }>

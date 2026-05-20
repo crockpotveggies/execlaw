@@ -2,30 +2,19 @@
 // globe glyph (matching business-website's `.language-switcher`
 // pattern) and floats top-right of the surrounding shell — see
 // `.execlaw-language-switcher` in `theme.scss` for positioning.
+// Used by the pre-auth surfaces (Login + SetupWizard); the in-app
+// equivalent lives inline in Settings → General.
 
-import { useCurrentLanguage, setLanguage, SUPPORTED_LANGUAGES } from "./index";
-
-interface Option {
-    value: (typeof SUPPORTED_LANGUAGES)[number];
-    label: string;
-    short: string;
-}
-
-const OPTIONS: Option[] = [
-    { value: "en", label: "English", short: "EN" },
-    { value: "es", label: "Español", short: "ES" },
-    { value: "fr", label: "Français", short: "FR" },
-    { value: "de", label: "Deutsch", short: "DE" },
-    { value: "it", label: "Italiano", short: "IT" },
-    { value: "nl", label: "Nederlands", short: "NL" },
-    { value: "pl", label: "Polski", short: "PL" },
-    { value: "pt", label: "Português", short: "PT" },
-];
+import {
+    useCurrentLanguage,
+    setLanguage,
+    LANGUAGE_OPTIONS,
+} from "./index";
 
 export function LanguageSwitcher({ className }: { className?: string }) {
     const current = useCurrentLanguage();
     const short =
-        OPTIONS.find((o) => o.value === current)?.short ??
+        LANGUAGE_OPTIONS.find((o) => o.value === current)?.short ??
         current.toUpperCase();
 
     return (
@@ -52,7 +41,7 @@ export function LanguageSwitcher({ className }: { className?: string }) {
                 }}
                 data-testid="language-switcher-select"
             >
-                {OPTIONS.map((o) => (
+                {LANGUAGE_OPTIONS.map((o) => (
                     <option key={o.value} value={o.value} data-short={o.short}>
                         {o.label}
                     </option>

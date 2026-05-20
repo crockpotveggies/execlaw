@@ -20,6 +20,7 @@ import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
 import { useScreenTransition } from "../anim/useScreenTransition";
 import { coerceRequestOptions, serializeCredential } from "../auth/webauthn";
+import { LanguageSwitcher } from "../i18n/LanguageSwitcher";
 
 export function Login() {
     const auth = useAuth();
@@ -162,6 +163,7 @@ export function Login() {
 
     return (
         <div className="execlaw-auth-shell">
+            <LanguageSwitcher />
             <div ref={ref} className="execlaw-auth-card">
                 <h1 className="execlaw-brand h4 mb-1">execlaw</h1>
                 <p className="execlaw-muted small mb-4">Sign in to continue.</p>

@@ -28,6 +28,11 @@ import {
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
+import {
+    LANGUAGE_OPTIONS,
+    setLanguage,
+    useCurrentLanguage,
+} from "../i18n";
 
 /// Literal the operator must type into the danger-zone input. Kept
 /// in sync with `factory_reset::CONFIRM_TOKEN` server-side; if these
@@ -148,6 +153,8 @@ export function GeneralPage() {
                     settings.
                 </div>
             )}
+
+            <LanguagePicker />
 
             <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
@@ -301,6 +308,46 @@ export function GeneralPage() {
             )}
 
             {canMutate && <DangerZone />}
+        </div>
+    );
+}
+
+/// Per-client language picker. Persists to localStorage via the i18n
+/// module (key: `execlaw.preferred-language`), so it's a UI
+/// preference rather than server state — every role can change it,
+/// and changes apply immediately without a Save button. The
+/// pre-auth surfaces (Login + SetupWizard) read the same key via
+/// the floating LanguageSwitcher chip.
+function LanguagePicker() {
+    const current = useCurrentLanguage();
+    return (
+        <div className="execlaw-card mb-3" data-testid="general-language-card">
+            <Form.Group>
+                <Form.Label
+                    className="execlaw-muted small mb-1"
+                    htmlFor="general-language"
+                >
+                    Language
+                </Form.Label>
+                <Form.Select
+                    id="general-language"
+                    value={current}
+                    onChange={(e) => {
+                        void setLanguage(e.target.value);
+                    }}
+                    data-testid="general-language"
+                >
+                    {LANGUAGE_OPTIONS.map((o) => (
+                        <option key={o.value} value={o.value}>
+                            {o.label}
+                        </option>
+                    ))}
+                </Form.Select>
+                <Form.Text className="execlaw-muted">
+                    Stored per browser. Detection falls back to your
+                    OS language on first run; changes here override it.
+                </Form.Text>
+            </Form.Group>
         </div>
     );
 }
