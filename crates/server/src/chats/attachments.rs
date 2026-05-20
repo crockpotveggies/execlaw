@@ -1025,11 +1025,21 @@ pub(crate) fn extract_channel_origin(e: &EventRecord) -> Option<String> {
 // shape (`{"$data_ref": "<id>"}`) and the recursive substitution
 // pass that runs before every tool invocation.
 
+// The constants + `persist_data_ref` are the producer half of the
+// data-ref scaffolding; only the consumer half (`fetch_data_ref` +
+// the `{"$data_ref": "<id>"}` substitution pass in `tool_dispatch`)
+// is wired into the agent loop today. Plugins that want to mint a
+// data ref still go through their own AttachmentStore call directly.
+// Kept around so the producer side is ready when a tool surfaces
+// that needs it — flag as allowed-dead-code rather than deleting so
+// the doc + invariants stay where future callers will look for them.
+
 /// Default TTL for data refs — long enough that a multi-round turn
 /// (tool A produces a ref → model reasons → tool B consumes it) has
 /// breathing room, short enough that abandoned refs don't pile up
 /// indefinitely on disk. The ephemeral sweeper culls expired rows
 /// + their on-disk bytes on its normal interval.
+#[allow(dead_code)]
 pub(crate) const DATA_REF_DEFAULT_TTL_SECS: i64 = 60 * 60; // 1h
 
 /// Hard cap on a single data ref's JSON payload. Larger than the
@@ -1037,12 +1047,14 @@ pub(crate) const DATA_REF_DEFAULT_TTL_SECS: i64 = 60 * 60; // 1h
 /// candle series, deep-research bibliographies, large search result
 /// sets) trends bigger than one image; small enough that a runaway
 /// plugin can't fill the artifacts dir with one tool call.
+#[allow(dead_code)]
 pub(crate) const DATA_REF_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 /// Persist a JSON value as a data ref, returning the fresh attachment
 /// id. The id is a UUID stamped on `state_artifacts.id`; the bytes
 /// land in the same on-disk artifacts root as plugin-rendered chart
 /// PNGs etc. `ttl_seconds=None` uses [`DATA_REF_DEFAULT_TTL_SECS`].
+#[allow(dead_code)]
 pub(crate) fn persist_data_ref(
     state: &AppState,
     plugin_id: &str,

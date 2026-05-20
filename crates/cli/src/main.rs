@@ -1641,13 +1641,10 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                 // image not found locally" warning + disabled
                 // supervisor — same end-state, fast.
                 let runner_probe_timeout = std::time::Duration::from_secs(5);
-                let probe_result = tokio::time::timeout(
-                    runner_probe_timeout,
-                    async {
-                        let _ = ensure_runner_image_fresh(&runner_image).await;
-                        launcher.image_present(&runner_image).await
-                    },
-                )
+                let probe_result = tokio::time::timeout(runner_probe_timeout, async {
+                    let _ = ensure_runner_image_fresh(&runner_image).await;
+                    launcher.image_present(&runner_image).await
+                })
                 .await;
                 let image_present = match probe_result {
                     Ok(present) => present,

@@ -41,6 +41,10 @@ struct RpcEnvelope<'a> {
 
 #[derive(Debug, Deserialize)]
 struct RpcResponse {
+    // Echoed by the peer for protocol-completeness; we don't validate
+    // it (we already chose to speak JSON-RPC 2.0 by construction) but
+    // keep the field so the deserializer accepts the full shape.
+    #[allow(dead_code)]
     #[serde(default)]
     jsonrpc: String,
     #[serde(default)]
@@ -55,6 +59,10 @@ struct RpcResponse {
 struct RpcError {
     code: i64,
     message: String,
+    // Optional per JSON-RPC 2.0 — peers can attach structured detail
+    // here. We surface `code` + `message` to the operator today and
+    // leave `data` for a future inspector view.
+    #[allow(dead_code)]
     #[serde(default)]
     data: Option<Value>,
 }

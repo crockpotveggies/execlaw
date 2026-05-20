@@ -30,8 +30,8 @@ use crate::state::AppState;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Json};
-use axum::routing::{delete, get, post, put};
+use axum::response::Json;
+use axum::routing::{get, post};
 use execlaw_core::automation_bus::{BusEventKind, BusEventRow, BusEventStore};
 use execlaw_core::automation_runs::{AutomationRunRow, AutomationRunStore};
 use execlaw_core::automation_suggestions::SuggestionStore;
@@ -793,7 +793,7 @@ mod tests {
     use axum::http::{Request, header};
     use execlaw_core::automation_bus::{BusEventKind, BusEventStore, Event as BusEvent};
     use execlaw_core::automations::{
-        AutomationDef, END_SENTINEL, EdgeDef, NodeDef, NodeKind, TRIGGER_SENTINEL, TriggerDef,
+        AutomationDef, EdgeDef, NodeDef, NodeKind, TRIGGER_SENTINEL, TriggerDef,
     };
     use tower::ServiceExt;
 

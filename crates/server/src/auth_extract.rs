@@ -108,4 +108,3 @@ impl FromRequestParts<AppState> for AuthedUser {
         Ok(AuthedUser::from(row))
     }
 }
-

@@ -1,4 +1,4 @@
-﻿//! Automation runtime â€” matcher + executor (M2 of Automations).
+//! Automation runtime â€” matcher + executor (M2 of Automations).
 //!
 //! Plugs into the M1 bus by providing an [`EventHandler`] that
 //! `cmd_serve` installs in place of [`noop_handler`]. For each
@@ -33,7 +33,7 @@ use crate::automation_agent::{AskAgentRequest, AutomationsAgentPool};
 use crate::automation_bus::EventHandler;
 use execlaw_core::Database;
 use execlaw_core::alerts::{AlertRow, AlertStatus, AlertStore, Severity};
-use execlaw_core::automation_bus::{BusEventRow, Event as BusEvent};
+use execlaw_core::automation_bus::BusEventRow;
 use execlaw_core::automation_runs::{AutomationRunStatus, AutomationRunStore, StepTrace};
 use execlaw_core::automations::{
     AutomationDef, AutomationRow, AutomationStore, END_SENTINEL, NodeDef, NodeKind,
@@ -63,11 +63,7 @@ pub struct ExecutorContext {
 }
 
 impl ExecutorContext {
-    pub fn new(
-        db: Database,
-        pool: AutomationsAgentPool,
-        plugin_host: Option<PluginHost>,
-    ) -> Self {
+    pub fn new(db: Database, pool: AutomationsAgentPool, plugin_host: Option<PluginHost>) -> Self {
         Self {
             db,
             pool,
@@ -622,9 +618,11 @@ fn render_template_in_value(
 ) -> serde_json::Value {
     match v {
         serde_json::Value::String(s) => serde_json::Value::String(render_template(s, state)),
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(|x| render_template_in_value(x, state)).collect())
-        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.iter()
+                .map(|x| render_template_in_value(x, state))
+                .collect(),
+        ),
         serde_json::Value::Object(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
             for (k, val) in map {
@@ -946,10 +944,9 @@ mod tests {
         AskAgentError, AutomationsAgentPool, ExitToolCall, StubAgentInvoker,
     };
     use execlaw_core::Database;
-    use execlaw_core::automation_bus::{BusEventKind, BusEventStore};
+    use execlaw_core::automation_bus::{BusEventKind, BusEventStore, Event as BusEvent};
     use execlaw_core::automations::{
-        AutomationDef, AutomationStore, AutomationUpsert, EdgeDef, ExitToolDef, NodeDef, NodeKind,
-        TriggerDef,
+        AutomationDef, AutomationStore, AutomationUpsert, EdgeDef, NodeDef, NodeKind, TriggerDef,
     };
     use execlaw_core::db::DbConfig;
     use execlaw_core::migrations::MigrationRunner;
@@ -1383,11 +1380,8 @@ mod tests {
 
         // Spawn the bus with the REAL matcher handler.
         let stop = std::sync::Arc::new(Notify::new());
-        let (bus, tasks) = AutomationBus::spawn(
-            db.clone(),
-            build_handler(noop_ctx(&db)),
-            stop.clone(),
-        );
+        let (bus, tasks) =
+            AutomationBus::spawn(db.clone(), build_handler(noop_ctx(&db)), stop.clone());
 
         // Publish a matching event through the bus.
         let evt = BusEvent {
@@ -1927,11 +1921,8 @@ mod tests {
             .unwrap();
 
         let stop = std::sync::Arc::new(Notify::new());
-        let (bus, tasks) = AutomationBus::spawn(
-            db.clone(),
-            build_handler(noop_ctx(&db)),
-            stop.clone(),
-        );
+        let (bus, tasks) =
+            AutomationBus::spawn(db.clone(), build_handler(noop_ctx(&db)), stop.clone());
 
         // Publish a WebhookReceived event â€” wrong kind, must not trigger.
         bus.publish(BusEvent {
@@ -2061,7 +2052,10 @@ mod tests {
         }));
         match validate(&def) {
             Err(AutomationError::Validation(msg)) => {
-                assert!(msg.contains("severity"), "expected severity error, got: {msg}");
+                assert!(
+                    msg.contains("severity"),
+                    "expected severity error, got: {msg}"
+                );
             }
             other => panic!("expected validation error, got {other:?}"),
         }
@@ -2097,7 +2091,11 @@ mod tests {
         run_matching_automations(&noop_ctx(&db), &evt2);
 
         let alerts = AlertStore::new(&db).list(None, None).unwrap();
-        assert_eq!(alerts.len(), 1, "dedup must collapse same-fingerprint firings");
+        assert_eq!(
+            alerts.len(),
+            1,
+            "dedup must collapse same-fingerprint firings"
+        );
         assert_eq!(alerts[0].occurrence_count, 2);
     }
 

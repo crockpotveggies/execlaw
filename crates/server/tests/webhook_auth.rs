@@ -323,7 +323,11 @@ async fn query_token_valid_accepts_and_redacts_payload() {
     let events = BusEventStore::new(&state.db)
         .list_recent_for_kind(BusEventKind::WebhookReceived, 10)
         .unwrap();
-    assert_eq!(events.len(), 1, "valid token must create exactly one bus event");
+    assert_eq!(
+        events.len(),
+        1,
+        "valid token must create exactly one bus event"
+    );
     let payload = &events[0].payload;
     // Persisted payload's query.token must be redacted.
     assert_eq!(

@@ -14,7 +14,6 @@ use axum::routing::{delete, get, post};
 use execlaw_core::search_providers::{
     SearchProviderError, SearchProviderKind, SearchProviderRow, SearchProviderStore,
 };
-use execlaw_core::tool::WebSearchApi;
 use execlaw_core::users::{UserRole, UserStore};
 use serde::{Deserialize, Serialize};
 

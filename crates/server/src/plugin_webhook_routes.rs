@@ -169,7 +169,10 @@ fn verify_webhook_auth(
     };
     match auth {
         WebhookAuthDecl::None => Ok(()),
-        WebhookAuthDecl::QueryToken { query: q_key, vault_key } => {
+        WebhookAuthDecl::QueryToken {
+            query: q_key,
+            vault_key,
+        } => {
             let expected = resolve_vault_secret(state, plugin_id, vault_key)?;
             let supplied = query
                 .get(q_key.as_str())
@@ -219,7 +222,9 @@ fn redact_query_for_bus(
         .map(|(k, v)| {
             let lower = k.to_ascii_lowercase();
             let redact = ALWAYS_REDACTED_QUERY_KEYS.contains(&lower.as_str())
-                || extra_redact.map(|e| e.eq_ignore_ascii_case(k)).unwrap_or(false);
+                || extra_redact
+                    .map(|e| e.eq_ignore_ascii_case(k))
+                    .unwrap_or(false);
             let val = if redact {
                 serde_json::Value::String("<redacted>".to_owned())
             } else {

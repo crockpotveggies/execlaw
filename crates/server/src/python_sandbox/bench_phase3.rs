@@ -14,7 +14,6 @@
 use super::hydration::{AttachmentToHydrate, HydrateOpts, hydrate_uploads};
 use execlaw_core::ids::ConversationId;
 use std::fs;
-use std::path::PathBuf;
 use std::time::Instant;
 
 fn bench_size(label: &str, blob_size: usize, n: usize) {

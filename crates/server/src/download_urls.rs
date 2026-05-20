@@ -77,12 +77,7 @@ pub fn compute_sig(path: &str, user_id: &str, exp_unix: i64, key: &[u8]) -> Stri
 /// `[1, MAX_TTL_SECS]`. Returns the URL string and the absolute
 /// `exp` unix-seconds so the caller can surface a "valid until …"
 /// hint to the operator.
-pub fn build_signed_url(
-    path: &str,
-    user_id: &str,
-    ttl_secs: i64,
-    key: &[u8],
-) -> (String, i64) {
+pub fn build_signed_url(path: &str, user_id: &str, ttl_secs: i64, key: &[u8]) -> (String, i64) {
     let ttl = ttl_secs.clamp(1, MAX_TTL_SECS);
     let exp = Utc::now().timestamp() + ttl;
     let sig = compute_sig(path, user_id, exp, key);
@@ -327,7 +322,11 @@ mod tests {
     fn tampered_user_rejected() {
         let (url, _) = build_signed_url("/api/attachments/abc", "u-1", 60, KEY);
         // Swap user but keep sig.
-        let q = url.split_once('?').unwrap().1.replace("user=u-1", "user=u-2");
+        let q = url
+            .split_once('?')
+            .unwrap()
+            .1
+            .replace("user=u-1", "user=u-2");
         assert_eq!(
             verify_sig("/api/attachments/abc", &q, KEY),
             Err(SignedUrlError::BadSig)

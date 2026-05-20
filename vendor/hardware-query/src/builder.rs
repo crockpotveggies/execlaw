@@ -27,8 +27,14 @@ pub struct HardwareQueryBuilder {
     include_pci: bool,
     include_usb: bool,
     include_virtualization: bool,
+    // Set by the builder's `with_capabilities()` method but the
+    // upstream stub never reads it back during `query()`. Kept on the
+    // struct so the builder's chained-setter API stays symmetric with
+    // the other `with_*` methods; suppressed locally so the vendored
+    // crate compiles warning-free.
+    #[allow(dead_code)]
     include_capabilities: bool,
-    
+
     #[cfg(feature = "monitoring")]
     include_power: bool,
 }

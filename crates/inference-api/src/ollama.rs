@@ -398,8 +398,6 @@ pub(crate) async fn chat_completions_stream(
     std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatStreamChunk, InferenceError>> + Send>>,
     InferenceError,
 > {
-    use futures::StreamExt;
-
     let url = format!("{}/api/chat", daemon_root(base_url));
     let body = build_request(req, true);
     let mut r = http.post(&url).json(&body);

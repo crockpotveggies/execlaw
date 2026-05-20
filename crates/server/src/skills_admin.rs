@@ -724,7 +724,6 @@ mod tests {
     //! path added alongside the standardized Skills page scaffolding.
     //! Hits the full HTTP route stack (auth extractor + handler +
     //! store) so a regression in any link of the chain trips here.
-    use super::*;
     use crate::routes::{build_router, test_app_state};
     use axum::body::{self, Body};
     use axum::http::{HeaderValue, Method, Request, StatusCode, header};

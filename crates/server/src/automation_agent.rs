@@ -38,7 +38,7 @@ use crate::inference_metrics::{InferenceConsumer, InferenceMetrics};
 use crate::inference_resolver::InferenceResolver;
 use async_trait::async_trait;
 use execlaw_core::Database;
-use execlaw_core::automations::{AskAgentConfig, ExitToolDef};
+use execlaw_core::automations::AskAgentConfig;
 use execlaw_core::backends::BackendPurpose;
 use execlaw_inference_api::{
     ChatMessage, ChatRequest, FunctionDecl, InferenceClient, ModelId, ToolCall, ToolDeclaration,

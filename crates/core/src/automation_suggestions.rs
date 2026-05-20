@@ -1,4 +1,4 @@
-﻿//! Automation suggestions â€” the discovery surface for the
+//! Automation suggestions â€” the discovery surface for the
 //! `/automations` landing page (M4).
 //!
 //! The daily sweep scans `state_bus_events`, groups by `(kind,
@@ -571,8 +571,8 @@ mod tests {
     #[test]
     fn sweep_skips_kinds_with_an_enabled_automation() {
         use crate::automations::{
-            AutomationDef, AutomationStore, AutomationUpsert, END_SENTINEL, EdgeDef, NodeDef,
-            NodeKind, TRIGGER_SENTINEL, TriggerDef,
+            AutomationDef, AutomationStore, AutomationUpsert, EdgeDef, NodeDef, NodeKind,
+            TRIGGER_SENTINEL, TriggerDef,
         };
         let db = fresh_db();
         let store = SuggestionStore::new(&db);
@@ -725,7 +725,7 @@ mod tests {
     #[test]
     fn set_draft_definition_round_trips_and_only_targets_pending() {
         use crate::automations::{
-            AutomationDef, END_SENTINEL, EdgeDef, NodeDef, NodeKind, TRIGGER_SENTINEL, TriggerDef,
+            AutomationDef, EdgeDef, NodeDef, NodeKind, TRIGGER_SENTINEL, TriggerDef,
         };
         let db = fresh_db();
         let store = SuggestionStore::new(&db);
@@ -762,7 +762,7 @@ mod tests {
     #[test]
     fn list_pending_includes_draft_when_set() {
         use crate::automations::{
-            AutomationDef, END_SENTINEL, EdgeDef, NodeDef, NodeKind, TRIGGER_SENTINEL, TriggerDef,
+            AutomationDef, EdgeDef, NodeDef, NodeKind, TRIGGER_SENTINEL, TriggerDef,
         };
         let db = fresh_db();
         let store = SuggestionStore::new(&db);

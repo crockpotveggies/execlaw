@@ -23,7 +23,6 @@
 use crate::host_caps_impl::builtin_artifacts_root_path as builtin_artifacts_root;
 use crate::mcp_host::{MCP_TOOL_PREFIX, McpHost};
 use crate::tool_apis_http::HttpWebFetchApi;
-use crate::tool_apis_search::DuckDuckGoSearchApi;
 use crate::tool_apis_subagent::InferenceSubagentApi;
 use async_trait::async_trait;
 use execlaw_core::Database;

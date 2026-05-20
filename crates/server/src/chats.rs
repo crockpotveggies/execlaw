@@ -18,11 +18,9 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use execlaw_core::backends::BackendPurpose;
-use execlaw_core::conversation::{
-    ConversationKind, ConversationRow, ConversationStore, Modality, Phase, ThreadSummary,
-};
+use execlaw_core::conversation::{ConversationStore, Phase};
 use execlaw_core::events::{
-    EventKind, EventLog, EventRecord, PendingEvent, ToolResultPayload, ToolUsePayload,
+    EventKind, EventRecord, PendingEvent, ToolResultPayload, ToolUsePayload,
 };
 use execlaw_core::ids::{ConversationId, EventSeq};
 use execlaw_core::principal::{Principal, PrincipalStore, TrustLevel as CoreTrustLevel};
@@ -56,7 +54,7 @@ pub use types::{
 pub(crate) use attachments::{
     build_attached_files_block, encode_attachments_as_data_urls, extract_applied_skill_names,
     extract_attachment_ids, extract_channel_origin, extract_text, fetch_data_ref,
-    hydrate_message_attachments, persist_data_ref, persist_inbound_attachments,
+    hydrate_message_attachments, persist_inbound_attachments,
 };
 pub(crate) use prompt::{assemble_system_prompt, build_tool_routing_prose, humanise_tool_call};
 // 2026-05-16 — small utilities split out into `chats/helpers.rs`.
@@ -67,13 +65,20 @@ pub(crate) use prompt::{assemble_system_prompt, build_tool_routing_prose, humani
 pub(crate) use helpers::{
     BusPhaseObserver, IdlePhaseGuard, ensure_conversation, err_500, event_log,
     refresh_conversation_kind, resolve_skill_prepend, rewrite_url_for_container,
-    rewrite_url_with_alias, sanitize_generated_title, strip_think_blocks,
+    sanitize_generated_title,
 };
+// `rewrite_url_with_alias` is consumed by this file's in-line test
+// module via `super::rewrite_url_with_alias(...)`. Gated to test
+// builds so the lib build path sees zero unused-import warnings.
+#[cfg(test)]
+pub(crate) use helpers::rewrite_url_with_alias;
 pub use helpers::{apply_auto_display_name, ensure_conversation_for};
-use types::{
-    ColdContactPayload, MAX_PREPEND_SKILL_BYTES, RealModelTurnPayload, StubModelTurnPayload,
-    UserMessagePayload, deserialize_optional_field,
-};
+use types::{ColdContactPayload, RealModelTurnPayload, StubModelTurnPayload, UserMessagePayload};
+// Consumed by this file's in-line test module via
+// `super::MAX_PREPEND_SKILL_BYTES`. Gated to test builds so the lib
+// build path sees zero unused-import warnings.
+#[cfg(test)]
+use types::MAX_PREPEND_SKILL_BYTES;
 
 /// `POST /api/chats/:id/messages`
 #[utoipa::path(
@@ -6797,9 +6802,10 @@ required_capabilities = []
             .unwrap(),
         );
 
-        // Call 2 — failure (e.g. plugin denied).
+        // Call 2 — failure (e.g. plugin denied). No further reads of
+        // `tool_ordinal` after this branch, so the trailing `+= 1`
+        // would be dead.
         let o1 = tool_ordinal;
-        tool_ordinal += 1;
         pending.push(
             PendingEvent::encode(
                 EventKind::ToolUse,

@@ -149,12 +149,7 @@ impl JwtSigner {
         let verifying_key = signing_key.verifying_key();
         let mut download_hmac_key = [0u8; 32];
         csprng.fill_bytes(&mut download_hmac_key);
-        Self::from_keys_with_download_key(
-            signing_key,
-            verifying_key,
-            issuer,
-            download_hmac_key,
-        )
+        Self::from_keys_with_download_key(signing_key, verifying_key, issuer, download_hmac_key)
     }
 
     /// Derive the Ed25519 signing key deterministically from the
@@ -193,12 +188,7 @@ impl JwtSigner {
         h2.update(b"execlaw/download-url-hmac/v1");
         h2.update(master_key);
         let download_hmac_key: [u8; 32] = h2.finalize().into();
-        Self::from_keys_with_download_key(
-            signing_key,
-            verifying_key,
-            issuer,
-            download_hmac_key,
-        )
+        Self::from_keys_with_download_key(signing_key, verifying_key, issuer, download_hmac_key)
     }
 
     pub fn from_keys(signing_key: SigningKey, verifying_key: VerifyingKey, issuer: String) -> Self {

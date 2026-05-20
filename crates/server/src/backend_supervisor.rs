@@ -533,6 +533,12 @@ fn default_tool_parser_for_args(args: &[String]) -> &'static str {
 /// `POST /api/pull` into the supervisor's existing download-task
 /// machinery so the SPA can surface "Pulling 47%…" the same way it
 /// does for HF model downloads on vLLM today.
+// Convenience wrapper used by unit tests that already have a
+// `ServiceSpec` in scope. The reconcile loop itself goes straight to
+// `health_path_for_hint` against the `BackendRow`, so the wrapper has
+// no production callers — gated to `#[cfg(test)]` to keep the lib
+// build warning-free.
+#[cfg(test)]
 fn health_path_for(spec: &ServiceSpec) -> &'static str {
     health_path_for_hint(&spec.binary_hint)
 }

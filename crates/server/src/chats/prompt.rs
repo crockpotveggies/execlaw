@@ -544,7 +544,7 @@ pub(crate) fn assemble_system_prompt(
     let r = routing_prose.trim();
     let c = turn_context.trim();
     let mut out = String::new();
-    let mut sep = |s: &mut String| {
+    let sep = |s: &mut String| {
         if !s.is_empty() {
             s.push_str("\n\n---\n\n");
         }

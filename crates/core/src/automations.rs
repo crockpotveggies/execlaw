@@ -1,4 +1,4 @@
-﻿//! Automations data model + store (M2 of Automations).
+//! Automations data model + store (M2 of Automations).
 //!
 //! Owns `state_automations`. An automation is a typed graph:
 //!
@@ -363,11 +363,7 @@ pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
         if matches!(n.kind, NodeKind::Notify) {
             // title is required + non-empty; severity (if present)
             // must parse to a known variant. detail + source are free.
-            let title = n
-                .config
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let title = n.config.get("title").and_then(|v| v.as_str()).unwrap_or("");
             if title.trim().is_empty() {
                 return Err(AutomationError::Validation(format!(
                     "Notify node '{}': config.title is required and must be a non-empty string",
@@ -387,11 +383,7 @@ pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
             // tool is required + non-empty. args is optional (defaults
             // to empty object at runtime); when present it must be an
             // object so we can apply template rendering recursively.
-            let tool = n
-                .config
-                .get("tool")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let tool = n.config.get("tool").and_then(|v| v.as_str()).unwrap_or("");
             if tool.trim().is_empty() {
                 return Err(AutomationError::Validation(format!(
                     "CallPlugin node '{}': config.tool is required (registered tool name)",

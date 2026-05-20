@@ -626,12 +626,16 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let headers = resp.headers().clone();
         assert_eq!(
-            headers.get(header::REFERRER_POLICY).and_then(|v| v.to_str().ok()),
+            headers
+                .get(header::REFERRER_POLICY)
+                .and_then(|v| v.to_str().ok()),
             Some("no-referrer"),
             "browser-direct download must not leak signed URL via Referer"
         );
         assert_eq!(
-            headers.get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok()),
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
             Some("private, no-store"),
         );
         let bytes = body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
