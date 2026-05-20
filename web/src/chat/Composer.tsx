@@ -12,6 +12,7 @@ import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
 import Spinner from "react-bootstrap/Spinner";
 import type { InlineAttachment, SkillListEntry } from "../api/endpoints";
+import { useT } from "../i18n";
 import type { VoiceReadiness } from "./useVoiceReadiness";
 import { VoiceCaptureButton } from "./VoiceCaptureButton";
 
@@ -284,6 +285,7 @@ export function Composer({
     recommendedImageEdge,
     getSkills,
 }: Props) {
+    const t = useT();
     // Bridged-channel short-circuit. Render a flat, non-interactive
     // notice in place of the composer chip. Mirrors the chip's
     // outer dimensions (max-width, padding, border-radius via the
@@ -741,7 +743,7 @@ export function Composer({
                             type="button"
                             className="execlaw-composer__drop-error-dismiss"
                             onClick={() => setDropError(null)}
-                            aria-label="Dismiss"
+                            aria-label={t("composer.dismiss", "Dismiss")}
                             data-testid="composer-drop-error-dismiss"
                         >
                             <i className="bi bi-x" aria-hidden />
@@ -825,7 +827,7 @@ export function Composer({
                     ref={textareaRef}
                     as="textarea"
                     rows={1}
-                    placeholder="How can I help?"
+                    placeholder={t("composer.placeholder", "How can I help?")}
                     value={text}
                     onChange={(e) => setText(e.target.value)}
                     onKeyDown={onKeyDown}
@@ -875,7 +877,7 @@ export function Composer({
                                         // state from the previous open.
                                         setAttachMenuMode("root");
                                     }}
-                                    aria-label="Attach"
+                                    aria-label={t("composer.attach", "Attach")}
                                     aria-haspopup="menu"
                                     aria-expanded={attachMenuOpen}
                                     disabled={isBusy}
@@ -901,7 +903,7 @@ export function Composer({
                                                     className="bi bi-image"
                                                     aria-hidden
                                                 />
-                                                <span>Attach photo</span>
+                                                <span>{t("composer.attachPhoto", "Attach photo")}</span>
                                             </button>
                                         )}
                                         {/*
@@ -933,7 +935,7 @@ export function Composer({
                                                 className="bi bi-paperclip"
                                                 aria-hidden
                                             />
-                                            <span>Attach file</span>
+                                            <span>{t("composer.attachFile", "Attach file")}</span>
                                         </button>
                                         {getSkills && (
                                             <button
@@ -947,7 +949,7 @@ export function Composer({
                                                     className="bi bi-stars"
                                                     aria-hidden
                                                 />
-                                                <span>Attach skill</span>
+                                                <span>{t("composer.attachSkill", "Attach skill")}</span>
                                             </button>
                                         )}
                                     </div>
@@ -965,7 +967,10 @@ export function Composer({
                                                 onClick={() =>
                                                     setAttachMenuMode("root")
                                                 }
-                                                aria-label="Back to attach menu"
+                                                aria-label={t(
+                                                    "composer.backToAttach",
+                                                    "Back to attach menu",
+                                                )}
                                                 data-testid="composer-skill-picker-back"
                                             >
                                                 <i
@@ -973,14 +978,14 @@ export function Composer({
                                                     aria-hidden
                                                 />
                                             </button>
-                                            <span>Pick skills for this turn</span>
+                                            <span>{t("composer.pickSkills", "Pick skills for this turn")}</span>
                                         </div>
                                         {skillsLoading && (
                                             <div
                                                 className="execlaw-composer__skill-picker-status"
                                                 data-testid="composer-skill-picker-loading"
                                             >
-                                                Loading…
+                                                {t("composer.loading", "Loading…")}
                                             </div>
                                         )}
                                         {skillsError && (
@@ -1124,7 +1129,7 @@ export function Composer({
                                     onStop();
                                 }}
                                 data-testid="composer-stop"
-                                aria-label="Stop generating"
+                                aria-label={t("composer.stop", "Stop generating")}
                                 className="execlaw-composer__send execlaw-composer__send--stop"
                             >
                                 <i className="bi bi-stop-fill" aria-hidden />
@@ -1135,7 +1140,7 @@ export function Composer({
                                 variant="primary"
                                 disabled={sendDisabled}
                                 data-testid="composer-send"
-                                aria-label="Send"
+                                aria-label={t("composer.send", "Send")}
                                 className="execlaw-composer__send"
                             >
                                 {submitting ? (

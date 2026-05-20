@@ -20,11 +20,13 @@ import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
 import { useScreenTransition } from "../anim/useScreenTransition";
 import { coerceRequestOptions, serializeCredential } from "../auth/webauthn";
+import { useT } from "../i18n";
 import { LanguageSwitcher } from "../i18n/LanguageSwitcher";
 
 export function Login() {
     const auth = useAuth();
     const navigate = useNavigate();
+    const t = useT();
     const { ref, dismiss } = useScreenTransition<HTMLDivElement>();
 
     const [username, setUsername] = useState("");
@@ -50,7 +52,10 @@ export function Login() {
     ) => {
         if (typeof navigator === "undefined" || !navigator.credentials) {
             setSubmitError(
-                "This browser does not support WebAuthn. Use a modern browser or remove the registered passkey.",
+                t(
+                    "login.webauthnUnsupported",
+                    "This browser does not support WebAuthn. Use a modern browser or remove the registered passkey.",
+                ),
             );
             return;
         }
@@ -59,7 +64,12 @@ export function Login() {
             publicKey: reqOpts,
         })) as PublicKeyCredential | null;
         if (!cred) {
-            setSubmitError("No credential returned from the authenticator.");
+            setSubmitError(
+                t(
+                    "login.webauthnNoCredential",
+                    "No credential returned from the authenticator.",
+                ),
+            );
             return;
         }
         const tokens = await finishWebauthnLogin(
@@ -74,7 +84,12 @@ export function Login() {
         e.preventDefault();
         setSubmitError(null);
         if (username.trim().length === 0 || password.length === 0) {
-            setSubmitError("Enter both username and password.");
+            setSubmitError(
+                t(
+                    "login.usernameAndPasswordRequired",
+                    "Enter both username and password.",
+                ),
+            );
             return;
         }
         setSubmitting(true);
@@ -112,8 +127,15 @@ export function Login() {
                     // authenticator step without re-typing the password.
                     setSubmitError(
                         e instanceof Error
-                            ? `Passkey step failed: ${e.message}`
-                            : "Passkey step failed.",
+                            ? t(
+                                  "login.passkeyStepFailedWithReason",
+                                  "Passkey step failed: {{reason}}",
+                                  { reason: e.message },
+                              )
+                            : t(
+                                  "login.passkeyStepFailed",
+                                  "Passkey step failed.",
+                              ),
                     );
                 }
                 return;
@@ -127,7 +149,12 @@ export function Login() {
         } catch (e) {
             if (e instanceof ApiError) {
                 if (e.code === "unauthorized") {
-                    setSubmitError("Incorrect username or password.");
+                    setSubmitError(
+                        t(
+                            "login.incorrectCredentials",
+                            "Incorrect username or password.",
+                        ),
+                    );
                 } else if (e.serverCode === "not_initialized") {
                     navigate("/setup", { replace: true });
                     return;
@@ -136,7 +163,9 @@ export function Login() {
                 }
             } else {
                 setSubmitError(
-                    e instanceof Error ? e.message : "Login failed.",
+                    e instanceof Error
+                        ? e.message
+                        : t("login.failed", "Login failed."),
                 );
             }
         } finally {
@@ -155,8 +184,12 @@ export function Login() {
         } catch (e) {
             setSubmitError(
                 e instanceof Error
-                    ? `Passkey step failed: ${e.message}`
-                    : "Passkey step failed.",
+                    ? t(
+                          "login.passkeyStepFailedWithReason",
+                          "Passkey step failed: {{reason}}",
+                          { reason: e.message },
+                      )
+                    : t("login.passkeyStepFailed", "Passkey step failed."),
             );
         }
     };
@@ -166,7 +199,9 @@ export function Login() {
             <LanguageSwitcher />
             <div ref={ref} className="execlaw-auth-card">
                 <h1 className="execlaw-brand h4 mb-1">execlaw</h1>
-                <p className="execlaw-muted small mb-4">Sign in to continue.</p>
+                <p className="execlaw-muted small mb-4">
+                    {t("login.intro", "Sign in to continue.")}
+                </p>
 
                 <ErrorBanner
                     message={submitError}
@@ -179,11 +214,13 @@ export function Login() {
                     <div className="execlaw-card mb-3" data-testid="login-webauthn-pending">
                         <div className="execlaw-card__title mb-2">
                             <i className="bi bi-key me-2" aria-hidden />
-                            Passkey required
+                            {t("login.passkeyRequired", "Passkey required")}
                         </div>
                         <p className="execlaw-muted small mb-3">
-                            Tap your security key or use your platform
-                            authenticator to finish signing in.
+                            {t(
+                                "login.passkeyRequiredBody",
+                                "Tap your security key or use your platform authenticator to finish signing in.",
+                            )}
                         </p>
                         <Button
                             type="button"
@@ -191,14 +228,14 @@ export function Login() {
                             onClick={() => void onRetryWebauthn()}
                             data-testid="login-webauthn-retry"
                         >
-                            Try passkey again
+                            {t("login.tryPasskeyAgain", "Try passkey again")}
                         </Button>
                     </div>
                 )}
 
                 <Form noValidate onSubmit={onSubmit}>
                     <Form.Group className="mb-3" controlId="login-username">
-                        <Form.Label>Username</Form.Label>
+                        <Form.Label>{t("login.username", "Username")}</Form.Label>
                         <Form.Control
                             type="text"
                             autoComplete="username"
@@ -212,7 +249,7 @@ export function Login() {
                     </Form.Group>
 
                     <Form.Group className="mb-4" controlId="login-password">
-                        <Form.Label>Password</Form.Label>
+                        <Form.Label>{t("login.password", "Password")}</Form.Label>
                         <Form.Control
                             type="password"
                             autoComplete="current-password"
@@ -231,10 +268,10 @@ export function Login() {
                         {submitting ? (
                             <>
                                 <Spinner size="sm" animation="border" className="me-2" />
-                                Signing in…
+                                {t("login.signingIn", "Signing in…")}
                             </>
                         ) : (
-                            "Sign in"
+                            t("login.signIn", "Sign in")
                         )}
                     </Button>
                 </Form>

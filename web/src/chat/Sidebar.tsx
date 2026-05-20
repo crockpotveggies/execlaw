@@ -10,6 +10,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
+import { useT } from "../i18n";
 import {
     deleteThread,
     getAlertCount,
@@ -49,6 +50,7 @@ interface SidebarProps {
 
 export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
     const auth = useAuth();
+    const tr = useT();
     const navigate = useNavigate();
     const location = useLocation();
     const threads = useChatState((s) => s.threads);
@@ -237,39 +239,41 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                         aria-hidden
                     />
                     <span className="execlaw-thread-item__name">
-                        New chat
+                        {tr("sidebar.newChat", "New chat")}
                     </span>
                 </button>
-                <div className="execlaw-sidebar__section">Browse</div>
+                <div className="execlaw-sidebar__section">
+                    {tr("sidebar.browse", "Browse")}
+                </div>
                 <SidebarNavLink
                     to="/routines"
                     icon="bi-clock-history"
-                    label="Routines"
+                    label={tr("sidebar.routines", "Routines")}
                     testId="sidebar-routines"
                 />
                 <SidebarNavLink
                     to="/automations"
                     icon="bi-lightning-charge-fill"
-                    label="Automations"
+                    label={tr("sidebar.automations", "Automations")}
                     testId="sidebar-automations"
                 />
                 <SidebarNavLink
                     to="/research"
                     icon="bi-binoculars"
-                    label="Research"
+                    label={tr("sidebar.research", "Research")}
                     testId="sidebar-research"
                 />
                 <SidebarNavLink
                     to="/skills"
                     icon="bi-stars"
-                    label="Skills"
+                    label={tr("sidebar.skills", "Skills")}
                     testId="sidebar-skills"
                 />
                 {pendingApprovalCount > 0 && (
                     <SidebarNavLink
                         to="/approvals"
                         icon="bi-shield-exclamation"
-                        label="Approvals"
+                        label={tr("sidebar.approvals", "Approvals")}
                         testId="sidebar-approvals"
                         badge={pendingApprovalCount}
                     />
@@ -288,14 +292,16 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                         }
                         aria-hidden
                     />
-                    <span className="execlaw-thread-item__name">More</span>
+                    <span className="execlaw-thread-item__name">
+                        {tr("sidebar.more", "More")}
+                    </span>
                 </button>
                 {moreExpanded && (
                     <div className="ps-3" data-testid="sidebar-more-panels">
                         <SidebarNavLink
                             to="/settings/contacts"
                             icon="bi-person-lines-fill"
-                            label="Contacts"
+                            label={tr("sidebar.contacts", "Contacts")}
                             testId="sidebar-contacts"
                         />
                         {/*
@@ -319,7 +325,9 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                     style={{ position: "relative" }}
                     ref={filtersRef}
                 >
-                    <span className="flex-grow-1">Threads</span>
+                    <span className="flex-grow-1">
+                        {tr("sidebar.threads", "Threads")}
+                    </span>
                     <button
                         type="button"
                         className="btn btn-link btn-sm p-0 execlaw-muted"
@@ -327,7 +335,7 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                         aria-haspopup="menu"
                         aria-expanded={filtersOpen}
                         data-testid="sidebar-threads-filters"
-                        title="Filters"
+                        title={tr("sidebar.filters", "Filters")}
                         style={{
                             lineHeight: 1,
                             display: "inline-flex",
@@ -386,7 +394,10 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                                 }}
                             >
                                 <span className="flex-grow-1">
-                                    External channels
+                                    {tr(
+                                        "sidebar.externalChannels",
+                                        "External channels",
+                                    )}
                                 </span>
                                 <span
                                     data-testid="sidebar-hide-external-state"
@@ -398,7 +409,9 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                                         marginLeft: "0.5rem",
                                     }}
                                 >
-                                    {hideExternal ? "off" : "on"}
+                                    {hideExternal
+                                        ? tr("sidebar.off", "off")
+                                        : tr("sidebar.on", "on")}
                                 </span>
                             </button>
                         </div>
@@ -406,7 +419,10 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                 </div>
                 {visibleThreads.length === 0 ? (
                     <div className="execlaw-muted small px-2 pt-2">
-                        No threads yet. Start a new chat to begin.
+                        {tr(
+                            "sidebar.noThreads",
+                            "No threads yet. Start a new chat to begin.",
+                        )}
                     </div>
                 ) : (
                     visibleThreads.map((t) => {
@@ -414,8 +430,12 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                             CONTROLLER_THREAD_PREFIX,
                         );
                         const fallback = isControl
-                            ? "Control thread"
-                            : `New chat · ${t.conversation_id.slice(0, 6)}`;
+                            ? tr("sidebar.controlThread", "Control thread")
+                            : tr(
+                                  "sidebar.newChatLabel",
+                                  "New chat · {{id}}",
+                                  { id: t.conversation_id.slice(0, 6) },
+                              );
                         const label = t.display_name ?? fallback;
                         const isRenaming = renamingId === t.conversation_id;
                         return (
@@ -487,7 +507,11 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                                     // here.
                                     if (
                                         !window.confirm(
-                                            `Delete "${label}"? This wipes the conversation's history.`,
+                                            tr(
+                                                "sidebar.deleteConfirm",
+                                                'Delete "{{name}}"? This wipes the conversation\'s history.',
+                                                { name: label },
+                                            ),
                                         )
                                     ) {
                                         return;
@@ -531,7 +555,7 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                     to="/settings"
                     className="btn btn-link btn-sm p-0 execlaw-muted"
                     data-testid="sidebar-settings"
-                    aria-label="Settings"
+                    aria-label={tr("sidebar.settings", "Settings")}
                 >
                     <i className="bi bi-gear" aria-hidden />
                 </Link>
@@ -545,7 +569,7 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
                     className="btn btn-link btn-sm p-0 ms-auto execlaw-muted"
                     onClick={onSignOut ?? auth.signOut}
                     data-testid="sidebar-signout"
-                    aria-label="Sign out"
+                    aria-label={tr("sidebar.signOut", "Sign out")}
                 >
                     <i className="bi bi-box-arrow-right" aria-hidden />
                 </button>
@@ -576,6 +600,7 @@ function BrandStatusIndicator({
     /// poll cost is paid once per Sidebar mount, not per render.
     installing: boolean;
 }) {
+    const tr = useT();
     const conn = useConnectionStatus();
     // Precedence (highest → lowest): disconnected > alert > installing > ok.
     // - Connection loss is the most urgent signal — without it nothing
@@ -588,8 +613,8 @@ function BrandStatusIndicator({
     if (conn !== "online") {
         const label =
             conn === "offline"
-                ? "Server unreachable"
-                : "Reconnecting to server";
+                ? tr("sidebar.status.offline", "Server unreachable")
+                : tr("sidebar.status.reconnecting", "Reconnecting to server");
         return (
             <span
                 className="execlaw-brand-status is-disconnected"
@@ -604,7 +629,18 @@ function BrandStatusIndicator({
         );
     }
     if (alertCount > 0) {
-        const label = `${alertCount} firing alert${alertCount === 1 ? "" : "s"}`;
+        const label =
+            alertCount === 1
+                ? tr(
+                      "sidebar.status.alertSingular",
+                      "{{count}} firing alert",
+                      { count: alertCount },
+                  )
+                : tr(
+                      "sidebar.status.alertPlural",
+                      "{{count}} firing alerts",
+                      { count: alertCount },
+                  );
         return (
             <Link
                 to="/settings/alerts"
@@ -619,7 +655,10 @@ function BrandStatusIndicator({
         );
     }
     if (installing) {
-        const label = "Backend installing — open Backends page";
+        const label = tr(
+            "sidebar.status.installing",
+            "Backend installing — open Backends page",
+        );
         return (
             <Link
                 to="/settings/backends"
@@ -637,8 +676,8 @@ function BrandStatusIndicator({
         <Link
             to="/settings/alerts"
             className="execlaw-brand-status is-ok"
-            aria-label="Online — open alerts"
-            title="Online — open alerts"
+            aria-label={tr("sidebar.status.online", "Online — open alerts")}
+            title={tr("sidebar.status.online", "Online — open alerts")}
             data-testid="sidebar-brand-status"
             data-state="ok"
         />

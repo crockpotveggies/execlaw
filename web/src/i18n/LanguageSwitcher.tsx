@@ -1,10 +1,10 @@
-// Compact language dropdown. Visually pairs with the bootstrap-icons
-// globe glyph (matching business-website's `.language-switcher`
-// pattern) and floats top-right of the surrounding shell — see
-// `.execlaw-language-switcher` in `theme.scss` for positioning.
-// Used by the pre-auth surfaces (Login + SetupWizard); the in-app
-// equivalent lives inline in Settings → General.
+// Compact language dropdown shown on the pre-auth surfaces (Login +
+// SetupWizard). The in-app equivalent lives inline in Settings →
+// General. Uses react-bootstrap `Dropdown` so the menu inherits the
+// global `.dropdown-menu` theme tokens (`bg-surface`, `shadow-soft`)
+// defined in `theme.scss` instead of the native OS dropdown chrome.
 
+import Dropdown from "react-bootstrap/Dropdown";
 import {
     useCurrentLanguage,
     setLanguage,
@@ -13,40 +13,54 @@ import {
 
 export function LanguageSwitcher({ className }: { className?: string }) {
     const current = useCurrentLanguage();
-    const short =
-        LANGUAGE_OPTIONS.find((o) => o.value === current)?.short ??
-        current.toUpperCase();
+    const currentOpt = LANGUAGE_OPTIONS.find((o) => o.value === current);
+    const short = currentOpt?.short ?? current.toUpperCase();
 
     return (
-        <div
+        <Dropdown
+            align="end"
             className={
                 "execlaw-language-switcher" +
                 (className ? " " + className : "")
             }
             data-testid="language-switcher"
         >
-            <span className="execlaw-language-switcher__value" aria-hidden>
-                {short}
-            </span>
-            <i
-                className="bi bi-globe2 execlaw-language-switcher__icon"
-                aria-hidden
-            />
-            <select
-                className="form-select execlaw-language-switcher__select"
+            <Dropdown.Toggle
+                variant="link"
+                className="execlaw-language-switcher__toggle"
                 aria-label="Language"
-                value={current}
-                onChange={(e) => {
-                    void setLanguage(e.target.value);
-                }}
-                data-testid="language-switcher-select"
+                data-testid="language-switcher-toggle"
+            >
+                <i
+                    className="bi bi-globe2 execlaw-language-switcher__icon"
+                    aria-hidden
+                />
+                <span className="execlaw-language-switcher__value">
+                    {short}
+                </span>
+            </Dropdown.Toggle>
+            <Dropdown.Menu
+                className="execlaw-language-switcher__menu"
+                data-testid="language-switcher-menu"
             >
                 {LANGUAGE_OPTIONS.map((o) => (
-                    <option key={o.value} value={o.value} data-short={o.short}>
-                        {o.label}
-                    </option>
+                    <Dropdown.Item
+                        key={o.value}
+                        active={o.value === current}
+                        onClick={() => {
+                            void setLanguage(o.value);
+                        }}
+                        data-testid={`language-switcher-item-${o.value}`}
+                    >
+                        <span className="execlaw-language-switcher__item-short">
+                            {o.short}
+                        </span>
+                        <span className="execlaw-language-switcher__item-label">
+                            {o.label}
+                        </span>
+                    </Dropdown.Item>
                 ))}
-            </select>
-        </div>
+            </Dropdown.Menu>
+        </Dropdown>
     );
 }

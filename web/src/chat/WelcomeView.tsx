@@ -7,25 +7,36 @@
 // manually.
 
 import { useAuth } from "../auth/AuthContext";
+import { useT } from "../i18n";
 import { Composer } from "./Composer";
 import { MascotGreeting } from "./MascotGreeting";
 import { useVoiceReadiness } from "./useVoiceReadiness";
 
-const SUGGESTIONS: ReadonlyArray<{ title: string; sub: string; prompt: string }> = [
+interface SuggestionDef {
+    key: string;
+    titleDefault: string;
+    subDefault: string;
+    promptDefault: string;
+}
+
+const SUGGESTIONS: ReadonlyArray<SuggestionDef> = [
     {
-        title: "Show me what you can do",
-        sub: "list your capabilities",
-        prompt: "Give me a quick tour of what you can help with.",
+        key: "capabilities",
+        titleDefault: "Show me what you can do",
+        subDefault: "list your capabilities",
+        promptDefault: "Give me a quick tour of what you can help with.",
     },
     {
-        title: "Help me plan",
-        sub: "today's priorities",
-        prompt: "Help me figure out what's most important to do today.",
+        key: "plan",
+        titleDefault: "Help me plan",
+        subDefault: "today's priorities",
+        promptDefault: "Help me figure out what's most important to do today.",
     },
     {
-        title: "Brainstorm",
-        sub: "open question I've been chewing on",
-        prompt:
+        key: "brainstorm",
+        titleDefault: "Brainstorm",
+        subDefault: "open question I've been chewing on",
+        promptDefault:
             "I've been thinking about a problem at work. Can we brainstorm together?",
     },
 ];
@@ -103,6 +114,7 @@ export function WelcomeView({
     getSkills,
 }: Props) {
     const auth = useAuth();
+    const t = useT();
     // Stable accessor — passing a fresh `() => auth.getAccessToken()`
     // arrow on every render used to force `useVoiceReadiness` to
     // re-fire its `useEffect` on every render, which spun a loop of
@@ -134,13 +146,25 @@ export function WelcomeView({
                     aria-pressed={!!incognito}
                     aria-label={
                         incognito
-                            ? "Incognito on — turn off"
-                            : "Start an incognito chat (not saved)"
+                            ? t(
+                                  "welcome.incognitoOnAria",
+                                  "Incognito on — turn off",
+                              )
+                            : t(
+                                  "welcome.incognitoOffAria",
+                                  "Start an incognito chat (not saved)",
+                              )
                     }
                     title={
                         incognito
-                            ? "Incognito on — this chat won't be saved"
-                            : "Incognito off — start a private chat"
+                            ? t(
+                                  "welcome.incognitoOnTitle",
+                                  "Incognito on — this chat won't be saved",
+                              )
+                            : t(
+                                  "welcome.incognitoOffTitle",
+                                  "Incognito off — start a private chat",
+                              )
                     }
                     data-testid="welcome-incognito-toggle"
                 >
@@ -153,7 +177,7 @@ export function WelcomeView({
                     userName={
                         auth.user?.display_name ||
                         auth.user?.username ||
-                        "friend"
+                        t("welcome.fallbackName", "friend")
                     }
                 />
             </div>
@@ -178,24 +202,38 @@ export function WelcomeView({
             <div className="execlaw-welcome__suggestions">
                 <div className="execlaw-welcome__suggestions-label">
                     <i className="bi bi-lightning-charge" aria-hidden />
-                    Suggested
+                    {t("welcome.suggestionsLabel", "Suggested")}
                 </div>
-                {SUGGESTIONS.map((s) => (
-                    <button
-                        key={s.title}
-                        type="button"
-                        className="execlaw-welcome__suggestion"
-                        data-testid="welcome-suggestion"
-                        onClick={() => void onSend(s.prompt, [], [])}
-                    >
-                        <span className="execlaw-welcome__suggestion-title">
-                            {s.title}
-                        </span>
-                        <span className="execlaw-welcome__suggestion-sub">
-                            {s.sub}
-                        </span>
-                    </button>
-                ))}
+                {SUGGESTIONS.map((s) => {
+                    const title = t(
+                        `welcome.suggestions.${s.key}.title`,
+                        s.titleDefault,
+                    );
+                    const sub = t(
+                        `welcome.suggestions.${s.key}.sub`,
+                        s.subDefault,
+                    );
+                    const prompt = t(
+                        `welcome.suggestions.${s.key}.prompt`,
+                        s.promptDefault,
+                    );
+                    return (
+                        <button
+                            key={s.key}
+                            type="button"
+                            className="execlaw-welcome__suggestion"
+                            data-testid="welcome-suggestion"
+                            onClick={() => void onSend(prompt, [], [])}
+                        >
+                            <span className="execlaw-welcome__suggestion-title">
+                                {title}
+                            </span>
+                            <span className="execlaw-welcome__suggestion-sub">
+                                {sub}
+                            </span>
+                        </button>
+                    );
+                })}
             </div>
         </div>
     );
