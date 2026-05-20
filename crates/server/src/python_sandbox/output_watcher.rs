@@ -378,6 +378,20 @@ mod tests {
     async fn fires_callback_for_outputs_file() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
+
+        // Pre-create the outputs subdir BEFORE starting the watcher
+        // so notify's initial recursive scan picks it up. On Linux
+        // `notify` uses inotify which has no native recursive watch
+        // — it walks the tree at start-up and adds one watch per
+        // subdir. New subdirs created at runtime get a watch added
+        // lazily on the Create(Folder) event, with a small window
+        // where a file written inside the new subdir gets missed.
+        // macOS (FSEvents) and Windows (ReadDirectoryChangesW) are
+        // kernel-recursive and don't have the race. Pre-creating
+        // here side-steps it on every platform.
+        let path = root.join("c-1").join("outputs");
+        std::fs::create_dir_all(&path).unwrap();
+
         let (tx, rx) = mpsc::channel();
         let _w = OutputWatcher::start(root.clone(), Duration::from_millis(150), move |e| {
             let _ = tx.send(e);
@@ -386,8 +400,6 @@ mod tests {
 
         // Give notify a beat to register the recursive watch.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let path = root.join("c-1").join("outputs");
-        std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join("hello.txt"), b"hi").unwrap();
 
         let got = await_until_async(|| rx.try_recv().is_ok(), Duration::from_secs(2)).await;
@@ -457,6 +469,14 @@ mod tests {
     async fn callback_carries_correct_convo_id_and_size() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
+
+        // Pre-create the convo's outputs/ dir so notify's initial
+        // recursive scan adds a watch on it before we start firing
+        // file events (see fires_callback_for_outputs_file for the
+        // inotify-race details).
+        let outputs = root.join("convo-XYZ").join("outputs");
+        std::fs::create_dir_all(&outputs).unwrap();
+
         let (tx, rx) = mpsc::channel();
         let _w = OutputWatcher::start(root.clone(), Duration::from_millis(120), move |e| {
             let _ = tx.send(e);
@@ -464,8 +484,6 @@ mod tests {
         .unwrap();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let outputs = root.join("convo-XYZ").join("outputs");
-        std::fs::create_dir_all(&outputs).unwrap();
         std::fs::write(outputs.join("region.csv"), b"abcdef").unwrap();
 
         let event = {
@@ -518,6 +536,17 @@ mod tests {
     async fn distinct_files_fire_distinct_callbacks() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
+
+        // Pre-create BOTH convo outputs/ dirs before the watcher
+        // starts so notify's initial recursive scan picks them up
+        // and there's no per-subdir-watch-add race against the
+        // file writes that follow. See
+        // `fires_callback_for_outputs_file` for the longer story.
+        let a = root.join("c-1").join("outputs");
+        let b = root.join("c-2").join("outputs");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
         let (tx, rx) = mpsc::channel();
         let _w = OutputWatcher::start(root.clone(), Duration::from_millis(150), move |e| {
             let _ = tx.send(e);
@@ -525,10 +554,6 @@ mod tests {
         .unwrap();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let a = root.join("c-1").join("outputs");
-        let b = root.join("c-2").join("outputs");
-        std::fs::create_dir_all(&a).unwrap();
-        std::fs::create_dir_all(&b).unwrap();
         std::fs::write(a.join("alpha.csv"), b"a").unwrap();
         std::fs::write(b.join("beta.csv"), b"b").unwrap();
 
