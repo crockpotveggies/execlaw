@@ -222,10 +222,29 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             match &event {
-                // Don't quit when the last window closes — we're a
-                // menu bar app, the tray is the only persistent UI.
-                tauri::RunEvent::ExitRequested { api, .. } => {
-                    api.prevent_exit();
+                // Three distinct triggers for ExitRequested:
+                //   1. The user closes the last visible window (chat
+                //      window). For a menu-bar app the tray is the
+                //      persistent UI; closing the chat window must
+                //      NOT quit the app. Tauri raises ExitRequested
+                //      with `code: None` in this case → suppress.
+                //   2. The user clicks "Quit (leaves service
+                //      running)" or finishes the Uninstall flow,
+                //      both of which call `app.exit(0)` →
+                //      ExitRequested arrives with `code: Some(0)`.
+                //      We DO want to exit then; otherwise the tray
+                //      icon stays, the Trash drag fails with "app
+                //      still open", and the operator has no escape
+                //      hatch short of Activity Monitor.
+                //   3. `app.exit(N)` from an error path → same as
+                //      (2), let it through.
+                //
+                // Pre-fix this handler called `prevent_exit()`
+                // unconditionally, so cases 2 + 3 silently hung.
+                tauri::RunEvent::ExitRequested { api, code, .. } => {
+                    if code.is_none() {
+                        api.prevent_exit();
+                    }
                 }
                 // Window-lifecycle policy flip: when the chat window
                 // is destroyed (operator closed it), drop the app
@@ -438,6 +457,17 @@ fn uninstall_flow(app: &AppHandle) {
             return;
         }
 
+        // SMAppService.unregister tells launchd to deregister, but
+        // launchd doesn't always SIGKILL the running process
+        // synchronously — and if we move on to the optional
+        // "delete data" step while the server is still alive, the
+        // SQLite vault + plugin runtime hold file handles that
+        // either block the rmdir or leave dangling locks. Kill any
+        // remaining server process explicitly. Best-effort: a
+        // missing process is the desired state; we don't fail the
+        // uninstall over it.
+        force_kill_server_processes();
+
         let delete_data = app_for_async
             .dialog()
             .message(
@@ -477,6 +507,38 @@ fn uninstall_flow(app: &AppHandle) {
 
         app_for_async.exit(0);
     });
+}
+
+/// SIGTERM (and then SIGKILL if needed) any execlaw server process
+/// spawned out of the installed .app. The Uninstall flow calls
+/// this after `SMAppService.unregister` so the operator-perceived
+/// "execlaw is gone" state is real: no lingering server holding
+/// the SQLite vault, no `launchctl list` row in `running` mode,
+/// no "app is still open" complaint from Finder when the operator
+/// drags the .app to the Trash.
+///
+/// We pkill via shell rather than walking `/proc`-equivalent
+/// APIs because pkill is in `/usr/bin` on every macOS install
+/// (no PATH lookup hazard) and matches both `service run` and
+/// any future subcommand the launchd plist might evolve to spawn.
+fn force_kill_server_processes() {
+    use std::process::Command;
+    // Pattern matches `/Applications/execlaw.app/Contents/MacOS/execlaw
+    // <anything>` — covers `service run` plus any future spawn shape
+    // the LaunchAgent plist might use. Anchored to the .app path so
+    // we don't accidentally kill a dev-built `cargo run -- service
+    // run` from another shell.
+    let pattern = "/Applications/execlaw.app/Contents/MacOS/execlaw";
+    // SIGTERM first — gives the server a chance to flush WAL + close
+    // SQLite cleanly. 1.5s is enough for our server's drop-impl
+    // cleanup; longer would leave the dialog blocking the operator's
+    // workflow.
+    let _ = Command::new("/usr/bin/pkill").args(["-TERM", "-f", pattern]).status();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // SIGKILL anything that didn't shut down in time. Silent if
+    // nothing's left (pkill returns non-zero with no matches, which
+    // is the desired state).
+    let _ = Command::new("/usr/bin/pkill").args(["-KILL", "-f", pattern]).status();
 }
 
 fn show_error(app: &AppHandle, title: &str, message: &str) {
