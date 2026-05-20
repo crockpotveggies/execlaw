@@ -29,7 +29,7 @@
     "react-bootstrap": "2.10.10",
     "react-dom": "19.2.6",
     "react-markdown": "^10.1.0",
-    "react-router-dom": "7.15.0",
+    "react-router-dom": "7.15.1",
     "remark-breaks": "^4.0.0",
     "remark-gfm": "^4.0.1"
   },
@@ -38,14 +38,14 @@
     "@testing-library/jest-dom": "6.9.1",
     "@testing-library/react": "16.3.2",
     "@testing-library/user-event": "14.6.1",
-    "@types/react": "19.2.14",
+    "@types/react": "19.2.15",
     "@types/react-dom": "19.2.3",
-    "@vitejs/plugin-react": "6.0.1",
+    "@vitejs/plugin-react": "6.0.2",
     "esbuild": "^0.28.0",
     "jsdom": "29.1.1",
     "sass": "1.99.0",
     "typescript": "6.0.3",
-    "vite": "8.0.12",
+    "vite": "8.0.13",
     "vitest": "4.1.6"
   }
 }
