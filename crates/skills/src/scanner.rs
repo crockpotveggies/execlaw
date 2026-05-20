@@ -545,9 +545,18 @@ mod tests {
     #[test]
     fn google_api_key_is_blocked() {
         // Real Google API keys are exactly 39 chars: "AIza" + 35 chars
-        // from [A-Za-z0-9_-]. Use a fixture matching that shape.
+        // from [A-Za-z0-9_-]. The fixture below matches that shape
+        // (4 + 18 x's + 17 chars of obvious fixture text = 39, all
+        // characters in the allowed set, word boundary on the right
+        // is end-of-string) so the regex fires, but the body is
+        // dominated by `x`s and the literal string `FAKE_TEST_FIXTURE`
+        // so neither a human reviewer nor an external secret scanner
+        // (gitleaks, trufflehog) can mistake it for a real credential.
+        // The original fixture used `AIzaSy…` which IS the prefix
+        // shape real Google "API key for SDK / server" tokens carry —
+        // shape-only scanners flagged it on sight.
         let v = scan(
-            &body("AIzaSyAbCdEfGhIjKlMnOpQrStUvWxYz0123456"),
+            &body("AIzaxxxxxxxxxxxxxxxxxxFAKE_TEST_FIXTURE"),
             Strictness::Strict,
         );
         assert!(!v.is_clean(), "google api key shape must trigger");
