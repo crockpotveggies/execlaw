@@ -2113,8 +2113,15 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
             // plugin. Constructs the PythonSandboxService against
             // the kernel-gateway sidecar's published port and
             // registers the four python.* tools as host-implemented
-            // builtins. No-op when the plugin isn't installed or
-            // the sidecar isn't healthy (warning logged from inside).
+            // builtins.
+            //
+            // 2026-05-20 — gated on plugin install state INSIDE
+            // `wire_python_sandbox`. When the plugin isn't installed,
+            // the helper is a DEBUG-level silent no-op; the host
+            // logs nothing about python.* on a fresh boot with no
+            // plugin (per encapsulation rule). When the plugin IS
+            // installed but the sidecar isn't healthy, the helper
+            // WARNs — operator opted in, they want a breadcrumb.
             //
             // Service is held in a `static` so its OutputWatcher
             // (notify OS thread + tokio timer) stays alive for the
@@ -2122,6 +2129,7 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
             if let Some(sup) = state_for_wire.sidecar_supervisor.as_ref() {
                 let now = chrono::Utc::now().timestamp();
                 match execlaw_server::python_sandbox::wire_python_sandbox(
+                    &plugin_host,
                     sup,
                     plugin_host.registry(),
                     &db_for_wire,
@@ -2143,7 +2151,9 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                         execlaw_server::python_sandbox::set_service(svc);
                     }
                     Ok(None) => {
-                        // wire helper already logged the reason.
+                        // wire helper already logged the reason (or
+                        // logged nothing, if the plugin isn't
+                        // installed — silent by design).
                     }
                     Err(e) => {
                         tracing::warn!(

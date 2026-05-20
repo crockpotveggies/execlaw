@@ -817,12 +817,19 @@ pub(crate) fn format_attached_files_block(
     }
     if !python_available {
         if let Some(cid) = cid_for_log {
+            // 2026-05-20 — generalized to avoid naming any specific
+            // plugin or sidecar in host-level logs. The block is
+            // gated on the agent-callable tool `python.execute`
+            // being present in the catalog; the host shouldn't be
+            // telling operators about plugin internals (which
+            // plugin owns the tool, what sidecar backs it) on
+            // every turn that happens to have a non-image
+            // attachment.
             tracing::debug!(
                 target: "chats::attached_files_block",
                 conversation_id = %cid,
                 attachment_count = non_image.len(),
-                "skipping attached-files block — python.execute is not in the tool catalog \
-                 (python-sandbox plugin not installed or kernel-gateway sidecar not healthy)",
+                "skipping attached-files block — python.execute is not in the tool catalog",
             );
         }
         return None;

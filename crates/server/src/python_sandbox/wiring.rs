@@ -23,7 +23,7 @@ use crate::python_sandbox::service::{
 use crate::python_sandbox::tools::python_sandbox_tools;
 use crate::sidecar_supervisor::SidecarSupervisor;
 use execlaw_core::Database;
-use execlaw_plugin_host::HookRegistry;
+use execlaw_plugin_host::{HookRegistry, PluginHost};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -56,23 +56,68 @@ pub enum WireError {
 /// host. Idempotent within one process: a second call will fail at
 /// register_builtins with a "already registered" conflict — call
 /// this exactly once at boot.
+///
+/// 2026-05-20 — gating contract (plugin encapsulation):
+///
+///   * **Plugin not installed (no `state_plugins` row, OR row with
+///     `enabled = 0`)** → silent `Ok(None)` at DEBUG. No WARN, no
+///     INFO, no mention of "python.*" in operator-facing logs.
+///     A fresh execlaw install with no plugins must NOT log
+///     anything about python-sandbox — the plugin is supposed to
+///     be invisible until the operator installs it.
+///
+///   * **Plugin installed + enabled, BUT sidecar not ready** (port
+///     not yet published — first reconcile in flight, or container
+///     crash-looping) → WARN. The operator opted in; the sidecar
+///     should be up. Surfacing this is the right operator UX.
+///
+///   * **Plugin installed + sidecar healthy** → wire normally,
+///     INFO with the gateway URL + tool count.
+///
+/// The pre-2026-05-20 behavior leaked: a host with no plugin
+/// installed would WARN about "kernel-gateway sidecar not ready"
+/// every boot, treating absence-of-plugin as if it were a sidecar
+/// fault. That's the bug this gate fixes.
 pub async fn wire_python_sandbox(
+    plugin_host: &PluginHost,
     supervisor: &SidecarSupervisor,
     registry: &HookRegistry,
     db: &Database,
     events: &EventBus,
     now_unix: i64,
 ) -> Result<Option<Arc<PythonSandboxService>>, WireError> {
+    // --- Gate #1: is the plugin even installed + enabled? -------
+    //
+    // If not, the host has no business knowing this plugin exists.
+    // Bail at DEBUG before touching the supervisor, registry, or
+    // anything else.
+    if !is_plugin_installed_and_enabled(plugin_host) {
+        tracing::debug!(
+            target: "python_sandbox::wiring",
+            plugin_id = PLUGIN_ID,
+            "plugin not installed (or disabled); skipping wiring silently"
+        );
+        return Ok(None);
+    }
+
+    // --- Gate #2: plugin opted in, but is the sidecar up? -------
+    //
     // Look up the supervisor-published port for the kernel-gateway
-    // sidecar. Returns None if:
-    //   - the plugin isn't installed (no [[services]] entry)
-    //   - the sidecar is still spawning (first reconcile pass
-    //     hasn't published the port yet)
-    //   - the sidecar is crash-looping (no healthy handle)
+    // sidecar. Returns None when the plugin IS installed but the
+    // sidecar:
+    //   - is still spawning (first reconcile pass hasn't published
+    //     the port yet — common immediately after install)
+    //   - is crash-looping (no healthy handle)
+    //   - has an [[services]] entry the supervisor didn't pick up
+    //     (manifest drift bug; should never happen with a clean install)
+    //
+    // The operator opted in by installing the plugin, so a WARN
+    // here is appropriate — they want python.* tools but won't get
+    // them this boot.
     let Some(port) = supervisor.host_port_for(SIDECAR_NAME).await else {
         tracing::warn!(
             "python_sandbox: kernel-gateway sidecar not ready; python.* tools \
-             will be unavailable this boot. Install the plugin or check supervisor logs."
+             will be unavailable this boot. Check supervisor logs."
         );
         return Ok(None);
     };
@@ -114,6 +159,33 @@ pub async fn wire_python_sandbox(
         "python_sandbox: registered python.* tool surface against live kernel-gateway"
     );
     Ok(Some(service))
+}
+
+/// 2026-05-20 — plugin-encapsulation gate. Returns `true` iff the
+/// python-sandbox plugin has a `state_plugins` row AND `enabled = 1`.
+/// Read errors fail closed (return false) so a transient DB hiccup
+/// doesn't accidentally arm the wiring against an uninstalled
+/// plugin.
+///
+/// Why this lives here and not in the plugin host: PluginHost
+/// already exposes `get_row(plugin_id)` returning the row + enabled
+/// flag generically. This is just the plugin-specific glue that
+/// asks the question with our plugin id, keeping the host crate's
+/// per-plugin knowledge zero.
+fn is_plugin_installed_and_enabled(plugin_host: &PluginHost) -> bool {
+    match plugin_host.get_row(PLUGIN_ID) {
+        Ok(Some(row)) => row.enabled,
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(
+                target: "python_sandbox::wiring",
+                plugin_id = PLUGIN_ID,
+                error = %e,
+                "state_plugins read failed; skipping wiring (fail-closed)"
+            );
+            false
+        }
+    }
 }
 
 /// Load operator-tunable settings from the plugin-settings vault.
@@ -256,6 +328,8 @@ mod tests {
     use super::*;
     use execlaw_core::db::{Database, DbConfig};
     use execlaw_core::migrations::MigrationRunner;
+    use execlaw_plugin_host::PluginHost;
+    use std::path::PathBuf;
 
     fn open_test_db() -> Database {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
@@ -268,6 +342,95 @@ mod tests {
         VaultRowStore::new(db)
             .put(Some(PLUGIN_ID), key, value.as_bytes(), 0)
             .unwrap();
+    }
+
+    /// Build a PluginHost pointed at the given DB. The stage path
+    /// is irrelevant for the gate tests — the gate only reads
+    /// state_plugins via `get_row`.
+    fn make_host(db: &Database) -> PluginHost {
+        PluginHost::new(db.clone(), HookRegistry::new(), PathBuf::from("/nonexistent"))
+    }
+
+    /// Insert a `state_plugins` row directly with the given
+    /// enabled state. Mirrors the helper in
+    /// `crates/plugin-host/src/host.rs` tests but only writes the
+    /// minimum the gate checks (we don't need a parseable manifest
+    /// — `get_row` reads the raw row).
+    fn install_row(db: &Database, plugin_id: &str, enabled: bool) {
+        let now = chrono::Utc::now().timestamp();
+        let enabled_int = if enabled { 1 } else { 0 };
+        db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO state_plugins(plugin_id, version, manifest_toml, stage_path, \
+                 enabled, installed_at, updated_at) \
+                 VALUES (?1, '0.1.0', '[plugin]\nid=\"x\"', '/nonexistent', ?2, ?3, ?3)",
+                rusqlite::params![plugin_id, enabled_int, now],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // ----------------------------------------------------------
+    // Plugin-encapsulation gate (2026-05-20). Pins the contract
+    // the user explicitly called out:
+    //
+    //   * No plugin installed → silent no-op. The host crate
+    //     must not surface any "python-sandbox" or "kernel-
+    //     gateway" mention in operator-visible logs on a fresh
+    //     boot.
+    //   * Plugin installed but disabled → also silent no-op.
+    //   * Plugin installed + enabled → gate allows wiring;
+    //     downstream sidecar check is what surfaces "sidecar
+    //     not ready" warnings.
+    // ----------------------------------------------------------
+
+    #[test]
+    fn gate_returns_false_when_plugin_row_missing() {
+        let db = open_test_db();
+        let host = make_host(&db);
+        assert!(
+            !is_plugin_installed_and_enabled(&host),
+            "fresh DB with no plugin rows must NOT pass the gate \
+             (this is the user-reported leak: WARN was firing on a \
+             clean install with no plugin)"
+        );
+    }
+
+    #[test]
+    fn gate_returns_false_when_plugin_disabled() {
+        let db = open_test_db();
+        install_row(&db, PLUGIN_ID, false);
+        let host = make_host(&db);
+        assert!(
+            !is_plugin_installed_and_enabled(&host),
+            "a disabled plugin must also be treated as absent — \
+             operator opted out, host should be silent"
+        );
+    }
+
+    #[test]
+    fn gate_returns_true_when_plugin_installed_and_enabled() {
+        let db = open_test_db();
+        install_row(&db, PLUGIN_ID, true);
+        let host = make_host(&db);
+        assert!(
+            is_plugin_installed_and_enabled(&host),
+            "installed + enabled must pass the gate so wiring can proceed"
+        );
+    }
+
+    #[test]
+    fn gate_only_recognizes_our_plugin_id() {
+        // Another plugin's row doesn't accidentally arm us.
+        let db = open_test_db();
+        install_row(&db, "some-other-plugin", true);
+        let host = make_host(&db);
+        assert!(
+            !is_plugin_installed_and_enabled(&host),
+            "the gate must check our specific PLUGIN_ID, not \
+             trip on any random installed plugin"
+        );
     }
 
     // ----------------------------------------------------------

@@ -61,6 +61,25 @@ pub mod plugin_settings_admin;
 pub mod plugin_webhook_routes;
 pub mod plugins;
 pub mod principal_admit;
+/// **Plugin-implementation surface, NOT a public API.** Holds the
+/// host-side Rust code that backs the `python-sandbox` plugin's
+/// `host_implemented = true` tools. Lives here (rather than inside
+/// the plugin's ZIP) because the plugin SDK doesn't ship Rust
+/// code, and the kernel-gateway WebSocket protocol + per-conversation
+/// kernel pool need Rust to be performant.
+///
+/// Reachable from `cli/main.rs` via `wire_python_sandbox` (the
+/// only legitimate entry point) and from request handlers via
+/// `python_sandbox::service()` (the OnceLock accessor). All other
+/// uses are unintended — this module's contents are an
+/// implementation detail of the plugin, not a stable host API.
+///
+/// 2026-05-20 — `wire_python_sandbox` is gated on the plugin
+/// actually being installed + enabled (see its docs). A host
+/// with no python-sandbox plugin installed will never touch any
+/// code in this module beyond the silent gate check, satisfying
+/// the plugin-encapsulation rule.
+#[doc(hidden)]
 pub mod python_sandbox;
 pub mod research;
 pub mod research_admin;
