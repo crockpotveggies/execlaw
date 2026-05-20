@@ -130,7 +130,7 @@ jobs:
           "exe=$($exe.FullName)" >> $env:GITHUB_OUTPUT
 
       - name: Upload installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: execlaw-windows-x64
           path: ${{ steps.outputs.outputs.exe }}
@@ -141,7 +141,7 @@ jobs:
         # Bundle all plugin ZIPs into a single workflow artifact
         # (so a `gh run download` grabs them in one shot) AND
         # attach them individually to the GitHub Release below.
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: execlaw-plugins-windows
           path: |
