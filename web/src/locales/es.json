@@ -1,1 +1,174 @@
-{}
+{
+  "general": {
+    "title": "General",
+    "introPre": "Ajustes para el servicio anfitrión. El plano de control se ejecuta como un servicio systemd / launchd / Windows — consulta ",
+    "introPost": " desde una terminal para ver el estado en vivo y las rutas de los registros.",
+    "readOnly": "Vista de solo lectura. Solo los Controladores pueden cambiar la configuración general.",
+    "loading": "Cargando…",
+    "startAtBoot": "Iniciar al arrancar",
+    "startAtBootHelpPre": "Cuando está activado, el servicio anfitrión se inicia automáticamente al arrancar el sistema. La próxima ejecución de ",
+    "startAtBootHelpPost": " aplicará el cambio; el registro del gestor de servicios en disco no cambia hasta entonces.",
+    "bootReinstallPre": "Vuelve a ejecutar ",
+    "bootReinstallPost": " desde una terminal para aplicar el nuevo indicador de inicio automático (o una PowerShell con privilegios en Windows).",
+    "bindAddress": "Dirección de enlace (host:puerto)",
+    "bindAddressHelp": "La dirección en la que escucha el plano de control. Usa 127.0.0.1:3031 solo para loopback, 0.0.0.0:3031 para vincular todas las interfaces (pon un proxy inverso delante para TLS) o un literal IPv6 como [::1]:3031.",
+    "bindRestartHintPre": "La dirección de enlace se aplica con el próximo ",
+    "bindRestartHintPost": ".",
+    "historyRetention": "Retención del historial",
+    "historyRetentionHelp": "Cuánto tiempo se conservan el historial de conversaciones, las ejecuciones de tareas programadas, los registros estructurados y (próximamente) los trabajos de investigación antes de su eliminación automática. Las entradas de memoria y el registro de auditoría no se ven afectados.",
+    "retentionNarrowing": "Esta es una ventana más corta. Al guardar se desencadenará una eliminación masiva única del historial anterior en la próxima pasada de limpieza (en unos 30 minutos). Esto no se puede deshacer.",
+    "save": "Guardar",
+    "revert": "Revertir",
+    "language": "Idioma",
+    "languageHelp": "Almacenado por navegador. En el primer uso se detecta el idioma del sistema operativo; los cambios aquí lo sobrescriben.",
+    "dangerConfirm": "¿Borrar TODOS los datos y restablecer el servicio de fábrica?\n\nEsto elimina cada conversación, complemento, contacto, rutina, token OAuth y cuenta de operador. El servicio seguirá funcionando, pero se cerrará tu sesión y la próxima visita iniciará el asistente de configuración.\n\nEsto no se puede deshacer.",
+    "dangerZone": "Zona de peligro",
+    "dangerZoneBody": "Borra cada conversación, complemento, contacto, rutina, token guardado y cuenta de operador, y luego cierra tu sesión. El servicio sigue funcionando, pero la próxima visita iniciará el asistente de configuración. Los artefactos del sistema de archivos (espacios de trabajo de investigación, adjuntos) no se eliminan; reinicia el servicio anfitrión para un estado totalmente limpio.",
+    "dangerTypePre": "Escribe ",
+    "dangerTypePost": " para habilitar el botón.",
+    "wiping": "Borrando…",
+    "dangerReset": "Borrar todos los datos y restablecer de fábrica"
+  },
+  "composer": {
+    "dismiss": "Descartar",
+    "placeholder": "¿En qué puedo ayudarte?",
+    "attach": "Adjuntar",
+    "attachPhoto": "Adjuntar foto",
+    "attachFile": "Adjuntar archivo",
+    "attachSkill": "Adjuntar habilidad",
+    "backToAttach": "Volver al menú de adjuntos",
+    "pickSkills": "Elegir habilidades para este turno",
+    "loading": "Cargando…",
+    "stop": "Detener generación",
+    "send": "Enviar"
+  },
+  "sidebar": {
+    "newChat": "Nuevo chat",
+    "browse": "Explorar",
+    "routines": "Rutinas",
+    "automations": "Automatizaciones",
+    "research": "Investigación",
+    "skills": "Habilidades",
+    "approvals": "Aprobaciones",
+    "more": "Más",
+    "contacts": "Contactos",
+    "threads": "Conversaciones",
+    "filters": "Filtros",
+    "externalChannels": "Canales externos",
+    "off": "inactivo",
+    "on": "activo",
+    "noThreads": "Aún no hay conversaciones. Inicia un nuevo chat para empezar.",
+    "controlThread": "Hilo de control",
+    "newChatLabel": "Nuevo chat · {{id}}",
+    "deleteConfirm": "¿Eliminar «{{name}}»? Esto borra el historial de la conversación.",
+    "settings": "Ajustes",
+    "signOut": "Cerrar sesión",
+    "status": {
+      "offline": "Servidor no accesible",
+      "reconnecting": "Reconectando al servidor",
+      "alertSingular": "{{count}} alerta activa",
+      "alertPlural": "{{count}} alertas activas",
+      "installing": "Instalando el backend — abrir la página de Backends",
+      "online": "En línea — abrir alertas"
+    }
+  },
+  "welcome": {
+    "incognitoOnAria": "Incógnito activado — desactivar",
+    "incognitoOffAria": "Iniciar un chat de incógnito (no se guarda)",
+    "incognitoOnTitle": "Incógnito activado — este chat no se guardará",
+    "incognitoOffTitle": "Incógnito desactivado — iniciar un chat privado",
+    "fallbackName": "amigo",
+    "suggestionsLabel": "Sugerido",
+    "suggestions": {
+      "capabilities": {
+        "title": "Muéstrame lo que puedes hacer",
+        "sub": "enumera tus capacidades",
+        "prompt": "Hazme un breve recorrido por las cosas con las que puedes ayudar."
+      },
+      "plan": {
+        "title": "Ayúdame a planificar",
+        "sub": "las prioridades de hoy",
+        "prompt": "Ayúdame a descubrir qué es lo más importante que debo hacer hoy."
+      },
+      "brainstorm": {
+        "title": "Lluvia de ideas",
+        "sub": "una pregunta abierta que llevo rumiando",
+        "prompt": "He estado pensando en un problema del trabajo. ¿Podemos hacer una lluvia de ideas juntos?"
+      }
+    }
+  },
+  "login": {
+    "webauthnUnsupported": "Este navegador no admite WebAuthn. Usa un navegador moderno o elimina la clave registrada.",
+    "webauthnNoCredential": "El autenticador no devolvió ninguna credencial.",
+    "usernameAndPasswordRequired": "Introduce el usuario y la contraseña.",
+    "passkeyStepFailedWithReason": "Falló el paso de la passkey: {{reason}}",
+    "passkeyStepFailed": "Falló el paso de la passkey.",
+    "incorrectCredentials": "Usuario o contraseña incorrectos.",
+    "failed": "Inicio de sesión fallido.",
+    "intro": "Inicia sesión para continuar.",
+    "passkeyRequired": "Se requiere passkey",
+    "passkeyRequiredBody": "Toca tu clave de seguridad o usa el autenticador de tu plataforma para terminar de iniciar sesión.",
+    "tryPasskeyAgain": "Intentar la passkey de nuevo",
+    "username": "Usuario",
+    "password": "Contraseña",
+    "signingIn": "Iniciando sesión…",
+    "signIn": "Iniciar sesión"
+  },
+  "setup": {
+    "validation": {
+      "required": "Obligatorio.",
+      "usernameTooShort": "Debe tener al menos {{n}} caracteres.",
+      "usernameTooLong": "Debe tener como máximo {{n}} caracteres.",
+      "usernameChars": "Solo letras, dígitos, guion bajo y guion.",
+      "passwordTooShort": "Debe tener al menos {{n}} caracteres.",
+      "email": "No parece una dirección de correo válida."
+    },
+    "stepper": {
+      "aria": "Progreso de la configuración",
+      "account": "Cuenta",
+      "docker": "Docker",
+      "backend": "Backend"
+    },
+    "account": {
+      "submitErrorFallback": "La configuración falló; inténtalo de nuevo.",
+      "intro": "Bienvenido — vamos a crear tu cuenta de controlador.",
+      "username": "Usuario",
+      "usernameHelp": "Se usa para iniciar sesión. Letras, dígitos, guion bajo y guion.",
+      "displayName": "Nombre visible",
+      "password": "Contraseña de administrador",
+      "passwordHelp": "Al menos {{n}} caracteres. Puedes cambiarla más tarde.",
+      "email": "Correo electrónico",
+      "optional": "(opcional)",
+      "creating": "Creando…",
+      "submit": "Crear cuenta"
+    },
+    "docker": {
+      "checking": "Comprobando Docker…",
+      "probing": "Sondeando el daemon de Docker…",
+      "preflightFailed": "No se pudo alcanzar el endpoint de comprobación previa.",
+      "retry": "Reintentar",
+      "skip": "Omitir",
+      "lookingForPrereqs": "Buscando requisitos previos…",
+      "reachable": "Docker está accesible",
+      "serverVersion": "Versión del servidor:",
+      "continue": "Continuar",
+      "rechecking": "Comprobando de nuevo…",
+      "recheck": "Comprobar de nuevo",
+      "needed": "Docker es necesario para los backends de inferencia gestionados.",
+      "notDetected": "No se detectó Docker Desktop",
+      "notDetectedBody": "execlaw usa Docker para crear los contenedores de inferencia que ejecutan Whisper, Kokoro y tu LLM. Sin Docker, todavía puedes apuntar execlaw a un endpoint externo compatible con OpenAI, pero el asistente de backend integrado no podrá gestionar contenedores por ti.",
+      "installLink": "Instalar Docker Desktop",
+      "installedRecheck": "Ya lo instalé, volver a comprobar",
+      "skipForNow": "Omitir por ahora"
+    },
+    "backend": {
+      "intro": "Elige dónde se ejecuta tu modelo de chat estándar."
+    },
+    "hardware": {
+      "title": "Hardware detectado",
+      "none": "No se detectó ninguna GPU compatible. Conecta una (o corrige los controladores) y pulsa Actualizar, o continúa y usa un endpoint externo abajo.",
+      "refreshing": "Actualizando…",
+      "refresh": "Actualizar"
+    }
+  }
+}

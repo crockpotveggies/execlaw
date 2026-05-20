@@ -1,1 +1,174 @@
-{}
+{
+  "general": {
+    "title": "Geral",
+    "introPre": "Configurações do operador para o serviço anfitrião. O plano de controlo é executado como um serviço systemd / launchd / Windows — consulte ",
+    "introPost": " num terminal para ver o estado em tempo real e os caminhos dos registos.",
+    "readOnly": "Vista só de leitura. Apenas os Controladores podem alterar as definições gerais.",
+    "loading": "A carregar…",
+    "startAtBoot": "Iniciar no arranque",
+    "startAtBootHelpPre": "Quando ligado, o serviço anfitrião inicia automaticamente no arranque do sistema. A próxima execução de ",
+    "startAtBootHelpPost": " aplicará a alteração; o registo do gestor de serviços em disco não muda até lá.",
+    "bootReinstallPre": "Volte a executar ",
+    "bootReinstallPost": " num terminal para aplicar a nova flag de arranque automático (ou uma PowerShell com privilégios no Windows).",
+    "bindAddress": "Endereço de ligação (host:porta)",
+    "bindAddressHelp": "O endereço em que o plano de controlo escuta. Use 127.0.0.1:3031 apenas para loopback, 0.0.0.0:3031 para se ligar em todas as interfaces (coloque um proxy inverso à frente para TLS), ou um literal IPv6 como [::1]:3031.",
+    "bindRestartHintPre": "O endereço de ligação entra em vigor no próximo ",
+    "bindRestartHintPost": ".",
+    "historyRetention": "Retenção do histórico",
+    "historyRetentionHelp": "Quanto tempo o histórico de conversas, execuções de tarefas agendadas, registos estruturados e (em breve) trabalhos de investigação permanecem antes da eliminação automática. As entradas de memória e o registo de auditoria não são afetados.",
+    "retentionNarrowing": "Esta é uma janela mais curta. Ao guardar irá despoletar uma eliminação massiva única do histórico mais antigo na próxima passagem de limpeza (em cerca de 30 minutos). Esta ação não pode ser desfeita.",
+    "save": "Guardar",
+    "revert": "Reverter",
+    "language": "Idioma",
+    "languageHelp": "Armazenado por navegador. Na primeira utilização recorre ao idioma do sistema operativo; as alterações aqui substituem-no.",
+    "dangerConfirm": "Eliminar TODOS os dados e repor o serviço para a configuração de fábrica?\n\nIsto elimina cada conversa, plug-in, contacto, rotina, token OAuth e conta de operador. O serviço continua em execução, mas a sua sessão será terminada e a próxima visita iniciará o assistente de configuração.\n\nEsta ação não pode ser desfeita.",
+    "dangerZone": "Zona de perigo",
+    "dangerZoneBody": "Elimina cada conversa, plug-in, contacto, rotina, token guardado e conta de operador, e depois termina a sua sessão. O serviço continua em execução, mas a próxima visita iniciará o assistente de configuração. Os artefactos do sistema de ficheiros (espaços de trabalho de investigação, anexos) não são removidos; reinicie o serviço anfitrião para um estado verdadeiramente limpo.",
+    "dangerTypePre": "Escreva ",
+    "dangerTypePost": " para ativar o botão.",
+    "wiping": "A eliminar…",
+    "dangerReset": "Eliminar todos os dados e repor de fábrica"
+  },
+  "composer": {
+    "dismiss": "Dispensar",
+    "placeholder": "Como posso ajudar?",
+    "attach": "Anexar",
+    "attachPhoto": "Anexar foto",
+    "attachFile": "Anexar ficheiro",
+    "attachSkill": "Anexar competência",
+    "backToAttach": "Voltar ao menu de anexos",
+    "pickSkills": "Escolher competências para este turno",
+    "loading": "A carregar…",
+    "stop": "Parar geração",
+    "send": "Enviar"
+  },
+  "sidebar": {
+    "newChat": "Nova conversa",
+    "browse": "Explorar",
+    "routines": "Rotinas",
+    "automations": "Automatizações",
+    "research": "Investigação",
+    "skills": "Competências",
+    "approvals": "Aprovações",
+    "more": "Mais",
+    "contacts": "Contactos",
+    "threads": "Conversas",
+    "filters": "Filtros",
+    "externalChannels": "Canais externos",
+    "off": "desligado",
+    "on": "ligado",
+    "noThreads": "Ainda não há conversas. Inicie uma nova conversa para começar.",
+    "controlThread": "Tópico de controlo",
+    "newChatLabel": "Nova conversa · {{id}}",
+    "deleteConfirm": "Eliminar «{{name}}»? Isto apaga o histórico da conversa.",
+    "settings": "Definições",
+    "signOut": "Terminar sessão",
+    "status": {
+      "offline": "Servidor inacessível",
+      "reconnecting": "A reconectar ao servidor",
+      "alertSingular": "{{count}} alerta ativo",
+      "alertPlural": "{{count}} alertas ativos",
+      "installing": "Backend a instalar — abrir página de Backends",
+      "online": "Online — abrir alertas"
+    }
+  },
+  "welcome": {
+    "incognitoOnAria": "Incógnito ligado — desligar",
+    "incognitoOffAria": "Iniciar uma conversa em incógnito (não guardada)",
+    "incognitoOnTitle": "Incógnito ligado — esta conversa não será guardada",
+    "incognitoOffTitle": "Incógnito desligado — iniciar uma conversa privada",
+    "fallbackName": "amigo",
+    "suggestionsLabel": "Sugerido",
+    "suggestions": {
+      "capabilities": {
+        "title": "Mostra-me o que sabes fazer",
+        "sub": "lista as tuas capacidades",
+        "prompt": "Dá-me uma visita rápida das coisas em que podes ajudar."
+      },
+      "plan": {
+        "title": "Ajuda-me a planear",
+        "sub": "as prioridades de hoje",
+        "prompt": "Ajuda-me a descobrir o que é mais importante fazer hoje."
+      },
+      "brainstorm": {
+        "title": "Brainstorming",
+        "sub": "uma questão aberta em que tenho andado a pensar",
+        "prompt": "Tenho andado a pensar num problema no trabalho. Podemos fazer brainstorming juntos?"
+      }
+    }
+  },
+  "login": {
+    "webauthnUnsupported": "Este navegador não suporta WebAuthn. Use um navegador moderno ou remova a passkey registada.",
+    "webauthnNoCredential": "O autenticador não devolveu nenhuma credencial.",
+    "usernameAndPasswordRequired": "Introduza o nome de utilizador e a palavra-passe.",
+    "passkeyStepFailedWithReason": "Passo da passkey falhou: {{reason}}",
+    "passkeyStepFailed": "Passo da passkey falhou.",
+    "incorrectCredentials": "Nome de utilizador ou palavra-passe incorretos.",
+    "failed": "Início de sessão falhou.",
+    "intro": "Inicie sessão para continuar.",
+    "passkeyRequired": "Passkey necessária",
+    "passkeyRequiredBody": "Toque na sua chave de segurança ou use o autenticador da sua plataforma para concluir o início de sessão.",
+    "tryPasskeyAgain": "Tentar passkey novamente",
+    "username": "Nome de utilizador",
+    "password": "Palavra-passe",
+    "signingIn": "A iniciar sessão…",
+    "signIn": "Iniciar sessão"
+  },
+  "setup": {
+    "validation": {
+      "required": "Obrigatório.",
+      "usernameTooShort": "Tem de ter pelo menos {{n}} caracteres.",
+      "usernameTooLong": "Tem de ter no máximo {{n}} caracteres.",
+      "usernameChars": "Apenas letras, dígitos, sublinhado e hífen.",
+      "passwordTooShort": "Tem de ter pelo menos {{n}} caracteres.",
+      "email": "Não parece um endereço de e-mail."
+    },
+    "stepper": {
+      "aria": "Progresso da configuração",
+      "account": "Conta",
+      "docker": "Docker",
+      "backend": "Backend"
+    },
+    "account": {
+      "submitErrorFallback": "A configuração falhou; tente novamente.",
+      "intro": "Bem-vindo — vamos criar a sua conta de controlador.",
+      "username": "Nome de utilizador",
+      "usernameHelp": "Usado para iniciar sessão. Letras, dígitos, sublinhado e hífen.",
+      "displayName": "Nome a apresentar",
+      "password": "Palavra-passe de administrador",
+      "passwordHelp": "Pelo menos {{n}} caracteres. Pode alterá-la mais tarde.",
+      "email": "E-mail",
+      "optional": "(opcional)",
+      "creating": "A criar…",
+      "submit": "Criar conta"
+    },
+    "docker": {
+      "checking": "A verificar o Docker…",
+      "probing": "A sondar o daemon do Docker…",
+      "preflightFailed": "Não foi possível alcançar o endpoint de pré-verificação.",
+      "retry": "Tentar novamente",
+      "skip": "Saltar",
+      "lookingForPrereqs": "À procura de pré-requisitos…",
+      "reachable": "O Docker está acessível",
+      "serverVersion": "Versão do servidor:",
+      "continue": "Continuar",
+      "rechecking": "A verificar novamente…",
+      "recheck": "Verificar novamente",
+      "needed": "O Docker é necessário para backends de inferência geridos.",
+      "notDetected": "Docker Desktop não detetado",
+      "notDetectedBody": "O execlaw usa o Docker para iniciar os contentores de inferência que executam o Whisper, o Kokoro e o seu LLM. Sem o Docker, ainda pode apontar o execlaw para um endpoint externo compatível com OpenAI, mas o assistente de backend integrado não conseguirá gerir contentores por si.",
+      "installLink": "Instalar o Docker Desktop",
+      "installedRecheck": "Já instalei, verificar novamente",
+      "skipForNow": "Saltar por agora"
+    },
+    "backend": {
+      "intro": "Escolha onde é executado o seu modelo de chat Standard."
+    },
+    "hardware": {
+      "title": "Hardware detetado",
+      "none": "Nenhuma GPU compatível detetada. Ligue uma (ou corrija os controladores) e clique em Atualizar, ou salte e use um endpoint externo abaixo.",
+      "refreshing": "A atualizar…",
+      "refresh": "Atualizar"
+    }
+  }
+}
