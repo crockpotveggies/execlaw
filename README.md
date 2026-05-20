@@ -1,6 +1,6 @@
 # execlaw
 
-[![CI](https://github.com/crockpotveggies/execlaw/actions/workflows/ci.yml/badge.svg?branch=foundation)](https://github.com/crockpotveggies/execlaw/actions/workflows/ci.yml)
+[![CI](https://github.com/crockpotveggies/execlaw/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/crockpotveggies/execlaw/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/crockpotveggies/execlaw/branch/foundation/graph/badge.svg)](https://codecov.io/gh/crockpotveggies/execlaw)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
