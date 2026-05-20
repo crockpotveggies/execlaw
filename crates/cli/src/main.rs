@@ -1624,8 +1624,45 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                 // without source on disk fall through to the old
                 // "warn + disable" branch when no Dockerfile is
                 // findable.
-                let _ = ensure_runner_image_fresh(&runner_image).await;
-                if launcher.image_present(&runner_image).await {
+                //
+                // 2026-05-19 — wrap the runner-image probe in a
+                // hard timeout. `image_present` calls bollard's
+                // `inspect_image`, which awaits a Docker daemon
+                // response with no built-in timeout. When Docker
+                // Desktop is in a half-broken state (running but
+                // not serving — common under WSL2 + WSL-integration
+                // distros) the await stalls for ~120 seconds before
+                // bollard's TCP read times out. That delay used to
+                // gate the entire server boot, so the SPA spun on
+                // the setup-wizard's docker check for two full
+                // minutes. Capping at 5s means a healthy host pays
+                // ~50-200 ms (the inspect round-trip), an unhealthy
+                // host pays 5s and falls through to the "runner
+                // image not found locally" warning + disabled
+                // supervisor — same end-state, fast.
+                let runner_probe_timeout = std::time::Duration::from_secs(5);
+                let probe_result = tokio::time::timeout(
+                    runner_probe_timeout,
+                    async {
+                        let _ = ensure_runner_image_fresh(&runner_image).await;
+                        launcher.image_present(&runner_image).await
+                    },
+                )
+                .await;
+                let image_present = match probe_result {
+                    Ok(present) => present,
+                    Err(_) => {
+                        tracing::warn!(
+                            image = %runner_image,
+                            timeout_secs = runner_probe_timeout.as_secs(),
+                            "runner image probe timed out — Docker daemon appears \
+                             unresponsive. Disabling runner supervisor; restart Docker \
+                             Desktop and re-launch execlaw to re-enable."
+                        );
+                        false
+                    }
+                };
+                if image_present {
                     tracing::info!(
                         image = %runner_image,
                         "runner supervisor enabled"
