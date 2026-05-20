@@ -2678,3 +2678,67 @@ body {
     }
 }
 
+// Floating language switcher. Used by the setup wizard / login shell
+// (top-right of the viewport, fixed so it stays in view when a tall
+// step scrolls). The visible `<select>` is opacity-0 and sized to
+// overlap the chip below it — same trick the business-website
+// `.language-switcher` uses to keep the native dropdown discoverable
+// without polluting the chrome with a full bootstrap form-select.
+.execlaw-language-switcher {
+    position: fixed;
+    top: 1rem;
+    right: 1rem;
+    z-index: 50;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.35rem 0.65rem;
+    background-color: rgba($bg-surface, 0.85);
+    backdrop-filter: blur(6px);
+    border-radius: $radius-pill;
+    box-shadow: $shadow-soft;
+    color: $text-primary;
+    font-size: 0.85rem;
+    line-height: 1;
+    user-select: none;
+}
+
+.execlaw-language-switcher__value {
+    font-weight: 600;
+    letter-spacing: 0.04em;
+}
+
+.execlaw-language-switcher__icon {
+    color: $text-muted;
+    font-size: 0.95rem;
+}
+
+.execlaw-language-switcher__select {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    opacity: 0;
+    cursor: pointer;
+    appearance: none;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    margin: 0;
+    color: $text-primary;
+
+    &:focus-visible {
+        outline: 2px solid $accent;
+        outline-offset: 2px;
+        opacity: 0.001;
+    }
+
+    // Native option list renders with the OS chrome — force readable
+    // text on Windows / Linux where the parent's transparent
+    // background otherwise bleeds through.
+    option {
+        color: #000;
+        background: #fff;
+    }
+}
+
