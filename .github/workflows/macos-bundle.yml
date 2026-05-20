@@ -191,7 +191,7 @@ jobs:
 
       - name: Create draft GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           # `draft: true` — the workflow stages the release; a
           # maintainer reviews the auto-generated notes + the
