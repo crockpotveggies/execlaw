@@ -45,7 +45,7 @@ hardware.
 - **Five shipped transports**: Signal (signal-cli sidecar), WhatsApp (wuzapi sidecar), Slack (multi-workspace Socket Mode OAuth), Discord (multi-guild Gateway WebSocket), SMS (Android-gateway WebSocket).
 - **HTTP integrations**: Google Apps (Gmail/Calendar/Contacts/Tasks/Drive in one OAuth), Google Places, Open-Meteo (key-less weather), Yahoo Finance (market data), Pushover.
 - **Research subsystem**: deep-research plan/gather/synthesize pipeline with retention and per-phase event flow.
-- **SPA**: chat-first sidebar, pinned Control thread (every controller-channel message collapses here), token streaming, approval queue, per-plugin admin panels, settings.
+- **SPA**: chat-first sidebar, pinned Control thread (every controller-channel message collapses here), token streaming, approval queue, per-plugin admin panels, settings. **i18n out of the box** — 8 languages (EN / ES / FR / DE / IT / NL / PL / PT), browser-locale auto-detection on first run, language switcher in the setup wizard and persisted to `localStorage`. See [Internationalisation (i18n)](#internationalisation-i18n) below.
 - **Native desktop bundles** for all three desktops — `.app`/`.dmg` on macOS (Apple Silicon, SMAppService LaunchAgent), NSIS `.exe` on Windows (SCM service), `.deb` on Linux (systemd `--user` unit). Each ships a tray icon, the bundled control plane, and the same SPA on `127.0.0.1:3031`. See [Desktop installations](#desktop-installations) below and [`docs/desktop-installations.md`](docs/desktop-installations.md) for the full cross-OS reference.
 
 See [`docs/architecture.md` §18](docs/architecture.md) for the full milestone breakdown.
@@ -70,6 +70,60 @@ All 12 in-tree plugins ship as ZIPs under [`dist/`](dist/) and install via the S
 | [`hello`](plugins/hello/) | 0.1.0 | subprocess | reference | Echo tool exercising the subprocess JSON-RPC tier. Template for new plugin authors. |
 
 Tools, host-side built-ins, and the manifest schema are documented in [`docs/plugins.md`](docs/plugins.md). Chart rendering (`chart.render`) is a host-side built-in as of 2026-05-15 — it was previously inside `open-meteo`.
+
+---
+
+## Internationalisation (i18n)
+
+The SPA ships with eight languages built in:
+
+| Code | Language |
+|---|---|
+| `en` | English (the source-of-truth defaults, inline in JSX) |
+| `es` | Español |
+| `fr` | Français |
+| `de` | Deutsch |
+| `it` | Italiano |
+| `nl` | Nederlands |
+| `pl` | Polski |
+| `pt` | Português |
+
+**How language gets picked.** On first load the SPA checks
+`localStorage["execlaw.preferred-language"]`; if absent it falls back
+to `navigator.language` (when that's one of the supported codes) and
+finally to English. The setup wizard renders a compact globe-icon
+language switcher in the top-right corner so the operator can flip
+languages before they've committed to anything — the choice is
+persisted to `localStorage` and applied to every subsequent visit.
+
+**How translations work in the code.** English defaults live inline
+in the React source via `t("namespace.key", "English default string")`
+— the same pattern as the upstream business website. Other locale
+bundles (`web/src/locales/<lang>.json`) are lazily code-split: only
+the active language's JSON is fetched. When a key is missing from a
+non-English bundle, `t()` silently falls back to the English default,
+so a partial translation can ship without surfacing empty UI strings.
+`{{var}}`-style interpolation works the same on the English path and
+the translated path.
+
+**Implementation reference.** Core: [`web/src/i18n/index.ts`](web/src/i18n/index.ts)
+(i18next bootstrap, lazy-loader registry, `t()` helper,
+`useT()` / `useCurrentLanguage()` React hooks). UI:
+[`web/src/i18n/LanguageSwitcher.tsx`](web/src/i18n/LanguageSwitcher.tsx).
+Locale bundles: [`web/src/locales/`](web/src/locales/).
+
+**Adding a new language.** Add the ISO code to `SUPPORTED_LANGUAGES`
+in `web/src/i18n/index.ts`, register a lazy-loader entry in
+`localeLoaders`, add an `OPTIONS` row in
+`web/src/i18n/LanguageSwitcher.tsx`, and drop a
+`web/src/locales/<code>.json` keyed by the same `namespace.key`
+strings the JSX passes to `t()`.
+
+**Not yet i18n-ized.** Server-side strings (CLI output, log lines,
+plugin-author-facing error messages) are English-only. The
+translation surface is the operator-facing SPA UI; the operator
+talks to the agent in whatever language they want — the LLM
+handles that end on its own.
 
 ---
 
