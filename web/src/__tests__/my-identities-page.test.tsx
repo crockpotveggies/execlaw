@@ -264,18 +264,26 @@ describe("MyIdentitiesPage", () => {
             return new Response("{}", { status: 200 });
         });
         mountPage();
-        const handle = await waitFor(() =>
-            screen.getByTestId("my-identities-handle"),
-        );
         // First entry is signal — placeholder is the phone shape.
-        expect((handle as HTMLInputElement).placeholder).toBe("+15551234");
+        // Wait on the placeholder *value*, not just the element: the
+        // input mounts immediately with the fallback "handle"
+        // placeholder, then re-renders with the transport's hint once
+        // `listAvailableTransports` resolves and the default-select
+        // useEffect commits `transport === "signal"`. The earlier
+        // `waitFor(getByTestId)` form races that re-render on slow
+        // CI runners.
+        const handle = await waitFor(() => {
+            const el = screen.getByTestId(
+                "my-identities-handle",
+            ) as HTMLInputElement;
+            expect(el.placeholder).toBe("+15551234");
+            return el;
+        });
         fireEvent.change(screen.getByTestId("my-identities-transport"), {
             target: { value: "email" },
         });
         await waitFor(() => {
-            expect((handle as HTMLInputElement).placeholder).toBe(
-                "you@example.com",
-            );
+            expect(handle.placeholder).toBe("you@example.com");
         });
     });
 });
