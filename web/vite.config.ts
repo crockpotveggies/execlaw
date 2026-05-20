@@ -42,6 +42,59 @@ export default defineConfig({
         // `npm run size` script checks dist/assets size against an
         // explicit ceiling.
         chunkSizeWarningLimit: 500,
+        rollupOptions: {
+            output: {
+                // Split heavy vendor libs into separate cacheable
+                // chunks so the main app bundle stays under the
+                // 500 kB chunk-size budget above. The split also
+                // means a code-only change doesn't bust the vendor
+                // chunk's browser cache — operators on slow links
+                // get incremental updates instead of re-downloading
+                // React + Bootstrap on every release. Keep this
+                // list narrow; only break out libs that materially
+                // move the needle (>50 kB minified).
+                //
+                // Vite 8 ships rolldown, which requires manualChunks
+                // as a function (the legacy Rollup record syntax was
+                // dropped). The function is called once per module;
+                // returning a string puts that module in the named
+                // chunk, undefined defers to rolldown's default
+                // grouping.
+                manualChunks(id: string): string | undefined {
+                    if (!id.includes("node_modules")) return undefined;
+                    if (
+                        /[\\/]node_modules[\\/](react|react-dom|scheduler|react-router|react-router-dom)[\\/]/.test(
+                            id,
+                        )
+                    ) {
+                        return "react-vendor";
+                    }
+                    if (
+                        /[\\/]node_modules[\\/](react-bootstrap|bootstrap|@restart)[\\/]/.test(
+                            id,
+                        )
+                    ) {
+                        return "bootstrap-vendor";
+                    }
+                    if (/[\\/]node_modules[\\/]@xyflow[\\/]/.test(id)) {
+                        return "xyflow-vendor";
+                    }
+                    if (
+                        /[\\/]node_modules[\\/](gsap|@gsap)[\\/]/.test(id)
+                    ) {
+                        return "gsap-vendor";
+                    }
+                    if (
+                        /[\\/]node_modules[\\/](react-markdown|remark-.*|micromark.*|mdast.*|unified|unist.*|vfile.*|hast.*|bail|trough|is-plain-obj|character-entities|decode-named-character-reference|devlop|estree-util-is-identifier-name|html-url-attributes|property-information|space-separated-tokens|comma-separated-tokens|zwitch|trim-lines|markdown-table)[\\/]/.test(
+                            id,
+                        )
+                    ) {
+                        return "markdown-vendor";
+                    }
+                    return undefined;
+                },
+            },
+        },
     },
     css: {
         preprocessorOptions: {
@@ -54,17 +107,19 @@ export default defineConfig({
                 api: "modern-compiler",
                 // Bootstrap 5.3 still uses `@import`, the old global
                 // colour functions (`red()`/`green()`/`blue()`/
-                // `mix()`/`unit()`), and ships rules where plain
-                // declarations follow nested rules. Those won't be
-                // fixed until Bootstrap 6. Silence those specific
-                // deprecation channels so a real new warning in our
-                // own SCSS still surfaces in the dev-server log.
+                // `mix()`/`unit()`), the Sass `if()` function (now
+                // deprecated in favour of the CSS-native `if()`), and
+                // ships rules where plain declarations follow nested
+                // rules. Those won't be fixed until Bootstrap 6.
+                // Silence those specific deprecation channels so a
+                // real new warning in our own SCSS still surfaces in
+                // the dev-server log.
                 silenceDeprecations: [
                     "import",
                     "global-builtin",
                     "color-functions",
-                    "mixed-decls",
                     "legacy-js-api",
+                    "if-function",
                 ],
             },
         },
