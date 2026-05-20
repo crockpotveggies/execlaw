@@ -124,6 +124,12 @@ pub struct JwtSigner {
     encoding_key: EncodingKey,
     decoding_key: DecodingKey,
     issuer: String,
+    /// HMAC-SHA256 key used to sign download URLs (§ download_urls).
+    /// Distinct from the EdDSA JWT signing key so a compromise of
+    /// one doesn't compromise the other; derived from the same
+    /// master in production via a separate domain-separator constant
+    /// so signed-URL acceptance survives restart.
+    download_hmac_key: [u8; 32],
 }
 
 impl std::fmt::Debug for JwtSigner {
@@ -137,10 +143,13 @@ impl std::fmt::Debug for JwtSigner {
 
 impl JwtSigner {
     pub fn generate(issuer: String) -> Self {
+        use rand::RngCore;
         let mut csprng = OsRng;
         let signing_key = SigningKey::generate(&mut csprng);
         let verifying_key = signing_key.verifying_key();
-        Self::from_keys(signing_key, verifying_key, issuer)
+        let mut download_hmac_key = [0u8; 32];
+        csprng.fill_bytes(&mut download_hmac_key);
+        Self::from_keys_with_download_key(signing_key, verifying_key, issuer, download_hmac_key)
     }
 
     /// Derive the Ed25519 signing key deterministically from the
@@ -170,10 +179,35 @@ impl JwtSigner {
         let bytes: [u8; 32] = derived.into();
         let signing_key = SigningKey::from_bytes(&bytes);
         let verifying_key = signing_key.verifying_key();
-        Self::from_keys(signing_key, verifying_key, issuer)
+        // Derive the download-URL HMAC key from the same master via
+        // a separate domain-separator so it stays distinct from the
+        // JWT signing key, the event-log HMAC, etc. — but survives
+        // restart for the same reason JWTs do (operators don't get
+        // 401 on every link click after cargo-watch rebuilds).
+        let mut h2 = Sha256::new();
+        h2.update(b"execlaw/download-url-hmac/v1");
+        h2.update(master_key);
+        let download_hmac_key: [u8; 32] = h2.finalize().into();
+        Self::from_keys_with_download_key(signing_key, verifying_key, issuer, download_hmac_key)
     }
 
     pub fn from_keys(signing_key: SigningKey, verifying_key: VerifyingKey, issuer: String) -> Self {
+        // Tests / callers without a master key get a random download
+        // HMAC. Mostly relevant in dev; production goes through
+        // `from_master_key` so the download key persists across
+        // restart.
+        use rand::RngCore;
+        let mut download_hmac_key = [0u8; 32];
+        OsRng.fill_bytes(&mut download_hmac_key);
+        Self::from_keys_with_download_key(signing_key, verifying_key, issuer, download_hmac_key)
+    }
+
+    fn from_keys_with_download_key(
+        signing_key: SigningKey,
+        verifying_key: VerifyingKey,
+        issuer: String,
+        download_hmac_key: [u8; 32],
+    ) -> Self {
         // Use PEM throughout — jsonwebtoken handles both PKCS#8-encoded
         // private and SubjectPublicKeyInfo public PEM for EdDSA.
         let priv_pem = signing_key
@@ -192,6 +226,7 @@ impl JwtSigner {
             encoding_key,
             decoding_key,
             issuer,
+            download_hmac_key,
         }
     }
 
@@ -247,6 +282,13 @@ impl JwtSigner {
 
     pub fn signing_key(&self) -> &SigningKey {
         &self.signing_key
+    }
+
+    /// 32-byte HMAC-SHA256 key for signed download URLs. See
+    /// [`download_urls`](crate::download_urls) for the URL shape
+    /// and verification flow.
+    pub fn download_hmac_key(&self) -> &[u8; 32] {
+        &self.download_hmac_key
     }
 }
 

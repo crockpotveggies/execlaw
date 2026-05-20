@@ -1,0 +1,26 @@
+-- 2026-05-17 — M5: agent-drafted suggestions scaffolding.
+--
+-- Adds a nullable `draft_definition` column to
+-- `state_automation_suggestions`. When NULL, the suggestion is a
+-- plain pattern-detected row (M4a behavior); the editor seeds an
+-- empty graph for the trigger kind.
+--
+-- When non-NULL, the column carries a serialized `AutomationDef`
+-- (same JSON shape as `state_automations.definition`) that the
+-- frontend uses to pre-fill the editor on the "Review and create"
+-- handoff. Producers:
+--
+--   * M5 deterministic path: not used today; reserved for a future
+--     templated draft generator that doesn't need the LLM.
+--   * M5+ agent-drafted path: a (deferred) sweep extension calls
+--     the `AgentInvoker` against a sample payload from the matching
+--     pattern and proposes a draft graph. The column is the storage
+--     seam — when the LLM-drafting path lands, no schema change is
+--     needed.
+--
+-- We don't update the UNIQUE(kind, source, status) index because the
+-- key doesn't change. The sweep's ON CONFLICT clause preserves an
+-- existing draft on count refresh (only the event_count + sample_ids
+-- + updated_at fields get touched on re-sweep).
+
+ALTER TABLE state_automation_suggestions ADD COLUMN draft_definition TEXT;

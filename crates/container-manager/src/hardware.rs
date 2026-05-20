@@ -41,8 +41,8 @@ impl GpuVendor {
     pub fn from_pci_vendor(hex: &str) -> Self {
         // sysfs returns `0x10de`, `0x8086`, etc. Apple's `0x106b` is
         // included for symmetry — Apple Silicon has no real PCI surface,
-        // but external Apple displays / older Intel Macs with Apple
-        // graphics controllers carry this id in IOKit.
+        // but external Apple-branded display controllers still carry
+        // this id in IOKit.
         match hex.trim().to_ascii_lowercase().trim_start_matches("0x") {
             "10de" => GpuVendor::Nvidia,
             "8086" => GpuVendor::Intel,
@@ -118,9 +118,9 @@ pub fn detect() -> HardwareProfile {
     // all of which fail on Mac, then synthesises a "Generic Unknown"
     // GPU as a fallback). We probe `system_profiler` ourselves so
     // Apple Silicon shows up as `GpuVendor::Apple` instead of getting
-    // folded into Unknown. If detection produces nothing usable we
-    // fall through to the cross-platform path — that way an Intel Mac
-    // with a discrete AMD GPU still gets recognised.
+    // folded into Unknown. The supported macOS target is
+    // `aarch64-apple-darwin` only; Intel Macs aren't supported and
+    // their discrete-GPU detection is out of scope.
     #[cfg(target_os = "macos")]
     {
         if let Some(prof) = detect_macos()
@@ -219,9 +219,10 @@ struct SystemProfilerDisplay {
 /// host without shelling out.
 ///
 /// Filters to entries where the vendor string is `sppci_vendor_Apple`
-/// — anything else (discrete AMD on Intel Macs, eGPU NVIDIA on older
-/// Macs) falls through to the cross-platform `hardware-query` path,
-/// which has correct vendor logic for those classes.
+/// — anything else (a non-Apple GPU controller that somehow surfaces
+/// in `system_profiler`) is skipped. execlaw doesn't support Intel
+/// Macs, so the historical "discrete AMD / eGPU NVIDIA on older Macs"
+/// case isn't a path we maintain.
 ///
 /// `memsize_bytes` is `sysctl -n hw.memsize`. Apple Silicon's GPU shares
 /// unified memory with the CPU; macOS's `iogpu.wired_limit_mb` default
@@ -684,9 +685,10 @@ mod tests {
 
     #[test]
     fn from_pci_vendor_maps_apple() {
-        // 0x106b is Apple's PCI vendor id (Apple Silicon SoCs don't sit
-        // on a real PCI bus, but external Apple display controllers and
-        // older Intel Macs with Apple-branded GPUs do).
+        // 0x106b is Apple's PCI vendor id. Apple Silicon SoCs don't
+        // sit on a real PCI bus (we detect those via
+        // `system_profiler`), but external Apple-branded display
+        // controllers still carry this id in IOKit.
         assert_eq!(GpuVendor::from_pci_vendor("0x106b"), GpuVendor::Apple);
         assert_eq!(GpuVendor::from_pci_vendor("106b"), GpuVendor::Apple);
     }
@@ -820,10 +822,11 @@ mod tests {
 
     #[test]
     fn parse_macos_system_profiler_skips_non_apple_vendors() {
-        // Older Intel Macs with a discrete AMD card report
-        // `sppci_vendor_AMD` (or similar). Our parser must skip those
-        // so `detect()` falls through to the cross-platform path that
-        // knows how to deal with them.
+        // execlaw only supports Apple-Silicon Macs, but
+        // `system_profiler` on any future / external GPU controller
+        // could still emit a non-Apple vendor string. The parser
+        // skips those rather than fabricating an `Unknown` entry the
+        // wizard can't do anything with.
         let json = r#"{
           "SPDisplaysDataType": [
             {
@@ -884,10 +887,11 @@ mod tests {
 
     #[test]
     fn parse_macos_system_profiler_handles_multi_entry_with_mixed_vendors() {
-        // Hypothetical Mac Pro with both an Apple-branded controller
-        // (for builtin display routing) and a discrete AMD card. The
-        // parser keeps the Apple entry only — AMD goes through the
-        // hardware-query path on Intel Macs.
+        // Defensive: if `system_profiler` ever lists a non-Apple
+        // entry alongside the Apple SoC (an external display
+        // controller, a future eGPU path), the parser keeps the
+        // Apple entry and drops the rest. execlaw doesn't manage
+        // non-Apple GPUs on macOS hosts.
         let json = r#"{
           "SPDisplaysDataType": [
             {"_name":"Apple M2 Ultra","sppci_model":"Apple M2 Ultra","sppci_vendor":"sppci_vendor_Apple"},

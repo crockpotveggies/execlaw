@@ -209,6 +209,86 @@ pub async fn get_handler(
     }))
 }
 
+// ----------------------------------------------------------------
+// 2026-05-16 — operator-facing skill creation. The Skills page
+// ships a "+ New skill" button that POSTs here. Pre-2026-05-16 the
+// only way to create a skill from the SPA was indirectly via the
+// auto-capture worker; manual authoring required calling the
+// `skills.create` tool from chat. This endpoint closes that loop.
+//
+// Controller-only — matches the trust contract on every other write
+// in this module. Strictness is `Warn` (same as the body editor)
+// rather than `Strict`: an operator typing into a form is more
+// trusted than an agent calling the tool surface, and false-positive
+// scanner trips were a reported friction point during onboarding.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateSkillRequest {
+    /// Skill name in `<namespace>/<segment>` form. Validated by the
+    /// store; 400 `invalid_name` if it doesn't match the canonical
+    /// shape (`[a-z0-9][a-z0-9-]*` per segment).
+    pub name: String,
+    pub description: String,
+    pub body_md: String,
+    /// Optional JSON-encoded frontmatter. Defaults to `"{}"` so the
+    /// SPA form doesn't have to ship a literal `{}` when the
+    /// operator leaves the field blank.
+    #[serde(default = "default_frontmatter_admin")]
+    pub frontmatter_json: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/admin/skills",
+    request_body = CreateSkillRequest,
+    responses(
+        (status = 200, description = "Created — returns the new skill detail", body = SkillDetail),
+        (status = 400, description = "Invalid name / frontmatter / body"),
+        (status = 403, description = "Caller is not a Controller"),
+        (status = 409, description = "Skill name already exists")
+    ),
+    security(("bearer_jwt" = [])),
+    tag = "skills"
+)]
+pub async fn create_handler(
+    State(state): State<AppState>,
+    user: AuthedUser,
+    Json(req): Json<CreateSkillRequest>,
+) -> Result<Json<SkillDetail>, ApiError> {
+    require_controller(&state, &user)?;
+    let store = SkillStore::new(state.db.clone());
+    // Pre-check: `SkillStore::create` raises a generic `DbError`
+    // (mapped to 500) when the name collides, not a typed
+    // `AlreadyExists`. Looking it up upfront lets us surface 409
+    // `already_exists` for the operator without touching the
+    // shared store contract.
+    if let Some(_existing) = store.get(&req.name).map_err(skill_err)? {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            code: "already_exists",
+            message: format!("skill '{}' already exists", req.name),
+        });
+    }
+    let now_ms = chrono::Utc::now().timestamp() * 1000;
+    let new = execlaw_skills::NewSkill {
+        name: req.name.clone(),
+        source: format!("admin:{}", user.user_id),
+        registration_kind: execlaw_skills::RegistrationKind::Authored,
+        owning_plugin_id: None,
+        initial_version: NewSkillVersion {
+            description: req.description,
+            body_md: req.body_md,
+            frontmatter_json: req.frontmatter_json,
+            authored_by: format!("admin:{}", user.user_id),
+            promotion_notes: None,
+        },
+        resources: vec![],
+    };
+    store
+        .create(new, Strictness::Warn, now_ms)
+        .map_err(skill_err)?;
+    get_handler(State(state), user, AxumPath(req.name)).await
+}
+
 #[utoipa::path(
     post,
     path = "/api/admin/skills/{name}/promote",
@@ -286,6 +366,30 @@ fn skill_err(e: execlaw_skills::SkillError) -> ApiError {
             status: StatusCode::FORBIDDEN,
             code: "denied",
             message: r,
+        },
+        // 2026-05-16 — fix #P3 (Codex review): these are caller-input
+        // validation failures, not server errors. The SPA's composer
+        // exposes the custom-frontmatter blob directly, so 400 lets
+        // the UI render an inline error chip instead of the generic
+        // "server error, retry" the 500 catch-all surfaced.
+        InvalidFrontmatter(m) => ApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_frontmatter",
+            message: format!("frontmatter is not valid JSON: {m}"),
+        },
+        BodyTooLarge { size, cap } => ApiError {
+            // Size-violation; PAYLOAD_TOO_LARGE is the closer fit
+            // than 400 since the SPA can short-circuit on this exact
+            // status to surface a "trim your body" message without
+            // re-parsing the error code string.
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code: "body_too_large",
+            message: format!("skill body size {size}B exceeds cap {cap}B"),
+        },
+        ResourceTooLarge { size, cap } => ApiError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code: "resource_too_large",
+            message: format!("skill resource size {size}B exceeds cap {cap}B"),
         },
         other => ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -614,9 +718,221 @@ pub async fn reject_proposal_handler(
     Ok(Json(p.into()))
 }
 
+#[cfg(test)]
+mod tests {
+    //! 2026-05-16 — coverage for the operator-facing skill creation
+    //! path added alongside the standardized Skills page scaffolding.
+    //! Hits the full HTTP route stack (auth extractor + handler +
+    //! store) so a regression in any link of the chain trips here.
+    use crate::routes::{build_router, test_app_state};
+    use axum::body::{self, Body};
+    use axum::http::{HeaderValue, Method, Request, StatusCode, header};
+    use execlaw_core::users::{UserRole, UserRow, UserStore};
+    use tower::ServiceExt;
+
+    /// Seed a user + issue a bearer access token for them. Returns
+    /// `(app, "Bearer <jwt>")` ready to drop on a request.
+    async fn seed_user_and_token(role: UserRole) -> (axum::Router, String) {
+        let state = test_app_state();
+        UserStore::new(&state.db)
+            .insert(&UserRow {
+                user_id: "u-test".into(),
+                username: "tester".into(),
+                display_name: "Tester".into(),
+                email: None,
+                password_hash: "argon2-placeholder".into(),
+                role,
+                created_at: 0,
+                last_login_at: None,
+            })
+            .expect("insert user");
+        let token = state
+            .signer
+            .issue_access_token("u-test", "session-test", 600)
+            .expect("issue token");
+        (build_router(state), format!("Bearer {token}"))
+    }
+
+    async fn post_create(
+        app: axum::Router,
+        bearer: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/admin/skills")
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )
+            .header(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(bearer).unwrap(),
+            )
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        (status, v)
+    }
+
+    #[tokio::test]
+    async fn controller_creates_skill_returns_detail() {
+        let (app, bearer) = seed_user_and_token(UserRole::Controller).await;
+        let (status, body) = post_create(
+            app,
+            &bearer,
+            serde_json::json!({
+                "name": "test/web-browsing",
+                "description": "Use the search and fetch tools.",
+                "body_md": "# Web Browsing\n\nReach for web_search first.",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["name"], "test/web-browsing");
+        assert_eq!(body["state"], "trial");
+        assert_eq!(body["registration_kind"], "authored");
+        assert_eq!(body["current_version"], 1);
+        assert!(
+            body["body_md"]
+                .as_str()
+                .unwrap()
+                .contains("Reach for web_search first"),
+            "body must round-trip; got {body}"
+        );
+        assert_eq!(
+            body["authored_by"], "admin:u-test",
+            "operator id must land in authored_by"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_controller_create_is_forbidden() {
+        let (app, bearer) = seed_user_and_token(UserRole::Operator).await;
+        let (status, body) = post_create(
+            app,
+            &bearer,
+            serde_json::json!({
+                "name": "test/foo",
+                "description": "x",
+                "body_md": "x",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], "controller_only");
+    }
+
+    #[tokio::test]
+    async fn duplicate_name_returns_409() {
+        let (app, bearer) = seed_user_and_token(UserRole::Controller).await;
+        let payload = serde_json::json!({
+            "name": "test/dup",
+            "description": "d",
+            "body_md": "b",
+        });
+        let (s1, _) = post_create(app.clone(), &bearer, payload.clone()).await;
+        assert_eq!(s1, StatusCode::OK);
+        let (s2, body) = post_create(app, &bearer, payload).await;
+        assert_eq!(s2, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "already_exists");
+    }
+
+    #[tokio::test]
+    async fn invalid_name_returns_400() {
+        let (app, bearer) = seed_user_and_token(UserRole::Controller).await;
+        let (status, body) = post_create(
+            app,
+            &bearer,
+            serde_json::json!({
+                "name": "NoSlash",
+                "description": "x",
+                "body_md": "x",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_name");
+    }
+
+    /// 2026-05-16 — fix #P3 (Codex review): malformed JSON in the
+    /// composer's custom-frontmatter field surfaced as 500 pre-fix
+    /// because `InvalidFrontmatter` fell through the catch-all
+    /// branch of `skill_err`. The OpenAPI schema documents 400 for
+    /// caller-input validation; the SPA's inline error chip relies
+    /// on the 400 status to surface a "fix your JSON" message rather
+    /// than the generic "server error, retry" loop.
+    #[tokio::test]
+    async fn invalid_frontmatter_returns_400() {
+        let (app, bearer) = seed_user_and_token(UserRole::Controller).await;
+        let (status, body) = post_create(
+            app,
+            &bearer,
+            serde_json::json!({
+                "name": "test/bad-fm",
+                "description": "x",
+                "body_md": "x",
+                // Not parseable JSON.
+                "frontmatter_json": "{not: valid json}",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_frontmatter");
+    }
+
+    /// Skill bodies above `MAX_BODY_BYTES` surface as 413 with an
+    /// `body_too_large` code (was 500 pre-fix).
+    #[tokio::test]
+    async fn oversized_body_returns_413() {
+        let (app, bearer) = seed_user_and_token(UserRole::Controller).await;
+        // MAX_BODY_BYTES = 256 KiB; ship one byte over.
+        let oversized = "a".repeat((execlaw_skills::MAX_BODY_BYTES as usize) + 1);
+        let (status, body) = post_create(
+            app,
+            &bearer,
+            serde_json::json!({
+                "name": "test/big-body",
+                "description": "x",
+                "body_md": oversized,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body["error"]["code"], "body_too_large");
+    }
+
+    #[tokio::test]
+    async fn create_without_auth_header_returns_401() {
+        let state = test_app_state();
+        let app = build_router(state);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/admin/skills")
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "test/foo",
+                    "description": "x",
+                    "body_md": "x",
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
 pub fn skills_admin_router() -> Router<AppState> {
     Router::new()
-        .route("/api/admin/skills", get(list_handler))
+        .route("/api/admin/skills", get(list_handler).post(create_handler))
         .route(
             "/api/admin/skills/config",
             get(get_config_handler).put(update_config_handler),

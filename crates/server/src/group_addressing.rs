@@ -454,6 +454,8 @@ async fn classify_via_llm(
         // a JSON token, not a chain-of-thought monologue. Other
         // models silently ignore the field.
         chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+        tool_choice: None,
+        guided_decoding_backend: None,
     };
 
     // Tighter timeout: when Small backend isn't configured the

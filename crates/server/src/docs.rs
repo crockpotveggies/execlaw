@@ -22,11 +22,17 @@ use crate::approvals::{
     IdentifierSummary, PendingApprovalSummary, PendingApprovalsResponse, PrincipalListResponse,
     PrincipalSummary,
 };
+use crate::automation_runtime::{DryRunResult, ExecOutcome};
+use crate::automations_admin::{
+    AutomationDto, CreateAutomationRequest, MetricsDto, RecentBusEventDto, SampleEventBody,
+    SuggestionDto, TestRunRequest, UpdateAutomationRequest,
+};
 use crate::backend_presets::{BackendPreset, PresetField, PresetWithFlag, PresetsResponse};
 use crate::backends::{
     BackendListEntry, BackendListResponse, BackendLogsResponse, BackendStatusResponse, BackendView,
     UpsertBackendRequest,
 };
+use crate::inference_metrics::{ConsumerSnapshot, InferenceConsumer, MetricsSnapshot};
 use crate::mcp_admin::{McpServerListResponse, McpServerView, McpServerWriteRequest};
 use crate::my_identities::{
     AddIdentifierRequest, AvailableTransportView, AvailableTransportsResponse, IdentifierView,
@@ -60,6 +66,11 @@ use crate::tools_admin::{ToolListResponse, ToolView, UpdateToolPolicyRequest};
 use crate::trust_policy::{TrustPolicyView, UpdateTrustPolicyRequest};
 use crate::users::{
     ChangePasswordRequest, InviteUserRequest, ResetPasswordRequest, UserListResponse, UserView,
+};
+use execlaw_core::automation_bus::BusEventKind;
+use execlaw_core::automation_runs::{AutomationRunRow, AutomationRunStatus, StepTrace};
+use execlaw_core::automations::{
+    AskAgentConfig, AutomationDef, EdgeDef, ExitToolDef, NodeDef, NodeKind, TriggerDef,
 };
 use utoipa::Modify;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
@@ -203,6 +214,24 @@ impl Modify for SecurityAddon {
         // setup preflight (Phase 14 — first-run wizard docker + gpu)
         crate::setup_preflight::get_handler,
         crate::setup_preflight::dismiss_handler,
+        // automations (M1-M5 — event-triggered flows)
+        crate::automations_admin::list,
+        crate::automations_admin::create,
+        crate::automations_admin::get_one,
+        crate::automations_admin::update,
+        crate::automations_admin::delete_one,
+        crate::automations_admin::enable,
+        crate::automations_admin::disable,
+        crate::automations_admin::list_runs,
+        crate::automations_admin::metrics,
+        crate::automations_admin::list_suggestions,
+        crate::automations_admin::get_suggestion,
+        crate::automations_admin::dismiss_suggestion,
+        crate::automations_admin::action_suggestion,
+        crate::automations_admin::test_run,
+        crate::automations_admin::list_recent_events,
+        // inference observability (M5)
+        crate::inference_admin::metrics,
     ),
     components(schemas(
         HealthResponse,
@@ -284,6 +313,32 @@ impl Modify for SecurityAddon {
         ResearchCancelRequest,
         PreflightResponse,
         DockerStatus,
+        // automations (M1-M5)
+        AutomationDto,
+        CreateAutomationRequest,
+        UpdateAutomationRequest,
+        MetricsDto,
+        RecentBusEventDto,
+        SampleEventBody,
+        SuggestionDto,
+        TestRunRequest,
+        DryRunResult,
+        ExecOutcome,
+        BusEventKind,
+        AutomationRunRow,
+        AutomationRunStatus,
+        StepTrace,
+        AutomationDef,
+        TriggerDef,
+        NodeDef,
+        EdgeDef,
+        NodeKind,
+        ExitToolDef,
+        AskAgentConfig,
+        // inference observability (M5)
+        MetricsSnapshot,
+        ConsumerSnapshot,
+        InferenceConsumer,
     )),
     tags(
         (name = "meta", description = "Liveness + introspection"),
@@ -293,6 +348,8 @@ impl Modify for SecurityAddon {
         (name = "plugins", description = "Install, enable/disable, uninstall, tool + panel listings"),
         (name = "observability", description = "Logs + eval flags"),
         (name = "approvals", description = "Approval verbs + trust revocation"),
+        (name = "automations", description = "Event-triggered flows: bus → matcher → typed graph → AskAgent / Filter / Transform / Branch / Terminal. CRUD, runs, metrics, suggestions, test-run."),
+        (name = "inference", description = "Per-consumer LLM call observability (in_flight, totals, p50/p95)."),
     )
 )]
 pub struct ApiDoc;

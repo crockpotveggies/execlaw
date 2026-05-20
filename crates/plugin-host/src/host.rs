@@ -414,7 +414,14 @@ impl PluginHost {
         // the registry doesn't leak a plugin that can't serve.
         let needs_runtime = !manifest.tools.is_empty()
             || manifest.transport.is_some()
-            || manifest.identity_provider.is_some();
+            || manifest.identity_provider.is_some()
+            // Admin / webhook routes are dispatched through the
+            // plugin's script (or subprocess) runtime — without one
+            // the host can't call the declared handler. Pre-fix, a
+            // webhook-only or admin-only plugin would silently 404
+            // at request time with no clear signal.
+            || !manifest.admin_routes.is_empty()
+            || !manifest.webhook_routes.is_empty();
         if needs_runtime {
             let runtime = manifest
                 .runtime
@@ -818,7 +825,14 @@ impl PluginHost {
 
         let needs_runtime = !manifest.tools.is_empty()
             || manifest.transport.is_some()
-            || manifest.identity_provider.is_some();
+            || manifest.identity_provider.is_some()
+            // Admin / webhook routes are dispatched through the
+            // plugin's script (or subprocess) runtime — without one
+            // the host can't call the declared handler. Pre-fix, a
+            // webhook-only or admin-only plugin would silently 404
+            // at request time with no clear signal.
+            || !manifest.admin_routes.is_empty()
+            || !manifest.webhook_routes.is_empty();
         if needs_runtime {
             let runtime = manifest
                 .runtime
@@ -940,7 +954,9 @@ impl PluginHost {
             }
             let needs_runtime = !manifest.tools.is_empty()
                 || manifest.transport.is_some()
-                || manifest.identity_provider.is_some();
+                || manifest.identity_provider.is_some()
+                || !manifest.admin_routes.is_empty()
+                || !manifest.webhook_routes.is_empty();
             if needs_runtime {
                 if let Some(runtime) = &manifest.runtime {
                     let stage = PathBuf::from(&row.stage_path);

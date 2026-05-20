@@ -1,0 +1,174 @@
+{
+  "general": {
+    "title": "Algemeen",
+    "introPre": "Beheerderinstellingen voor de hostservice. Het besturingsvlak draait als systemd- / launchd- / Windows-service — zie ",
+    "introPost": " vanaf een terminal voor live status en logpaden.",
+    "readOnly": "Alleen-lezenweergave. Alleen Controllers kunnen algemene instellingen wijzigen.",
+    "loading": "Laden…",
+    "startAtBoot": "Starten bij opstarten",
+    "startAtBootHelpPre": "Wanneer ingeschakeld, start de hostservice automatisch bij het opstarten van het besturingssysteem. De volgende uitvoering van ",
+    "startAtBootHelpPost": " past de wijziging toe; de servicebeheer-registratie op schijf verandert tot dan niet.",
+    "bootReinstallPre": "Voer ",
+    "bootReinstallPost": " opnieuw uit vanaf een terminal om de nieuwe autostartvlag toe te passen (of een verhoogde PowerShell op Windows).",
+    "bindAddress": "Bindadres (host:poort)",
+    "bindAddressHelp": "Het adres waarop het besturingsvlak luistert. Gebruik 127.0.0.1:3031 alleen voor loopback, 0.0.0.0:3031 om op alle interfaces te binden (plaats een reverse proxy ervoor voor TLS), of een IPv6-literal zoals [::1]:3031.",
+    "bindRestartHintPre": "Het bindadres wordt van kracht bij de volgende ",
+    "bindRestartHintPost": ".",
+    "historyRetention": "Geschiedenisbewaring",
+    "historyRetentionHelp": "Hoe lang gespreksgeschiedenis, geplande taakuitvoeringen, gestructureerde logs en (binnenkort) onderzoekstaken bewaard blijven voordat ze automatisch worden verwijderd. Geheugengegevens en het auditlog worden niet beïnvloed.",
+    "retentionNarrowing": "Dit is een kortere periode. Bij opslaan wordt bij de volgende opruimronde (binnen ongeveer 30 minuten) een eenmalige bulkverwijdering van oudere geschiedenis uitgevoerd. Dit kan niet ongedaan worden gemaakt.",
+    "save": "Opslaan",
+    "revert": "Terugzetten",
+    "language": "Taal",
+    "languageHelp": "Per browser opgeslagen. Bij het eerste gebruik wordt teruggevallen op de taal van het besturingssysteem; wijzigingen hier overschrijven dat.",
+    "dangerConfirm": "ALLE gegevens wissen en de service terugzetten naar fabrieksinstellingen?\n\nDit verwijdert elk gesprek, plug-in, contact, routine, OAuth-token en operatoraccount. De service blijft draaien maar je wordt afgemeld en het volgende bezoek start de installatiewizard.\n\nDit kan niet ongedaan worden gemaakt.",
+    "dangerZone": "Gevaarlijke zone",
+    "dangerZoneBody": "Wist elk gesprek, plug-in, contact, routine, opgeslagen token en operatoraccount en meldt je vervolgens af. De service blijft draaien, maar het volgende bezoek start de installatiewizard. Bestandssysteem-artefacten (onderzoekswerkruimtes, bijlagen) worden niet verwijderd; start de hostservice opnieuw voor een werkelijk schone lei.",
+    "dangerTypePre": "Typ ",
+    "dangerTypePost": " om de knop in te schakelen.",
+    "wiping": "Wissen…",
+    "dangerReset": "Alle gegevens wissen en fabrieksreset"
+  },
+  "composer": {
+    "dismiss": "Sluiten",
+    "placeholder": "Hoe kan ik helpen?",
+    "attach": "Bijvoegen",
+    "attachPhoto": "Foto bijvoegen",
+    "attachFile": "Bestand bijvoegen",
+    "attachSkill": "Skill bijvoegen",
+    "backToAttach": "Terug naar bijlagemenu",
+    "pickSkills": "Kies skills voor deze beurt",
+    "loading": "Laden…",
+    "stop": "Generatie stoppen",
+    "send": "Versturen"
+  },
+  "sidebar": {
+    "newChat": "Nieuw gesprek",
+    "browse": "Bladeren",
+    "routines": "Routines",
+    "automations": "Automatiseringen",
+    "research": "Onderzoek",
+    "skills": "Skills",
+    "approvals": "Goedkeuringen",
+    "more": "Meer",
+    "contacts": "Contacten",
+    "threads": "Gesprekken",
+    "filters": "Filters",
+    "externalChannels": "Externe kanalen",
+    "off": "uit",
+    "on": "aan",
+    "noThreads": "Nog geen gesprekken. Start een nieuw gesprek om te beginnen.",
+    "controlThread": "Controlethread",
+    "newChatLabel": "Nieuw gesprek · {{id}}",
+    "deleteConfirm": "„{{name}}” verwijderen? Hiermee wordt de geschiedenis van het gesprek gewist.",
+    "settings": "Instellingen",
+    "signOut": "Afmelden",
+    "status": {
+      "offline": "Server niet bereikbaar",
+      "reconnecting": "Verbinding met server wordt hersteld",
+      "alertSingular": "{{count}} actieve waarschuwing",
+      "alertPlural": "{{count}} actieve waarschuwingen",
+      "installing": "Backend wordt geïnstalleerd — open Backends-pagina",
+      "online": "Online — waarschuwingen openen"
+    }
+  },
+  "welcome": {
+    "incognitoOnAria": "Incognito aan — uitschakelen",
+    "incognitoOffAria": "Start een incognito-gesprek (niet opgeslagen)",
+    "incognitoOnTitle": "Incognito aan — dit gesprek wordt niet opgeslagen",
+    "incognitoOffTitle": "Incognito uit — start een privégesprek",
+    "fallbackName": "vriend",
+    "suggestionsLabel": "Voorgesteld",
+    "suggestions": {
+      "capabilities": {
+        "title": "Laat me zien wat je kunt",
+        "sub": "noem je mogelijkheden",
+        "prompt": "Geef me een korte rondleiding van waarmee je kunt helpen."
+      },
+      "plan": {
+        "title": "Help me plannen",
+        "sub": "de prioriteiten van vandaag",
+        "prompt": "Help me uit te zoeken wat vandaag het belangrijkst is om te doen."
+      },
+      "brainstorm": {
+        "title": "Brainstormen",
+        "sub": "een open vraag waar ik op kauw",
+        "prompt": "Ik denk na over een probleem op het werk. Kunnen we samen brainstormen?"
+      }
+    }
+  },
+  "login": {
+    "webauthnUnsupported": "Deze browser ondersteunt geen WebAuthn. Gebruik een moderne browser of verwijder de geregistreerde passkey.",
+    "webauthnNoCredential": "Geen referentie ontvangen van de authenticator.",
+    "usernameAndPasswordRequired": "Voer zowel gebruikersnaam als wachtwoord in.",
+    "passkeyStepFailedWithReason": "Passkey-stap mislukt: {{reason}}",
+    "passkeyStepFailed": "Passkey-stap mislukt.",
+    "incorrectCredentials": "Onjuiste gebruikersnaam of wachtwoord.",
+    "failed": "Aanmelden mislukt.",
+    "intro": "Meld je aan om door te gaan.",
+    "passkeyRequired": "Passkey vereist",
+    "passkeyRequiredBody": "Raak je beveiligingssleutel aan of gebruik de authenticator van je platform om de aanmelding af te ronden.",
+    "tryPasskeyAgain": "Passkey opnieuw proberen",
+    "username": "Gebruikersnaam",
+    "password": "Wachtwoord",
+    "signingIn": "Aanmelden…",
+    "signIn": "Aanmelden"
+  },
+  "setup": {
+    "validation": {
+      "required": "Verplicht.",
+      "usernameTooShort": "Moet minstens {{n}} tekens bevatten.",
+      "usernameTooLong": "Mag maximaal {{n}} tekens bevatten.",
+      "usernameChars": "Alleen letters, cijfers, liggend streepje en koppelteken.",
+      "passwordTooShort": "Moet minstens {{n}} tekens bevatten.",
+      "email": "Lijkt geen e-mailadres."
+    },
+    "stepper": {
+      "aria": "Voortgang installatie",
+      "account": "Account",
+      "docker": "Docker",
+      "backend": "Backend"
+    },
+    "account": {
+      "submitErrorFallback": "Installatie mislukt; probeer opnieuw.",
+      "intro": "Welkom — laten we je controller-account aanmaken.",
+      "username": "Gebruikersnaam",
+      "usernameHelp": "Wordt gebruikt om aan te melden. Letters, cijfers, liggend streepje, koppelteken.",
+      "displayName": "Weergavenaam",
+      "password": "Beheerderswachtwoord",
+      "passwordHelp": "Minstens {{n}} tekens. Je kunt het later wijzigen.",
+      "email": "E-mail",
+      "optional": "(optioneel)",
+      "creating": "Aanmaken…",
+      "submit": "Account aanmaken"
+    },
+    "docker": {
+      "checking": "Docker wordt gecontroleerd…",
+      "probing": "Docker-daemon wordt onderzocht…",
+      "preflightFailed": "Kon het preflight-eindpunt niet bereiken.",
+      "retry": "Opnieuw proberen",
+      "skip": "Overslaan",
+      "lookingForPrereqs": "Zoeken naar vereisten…",
+      "reachable": "Docker is bereikbaar",
+      "serverVersion": "Serverversie:",
+      "continue": "Doorgaan",
+      "rechecking": "Opnieuw controleren…",
+      "recheck": "Opnieuw controleren",
+      "needed": "Docker is nodig voor beheerde inferentiebackends.",
+      "notDetected": "Docker Desktop niet gedetecteerd",
+      "notDetectedBody": "execlaw gebruikt Docker om de inferentiecontainers te starten die Whisper, Kokoro en je LLM uitvoeren. Zonder Docker kun je execlaw nog steeds naar een extern OpenAI-compatibel eindpunt wijzen, maar de ingebouwde backend-wizard kan dan geen containers voor je beheren.",
+      "installLink": "Docker Desktop installeren",
+      "installedRecheck": "Ik heb het geïnstalleerd, opnieuw controleren",
+      "skipForNow": "Voorlopig overslaan"
+    },
+    "backend": {
+      "intro": "Kies waar je Standaard chatmodel draait."
+    },
+    "hardware": {
+      "title": "Gedetecteerde hardware",
+      "none": "Geen ondersteunde GPU gedetecteerd. Sluit er een aan (of repareer de drivers) en klik op Vernieuwen, of sla over en gebruik hieronder een extern eindpunt.",
+      "refreshing": "Vernieuwen…",
+      "refresh": "Vernieuwen"
+    }
+  }
+}

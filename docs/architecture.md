@@ -119,7 +119,7 @@ The coordinator. Owns:
 - **Axum server** — REST + WebSocket surface for UI and plugins.
 - **Vault** — SQLCipher-encrypted secrets; master key from OS keyring.
 
-Deployed as a per-OS native binary (one of `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `x86_64-apple-darwin`, `aarch64-apple-darwin`). The `service-manager` crate registers it as a host service — systemd unit on Linux, launchd plist on macOS, Service Control Manager entry on Windows. State lives at `~/.execlaw/` (SQLite DB, master key, per-plugin sidecar volumes). No Docker image for the control plane itself; `execlaw install` migrates the DB, registers the service, and starts it.
+Deployed as a per-OS native binary, one of `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, or `aarch64-apple-darwin`. Intel Macs (`x86_64-apple-darwin`) are intentionally out of scope — the only macOS-specific code path that justifies a dedicated build is Metal-accelerated inference, which doesn't exist on Intel hardware. The `service-manager` crate registers the binary as a host service — systemd unit on Linux, launchd plist on macOS, Service Control Manager entry on Windows. State lives at `~/.execlaw/` (SQLite DB, master key, per-plugin sidecar volumes). No Docker image for the control plane itself; `execlaw install` migrates the DB, registers the service, and starts it.
 
 ### 4.2 Runner (one container *per active conversation*)
 
@@ -133,13 +133,15 @@ Thin Rust binary (`runner-local`). Speaks OpenAI-compatible API to whichever loc
 
 **Apple Silicon carve-out:** `service-ollama` runs as a host-native subprocess, not a Docker container. Docker Desktop on macOS executes containers inside a Linux microVM with no Metal passthrough — every container-bound inference engine on Mac falls back to CPU and loses the entire point of an Apple-GPU host. The same constraint affects every Metal-backed engine (llama.cpp Metal, Whisper.cpp Metal, MLX), so the control plane manages them as native subprocesses via `NativeServiceController` instead. vLLM is intentionally **not** supported on Apple Silicon — it has no Metal kernels and the CPU build is unusable for any LLM larger than a few billion parameters. See [`setup-mac.md`](setup-mac.md) for first-run setup. The "minimal containers" axiom (#12) still holds — it's the same principle expressed as "minimal native dependencies" because Apple Silicon doesn't offer a container-passthrough surface for the GPU.
 
-| Host class | Standard inference | Process model |
-|---|---|---|
-| Linux + NVIDIA | vLLM | Docker container, `--gpus` passthrough |
-| Linux + Intel Arc | vLLM-CPU / OpenVINO | Docker container, `/dev/dri` bind |
-| Windows + NVIDIA | vLLM (Docker Desktop) | Docker container, `--gpus` passthrough |
-| **macOS + Apple Silicon** | **Ollama** | **Native `ollama serve` subprocess** |
-| Any host, GPU-less | vLLM-CPU | Docker container, CPU-only |
+**Cross-OS Ollama support:** the `NativeServiceController` path is no longer Apple-Silicon-only. The discoverer (`discover_ollama`) probes well-known install locations on macOS (`/opt/homebrew/bin/ollama`), Linux (`/usr/local/bin/ollama` from the `curl|sh` installer, `/usr/bin/ollama` from distro packages), and Windows (`%USERPROFILE%\AppData\Local\Programs\Ollama\ollama.exe` from `winget` / standalone installer). When the binary is detected, the setup wizard surfaces "ollama" as an additional serving-method choice in the backend dropdown alongside the vendor's Docker-backed engines. Apple GPUs still get Ollama as the *only* option (no Metal-to-container passthrough exists); NVIDIA / Intel hosts get it as an alternative useful when Docker Desktop is misbehaving, `nvidia-container-toolkit` is missing, or the operator already has a populated Ollama model cache. See [`docs/ollama.md`](ollama.md) for the cross-OS discovery + dropdown behaviour.
+
+| Host class | Standard inference | Process model | Alternative |
+|---|---|---|---|
+| Linux + NVIDIA | vLLM | Docker container, `--gpus` passthrough | Native Ollama subprocess (CUDA) — surfaced when `ollama` is detected |
+| Linux + Intel Arc | vLLM-CPU / OpenVINO | Docker container, `/dev/dri` bind | Native Ollama subprocess — surfaced when `ollama` is detected |
+| Windows + NVIDIA | vLLM (Docker Desktop) | Docker container, `--gpus` passthrough | Native Ollama subprocess (CUDA) — surfaced when `ollama.exe` is detected |
+| **macOS + Apple Silicon** | **Ollama** | **Native `ollama serve` subprocess** | None (no Docker path on Mac) |
+| Any host, GPU-less | vLLM-CPU | Docker container, CPU-only | Native Ollama subprocess (CPU) — surfaced when `ollama` is detected |
 
 ### 4.4 Plugins (ZIP-installed extensions)
 

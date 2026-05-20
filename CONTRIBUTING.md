@@ -208,6 +208,14 @@ Same as [`AGENTS.md` §5](AGENTS.md). The high-impact ones:
 - **Migrations are append-only.** Add a new
   `crates/core/migrations/00NN_<change>.sql` — never edit existing
   ones.
+- **Never build SQL with `format!`** unless the interpolated value
+  comes from a closed enum of identifiers (e.g.
+  `ConfigTable::name() -> &'static str`). Use rusqlite's `?N`
+  positional or `:name` named parameters for anything user-supplied.
+  CI's `semgrep` job (advisory) flags `format!` near SQL verbs as
+  a regression guard; silence a confirmed-safe finding with
+  `// nosemgrep: <rule-id>` on the line above plus a one-line
+  reason. See [`.semgrep/rust-sql-format.yml`](.semgrep/rust-sql-format.yml).
 
 ---
 

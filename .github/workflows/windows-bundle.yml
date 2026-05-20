@@ -1,0 +1,213 @@
+name: Windows bundle
+
+# Build the execlaw NSIS .exe installer on every push to a release
+# tag, and also on-demand via workflow_dispatch (for ad-hoc dev
+# builds from any branch). Uploads the artefact so a maintainer can
+# attach it to the GitHub Release.
+#
+# We do NOT run this on every push — it's expensive (Tauri + Node +
+# Rust release build = ~15 min on windows-2022) and not relevant to
+# the vast majority of changes. The per-push CI matrix in ci.yml
+# already covers `x86_64-pc-windows-msvc` for compile + test signal.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or tag to build (defaults to the current ref)"
+        required: false
+        default: ""
+
+concurrency:
+  group: windows-bundle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bundle:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    permissions:
+      # `contents: write` is required by the release step to create
+      # a GitHub Release and upload the installer as an asset.
+      # workflow_dispatch runs (non-tag) just upload artifacts to
+      # the run; the release step is skipped via the `if:` guard.
+      contents: write
+      # `id-token: write` + `attestations: write` are required by
+      # `actions/attest-build-provenance@v2` so a downstream auditor
+      # can run `gh attestation verify execlaw_*-setup.exe --owner
+      # ${{ github.repository_owner }}` and confirm the artefact was
+      # built by this exact workflow at this exact commit.
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          # Tauri's `cargo tauri build` reads the version from
+          # tauri.conf.json; we don't need git history.
+          fetch-depth: 1
+
+      - name: Install Rust toolchain (MSVC host)
+        # `dtolnay/rust-toolchain@stable` installs the GitHub
+        # runner's default host triple by default — which on
+        # `windows-2022` happens to already be MSVC, but pin it
+        # explicitly so a future runner-image refresh that flips
+        # the default to GNU doesn't silently break the build.
+        # `tauri-winres` (pulled in by `tauri-build`) compiles
+        # against the HOST triple and uses `cfg!(target_env =
+        # "msvc")` to pick `rc.exe` vs `windres`; a GNU host
+        # picks `windres` and hits a path-handling bug.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          # One key per workflow + lockfile pair so an unrelated PR
+          # touching the cli crate doesn't poison the Tauri build's
+          # incremental compile.
+          shared-key: windows-bundle
+          workspaces: |
+            .
+            desktop-windows/src-tauri
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Tauri CLI
+        # Pin the CLI to Tauri 2.x. We pull from crates.io rather
+        # than the standalone tauri-cli npm package so the version
+        # is reproducible and doesn't drift on a Node minor bump.
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      - name: Install ImageMagick
+        # build-windows.ps1's icon-render step needs `magick` to
+        # render SVG -> ICO + SVG -> PNG. windows-2022 runners
+        # ship Chocolatey by default, so a one-line install works.
+        run: choco install -y --no-progress imagemagick.app
+
+      - name: Build bundle
+        shell: pwsh
+        run: ./scripts/build-windows.ps1
+
+      - name: Package plugin ZIPs
+        # Every plugin under `plugins\*\` with a parseable
+        # `plugin.toml` gets a `dist\<id>-<version>.zip` plus a
+        # SHA-256 sidecar. The build-windows.ps1 step above also
+        # invokes this so the same ZIPs land in the installer's
+        # `resources\plugins\`; running it again here is idempotent
+        # and gives us a clean `dist\` to attach to the Release.
+        shell: pwsh
+        run: ./scripts/package-plugins.ps1
+
+      - name: Locate bundle outputs
+        id: outputs
+        shell: pwsh
+        run: |
+          $bundleRoot = 'desktop-windows/src-tauri/target/x86_64-pc-windows-msvc/release/bundle'
+          $nsisDir = Join-Path $bundleRoot 'nsis'
+          if (-not (Test-Path $nsisDir)) {
+              Write-Output '::error::expected NSIS output dir at desktop-windows/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis - build-windows.ps1 failed silently?'
+              exit 1
+          }
+          $exe = Get-ChildItem -LiteralPath $nsisDir -Filter 'execlaw_*-setup.exe' |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $exe) {
+              Write-Output "::error::no execlaw_*-setup.exe under $nsisDir"
+              exit 1
+          }
+          "exe=$($exe.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: execlaw-windows-x64
+          path: ${{ steps.outputs.outputs.exe }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload plugin ZIPs
+        # Bundle all plugin ZIPs into a single workflow artifact
+        # (so a `gh run download` grabs them in one shot) AND
+        # attach them individually to the GitHub Release below.
+        uses: actions/upload-artifact@v4
+        with:
+          name: execlaw-plugins-windows
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: warn
+          retention-days: 90
+
+      # ----- Provenance attestation -----
+      # `actions/attest-build-provenance@v2` produces a verifiable
+      # in-toto SLSA provenance statement linking the artifact's
+      # SHA-256 to this workflow run. Stored on GitHub; an end user
+      # can `gh attestation verify <file> --owner
+      # ${{ github.repository_owner }}` to confirm the artifact came
+      # from this repo + this exact workflow. Free, no secrets, no
+      # setup. Runs on every build (workflow_dispatch + tag) so
+      # dev-ad-hoc downloads are also verifiable.
+      - name: Attest installer provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.outputs.outputs.exe }}
+
+      - name: Attest plugin ZIP provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          # Glob-supported — each ZIP gets its own attestation.
+          subject-path: "dist/*.zip"
+
+      # ----- Release path -----
+      # The remaining steps only fire on a tag push. workflow_dispatch
+      # runs (manual ad-hoc builds) skip them — those builds just
+      # leave the installer as a workflow artifact for the maintainer
+      # to grab. This guard keeps "test the bundle on a branch" cheap
+      # while still cutting a real Release on `git push --tags`.
+      - name: Compute SHA256 of installer
+        id: checksum
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $exe = '${{ steps.outputs.outputs.exe }}'
+          $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $basename = Split-Path $exe -Leaf
+          # Format mirrors `shasum -a 256` output so a downstream
+          # `shasum -a 256 -c <name>.sha256` (or `Get-FileHash`)
+          # verifies cleanly.
+          Set-Content -LiteralPath "$exe.sha256" -Value "$hash  $basename" -Encoding ascii -NoNewline
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          "sha_file=$exe.sha256" >> $env:GITHUB_OUTPUT
+
+      - name: Update GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        # softprops/action-gh-release tolerates an existing release
+        # — the macOS-bundle workflow creates the release entry as a
+        # draft, then this workflow adds the Windows artefacts to
+        # the same release. Tag-name dedup happens server-side.
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: false
+          generate_release_notes: false
+          name: "execlaw ${{ github.ref_name }}"
+          # Append-only — uploads new files to the existing draft
+          # release without overwriting the macOS-side notes.
+          files: |
+            ${{ steps.outputs.outputs.exe }}
+            ${{ steps.checksum.outputs.sha_file }}
+            dist/*.zip
+            dist/*.zip.sha256
+          fail_on_unmatched_files: true

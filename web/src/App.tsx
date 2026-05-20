@@ -11,6 +11,7 @@ import { Login } from "./routes/Login";
 import { RequireSetupComplete } from "./routes/RequireSetupComplete";
 import { Research } from "./routes/Research";
 import { Routines } from "./routes/Routines";
+import { Automations } from "./routes/Automations";
 import { SetupWizard } from "./routes/SetupWizard";
 import { Skills } from "./routes/Skills";
 import { Settings } from "./settings/Settings";
@@ -100,6 +101,22 @@ export function App() {
                         element={
                             <RequireSetupComplete>
                                 <Routines />
+                            </RequireSetupComplete>
+                        }
+                    />
+                    <Route
+                        path="/automations"
+                        element={
+                            <RequireSetupComplete>
+                                <Automations />
+                            </RequireSetupComplete>
+                        }
+                    />
+                    <Route
+                        path="/automations/:id"
+                        element={
+                            <RequireSetupComplete>
+                                <Automations />
                             </RequireSetupComplete>
                         }
                     />

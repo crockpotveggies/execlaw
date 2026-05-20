@@ -28,7 +28,7 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, NSObject};
-use objc2::{class, msg_send, msg_send_id};
+use objc2::{msg_send, msg_send_id};
 use objc2_foundation::{NSError, NSString};
 
 /// Mirrors `SMAppServiceStatus` from `<ServiceManagement/SMAppService.h>`.
@@ -89,7 +89,9 @@ fn sm_class() -> Option<&'static AnyClass> {
     // `class!` panics if the class is missing. We need a non-panic
     // lookup so an older macOS doesn't crash the tray. Use the raw
     // runtime function via `objc2::runtime::AnyClass::get`.
-    AnyClass::get(c"SMAppService")
+    // objc2 0.5.x takes `&str`; the c"..." CStr literal form is a
+    // 0.6+ API. Pin in Cargo.toml is "0.5", so use the str form.
+    AnyClass::get("SMAppService")
 }
 
 /// Build an `SMAppService` for the bundled LaunchAgent at

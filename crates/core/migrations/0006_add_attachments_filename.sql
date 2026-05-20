@@ -1,0 +1,24 @@
+-- 2026-05-18 — add `filename` column to state_attachments.
+--
+-- Previously the table tracked an attachment's blob via path + sha256
+-- but had no operator-facing name. For inbound transports the original
+-- filename was carried in the message-card payload only; for the
+-- python-sandbox plugin's hydration flow (Phase 3) the kernel needs to
+-- see uploaded files at /work/<convo>/uploads/<filename> with their
+-- ORIGINAL name, not the sha256-hex blob name. Without this column the
+-- agent would see opaque hex filenames in its workspace.
+--
+-- Nullable so:
+--   1. Existing rows survive without a backfill pass (their filename
+--      lives in card payloads; chats.rs may eventually backfill, may
+--      not — either way the hydration path falls back to a derived
+--      default when filename is NULL).
+--   2. Pre-2026-05-18 ingest paths that haven't been updated yet
+--      keep working — the column defaults to NULL on insert.
+--
+-- The companion `ArtifactRow.filename` already exists on
+-- `state_artifacts` (added pre-baseline); this migration just brings
+-- `state_attachments` to parity so the python-sandbox plugin's
+-- hydration code can treat inbound + outbound files uniformly.
+
+ALTER TABLE state_attachments ADD COLUMN filename TEXT;

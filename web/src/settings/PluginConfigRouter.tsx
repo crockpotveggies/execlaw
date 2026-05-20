@@ -33,6 +33,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import Button from "react-bootstrap/Button";
 import Spinner from "react-bootstrap/Spinner";
 import {
+    getSetupPreflight,
     listPlugins,
     uninstallPlugin,
     type PluginSummary,
@@ -71,6 +72,16 @@ export function PluginConfigRouter() {
     );
     const [error, setError] = useState<string | null>(null);
     const [uninstalling, setUninstalling] = useState(false);
+    // Docker availability — fetched lazily ONLY when the loaded
+    // plugin declares sidecars (manifest has `[[services]]`). On
+    // Apple-Silicon installs the setup wizard auto-skips the
+    // Docker step, so the operator finishes setup with no Docker
+    // check; if they then install a plugin like python-sandbox
+    // that needs Docker, the sidecar would silently fail to spawn
+    // with no SPA signal. The banner below makes the mismatch
+    // explicit. `null` = not yet probed; `true` / `false` are the
+    // resolved states.
+    const [dockerAvailable, setDockerAvailable] = useState<boolean | null>(null);
 
     const refresh = useCallback(async () => {
         try {
@@ -87,6 +98,41 @@ export function PluginConfigRouter() {
     useEffect(() => {
         void refresh();
     }, [refresh]);
+
+    // Probe Docker only when we know the plugin needs it. Older
+    // server builds may omit `has_sidecars`; treat undefined as
+    // false so we don't spam preflight for plugins that don't
+    // need the check.
+    useEffect(() => {
+        if (
+            summary === "loading" ||
+            summary === null ||
+            !summary.has_sidecars
+        ) {
+            return;
+        }
+        let cancelled = false;
+        void (async () => {
+            try {
+                const p = await getSetupPreflight(getAccessToken);
+                if (!cancelled) {
+                    setDockerAvailable(p.docker.available === true);
+                }
+            } catch {
+                // Preflight failure isn't fatal — leave the banner
+                // off and let the operator find out via the
+                // sidecar status block instead. Better than a
+                // spurious "Docker missing" claim when the real
+                // failure is /api/admin/setup/preflight itself.
+                if (!cancelled) {
+                    setDockerAvailable(null);
+                }
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [summary, getAccessToken]);
 
     const onUninstall = useCallback(async () => {
         if (
@@ -137,6 +183,54 @@ export function PluginConfigRouter() {
                     </>
                 )}
             </div>
+
+            {/* Docker-required warning. Renders only when we
+                confirmed (a) the plugin's manifest declares
+                sidecars AND (b) preflight reported Docker
+                unavailable. The wizard auto-skips the Docker step
+                on Apple Silicon (Ollama runs natively, no
+                Metal-in-container path), so an operator who later
+                installs a sidecar-bearing plugin would otherwise
+                get no signal. */}
+            {summary &&
+                summary !== "loading" &&
+                summary.has_sidecars === true &&
+                dockerAvailable === false && (
+                    <div
+                        className="execlaw-card mb-3 border border-warning-subtle"
+                        data-testid="plugin-config-docker-missing"
+                    >
+                        <div className="execlaw-card__title text-warning d-flex align-items-center">
+                            <i
+                                className="bi bi-exclamation-triangle-fill me-2"
+                                aria-hidden
+                            />
+                            Docker is required for this plugin
+                        </div>
+                        <div className="execlaw-muted small mb-2">
+                            <strong>{id}</strong> declares one or more sidecar
+                            containers in its manifest. execlaw spawns those
+                            sidecars via Docker, but the Docker daemon is not
+                            reachable on this host. The plugin&rsquo;s panel
+                            below will load, but any feature that depends on
+                            the sidecar will fail until Docker is running.
+                        </div>
+                        <div className="execlaw-muted small">
+                            Apple Silicon note: the setup wizard skips Docker
+                            because the inference path uses Ollama natively.
+                            Sidecar plugins still need Docker Desktop or an
+                            equivalent runtime — install it from{" "}
+                            <a
+                                href="https://www.docker.com/products/docker-desktop/"
+                                target="_blank"
+                                rel="noreferrer noopener"
+                            >
+                                docker.com
+                            </a>{" "}
+                            and restart execlaw to pick it up.
+                        </div>
+                    </div>
+                )}
 
             {/* Plugin-supplied content. */}
             {!idLooksValid ? (

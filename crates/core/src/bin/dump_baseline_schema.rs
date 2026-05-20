@@ -190,7 +190,12 @@ fn main() {
         );
         for (table, _) in &tables {
             // Count rows; emit INSERTs only for non-empty tables.
+            // `{table}` was pulled from `sqlite_schema` by the
+            // earlier SELECT — i.e. a name we ourselves wrote in a
+            // migration. Wrapped in double-quote identifier
+            // delimiters for paranoia. Dev binary; not shipped.
             let count: i64 =
+                // nosemgrep: rust-sql-format-interpolation, rust-rusqlite-format-arg
                 c.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |r| {
                     r.get(0)
                 })?;
@@ -198,7 +203,11 @@ fn main() {
                 continue;
             }
 
-            // Pull column names for ordered INSERTs.
+            // Pull column names for ordered INSERTs. PRAGMA
+            // table_info() requires the table name inline
+            // (placeholders don't substitute in PRAGMA). Same
+            // closed-set + identifier-quoting rationale as above.
+            // nosemgrep: rust-rusqlite-format-arg
             let mut col_stmt = c.prepare(&format!("PRAGMA table_info(\"{table}\")"))?;
             let cols: Vec<String> = col_stmt
                 .query_map([], |r| r.get::<_, String>(1))?

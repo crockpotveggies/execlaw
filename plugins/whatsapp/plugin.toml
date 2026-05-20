@@ -175,18 +175,20 @@ path = "/unregister-account"
 handler = "admin_unregister_account"
 description = "Unlink this execlaw install from the paired WhatsApp account."
 
-# ===== Webhook routes (PUBLIC, unauthenticated) ==================
+# ===== Webhook routes (PUBLIC, host-authenticated) ===============
 # wuzapi has no WS event surface — it delivers Message events by
 # POSTing to a webhook URL the plugin registers via /webhook on
-# enable. These routes are mounted under
-# /api/webhooks/whatsapp{path} with NO host-level auth; the
-# handlers validate a per-install secret token in the URL query
-# before accepting the request.
+# enable. The route is mounted under /api/webhooks/whatsapp/event;
+# the host validates the `?token=` query param against the per-
+# install secret in the vault row `webhook_secret` BEFORE
+# publishing the request to the automation bus or invoking the
+# Rhai handler. The handler also re-checks as defense in depth.
 [[webhook_routes]]
 method = "POST"
 path = "/event"
 handler = "on_webhook_event"
-description = "wuzapi POSTs Message events here. Validates the ?token= query param against the vault-stored webhook_secret before accepting."
+description = "wuzapi POSTs Message events here. Host validates ?token= against vault[whatsapp][webhook_secret]; handler re-checks defensively."
+auth = { kind = "query_token", query = "token", vault_key = "webhook_secret" }
 
 # SPA settings page mount.
 [[ui_panels]]

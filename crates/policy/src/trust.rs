@@ -145,6 +145,86 @@ const CAPS_DELEGATED: &[&str] = &[
     "controller.ask",
 ];
 
+/// Map a built-in tool descriptor's [`Capability`] to the policy-issued
+/// capability tag(s) a caller must hold to invoke a tool that declares
+/// it. Returns a `&'static [&'static str]` so the dispatch hot path
+/// never allocates.
+///
+/// The mapping is the formal bridge between the closed-set
+/// `core::tool::Capability` enum (what tools say they need) and the
+/// policy's free-form `capability_set` tags (what callers are issued).
+/// Pre-fix the two namespaces lived in parallel with no comparison
+/// possible — `caller_caps` only reached plugin host dispatch
+/// (`PluginHost::call_tool`), so a `KnownLimited` caller invoking a
+/// built-in tool got the matching capability API populated regardless
+/// of policy. With this mapping, `tool_dispatch::dispatch` can reject
+/// before the built-in's side effect.
+///
+/// "*" in `caller_caps` (Controller wildcard) satisfies any requirement.
+/// An empty slice means "no policy capability gates this tool" —
+/// the `config_tool_access` row's `allowed_classes` is the sole gate.
+pub fn required_policy_caps(c: execlaw_core::tool::Capability) -> &'static [&'static str] {
+    use execlaw_core::tool::Capability::*;
+    match c {
+        // Conversation/task/schedule reads + writes are part of the
+        // "safe tools" tier — KnownTrusted+ contacts and Controller.
+        ConversationRead | ConversationWrite => &["tools.safe"],
+        TaskRead | TaskWrite => &["tools.safe"],
+        ScheduleRead | ScheduleWrite => &["tools.safe"],
+        // Memory is its own pair of policy caps — `KnownTrusted`
+        // gets both, `KnownLimited` gets neither, `Controller` "*".
+        MemoryRead => &["memory.read"],
+        MemoryWrite => &["memory.write"],
+        // Outbound HTTP / search / notify / file-send are "safe tier".
+        WebFetch => &["tools.safe"],
+        Search => &["tools.safe"],
+        Notify => &["tools.safe"],
+        AttachmentSend => &["tools.safe"],
+        // Reading a research job's status is a safe operation; spawning
+        // is a "medium" operation (it can fan out external HTTP fetches
+        // for hours). Delegated contacts and Controller can spawn.
+        ResearchRead => &["tools.safe"],
+        ResearchSpawn => &["tools.medium"],
+        // Spawning a sub-agent is a "medium" — it runs an LLM call
+        // with the spawner's capability set, so the spawner needs to
+        // actually be allowed to do non-trivial things.
+        SubagentSpawn => &["tools.medium"],
+        // Transport dispatch (signal.send_message etc.) is safe-tier;
+        // per-plugin `trust_floor` and per-conversation routing add
+        // additional gates downstream.
+        Transport => &["tools.safe"],
+        // MCP admin: Controller-only. Wildcard required.
+        McpAdmin => &["*"],
+    }
+}
+
+/// Verify that `caller_caps` covers every required policy cap for a
+/// given built-in `Capability`. `"*"` in `caller_caps` satisfies any
+/// requirement (Controller wildcard).
+///
+/// Returns `Ok(())` on success; on failure returns the first cap that
+/// the caller is missing — useful for the rejection message
+/// (`"denied: capability 'memory.write' not granted"`).
+pub fn check_builtin_capability<'a>(
+    capability: execlaw_core::tool::Capability,
+    caller_caps: &'a [&'a str],
+) -> Result<(), &'static str> {
+    if caller_caps.contains(&"*") {
+        return Ok(());
+    }
+    for required in required_policy_caps(capability) {
+        if *required == "*" {
+            // Capability is Controller-only and caller lacks the
+            // wildcard (we already returned above when present).
+            return Err(*required);
+        }
+        if !caller_caps.iter().any(|c| c == required) {
+            return Err(*required);
+        }
+    }
+    Ok(())
+}
+
 /// The main evaluator. Pure; returns its decision, never mutates state.
 pub fn evaluate_turn(input: TurnPolicyInput) -> TurnPolicyDecision {
     // Blocked senders: message never reaches the agent.
@@ -428,6 +508,102 @@ mod tests {
         assert_eq!(TrustLevel::parse("Admin"), None);
         assert_eq!(TrustLevel::parse(""), None);
         assert_eq!(TrustLevel::parse("controller"), None, "case-sensitive");
+    }
+
+    /// 2026-05-16 — built-in capability gate. `check_builtin_capability`
+    /// is the bridge between the `core::tool::Capability` enum a tool
+    /// declares and the `TurnPolicyDecision.capability_set` tags the
+    /// dispatcher gets per-turn. Pre-fix the dispatch path checked
+    /// `config_tool_access.allowed_classes` but completely ignored
+    /// `capability_set` for built-ins, so a KnownLimited caller
+    /// invoking a Memory built-in would get the API populated and
+    /// silently write memory.
+    #[test]
+    fn check_builtin_capability_grants_wildcard_caller_anything() {
+        use execlaw_core::tool::Capability;
+        let caps = ["*"];
+        for c in [
+            Capability::MemoryRead,
+            Capability::MemoryWrite,
+            Capability::McpAdmin,
+            Capability::SubagentSpawn,
+        ] {
+            assert!(
+                check_builtin_capability(c, &caps).is_ok(),
+                "Controller wildcard must satisfy any built-in capability ({c:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn check_builtin_capability_blocks_known_limited_from_memory() {
+        use execlaw_core::tool::Capability;
+        // The KnownLimited tier issues only `messaging.reply_current_transport`.
+        let caps = ["messaging.reply_current_transport"];
+        assert_eq!(
+            check_builtin_capability(Capability::MemoryRead, &caps),
+            Err("memory.read"),
+            "KnownLimited callers must NOT be able to invoke memory.read built-ins",
+        );
+        assert_eq!(
+            check_builtin_capability(Capability::MemoryWrite, &caps),
+            Err("memory.write"),
+        );
+        assert_eq!(
+            check_builtin_capability(Capability::WebFetch, &caps),
+            Err("tools.safe"),
+            "KnownLimited lacks tools.safe — web fetch built-in is gated"
+        );
+    }
+
+    #[test]
+    fn check_builtin_capability_allows_known_trusted_memory_and_safe_tools() {
+        use execlaw_core::tool::Capability;
+        let caps = [
+            "messaging.reply_current_transport",
+            "memory.read",
+            "memory.write",
+            "tools.safe",
+        ];
+        assert!(check_builtin_capability(Capability::MemoryRead, &caps).is_ok());
+        assert!(check_builtin_capability(Capability::MemoryWrite, &caps).is_ok());
+        assert!(check_builtin_capability(Capability::WebFetch, &caps).is_ok());
+        assert!(check_builtin_capability(Capability::Search, &caps).is_ok());
+        // No tools.medium → research spawn / subagent spawn denied.
+        assert_eq!(
+            check_builtin_capability(Capability::ResearchSpawn, &caps),
+            Err("tools.medium"),
+        );
+        assert_eq!(
+            check_builtin_capability(Capability::SubagentSpawn, &caps),
+            Err("tools.medium"),
+        );
+        // McpAdmin is Controller-only (requires "*") and KnownTrusted
+        // doesn't have it.
+        assert_eq!(
+            check_builtin_capability(Capability::McpAdmin, &caps),
+            Err("*"),
+        );
+    }
+
+    #[test]
+    fn check_builtin_capability_allows_delegated_medium_tier() {
+        use execlaw_core::tool::Capability;
+        let caps = [
+            "messaging.reply_current_transport",
+            "memory.read",
+            "memory.write",
+            "tools.safe",
+            "tools.medium",
+            "controller.ask",
+        ];
+        assert!(check_builtin_capability(Capability::ResearchSpawn, &caps).is_ok());
+        assert!(check_builtin_capability(Capability::SubagentSpawn, &caps).is_ok());
+        // Still no McpAdmin without "*".
+        assert_eq!(
+            check_builtin_capability(Capability::McpAdmin, &caps),
+            Err("*"),
+        );
     }
 
     /// Rule of Two must count "untrusted" as effective_trust BELOW

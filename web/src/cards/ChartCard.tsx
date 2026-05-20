@@ -19,8 +19,9 @@
 // output, not user data, so dangerouslySetInnerHTML is safe) and
 // adds a "PNG" download chip pointing at the persisted artifact.
 
-import { useContext } from "react";
+import { useContext, useEffect, useState } from "react";
 import { AuthContext } from "../auth/AuthContext";
+import { signDownloadUrl } from "../api/signedDownloadUrl";
 import { registerCardRenderer, type CardRendererProps } from "./CardRenderer";
 
 interface ChartDetails {
@@ -50,19 +51,31 @@ export function ChartCard({ card }: CardRendererProps) {
     const title = details?.title || card.title || null;
     const filename = details?.filename ?? "chart.png";
 
-    // Build the download URL with `?access_token=` so the browser's
-    // link-navigation to `/api/attachments/<id>` authenticates
-    // (browsers don't carry the Authorization header on
-    // `<a download>` requests). Same pattern as AttachmentCard.
+    // 2026-05-19 — ask the server for a signed URL instead of
+    // pasting a raw JWT in the query string. See AttachmentCard
+    // for the why.
     const baseUrl =
         details?.download_url ??
         (attachmentId ? `/api/attachments/${attachmentId}` : null);
-    const token = auth?.getAccessToken() ?? null;
-    const downloadUrl = baseUrl
-        ? token
-            ? `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}access_token=${encodeURIComponent(token)}`
-            : baseUrl
-        : null;
+    const getToken = auth?.getAccessToken;
+    const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+    useEffect(() => {
+        if (!baseUrl || !getToken) {
+            setDownloadUrl(null);
+            return;
+        }
+        let cancelled = false;
+        signDownloadUrl(baseUrl, getToken)
+            .then((u) => {
+                if (!cancelled) setDownloadUrl(u);
+            })
+            .catch(() => {
+                if (!cancelled) setDownloadUrl(null);
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [baseUrl, getToken]);
 
     return (
         <figure

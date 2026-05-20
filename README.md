@@ -21,8 +21,12 @@ hardware.
 | [`docs/agent-model.md`](docs/agent-model.md) | TurnExecutor, memory layers, reflection loop, planner/executor split — the **how** of one turn. |
 | [`docs/plugins.md`](docs/plugins.md) | Plugin manifest schema, runtime tiers, sidecar model, Rhai primitives, and a step-by-step guide for writing a custom plugin. |
 | [`docs/setup-walkthroughs.md`](docs/setup-walkthroughs.md) | Operator-facing pairing flows for Signal QR, WhatsApp wuzapi, Slack OAuth, Google OAuth + API-key. |
+| [`docs/desktop-installations.md`](docs/desktop-installations.md) | Cross-OS reference for the three desktop bundles — `.app`/`.dmg`, NSIS `.exe`, `.deb`. Tray architecture, service-manager mapping, install + uninstall flows, build scripts. |
+| [`docs/ollama.md`](docs/ollama.md) | Pre-installed Ollama support across macOS / Linux / Windows. How discovery works, when to pick Ollama over Docker, the wizard's serving dropdown. |
 | [`docs/setup-mac.md`](docs/setup-mac.md) | Apple Silicon first-run notes — native Ollama subprocess, model sizing, brand indicator. |
 | [`desktop-macos/README.md`](desktop-macos/README.md) | macOS `.app` bundle internals — Tauri 2, SMAppService, build script. |
+| [`desktop-windows/README.md`](desktop-windows/README.md) | Windows NSIS `.exe` bundle internals — Tauri 2, SCM service, build script. |
+| [`desktop-linux/README.md`](desktop-linux/README.md) | Linux `.deb` bundle internals — Tauri 2, systemd `--user` unit, build script. |
 | [`docs/security.md`](docs/security.md) | Disclosure path, threat model, cryptography, trust assumptions, known limitations, hardening checklist. |
 | [`docs/sidecar-supervisor-design.md`](docs/sidecar-supervisor-design.md) | Supervised-container layer plugins compose against. |
 | [`docs/runner-design.md`](docs/runner-design.md) | Per-conversation runner container model. |
@@ -41,8 +45,8 @@ hardware.
 - **Five shipped transports**: Signal (signal-cli sidecar), WhatsApp (wuzapi sidecar), Slack (multi-workspace Socket Mode OAuth), Discord (multi-guild Gateway WebSocket), SMS (Android-gateway WebSocket).
 - **HTTP integrations**: Google Apps (Gmail/Calendar/Contacts/Tasks/Drive in one OAuth), Google Places, Open-Meteo (key-less weather), Yahoo Finance (market data), Pushover.
 - **Research subsystem**: deep-research plan/gather/synthesize pipeline with retention and per-phase event flow.
-- **SPA**: chat-first sidebar, pinned Control thread (every controller-channel message collapses here), token streaming, approval queue, per-plugin admin panels, settings.
-- **Native macOS app** (Apple Silicon): menu bar `.app` bundle, SMAppService-managed LaunchAgent, drag-to-Trash uninstall — see [Install on macOS](#install-on-macos-apple-silicon--menu-bar-app).
+- **SPA**: chat-first sidebar, pinned Control thread (every controller-channel message collapses here), token streaming, approval queue, per-plugin admin panels, settings. **i18n out of the box** — 8 languages (EN / ES / FR / DE / IT / NL / PL / PT), browser-locale auto-detection on first run, language switcher in the setup wizard and persisted to `localStorage`. See [Internationalisation (i18n)](#internationalisation-i18n) below.
+- **Native desktop bundles** for all three desktops — `.app`/`.dmg` on macOS (Apple Silicon, SMAppService LaunchAgent), NSIS `.exe` on Windows (SCM service), `.deb` on Linux (systemd `--user` unit). Each ships a tray icon, the bundled control plane, and the same SPA on `127.0.0.1:3031`. See [Desktop installations](#desktop-installations) below and [`docs/desktop-installations.md`](docs/desktop-installations.md) for the full cross-OS reference.
 
 See [`docs/architecture.md` §18](docs/architecture.md) for the full milestone breakdown.
 
@@ -69,6 +73,60 @@ Tools, host-side built-ins, and the manifest schema are documented in [`docs/plu
 
 ---
 
+## Internationalisation (i18n)
+
+The SPA ships with eight languages built in:
+
+| Code | Language |
+|---|---|
+| `en` | English (the source-of-truth defaults, inline in JSX) |
+| `es` | Español |
+| `fr` | Français |
+| `de` | Deutsch |
+| `it` | Italiano |
+| `nl` | Nederlands |
+| `pl` | Polski |
+| `pt` | Português |
+
+**How language gets picked.** On first load the SPA checks
+`localStorage["execlaw.preferred-language"]`; if absent it falls back
+to `navigator.language` (when that's one of the supported codes) and
+finally to English. The setup wizard renders a compact globe-icon
+language switcher in the top-right corner so the operator can flip
+languages before they've committed to anything — the choice is
+persisted to `localStorage` and applied to every subsequent visit.
+
+**How translations work in the code.** English defaults live inline
+in the React source via `t("namespace.key", "English default string")`
+— the same pattern as the upstream business website. Other locale
+bundles (`web/src/locales/<lang>.json`) are lazily code-split: only
+the active language's JSON is fetched. When a key is missing from a
+non-English bundle, `t()` silently falls back to the English default,
+so a partial translation can ship without surfacing empty UI strings.
+`{{var}}`-style interpolation works the same on the English path and
+the translated path.
+
+**Implementation reference.** Core: [`web/src/i18n/index.ts`](web/src/i18n/index.ts)
+(i18next bootstrap, lazy-loader registry, `t()` helper,
+`useT()` / `useCurrentLanguage()` React hooks). UI:
+[`web/src/i18n/LanguageSwitcher.tsx`](web/src/i18n/LanguageSwitcher.tsx).
+Locale bundles: [`web/src/locales/`](web/src/locales/).
+
+**Adding a new language.** Add the ISO code to `SUPPORTED_LANGUAGES`
+in `web/src/i18n/index.ts`, register a lazy-loader entry in
+`localeLoaders`, add an `OPTIONS` row in
+`web/src/i18n/LanguageSwitcher.tsx`, and drop a
+`web/src/locales/<code>.json` keyed by the same `namespace.key`
+strings the JSX passes to `t()`.
+
+**Not yet i18n-ized.** Server-side strings (CLI output, log lines,
+plugin-author-facing error messages) are English-only. The
+translation surface is the operator-facing SPA UI; the operator
+talks to the agent in whatever language they want — the LLM
+handles that end on its own.
+
+---
+
 ## Minimum requirements
 
 execlaw is **self-hosted by design** — there is no SaaS tier, no cloud
@@ -80,12 +138,12 @@ floor is set by the LLM you choose to run, not by execlaw itself.
 
 | Platform | Status | Recommended install | Service backend |
 |---|---|---|---|
-| Linux x86_64 (Ubuntu 22.04+, Debian 12+, Fedora 39+, Arch, …) | Supported | `execlaw install` (CLI) | systemd |
+| Linux x86_64 (Ubuntu 22.04+, Debian 12+, Mint 21+, Pop_OS! 22.04+) | Supported | **`execlaw_<v>_amd64.deb`** (Debian-family desktop) or `execlaw install` (CLI / non-Debian) | systemd `--user` (`.deb`) / systemd (CLI) |
 | macOS arm64 (Apple Silicon, M1+) | Supported | **`execlaw.app` menu bar bundle** | launchd via SMAppService |
 | macOS x86_64 (Intel) | Supported | `execlaw install` (CLI) | launchd |
-| Windows 10 / 11 (x86_64, MSVC toolchain) | Supported | `execlaw install` (CLI) | Service Control Manager |
+| Windows 10 / 11 (x86_64, MSVC toolchain) | Supported | **`execlaw_<v>_x64-setup.exe`** (NSIS) or `execlaw install` (CLI / headless) | Service Control Manager |
 
-The CLI path uses the [`service-manager`](https://crates.io/crates/service-manager) crate. On Apple Silicon the recommended path is the [menu bar `.app`](#install-on-macos-apple-silicon--menu-bar-app), which registers the LaunchAgent via Apple's `SMAppService` API so dragging the app to Trash automatically cleans up the service. The CLI install still works for headless Macs.
+The CLI path uses the [`service-manager`](https://crates.io/crates/service-manager) crate. For desktop installs the recommended path is the OS-native bundle — `.app` on Apple Silicon, NSIS `.exe` on Windows, `.deb` on Debian-family Linux — each registers the background service through that OS's native API (`SMAppService` / SCM / systemd `--user`) so install + uninstall stay self-contained. See [Desktop installations](#desktop-installations). CLI install still works on headless servers (and is the only path on non-Debian Linux and Intel Macs).
 
 ### GPU / inference acceleration
 
@@ -94,10 +152,11 @@ in-tree default is **Qwen3.5-27B-AWQ** (~14 GB VRAM for weights + a
 working KV cache budget for ~8K-token contexts). Two acceleration paths
 are supported out-of-the-box:
 
-| Path | Hardware | Backend container | Typical floor |
+| Path | Hardware | Backend | Typical floor |
 |---|---|---|---|
-| **NVIDIA CUDA** | RTX 30-series or newer with **≥16 GB VRAM** | `service-vllm` (vLLM) | RTX 4090 / 3090 / A4000 |
-| **Intel Arc / Xeon** | Arc A770 / B580, Battlemage, Xeon w/ AMX | `service-openarc` (OpenVINO) | Arc A770 16 GB |
+| **NVIDIA CUDA** | RTX 30-series or newer with **≥16 GB VRAM** | `service-vllm` (vLLM, Docker) or native Ollama | RTX 4090 / 3090 / A4000 |
+| **Intel Arc / Xeon** | Arc A770 / B580, Battlemage, Xeon w/ AMX | `service-openarc` (OpenVINO, Docker) or native Ollama | Arc A770 16 GB |
+| **Apple Silicon** | M1 / M2 / M3 / M4 with 16+ GB unified memory | native Ollama subprocess (Metal) | M2 / M3 base 16 GB |
 
 CPU-only inference is technically possible via llama.cpp or similar
 sidecars, but at 27B-AWQ the latency makes the agent loop unusable.
@@ -136,6 +195,11 @@ can pin each backend per-card via Settings → Runners.
   a native subprocess** on Apple Silicon instead — see
   [`docs/setup-mac.md`](docs/setup-mac.md). Docker is still needed for
   the bridged-transport sidecars (signal-cli, wuzapi).
+  *Cross-OS Ollama support:* the native-subprocess path also works on
+  Linux and Windows when `ollama` is installed on the host. The setup
+  wizard discovers it automatically and offers it as an alternative
+  serving method alongside vLLM / OpenVINO. See
+  [`docs/ollama.md`](docs/ollama.md) for when to pick which.
 - **An NVIDIA or Intel GPU driver stack** matching the inference path
   you choose — CUDA 12+ runtime for NVIDIA, the OpenVINO drivers for
   Intel. Both are normally installed alongside the GPU; `execlaw doctor`
@@ -191,53 +255,96 @@ open  http://127.0.0.1:3031/api/docs     # Swagger + AsyncAPI
 Windows the Service Control Manager always runs system-level, so
 `--system` is implied.
 
-### Install on macOS (Apple Silicon) — menu bar app
+### Desktop installations
 
-For desktop Macs the recommended path is the menu bar `.app`. It
-bundles the same server binary as the CLI install above, but
-registers the LaunchAgent through Apple's modern `SMAppService`
-API — which means **dragging the `.app` to the Trash
-automatically removes the background service.** No leftover plist
-in `~/Library/LaunchAgents/`, no manual cleanup.
+For desktop hosts the recommended path is the OS-native bundle.
+Each one ships a tray / menu-bar icon plus the same bundled control
+plane, and each registers the background service through that OS's
+native API so install + uninstall stay self-contained. Full
+cross-OS reference: [`docs/desktop-installations.md`](docs/desktop-installations.md).
 
-1. Download the latest `execlaw_<version>_aarch64.dmg` from
+#### macOS (Apple Silicon) — menu bar `.app`
+
+Registers a LaunchAgent through Apple's modern `SMAppService` API,
+so **dragging the `.app` to the Trash automatically removes the
+background service** — no leftover plist in `~/Library/LaunchAgents/`.
+
+1. Download `execlaw_<version>_aarch64.dmg` from
    [Releases](https://github.com/justinelgenlong/execlaw/releases).
-2. Open the `.dmg` and drag **execlaw** to `/Applications`.
-3. **First launch** — because the build is unsigned, Gatekeeper
-   refuses a double-click. Right-click execlaw → *Open* → confirm
-   in the dialog. macOS remembers the exception for subsequent
-   launches.
-4. The menu bar icon appears. The first time, macOS may surface
-   *Background Items Added* — that's `SMAppService` registering
-   the LaunchAgent. Approve in *System Settings → General →
-   Login Items & Extensions → Allow in Background* if prompted
-   (the tray's status row links you there).
-5. Click the menu bar icon → *Open execlaw*. The SPA loads from
-   the local server on `127.0.0.1:3031` and walks you through
-   first-run setup.
+2. Open `.dmg` → drag **execlaw** to `/Applications`.
+3. First launch: right-click execlaw → *Open* (the build is
+   unsigned, so a plain double-click hits Gatekeeper). macOS
+   remembers the exception.
+4. macOS surfaces *Background Items Added* the first time —
+   that's `SMAppService` registering the LaunchAgent. Approve in
+   *System Settings → General → Login Items & Extensions* if
+   prompted (the tray's status row links you there).
+5. Menu bar icon → *Open execlaw* → SPA loads on
+   `http://127.0.0.1:3031/`. First-run wizard takes it from there.
 
 The menu bar also exposes *Restart service*, *Open data folder*,
-and *Uninstall execlaw…* (the latter deregisters the LaunchAgent
-and optionally wipes `~/.execlaw/` before you drag the `.app` to
-Trash).
+*View logs (log stream)…*, and *Uninstall execlaw…* (the latter
+deregisters the LaunchAgent and optionally wipes `~/.execlaw/`
+before you drag the `.app` to Trash).
 
-**Build it yourself** — on a macOS 13+ host with Xcode CLT, Rust,
-Node 20, and `cargo install tauri-cli --version "^2.0"`:
+#### Windows 10 / 11 — NSIS `.exe` installer
 
-```bash
-./scripts/build-mac.sh
-# .app → desktop-macos/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/
-# .dmg → desktop-macos/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/
-```
+Registers a Service Control Manager service running as
+`LocalSystem` so the control plane starts at boot.
 
-The .dmg opens to a Finder window showing the `execlaw` app on
-the left and an `Applications` symlink on the right — drag one
-to the other to install.
+1. Download `execlaw_<version>_x64-setup.exe` from
+   [Releases](https://github.com/justinelgenlong/execlaw/releases).
+2. Run the installer; UAC fires (the SCM service install needs
+   admin). NSIS's post-install hook calls
+   `execlaw.exe service install --system` + `service start --system`.
+3. SmartScreen warns "Windows protected your PC" on first run
+   (unsigned installer) → *More info → Run anyway*.
+4. Notification-area icon appears. *Open execlaw* opens a WebView2
+   window on `http://127.0.0.1:3031/`.
 
-See [desktop-macos/README.md](desktop-macos/README.md) for build
-details, [Phase 6d](docs/architecture.md) for the broader desktop
-wrapper design, and [CONTRIBUTING.md → Cutting a release](CONTRIBUTING.md)
-for the tag → GitHub Release flow.
+Uninstall via *Settings → Apps → execlaw → Uninstall* (NSIS's
+pre-uninstall hook stops + deregisters the service) or from the
+tray's *Uninstall execlaw…* (UAC → `service uninstall`).
+
+#### Linux (Debian / Ubuntu / Mint / Pop_OS!) — `.deb`
+
+Registers a `systemd --user` unit on first tray-app launch. **No
+service registration happens at `apt install` time** — apt's
+`postinst` runs as root, but `systemd --user` units must live in
+the operator's HOME to start under their UID.
+
+1. Download `execlaw_<version>_amd64.deb` from
+   [Releases](https://github.com/justinelgenlong/execlaw/releases).
+2. `sudo apt install ./execlaw_<version>_amd64.deb`.
+3. Launch `execlaw-tray` from the application menu (or
+   `/usr/bin/execlaw-tray` from a shell). The tray calls
+   `execlaw service install --user` then `service start --user`.
+4. SNI tray icon appears (Just Works on KDE Plasma, XFCE, MATE,
+   Cinnamon, elementary OS; vanilla GNOME needs the *AppIndicator
+   and KStatusNotifierItem Support* extension — Ubuntu bundles it
+   since 22.04).
+5. *Open execlaw* → webkit2gtk-4.1 window on
+   `http://127.0.0.1:3031/`.
+
+For boot-time start without an interactive login, run
+`loginctl enable-linger $USER` once. To uninstall cleanly: tray
+*Uninstall execlaw…* first (deregisters the user unit), then
+`sudo apt remove execlaw` for the program files.
+
+#### Building from source
+
+| OS | Command | Toolchain ref |
+|---|---|---|
+| macOS | `./scripts/build-mac.sh` | [`desktop-macos/README.md`](desktop-macos/README.md) |
+| Windows | `./scripts/build-windows.ps1` | [`desktop-windows/README.md`](desktop-windows/README.md) |
+| Linux | `./scripts/build-linux.sh` | [`desktop-linux/README.md`](desktop-linux/README.md) |
+
+See [`docs/desktop-installations.md`](docs/desktop-installations.md)
+for the cross-OS architecture reference,
+[`docs/architecture.md`](docs/architecture.md) for the broader
+desktop-wrapper design, and
+[`CONTRIBUTING.md` → Cutting a release](CONTRIBUTING.md) for the
+tag → GitHub Release flow.
 
 ### Service lifecycle
 
@@ -356,8 +463,11 @@ cargo run -p execlaw -- replay <conversation_id> --at <seq>
 
 Requires Rust 1.85+ (edition 2024). Bare-metal targets:
 `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`,
-`x86_64-apple-darwin`, `aarch64-apple-darwin`. Service registration
-on each is handled by the
+`aarch64-apple-darwin`. Intel Macs (`x86_64-apple-darwin`) are
+explicitly **not** supported — the only macOS-specific code path
+that matters is Metal-accelerated inference via Ollama, which lives
+on Apple Silicon. Service registration on each supported target is
+handled by the
 [`service-manager`](https://crates.io/crates/service-manager) crate.
 
 ### Disk-space note
@@ -397,13 +507,15 @@ warm dev box). If `cargo-watch` rebuilds start failing with
 | `crates/eval-harness/` | LLM-judge harness against local Qwen. |
 | `plugins/` | In-tree reference + first-party plugins (see [Plugins shipped](#plugins-shipped)). |
 | `web/` | React + react-bootstrap SPA. Vite + Vitest. |
-| `desktop-macos/` | Tauri 2 menu bar app for Apple Silicon. SMAppService LaunchAgent + WebView. Out-of-workspace cargo crate. |
-| `scripts/` | `dev-server.{sh,ps1}` (cargo-watch wrappers), `build-mac.sh` (Tauri release), `trace-turn.{sh,ps1}` (turn replay). |
-| `docs/` | Architecture + agent-model + plugins + setup walkthroughs + screenshots. |
+| `desktop-macos/` | Tauri 2 menu bar app for Apple Silicon. SMAppService LaunchAgent + WKWebView. Out-of-workspace cargo crate. |
+| `desktop-windows/` | Tauri 2 tray app for x86_64 Windows. NSIS installer + SCM service + WebView2. Out-of-workspace cargo crate. |
+| `desktop-linux/` | Tauri 2 tray app for x86_64 Debian-family Linux. `.deb` installer + systemd `--user` unit + webkit2gtk-4.1. Out-of-workspace cargo crate. |
+| `scripts/` | `dev-server.{sh,ps1}` (cargo-watch wrappers), `build-mac.sh` / `build-windows.ps1` / `build-linux.sh` (Tauri releases), `trace-turn.{sh,ps1}` (turn replay). |
+| `docs/` | Architecture + agent-model + plugins + setup walkthroughs + desktop-installations + ollama + screenshots. |
 | `evals/` | Rubric TOML files for the LLM-judge harness. |
 | `spec/` | OpenAPI + AsyncAPI specs. |
 | `dist/` | Built plugin install ZIPs (one per plugin / version). |
-| `.github/workflows/` | CI (per-push), `macos-bundle.yml` (tag-driven `.app` + `.dmg` → GitHub Releases). |
+| `.github/workflows/` | CI (per-push), `macos-bundle.yml` / `windows-bundle.yml` / `linux-bundle.yml` (tag-driven `.app`+`.dmg` / NSIS `.exe` / `.deb` → GitHub Releases). |
 
 ## License
 

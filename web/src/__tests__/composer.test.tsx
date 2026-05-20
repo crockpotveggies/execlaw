@@ -146,9 +146,20 @@ describe("Composer", () => {
         expect(screen.getByTestId("composer-attach-trigger")).toBeTruthy();
     });
 
-    it("hides the `+` button when neither multimodal nor getSkills is supplied", () => {
+    it("shows the `+` button even on text-only backends — Attach file is always available", () => {
+        // 2026-05-18 — previously the `+` was hidden unless
+        // `multimodal || getSkills`. Phase B made "Attach file"
+        // always available (data files don't need a vision
+        // backend), so the trigger is now unconditional. This
+        // test was inverted from its prior "hides" assertion.
         render(<Composer onSend={() => {}} />);
-        expect(screen.queryByTestId("composer-attach-trigger")).toBeNull();
+        expect(screen.getByTestId("composer-attach-trigger")).toBeTruthy();
+        // Open the menu — "Attach file" is the only item visible
+        // when multimodal=false and getSkills is not provided.
+        fireEvent.click(screen.getByTestId("composer-attach-trigger"));
+        expect(screen.getByTestId("composer-attach-file")).toBeTruthy();
+        expect(screen.queryByTestId("composer-attach-photo")).toBeNull();
+        expect(screen.queryByTestId("composer-attach-skill")).toBeNull();
     });
 
     it("renders both menu items when multimodal AND getSkills are wired", () => {
@@ -315,5 +326,223 @@ describe("Composer", () => {
             fireEvent.click(screen.getByTestId("composer-attach-skill"));
         });
         await screen.findByTestId("composer-skill-picker-empty");
+    });
+
+    // -------------------------------------------------------------
+    // Drag-drop tests (2026-05-18). Cover the classifier branches
+    // end-to-end through the rendered component: drop dispatches a
+    // synthetic DragEvent with a stubbed `dataTransfer`, the
+    // composer's handler classifies + routes, the resulting chip
+    // (or error banner) is asserted from the DOM.
+    //
+    // jsdom doesn't give us a real `DragEvent` or `DataTransfer`,
+    // so we shape an object literal that matches what React's
+    // synthetic event sees. `Array.from(files)` is what the
+    // handler uses; both DataTransferItemList semantics + the
+    // `.types.includes("Files")` guard are covered by setting
+    // `types: ["Files"]` on the stub.
+    // -------------------------------------------------------------
+
+    /// Build a File-shaped Blob with `name` + `type` set the way
+    /// the OS file picker (or a real drag-drop) populates them.
+    /// jsdom's File constructor accepts this.
+    function makeFile(name: string, type: string, size = 16): File {
+        const bytes = new Uint8Array(size);
+        return new File([bytes], name, { type });
+    }
+
+    function fakeDataTransfer(files: File[]) {
+        return {
+            files,
+            items: files.map((f) => ({ kind: "file", type: f.type })),
+            types: ["Files"],
+            dropEffect: "copy",
+            effectAllowed: "all",
+        };
+    }
+
+    /// Drop helper: synth `dragenter` so the highlight flips on,
+    /// then `drop` so the handler sees the files. Returns the
+    /// shell element for follow-up assertions.
+    async function dropOn(shell: HTMLElement, files: File[]) {
+        await act(async () => {
+            fireEvent.dragEnter(shell, { dataTransfer: fakeDataTransfer(files) });
+            fireEvent.drop(shell, { dataTransfer: fakeDataTransfer(files) });
+        });
+        return shell;
+    }
+
+    it("dropping a PNG produces an image chip", async () => {
+        render(<Composer onSend={() => {}} multimodal />);
+        const shell = screen.getByTestId("composer-shell");
+        await dropOn(shell, [makeFile("photo.png", "image/png")]);
+        await waitFor(() => {
+            const chip = screen.getByTestId("composer-attachment-chip");
+            expect(chip.getAttribute("data-attachment-kind")).toBe("image");
+        });
+        expect(screen.queryByTestId("composer-drop-error")).toBeNull();
+    });
+
+    it("dropping a CSV produces a file chip with the filename visible", async () => {
+        render(<Composer onSend={() => {}} multimodal />);
+        const shell = screen.getByTestId("composer-shell");
+        await dropOn(shell, [makeFile("data.csv", "text/csv")]);
+        const chip = await screen.findByTestId("composer-attachment-chip");
+        expect(chip.getAttribute("data-attachment-kind")).toBe("file");
+        expect(within(chip).getByText("data.csv")).toBeTruthy();
+        expect(screen.queryByTestId("composer-drop-error")).toBeNull();
+    });
+
+    it("dropping a CSV with empty file.type still classifies via extension", async () => {
+        // Some browsers + Windows installs report file.type === ""
+        // for .csv. The classifier falls through to inferFileMime,
+        // which extension-derives text/csv.
+        render(<Composer onSend={() => {}} multimodal />);
+        const shell = screen.getByTestId("composer-shell");
+        await dropOn(shell, [makeFile("data.csv", "")]);
+        const chip = await screen.findByTestId("composer-attachment-chip");
+        expect(chip.getAttribute("data-attachment-kind")).toBe("file");
+    });
+
+    it("dropping an unsupported file surfaces the inline error banner", async () => {
+        render(<Composer onSend={() => {}} multimodal />);
+        const shell = screen.getByTestId("composer-shell");
+        await dropOn(shell, [makeFile("payload.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document")]);
+        const err = await screen.findByTestId("composer-drop-error");
+        expect(err.textContent).toContain("payload.docx");
+        expect(err.textContent).toContain("Unsupported file type");
+        expect(screen.queryByTestId("composer-attachment-chip")).toBeNull();
+    });
+
+    it("rejects executables outright", async () => {
+        render(<Composer onSend={() => {}} multimodal />);
+        const shell = screen.getByTestId("composer-shell");
+        await dropOn(shell, [
+            makeFile("evil.exe", "application/x-msdownload"),
+            makeFile("evil.sh", "application/x-sh"),
+        ]);
+        const err = await screen.findByTestId("composer-drop-error");
+        expect(err.textContent).toContain("evil.exe");
+        expect(err.textContent).toContain("evil.sh");
+        expect(screen.queryByTestId("composer-attachment-chip")).toBeNull();
+    });
+
+    it("mixed drop accepts the supported subset and reports the rejects", async () => {
+        render(<Composer onSend={() => {}} multimodal />);
+        const shell = screen.getByTestId("composer-shell");
+        await dropOn(shell, [
+            makeFile("photo.png", "image/png"),
+            makeFile("notes.md", "text/markdown"),
+            makeFile("payload.exe", "application/x-msdownload"),
+        ]);
+        // Both supported files become chips.
+        await waitFor(() => {
+            expect(screen.getAllByTestId("composer-attachment-chip")).toHaveLength(2);
+        });
+        // Reject reported in the banner.
+        const err = await screen.findByTestId("composer-drop-error");
+        expect(err.textContent).toContain("payload.exe");
+        expect(err.textContent).not.toContain("photo.png");
+        expect(err.textContent).not.toContain("notes.md");
+    });
+
+    it("rejects an SVG image (server doesn't accept SVG in v1)", async () => {
+        // SVG slips past a naive `mime.startsWith("image/")` check
+        // — the classifier specifically excludes it to match the
+        // server's image allowlist (PNG / JPEG / WebP / GIF).
+        render(<Composer onSend={() => {}} multimodal />);
+        const shell = screen.getByTestId("composer-shell");
+        await dropOn(shell, [makeFile("logo.svg", "image/svg+xml")]);
+        const err = await screen.findByTestId("composer-drop-error");
+        expect(err.textContent).toContain("logo.svg");
+        expect(screen.queryByTestId("composer-attachment-chip")).toBeNull();
+    });
+
+    it("compacts the reject list to 3 names + count when many", async () => {
+        render(<Composer onSend={() => {}} multimodal />);
+        const shell = screen.getByTestId("composer-shell");
+        const rejects = Array.from({ length: 6 }, (_, i) =>
+            makeFile(`bad-${i}.exe`, "application/x-msdownload")
+        );
+        await dropOn(shell, rejects);
+        const err = await screen.findByTestId("composer-drop-error");
+        // First 3 listed, remainder counted.
+        expect(err.textContent).toContain("bad-0.exe");
+        expect(err.textContent).toContain("bad-1.exe");
+        expect(err.textContent).toContain("bad-2.exe");
+        expect(err.textContent).toContain("+3 more");
+        expect(err.textContent).not.toContain("bad-3.exe");
+    });
+
+    it("error banner dismiss button clears the banner", async () => {
+        render(<Composer onSend={() => {}} multimodal />);
+        const shell = screen.getByTestId("composer-shell");
+        await dropOn(shell, [makeFile("bad.exe", "application/x-msdownload")]);
+        await screen.findByTestId("composer-drop-error");
+        await act(async () => {
+            fireEvent.click(screen.getByTestId("composer-drop-error-dismiss"));
+        });
+        expect(screen.queryByTestId("composer-drop-error")).toBeNull();
+    });
+
+    it("a fresh accepted drop clears a stale reject banner", async () => {
+        render(<Composer onSend={() => {}} multimodal />);
+        const shell = screen.getByTestId("composer-shell");
+        await dropOn(shell, [makeFile("bad.exe", "application/x-msdownload")]);
+        await screen.findByTestId("composer-drop-error");
+        // Second drop, all accepted — banner should auto-clear.
+        await dropOn(shell, [makeFile("photo.png", "image/png")]);
+        await waitFor(() => {
+            expect(screen.queryByTestId("composer-drop-error")).toBeNull();
+        });
+    });
+
+    it("drag-enter applies the highlight class; drag-leave removes it", () => {
+        render(<Composer onSend={() => {}} multimodal />);
+        const shell = screen.getByTestId("composer-shell");
+        expect(shell.className).not.toContain("--drag-over");
+
+        fireEvent.dragEnter(shell, { dataTransfer: fakeDataTransfer([]) });
+        expect(shell.className).toContain("--drag-over");
+        expect(shell.getAttribute("data-drag-over")).toBe("true");
+
+        fireEvent.dragLeave(shell, { dataTransfer: fakeDataTransfer([]) });
+        expect(shell.className).not.toContain("--drag-over");
+    });
+
+    it("drag of non-file data (text) is ignored — no highlight, no chip", () => {
+        // Dragging selected text from another tab/app should NOT
+        // trigger the composer's drop zone; only file drags do.
+        render(<Composer onSend={() => {}} multimodal />);
+        const shell = screen.getByTestId("composer-shell");
+        const textOnlyTransfer = {
+            files: [],
+            items: [{ kind: "string", type: "text/plain" }],
+            types: ["text/plain"],
+            dropEffect: "none",
+            effectAllowed: "all",
+        };
+        fireEvent.dragEnter(shell, { dataTransfer: textOnlyTransfer });
+        expect(shell.className).not.toContain("--drag-over");
+    });
+
+    it("nested dragenter/dragleave pairs don't strobe the highlight", () => {
+        // Browsers fire one dragleave + one dragenter every time
+        // the pointer crosses an internal child boundary. The
+        // composer counts depth so the highlight stays stable
+        // until depth returns to 0.
+        render(<Composer onSend={() => {}} multimodal />);
+        const shell = screen.getByTestId("composer-shell");
+        const dt = fakeDataTransfer([]);
+
+        fireEvent.dragEnter(shell, { dataTransfer: dt }); // depth 1
+        expect(shell.className).toContain("--drag-over");
+        fireEvent.dragEnter(shell, { dataTransfer: dt }); // depth 2
+        expect(shell.className).toContain("--drag-over");
+        fireEvent.dragLeave(shell, { dataTransfer: dt }); // depth 1
+        expect(shell.className).toContain("--drag-over");
+        fireEvent.dragLeave(shell, { dataTransfer: dt }); // depth 0
+        expect(shell.className).not.toContain("--drag-over");
     });
 });

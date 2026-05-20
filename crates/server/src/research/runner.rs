@@ -33,7 +33,7 @@ use execlaw_core::cards::{
 };
 use execlaw_core::ids::ResearchJobId;
 use execlaw_core::research::{
-    PhaseGates, PlanStep, ResearchConfigStore, ResearchError, ResearchJobRow, ResearchJobStatus,
+    PlanStep, ResearchConfigStore, ResearchError, ResearchJobRow, ResearchJobStatus,
     ResearchJobStore, ResearchPlan,
 };
 use execlaw_core::tool::{SubagentApi, WebFetchApi, WebSearchApi};
@@ -915,6 +915,8 @@ async fn call_planner(
         // Adapter applies per-family kwargs (e.g. enable_thinking
         // for Qwen3); leave None here so the adapter's choice wins.
         chat_template_kwargs: None,
+        tool_choice: None,
+        guided_decoding_backend: None,
     };
     let adapter =
         execlaw_model_adapter::adapter_for(execlaw_model_adapter::ModelFamily::detect(model));

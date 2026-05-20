@@ -761,18 +761,23 @@ pub fn build_router(state: AppState) -> Router {
             get(crate::runner_rpc::register_runner),
         )
         .merge(crate::plugins::plugins_router())
+        .merge(crate::bundled_plugins::bundled_plugins_router())
         .merge(crate::plugin_admin_routes::admin_routes_router())
         .merge(crate::plugin_webhook_routes::webhook_routes_router())
         .merge(crate::approvals::approvals_router())
         .merge(crate::attachments_admin::attachments_router())
+        .merge(crate::downloads_admin::downloads_router())
         .merge(crate::observability::observability_router())
         .merge(crate::backends::backends_router())
         .merge(crate::alerts::alerts_router())
         .merge(crate::trust_policy::trust_policy_router())
         .merge(crate::my_identities::my_identities_router())
         .merge(crate::routines::routines_router())
+        .merge(crate::automations_admin::router())
+        .merge(crate::inference_admin::router())
         .merge(crate::personality::personality_router())
         .merge(crate::runners_admin::runners_admin_router())
+        .merge(crate::inference_probe::inference_probe_router())
         .merge(crate::sidecars_admin::sidecars_admin_router())
         // (Phase B: signal_admin_router retired. Pairing flow is
         // now plugin-served via [[admin_routes]] in
@@ -883,7 +888,7 @@ pub fn test_app_state() -> AppState {
         // when needed. Leaving this `None` means count_for_user
         // returns 0 and the password-only login path is exercised.
         webauthn: None,
-        mcp_host: crate::mcp_host::McpHost::new(db),
+        mcp_host: crate::mcp_host::McpHost::new(db.clone()),
         // Tests don't have Docker; supervisor stays None and the
         // routes report 503 if exercised. Tests that DO want a
         // mock-backed supervisor construct AppState manually.
@@ -923,6 +928,29 @@ pub fn test_app_state() -> AppState {
         skill_capture: execlaw_skills::AutoCaptureSink::noop(),
         // Phase D.3 — same noop pattern for the reuse-update sink.
         reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
+        // Tests don't run the bundled-plugins mirror; point at a
+        // unique tempdir-style path so the endpoints can still
+        // resolve `<data_dir>/bundled-plugins/...` deterministically
+        // without writing into a real user dir.
+        data_dir: std::env::temp_dir().join(format!("execlaw-test-data-{}", uuid::Uuid::new_v4())),
+        // M1 of Automations — stub bus that writes durably but doesn't
+        // dispatch. Tests exercising end-to-end dispatch should use
+        // `AutomationBus::spawn` inside a `#[tokio::test]` (the
+        // automation_bus module's own tests do this).
+        automation_bus: crate::automation_bus::AutomationBus::stub(db.clone()),
+        // M3 + M4c — test-fixture agent pool. The invoker returns an
+        // error for any AskAgent invocation, which is what we want
+        // in tests that don't exercise the LLM path. Tests that DO
+        // exercise AskAgent construct their own pool inline.
+        automation_agent_pool: crate::automation_agent::AutomationsAgentPool::new(
+            std::sync::Arc::new(crate::automation_agent::StubAgentInvoker::err(
+                "test fixture pool: no LLM wired",
+            )),
+        ),
+        // M5 — empty metrics handle. Tests that exercise the metrics
+        // page can pre-populate this via `state.inference_metrics
+        // .observe(...)` and snapshot.
+        inference_metrics: crate::inference_metrics::InferenceMetrics::new(),
     }
 }
 

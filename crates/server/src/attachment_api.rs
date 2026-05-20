@@ -568,6 +568,7 @@ mod tests {
                 path: path.to_string_lossy().into_owned(),
                 sha256: "x".into(),
                 received_at: 0,
+                filename: None,
             })
             .unwrap();
         (id.as_str().to_owned(), path)

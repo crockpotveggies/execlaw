@@ -27,12 +27,19 @@ members = [
     "crates/skills",
     "crates/model-adapter",
 ]
-# Tauri desktop wrapper is built with its own Rust toolchain via
-# `cargo tauri build` (which adds the WebView2/WKWebView linkage and
-# bundles assets) — keep it out of the main workspace so a plain
-# `cargo check` on a Linux/Windows host doesn't try to compile
-# macOS-only Apple framework bindings.
-exclude = ["desktop-macos/src-tauri"]
+# Tauri desktop wrappers (macOS .app + Windows .exe-installer +
+# Linux .deb) are built with their own Rust toolchain via
+# `cargo tauri build` (which adds the WebView2 / WKWebView /
+# webkit2gtk linkage and bundles assets) — keep them out of the
+# main workspace so a plain `cargo check` on any host doesn't try
+# to compile the platform-specific Apple-framework / WebView2 /
+# GTK bindings. Each desktop crate is gated on its respective
+# `cfg(target_os = …)` internally and won't link on the wrong host.
+exclude = [
+    "desktop-macos/src-tauri",
+    "desktop-windows/src-tauri",
+    "desktop-linux/src-tauri",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -65,6 +72,11 @@ url = "2"
 # their public gateways). Enable rustls-tls-native-roots to match the
 # rustls + OS-trust-store choice reqwest already uses for OAuth.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+# Filesystem event watcher — Linux inotify, macOS FSEvents, Windows
+# ReadDirectoryChangesW. Used by python_sandbox's output watcher to
+# detect when the kernel writes into /work/<convo>/outputs/. We
+# implement our own debounce on top so we control timing.
+notify = "7"
 
 # --- storage ---
 # SQLCipher (encrypted SQLite) via bundled build with vendored OpenSSL.

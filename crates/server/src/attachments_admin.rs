@@ -13,9 +13,13 @@
 //!     so the user can save the report straight from the conversation.
 //!
 //! Auth model:
-//!   * `AuthedUser` (any authenticated user) — there is no separate
-//!     "view attachment" capability today; the conversation-scoping
-//!     is enforced at the row level.
+//!   * `MediaAuthedUser` — accepts Authorization: Bearer (fetch-driven
+//!     calls) OR a short-lived signed URL minted by
+//!     `POST /api/downloads/sign` (browser-direct GETs from
+//!     `<a download>`, `<img src>`, etc.). The pre-2026-05
+//!     `?access_token=<jwt>` query fallback was removed.
+//!   * There is no separate "view attachment" capability today; the
+//!     conversation-scoping below is enforced at the row level.
 //!   * Trust scoping: a non-Controller caller may only download
 //!     attachments belonging to a conversation they participate in.
 //!     Attachments are scoped to a `conversation_id` at write time
@@ -32,6 +36,7 @@
 //! and the path is read from the trusted DB row.
 
 use crate::auth_extract::AuthedUser;
+use crate::download_urls::MediaAuthedUser;
 use crate::routes::ApiError;
 use crate::state::AppState;
 use axum::Router;
@@ -60,7 +65,7 @@ fn user_role(state: &AppState, user: &AuthedUser) -> Option<UserRole> {
 /// ids when the caller is below Controller, 500 for I/O errors.
 pub async fn get_attachment_handler(
     State(state): State<AppState>,
-    user: AuthedUser,
+    MediaAuthedUser(user): MediaAuthedUser,
     Path(attachment_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let store = AttachmentStore::new(&state.db);
@@ -222,6 +227,20 @@ pub async fn get_attachment_handler(
             headers.insert(header::CONTENT_LENGTH, v);
         }
     }
+    // Browser-direct GETs to attachment URLs carry a signed-URL
+    // signature in the query string. Even though the sig is bound
+    // to (path, user, exp), don't let it travel via Referer to any
+    // resource the response page subsequently loads. Pair with
+    // Cache-Control to keep intermediaries from caching either the
+    // bytes or the URL.
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
 
     let mut response = Response::new(body);
     *response.headers_mut() = headers;
@@ -359,6 +378,7 @@ mod tests {
                 path: path.to_string_lossy().into_owned(),
                 sha256: "x".into(),
                 received_at: 0,
+                filename: None,
             })
             .unwrap();
         (id.as_str().to_owned(), path)
@@ -539,16 +559,173 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// 2026-05-04 regression: the `<a download>` link in the
-    /// SPA's AttachmentCard can't carry an Authorization header
-    /// (browsers don't propagate it on link navigations). Fix is
-    /// to accept `?access_token=…` as a fallback. Asserts the
-    /// query-param path works end-to-end against the actual route.
+    /// 2026-05-19 — the `<a download>` link in the SPA's
+    /// AttachmentCard can't carry an Authorization header (browsers
+    /// don't propagate it on link navigations). Pre-2026-05-19 the
+    /// SPA appended a raw `?access_token=<jwt>` — flagged by the
+    /// security audit (full-access JWTs leak via history/referrers).
+    /// Fix: a signed URL minted by `POST /api/downloads/sign`. The
+    /// URL carries `?exp&user&sig` instead of a JWT; the sig is
+    /// HMAC-SHA256 over (path, user, exp) bound to the operator's
+    /// download_hmac_key.
     #[tokio::test]
-    async fn get_attachment_accepts_access_token_query_param() {
+    async fn get_attachment_accepts_signed_url() {
         let state = test_app_state();
         let dir = TempDir::new().unwrap();
         let cid = seed_conv(&state, "c-q");
+        let (att_id, _path) = seed_attachment(&state, &cid, &dir);
+        let app = build_router(state.clone());
+        let tok = setup_controller_token(&app).await;
+
+        // Step 1: POST /api/downloads/sign with the operator's JWT
+        // → receive a signed URL.
+        let sign_body = serde_json::to_vec(&serde_json::json!({
+            "path": format!("/api/attachments/{att_id}"),
+        }))
+        .unwrap();
+        let sign_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/downloads/sign")
+                    .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(sign_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sign_resp.status(), StatusCode::OK);
+        let sign_bytes = body::to_bytes(sign_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let sign_v: serde_json::Value = serde_json::from_slice(&sign_bytes).unwrap();
+        let signed_url = sign_v["url"].as_str().unwrap().to_owned();
+        assert!(
+            signed_url.contains("sig=") && signed_url.contains("exp="),
+            "signed URL missing expected params: {signed_url}"
+        );
+        assert!(
+            !signed_url.contains("access_token="),
+            "signed URL must NOT carry a raw JWT: {signed_url}"
+        );
+
+        // Step 2: GET the attachment using the signed URL — no
+        // Authorization header. The `<a download>` flow.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&signed_url)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let headers = resp.headers().clone();
+        assert_eq!(
+            headers
+                .get(header::REFERRER_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-referrer"),
+            "browser-direct download must not leak signed URL via Referer"
+        );
+        assert_eq!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("private, no-store"),
+        );
+        let bytes = body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        assert!(bytes.starts_with(b"%PDF-"));
+    }
+
+    /// Signed URLs are bound to the path: tampering with the
+    /// attachment id in the URL invalidates the signature.
+    #[tokio::test]
+    async fn get_attachment_rejects_signed_url_with_tampered_path() {
+        let state = test_app_state();
+        let dir = TempDir::new().unwrap();
+        let cid = seed_conv(&state, "c-tamper");
+        let (att_id, _path) = seed_attachment(&state, &cid, &dir);
+        let app = build_router(state);
+        let tok = setup_controller_token(&app).await;
+
+        let sign_body = serde_json::to_vec(&serde_json::json!({
+            "path": format!("/api/attachments/{att_id}"),
+        }))
+        .unwrap();
+        let sign_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/downloads/sign")
+                    .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(sign_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let sign_bytes = body::to_bytes(sign_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let sign_v: serde_json::Value = serde_json::from_slice(&sign_bytes).unwrap();
+        let signed_url = sign_v["url"].as_str().unwrap();
+        // Swap the path; keep the (now-stale) query.
+        let (_path, query) = signed_url.split_once('?').unwrap();
+        let tampered = format!("/api/attachments/{att_id}-WRONG?{query}");
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&tampered)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A garbage signed-URL trio (no Authorization header either)
+    /// is rejected.
+    #[tokio::test]
+    async fn get_attachment_rejects_garbage_query_params() {
+        let state = test_app_state();
+        let dir = TempDir::new().unwrap();
+        let cid = seed_conv(&state, "c-garbage");
+        let (att_id, _path) = seed_attachment(&state, &cid, &dir);
+        let app = build_router(state);
+        let _ = setup_controller_token(&app).await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/api/attachments/{att_id}?exp=9999999999&user=u&sig=deadbeef"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Asserts that the legacy `?access_token=<jwt>` path is GONE.
+    /// Even with a valid JWT in the query string, the response must
+    /// be 401 — `AuthedUser` no longer accepts query-token auth.
+    #[tokio::test]
+    async fn get_attachment_rejects_legacy_access_token_query() {
+        let state = test_app_state();
+        let dir = TempDir::new().unwrap();
+        let cid = seed_conv(&state, "c-legacy");
         let (att_id, _path) = seed_attachment(&state, &cid, &dir);
         let app = build_router(state);
         let tok = setup_controller_token(&app).await;
@@ -557,42 +734,9 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
+                    // Even a VALID JWT in the query must now fail —
+                    // this is the audit-required regression bar.
                     .uri(format!("/api/attachments/{att_id}?access_token={tok}"))
-                    // Deliberately NO Authorization header — the
-                    // whole point is that the query param works
-                    // alone.
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-        assert!(bytes.starts_with(b"%PDF-"));
-    }
-
-    #[tokio::test]
-    async fn get_attachment_rejects_invalid_access_token_query_param() {
-        // Asserts the query param doesn't bypass validation —
-        // an arbitrary string isn't enough; the JWT signature
-        // still has to verify.
-        let state = test_app_state();
-        let dir = TempDir::new().unwrap();
-        let cid = seed_conv(&state, "c-bad");
-        let (att_id, _path) = seed_attachment(&state, &cid, &dir);
-        let app = build_router(state);
-        // Invoke setup so the JwtSigner state matches production
-        // (test_app_state() generates a fresh signer; setup just
-        // mints an unrelated token we ignore).
-        let _ = setup_controller_token(&app).await;
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri(format!(
-                        "/api/attachments/{att_id}?access_token=not-a-real-jwt"
-                    ))
                     .body(Body::empty())
                     .unwrap(),
             )

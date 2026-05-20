@@ -32,6 +32,7 @@ import {
     type UiPanelSummary,
 } from "../api/endpoints";
 import { useBackendCapabilities } from "../chat/useBackendCapabilities";
+import { useToolResultsVisible } from "../chat/useToolResultsVisible";
 import { WsClient, type WsEvent } from "../api/ws";
 import { applyCardEvent, setCardsForConversation } from "../cards/cardStore";
 // Side-effect import: registers the ResearchCard renderer for
@@ -1092,6 +1093,34 @@ function ActiveThreadPane({
     const [editValue, setEditValue] = useState(headerLabel);
     const [approvalBusy, setApprovalBusy] = useState(false);
 
+    // 2026-05-16 — view-filter popup in the chat header. Today it
+    // hosts a single "Tool Results" on/off toggle (hides `tool_use`
+    // / `tool_result` bubbles when off) — same popup shape as the
+    // sidebar's THREADS filters menu, so the visual treatment is
+    // consistent across both surfaces. State persists across
+    // threads + reloads via `useToolResultsVisible`.
+    const [filtersOpen, setFiltersOpen] = useState(false);
+    const filtersRef = useRef<HTMLDivElement | null>(null);
+    const [toolResultsVisible, setToolResultsVisible] = useToolResultsVisible();
+    useEffect(() => {
+        if (!filtersOpen) return;
+        const onPointer = (ev: MouseEvent) => {
+            const root = filtersRef.current;
+            if (root && !root.contains(ev.target as Node)) {
+                setFiltersOpen(false);
+            }
+        };
+        const onKey = (ev: globalThis.KeyboardEvent) => {
+            if (ev.key === "Escape") setFiltersOpen(false);
+        };
+        document.addEventListener("mousedown", onPointer);
+        document.addEventListener("keydown", onKey);
+        return () => {
+            document.removeEventListener("mousedown", onPointer);
+            document.removeEventListener("keydown", onKey);
+        };
+    }, [filtersOpen]);
+
     // Reset edit buffer whenever the active thread / its label changes.
     useEffect(() => {
         setEditValue(headerLabel);
@@ -1196,9 +1225,102 @@ function ActiveThreadPane({
                         Incognito
                     </span>
                 )}
+                {/* 2026-05-16 — view-filter popup, right-anchored.
+                    Mirrors the sidebar's THREADS filters menu so
+                    the operator gets one consistent affordance for
+                    "what to show vs hide" across the two surfaces.
+                    Today hosts a single Tool Results toggle. */}
+                <div
+                    ref={filtersRef}
+                    style={{
+                        marginLeft: "auto",
+                        position: "relative",
+                        lineHeight: 1,
+                    }}
+                >
+                    <button
+                        type="button"
+                        className="btn btn-link btn-sm p-0 execlaw-muted"
+                        onClick={() => setFiltersOpen((v) => !v)}
+                        aria-haspopup="menu"
+                        aria-expanded={filtersOpen}
+                        data-testid="chat-header-filters"
+                        title="View filters"
+                        style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            lineHeight: 1,
+                        }}
+                    >
+                        <i className="bi bi-file-diff" aria-hidden />
+                    </button>
+                    {filtersOpen && (
+                        <div
+                            role="menu"
+                            className="execlaw-card"
+                            data-testid="chat-header-filters-menu"
+                            style={{
+                                position: "absolute",
+                                top: "100%",
+                                right: 0,
+                                zIndex: 100,
+                                minWidth: "13rem",
+                                marginTop: "0.25rem",
+                                padding: "0.25rem",
+                                background: "#1f2630",
+                                border: "1px solid #30363d",
+                                boxShadow:
+                                    "0 8px 24px rgba(0,0,0,0.45)",
+                                textTransform: "none",
+                                letterSpacing: "normal",
+                                fontSize: "0.875rem",
+                                fontWeight: 400,
+                                color: "#e6edf3",
+                            }}
+                        >
+                            <button
+                                type="button"
+                                onClick={() =>
+                                    setToolResultsVisible(!toolResultsVisible)
+                                }
+                                data-testid="chat-header-tool-results-toggle"
+                                aria-pressed={toolResultsVisible}
+                                className="d-flex align-items-center w-100"
+                                style={{
+                                    background: "transparent",
+                                    border: "none",
+                                    color: "inherit",
+                                    padding: "0.4rem 0.6rem",
+                                    borderRadius: "0.25rem",
+                                    cursor: "pointer",
+                                    textAlign: "left",
+                                }}
+                            >
+                                <span className="flex-grow-1">
+                                    Tool Results
+                                </span>
+                                <span
+                                    data-testid="chat-header-tool-results-state"
+                                    style={{
+                                        fontWeight: 600,
+                                        color: toolResultsVisible
+                                            ? "#3fb950"
+                                            : "#7d8590",
+                                        marginLeft: "0.5rem",
+                                    }}
+                                >
+                                    {toolResultsVisible ? "on" : "off"}
+                                </span>
+                            </button>
+                        </div>
+                    )}
+                </div>
             </header>
 
-            <MessageStream conversationId={conversationId} />
+            <MessageStream
+                conversationId={conversationId}
+                showToolResults={toolResultsVisible}
+            />
 
             <div className="execlaw-composer" data-flip-id="composer-shell">
                 <ApprovalCard

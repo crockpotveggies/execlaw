@@ -26,12 +26,22 @@ use thiserror::Error;
 /// Guardrail (unused; one-model world) and Reasoning (capability,
 /// not a deployment) are gone. Reasoning is now a flag on Standard.
 /// Small was added for voice mode and any latency-sensitive route.
+///
+/// Vision (M5, 2026-05-17) is the multi-modal slot — Automations'
+/// `AskAgent` node falls through to this row when the flow author
+/// attaches images. Operators who want the Ring use case (or any
+/// other vision-bearing automation) point this at a VL model (Qwen-VL,
+/// Pixtral, LLaVA, etc.) via Settings → Backends. When unset, vision-
+/// requiring automation runs fail fast with `VisionRequiredButTextOnlyModel`
+/// so the operator sees a clear error rather than a silent 400 from
+/// the text-only backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum BackendPurpose {
     Standard,
     Small,
     VoiceStt,
     VoiceTts,
+    Vision,
 }
 
 /// Lifecycle ownership for a backend (Phase 12 — §5.4).
@@ -72,6 +82,7 @@ impl BackendPurpose {
             Self::Small => "Small",
             Self::VoiceStt => "VoiceSTT",
             Self::VoiceTts => "VoiceTTS",
+            Self::Vision => "Vision",
         }
     }
 
@@ -81,6 +92,7 @@ impl BackendPurpose {
             "Small" => Some(Self::Small),
             "VoiceSTT" => Some(Self::VoiceStt),
             "VoiceTTS" => Some(Self::VoiceTts),
+            "Vision" => Some(Self::Vision),
             _ => None,
         }
     }
@@ -89,7 +101,13 @@ impl BackendPurpose {
     /// this so a missing row renders as "not configured" instead of
     /// silently disappearing.
     pub fn all() -> &'static [BackendPurpose] {
-        &[Self::Standard, Self::Small, Self::VoiceStt, Self::VoiceTts]
+        &[
+            Self::Standard,
+            Self::Small,
+            Self::VoiceStt,
+            Self::VoiceTts,
+            Self::Vision,
+        ]
     }
 
     /// `reasoning_enabled` only applies to the Standard purpose —
@@ -396,7 +414,10 @@ mod tests {
     #[test]
     fn purpose_all_lists_every_enum_value() {
         let names: Vec<_> = BackendPurpose::all().iter().map(|p| p.as_str()).collect();
-        assert_eq!(names, vec!["Standard", "Small", "VoiceSTT", "VoiceTTS"]);
+        assert_eq!(
+            names,
+            vec!["Standard", "Small", "VoiceSTT", "VoiceTTS", "Vision"]
+        );
     }
 
     #[test]

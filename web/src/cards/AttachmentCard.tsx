@@ -11,8 +11,9 @@
 // email — those transport the file out-of-band; the web channel
 // surfaces it as this chip.
 
-import { useContext } from "react";
+import { useContext, useEffect, useState } from "react";
 import { AuthContext } from "../auth/AuthContext";
+import { signDownloadUrl } from "../api/signedDownloadUrl";
 import { registerCardRenderer, type CardRendererProps } from "./CardRenderer";
 
 interface AttachmentDetails {
@@ -75,29 +76,40 @@ export function AttachmentCard({ card }: CardRendererProps) {
         (details?.attachment_id
             ? `/api/attachments/${details.attachment_id}`
             : null);
-    // 2026-05-04: append `?access_token=<jwt>` so the
-    // browser's link navigation authenticates. Browsers don't
-    // carry the Authorization header on `<a download href>`
-    // requests, so without this the streaming-attachment endpoint
-    // returns 401 even though the operator is signed in. The
-    // server's AuthedUser extractor reads `?access_token=…` as a
-    // fallback to the Bearer header for exactly this case.
-    //
-    // Token comes from accessTokenRef via getAccessToken — a
-    // straight ref read, no React re-render dependency. The href
-    // updates on the next render after a token refresh; if a
-    // user clicks during the brief window between expiry and
-    // refresh the request 401s and the chip surfaces the error
-    // (acceptable — same shape as any other expired-token
-    // request).
-    const token = auth?.getAccessToken() ?? null;
-    const url = baseUrl
-        ? token
-            ? `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}access_token=${encodeURIComponent(
-                  token,
-              )}`
-            : baseUrl
-        : null;
+    // 2026-05-19 — Browsers can't attach the Authorization header
+    // to `<a download href>` link navigations. Pre-fix the SPA
+    // pasted a raw JWT in `?access_token=<jwt>` — flagged by the
+    // security audit (full-access JWTs leak via history,
+    // referrers, copied links). Now we ask the server for a
+    // signed URL bound to (path, user_id, exp) instead. Fetched
+    // on mount; cached until the source path or auth changes.
+    // A null `signedUrl` during the brief async window falls
+    // through to `null` href so the Download button doesn't
+    // render until the URL resolves.
+    const getToken = auth?.getAccessToken;
+    const [signedUrl, setSignedUrl] = useState<string | null>(null);
+    useEffect(() => {
+        if (!baseUrl || !getToken) {
+            setSignedUrl(null);
+            return;
+        }
+        let cancelled = false;
+        signDownloadUrl(baseUrl, getToken)
+            .then((u) => {
+                if (!cancelled) setSignedUrl(u);
+            })
+            .catch(() => {
+                // Sign failures (operator signed out, network blip,
+                // etc.) leave the button absent rather than showing
+                // a broken link. The card's next render after a
+                // token refresh re-fetches.
+                if (!cancelled) setSignedUrl(null);
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [baseUrl, getToken]);
+    const url = signedUrl;
     const filename = details?.filename ?? card.title ?? "attachment";
     const sizeLabel = formatBytes(details?.byte_size);
     const caption = details?.caption ?? null;

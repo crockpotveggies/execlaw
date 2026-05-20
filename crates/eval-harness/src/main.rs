@@ -169,6 +169,8 @@ async fn run_one(
         chat_template_kwargs: Some(serde_json::json!({
             "enable_thinking": false,
         })),
+        tool_choice: None,
+        guided_decoding_backend: None,
     };
     let resp = client
         .chat_completions(&req)

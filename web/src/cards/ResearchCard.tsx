@@ -18,8 +18,9 @@
 //
 // 2026-04-29.
 
-import { useContext, useState } from "react";
+import { useContext, useEffect, useState } from "react";
 import { AuthContext } from "../auth/AuthContext";
+import { signDownloadUrl } from "../api/signedDownloadUrl";
 import { registerCardRenderer, type CardRendererProps } from "./CardRenderer";
 import type { Card } from "./types";
 
@@ -389,7 +390,6 @@ function StatusBadge({ state }: { state: SubQueryState }) {
 /// page refresh via the listCards projection.
 function DownloadButton({ card }: { card: Card }) {
     const auth = useContext(AuthContext);
-    if (card.state !== "Completed") return null;
     // Belt-and-suspenders: read attachment_id from the card's
     // top-level field OR from details (the runner stamps both as
     // of 2026-05-04 so a wire-edge that drops the top-level field
@@ -408,16 +408,56 @@ function DownloadButton({ card }: { card: Card }) {
         (card.attachment_id && card.attachment_id.length > 0
             ? card.attachment_id
             : null) ?? fromDetails;
+    const completed = card.state === "Completed";
+    const basePath =
+        attachmentId && completed
+            ? `/api/attachments/${attachmentId}`
+            : null;
+    // 2026-05-19 — fetch a server-signed URL bound to (path, user,
+    // exp) instead of pasting a raw JWT in the query string.
+    // Security audit replaced the `?access_token=<jwt>` fallback.
+    const getToken = auth?.getAccessToken;
+    const [url, setUrl] = useState<string | null>(null);
+    useEffect(() => {
+        if (!basePath || !getToken) {
+            setUrl(null);
+            return;
+        }
+        let cancelled = false;
+        signDownloadUrl(basePath, getToken)
+            .then((u) => {
+                if (!cancelled) setUrl(u);
+            })
+            .catch(() => {
+                if (!cancelled) setUrl(null);
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [basePath, getToken]);
+    if (!completed) return null;
     if (!attachmentId) return null;
-    const token = auth?.getAccessToken() ?? null;
-    const baseUrl = `/api/attachments/${attachmentId}`;
-    // Token in query-string so the `<a download>` link
-    // authenticates — browsers don't carry the Authorization
-    // header on link navigations. See auth_extract.rs's
-    // `?access_token=…` fallback.
-    const url = token
-        ? `${baseUrl}?access_token=${encodeURIComponent(token)}`
-        : baseUrl;
+    if (!url) {
+        // Render a disabled placeholder while the sign call is in
+        // flight, so the button doesn't disappear on the first
+        // render after the card completes.
+        return (
+            <div
+                className="execlaw-card-research__download"
+                data-testid="card-research-download"
+            >
+                <button
+                    type="button"
+                    className="btn btn-sm btn-primary"
+                    disabled
+                    data-testid="card-research-download-link"
+                >
+                    <i className="bi bi-hourglass-split me-1" aria-hidden />
+                    Preparing download…
+                </button>
+            </div>
+        );
+    }
     return (
         <div
             className="execlaw-card-research__download"

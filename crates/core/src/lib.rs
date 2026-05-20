@@ -18,8 +18,13 @@
 pub mod alerts;
 pub mod attachments;
 pub mod audit;
+pub mod automation_bus;
+pub mod automation_runs;
+pub mod automation_suggestions;
+pub mod automations;
 pub mod backends;
 pub mod builtin_tools;
+pub mod bus_event_retention;
 pub mod cards;
 pub mod config;
 pub mod conversation;

@@ -11,12 +11,21 @@ import "@fontsource/ibm-plex-sans/500.css";
 import "@fontsource/ibm-plex-sans/600.css";
 import "@fontsource/ibm-plex-sans/700.css";
 import { App } from "./App";
+import { initializeI18n } from "./i18n";
 import "./styles/theme.scss";
 
 const rootEl = document.getElementById("root");
 if (!rootEl) {
     throw new Error("Could not find <div id=\"root\"> — index.html is malformed.");
 }
+
+// Kick off i18n boot — we don't await it. The initial render shows
+// English defaults (correct fallback when `i18next.language` is still
+// the default), and components subscribed via `useT()` re-render once
+// the stored / browser-detected language resolves.
+void initializeI18n().catch((err) => {
+    console.error("Failed to initialize translations", err);
+});
 
 createRoot(rootEl).render(
     <StrictMode>

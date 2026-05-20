@@ -35,6 +35,7 @@ hyper.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 tokio-util.workspace = true
+notify.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_urlencoded = "0.7"
@@ -54,7 +55,15 @@ async-trait.workspace = true
 dashmap.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
+hmac.workspace = true
 rmp-serde.workspace = true
+# M2 of Automations — Rhai is the expression language for Filter
+# / Transform / Branch nodes. The execlaw-script crate uses it for
+# plugin scripts; we need a direct dep here so `automation_runtime.rs`
+# can construct its own sandboxed engine without the plugin-tier
+# capabilities (no HTTP, no host caps — just expression eval over
+# a JSON context). Workspace pin (`1.21`, features `std,sync,serde`).
+rhai.workspace = true
 
 # Phase 13.C — voice STT/TTS adapters POST audio to the managed
 # faster-whisper / Kokoro containers. Multipart for the WAV upload,
@@ -150,4 +159,8 @@ execlaw-voice-pipeline = { path = "../voice-pipeline" }
 
 [[bench]]
 name = "server_hot_paths"
+harness = false
+
+[[bench]]
+name = "python_sandbox_hot_paths"
 harness = false

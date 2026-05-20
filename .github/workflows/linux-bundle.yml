@@ -1,0 +1,187 @@
+name: Linux bundle
+
+# Build the execlaw .deb on every push to a release tag, and also
+# on-demand via workflow_dispatch (for ad-hoc dev builds from any
+# branch). Uploads the artefact so a maintainer can attach it to
+# the GitHub Release.
+#
+# Not on every push — Tauri + Node + Rust release build is ~12 min
+# on ubuntu-22.04 and not relevant to most changes. The per-push CI
+# matrix in `ci.yml` already covers `x86_64-unknown-linux-gnu` for
+# compile + test signal.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or tag to build (defaults to the current ref)"
+        required: false
+        default: ""
+
+concurrency:
+  group: linux-bundle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bundle:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      # `contents: write` is required by the release step to attach
+      # the .deb to a GitHub Release. workflow_dispatch runs (non-
+      # tag) just upload artifacts to the run; the release step is
+      # skipped via the `if:` guard.
+      contents: write
+      # `id-token: write` + `attestations: write` are required by
+      # `actions/attest-build-provenance@v2` so a downstream auditor
+      # can run `gh attestation verify execlaw_*.deb --owner
+      # ${{ github.repository_owner }}` and confirm the artefact
+      # was built by this exact workflow at this exact commit.
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 1
+
+      - name: Install Linux system deps
+        # Tauri 2 on Linux pulls in webkit2gtk-4.1, libsoup-3.0, and
+        # libayatana-appindicator3 at link time. `librsvg2-bin` is
+        # the `rsvg-convert` binary the build script uses for icon
+        # rendering. `libssl-dev` covers the OpenSSL link of the
+        # vendored crate.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            librsvg2-bin \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libssl-dev \
+            pkg-config \
+            build-essential \
+            zip
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-bundle
+          workspaces: |
+            .
+            desktop-linux/src-tauri
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      - name: Build bundle
+        run: ./scripts/build-linux.sh
+
+      - name: Package plugin ZIPs
+        # Every plugin under `plugins/*/` with a parseable
+        # `plugin.toml` gets a `dist/<id>-<version>.zip` plus a
+        # SHA-256 sidecar. The `build-linux.sh` step also invokes
+        # this so the same ZIPs land in the .deb's
+        # `/usr/share/execlaw/plugins/`; running it again here is
+        # idempotent and gives us a clean `dist/` to attach to the
+        # Release.
+        run: ./scripts/package-plugins.sh
+
+      - name: Locate bundle outputs
+        id: outputs
+        run: |
+          set -e
+          BUNDLE_ROOT="desktop-linux/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle"
+          DEB=$(ls "$BUNDLE_ROOT"/deb/execlaw_*_amd64.deb 2>/dev/null | head -n 1 || true)
+          if [[ -z "$DEB" ]]; then
+              echo "::error::expected .deb under $BUNDLE_ROOT/deb/ — build-linux.sh failed silently?"
+              exit 1
+          fi
+          echo "deb=$DEB" >> "$GITHUB_OUTPUT"
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: execlaw-deb-amd64
+          path: ${{ steps.outputs.outputs.deb }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload plugin ZIPs
+        uses: actions/upload-artifact@v4
+        with:
+          name: execlaw-plugins-linux
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: warn
+          retention-days: 90
+
+      # ----- Provenance attestation -----
+      - name: Attest .deb provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.outputs.outputs.deb }}
+
+      - name: Attest plugin ZIP provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*.zip"
+
+      # ----- Release path -----
+      # The remaining steps only fire on a tag push. workflow_dispatch
+      # runs (manual ad-hoc builds) skip them — those builds just
+      # leave the .deb as a workflow artifact for the maintainer to
+      # grab.
+      - name: Compute SHA256 of .deb
+        id: checksum
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -e
+          DEB='${{ steps.outputs.outputs.deb }}'
+          SHA=$(sha256sum "$DEB" | awk '{print $1}')
+          BASENAME=$(basename "$DEB")
+          echo "$SHA  $BASENAME" > "${DEB}.sha256"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "sha_file=${DEB}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Update GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        # softprops/action-gh-release tolerates an existing release
+        # — the macOS-bundle workflow creates the release entry as
+        # a draft, then this workflow + the windows-bundle workflow
+        # add their artefacts to the same release. Tag-name dedup
+        # happens server-side.
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: false
+          generate_release_notes: false
+          name: "execlaw ${{ github.ref_name }}"
+          # Append-only — uploads new files to the existing draft
+          # release without overwriting the macOS-side notes.
+          files: |
+            ${{ steps.outputs.outputs.deb }}
+            ${{ steps.checksum.outputs.sha_file }}
+            dist/*.zip
+            dist/*.zip.sha256
+          fail_on_unmatched_files: true

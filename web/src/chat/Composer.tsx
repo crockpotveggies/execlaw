@@ -7,25 +7,180 @@
 // `sendVoiceFrame` accessor; when absent (e.g. settings shell) the
 // button is hidden.
 
-import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type DragEvent, type FormEvent, type KeyboardEvent } from "react";
 import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
 import Spinner from "react-bootstrap/Spinner";
 import type { InlineAttachment, SkillListEntry } from "../api/endpoints";
+import { useT } from "../i18n";
 import type { VoiceReadiness } from "./useVoiceReadiness";
 import { VoiceCaptureButton } from "./VoiceCaptureButton";
 
-/// One image staged in the composer before send. The component
-/// holds the data URL inline; on submit it's handed to `onSend` as
-/// an `InlineAttachment` and the server persists. A local-only
-/// `localId` lets the preview chip render before the file is even
-/// finished reading; `dataUrl` lands the moment `FileReader` resolves.
+/// One attachment staged in the composer before send. The
+/// component holds the data URL inline; on submit it's handed to
+/// `onSend` as an `InlineAttachment` and the server persists. A
+/// local-only `localId` lets the preview chip render before the
+/// file is even finished reading; `dataUrl` lands the moment
+/// `FileReader` resolves.
+///
+/// `kind` discriminates rendering: `"image"` shows a thumbnail (the
+/// vision-content path), `"file"` shows a file icon + filename
+/// chip (the python-sandbox hydration path, added 2026-05-18 to
+/// let the operator hand a CSV / PDF / JSON / etc. to the agent
+/// so it can operate on it via `python.execute`).
 interface PendingAttachment {
     localId: string;
     name: string;
     mime: string;
     dataUrl: string;
     sizeBytes: number;
+    kind: "image" | "file";
+}
+
+/// Accept-list for the "Attach file" picker (the non-image path).
+/// Mirrors `ALLOWED_ATTACHMENT_MIMES` on the server (minus the
+/// image group, which has its own picker). Operator picks one of
+/// these from disk, the SPA base64-encodes inline, the server
+/// validates against the same list before persisting.
+const FILE_PICKER_ACCEPT = [
+    ".csv",
+    ".tsv",
+    ".json",
+    ".txt",
+    ".md",
+    ".pdf",
+    ".xlsx",
+    ".xls",
+].join(",");
+
+/// Image MIMEs accepted by the server (`ALLOWED_ATTACHMENT_MIMES`
+/// image subset). Used by the drag-drop classifier to route a
+/// dropped file to the image branch — `mime.startsWith("image/")`
+/// would be too permissive (image/svg+xml would slip through here
+/// but get rejected at the server, leaving an orphan chip).
+const IMAGE_MIME_ALLOWLIST: ReadonlySet<string> = new Set([
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+]);
+
+/// Data MIMEs accepted by the server. Same source of truth as the
+/// backend's `ALLOWED_ATTACHMENT_MIMES`. The drag-drop classifier
+/// uses this for the file branch; anything outside both
+/// IMAGE_MIME_ALLOWLIST and this set is rejected client-side with
+/// an inline ErrorBanner so the operator gets immediate feedback
+/// instead of a silent server 400.
+const DATA_MIME_ALLOWLIST: ReadonlySet<string> = new Set([
+    "text/csv",
+    "text/tab-separated-values",
+    "application/json",
+    "text/plain",
+    "text/markdown",
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel",
+]);
+
+/// Drag-drop classification result. The drop handler walks every
+/// dropped file, classifies, then routes the image group through
+/// the image prep path, the file group through the data path, and
+/// surfaces the rejected names to the operator via ErrorBanner.
+type DropClassification = "image" | "file" | "reject";
+
+/// Decide which path a dropped file goes through. The browser
+/// reports `file.type` from the OS — usually accurate, but
+/// occasionally empty for less-common MIMEs (`.csv` on some
+/// Windows installs, `.md` everywhere). Falls back to extension
+/// via `inferFileMime` for those cases. Returns "reject" for
+/// anything outside the two allowlists — the operator sees an
+/// inline error instead of a silent server rejection later.
+function classifyDroppedFile(file: File): DropClassification {
+    // Prefer the browser-reported MIME; only fall through to
+    // extension-derived for the empty case.
+    const reported = file.type;
+    if (reported && IMAGE_MIME_ALLOWLIST.has(reported)) return "image";
+    if (reported && DATA_MIME_ALLOWLIST.has(reported)) return "file";
+    // Empty `file.type` is common for .csv / .md on some browsers;
+    // ask `inferFileMime` to look at the extension.
+    const inferred = inferFileMime(file);
+    if (IMAGE_MIME_ALLOWLIST.has(inferred)) return "image";
+    if (DATA_MIME_ALLOWLIST.has(inferred)) return "file";
+    return "reject";
+}
+
+/// Best-effort MIME for a picked file. Browsers populate `file.type`
+/// from the OS for most common extensions, but a handful of
+/// extensions (`.csv` on some Windows installs, `.md` everywhere)
+/// come through as the empty string. Fall back to the extension.
+function inferFileMime(file: File): string {
+    if (file.type && file.type.length > 0) return file.type;
+    const name = file.name.toLowerCase();
+    if (name.endsWith(".csv")) return "text/csv";
+    if (name.endsWith(".tsv")) return "text/tab-separated-values";
+    if (name.endsWith(".json")) return "application/json";
+    if (name.endsWith(".md")) return "text/markdown";
+    if (name.endsWith(".txt")) return "text/plain";
+    if (name.endsWith(".pdf")) return "application/pdf";
+    if (name.endsWith(".xlsx"))
+        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    if (name.endsWith(".xls")) return "application/vnd.ms-excel";
+    return "application/octet-stream";
+}
+
+/// Read a `File` as a `data:<mime>;base64,<bytes>` URL. Mirrors the
+/// shape `prepareImageForUpload` returns for the image path, minus
+/// the downscale (data files go through untouched).
+function readFileAsDataUrl(
+    file: File,
+    mime: string,
+): Promise<{ dataUrl: string; sizeBytes: number; mime: string }> {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+            const result = reader.result;
+            if (typeof result !== "string") {
+                reject(new Error("FileReader returned non-string result"));
+                return;
+            }
+            // Some browsers fill in `application/octet-stream` for
+            // unknown types regardless of file extension. Splice in
+            // our inferred MIME so the server's acceptlist check
+            // doesn't reject a perfectly-valid .csv.
+            const fixedDataUrl = result.replace(
+                /^data:[^;]+;base64,/,
+                `data:${mime};base64,`,
+            );
+            resolve({
+                dataUrl: fixedDataUrl,
+                sizeBytes: file.size,
+                mime,
+            });
+        };
+        reader.onerror = () =>
+            reject(reader.error ?? new Error("FileReader failed"));
+        reader.readAsDataURL(file);
+    });
+}
+
+/// File-icon class for a non-image attachment chip. Mirrors
+/// AttachmentCard's icon table (PDF, CSV, JSON, etc.) so the
+/// composer chip matches what the operator will see in the message
+/// stream once the upload commits.
+function fileIconForMime(mime: string): string {
+    if (mime === "application/pdf") return "bi bi-file-earmark-pdf";
+    if (mime === "text/csv" || mime === "text/tab-separated-values")
+        return "bi bi-file-earmark-spreadsheet";
+    if (
+        mime ===
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+        mime === "application/vnd.ms-excel"
+    )
+        return "bi bi-file-earmark-excel";
+    if (mime === "application/json") return "bi bi-file-earmark-code";
+    if (mime === "text/markdown") return "bi bi-markdown";
+    if (mime === "text/plain") return "bi bi-file-earmark-text";
+    return "bi bi-file-earmark";
 }
 
 interface Props {
@@ -130,6 +285,7 @@ export function Composer({
     recommendedImageEdge,
     getSkills,
 }: Props) {
+    const t = useT();
     // Bridged-channel short-circuit. Render a flat, non-interactive
     // notice in place of the composer chip. Mirrors the chip's
     // outer dimensions (max-width, padding, border-radius via the
@@ -167,6 +323,11 @@ export function Composer({
     const [attachMenuOpen, setAttachMenuOpen] = useState(false);
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
+    /// 2026-05-18 — second hidden <input> for the non-image
+    /// "Attach file" path. Kept separate from `fileInputRef` (the
+    /// image picker) so each has its own `accept` attribute and
+    /// the OS picker shows the right MIME group by default.
+    const dataFileInputRef = useRef<HTMLInputElement | null>(null);
     const attachMenuRef = useRef<HTMLDivElement | null>(null);
     /// 2026-05-15 — skill picker state. `mode` toggles the dropdown
     /// between the two-item top menu and the skill list view. The
@@ -179,6 +340,19 @@ export function Composer({
     const [skillsLoading, setSkillsLoading] = useState(false);
     const [skillsError, setSkillsError] = useState<string | null>(null);
     const [selectedSkills, setSelectedSkills] = useState<SkillListEntry[]>([]);
+    /// 2026-05-18 — drag-drop state. `isDragOver` toggles the
+    /// composer-shell drop-zone highlight; `dropError` carries
+    /// the most recent "unsupported file" message for the
+    /// inline ErrorBanner. `dragDepth` solves the dragenter /
+    /// dragleave flicker problem: dragenter fires on every child
+    /// element transition, dragleave fires before the next
+    /// dragenter, so a naive boolean toggles rapidly as the
+    /// pointer moves over the textarea / buttons. Counting
+    /// enter/leave pairs lets us flip the highlight only when
+    /// the cursor truly leaves the shell.
+    const [isDragOver, setIsDragOver] = useState(false);
+    const [dropError, setDropError] = useState<string | null>(null);
+    const dragDepth = useRef(0);
 
     // Auto-grow.
     useEffect(() => {
@@ -222,6 +396,18 @@ export function Composer({
         fileInputRef.current?.click();
     };
 
+    /// 2026-05-18 — third menu item alongside "Attach photo" /
+    /// "Attach skill". Opens a separate <input type="file"> with the
+    /// `accept` attribute restricted to data files (CSV, JSON, PDF,
+    /// etc.) so the OS picker hides binaries by default. The actual
+    /// MIME acceptlist still gets re-checked server-side; this is
+    /// just the operator-affordance.
+    const onPickFile = () => {
+        setAttachMenuOpen(false);
+        setAttachMenuMode("root");
+        dataFileInputRef.current?.click();
+    };
+
     /// Switch the menu into "skill picker" mode and lazy-load the
     /// list on first open. Cached across opens for the rest of the
     /// component's lifetime so the second open is instant. Errors
@@ -262,33 +448,147 @@ export function Composer({
         setSelectedSkills((prev) => prev.filter((s) => s.name !== name));
     };
 
+    /// Per-file image processor. Reads the bytes, downscales when
+    /// the backend asked for it, returns a `PendingAttachment`
+    /// suitable for direct append to staged state. Extracted from
+    /// the picker handler so the drag-drop path can reuse the
+    /// same downscale + chip-shape logic.
+    const processImageFile = async (
+        f: File,
+        idx: number,
+    ): Promise<PendingAttachment> => {
+        const result = await prepareImageForUpload(f, recommendedImageEdge ?? 0);
+        return {
+            localId: `${Date.now()}-${idx}-${f.name}`,
+            name: f.name,
+            mime: result.mime,
+            dataUrl: result.dataUrl,
+            sizeBytes: result.sizeBytes,
+            kind: "image",
+        };
+    };
+
+    /// Per-file data-file processor. Mirrors `processImageFile`
+    /// but for non-image attachments (CSV / PDF / JSON / etc.).
+    /// Returns `null` on FileReader failure (rare — browser quota,
+    /// permission revoked mid-read); callers filter nulls.
+    const processDataFile = async (
+        f: File,
+        idx: number,
+    ): Promise<PendingAttachment | null> => {
+        const mime = inferFileMime(f);
+        try {
+            const result = await readFileAsDataUrl(f, mime);
+            return {
+                localId: `${Date.now()}-${idx}-${f.name}`,
+                name: f.name,
+                mime: result.mime,
+                dataUrl: result.dataUrl,
+                sizeBytes: result.sizeBytes,
+                kind: "file",
+            };
+        } catch (e) {
+            console.error("readFileAsDataUrl failed", f.name, e);
+            return null;
+        }
+    };
+
     const onFilesPicked = async (files: FileList | null) => {
         if (!files) return;
         const next: PendingAttachment[] = [];
         for (let i = 0; i < files.length; i++) {
             const f = files[i];
             if (!f.type.startsWith("image/")) continue;
-            // 2026-05-15 — downscale before base64 when the backend
-            // told us an edge target. Skipped for GIFs (preserve
-            // animation; Canvas would flatten to first frame) and
-            // when the image is already smaller than the target.
-            const result = await prepareImageForUpload(
-                f,
-                recommendedImageEdge ?? 0,
-            );
-            next.push({
-                localId: `${Date.now()}-${i}-${f.name}`,
-                name: f.name,
-                mime: result.mime,
-                dataUrl: result.dataUrl,
-                sizeBytes: result.sizeBytes,
-            });
+            next.push(await processImageFile(f, i));
         }
         setAttachments((prev) => [...prev, ...next]);
         // Reset the input so picking the same file twice in a row
         // re-fires onChange (browsers suppress duplicate selections
         // otherwise).
         if (fileInputRef.current) fileInputRef.current.value = "";
+    };
+
+    /// 2026-05-18 — non-image picker. Tags the resulting chip as
+    /// `kind: "file"` so the preview renders an icon instead of
+    /// a thumbnail, and stages the original `file.name` as the
+    /// operator-facing filename so python-sandbox hydration can
+    /// drop the blob at `/work/<convo>/uploads/<filename>`.
+    const onDataFilesPicked = async (files: FileList | null) => {
+        if (!files) return;
+        const next: PendingAttachment[] = [];
+        for (let i = 0; i < files.length; i++) {
+            const f = files[i];
+            const att = await processDataFile(f, i);
+            if (att !== null) next.push(att);
+        }
+        setAttachments((prev) => [...prev, ...next]);
+        if (dataFileInputRef.current) dataFileInputRef.current.value = "";
+    };
+
+    /// 2026-05-18 — drag-and-drop path. Classifies every dropped
+    /// file (image / data / unsupported), routes the supported
+    /// ones through the same per-file processors the pickers use,
+    /// and surfaces rejected names to the operator via the
+    /// inline ErrorBanner so a wrong-MIME drop doesn't fail
+    /// silently or with a server 400.
+    ///
+    /// Failure modes the operator might hit (and what they see):
+    ///   * Drops a .py / .exe / .docx file → ErrorBanner naming
+    ///     the rejected files + the accepted MIME groups.
+    ///   * Drops a mix of accepted + unsupported → accepted files
+    ///     stage as chips, unsupported names go to the banner.
+    ///   * Drops a folder (browser surfaces folders as a single
+    ///     File with size=0 and empty type) → classified as
+    ///     reject because no MIME matches.
+    ///   * Drops nothing (drag was just text from another tab) →
+    ///     no-op; banner stays clear.
+    const handleDroppedFiles = async (files: File[]) => {
+        if (files.length === 0) return;
+        const images: File[] = [];
+        const dataFiles: File[] = [];
+        const rejected: string[] = [];
+        for (const f of files) {
+            switch (classifyDroppedFile(f)) {
+                case "image":
+                    images.push(f);
+                    break;
+                case "file":
+                    dataFiles.push(f);
+                    break;
+                case "reject":
+                    rejected.push(f.name || "(unnamed)");
+                    break;
+            }
+        }
+        // Process both groups in parallel — image downscale is the
+        // slow part and there's no inter-file dependency.
+        const [imageChips, dataChips] = await Promise.all([
+            Promise.all(images.map((f, i) => processImageFile(f, i))),
+            Promise.all(
+                dataFiles.map((f, i) => processDataFile(f, images.length + i)),
+            ),
+        ]);
+        const accepted: PendingAttachment[] = [
+            ...imageChips,
+            ...dataChips.filter((a): a is PendingAttachment => a !== null),
+        ];
+        if (accepted.length > 0) {
+            setAttachments((prev) => [...prev, ...accepted]);
+        }
+        if (rejected.length > 0) {
+            // Compact list when many — operators don't need a 20-
+            // name dump in the banner.
+            const shown = rejected.length <= 3
+                ? rejected.join(", ")
+                : `${rejected.slice(0, 3).join(", ")} +${rejected.length - 3} more`;
+            setDropError(
+                `Unsupported file type: ${shown}. Supported: images (PNG, JPEG, WebP, GIF) ` +
+                `and data files (CSV, TSV, JSON, TXT, MD, PDF, XLSX, XLS).`,
+            );
+        } else {
+            // Clear any stale banner on a fully-accepted drop.
+            setDropError(null);
+        }
     };
 
     const removeAttachment = (localId: string) => {
@@ -308,6 +608,12 @@ export function Composer({
         const wire: InlineAttachment[] = attachments.map((a) => ({
             mime: a.mime,
             data_url: a.dataUrl,
+            // 2026-05-18 — server REQUIRES filename for non-image
+            // MIMEs so python-sandbox hydration can land the file
+            // at /work/<convo>/uploads/<filename>. Images carry the
+            // filename too (harmless metadata), but the server
+            // doesn't act on it for the vision-content path.
+            filename: a.name,
         }));
         const skillNames = selectedSkills.map((s) => s.name);
         setText("");
@@ -349,9 +655,101 @@ export function Composer({
     // InputGroup because InputGroup is fundamentally a single
     // horizontal row (textarea + buttons inline) and we want a
     // two-row chip (textarea on top, tools below).
+    /// 2026-05-18 — drag-drop event wiring on the composer shell.
+    ///
+    /// The shell is the natural drop zone (it covers the textarea
+    /// + the tools row). Wiring details:
+    ///
+    /// `dragenter` / `dragleave` use a ref-counted depth instead
+    /// of a plain boolean. Browsers fire one dragleave + one
+    /// dragenter every time the pointer crosses an internal
+    /// boundary (e.g. from the textarea onto the + button); a
+    /// boolean toggle there causes the highlight to strobe. The
+    /// counter increments on enter, decrements on leave, and only
+    /// the depth==0 transitions flip the highlight state.
+    ///
+    /// `dragover` MUST call `preventDefault` or the drop event
+    /// never fires (HTML5 drag-drop spec quirk — without the
+    /// preventDefault, the browser treats the area as a non-drop
+    /// target and renders the "no drop" cursor). We also set
+    /// `dropEffect = "copy"` so the OS cursor shows the copy-on-
+    /// drop affordance.
+    ///
+    /// `drop` cancels the default (otherwise the browser
+    /// navigates to display the file) and delegates to
+    /// `handleDroppedFiles`. Files that aren't accepted MIMEs
+    /// get listed in the inline ErrorBanner below the chip row;
+    /// supported files stage as chips immediately.
+    const onShellDragEnter = (e: DragEvent<HTMLDivElement>) => {
+        // Only respond to file drags, not text / DOM-node drags
+        // from elsewhere in the SPA. `dataTransfer.types` contains
+        // "Files" when an OS file drag is in flight.
+        if (!e.dataTransfer.types.includes("Files")) return;
+        e.preventDefault();
+        dragDepth.current += 1;
+        setIsDragOver(true);
+    };
+    const onShellDragLeave = (e: DragEvent<HTMLDivElement>) => {
+        if (!e.dataTransfer.types.includes("Files")) return;
+        e.preventDefault();
+        dragDepth.current = Math.max(0, dragDepth.current - 1);
+        if (dragDepth.current === 0) setIsDragOver(false);
+    };
+    const onShellDragOver = (e: DragEvent<HTMLDivElement>) => {
+        if (!e.dataTransfer.types.includes("Files")) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "copy";
+    };
+    const onShellDrop = (e: DragEvent<HTMLDivElement>) => {
+        if (!e.dataTransfer.types.includes("Files")) return;
+        e.preventDefault();
+        dragDepth.current = 0;
+        setIsDragOver(false);
+        // Snapshot files synchronously — `e.dataTransfer.files`
+        // is invalidated as soon as the event handler returns,
+        // and our classifier + reader is async.
+        const files: File[] = Array.from(e.dataTransfer.files);
+        void handleDroppedFiles(files);
+    };
+
     return (
         <form onSubmit={submit} className="execlaw-composer__form">
-            <div className="execlaw-composer__shell" data-testid="composer-shell">
+            <div
+                className={
+                    isDragOver
+                        ? "execlaw-composer__shell execlaw-composer__shell--drag-over"
+                        : "execlaw-composer__shell"
+                }
+                data-testid="composer-shell"
+                data-drag-over={isDragOver || undefined}
+                onDragEnter={onShellDragEnter}
+                onDragLeave={onShellDragLeave}
+                onDragOver={onShellDragOver}
+                onDrop={onShellDrop}
+            >
+                {dropError && (
+                    <div
+                        className="execlaw-composer__drop-error"
+                        role="alert"
+                        data-testid="composer-drop-error"
+                    >
+                        <i
+                            className="bi bi-exclamation-triangle-fill"
+                            aria-hidden
+                            style={{ marginRight: "0.4rem" }}
+                        />
+                        <span style={{ flex: 1 }}>{dropError}</span>
+                        <button
+                            type="button"
+                            className="execlaw-composer__drop-error-dismiss"
+                            onClick={() => setDropError(null)}
+                            aria-label={t("composer.dismiss", "Dismiss")}
+                            data-testid="composer-drop-error-dismiss"
+                        >
+                            <i className="bi bi-x" aria-hidden />
+                        </button>
+                    </div>
+                )}
                 {(attachments.length > 0 || selectedSkills.length > 0) && (
                     <div
                         className="execlaw-composer__attachments"
@@ -360,15 +758,32 @@ export function Composer({
                         {attachments.map((a) => (
                             <div
                                 key={a.localId}
-                                className="execlaw-composer__attachment-chip"
+                                className={
+                                    a.kind === "file"
+                                        ? "execlaw-composer__attachment-chip execlaw-composer__attachment-chip--file"
+                                        : "execlaw-composer__attachment-chip"
+                                }
                                 data-testid="composer-attachment-chip"
+                                data-attachment-kind={a.kind}
                                 title={`${a.name} · ${formatBytes(a.sizeBytes)}`}
                             >
-                                <img
-                                    className="execlaw-composer__attachment-thumb"
-                                    src={a.dataUrl}
-                                    alt={a.name}
-                                />
+                                {a.kind === "image" ? (
+                                    <img
+                                        className="execlaw-composer__attachment-thumb"
+                                        src={a.dataUrl}
+                                        alt={a.name}
+                                    />
+                                ) : (
+                                    <span className="execlaw-composer__attachment-file">
+                                        <i
+                                            className={fileIconForMime(a.mime)}
+                                            aria-hidden
+                                        />
+                                        <span className="execlaw-composer__attachment-filename">
+                                            {a.name}
+                                        </span>
+                                    </span>
+                                )}
                                 <button
                                     type="button"
                                     className="execlaw-composer__attachment-remove"
@@ -412,7 +827,7 @@ export function Composer({
                     ref={textareaRef}
                     as="textarea"
                     rows={1}
-                    placeholder="How can I help?"
+                    placeholder={t("composer.placeholder", "How can I help?")}
                     value={text}
                     onChange={(e) => setText(e.target.value)}
                     onKeyDown={onKeyDown}
@@ -434,8 +849,20 @@ export function Composer({
                 />
                 <div className="execlaw-composer__tools">
                     <div className="execlaw-composer__tools-left">
-                        {(multimodal || !!getSkills) && (
-                            <div
+                        {/*
+                          Attach-trigger anchor. 2026-05-18: "Attach
+                          file" is always available (data files don't
+                          need a vision-capable backend), so the +
+                          button is now unconditionally rendered. The
+                          submenu items are individually gated on the
+                          underlying capability (multimodal for photos,
+                          getSkills for skills, always-on for files).
+                          The previous `{(multimodal || !!getSkills) &&`
+                          wrapper would hide the + button entirely on
+                          a text-only backend without skills, which
+                          would also hide the file-attach affordance.
+                        */}
+                        <div
                                 ref={attachMenuRef}
                                 className="execlaw-composer__attach-anchor"
                             >
@@ -450,7 +877,7 @@ export function Composer({
                                         // state from the previous open.
                                         setAttachMenuMode("root");
                                     }}
-                                    aria-label="Attach"
+                                    aria-label={t("composer.attach", "Attach")}
                                     aria-haspopup="menu"
                                     aria-expanded={attachMenuOpen}
                                     disabled={isBusy}
@@ -476,9 +903,40 @@ export function Composer({
                                                     className="bi bi-image"
                                                     aria-hidden
                                                 />
-                                                <span>Attach photo</span>
+                                                <span>{t("composer.attachPhoto", "Attach photo")}</span>
                                             </button>
                                         )}
+                                        {/*
+                                          2026-05-18 — "Attach file"
+                                          surfaces the python-sandbox
+                                          hydration path. Always shown
+                                          (independent of `multimodal`
+                                          since data files don't need a
+                                          vision-capable backend); the
+                                          server-side acceptlist gates
+                                          which MIME types actually
+                                          land. If the python-sandbox
+                                          plugin isn't installed the
+                                          file still uploads + becomes
+                                          a state_attachments row but
+                                          no hydration occurs — that's
+                                          fine, the agent just won't
+                                          see it surface in
+                                          /work/uploads/.
+                                        */}
+                                        <button
+                                            type="button"
+                                            role="menuitem"
+                                            className="execlaw-composer__attach-menu-item"
+                                            onClick={onPickFile}
+                                            data-testid="composer-attach-file"
+                                        >
+                                            <i
+                                                className="bi bi-paperclip"
+                                                aria-hidden
+                                            />
+                                            <span>{t("composer.attachFile", "Attach file")}</span>
+                                        </button>
                                         {getSkills && (
                                             <button
                                                 type="button"
@@ -491,7 +949,7 @@ export function Composer({
                                                     className="bi bi-stars"
                                                     aria-hidden
                                                 />
-                                                <span>Attach skill</span>
+                                                <span>{t("composer.attachSkill", "Attach skill")}</span>
                                             </button>
                                         )}
                                     </div>
@@ -509,7 +967,10 @@ export function Composer({
                                                 onClick={() =>
                                                     setAttachMenuMode("root")
                                                 }
-                                                aria-label="Back to attach menu"
+                                                aria-label={t(
+                                                    "composer.backToAttach",
+                                                    "Back to attach menu",
+                                                )}
                                                 data-testid="composer-skill-picker-back"
                                             >
                                                 <i
@@ -517,14 +978,14 @@ export function Composer({
                                                     aria-hidden
                                                 />
                                             </button>
-                                            <span>Pick skills for this turn</span>
+                                            <span>{t("composer.pickSkills", "Pick skills for this turn")}</span>
                                         </div>
                                         {skillsLoading && (
                                             <div
                                                 className="execlaw-composer__skill-picker-status"
                                                 data-testid="composer-skill-picker-loading"
                                             >
-                                                Loading…
+                                                {t("composer.loading", "Loading…")}
                                             </div>
                                         )}
                                         {skillsError && (
@@ -600,8 +1061,26 @@ export function Composer({
                                     }
                                     data-testid="composer-file-input"
                                 />
+                                {/*
+                                  2026-05-18 — second hidden input for
+                                  the non-image "Attach file" path. The
+                                  separate `accept` attribute means the
+                                  OS picker shows only data files by
+                                  default (the operator can override
+                                  with "All files" in most pickers).
+                                */}
+                                <input
+                                    ref={dataFileInputRef}
+                                    type="file"
+                                    accept={FILE_PICKER_ACCEPT}
+                                    multiple
+                                    style={{ display: "none" }}
+                                    onChange={(e) =>
+                                        void onDataFilesPicked(e.target.files)
+                                    }
+                                    data-testid="composer-data-file-input"
+                                />
                             </div>
-                        )}
                     </div>
                     <div className="execlaw-composer__tools-right">
                         {/*
@@ -650,7 +1129,7 @@ export function Composer({
                                     onStop();
                                 }}
                                 data-testid="composer-stop"
-                                aria-label="Stop generating"
+                                aria-label={t("composer.stop", "Stop generating")}
                                 className="execlaw-composer__send execlaw-composer__send--stop"
                             >
                                 <i className="bi bi-stop-fill" aria-hidden />
@@ -661,7 +1140,7 @@ export function Composer({
                                 variant="primary"
                                 disabled={sendDisabled}
                                 data-testid="composer-send"
-                                aria-label="Send"
+                                aria-label={t("composer.send", "Send")}
                                 className="execlaw-composer__send"
                             >
                                 {submitting ? (

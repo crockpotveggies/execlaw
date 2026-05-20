@@ -482,11 +482,20 @@ impl RunnerSupervisor {
         }
 
         // Stamp the container id + controller-pin flag.
+        //
+        // 2026-05-17 — was `g.includes_controller`, which is `true`
+        // for every group the controller is a MEMBER of (including
+        // shared Signal/WhatsApp/Slack groups). That flag flowed
+        // straight into `RunnerHandle.controller_runner`, which
+        // makes `is_reapable` return false → those group runners
+        // stayed up forever, and the operator saw "N runners owned
+        // by the controller" in diagnostics. Switch to
+        // `is_controller_solo`: only the single-member
+        // controller-only DM (the SPA's runner) is reap-exempt;
+        // multi-member groups the controller happens to be in
+        // follow the regular ephemeral group-container lifecycle.
         let store = PrincipalGroupStore::new(&self.inner.db);
-        let controller_runner = match store.get(group_id) {
-            Ok(Some(g)) => g.includes_controller,
-            _ => false,
-        };
+        let controller_runner = store.is_controller_solo(group_id).unwrap_or(false);
         if let Some(handle) = self.get(group_id) {
             let mut s = handle.state.write().await;
             s.container_id = Some(id.container_id.clone());
@@ -1530,6 +1539,7 @@ mod tests {
             reasoning_enabled: false,
             spotlight: None,
             user_image_urls: Vec::new(),
+            max_tool_rounds: 16,
         };
         let res = s.forward_turn("g-missing", req).await;
         assert!(matches!(res, Err(ForwardError::NoRunner)));
@@ -1569,6 +1579,7 @@ mod tests {
             reasoning_enabled: false,
             spotlight: None,
             user_image_urls: Vec::new(),
+            max_tool_rounds: 16,
         };
         let res = s.forward_turn("g-dead", req).await;
         assert!(matches!(res, Err(ForwardError::RunnerGone)));
@@ -1833,6 +1844,168 @@ mod tests {
             launcher.spawn_count().await,
             1,
             "stale tombstone should have been replaced via a single fresh spawn"
+        );
+    }
+
+    /// 2026-05-17 — regression test for "the controller appears to
+    /// own N runners". Pre-fix, `ensure_runner` set
+    /// `RunnerHandle.controller_runner` from
+    /// `state_principal_groups.includes_controller`, which is `true`
+    /// for ANY group containing the controller — including a Signal
+    /// group of 3 people where the controller is one passive member.
+    /// Those runners then never reaped. Post-fix, only the
+    /// controller's solo DM is reap-exempt; multi-member groups
+    /// follow the regular ephemeral group-runner lifecycle.
+    #[tokio::test]
+    async fn ensure_runner_marks_multi_member_controller_group_as_non_controller_runner() {
+        use crate::runner_spawn::{MockRunnerLauncher, RunnerSpec};
+        use execlaw_core::ids::PrincipalId;
+        use execlaw_core::principal_groups::{GroupKey, PrincipalGroupStore};
+
+        let s = fresh_supervisor();
+        // Seed a Signal group with controller + alice + bob.
+        let store = PrincipalGroupStore::new(s.db());
+        let principals = vec![
+            PrincipalId::from("controller"),
+            PrincipalId::from("alice"),
+            PrincipalId::from("bob"),
+        ];
+        let pg = store
+            .resolve(
+                &GroupKey {
+                    channel: "signal",
+                    native_group_id: Some("signal:group:room-1"),
+                    principals: &principals,
+                    includes_controller: true,
+                },
+                Utc::now().timestamp(),
+            )
+            .unwrap();
+        assert!(
+            pg.includes_controller,
+            "fixture invariant: row should be flagged includes_controller"
+        );
+
+        let launcher = MockRunnerLauncher::new();
+        let group_id = pg.group_id.clone();
+        let s_clone = s.clone();
+        let gid_for_ack = group_id.clone();
+        let ack = tokio::spawn(async move {
+            for _ in 0..50 {
+                let secret = s_clone
+                    .inner
+                    .pending_spawns
+                    .get(&gid_for_ack)
+                    .map(|p| p.value().secret);
+                if let Some(secret) = secret {
+                    let _ = s_clone.accept_registration(&gid_for_ack, &secret, false);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        let h = s
+            .ensure_runner(
+                &launcher,
+                &group_id,
+                RunnerSpec {
+                    group_id: group_id.clone(),
+                    image: "x".into(),
+                    spawn_secret_hex: "".into(),
+                    rpc_url: "ws://x".into(),
+                    inference_url: "http://x".into(),
+                    memory_bytes: None,
+                    network: None,
+                    env: vec![],
+                },
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("ensure_runner ok");
+        ack.await.unwrap();
+
+        assert!(
+            !h.controller_runner,
+            "multi-member group runner must NOT inherit controller_runner=true \
+             just because the controller is one of the members"
+        );
+
+        // And the reap-eligibility check honors that.
+        let stale = Utc::now() + chrono::Duration::seconds(IDLE_TTL.as_secs() as i64 * 2);
+        assert!(
+            h.is_reapable(stale, IDLE_TTL).await,
+            "an idle multi-member group runner with the controller as a member \
+             must be reapable on the regular lifecycle"
+        );
+    }
+
+    /// Companion: confirm the controller's SOLO DM still pins as
+    /// `controller_runner=true` post-fix — we only want to strip the
+    /// flag from group runners, not from the SPA's always-warm runner.
+    #[tokio::test]
+    async fn ensure_runner_pins_solo_controller_dm_as_controller_runner() {
+        use crate::runner_spawn::{MockRunnerLauncher, RunnerSpec};
+        use execlaw_core::ids::PrincipalId;
+        use execlaw_core::principal_groups::{GroupKey, PrincipalGroupStore};
+
+        let s = fresh_supervisor();
+        let store = PrincipalGroupStore::new(s.db());
+        let principals = vec![PrincipalId::from("controller")];
+        let pg = store
+            .resolve(
+                &GroupKey {
+                    channel: "web",
+                    native_group_id: None,
+                    principals: &principals,
+                    includes_controller: true,
+                },
+                Utc::now().timestamp(),
+            )
+            .unwrap();
+
+        let launcher = MockRunnerLauncher::new();
+        let group_id = pg.group_id.clone();
+        let s_clone = s.clone();
+        let gid_for_ack = group_id.clone();
+        let ack = tokio::spawn(async move {
+            for _ in 0..50 {
+                let secret = s_clone
+                    .inner
+                    .pending_spawns
+                    .get(&gid_for_ack)
+                    .map(|p| p.value().secret);
+                if let Some(secret) = secret {
+                    let _ = s_clone.accept_registration(&gid_for_ack, &secret, false);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        let h = s
+            .ensure_runner(
+                &launcher,
+                &group_id,
+                RunnerSpec {
+                    group_id: group_id.clone(),
+                    image: "x".into(),
+                    spawn_secret_hex: "".into(),
+                    rpc_url: "ws://x".into(),
+                    inference_url: "http://x".into(),
+                    memory_bytes: None,
+                    network: None,
+                    env: vec![],
+                },
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("ensure_runner ok");
+        ack.await.unwrap();
+
+        assert!(
+            h.controller_runner,
+            "single-member controller DM must still pin as controller_runner=true"
         );
     }
 

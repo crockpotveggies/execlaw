@@ -33,6 +33,7 @@ import { SearchPage } from "./SearchPage";
 import { PersonalityPage } from "./PersonalityPage";
 import { AlertsPage } from "./AlertsPage";
 import { TrustPolicyPage } from "./TrustPolicyPage";
+import { InferencePage } from "./InferencePage";
 
 const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     // General first (Phase 14 bare-metal pivot) — host-service knobs
@@ -70,6 +71,14 @@ const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     { to: "/settings/mcp", icon: "bi-broadcast", label: "MCP" },
     // Hardware now lives at the bottom of the Backends page.
     { to: "/settings/backends", icon: "bi-cpu-fill", label: "Backends" },
+    // Inference — M5 per-consumer observability. Lives alongside
+    // Backends because operators reach for both when diagnosing
+    // "is the model the bottleneck" questions.
+    {
+        to: "/settings/inference",
+        icon: "bi-graph-up",
+        label: "Inference",
+    },
     { to: "/settings/runners", icon: "bi-fire", label: "Runners" },
     // Sidecars — companion containers the sidecar supervisor manages
     // (signal-cli, WhatsApp bridges, future OCR / ffmpeg helpers).
@@ -212,6 +221,7 @@ export function Settings() {
                         <Route path="tools" element={<ToolsPage />} />
                         <Route path="mcp" element={<McpServersPage />} />
                         <Route path="backends" element={<BackendsPage />} />
+                        <Route path="inference" element={<InferencePage />} />
                         <Route path="runners" element={<RunnersPage />} />
                         <Route path="sidecars" element={<SidecarsPage />} />
                         <Route path="contacts" element={<ContactsPage />} />

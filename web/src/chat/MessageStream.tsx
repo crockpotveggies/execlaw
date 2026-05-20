@@ -23,6 +23,7 @@ import {
     useState,
 } from "react";
 import type { MessageView } from "../api/endpoints";
+import { signDownloadUrl } from "../api/signedDownloadUrl";
 import { AuthContext } from "../auth/AuthContext";
 import { getCardRenderer } from "../cards/CardRenderer";
 import { useCardsForConversation } from "../cards/cardStore";
@@ -41,10 +42,63 @@ import {
 import "./components/ChartInlineComponent";
 import "./components/WeatherCurrentComponent";
 import "./components/WeatherDailyComponent";
+import "./components/PythonExecuteComponent";
 import { useChatState } from "./store";
+
+// 2026-05-18 — helpers for the file-vs-image branching when
+// rendering attachments under user message bubbles. Image MIMEs
+// mirror the server's `ALLOWED_ATTACHMENT_MIMES` image subset;
+// anything else takes the file-chip path.
+const IMAGE_MIME_SET: ReadonlySet<string> = new Set([
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+]);
+function isImageMime(m: string): boolean {
+    return IMAGE_MIME_SET.has(m);
+}
+
+/// Bootstrap-icons class for a non-image attachment chip. Mirrors
+/// the Composer's `fileIconForMime` so a CSV looks the same in the
+/// composer preview and the rendered message.
+function fileIconForMime(mime: string): string {
+    if (mime === "application/pdf") return "bi bi-file-earmark-pdf";
+    if (mime === "text/csv" || mime === "text/tab-separated-values")
+        return "bi bi-file-earmark-spreadsheet";
+    if (
+        mime ===
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+        mime === "application/vnd.ms-excel"
+    )
+        return "bi bi-file-earmark-excel";
+    if (mime === "application/json") return "bi bi-file-earmark-code";
+    if (mime === "text/markdown") return "bi bi-markdown";
+    if (mime === "text/plain") return "bi bi-file-earmark-text";
+    return "bi bi-file-earmark";
+}
+
+/// Compact byte-size formatter for the message-attachment chip.
+/// Matches the Composer's `formatBytes` style ("5.2 KB", "1.4 MB").
+function formatBytes(n: number): string {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+    return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
 
 interface Props {
     conversationId: string;
+    /**
+     * 2026-05-16 — when false, `tool_use` / `tool_result` messages
+     * are filtered out of the stream entirely (not just hidden via
+     * CSS — dropped from the items list so the DOM stays small).
+     * Default `true` preserves historical behaviour for tests + any
+     * caller that doesn't thread the toggle. The operator flips
+     * this via the chat header's view-filter popup; the preference
+     * persists across reloads (see `useToolResultsVisible`).
+     */
+    showToolResults?: boolean;
 }
 
 /** Pixel slack on the at-bottom check. Browsers can leave a fractional
@@ -58,7 +112,7 @@ type StreamItem =
     | { kind: "message"; message: MessageView; sortKey: number }
     | { kind: "card"; card: Card; sortKey: number };
 
-export function MessageStream({ conversationId }: Props) {
+export function MessageStream({ conversationId, showToolResults = true }: Props) {
     const messages = useChatState(
         (s) => s.messages[conversationId] ?? null,
     );
@@ -70,6 +124,12 @@ export function MessageStream({ conversationId }: Props) {
         const acc: StreamItem[] = [];
         if (messages) {
             for (const m of messages) {
+                // 2026-05-16 — tool_use / tool_result bubbles are
+                // typically raw JSON / monospace dumps that crowd
+                // the transcript when the operator just wants the
+                // agent's prose. The chat header's view filter
+                // gates them on/off; default is on.
+                if (!showToolResults && isToolKind(m.kind)) continue;
                 acc.push({ kind: "message", message: m, sortKey: m.seq });
             }
         }
@@ -97,7 +157,7 @@ export function MessageStream({ conversationId }: Props) {
         }
         acc.sort((a, b) => a.sortKey - b.sortKey);
         return acc;
-    }, [messages, cards]);
+    }, [messages, cards, showToolResults]);
     const scrollRef = useRef<HTMLDivElement | null>(null);
     const [isAtBottom, setIsAtBottom] = useState(true);
 
@@ -342,33 +402,16 @@ function MessageBubble({ message }: { message: MessageView }) {
                         className="execlaw-msg__attachments"
                         data-testid="message-attachments"
                     >
-                        {attachments.map((a) => {
-                            // 2026-05-15 — `<img>` tags can't attach
-                            // the SPA's Authorization: Bearer header,
-                            // so a plain `/api/attachments/{id}` src
-                            // gets blocked by `AuthedUser` and the
-                            // browser falls back to the alt text.
-                            // The auth extractor supports a
-                            // `?access_token=<jwt>` query fallback
-                            // specifically for browser-direct GETs;
-                            // we use it here for persisted ids.
-                            // Optimistic data URLs (in-flight upload)
-                            // are still rendered verbatim.
-                            const src = a.id.startsWith("data:")
-                                ? a.id
-                                : buildAttachmentSrc(
-                                      a.id,
-                                      auth?.getAccessToken() ?? null,
-                                  );
-                            return (
-                                <img
-                                    key={a.id}
-                                    src={src}
-                                    alt="attached image"
-                                    className="execlaw-msg__attachment-image"
-                                />
-                            );
-                        })}
+                        {attachments.map((a) => (
+                            <AttachmentMedia
+                                key={a.id}
+                                id={a.id}
+                                mime={a.mime}
+                                filename={a.filename ?? null}
+                                sizeBytes={a.size_bytes ?? null}
+                                getToken={auth?.getAccessToken}
+                            />
+                        ))}
                     </div>
                 )}
                 {/* Tool messages are JSON / monospace dumps by default —
@@ -493,15 +536,87 @@ function renderToolFallback(m: MessageView): string {
     return `[${m.kind} (no text payload)]`;
 }
 
-/// Build an `/api/attachments/<id>` URL with the access token in the
-/// query string. The auth extractor (`AuthedUser`) accepts
-/// `?access_token=<jwt>` as a fallback for browser-direct GETs like
-/// `<img>` tags, which can't carry an Authorization: Bearer header.
-/// A null token (e.g. just-rotated, render before refresh lands)
-/// falls back to the bare URL — the request will 401, the `<img>`
-/// shows alt text briefly, and the next render after token rotation
-/// re-renders with the new token.
-function buildAttachmentSrc(id: string, token: string | null): string {
-    const path = `/api/attachments/${encodeURIComponent(id)}`;
-    return token ? `${path}?access_token=${encodeURIComponent(token)}` : path;
+/// One attachment under a message bubble. Handles both the
+/// `<img>` (image MIME) and `<a download>` (file chip) layouts.
+///
+/// 2026-05-19 — the URL is fetched from `POST /api/downloads/sign`
+/// on mount (replacing the pre-fix `?access_token=<jwt>` query
+/// param that the security audit flagged as broad leak surface).
+/// During the brief async window before the signed URL resolves
+/// the `<img>` shows alt text / the chip is disabled. Optimistic
+/// data URLs (in-flight upload) bypass the sign call.
+function AttachmentMedia({
+    id,
+    mime,
+    filename,
+    sizeBytes,
+    getToken,
+}: {
+    id: string;
+    mime: string;
+    filename: string | null;
+    sizeBytes: number | null;
+    getToken: (() => string | null) | undefined;
+}) {
+    const isDataUrl = id.startsWith("data:");
+    const basePath = isDataUrl
+        ? null
+        : `/api/attachments/${encodeURIComponent(id)}`;
+    const [signedUrl, setSignedUrl] = useState<string | null>(null);
+    useEffect(() => {
+        if (!basePath || !getToken) {
+            setSignedUrl(null);
+            return;
+        }
+        let cancelled = false;
+        signDownloadUrl(basePath, getToken)
+            .then((u) => {
+                if (!cancelled) setSignedUrl(u);
+            })
+            .catch(() => {
+                if (!cancelled) setSignedUrl(null);
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [basePath, getToken]);
+    const src = isDataUrl ? id : signedUrl;
+    if (isImageMime(mime)) {
+        if (!src) {
+            // No render until the signed URL lands — keeps the
+            // browser from issuing a 401 GET it would just retry.
+            return null;
+        }
+        return (
+            <img
+                src={src}
+                alt="attached image"
+                className="execlaw-msg__attachment-image"
+            />
+        );
+    }
+    // File-chip path. Without a signed URL we still render the
+    // chip but without an `href`, so the affordance is visible
+    // (filename + icon) even while the URL is being signed.
+    return (
+        <a
+            href={src ?? undefined}
+            download={filename ?? undefined}
+            className="execlaw-msg__attachment-file"
+            data-testid="message-attachment-file"
+            data-mime={mime}
+            title={`${filename ?? "file"} · ${mime}`}
+            aria-disabled={src ? undefined : true}
+        >
+            <i className={fileIconForMime(mime)} aria-hidden />
+            <span className="execlaw-msg__attachment-file-name">
+                {filename ?? "attachment"}
+            </span>
+            {typeof sizeBytes === "number" && sizeBytes > 0 && (
+                <span className="execlaw-msg__attachment-file-size">
+                    {formatBytes(sizeBytes)}
+                </span>
+            )}
+        </a>
+    );
 }

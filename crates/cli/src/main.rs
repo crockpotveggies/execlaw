@@ -28,6 +28,15 @@ use std::process::ExitCode;
 
 mod service;
 
+// 2026-05-18 — process-wide python-sandbox service handle moved
+// into `execlaw_server::python_sandbox::SERVICE` so request handlers
+// (specifically the `DELETE /api/chats/{id}` handler that needs to
+// call `on_conversation_deleted`) can reach it. The cli used to
+// keep a local OnceLock here purely to keep the Arc alive across
+// the spawned wiring task; that role is now subsumed by the
+// server-crate static. See `python_sandbox::set_service` /
+// `python_sandbox::service()`.
+
 #[derive(Debug, Parser)]
 #[command(name = "execlaw", version, about = "execlaw control plane CLI")]
 struct Cli {
@@ -313,6 +322,35 @@ enum EvalOp {
 /// `EXECLAW_LOG_DIR` overrides the file directory; `EXECLAW_NO_FILE_LOG=1`
 /// disables the file appender (useful for tests + ephemeral CLI
 /// invocations like `execlaw doctor`).
+/// Replace the default `eprintln!`-based panic hook with one that
+/// emits a structured tracing event AND aborts the process. See
+/// the call site comment for the rationale; mirrors the runner-
+/// binary's `install_panic_hook` for journal-grep parity (target
+/// `server::panic` on this side).
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("<non-string panic payload>");
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_owned());
+        tracing::error!(
+            target: "server::panic",
+            message,
+            location,
+            backtrace = %backtrace,
+            "SERVER_PANIC — process aborting (core dump if ulimit -c allows)"
+        );
+        std::process::abort();
+    }));
+}
+
 fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
@@ -1064,6 +1102,13 @@ fn cmd_backup(to: PathBuf, db_path: PathBuf, no_encrypt: bool) -> anyhow::Result
     // encryption posture by default, so a snapshot can be restored
     // by any process holding the master key.
     db.with_conn(|c| {
+        // VACUUM INTO requires the destination as an inline string
+        // literal (rusqlite's `?` placeholders don't substitute for
+        // path positions in SQLite DDL). Path comes from the
+        // admin-only `--to` CLI flag and is SQL-quote-escaped via
+        // `replace('\'', "''")` to neutralise embedded single quotes.
+        // Not reachable by untrusted input.
+        // nosemgrep: rust-rusqlite-format-arg
         c.execute_batch(&format!("VACUUM INTO '{}'", to_str.replace('\'', "''")))?;
         Ok(())
     })
@@ -1225,6 +1270,27 @@ fn resolve_bind(cli: Option<String>, db: Option<String>) -> (String, &'static st
 async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> anyhow::Result<()> {
     let (db, db_config) = open_db_with_config(&db_path, no_encrypt)?;
     execlaw_core::MigrationRunner::new(&db).apply_all()?;
+
+    // Resolve the data directory once at boot so downstream code
+    // (bundled-plugins mirror, settings paths, etc.) doesn't have
+    // to re-derive it. `db_path` always lives under the data dir
+    // by construction (cli/main.rs::default_db_path returns
+    // `<data_dir>/execlaw.db`); pull the parent and fall back to
+    // `default_data_dir()` for operators who explicitly pointed
+    // --db elsewhere.
+    let data_dir = db_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(default_data_dir);
+    let _ = std::fs::create_dir_all(&data_dir);
+
+    // Mirror any plugin ZIPs that ship inside the .app's
+    // Contents/Resources/plugins/ into <data_dir>/bundled-plugins/.
+    // Idempotent + best-effort — see crates/server/src/bundled_plugins.rs.
+    // Linux/Windows installs (no .app shell, no env override) are
+    // a silent no-op; operators drop ZIPs into that directory by
+    // hand and the SPA's "Bundled" section still lists them.
+    execlaw_server::bundled_plugins::mirror_bundled_plugins_into_data_dir(&data_dir);
 
     // Bind address resolution (precedence: CLI flag > DB > default).
     // The DB-stored value comes from Settings → General; making it
@@ -1565,8 +1631,42 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                 // without source on disk fall through to the old
                 // "warn + disable" branch when no Dockerfile is
                 // findable.
-                let _ = ensure_runner_image_fresh(&runner_image).await;
-                if launcher.image_present(&runner_image).await {
+                //
+                // 2026-05-19 — wrap the runner-image probe in a
+                // hard timeout. `image_present` calls bollard's
+                // `inspect_image`, which awaits a Docker daemon
+                // response with no built-in timeout. When Docker
+                // Desktop is in a half-broken state (running but
+                // not serving — common under WSL2 + WSL-integration
+                // distros) the await stalls for ~120 seconds before
+                // bollard's TCP read times out. That delay used to
+                // gate the entire server boot, so the SPA spun on
+                // the setup-wizard's docker check for two full
+                // minutes. Capping at 5s means a healthy host pays
+                // ~50-200 ms (the inspect round-trip), an unhealthy
+                // host pays 5s and falls through to the "runner
+                // image not found locally" warning + disabled
+                // supervisor — same end-state, fast.
+                let runner_probe_timeout = std::time::Duration::from_secs(5);
+                let probe_result = tokio::time::timeout(runner_probe_timeout, async {
+                    let _ = ensure_runner_image_fresh(&runner_image).await;
+                    launcher.image_present(&runner_image).await
+                })
+                .await;
+                let image_present = match probe_result {
+                    Ok(present) => present,
+                    Err(_) => {
+                        tracing::warn!(
+                            image = %runner_image,
+                            timeout_secs = runner_probe_timeout.as_secs(),
+                            "runner image probe timed out — Docker daemon appears \
+                             unresponsive. Disabling runner supervisor; restart Docker \
+                             Desktop and re-launch execlaw to re-enable."
+                        );
+                        false
+                    }
+                };
+                if image_present {
                     tracing::info!(
                         image = %runner_image,
                         "runner supervisor enabled"
@@ -1744,6 +1844,46 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
             inference.clone(),
         );
 
+    // M1/M2/M3 of Automations — spawn the durable event bus before
+    // constructing AppState so the dispatcher + poller are live
+    // before the first ingress (webhook routes mount after this
+    // point). The handler runs the automation matcher: for each
+    // delivered event, it looks up enabled automations whose
+    // trigger.kind matches, evaluates trigger.when predicates, and
+    // executes the typed graph. M3 adds the `AskAgent` node, which
+    // delegates to the `AutomationsAgentPool`. The pool wraps
+    // `InferenceAgentInvoker` (real LLM via the inference resolver)
+    // and bounds concurrency at the locked default (1). When no
+    // inference backend is configured, AskAgent fails fast with
+    // `NoLlmConfigured` rather than silently hanging.
+    let automation_bus_stop = std::sync::Arc::new(tokio::sync::Notify::new());
+    // M5 — shared inference metrics handle. Threaded into the
+    // automations agent invoker (Automations consumer attribution)
+    // and stored on AppState so the `/admin/inference` page reads
+    // the same instance. Future call sites (chat / routines /
+    // research) wire the same handle for cross-consumer slicing.
+    let inference_metrics = execlaw_server::inference_metrics::InferenceMetrics::new();
+    let automation_agent_pool =
+        execlaw_server::automation_agent::AutomationsAgentPool::new(std::sync::Arc::new(
+            execlaw_server::automation_agent::InferenceAgentInvoker::new_with_metrics(
+                db.clone(),
+                inference.clone(),
+                inference_metrics.clone(),
+            ),
+        ));
+    let (automation_bus, automation_bus_tasks) =
+        execlaw_server::automation_bus::AutomationBus::spawn(
+            db.clone(),
+            execlaw_server::automation_runtime::build_handler(
+                execlaw_server::automation_runtime::ExecutorContext::new(
+                    db.clone(),
+                    automation_agent_pool.clone(),
+                    Some(plugin_host.clone()),
+                ),
+            ),
+            automation_bus_stop.clone(),
+        );
+
     let state = execlaw_server::AppState {
         db: db.clone(),
         // Stash the exact config we just opened with so the
@@ -1770,7 +1910,19 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         research_supervisor: Some(research_supervisor.clone()),
         skill_capture: skill_capture_sink,
         reuse_update: reuse_update_sink,
+        data_dir: data_dir.clone(),
+        automation_bus,
+        automation_agent_pool,
+        // M5 — same handle as the automations invoker holds, so the
+        // `/admin/inference` snapshot endpoint sees AskAgent calls.
+        inference_metrics,
     };
+    // We don't await `automation_bus_tasks` — letting the spawned
+    // dispatcher + poller run for the process lifetime. The `stop`
+    // notify is held by the same shutdown path that drives the rest
+    // of the sweepers (`sweep_stop`); we link them below so a SIGTERM
+    // drains everything together.
+    drop(automation_bus_tasks);
 
     // Phase B (channel-plugin surface): wire the host-capabilities
     // arc into the script engine NOW that AppState exists. The
@@ -1880,6 +2032,43 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         tokio::spawn(async move { routine_run_sweeper.run(stop).await });
     }
 
+    // M1 of Automations — retention sweep for `state_bus_events`.
+    // Only dispatched rows are eligible (the sweeper's underlying
+    // store call enforces this); pending rows are preserved
+    // regardless of age so a stuck dispatcher stays visible.
+    // 2-hour cadence matches `EventRetentionSweeper`.
+    {
+        let stop = sweep_stop.clone();
+        let bus_event_sweeper =
+            execlaw_core::bus_event_retention::BusEventRetentionSweeper::new(db.clone());
+        tokio::spawn(async move { bus_event_sweeper.run(stop).await });
+    }
+    // M4 of Automations — daily sweep that populates
+    // `state_automation_suggestions`. Groups recent bus events by
+    // (kind, source), surfaces high-volume patterns that have no
+    // matching enabled automation, and skips muted patterns.
+    // The landing page reads from this table; agent-drafted
+    // suggestions (M5) plug in at the same seam.
+    {
+        let stop = sweep_stop.clone();
+        let sugg_sweeper =
+            execlaw_server::automation_suggestions_sweeper::AutomationSuggestionsSweeper::new(
+                db.clone(),
+            );
+        tokio::spawn(async move { sugg_sweeper.run(stop).await });
+    }
+    // Link the automation bus's dispatcher + poller into the same
+    // shutdown signal as the sweepers — a SIGTERM drains the bus
+    // alongside everything else.
+    {
+        let stop = sweep_stop.clone();
+        let bus_stop = automation_bus_stop.clone();
+        tokio::spawn(async move {
+            stop.notified().await;
+            bus_stop.notify_waiters();
+        });
+    }
+
     // Phase 12.C — backend supervisor reconcile loop. Only spawns
     // if the Docker connect succeeded above; otherwise managed-mode
     // backends are inert and the SPA shows a "Docker unreachable"
@@ -1910,6 +2099,8 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     // adds blocking I/O to the boot path.
     {
         let plugin_host = state.plugin_host.clone();
+        let state_for_wire = state.clone();
+        let db_for_wire = db.clone();
         tokio::spawn(async move {
             // Small delay so the supervisor's first reconcile
             // pass has a chance to publish ports. Capped — if
@@ -1917,6 +2108,51 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
             // and let the plugin handle the None.
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             plugin_host.fire_on_enable_for_all().await;
+
+            // 2026-05-18 — Phase 8 wiring for the python-sandbox
+            // plugin. Constructs the PythonSandboxService against
+            // the kernel-gateway sidecar's published port and
+            // registers the four python.* tools as host-implemented
+            // builtins. No-op when the plugin isn't installed or
+            // the sidecar isn't healthy (warning logged from inside).
+            //
+            // Service is held in a `static` so its OutputWatcher
+            // (notify OS thread + tokio timer) stays alive for the
+            // server's lifetime. Drop happens on process exit.
+            if let Some(sup) = state_for_wire.sidecar_supervisor.as_ref() {
+                let now = chrono::Utc::now().timestamp();
+                match execlaw_server::python_sandbox::wire_python_sandbox(
+                    sup,
+                    plugin_host.registry(),
+                    &db_for_wire,
+                    &state_for_wire.events,
+                    now,
+                )
+                .await
+                {
+                    Ok(Some(svc)) => {
+                        // Stash in the server-crate's process-wide
+                        // OnceLock so:
+                        //   1. Drop doesn't run mid-server (anchor
+                        //      for the OutputWatcher's threads).
+                        //   2. Request handlers can reach it via
+                        //      `python_sandbox::service()` — the
+                        //      delete-thread handler uses this to
+                        //      clean up `/work/<convo>/` on
+                        //      conversation delete.
+                        execlaw_server::python_sandbox::set_service(svc);
+                    }
+                    Ok(None) => {
+                        // wire helper already logged the reason.
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            ?e,
+                            "python_sandbox wiring failed; python.* tools unavailable this boot"
+                        );
+                    }
+                }
+            }
         });
     }
 
@@ -2093,6 +2329,15 @@ fn main() -> ExitCode {
     // Hold the tracing-appender guard for the whole process lifetime
     // so the background flush thread sees every event before exit.
     let _tracing_guard = init_tracing();
+    // 2026-05-16 — install a panic hook that emits a structured
+    // tracing event (full backtrace + payload + location) and
+    // aborts. The abort produces a core dump if the host's
+    // `ulimit -c` allows; `rust-gdb <execlaw> <core>` then
+    // attaches for post-mortem analysis. Without this hook a
+    // panic in a tokio worker thread silently prints to stderr
+    // and the server keeps running with a corrupt runtime —
+    // exactly the failure mode that's hardest to debug.
+    install_panic_hook();
     let cli = Cli::parse();
     let result: anyhow::Result<()> = (|| match cli.command {
         Command::Install {

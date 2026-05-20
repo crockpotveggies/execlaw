@@ -504,9 +504,23 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// Vision (M5) is intentionally not pre-stocked — operators
+    /// configure it explicitly via Settings → Backends with a VL
+    /// model of their choice (Qwen-VL, Pixtral, LLaVA, etc.). When
+    /// unset, vision-requiring automation runs fail fast with
+    /// `VisionRequiredButTextOnlyModel`, which is the design. See
+    /// `crates/core/src/backends.rs` doc-comment on the `Vision`
+    /// variant. The preset-coverage invariants below skip it.
+    fn purposes_with_presets() -> impl Iterator<Item = BackendPurpose> {
+        BackendPurpose::all()
+            .iter()
+            .copied()
+            .filter(|p| !matches!(p, BackendPurpose::Vision))
+    }
+
     #[test]
     fn preset_library_covers_every_purpose() {
-        for purpose in BackendPurpose::all() {
+        for purpose in purposes_with_presets() {
             let presets: Vec<_> = all_presets()
                 .into_iter()
                 .filter(|p| p.purpose == purpose.as_str())
@@ -522,10 +536,11 @@ mod tests {
     #[test]
     fn every_purpose_has_a_cpu_fallback() {
         // No-GPU hosts must still be able to pick managed mode for
-        // every purpose. We don't ship every purpose with every
-        // vendor (no Intel for vLLM yet), but CPU is always the safe
-        // fallback.
-        for purpose in BackendPurpose::all() {
+        // every preset-backed purpose. We don't ship every purpose
+        // with every vendor (no Intel for vLLM yet), but CPU is
+        // always the safe fallback. Vision is exempt — see the
+        // `purposes_with_presets` doc-comment above.
+        for purpose in purposes_with_presets() {
             let has_cpu = all_presets()
                 .into_iter()
                 .any(|p| p.purpose == purpose.as_str() && p.vendor == "cpu");

@@ -17,7 +17,7 @@ use crate::conversation::ConversationStore;
 use crate::db::Database;
 use crate::ids::{AlertId, ConversationId, ResearchJobId};
 use crate::memory::{MemoryEntry, MemoryStore};
-use crate::research::{ResearchJobRow, ResearchJobStatus, ResearchJobStore, ResearchJobSummary};
+use crate::research::{ResearchJobRow, ResearchJobStore, ResearchJobSummary};
 use crate::routines::{
     RoutineRow, RoutineStore, RoutineUpsert, next_fire_after, parse_cron, parse_timezone,
 };

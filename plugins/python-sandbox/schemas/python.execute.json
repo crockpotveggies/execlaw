@@ -1,0 +1,21 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+        "code": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200000,
+            "description": "Python source to execute in the conversation's persistent kernel. Multi-line is fine. IPython magics (%timeit, %who, ?help) are supported. Writes to /work/outputs/ auto-publish as conversation artifacts."
+        },
+        "timeout_ms": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 600000,
+            "default": 30000,
+            "description": "Hard wall-clock ceiling in milliseconds. On expiry the kernel receives a KeyboardInterrupt and the tool returns status=timeout with any partial stdout. Defaults to 30000 (30s); set higher for ML training, web scraping, large groupbys. Maximum is 600000 (10 min)."
+        }
+    },
+    "required": ["code"],
+    "additionalProperties": false
+}

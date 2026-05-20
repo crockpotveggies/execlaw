@@ -309,7 +309,11 @@ fn render_markdown_to_pdf(
                 layer_id = nl;
                 layer = doc.get_page(page).get_layer(layer_id);
                 y = PAGE_H - MARGIN_TOP;
-                at_page_top = true;
+                // We're at the top of a fresh page — but `at_page_top`
+                // gets clobbered to false on the very next line anyway,
+                // so the outer heading's `above_gap` check never sees
+                // the `true`. Leaving the elision explicit so a future
+                // reader doesn't reintroduce a dead assignment.
             }
             layer.use_text(visual.as_ref(), size, Mm(MARGIN_X), Mm(y), font);
             y -= line_h;

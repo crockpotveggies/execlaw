@@ -218,6 +218,10 @@ fn historical_impl(args) {
     let q = base_query(lat, lng, merged);
     q["start_date"] = start;
     q["end_date"]   = end;
+    // 2026-05-16 — unixtime for the data-ref pipeline. See
+    // `summarize_with_refs` for why this is required (chart.render
+    // needs numeric x; we multiply by 1000 to get ms).
+    q["timeformat"] = "unixtime";
     q = add_csv(q, "hourly", merged["hourly"]);
     q = add_csv(q, "daily",  merged["daily"]);
 
@@ -227,7 +231,11 @@ fn historical_impl(args) {
         "",
         86400,
     );
-    annotate(resp, merged, "weather_daily")
+    // Long horizons (> REF_THRESHOLD points per block) get
+    // collapsed to summary + data_refs; short horizons pass
+    // through inline. No chat_component_kind: the chart card
+    // from a subsequent chart.render call IS the rendering.
+    summarize_with_refs(annotate_lite(resp, merged))
 }
 
 
@@ -311,6 +319,7 @@ fn seasonal_impl(args) {
     let q = #{};
     q["latitude"]  = "" + lat;
     q["longitude"] = "" + lng;
+    q["timeformat"] = "unixtime";
     q = add_csv(q, "six_hourly", args["six_hourly"]);
     q = add_csv(q, "daily",      merged["daily"]);
     if args["forecast_days"] != () {
@@ -326,7 +335,7 @@ fn seasonal_impl(args) {
         "",
         21600,
     );
-    annotate(resp, merged, "weather_daily")
+    summarize_with_refs(annotate_lite(resp, merged))
 }
 
 
@@ -341,6 +350,7 @@ fn ensemble_impl(args) {
     let lng = coords[1];
 
     let q = base_query(lat, lng, merged);
+    q["timeformat"] = "unixtime";
     q = add_csv(q, "hourly", merged["hourly"]);
     q = add_csv(q, "daily",  merged["daily"]);
     if args["models"] != () && type_of(args["models"]) == "array" && args["models"].len() > 0 {
@@ -356,7 +366,11 @@ fn ensemble_impl(args) {
         "",
         900,
     );
-    annotate(resp, merged, "weather_daily")
+    // Ensemble responses can carry 50+ member series — biggest
+    // beneficiary of refs in the plugin. Each member variable
+    // becomes its own data_ref so the agent can either chart one
+    // member or layer many.
+    summarize_with_refs(annotate_lite(resp, merged))
 }
 
 
@@ -409,6 +423,7 @@ fn climate_impl(args) {
     q["start_date"] = start;
     q["end_date"]   = end;
     q["models"]     = csv(args["models"]);
+    q["timeformat"] = "unixtime";
     q = add_csv(q, "daily", merged["daily"]);
     if merged["temperature_unit"] != () && merged["temperature_unit"] != "" {
         q["temperature_unit"] = merged["temperature_unit"];
@@ -423,7 +438,11 @@ fn climate_impl(args) {
         "",
         86400,
     );
-    annotate(resp, merged, "weather_daily")
+    // Climate projections can span decades at daily resolution
+    // (10s of thousands of points). Without refs the model would
+    // OOM the decode budget by re-emitting a 50-year temperature
+    // series into chart.render.
+    summarize_with_refs(annotate_lite(resp, merged))
 }
 
 
@@ -656,6 +675,30 @@ fn annotate(resp, merged, chat_component_kind) {
     resp
 }
 
+// 2026-05-16 — like `annotate` but doesn't stamp a
+// `chat_component_kind`. Used by the long-horizon tools
+// (historical / seasonal / ensemble / climate) that route through
+// `summarize_with_refs` — the natural rendering for those flows
+// is a chart card emitted by a subsequent `chart.render` call,
+// not a SPA-side widget over the raw rows. Place + units still
+// echo back because the model + audit log both reference them.
+fn annotate_lite(resp, merged) {
+    if resp == () { resp = #{}; }
+    if merged["place_name"] != () && merged["place_name"] != "" {
+        resp["place_name"] = merged["place_name"];
+    }
+    if merged["temperature_unit"] != () {
+        resp["temperature_unit"] = merged["temperature_unit"];
+    }
+    if merged["wind_speed_unit"] != () {
+        resp["wind_speed_unit"] = merged["wind_speed_unit"];
+    }
+    if merged["precipitation_unit"] != () {
+        resp["precipitation_unit"] = merged["precipitation_unit"];
+    }
+    resp
+}
+
 fn require_string(value, label) {
     if value == () || value == "" {
         throw "open-meteo: `" + label + "` is required";
@@ -692,6 +735,134 @@ fn clamp_int(value, lo, hi, fallback) {
     if n < lo { return lo; }
     if n > hi { return hi; }
     n
+}
+
+
+// =====================================================================
+// 2026-05-16 — DATA-REF PIPELINE
+// =====================================================================
+//
+// Long-horizon Open-Meteo responses (historical / seasonal /
+// ensemble / climate) can carry thousands of time-indexed values
+// across many variables. Returning all of them inline forces the
+// model to re-type the bytes when piping into chart.render — the
+// same decode-blow-up that killed the 6-month NKE chart turn
+// before the data-ref pipeline landed.
+//
+// `summarize_with_refs(resp)` walks the response's time-series
+// blocks (`hourly`, `daily`, `six_hourly`) and, for any block with
+// more than REF_THRESHOLD time entries, replaces each inline
+// variable array with a host-side data ref + a small summary
+// (min / max / first / last / count). The agent then passes
+// `points: {"$data_ref": <id>}` into chart.render and the host
+// inflates server-side.
+//
+// Prerequisite: the caller MUST add `&timeformat=unixtime` to the
+// Open-Meteo URL so `time[i]` is a numeric Unix second. The
+// helper multiplies by 1000 to produce the millisecond x-values
+// chart.render expects when `time_axis: true`.
+
+const REF_THRESHOLD = 30;
+const REF_TTL_SECS = 3600;
+
+fn summarize_with_refs(resp) {
+    if resp == () || type_of(resp) != "map" { return resp; }
+
+    let block_names = ["hourly", "daily", "six_hourly"];
+    let any_refs = false;
+    for block_name in block_names {
+        let block = resp[block_name];
+        if block == () || type_of(block) != "map" { continue; }
+        let time = block["time"];
+        if time == () || type_of(time) != "array" { continue; }
+        let n = time.len();
+        if n <= global::REF_THRESHOLD { continue; }
+
+        // Collect variable names (everything in the block other
+        // than `time` is a parallel y-array).
+        let variable_names = [];
+        for k in block.keys() {
+            if k == "time" { continue; }
+            variable_names.push(k);
+        }
+        if variable_names.len() == 0 { continue; }
+
+        let block_refs = #{};
+        let summary = #{};
+        for var_name in variable_names {
+            let values = block[var_name];
+            if type_of(values) != "array" { continue; }
+
+            // Build per-variable {x, y} points, skipping nulls.
+            // x is millis since epoch (caller set timeformat=unixtime
+            // so `time[i]` is unix seconds; we * 1000).
+            let points = [];
+            let min_y = ();
+            let max_y = ();
+            let first_y = ();
+            let last_y = ();
+            let valid_count = 0;
+            let bail = false;
+            for i in 0..n {
+                let y = values[i];
+                if y == () { continue; }
+                let t = time[i];
+                let tt = type_of(t);
+                if tt != "i64" && tt != "int" && tt != "f64" && tt != "float" {
+                    // Time isn't numeric — caller forgot the
+                    // unixtime knob. Skip ref-emission for this
+                    // var rather than producing garbage points.
+                    bail = true;
+                    break;
+                }
+                let x_ms = if tt == "f64" || tt == "float" {
+                    (t.to_int()) * 1000
+                } else {
+                    t * 1000
+                };
+                points.push(#{ "x": x_ms, "y": y });
+                if first_y == () { first_y = y; }
+                last_y = y;
+                if min_y == () || y < min_y { min_y = y; }
+                if max_y == () || y > max_y { max_y = y; }
+                valid_count += 1;
+            }
+            if bail || points.len() == 0 { continue; }
+
+            let ref_info = host_create_data_ref(to_json_string(points), global::REF_TTL_SECS);
+            block_refs[var_name + "_points"] = ref_info["data_ref_id"];
+            summary[var_name] = #{
+                "count": valid_count,
+                "min":   min_y,
+                "max":   max_y,
+                "first": first_y,
+                "last":  last_y,
+            };
+        }
+        if block_refs.len() == 0 { continue; }
+
+        // Replace the block. Inline arrays are gone; agent's
+        // tool_result becomes ~hundreds of bytes per block
+        // regardless of how many original time steps there were.
+        // `time_first` / `time_last` are unix seconds (the format
+        // the caller requested); `time_unit` documents this so
+        // downstream consumers don't have to guess.
+        let new_block = #{
+            "n":          n,
+            "time_first": time[0],
+            "time_last":  time[n - 1],
+            "time_unit":  "seconds_since_epoch_utc",
+            "summary":    summary,
+            "data_refs":  block_refs,
+        };
+        resp[block_name] = new_block;
+        any_refs = true;
+    }
+
+    if any_refs {
+        resp["_hint"] = "chart.render: `points: {\"$data_ref\": <block>.data_refs.<var>_points}`, `time_axis: true`. Use `summary` for non-chart answers.";
+    }
+    resp
 }
 
 

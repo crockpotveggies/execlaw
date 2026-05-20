@@ -16,8 +16,9 @@
 // host produced. Keeps the bundle small and the rendering
 // deterministic across browsers.
 
-import { useContext } from "react";
+import { useContext, useEffect, useState } from "react";
 import { AuthContext } from "../../auth/AuthContext";
+import { signDownloadUrl } from "../../api/signedDownloadUrl";
 import {
     registerChatComponent,
     type ChatComponentProps,
@@ -31,20 +32,31 @@ function ChartInline({ data }: ChatComponentProps) {
             : null;
     const title = typeof data.title === "string" ? (data.title as string) : null;
 
-    // Build the download URL for the PNG render. Browsers don't
-    // attach the Authorization header to `<a download>` clicks, so
-    // the SPA appends `?access_token=<jwt>` (same pattern as
-    // AttachmentCard) when an auth context is available.
+    // 2026-05-19 — fetch a signed URL for the PNG render. Pre-fix
+    // the SPA pasted a raw JWT; security audit flagged that as
+    // broad leak surface. See AttachmentCard for the full why.
     const auth = useContext(AuthContext);
-    const token = auth?.getAccessToken() ?? null;
-    const downloadUrl =
-        attachmentId !== null
-            ? token
-                ? `/api/attachments/${attachmentId}?access_token=${encodeURIComponent(
-                      token,
-                  )}`
-                : `/api/attachments/${attachmentId}`
-            : null;
+    const getToken = auth?.getAccessToken;
+    const basePath =
+        attachmentId !== null ? `/api/attachments/${attachmentId}` : null;
+    const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+    useEffect(() => {
+        if (!basePath || !getToken) {
+            setDownloadUrl(null);
+            return;
+        }
+        let cancelled = false;
+        signDownloadUrl(basePath, getToken)
+            .then((u) => {
+                if (!cancelled) setDownloadUrl(u);
+            })
+            .catch(() => {
+                if (!cancelled) setDownloadUrl(null);
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [basePath, getToken]);
 
     return (
         <figure

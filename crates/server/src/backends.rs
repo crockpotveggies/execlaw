@@ -925,8 +925,11 @@ mod tests {
         let bytes = body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let arr = v["backends"].as_array().unwrap();
-        // Always four purposes regardless of how many are filled in.
-        assert_eq!(arr.len(), 4);
+        // One entry per `BackendPurpose` variant regardless of how
+        // many are filled in. Anchored to the enum's `all()` length
+        // so adding a variant (Vision landed via M5) updates this
+        // expectation automatically.
+        assert_eq!(arr.len(), BackendPurpose::all().len());
         for entry in arr {
             assert_eq!(entry["configured"], false);
             assert!(entry["backend"].is_null());

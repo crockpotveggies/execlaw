@@ -78,6 +78,32 @@ struct SidecarSlot {
     /// `CrashLooping` — operators must `kick` (after fixing the
     /// underlying issue) to retry.
     restart_attempts: u32,
+    /// In-flight `docker build` task for the sidecar's image when
+    /// it's not yet present locally. `Some` only while a build is
+    /// running; the reconcile loop polls `done` and clears the
+    /// field once the task terminates. Without this the supervisor
+    /// would `.await` the build (5-15 min for python-sandbox)
+    /// holding the slots mutex, blocking every `snapshot_status`
+    /// call the SPA polls — the user-visible symptom was a
+    /// "Loading sidecar status…" spinner stuck for the whole
+    /// build.
+    build_task: Option<BuildTaskState>,
+}
+
+/// Background image-build state shared between the reconcile loop
+/// and the spawned `tokio::spawn` task that runs `docker build`.
+/// All fields are Arc-wrapped so the slot can `clone()` cheaply on
+/// every reconcile pass without contention.
+#[derive(Debug, Clone)]
+struct BuildTaskState {
+    /// Set to `true` when the build task terminates (success OR
+    /// failure). The reconcile loop reads this on each tick to
+    /// decide whether the slot should stay parked or advance.
+    done: Arc<std::sync::atomic::AtomicBool>,
+    /// `Some(error_message)` when the build failed; `None` on
+    /// success. Only written once, immediately before `done` flips
+    /// to true.
+    failure: Arc<Mutex<Option<String>>>,
 }
 
 impl SidecarSlot {
@@ -88,6 +114,7 @@ impl SidecarSlot {
             host_port: None,
             status: ServiceStatus::Stopped,
             restart_attempts: 0,
+            build_task: None,
         }
     }
 
@@ -670,6 +697,103 @@ impl SidecarSupervisor {
                 container_port: sidecar.rpc_port,
                 ..Default::default()
             };
+            // Plugin sidecars typically declare images like
+            // `execlaw/python-sandbox-fast:0.1.0` that only exist
+            // locally — operators don't `docker push` to a public
+            // registry. When the image isn't present, we run
+            // `docker build` against the plugin's stage dir before
+            // letting Bollard try to spawn (which would otherwise
+            // pull-404 and park the slot at CrashLooping).
+            //
+            // The build runs in `tokio::spawn` so the supervisor's
+            // slots mutex isn't held for the build's 5-15 minute
+            // duration — without that hand-off, every
+            // `snapshot_status` call the SPA polls would queue
+            // behind the build and the operator would see
+            // "Loading sidecar status…" stuck on the page until
+            // duckdb's source-build finished. The supervisor polls
+            // `slot.build_task.done` on each reconcile tick and
+            // advances the slot through Pulling → spawn once the
+            // task succeeds. Skip the build path entirely when
+            // `stage_path` is None (test fixtures register
+            // sidecars without a build context; those use prebuilt
+            // mock images).
+            if let Some(stage) = sidecar.stage_path.as_ref() {
+                if let Some(task) = slot.build_task.clone() {
+                    if !task.done.load(std::sync::atomic::Ordering::SeqCst) {
+                        // Still building. Keep the slot in Pulling
+                        // so the SPA's "Sidecar is booting up…"
+                        // banner stays visible. Return from this
+                        // reconcile_slot pass — the supervisor's
+                        // outer loop will check us again next tick.
+                        self.transition_status(&sidecar.name, slot, ServiceStatus::Pulling);
+                        return;
+                    }
+                    // Build terminated — drop the task either way,
+                    // then surface the failure (if any) or fall
+                    // through to spawn.
+                    let failure = task.failure.lock().await.clone();
+                    slot.build_task = None;
+                    if let Some(err) = failure {
+                        warn!(
+                            sidecar = %sidecar.name,
+                            plugin_id = %sidecar.plugin_id,
+                            image = %sidecar.image,
+                            error = %err,
+                            "sidecar image build failed; falling through to spawn so \
+                             Bollard reports the underlying pull-404",
+                        );
+                    } else {
+                        info!(
+                            sidecar = %sidecar.name,
+                            plugin_id = %sidecar.plugin_id,
+                            image = %sidecar.image,
+                            "sidecar image build complete; proceeding to spawn",
+                        );
+                    }
+                } else if let Some(docker) = resolve_docker_binary() {
+                    // Fast probe: is the image already local? If
+                    // yes, skip the build entirely (operator-paced
+                    // rebuild already happened OR this is a
+                    // supervisor restart after a successful build).
+                    let cached = image_is_local(&docker, &sidecar.image).await;
+                    if !cached {
+                        let dockerfile = stage.join("Dockerfile");
+                        if dockerfile.exists() {
+                            info!(
+                                sidecar = %sidecar.name,
+                                plugin_id = %sidecar.plugin_id,
+                                image = %sidecar.image,
+                                context = %stage.display(),
+                                "sidecar image missing locally; spawning background \
+                                 `docker build` task",
+                            );
+                            let task = spawn_image_build_task(
+                                docker,
+                                sidecar.image.clone(),
+                                stage.to_path_buf(),
+                                sidecar.plugin_id.clone(),
+                            );
+                            slot.build_task = Some(task);
+                            self.transition_status(&sidecar.name, slot, ServiceStatus::Pulling);
+                            // First reconcile after kick: leave
+                            // the spawn for the next tick. The
+                            // build runs in tokio::spawn so the
+                            // slots mutex is released as soon as
+                            // we return.
+                            return;
+                        } else {
+                            debug!(
+                                sidecar = %sidecar.name,
+                                stage = %stage.display(),
+                                "sidecar image missing locally and stage has no \
+                                 Dockerfile; falling through to spawn (Bollard \
+                                 will surface the pull-404)",
+                            );
+                        }
+                    }
+                }
+            }
             match self.controller.spawn(&spec).await {
                 Ok(handle) => {
                     info!(
@@ -978,6 +1102,123 @@ impl SidecarSupervisor {
 /// `execlaw-…` convention finds sidecars where they expect.
 fn container_name(plugin_id: &str, name: &str) -> String {
     format!("execlaw-sidecar-{plugin_id}-{name}")
+}
+
+/// `true` when `docker image inspect <image>` exits 0 — the cheap
+/// probe that drives the supervisor's "build needed?" decision.
+/// Returns `false` on any failure (missing image, daemon down,
+/// docker CLI broken); the caller's next step (try to build, or
+/// fall through to the spawn path which surfaces Bollard's error)
+/// is the same either way.
+async fn image_is_local(docker: &str, image: &str) -> bool {
+    tokio::process::Command::new(docker)
+        .arg("image")
+        .arg("inspect")
+        .arg(image)
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Spawn a background `docker build` task and return a handle the
+/// supervisor's reconcile loop can poll on subsequent ticks. The
+/// task runs OFF the slots-mutex critical section so the SPA's
+/// `/api/admin/sidecars` polls aren't blocked for the build's
+/// duration (5-15 min on alpine + duckdb source-build the first
+/// time around).
+///
+/// Two PATH knobs matter:
+///   * The `docker` binary itself — resolved by `resolve_docker_binary`
+///     in the supervisor (already done at call site; the resolved
+///     path is passed in here).
+///   * The child process's PATH — must include the Docker Desktop
+///     bin dir so BuildKit's `docker-credential-desktop` helper
+///     resolves when authenticating with Docker Hub for FROM-image
+///     pulls. launchd's default PATH excludes `/usr/local/bin`.
+fn spawn_image_build_task(
+    docker: String,
+    image: String,
+    stage_path: std::path::PathBuf,
+    plugin_id: String,
+) -> BuildTaskState {
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let done_clone = done.clone();
+    let failure_clone = failure.clone();
+    tokio::spawn(async move {
+        let extended_path =
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".to_string());
+        let extended_path = format!(
+            "/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:{extended_path}"
+        );
+        info!(
+            image = %image,
+            plugin_id = %plugin_id,
+            context = %stage_path.display(),
+            "sidecar image build started",
+        );
+        let result = tokio::process::Command::new(&docker)
+            .arg("build")
+            .arg("-t")
+            .arg(&image)
+            .arg(stage_path.as_os_str())
+            .env("PATH", &extended_path)
+            .status()
+            .await;
+        let outcome = match result {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => Err(format!(
+                "`docker build` for {image} exited non-zero ({:?}); \
+                 run the build manually with `docker build -t {image} {}` \
+                 to see the full output",
+                status.code(),
+                stage_path.display(),
+            )),
+            Err(e) => Err(format!("could not invoke `docker build`: {e}")),
+        };
+        if let Err(ref err) = outcome {
+            *failure_clone.lock().await = Some(err.clone());
+        } else {
+            info!(
+                image = %image,
+                plugin_id = %plugin_id,
+                "sidecar image build complete",
+            );
+        }
+        done_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    BuildTaskState { done, failure }
+}
+
+/// Resolve a usable `docker` binary path. Mirrors the absolute-
+/// path fallbacks in `setup_preflight::detect_docker` since the
+/// launchd-spawned server inherits a minimal PATH (`/usr/bin:
+/// /bin:/usr/sbin:/sbin`) that excludes both `/usr/local/bin`
+/// (Docker Desktop's symlink) and `/opt/homebrew/bin` (brew's
+/// docker CLI). Returns the first path whose `-v` invocation
+/// exits 0; `None` when no candidate works.
+fn resolve_docker_binary() -> Option<String> {
+    use std::process::Command;
+    for candidate in [
+        "docker",
+        "/usr/local/bin/docker",
+        "/opt/homebrew/bin/docker",
+        "/Applications/Docker.app/Contents/Resources/bin/docker",
+    ] {
+        // NOT `?` — a failed lookup on one candidate (e.g.
+        // `docker` not on launchd's PATH) must fall through to
+        // the next, not short-circuit out of the whole function.
+        // Pre-fix this returned None on the first miss and the
+        // sidecar supervisor never tried `/usr/local/bin/docker`,
+        // leaving python-sandbox stuck on a pull-404.
+        if let Ok(out) = Command::new(candidate).arg("-v").output() {
+            if out.status.success() {
+                return Some(candidate.to_owned());
+            }
+        }
+    }
+    None
 }
 
 /// Translate a sidecar's [`MountDecl`] entries into the

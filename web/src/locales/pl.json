@@ -1,0 +1,174 @@
+{
+  "general": {
+    "title": "Ogólne",
+    "introPre": "Ustawienia operatora dla usługi hosta. Płaszczyzna sterowania działa jako usługa systemd / launchd / Windows — zobacz ",
+    "introPost": " w terminalu, aby zobaczyć stan na żywo i ścieżki dzienników.",
+    "readOnly": "Widok tylko do odczytu. Tylko Kontrolerzy mogą zmieniać ustawienia ogólne.",
+    "loading": "Ładowanie…",
+    "startAtBoot": "Uruchamiaj przy starcie systemu",
+    "startAtBootHelpPre": "Gdy włączone, usługa hosta uruchamia się automatycznie przy starcie systemu. Następne uruchomienie ",
+    "startAtBootHelpPost": " zastosuje zmianę; rejestracja w menedżerze usług na dysku nie zmieni się do tej chwili.",
+    "bootReinstallPre": "Uruchom ponownie ",
+    "bootReinstallPost": " w terminalu, aby zastosować nową flagę autostartu (lub PowerShell z podwyższonymi uprawnieniami w systemie Windows).",
+    "bindAddress": "Adres powiązania (host:port)",
+    "bindAddressHelp": "Adres, na którym nasłuchuje płaszczyzna sterowania. Użyj 127.0.0.1:3031 tylko dla pętli zwrotnej, 0.0.0.0:3031 dla powiązania na wszystkich interfejsach (postaw odwrotne proxy przed nim dla TLS) lub literału IPv6 typu [::1]:3031.",
+    "bindRestartHintPre": "Adres powiązania zacznie obowiązywać po następnym ",
+    "bindRestartHintPost": ".",
+    "historyRetention": "Przechowywanie historii",
+    "historyRetentionHelp": "Jak długo historia rozmów, uruchomienia zadań zaplanowanych, dzienniki strukturalne i (wkrótce) zadania badawcze pozostają przed automatycznym usunięciem. Wpisy pamięci i dziennik audytu nie są objęte.",
+    "retentionNarrowing": "To węższe okno. Zapisanie wywoła jednorazowe masowe usunięcie starszej historii w następnym cyklu czyszczenia (w ciągu około 30 minut). Tej operacji nie można cofnąć.",
+    "save": "Zapisz",
+    "revert": "Przywróć",
+    "language": "Język",
+    "languageHelp": "Przechowywane dla każdej przeglądarki. Przy pierwszym uruchomieniu wykrywany jest język systemu operacyjnego; zmiany tutaj go zastępują.",
+    "dangerConfirm": "Wyczyścić WSZYSTKIE dane i zresetować usługę do ustawień fabrycznych?\n\nUsuwa to każdą rozmowę, wtyczkę, kontakt, rutynę, token OAuth i konto operatora. Usługa nadal działa, ale zostaniesz wylogowany, a następna wizyta uruchomi kreatora konfiguracji.\n\nTej operacji nie można cofnąć.",
+    "dangerZone": "Strefa zagrożenia",
+    "dangerZoneBody": "Usuwa każdą rozmowę, wtyczkę, kontakt, rutynę, zapisany token i konto operatora, a następnie wylogowuje cię. Usługa nadal działa, ale następna wizyta uruchomi kreatora konfiguracji. Artefakty systemu plików (przestrzenie robocze badań, załączniki) nie są usuwane; uruchom ponownie usługę hosta, aby uzyskać naprawdę czysty stan.",
+    "dangerTypePre": "Wpisz ",
+    "dangerTypePost": ", aby włączyć przycisk.",
+    "wiping": "Czyszczenie…",
+    "dangerReset": "Usuń wszystkie dane i wykonaj reset fabryczny"
+  },
+  "composer": {
+    "dismiss": "Odrzuć",
+    "placeholder": "W czym mogę pomóc?",
+    "attach": "Załącz",
+    "attachPhoto": "Załącz zdjęcie",
+    "attachFile": "Załącz plik",
+    "attachSkill": "Załącz umiejętność",
+    "backToAttach": "Wróć do menu załączników",
+    "pickSkills": "Wybierz umiejętności do tej tury",
+    "loading": "Ładowanie…",
+    "stop": "Zatrzymaj generowanie",
+    "send": "Wyślij"
+  },
+  "sidebar": {
+    "newChat": "Nowy czat",
+    "browse": "Przeglądaj",
+    "routines": "Rutyny",
+    "automations": "Automatyzacje",
+    "research": "Badania",
+    "skills": "Umiejętności",
+    "approvals": "Zatwierdzenia",
+    "more": "Więcej",
+    "contacts": "Kontakty",
+    "threads": "Rozmowy",
+    "filters": "Filtry",
+    "externalChannels": "Kanały zewnętrzne",
+    "off": "wył.",
+    "on": "wł.",
+    "noThreads": "Brak rozmów. Rozpocznij nowy czat, aby zacząć.",
+    "controlThread": "Wątek sterujący",
+    "newChatLabel": "Nowy czat · {{id}}",
+    "deleteConfirm": "Usunąć „{{name}}”? Spowoduje to wyczyszczenie historii rozmowy.",
+    "settings": "Ustawienia",
+    "signOut": "Wyloguj",
+    "status": {
+      "offline": "Serwer nieosiągalny",
+      "reconnecting": "Ponowne łączenie z serwerem",
+      "alertSingular": "{{count}} aktywny alert",
+      "alertPlural": "{{count}} aktywnych alertów",
+      "installing": "Backend instaluje się — otwórz stronę Backends",
+      "online": "Online — otwórz alerty"
+    }
+  },
+  "welcome": {
+    "incognitoOnAria": "Tryb incognito włączony — wyłącz",
+    "incognitoOffAria": "Rozpocznij czat w trybie incognito (nie zapisywany)",
+    "incognitoOnTitle": "Tryb incognito włączony — ten czat nie zostanie zapisany",
+    "incognitoOffTitle": "Tryb incognito wyłączony — rozpocznij prywatny czat",
+    "fallbackName": "przyjacielu",
+    "suggestionsLabel": "Sugerowane",
+    "suggestions": {
+      "capabilities": {
+        "title": "Pokaż mi, co potrafisz",
+        "sub": "wymień swoje możliwości",
+        "prompt": "Daj mi krótki przegląd tego, w czym możesz pomóc."
+      },
+      "plan": {
+        "title": "Pomóż mi zaplanować",
+        "sub": "dzisiejsze priorytety",
+        "prompt": "Pomóż mi ustalić, co jest dziś najważniejsze do zrobienia."
+      },
+      "brainstorm": {
+        "title": "Burza mózgów",
+        "sub": "otwarte pytanie, które mnie dręczy",
+        "prompt": "Myślę nad pewnym problemem w pracy. Możemy razem zrobić burzę mózgów?"
+      }
+    }
+  },
+  "login": {
+    "webauthnUnsupported": "Ta przeglądarka nie obsługuje WebAuthn. Użyj nowoczesnej przeglądarki lub usuń zarejestrowany klucz.",
+    "webauthnNoCredential": "Uwierzytelniacz nie zwrócił żadnych danych logowania.",
+    "usernameAndPasswordRequired": "Wprowadź nazwę użytkownika i hasło.",
+    "passkeyStepFailedWithReason": "Krok klucza nie powiódł się: {{reason}}",
+    "passkeyStepFailed": "Krok klucza nie powiódł się.",
+    "incorrectCredentials": "Nieprawidłowa nazwa użytkownika lub hasło.",
+    "failed": "Logowanie nie powiodło się.",
+    "intro": "Zaloguj się, aby kontynuować.",
+    "passkeyRequired": "Wymagany klucz",
+    "passkeyRequiredBody": "Dotknij klucza bezpieczeństwa lub użyj uwierzytelniacza platformy, aby zakończyć logowanie.",
+    "tryPasskeyAgain": "Spróbuj klucza ponownie",
+    "username": "Nazwa użytkownika",
+    "password": "Hasło",
+    "signingIn": "Logowanie…",
+    "signIn": "Zaloguj się"
+  },
+  "setup": {
+    "validation": {
+      "required": "Wymagane.",
+      "usernameTooShort": "Musi mieć co najmniej {{n}} znaków.",
+      "usernameTooLong": "Może mieć najwyżej {{n}} znaków.",
+      "usernameChars": "Tylko litery, cyfry, podkreślenie i myślnik.",
+      "passwordTooShort": "Musi mieć co najmniej {{n}} znaków.",
+      "email": "To nie wygląda na adres e-mail."
+    },
+    "stepper": {
+      "aria": "Postęp konfiguracji",
+      "account": "Konto",
+      "docker": "Docker",
+      "backend": "Backend"
+    },
+    "account": {
+      "submitErrorFallback": "Konfiguracja nie powiodła się; spróbuj ponownie.",
+      "intro": "Witaj — utwórzmy twoje konto kontrolera.",
+      "username": "Nazwa użytkownika",
+      "usernameHelp": "Używana do logowania. Litery, cyfry, podkreślenie, myślnik.",
+      "displayName": "Nazwa wyświetlana",
+      "password": "Hasło administratora",
+      "passwordHelp": "Co najmniej {{n}} znaków. Możesz je później zmienić.",
+      "email": "E-mail",
+      "optional": "(opcjonalnie)",
+      "creating": "Tworzenie…",
+      "submit": "Utwórz konto"
+    },
+    "docker": {
+      "checking": "Sprawdzanie Dockera…",
+      "probing": "Badanie demona Docker…",
+      "preflightFailed": "Nie udało się dotrzeć do punktu końcowego pre-flight.",
+      "retry": "Ponów",
+      "skip": "Pomiń",
+      "lookingForPrereqs": "Szukanie wymagań wstępnych…",
+      "reachable": "Docker jest dostępny",
+      "serverVersion": "Wersja serwera:",
+      "continue": "Kontynuuj",
+      "rechecking": "Ponowne sprawdzanie…",
+      "recheck": "Sprawdź ponownie",
+      "needed": "Docker jest potrzebny do zarządzanych backendów inferencji.",
+      "notDetected": "Nie wykryto Docker Desktop",
+      "notDetectedBody": "execlaw używa Dockera do uruchamiania kontenerów inferencji, które obsługują Whisper, Kokoro i twojego LLM. Bez Dockera nadal możesz wskazać execlaw zewnętrzny punkt końcowy zgodny z OpenAI, ale wbudowany kreator backendu nie będzie mógł zarządzać kontenerami za ciebie.",
+      "installLink": "Zainstaluj Docker Desktop",
+      "installedRecheck": "Zainstalowałem, sprawdź ponownie",
+      "skipForNow": "Pomiń na razie"
+    },
+    "backend": {
+      "intro": "Wybierz, gdzie ma działać twój model czatu Standard."
+    },
+    "hardware": {
+      "title": "Wykryty sprzęt",
+      "none": "Nie wykryto obsługiwanego GPU. Podłącz jakieś (lub napraw sterowniki) i kliknij Odśwież, albo pomiń i użyj zewnętrznego punktu końcowego poniżej.",
+      "refreshing": "Odświeżanie…",
+      "refresh": "Odśwież"
+    }
+  }
+}

@@ -23,7 +23,6 @@
 use crate::host_caps_impl::builtin_artifacts_root_path as builtin_artifacts_root;
 use crate::mcp_host::{MCP_TOOL_PREFIX, McpHost};
 use crate::tool_apis_http::HttpWebFetchApi;
-use crate::tool_apis_search::DuckDuckGoSearchApi;
 use crate::tool_apis_subagent::InferenceSubagentApi;
 use async_trait::async_trait;
 use execlaw_core::Database;
@@ -545,6 +544,31 @@ impl<B: BuiltinTools + 'static> ToolDispatch for ChainedToolDispatch<B> {
         // MCP server.
         self.check_access(tool_name)?;
 
+        // 2026-05-16 — fix #4: built-in capability gate. The plugin
+        // tier already enforces `caller_caps ⊇ required_capabilities`
+        // at dispatch (see `PluginHost::call_tool`), but registry
+        // built-ins were getting their `ToolCtx` APIs wired up based
+        // on the tool's descriptor alone — meaning a KnownLimited
+        // caller invoking a `Memory` built-in got a fully populated
+        // memory API and silently bypassed `capability_set` policy.
+        // Walk the descriptor's declared capabilities up front and
+        // reject when the caller lacks the matching policy tag.
+        // Wildcard `"*"` (Controller) satisfies any. Tools registered
+        // through the legacy `BuiltinTools` API (no descriptor)
+        // remain ungated here — they're a shrinking surface and the
+        // `check_access` trust-class gate above still applies.
+        if let Some(tool) = self.host.registry().builtin(tool_name) {
+            let caps: Vec<&str> = self.caller_caps.iter().map(|s| s.as_str()).collect();
+            for c in &tool.descriptor().capabilities {
+                if let Err(missing) = execlaw_policy::trust::check_builtin_capability(*c, &caps) {
+                    return Err(format!(
+                        "not authorized: tool '{tool_name}' requires capability \
+                         '{missing}' not in caller's set"
+                    ));
+                }
+            }
+        }
+
         // Phase-8d: prefix-route MCP-sourced tools to the connection
         // manager. Falling back to builtins/plugins for an
         // `mcp:`-prefixed name is wrong — those tiers don't speak
@@ -555,6 +579,33 @@ impl<B: BuiltinTools + 'static> ToolDispatch for ChainedToolDispatch<B> {
                 None => Err(format!("no MCP host configured to dispatch '{tool_name}'")),
             };
         }
+
+        // 2026-05-16 — data-ref resolution. Walk the args and replace
+        // any `{"$data_ref": "<id>"}` object with the JSON value the
+        // host stored under that id (typically a previous tool's
+        // structured output). This avoids forcing the model to
+        // re-emit large arrays (e.g. 125 OHLC candles flowing from
+        // `yahoo_finance.historical_candles` into `chart.render` —
+        // the 6-month NKE turn that produced 130+ seconds of decode
+        // and a vLLM read-timeout). The resolver runs BEFORE every
+        // tier (registry / legacy builtin / plugin / MCP-fallback)
+        // so consuming tools see inline data regardless of where
+        // they're dispatched. Tools that don't need data refs see
+        // their args pass through unchanged (the resolver is a
+        // no-op on plain values).
+        let resolved_args_owned;
+        let args_json = if let Some(db) = self.access_db.as_ref() {
+            match resolve_data_refs(args_json, db) {
+                Ok(Some(resolved)) => {
+                    resolved_args_owned = resolved;
+                    &resolved_args_owned
+                }
+                Ok(None) => args_json,
+                Err(e) => return Err(format!("data_ref resolution failed: {e}")),
+            }
+        } else {
+            args_json
+        };
 
         // 2026-04-29 — registry-based built-in tier (new
         // `Arc<dyn ToolImpl>` path). Runs before the legacy
@@ -581,6 +632,72 @@ impl<B: BuiltinTools + 'static> ToolDispatch for ChainedToolDispatch<B> {
             )
             .await
     }
+}
+
+/// Walk `args` and substitute every `{"$data_ref": "<id>"}` object
+/// with the JSON value the host stored under that id. Returns
+/// `Ok(None)` when no `$data_ref` appears anywhere in the tree (the
+/// fast path — caller keeps the borrowed `args` and avoids the
+/// clone); `Ok(Some(resolved))` when at least one substitution
+/// happened.
+///
+/// Recognition is strict: an object qualifies as a data-ref wrapper
+/// **only** when it has exactly one key `"$data_ref"` whose value is
+/// a non-empty string. Objects with extra fields, or with
+/// `"$data_ref"` set to a non-string value, are treated as regular
+/// data and recursed into normally — this keeps the conservative
+/// surface so a tool legitimately receiving an object with a key
+/// named `$data_ref` (unlikely but possible) doesn't get its data
+/// silently replaced.
+///
+/// Resolution failure (unknown id, expired ref, wrong mime, disk
+/// read error) propagates as an error — the dispatcher surfaces it
+/// to the model in the next round's `tool_result.error` so the
+/// model can correct.
+fn resolve_data_refs(
+    args: &serde_json::Value,
+    db: &Database,
+) -> Result<Option<serde_json::Value>, String> {
+    fn walk(
+        v: &serde_json::Value,
+        db: &Database,
+        changed: &mut bool,
+    ) -> Result<serde_json::Value, String> {
+        use serde_json::Value;
+        match v {
+            Value::Object(map) => {
+                if map.len() == 1 {
+                    if let Some(Value::String(id)) = map.get("$data_ref") {
+                        if !id.is_empty() {
+                            let resolved = crate::chats::fetch_data_ref(db, id)?;
+                            *changed = true;
+                            // The resolved value itself may legitimately
+                            // contain further `$data_ref` wrappers (a tool
+                            // could chain refs). Walk it too.
+                            return walk(&resolved, db, changed);
+                        }
+                    }
+                }
+                let mut out = serde_json::Map::with_capacity(map.len());
+                for (k, val) in map {
+                    out.insert(k.clone(), walk(val, db, changed)?);
+                }
+                Ok(Value::Object(out))
+            }
+            Value::Array(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    out.push(walk(item, db, changed)?);
+                }
+                Ok(Value::Array(out))
+            }
+            other => Ok(other.clone()),
+        }
+    }
+
+    let mut changed = false;
+    let walked = walk(args, db, &mut changed)?;
+    if changed { Ok(Some(walked)) } else { Ok(None) }
 }
 
 /// An empty built-ins set — useful when the server is serving turns
@@ -1125,5 +1242,324 @@ mod tests {
         assert!(v.get("from_legacy").is_none());
         let row = ConversationStore::new(&db).get(&cid).unwrap().unwrap();
         assert_eq!(row.display_name.as_deref(), Some("Won"));
+    }
+
+    /// 2026-05-16 — built-in capability gate (fix #4). A built-in tool
+    /// whose descriptor declares `Capability::MemoryWrite` is denied
+    /// when the caller's `caller_caps` doesn't include `memory.write`.
+    /// Pre-fix the dispatcher checked only `config_tool_access` and
+    /// then handed control to the registry's `invoke()` — which
+    /// populated `ctx.memory` based on the *descriptor's* declared
+    /// capabilities, not the caller's policy capability set. A
+    /// KnownLimited contact could write memory entries it had no
+    /// policy right to touch.
+    #[tokio::test]
+    async fn builtin_capability_gate_denies_caller_missing_required_cap() {
+        use async_trait::async_trait;
+        use execlaw_core::tool::{
+            Capability, ToolCtx, ToolDescriptor, ToolImpl, ToolLatency, ToolOutcome,
+            ToolSource as CoreToolSource,
+        };
+
+        struct MemoryWriter {
+            d: ToolDescriptor,
+        }
+        #[async_trait]
+        impl ToolImpl for MemoryWriter {
+            fn descriptor(&self) -> &ToolDescriptor {
+                &self.d
+            }
+            async fn invoke(&self, _ctx: ToolCtx, _args: serde_json::Value) -> ToolOutcome {
+                ToolOutcome::ok(serde_json::json!({"reached": true}))
+            }
+        }
+
+        let host = test_host();
+        host.registry()
+            .register_builtin(Arc::new(MemoryWriter {
+                d: ToolDescriptor {
+                    name: "test_mem_write".into(),
+                    description: "test".into(),
+                    schema: serde_json::json!({"type": "object"}),
+                    source: CoreToolSource::Builtin,
+                    latency: ToolLatency::Low,
+                    capabilities: vec![Capability::MemoryWrite],
+                    default_allowed_classes: vec!["Controller".into(), "KnownTrusted".into()],
+                },
+            }))
+            .unwrap();
+
+        // KnownLimited caller — caller_caps contains ONLY
+        // `messaging.reply_current_transport`, so memory.write is not
+        // satisfied. Dispatch MUST refuse before the tool's `invoke`
+        // body runs.
+        let disp = ChainedToolDispatch::new(
+            host,
+            vec!["messaging.reply_current_transport".into()],
+            NoBuiltinTools,
+        )
+        .with_conversation(ConversationId::from("c"));
+        let err = disp
+            .call("test_mem_write", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("memory.write") && err.contains("not authorized"),
+            "expected capability-denial mentioning the missing cap, got: {err}"
+        );
+    }
+
+    /// Companion: when the caller DOES hold the required policy cap,
+    /// the gate lets the tool run.
+    #[tokio::test]
+    async fn builtin_capability_gate_allows_caller_with_required_cap() {
+        use async_trait::async_trait;
+        use execlaw_core::tool::{
+            Capability, ToolCtx, ToolDescriptor, ToolImpl, ToolLatency, ToolOutcome,
+            ToolSource as CoreToolSource,
+        };
+
+        struct MemoryWriter {
+            d: ToolDescriptor,
+        }
+        #[async_trait]
+        impl ToolImpl for MemoryWriter {
+            fn descriptor(&self) -> &ToolDescriptor {
+                &self.d
+            }
+            async fn invoke(&self, _ctx: ToolCtx, _args: serde_json::Value) -> ToolOutcome {
+                ToolOutcome::ok(serde_json::json!({"reached": true}))
+            }
+        }
+
+        let host = test_host();
+        host.registry()
+            .register_builtin(Arc::new(MemoryWriter {
+                d: ToolDescriptor {
+                    name: "test_mem_write_2".into(),
+                    description: "test".into(),
+                    schema: serde_json::json!({"type": "object"}),
+                    source: CoreToolSource::Builtin,
+                    latency: ToolLatency::Low,
+                    capabilities: vec![Capability::MemoryWrite],
+                    default_allowed_classes: vec!["Controller".into(), "KnownTrusted".into()],
+                },
+            }))
+            .unwrap();
+
+        // KnownTrusted-tier caps include memory.write.
+        let disp = ChainedToolDispatch::new(
+            host,
+            vec![
+                "messaging.reply_current_transport".into(),
+                "memory.read".into(),
+                "memory.write".into(),
+                "tools.safe".into(),
+            ],
+            NoBuiltinTools,
+        )
+        .with_conversation(ConversationId::from("c"));
+        let v = disp
+            .call("test_mem_write_2", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(v["reached"], true);
+    }
+
+    /// Wildcard `"*"` (Controller) bypasses the cap gate even for
+    /// Controller-only capabilities like `McpAdmin`.
+    #[tokio::test]
+    async fn builtin_capability_gate_wildcard_passes_mcp_admin() {
+        use async_trait::async_trait;
+        use execlaw_core::tool::{
+            Capability, ToolCtx, ToolDescriptor, ToolImpl, ToolLatency, ToolOutcome,
+            ToolSource as CoreToolSource,
+        };
+
+        struct McpTool {
+            d: ToolDescriptor,
+        }
+        #[async_trait]
+        impl ToolImpl for McpTool {
+            fn descriptor(&self) -> &ToolDescriptor {
+                &self.d
+            }
+            async fn invoke(&self, _ctx: ToolCtx, _args: serde_json::Value) -> ToolOutcome {
+                ToolOutcome::ok(serde_json::json!({"reached": true}))
+            }
+        }
+
+        let host = test_host();
+        host.registry()
+            .register_builtin(Arc::new(McpTool {
+                d: ToolDescriptor {
+                    name: "test_mcp_admin".into(),
+                    description: "test".into(),
+                    schema: serde_json::json!({"type": "object"}),
+                    source: CoreToolSource::Builtin,
+                    latency: ToolLatency::Low,
+                    capabilities: vec![Capability::McpAdmin],
+                    default_allowed_classes: vec!["Controller".into()],
+                },
+            }))
+            .unwrap();
+
+        let disp = ChainedToolDispatch::new(host, vec!["*".into()], NoBuiltinTools)
+            .with_conversation(ConversationId::from("c"));
+        let v = disp
+            .call("test_mcp_admin", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(v["reached"], true);
+    }
+
+    // ---- resolve_data_refs --------------------------------------
+    //
+    // 2026-05-16 — pin the wire-shape contract the dispatcher
+    // relies on. The resolver runs BEFORE every tool tier sees
+    // args, so changes here propagate across the entire tool
+    // surface; a regression that mis-substitutes or fails to
+    // substitute would silently break data-ref-using tools
+    // (yahoo_finance → chart.render today; more pipelines later).
+
+    fn write_ref(
+        db: &Database,
+        artifacts_root: &std::path::Path,
+        value: &serde_json::Value,
+    ) -> String {
+        use execlaw_core::attachments::AttachmentStore;
+        let bytes = serde_json::to_vec(value).unwrap();
+        let store = AttachmentStore::new(db);
+        // Use wall-clock so the 1-hour TTL the fetcher checks is
+        // genuinely in the future regardless of when the test runs.
+        let now = chrono::Utc::now().timestamp();
+        store
+            .insert_plugin_artifact(
+                artifacts_root,
+                "test-plugin",
+                "data_ref.json",
+                "application/json",
+                &bytes,
+                Some(3600),
+                now,
+            )
+            .unwrap()
+            .attachment_id
+    }
+
+    fn fresh_db_and_root() -> (Database, tempfile::TempDir) {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn resolve_data_refs_no_op_returns_none() {
+        // Hot path: args with no `$data_ref` anywhere skip the
+        // clone and the caller keeps the borrowed value.
+        let (db, _root) = fresh_db_and_root();
+        let args = serde_json::json!({
+            "title": "Hello",
+            "points": [{"x": 1, "y": 2}, {"x": 3, "y": 4}],
+        });
+        let out = resolve_data_refs(&args, &db).unwrap();
+        assert!(
+            out.is_none(),
+            "args with no $data_ref must return None to skip the clone"
+        );
+    }
+
+    #[test]
+    fn resolve_data_refs_substitutes_top_level() {
+        let (db, root) = fresh_db_and_root();
+        let stored = serde_json::json!([{"x": 1, "y": 10}, {"x": 2, "y": 20}]);
+        let id = write_ref(&db, root.path(), &stored);
+        let args = serde_json::json!({"$data_ref": id});
+        let out = resolve_data_refs(&args, &db).unwrap().expect("ref present");
+        assert_eq!(out, stored);
+    }
+
+    #[test]
+    fn resolve_data_refs_substitutes_nested_under_named_field() {
+        // The yahoo_finance → chart.render shape: refs appear at
+        // `series[].points`, not at the top.
+        let (db, root) = fresh_db_and_root();
+        let points = serde_json::json!([{"x": 1, "y": 10}, {"x": 2, "y": 20}]);
+        let id = write_ref(&db, root.path(), &points);
+        let args = serde_json::json!({
+            "title": "Close",
+            "series": [
+                {"name": "NKE", "points": {"$data_ref": id}}
+            ]
+        });
+        let out = resolve_data_refs(&args, &db).unwrap().expect("ref present");
+        assert_eq!(out["series"][0]["points"], points);
+        // Sibling fields preserved verbatim.
+        assert_eq!(out["title"], "Close");
+        assert_eq!(out["series"][0]["name"], "NKE");
+    }
+
+    #[test]
+    fn resolve_data_refs_does_not_substitute_object_with_extra_keys() {
+        // Conservative recognition: `{"$data_ref": "id", "other": ...}`
+        // is NOT a ref wrapper — it might be a tool legitimately
+        // receiving an object that happens to have a `$data_ref`
+        // key. We recurse into it normally.
+        let (db, root) = fresh_db_and_root();
+        let stored = serde_json::json!({"hello": "world"});
+        let id = write_ref(&db, root.path(), &stored);
+        let args = serde_json::json!({
+            "wrapper": {"$data_ref": id, "extra": "stay"}
+        });
+        let out = resolve_data_refs(&args, &db).unwrap();
+        // No substitution happened because the inner object had two
+        // keys → returned None (no change).
+        assert!(
+            out.is_none(),
+            "wrapper with extra keys must NOT be treated as a ref"
+        );
+    }
+
+    #[test]
+    fn resolve_data_refs_recurses_into_resolved_value() {
+        // A ref pointing at a value that itself contains a ref —
+        // resolver must walk recursively. Useful for plugins that
+        // chain refs (output of step A → input to step B → final
+        // bundle).
+        let (db, root) = fresh_db_and_root();
+        let inner_stored = serde_json::json!([1, 2, 3]);
+        let inner_id = write_ref(&db, root.path(), &inner_stored);
+        let outer_value = serde_json::json!({
+            "wrapped": {"$data_ref": inner_id}
+        });
+        let outer_id = write_ref(&db, root.path(), &outer_value);
+        let args = serde_json::json!({"$data_ref": outer_id});
+        let out = resolve_data_refs(&args, &db).unwrap().expect("ref present");
+        assert_eq!(out, serde_json::json!({"wrapped": [1, 2, 3]}));
+    }
+
+    #[test]
+    fn resolve_data_refs_missing_id_errors() {
+        // Unknown id → error bubbles back to the dispatcher which
+        // turns it into a tool_result.error in the next round so
+        // the model can correct.
+        let (db, _root) = fresh_db_and_root();
+        let args = serde_json::json!({"$data_ref": "nonexistent-uuid"});
+        let err = resolve_data_refs(&args, &db).unwrap_err();
+        assert!(
+            err.contains("not found") && err.contains("nonexistent-uuid"),
+            "error must name the missing id; got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_data_refs_ignores_non_string_value_under_marker_key() {
+        // `{"$data_ref": 42}` (integer) — not a valid ref wrapper.
+        // Recurse normally rather than erroring.
+        let (db, _root) = fresh_db_and_root();
+        let args = serde_json::json!({"$data_ref": 42});
+        let out = resolve_data_refs(&args, &db).unwrap();
+        assert!(out.is_none());
     }
 }

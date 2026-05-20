@@ -43,6 +43,12 @@ hex.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 schemars.workspace = true
+# 2026-05-17 — utoipa derives let core types (AutomationDef, NodeDef,
+# BusEventKind, AutomationRunStatus, ...) self-describe in the
+# server's OpenAPI spec at `/api/openapi.json`. Derive-only usage,
+# no runtime cost; the macro expands to a static schema function the
+# server's `ApiDoc` collects.
+utoipa.workspace = true
 # 2026-05-15 — needed by the chart.render built-in tool. The
 # charting crate is pure Rust (plotters) so it builds in core
 # without pulling in any heavy native deps.

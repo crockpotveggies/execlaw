@@ -224,12 +224,18 @@ pub struct RegisteredAdminRoute {
     pub description: Option<String>,
 }
 
-/// Same shape as `RegisteredAdminRoute` but for unauthenticated
-/// `[[webhook_routes]]` mounted at `/api/webhooks/{plugin_id}{path}`.
-/// Held in its own map so the public-webhook dispatcher can't
-/// accidentally pick up an admin route, and vice-versa — keeping
-/// the two surfaces strictly disjoint avoids accidental auth
-/// bypass.
+/// Same shape as `RegisteredAdminRoute` but for the public
+/// `[[webhook_routes]]` surface mounted at
+/// `/api/webhooks/{plugin_id}{path}`. Held in its own map so the
+/// public-webhook dispatcher can't accidentally pick up an admin
+/// route, and vice-versa — keeping the two surfaces strictly
+/// disjoint avoids accidental auth bypass.
+///
+/// `auth` mirrors the manifest's `WebhookAuthDecl`. `None` here
+/// means the manifest omitted `auth` entirely (legacy "handler
+/// validates" behavior, deprecation-warned at enable); a `Some`
+/// value is enforced by the host BEFORE bus publish or handler
+/// dispatch.
 #[derive(Debug, Clone)]
 pub struct RegisteredWebhookRoute {
     pub plugin_id: String,
@@ -237,6 +243,7 @@ pub struct RegisteredWebhookRoute {
     pub path: String,
     pub handler: String,
     pub description: Option<String>,
+    pub auth: Option<execlaw_plugin_sdk::manifest::WebhookAuthDecl>,
 }
 
 /// Result of [`HookRegistry::lookup_any`]. The dispatch layer pattern-
@@ -576,12 +583,28 @@ impl HookRegistry {
                     if !path.starts_with('/') {
                         path.insert(0, '/');
                     }
+                    if r.auth.is_none() {
+                        // Loud, one-line, structured warning so an operator
+                        // grep'ing for `webhook_route_auth_unset` finds every
+                        // route still on the legacy "handler validates" path.
+                        tracing::warn!(
+                            target: "plugin_host::webhook_routes",
+                            plugin_id = %plugin_id,
+                            method = %r.method.to_uppercase(),
+                            path = %path,
+                            "webhook_route_auth_unset: this route relies on the plugin handler \
+                             to validate the caller. Declare `auth = {{ kind = \"query_token\", ... }}` \
+                             (or `kind = \"none\"` to silence) in plugin.toml to have the host \
+                             enforce authentication before bus publish."
+                        );
+                    }
                     RegisteredWebhookRoute {
                         plugin_id: plugin_id.clone(),
                         method: r.method.to_uppercase(),
                         path,
                         handler: r.handler.clone(),
                         description: r.description.clone(),
+                        auth: r.auth.clone(),
                     }
                 })
                 .collect();

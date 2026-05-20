@@ -47,6 +47,8 @@ import {
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
 import { useScreenTransition } from "../anim/useScreenTransition";
+import { useT, t as i18nT } from "../i18n";
+import { LanguageSwitcher } from "../i18n/LanguageSwitcher";
 import {
     UnifiedBackendForm,
     gpuIdString as sharedGpuIdString,
@@ -77,27 +79,45 @@ export function validateSetupForm(input: {
 
     const trimmedUsername = input.username.trim();
     if (trimmedUsername.length === 0) {
-        errors.username = "Required.";
+        errors.username = i18nT("setup.validation.required", "Required.");
     } else if (trimmedUsername.length < USERNAME_MIN_LEN) {
-        errors.username = `Must be at least ${USERNAME_MIN_LEN} characters.`;
+        errors.username = i18nT(
+            "setup.validation.usernameTooShort",
+            "Must be at least {{n}} characters.",
+            { n: USERNAME_MIN_LEN },
+        );
     } else if (trimmedUsername.length > USERNAME_MAX_LEN) {
-        errors.username = `Must be at most ${USERNAME_MAX_LEN} characters.`;
+        errors.username = i18nT(
+            "setup.validation.usernameTooLong",
+            "Must be at most {{n}} characters.",
+            { n: USERNAME_MAX_LEN },
+        );
     } else if (!USERNAME_PATTERN.test(trimmedUsername)) {
-        errors.username = "Letters, digits, underscore, hyphen only.";
+        errors.username = i18nT(
+            "setup.validation.usernameChars",
+            "Letters, digits, underscore, hyphen only.",
+        );
     }
 
     if (input.display_name.trim().length === 0) {
-        errors.display_name = "Required.";
+        errors.display_name = i18nT("setup.validation.required", "Required.");
     }
     if (input.admin_password.length < PASSWORD_MIN_LEN) {
-        errors.admin_password = `Must be at least ${PASSWORD_MIN_LEN} characters.`;
+        errors.admin_password = i18nT(
+            "setup.validation.passwordTooShort",
+            "Must be at least {{n}} characters.",
+            { n: PASSWORD_MIN_LEN },
+        );
     }
     if (input.email.trim().length > 0) {
         // Loose RFC-ish check — the backend doesn't validate either,
         // so this just stops obvious typos rather than enforcing a
         // canonical form.
         if (!/^\S+@\S+\.\S+$/.test(input.email.trim())) {
-            errors.email = "Doesn't look like an email address.";
+            errors.email = i18nT(
+                "setup.validation.email",
+                "Doesn't look like an email address.",
+            );
         }
     }
     return errors;
@@ -164,6 +184,32 @@ export function SetupWizard() {
         }
     }, [getToken]);
 
+    // Apple Silicon: skip the Docker step entirely. Docker Desktop on
+    // Apple Silicon runs containers inside a Linux microVM with zero
+    // Metal access, so the managed-backend path that justifies the
+    // Docker check is unusable on this hardware — inference runs
+    // natively via Ollama instead (see docs/setup-mac.md). Without
+    // this guard the wizard surfaces a misleading "Docker Desktop not
+    // detected" warning even though the Backend step would have
+    // routed the operator to the Apple-Silicon Ollama panel anyway.
+    //
+    // `effectiveStep` short-circuits the render so we never flash the
+    // Docker UI for a frame between the preflight resolving and the
+    // useEffect committing setStep("backend"). The useEffect still
+    // fires so the actual `step` state catches up — the stepper
+    // indicator and Skip/Continue handlers read `step`, not the
+    // derived value, so they need real state. STEP_ORDER also hides
+    // "Docker" from the timeline so the stepper reads 2/2.
+    const hasAppleGpu =
+        preflight?.gpus?.some((g) => g.vendor === "Apple") ?? false;
+    const effectiveStep: WizardStep =
+        step === "docker" && hasAppleGpu ? "backend" : step;
+    useEffect(() => {
+        if (step === "docker" && hasAppleGpu) {
+            setStep("backend");
+        }
+    }, [step, hasAppleGpu]);
+
     const finish = useCallback(() => {
         // Same shrink + fade as the original single-screen wizard.
         // The "complete" path runs after a successful backend save:
@@ -196,15 +242,16 @@ export function SetupWizard() {
 
     return (
         <div className="execlaw-auth-shell">
+            <LanguageSwitcher />
             <div ref={ref} className="execlaw-auth-card">
                 <h1 className="execlaw-brand h4 mb-1">execlaw</h1>
-                <SetupStepIndicator step={step} preflight={preflight} />
-                {step === "account" && (
+                <SetupStepIndicator step={effectiveStep} preflight={preflight} />
+                {effectiveStep === "account" && (
                     <AccountStep
                         onComplete={() => setStep("docker")}
                     />
                 )}
-                {step === "docker" && (
+                {effectiveStep === "docker" && (
                     <DockerStep
                         preflight={preflight}
                         loading={preflightLoading}
@@ -214,7 +261,7 @@ export function SetupWizard() {
                         onSkip={() => setStep("backend")}
                     />
                 )}
-                {step === "backend" && (
+                {effectiveStep === "backend" && (
                     <BackendStep
                         getToken={getToken}
                         preflight={preflight}
@@ -236,7 +283,7 @@ export function SetupWizard() {
 type StepStatus = "upcoming" | "current" | "done";
 
 const STEP_ORDER: WizardStep[] = ["account", "docker", "backend"];
-const STEP_LABELS: Record<WizardStep, string> = {
+const STEP_LABEL_DEFAULTS: Record<WizardStep, string> = {
     account: "Account",
     docker: "Docker",
     backend: "Backend",
@@ -249,7 +296,16 @@ function SetupStepIndicator({
     step: WizardStep;
     preflight: PreflightResponse | null;
 }) {
-    const currentIdx = STEP_ORDER.indexOf(step);
+    const t = useT();
+    // Apple Silicon: hide the Docker step from the timeline since the
+    // wizard auto-skips past it — see the parent's auto-skip useEffect.
+    // Without this filter the stepper would render 3 dots but only 2
+    // are ever reachable, leaving an "upcoming" gray Docker dot the
+    // operator can't navigate to.
+    const hasAppleGpu =
+        preflight?.gpus?.some((g) => g.vendor === "Apple") ?? false;
+    const steps = STEP_ORDER.filter((s) => !(s === "docker" && hasAppleGpu));
+    const currentIdx = steps.indexOf(step);
     const dockerOk = preflight?.docker.available === true;
 
     function statusFor(idx: number, key: WizardStep): StepStatus {
@@ -270,9 +326,9 @@ function SetupStepIndicator({
             className="execlaw-stepper"
             data-testid="setup-step-indicator"
             role="list"
-            aria-label="Setup progress"
+            aria-label={t("setup.stepper.aria", "Setup progress")}
         >
-            {STEP_ORDER.map((s, i) => {
+            {steps.map((s, i) => {
                 const status = statusFor(i, s);
                 return (
                     <div
@@ -298,7 +354,7 @@ function SetupStepIndicator({
                             )}
                         </div>
                         <div className="execlaw-stepper__label">
-                            {STEP_LABELS[s]}
+                            {t(`setup.stepper.${s}`, STEP_LABEL_DEFAULTS[s])}
                         </div>
                     </div>
                 );
@@ -313,6 +369,7 @@ function SetupStepIndicator({
 
 function AccountStep({ onComplete }: { onComplete: () => void }) {
     const auth = useAuth();
+    const t = useT();
     const [username, setUsername] = useState("");
     const [displayName, setDisplayName] = useState("");
     const [password, setPassword] = useState("");
@@ -355,7 +412,9 @@ function AccountStep({ onComplete }: { onComplete: () => void }) {
                 return;
             }
             setSubmitError(
-                e instanceof Error ? e.message : "Setup failed; try again.",
+                e instanceof Error
+                    ? e.message
+                    : t("setup.account.submitErrorFallback", "Setup failed; try again."),
             );
         } finally {
             setSubmitting(false);
@@ -365,7 +424,10 @@ function AccountStep({ onComplete }: { onComplete: () => void }) {
     return (
         <>
             <p className="execlaw-muted small mb-4">
-                Welcome — let&rsquo;s create your controller account.
+                {t(
+                    "setup.account.intro",
+                    "Welcome — let’s create your controller account.",
+                )}
             </p>
 
             <ErrorBanner
@@ -377,7 +439,7 @@ function AccountStep({ onComplete }: { onComplete: () => void }) {
 
             <Form noValidate onSubmit={onSubmit} data-testid="setup-account-form">
                 <Form.Group className="mb-3" controlId="setup-username">
-                    <Form.Label>Username</Form.Label>
+                    <Form.Label>{t("setup.account.username", "Username")}</Form.Label>
                     <Form.Control
                         type="text"
                         autoComplete="username"
@@ -393,12 +455,17 @@ function AccountStep({ onComplete }: { onComplete: () => void }) {
                         {errors.username}
                     </Form.Control.Feedback>
                     <Form.Text className="execlaw-muted">
-                        Used to sign in. Letters, digits, underscore, hyphen.
+                        {t(
+                            "setup.account.usernameHelp",
+                            "Used to sign in. Letters, digits, underscore, hyphen.",
+                        )}
                     </Form.Text>
                 </Form.Group>
 
                 <Form.Group className="mb-3" controlId="setup-display-name">
-                    <Form.Label>Display name</Form.Label>
+                    <Form.Label>
+                        {t("setup.account.displayName", "Display name")}
+                    </Form.Label>
                     <Form.Control
                         type="text"
                         autoComplete="name"
@@ -413,7 +480,9 @@ function AccountStep({ onComplete }: { onComplete: () => void }) {
                 </Form.Group>
 
                 <Form.Group className="mb-3" controlId="setup-password">
-                    <Form.Label>Admin password</Form.Label>
+                    <Form.Label>
+                        {t("setup.account.password", "Admin password")}
+                    </Form.Label>
                     <Form.Control
                         type="password"
                         autoComplete="new-password"
@@ -426,13 +495,20 @@ function AccountStep({ onComplete }: { onComplete: () => void }) {
                         {errors.admin_password}
                     </Form.Control.Feedback>
                     <Form.Text className="execlaw-muted">
-                        At least {PASSWORD_MIN_LEN} characters. You can change it later.
+                        {t(
+                            "setup.account.passwordHelp",
+                            "At least {{n}} characters. You can change it later.",
+                            { n: PASSWORD_MIN_LEN },
+                        )}
                     </Form.Text>
                 </Form.Group>
 
                 <Form.Group className="mb-4" controlId="setup-email">
                     <Form.Label>
-                        Email <span className="execlaw-muted">(optional)</span>
+                        {t("setup.account.email", "Email")}{" "}
+                        <span className="execlaw-muted">
+                            {t("setup.account.optional", "(optional)")}
+                        </span>
                     </Form.Label>
                     <Form.Control
                         type="email"
@@ -457,10 +533,10 @@ function AccountStep({ onComplete }: { onComplete: () => void }) {
                     {submitting ? (
                         <>
                             <Spinner size="sm" animation="border" className="me-2" />
-                            Creating…
+                            {t("setup.account.creating", "Creating…")}
                         </>
                     ) : (
-                        "Create account"
+                        t("setup.account.submit", "Create account")
                     )}
                 </Button>
             </Form>
@@ -487,6 +563,7 @@ function DockerStep({
     onContinue: () => void;
     onSkip: () => void;
 }) {
+    const t = useT();
     // Mount → kick the first probe. Lifted preflight means we don't
     // re-fetch on re-render, just the initial mount and explicit
     // user-initiated refreshes.
@@ -501,11 +578,11 @@ function DockerStep({
         return (
             <>
                 <p className="execlaw-muted small mb-3">
-                    Checking for Docker…
+                    {t("setup.docker.checking", "Checking for Docker…")}
                 </p>
                 <div data-testid="setup-docker-loading">
                     <Spinner size="sm" animation="border" className="me-2" />
-                    Probing the Docker daemon…
+                    {t("setup.docker.probing", "Probing the Docker daemon…")}
                 </div>
             </>
         );
@@ -515,7 +592,10 @@ function DockerStep({
         return (
             <>
                 <p className="execlaw-muted small mb-3">
-                    Couldn&rsquo;t reach the preflight endpoint.
+                    {t(
+                        "setup.docker.preflightFailed",
+                        "Couldn’t reach the preflight endpoint.",
+                    )}
                 </p>
                 {/* Preflight failure is a hard error screen with a Retry
                     button below; not a transient banner that should
@@ -530,14 +610,14 @@ function DockerStep({
                         disabled={loading}
                         data-testid="setup-docker-retry"
                     >
-                        Retry
+                        {t("setup.docker.retry", "Retry")}
                     </Button>
                     <Button
                         variant="outline-secondary"
                         onClick={onSkip}
                         data-testid="setup-docker-skip"
                     >
-                        Skip
+                        {t("setup.docker.skip", "Skip")}
                     </Button>
                 </div>
             </>
@@ -550,7 +630,7 @@ function DockerStep({
         return (
             <div data-testid="setup-docker-ok">
                 <p className="execlaw-muted small mb-3">
-                    Looking for prerequisites…
+                    {t("setup.docker.lookingForPrereqs", "Looking for prerequisites…")}
                 </p>
                 <div className="execlaw-card mb-3">
                     <div className="execlaw-card__title d-flex align-items-center">
@@ -558,11 +638,12 @@ function DockerStep({
                             className="bi bi-check-circle-fill text-success me-2"
                             aria-hidden
                         />
-                        Docker is reachable
+                        {t("setup.docker.reachable", "Docker is reachable")}
                     </div>
                     {docker.version && (
                         <div className="execlaw-muted small">
-                            Server version: <code>{docker.version}</code>
+                            {t("setup.docker.serverVersion", "Server version:")}{" "}
+                            <code>{docker.version}</code>
                         </div>
                     )}
                 </div>
@@ -572,7 +653,7 @@ function DockerStep({
                         onClick={onContinue}
                         data-testid="setup-docker-continue"
                     >
-                        Continue
+                        {t("setup.docker.continue", "Continue")}
                     </Button>
                     <Button
                         variant="outline-secondary"
@@ -587,10 +668,10 @@ function DockerStep({
                                     animation="border"
                                     className="me-2"
                                 />
-                                Re-checking…
+                                {t("setup.docker.rechecking", "Re-checking…")}
                             </>
                         ) : (
-                            "Re-check"
+                            t("setup.docker.recheck", "Re-check")
                         )}
                     </Button>
                 </div>
@@ -601,7 +682,10 @@ function DockerStep({
     return (
         <div data-testid="setup-docker-missing">
             <p className="execlaw-muted small mb-3">
-                Docker is needed for managed inference backends.
+                {t(
+                    "setup.docker.needed",
+                    "Docker is needed for managed inference backends.",
+                )}
             </p>
             <div className="execlaw-card mb-3">
                 <div className="execlaw-card__title d-flex align-items-center">
@@ -609,15 +693,13 @@ function DockerStep({
                         className="bi bi-exclamation-triangle-fill text-warning me-2"
                         aria-hidden
                     />
-                    Docker Desktop not detected
+                    {t("setup.docker.notDetected", "Docker Desktop not detected")}
                 </div>
                 <div className="execlaw-muted small">
-                    execlaw uses Docker to spawn the inference containers
-                    that run Whisper, Kokoro, and your LLM. Without it
-                    you can still point execlaw at an external
-                    OpenAI-compatible endpoint, but the in-app backend
-                    wizard won&rsquo;t be able to manage containers for
-                    you.
+                    {t(
+                        "setup.docker.notDetectedBody",
+                        "execlaw uses Docker to spawn the inference containers that run Whisper, Kokoro, and your LLM. Without it you can still point execlaw at an external OpenAI-compatible endpoint, but the in-app backend wizard won’t be able to manage containers for you.",
+                    )}
                 </div>
                 <div className="mt-2">
                     <a
@@ -631,7 +713,7 @@ function DockerStep({
                             className="bi bi-box-arrow-up-right me-1"
                             aria-hidden
                         />
-                        Install Docker Desktop
+                        {t("setup.docker.installLink", "Install Docker Desktop")}
                     </a>
                 </div>
             </div>
@@ -649,10 +731,10 @@ function DockerStep({
                                 animation="border"
                                 className="me-2"
                             />
-                            Re-checking…
+                            {t("setup.docker.rechecking", "Re-checking…")}
                         </>
                     ) : (
-                        "I've installed it, re-check"
+                        t("setup.docker.installedRecheck", "I've installed it, re-check")
                     )}
                 </Button>
                 <Button
@@ -660,7 +742,7 @@ function DockerStep({
                     onClick={onSkip}
                     data-testid="setup-docker-skip"
                 >
-                    Skip for now
+                    {t("setup.docker.skipForNow", "Skip for now")}
                 </Button>
             </div>
         </div>
@@ -686,6 +768,7 @@ function BackendStep({
     onComplete: () => void;
     onSkip: () => void;
 }) {
+    const t = useT();
     const gpus = preflight?.gpus ?? [];
     const dockerAvailable = preflight?.docker.available ?? false;
     const ollamaAvailable = preflight?.ollama?.available ?? false;
@@ -709,7 +792,10 @@ function BackendStep({
     return (
         <>
             <p className="execlaw-muted small mb-3">
-                Pick where your Standard chat model runs.
+                {t(
+                    "setup.backend.intro",
+                    "Pick where your Standard chat model runs.",
+                )}
             </p>
             <HardwareSummary
                 gpus={gpus}
@@ -748,6 +834,7 @@ function HardwareSummary({
     refreshing: boolean;
     refresh: () => Promise<void>;
 }) {
+    const t = useT();
     const usable = gpus.filter(
         (g) =>
             g.vendor === "Nvidia" ||
@@ -761,12 +848,15 @@ function HardwareSummary({
             data-testid="setup-hardware-summary"
         >
             <div className="flex-grow-1">
-                <div className="execlaw-card__title">Detected hardware</div>
+                <div className="execlaw-card__title">
+                    {t("setup.hardware.title", "Detected hardware")}
+                </div>
                 {usable.length === 0 ? (
                     <div className="execlaw-muted small">
-                        No supported GPU detected. Plug one in (or fix
-                        drivers) and click Refresh, or skip and use an
-                        external endpoint below.
+                        {t(
+                            "setup.hardware.none",
+                            "No supported GPU detected. Plug one in (or fix drivers) and click Refresh, or skip and use an external endpoint below.",
+                        )}
                     </div>
                 ) : (
                     <div className="execlaw-muted small">
@@ -797,7 +887,7 @@ function HardwareSummary({
                             animation="border"
                             className="me-2"
                         />
-                        Refreshing…
+                        {t("setup.hardware.refreshing", "Refreshing…")}
                     </>
                 ) : (
                     <>
@@ -805,7 +895,7 @@ function HardwareSummary({
                             className="bi bi-arrow-clockwise me-1"
                             aria-hidden
                         />
-                        Refresh
+                        {t("setup.hardware.refresh", "Refresh")}
                     </>
                 )}
             </Button>

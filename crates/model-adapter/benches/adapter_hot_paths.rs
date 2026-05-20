@@ -28,6 +28,8 @@ fn req() -> ChatRequest {
         temperature: None,
         max_tokens: None,
         chat_template_kwargs: None,
+        tool_choice: None,
+        guided_decoding_backend: None,
     }
 }
 

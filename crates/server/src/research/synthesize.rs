@@ -144,6 +144,8 @@ pub async fn run_synthesize(ctx: SynthesizeCtx) -> Result<SynthesizeOutcome, Syn
         stream: false,
         tools: None,
         chat_template_kwargs: None,
+        tool_choice: None,
+        guided_decoding_backend: None,
     };
     let adapter =
         execlaw_model_adapter::adapter_for(execlaw_model_adapter::ModelFamily::detect(&model));
@@ -256,6 +258,11 @@ pub async fn finalize_report(
         path: att_path.clone(),
         sha256: sha,
         received_at: chrono::Utc::now().timestamp(),
+        // Research-pipeline PDFs surface as `state_artifacts` with
+        // their own `filename`; the parallel `state_attachments` row
+        // points at the same blob but its filename comes from the
+        // artifact projection layer, not from here.
+        filename: None,
     };
     let db_for_task = db.clone();
     tokio::task::spawn_blocking(move || AttachmentStore::new(&db_for_task).insert(&row))

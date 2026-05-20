@@ -210,6 +210,22 @@ export interface MessageView {
 export interface MessageAttachment {
     id: string;
     mime: string;
+    /**
+     * 2026-05-18 — populated server-side from
+     * `state_attachments.filename`, with a derived fallback for
+     * legacy rows. Required by MessageStream's file-chip render
+     * path so non-image attachments (CSV, PDF, JSON, etc.) show
+     * the operator-uploaded name + a Download link instead of
+     * an `<img>` that fails to load.
+     */
+    filename?: string | null;
+    /**
+     * 2026-05-18 — blob size in bytes, used by the file-chip
+     * "data.csv (5.2 KB)" display. 0 means the size lookup
+     * failed (the server returns 0 on stat failure rather than
+     * failing the whole list-messages call).
+     */
+    size_bytes?: number;
 }
 
 export interface MessagesListResponse {
@@ -314,6 +330,15 @@ export interface SendMessageRequest {
 export interface InlineAttachment {
     mime: string;
     data_url: string;
+    /**
+     * 2026-05-18 — original filename from the OS file picker.
+     * Required by the server for non-image attachments (CSV / JSON /
+     * PDF / etc.) so the python-sandbox sidecar can hydrate the
+     * file at `/work/<convo>/uploads/<filename>` under its
+     * operator-chosen name. Optional for images — vision content
+     * doesn't surface filenames to the model.
+     */
+    filename?: string;
 }
 
 export interface SendMessageResponse {
@@ -478,6 +503,13 @@ export interface PluginSummary {
     /// renders a settings page for (today: any [[oauth_accounts]]).
     /// Drives the gear icon on the Plugins page row.
     has_settings_ui: boolean;
+    /// True when the plugin's manifest declares one or more
+    /// `[[services]]` entries (sidecar containers). The config page
+    /// uses this together with the preflight Docker check to
+    /// render a "Docker not available" warning on Apple-Silicon
+    /// hosts where the wizard skipped Docker but the plugin needs
+    /// it.
+    has_sidecars?: boolean;
     /// Operator-facing one-liner from `[plugin].description` in the
     /// manifest. The Plugins page row renders this under the title
     /// with a single-line ellipsis truncation. May be omitted by
@@ -583,6 +615,63 @@ export async function installPlugin(
         throw new ApiError(code, message, resp.status);
     }
     return (await resp.json()) as InstallPluginResponse;
+}
+
+// ---- /api/admin/plugins/bundled ----------------------------------
+
+/// One entry in the bundled-plugins listing — a ZIP that lives
+/// under `~/.execlaw/bundled-plugins/`. Populated either by the
+/// macOS .app's boot-time mirror (Contents/Resources/plugins/ →
+/// data dir) or by an operator dropping a ZIP into that directory
+/// by hand. The SPA renders these on the Plugins page so the
+/// operator can install with a single click instead of finding +
+/// uploading the file.
+export interface BundledPlugin {
+    file: string;
+    plugin_id: string | null;
+    version: string | null;
+    description?: string | null;
+    size_bytes: number;
+    /// True when a plugin with this `plugin_id` is already
+    /// installed (regardless of version). Drives the SPA's
+    /// button label (Install vs Reinstall / Upgrade).
+    already_installed: boolean;
+}
+
+export interface BundledPluginListResponse {
+    plugins: BundledPlugin[];
+}
+
+export async function listBundledPlugins(
+    tokenAccessor: () => string | null,
+): Promise<BundledPluginListResponse> {
+    return apiFetch<BundledPluginListResponse>(
+        "/api/admin/plugins/bundled",
+        {},
+        tokenAccessor,
+    );
+}
+
+/// Install a specific bundled ZIP by filename. The backend
+/// resolves it against `~/.execlaw/bundled-plugins/` and routes
+/// through the same staging + install pipeline as the upload path.
+/// Pass `ifExisting: "upgrade"` to replace an existing install
+/// with the same id; the default `"reject"` returns a 409 if
+/// there's a conflict so the SPA can prompt.
+export async function installBundledPlugin(
+    file: string,
+    tokenAccessor: () => string | null,
+    ifExisting: "reject" | "upgrade" = "reject",
+): Promise<InstallPluginResponse> {
+    const params = new URLSearchParams({ file });
+    if (ifExisting === "upgrade") {
+        params.set("if_existing", "upgrade");
+    }
+    return apiFetch<InstallPluginResponse>(
+        `/api/admin/plugins/install-bundled?${params.toString()}`,
+        { method: "POST" },
+        tokenAccessor,
+    );
 }
 
 // ---- /api/admin/hardware ------------------------------------------
@@ -1424,6 +1513,31 @@ export async function listSkills(
     return apiFetch<SkillListResponse>(
         `/api/admin/skills${qs}`,
         {},
+        tokenAccessor,
+    );
+}
+
+/// 2026-05-16 — manual skill creation from the Skills page's
+/// "New skill" button. Wraps the auto-capture / agent-driven paths
+/// that already existed by giving the operator a direct authoring
+/// surface. Controller-only server-side; mirrors `updateSkillBody`'s
+/// shape (description + body + optional frontmatter).
+export interface CreateSkillRequest {
+    name: string;
+    description: string;
+    body_md: string;
+    /// Optional JSON-encoded frontmatter. Server defaults to "{}" if
+    /// omitted, so the SPA can send `undefined` for the common case.
+    frontmatter_json?: string;
+}
+
+export async function createSkill(
+    req: CreateSkillRequest,
+    tokenAccessor: () => string | null,
+): Promise<SkillDetail> {
+    return apiFetch<SkillDetail>(
+        "/api/admin/skills",
+        { method: "POST", body: req },
         tokenAccessor,
     );
 }

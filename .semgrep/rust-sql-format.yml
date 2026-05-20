@@ -1,0 +1,99 @@
+# Semgrep rules for Rust SQL-construction patterns.
+#
+# Audit recommendation (2026-05): add a lint/grep rule for `format!` near
+# SQL verbs so a future contributor doesn't reintroduce a string-built
+# query path. The audit's review of the codebase found no obvious
+# injection sites today (`crates/core/src/config.rs`, `db.rs` use
+# `format!` only to interpolate a *closed enum* of table names — that
+# is safe). This file's job is to keep it that way.
+#
+# Severity is WARNING: findings surface in CI as advisories, not hard
+# failures. Reviewers eyeball each new hit. To silence a finding the
+# auditor has confirmed is safe (e.g. table name from a closed enum,
+# not user input), add a `// nosemgrep: rust-sql-format-interpolation`
+# comment on the line above the `format!` call.
+#
+# Run locally:
+#   semgrep --config .semgrep/rust-sql-format.yml crates/
+#
+# In CI: see .github/workflows/ci.yml's `semgrep` job.
+
+rules:
+  - id: rust-sql-format-interpolation
+    languages: [rust]
+    severity: WARNING
+    message: >
+      `format!` is being used to build a string that contains a SQL
+      verb (SELECT / INSERT / UPDATE / DELETE / REPLACE / MERGE / TRUNCATE)
+      AND a `{}` interpolation placeholder. Verify the interpolated
+      value is from a CLOSED ENUM of identifiers (table name from
+      `ConfigTable::name() -> &'static str` style), NOT user input.
+      Use `?N` positional / `:name` named parameters for any user-supplied
+      value. If safe, suppress with `// nosemgrep: rust-sql-format-interpolation`
+      on the line above and a one-line reason.
+    paths:
+      include:
+        - "**/crates/**/*.rs"
+      exclude:
+        # Test files frequently build SQL strings for fixture seeding
+        # using the same format! pattern. We don't ship test code; the
+        # production constraint is what matters. (Anchored with `**/`
+        # to comply with semgrepignore v2 — see the deprecation warning
+        # semgrep prints without the prefix.)
+        - "**/crates/**/tests/**"
+        - "**/crates/**/benches/**"
+        - "**/*_test.rs"
+        - "**/tests.rs"
+    patterns:
+      - pattern-either:
+          - pattern: format!("$SQL", ...)
+          - pattern: format!("$SQL")
+      - metavariable-regex:
+          metavariable: $SQL
+          # Case-SENSITIVE on purpose. Project convention is uppercase
+          # SQL keywords (`SELECT … FROM …`), and every real SQL site
+          # in the codebase follows it. Dropping the previous `(?i)`
+          # flag means error-message `format!`s like
+          # `format!("delete user: {e}")` or
+          # `format!("mcp insert: {e}")` — which contain a lowercase
+          # SQL verb purely by coincidence — stop tripping the lint.
+          # The companion `rust-rusqlite-format-arg` rule below stays
+          # case-insensitive (and pattern-anchored on rusqlite calls)
+          # so lowercase SQL that actually lands in `execute(...)` /
+          # `query(...)` is still caught.
+          regex: '.*\b(SELECT|INSERT|UPDATE|DELETE|REPLACE|MERGE|TRUNCATE)\b.*\{.*\}.*'
+
+  # Variant: catch the case where the formatted string is passed
+  # directly to a SQL-execution method. Independent rule so the
+  # message can be more specific — "this format! lands in
+  # rusqlite::Connection::{execute,query,query_row,prepare}, which
+  # IS a SQL string."
+  - id: rust-rusqlite-format-arg
+    languages: [rust]
+    severity: WARNING
+    message: >
+      A `format!` value is being passed directly into a rusqlite SQL
+      method (`execute`, `query`, `query_row`, `query_map`, `prepare`,
+      `execute_batch`). Even when the interpolated value comes from a
+      closed enum, prefer building the SQL once at startup or using
+      `?` parameters. If unavoidable, add a `// nosemgrep:
+      rust-rusqlite-format-arg` comment with a one-line justification
+      (e.g. "table name from ConfigTable enum, closed set, never user
+      input").
+    paths:
+      include:
+        - "**/crates/**/*.rs"
+      exclude:
+        - "**/crates/**/tests/**"
+        - "**/crates/**/benches/**"
+        - "**/*_test.rs"
+        - "**/tests.rs"
+    patterns:
+      - pattern-either:
+          - pattern: $CONN.execute(&format!(...), ...)
+          - pattern: $CONN.execute(&format!(...))
+          - pattern: $CONN.execute_batch(&format!(...))
+          - pattern: $CONN.query(&format!(...), ...)
+          - pattern: $CONN.query_row(&format!(...), ...)
+          - pattern: $CONN.query_map(&format!(...), ...)
+          - pattern: $CONN.prepare(&format!(...))

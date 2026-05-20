@@ -1,0 +1,142 @@
+[plugin]
+id = "python-sandbox"
+name = "Python Sandbox"
+version = "0.1.0"
+description = """Persistent per-conversation Python execution sandbox. One \
+container hosting a Jupyter Kernel Gateway with kernel-per-conversation. \
+Pre-installed: pandas, polars, duckdb, pyarrow, numpy, openpyxl, ipython, \
+httpx. Files in /work/<convo>/uploads are hydrated from conversation \
+attachments (read-only); files written to /work/<convo>/outputs are \
+auto-published as conversation artifacts. Plotting is delegated to the \
+host's chart.render built-in — matplotlib is intentionally NOT installed."""
+author = "execlaw"
+license = "Apache-2.0"
+
+# Single shared sidecar — the kernel gateway. Per-conversation kernels
+# are managed via the gateway's HTTP+WS API by the host's
+# `python_sandbox` Rust module (NOT by the sidecar supervisor). The
+# supervisor's only job here is to keep this one container healthy.
+[[services]]
+name = "kernel-gateway"
+image = "execlaw/python-sandbox-fast:0.1.0"
+ports = []
+
+# Per-conversation subdirs live at <state>/<convo_id>/{uploads,outputs}/.
+# Supervisor creates them on hydrate; container's kernels see them at
+# /work/<convo_id>/{uploads,outputs}/ through this single bind mount.
+[[services.mounts]]
+source = "state://work"
+target = "/work"
+read_only = false
+
+[services.sidecar]
+rpc_port = 8888
+# Gateway responds with the (possibly empty) kernel list as JSON.
+# Used by the supervisor for liveness probing.
+rpc_health_path = "/api/kernels"
+
+# ============================================================
+# Agent-callable tools — all host_implemented = true. The host's
+# `python_sandbox` Rust module owns dispatch: it manages per-
+# conversation kernel ids, dials the gateway via HTTP+WS, parses
+# MIME bundles from iopub messages, and attaches `created_files`
+# from the supervisor's /work/<convo>/outputs/ watcher.
+#
+# Trust floor = Controller across the board. Python execution is
+# high-leverage — outsiders in a mixed-trust thread can't trigger
+# `python.execute` to crypto-mine or fork-bomb the host. Operators
+# can relax this per-conversation via plugin settings (v1.1).
+# ============================================================
+
+[[tools]]
+name = "python.execute"
+host_implemented = true
+trust_floor = "Controller"
+latency = "high"
+schema = "schemas/python.execute.json"
+description = """Execute Python in a persistent per-conversation sandbox. \
+State (variables, dataframes, imports) survives across turns until the \
+kernel is idle-evicted (~15 min of no executes).
+
+Pre-installed: pandas, polars, duckdb, pyarrow, numpy, openpyxl, \
+ipython, httpx. Cannot pip install additional packages.
+
+Filesystem convention:
+  /work/uploads/  read-only. Files the user uploaded, with original \
+filenames.
+  /work/outputs/  write user-facing results HERE. Any file appearing in \
+this directory is auto-published as a downloadable conversation artifact.
+  /work/          scratch space, invisible to the user.
+
+Charts: do NOT use matplotlib (not installed). Compute the data with \
+pandas/polars/duckdb, then call chart.render with a Vega-Lite spec.
+
+Use for non-trivial computation, data analysis, file inspection, \
+statistical work, structured-data transformation. Do NOT use for \
+simple arithmetic, definitions, or questions answerable from general \
+knowledge.
+
+Args: { code: string (multi-line Python ok), timeout_ms?: int (default \
+30000, max 600000) }.
+Returns: { outputs: [{ mime_type, data }], execution_count, \
+duration_ms, status: "ok"|"error"|"timeout", \
+created_files?: [{ name, size, mime, attachment_id }] }."""
+
+[[tools]]
+name = "python.reset"
+host_implemented = true
+trust_floor = "Controller"
+latency = "low"
+schema = "schemas/python.reset.json"
+description = """Soft-reset the conversation's Python kernel — clears \
+all variables, imports, and module state without restarting the container. \
+Use when prior kernel state is stale, wrong, or interfering with new work. \
+Files in /work/uploads/ and /work/outputs/ are NOT affected. Args: {}. \
+Returns: { ok: true }."""
+
+[[tools]]
+name = "python.interrupt"
+host_implemented = true
+host_internal = true
+trust_floor = "Controller"
+latency = "low"
+schema = "schemas/python.interrupt.json"
+description = """Host-internal: send a KeyboardInterrupt to a currently- \
+executing Python cell. Driven by the SPA's "stop" button while a cell is \
+running; agents normally don't call this directly (a long-running \
+execute will return with status=timeout when timeout_ms elapses). \
+Args: {}. Returns: { ok: true }."""
+
+[[tools]]
+name = "python.list_files"
+host_implemented = true
+trust_floor = "Controller"
+latency = "low"
+schema = "schemas/python.list_files.json"
+description = """List the current contents of /work/uploads/ and \
+/work/outputs/ for this conversation. Cheap; does no kernel work. \
+Useful after idle eviction to recover which files are still on disk \
+without re-running a `%ls`. Args: {}. Returns: { uploads: [{ name, \
+size, mime }], outputs: [{ name, size, mime }] }."""
+
+# Runtime tier is `script` with a stub main.rhai because every tool
+# is host_implemented = true. The host registers dispatch directly;
+# this script exists only to satisfy the manifest validator and to
+# carry future admin-route handlers (v1.1: per-conversation resource
+# limits, optional network egress allowlist).
+[runtime]
+tier = "script"
+source = "main.rhai"
+
+# 2026-05-18 — SPA settings page. The host's plugin-discovery sets
+# `has_settings_ui = true` whenever `[[ui_panels]]` is non-empty,
+# which surfaces a gear icon next to the plugin row in
+# /settings/plugins. Click → DynamicPluginPanel fetches
+# `panel.js` from `GET /api/admin/plugins/python-sandbox/ui/panel.js`
+# (authenticated; Controller-only) and dynamic-imports it at runtime.
+# The panel source lives at `ui/panel.tsx`; build via:
+#   node scripts/build-plugin-ui.mjs python-sandbox
+# The produced `ui/panel.js` ships inside the dist ZIP.
+[[ui_panels]]
+mount = "admin/plugins/python-sandbox"
+entry = "ui/panel.js"

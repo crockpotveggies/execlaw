@@ -18,189 +18,67 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use execlaw_core::backends::BackendPurpose;
-use execlaw_core::conversation::{
-    ConversationKind, ConversationRow, ConversationStore, Modality, Phase, ThreadSummary,
-};
+use execlaw_core::conversation::{ConversationStore, Phase};
 use execlaw_core::events::{
-    EventKind, EventLog, EventRecord, PendingEvent, ToolResultPayload, ToolUsePayload,
+    EventKind, EventRecord, PendingEvent, ToolResultPayload, ToolUsePayload,
 };
 use execlaw_core::ids::{ConversationId, EventSeq};
 use execlaw_core::principal::{Principal, PrincipalStore, TrustLevel as CoreTrustLevel};
 use execlaw_inference_api::ModelId;
 use execlaw_policy::trust::{TrustLevel, TurnPolicyInput, evaluate_turn};
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::events::UiEvent;
 use crate::state::AppState;
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct SendMessageRequest {
-    pub text: String,
-    /// Optional override — defaults to the controller's principal id.
-    pub sender_principal_id: Option<String>,
-    /// 2026-04-28 — when true, run the turn against inference but
-    /// skip every persistent write: no event-log rows, no
-    /// conversation-table upsert, no outbox, no display-name
-    /// generation. The SPA owns the transcript and ships the
-    /// running history in `prior_messages` on each turn.
-    /// Streaming token deltas + phase events still broadcast over
-    /// the WS bus keyed on `conversation_id`, matching the regular
-    /// chat UX exactly. Default false.
-    #[serde(default)]
-    pub incognito: bool,
-    /// 2026-04-28 — running transcript for incognito turns. The
-    /// server reads this in place of replaying the event log when
-    /// `incognito = true`. Ordered oldest-first; excludes the new
-    /// user message in `text` (server appends that itself before
-    /// calling the model). Each entry's `role` is `"user"` or
-    /// `"assistant"`. Ignored when `incognito = false`.
-    #[serde(default)]
-    pub prior_messages: Vec<IncognitoTurnMessage>,
-    /// IANA timezone name (e.g. `America/Los_Angeles`) the SPA
-    /// browser detected via `Intl.DateTimeFormat().resolvedOptions().timeZone`.
-    /// Stamped into the per-turn context prose so the agent
-    /// interprets bare clock times ("create an event at 6pm") in
-    /// the operator's local zone instead of UTC. Optional because
-    /// non-browser inbounds (Signal, future SMS / email) don't
-    /// supply one; those fall back to UTC and the agent should
-    /// ask if a clock time is ambiguous.
-    #[serde(default)]
-    pub timezone: Option<String>,
-    /// 2026-05-15 — inline image attachments. Each entry is a
-    /// `data:image/...;base64,...` URL the SPA produced from the
-    /// operator's file picker. The server decodes, content-
-    /// addresses the bytes under `<data_dir>/blobs/`, and inserts a
-    /// `state_attachments` row scoped to the conversation. The
-    /// resulting attachment ids are stamped onto the `user_msg`
-    /// event payload so history replay can re-encode them as
-    /// `image_url` content parts when calling a vision-capable
-    /// model (Qwen3-VL / Qwen3.6 / LLaVA / Pixtral, etc).
-    ///
-    /// Per-image data URL is capped at ~20 MiB after base64 decode;
-    /// oversize images are rejected with `attachment_too_large`.
-    /// The SPA should pre-resize before send (1024-ish px on the
-    /// long edge is enough for nearly every vision model and keeps
-    /// the request comfortably under the cap).
-    #[serde(default)]
-    pub attachments: Vec<InlineAttachmentRequest>,
-    /// 2026-05-15 — names of skills the operator picked from the
-    /// composer's `+` menu to apply to THIS turn only. The server
-    /// resolves each name to its current stable/trial body, prepends
-    /// the bodies as `<skill name="...">...</skill>` blocks above
-    /// the user text, and ships the combined string to the model.
-    /// The original (un-prepended) text remains in
-    /// `UserMessagePayload.text` so subsequent turns don't keep
-    /// re-seeing the skill body in history. The applied names land
-    /// on `UserMessagePayload.applied_skill_names` so the SPA can
-    /// render a "applied: foo, bar" chip on the message bubble.
-    ///
-    /// Validation:
-    ///   * Unknown / archived skill name → 404 `skill_not_found`.
-    ///   * Total resolved body bytes > [`MAX_PREPEND_SKILL_BYTES`]
-    ///     → 413 `skill_prepend_too_large` (prevents ballooning the
-    ///     request past the model's context window in one shot).
-    ///
-    /// Empty / absent for every non-web inbound path; transports
-    /// don't surface a picker UI today.
-    #[serde(default)]
-    pub skill_names: Vec<String>,
-}
+mod attachments;
+mod helpers;
+mod prompt;
+mod types;
 
-/// Hard cap on the total bytes of resolved skill bodies prepended
-/// onto a single turn. Kept generous (32 KiB ≈ 8000 tokens) so a
-/// few medium-sized skills fit comfortably; exceeded only when the
-/// operator picks several large skills at once. The cap is checked
-/// AFTER resolving each name to its body — names alone don't count.
-const MAX_PREPEND_SKILL_BYTES: usize = 32 * 1024;
-
-/// One image attachment from the SPA composer. The `data_url` carries
-/// the bytes inline as a `data:` URL (`data:<mime>;base64,<bytes>`).
-/// The SPA encodes locally so the server doesn't need a separate
-/// upload endpoint for the common Phase-1 case.
-#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
-pub struct InlineAttachmentRequest {
-    /// IANA mime type. Restricted server-side to the image family
-    /// today (`image/png`, `image/jpeg`, `image/webp`, `image/gif`).
-    /// Non-image mime types fail with `attachment_mime_unsupported`.
-    pub mime: String,
-    /// `data:<mime>;base64,<bytes>` URL. The mime in this URL must
-    /// match the `mime` field above; mismatches fail with
-    /// `attachment_data_url_invalid`.
-    pub data_url: String,
-}
-
-#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
-pub struct IncognitoTurnMessage {
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SendMessageResponse {
-    pub conversation_id: String,
-    pub user_msg_seq: i64,
-    pub assistant_text: String,
-    pub assistant_seq: i64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct MessagesListResponse {
-    pub conversation_id: String,
-    pub messages: Vec<MessageView>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct MessageView {
-    pub seq: i64,
-    pub kind: String,
-    pub text: Option<String>,
-    pub actor: Option<String>,
-    pub committed_at: i64,
-    /// Originating transport for this message (signal / email /
-    /// voice / sms). Set on user_msg + model_turn events that
-    /// flowed through a transport bridge; absent for the default
-    /// web path. The SPA reads this to render a per-message
-    /// channel icon in the chat view so the operator can tell at
-    /// a glance "this came in via Signal" / "the agent replied
-    /// via Signal".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub channel_origin: Option<String>,
-    /// 2026-05-15 — image attachments included on a user_msg via
-    /// the composer's `+` menu. Empty (and serialised as absent)
-    /// for every other message kind. The SPA renders each entry
-    /// as an inline `<img src="/api/attachments/{id}">` above the
-    /// text bubble.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attachments: Vec<MessageAttachmentView>,
-    /// 2026-05-15 — names of skills the operator picked from the
-    /// composer's `+` menu when sending this `user_msg`. The skill
-    /// bodies were prepended onto the message text server-side
-    /// before the model saw them; the SPA strips those `<skill
-    /// name="...">...</skill>` blocks out of `text` for display
-    /// and renders this list as a chip under the bubble. Empty for
-    /// every non-user_msg kind and for user_msg events sent without
-    /// any skill selection.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub applied_skill_names: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct MessageAttachmentView {
-    pub id: String,
-    pub mime: String,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct ListQuery {
-    /// Return events with `seq > before` in ascending order. Default 0
-    /// (return everything).
-    #[serde(default)]
-    pub before: i64,
-    /// Hard cap — default 200.
-    #[serde(default)]
-    pub limit: Option<i64>,
-}
+// 2026-05-16 — types lifted into `chats/types.rs`. Re-exported
+// here so external callers (and the OpenAPI generator) keep
+// resolving them at `crate::chats::X`. The persisted-payload
+// structs stay crate-private; they're the chats module's contract
+// with the event log, not part of the public surface.
+pub use prompt::{GroupTurnContext, build_turn_context_prose, resolve_group_turn_context};
+pub use types::{
+    IncognitoTurnMessage, InlineAttachmentRequest, ListQuery, MessageAttachmentView, MessageView,
+    MessagesListResponse, PatchThreadRequest, PatchThreadResponse, SendMessageRequest,
+    SendMessageResponse, ThreadListResponse, ThreadSummaryView,
+};
+// 2026-05-16 — attachment helpers split out. Re-exports are
+// crate-private; `generic_inbound` is in the same crate so
+// `pub(crate)` is sufficient (and avoids the `pub use` error on a
+// `pub(crate)` item).
+pub(crate) use attachments::{
+    build_attached_files_block, encode_attachments_as_data_urls, extract_applied_skill_names,
+    extract_attachment_ids, extract_channel_origin, extract_text, fetch_data_ref,
+    hydrate_message_attachments, persist_inbound_attachments,
+};
+pub(crate) use prompt::{assemble_system_prompt, build_tool_routing_prose, humanise_tool_call};
+// 2026-05-16 — small utilities split out into `chats/helpers.rs`.
+// `ensure_conversation_for` and `apply_auto_display_name` are
+// consumed by `crate::generic_inbound`; `rewrite_url_for_container`
+// is consumed by callers outside chats (cli). Everything else is
+// crate-internal.
+pub(crate) use helpers::{
+    BusPhaseObserver, IdlePhaseGuard, ensure_conversation, err_500, event_log,
+    refresh_conversation_kind, resolve_skill_prepend, rewrite_url_for_container,
+    sanitize_generated_title,
+};
+// `rewrite_url_with_alias` is consumed by this file's in-line test
+// module via `super::rewrite_url_with_alias(...)`. Gated to test
+// builds so the lib build path sees zero unused-import warnings.
+#[cfg(test)]
+pub(crate) use helpers::rewrite_url_with_alias;
+pub use helpers::{apply_auto_display_name, ensure_conversation_for};
+use types::{ColdContactPayload, RealModelTurnPayload, StubModelTurnPayload, UserMessagePayload};
+// Consumed by this file's in-line test module via
+// `super::MAX_PREPEND_SKILL_BYTES`. Gated to test builds so the lib
+// build path sees zero unused-import warnings.
+#[cfg(test)]
+use types::MAX_PREPEND_SKILL_BYTES;
 
 /// `POST /api/chats/:id/messages`
 #[utoipa::path(
@@ -235,27 +113,28 @@ pub async fn send_message(
 
     let cid = ConversationId::from(conversation_id.as_str());
 
-    // 2026-05-15 — decode + persist inline image attachments BEFORE
-    // identity resolution / policy. The attachment rows are scoped
-    // to the conversation id and end up referenced from the
-    // user_msg event payload; subsequent history hydration re-loads
-    // the bytes and emits them as OpenAI vision content parts.
-    // Persisting up front (vs. inside a turn helper) means every
-    // dispatch path — stub / real / runner / tool-capable —
-    // receives the same `Vec<String>` of attachment ids.
+    // 2026-05-16 — fix #6: validate + decode inline attachments up
+    // front so a malformed payload still 400s fast, but DEFER the
+    // blob + `state_attachments` row write until after every
+    // identity / Blocked / UnknownPending / Rule-of-Two early-return
+    // gate has passed. Pre-fix the persistence happened upfront, so a
+    // turn that the policy engine later dropped (or that we parked
+    // for cold-contact admission) left orphan blob files + rows
+    // behind. The decoded bytes live in this stack frame until the
+    // commit point right before dispatch.
     //
-    // Incognito turns skip persistence: the SPA owns the running
-    // transcript and the data URLs can be encoded straight into
-    // the LLM call without a DB write (incognito invariant: no
-    // persistent state).
-    let persisted_attachments: Vec<String> = if req.incognito || req.attachments.is_empty() {
-        Vec::new()
-    } else {
-        match persist_inline_attachments(&state, &cid, &req.attachments) {
-            Ok(ids) => ids,
-            Err(err) => return err.into_response(),
-        }
-    };
+    // Incognito turns never persist: the SPA owns the running
+    // transcript and the data URLs are encoded straight into the LLM
+    // call (incognito invariant: no persistent state).
+    let decoded_attachments: Vec<crate::chats::attachments::DecodedAttachment> =
+        if req.incognito || req.attachments.is_empty() {
+            Vec::new()
+        } else {
+            match crate::chats::attachments::decode_inline_attachments(&req.attachments) {
+                Ok(d) => d,
+                Err(err) => return err.into_response(),
+            }
+        };
 
     // 2026-05-15 — operator-picked skills (composer `+` menu, second
     // item). Resolve every name to its current body and build the
@@ -400,7 +279,20 @@ pub async fn send_message(
     //   TurnExecutor path (supports multi-round tool_call loop with
     //   ChainedToolDispatch routing to the plugin host).
     let text_for_broadcast = req.text.clone();
-    let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
+    // `all_tools` returns plugin-owned tools only — built-ins are in
+    // a separate map (see HookRegistry::all_builtins). On a fresh
+    // install with no plugins installed (e.g. the Apple-Silicon
+    // wizard finishing without manually adding Signal/Discord/etc.)
+    // a check that only consults `all_tools()` returns empty even
+    // when the agent has 28+ core built-in tools available, sending
+    // the operator straight into `run_real_turn` with `tools: None`
+    // and a model that responds "I'll fetch that for you" without
+    // ever emitting a tool call. Combine both so the tool-capable
+    // path engages whenever there's ANY tool surface the agent can
+    // call.
+    let registry_for_tools = state.plugin_host.registry();
+    let has_plugin_tools =
+        !registry_for_tools.all_tools().is_empty() || !registry_for_tools.all_builtins().is_empty();
     let caller_caps: Vec<String> = policy
         .capability_set
         .iter()
@@ -471,13 +363,7 @@ pub async fn send_message(
     // for tests that exercise the in-process path directly.
     let runner_eligible = state.runner_supervisor.is_some() && inference_for_turn.is_some();
     let runner_routed = if runner_eligible {
-        match resolve_chat_group(&state, &cid, &principal).await {
-            Ok(group_id) => Some(group_id),
-            Err(e) => {
-                tracing::warn!(error = %e, "runner routing skipped: group resolve failed");
-                None
-            }
-        }
+        resolve_runner_routed_group(&state, &cid, &principal).await
     } else {
         None
     };
@@ -494,6 +380,27 @@ pub async fn send_message(
         &cid,
         crate::group_addressing::AddressedReason::EligibilityBypass,
     );
+
+    // 2026-05-16 — fix #6 commit point. Every identity / Blocked /
+    // UnknownPending / Rule-of-Two / require_approval gate above has
+    // already returned (with attachment bytes still in-memory only).
+    // From here the turn is going to dispatch, so we can safely
+    // write the blobs + `state_attachments` rows. Failure surfaces
+    // as a 500 — there's nothing useful the caller can do besides
+    // retry.
+    let persisted_attachments: Vec<String> = if decoded_attachments.is_empty() {
+        Vec::new()
+    } else {
+        match crate::chats::attachments::commit_decoded_attachments(
+            &state,
+            &cid,
+            &decoded_attachments,
+        ) {
+            Ok(ids) => ids,
+            Err(err) => return err.into_response(),
+        }
+    };
+    drop(decoded_attachments);
 
     let (user_msg_seq, assistant_text, assistant_seq) =
         match (inference_for_turn, runner_routed.as_deref()) {
@@ -513,6 +420,7 @@ pub async fn send_message(
                     cancel_flag: cancel_flag.clone(),
                     caller_caps: caller_caps.clone(),
                     caller_trust: sender_trust,
+                    planner_executor: policy.planner_executor,
                     // send_message hits this from the web-chat path;
                     // no transport-bridge here.
                     inbound_channel_origin: None,
@@ -544,6 +452,13 @@ pub async fn send_message(
                 req.sender_principal_id.clone(),
                 caller_caps.clone(),
                 sender_trust,
+                spotlight_content,
+                // `use_tool_path` is `has_plugin_tools &&
+                // !policy.planner_executor`, so this arm only fires
+                // when the split is OFF. Pass `false` rather than
+                // `policy.planner_executor` to be explicit about the
+                // invariant.
+                false,
                 None,
                 req.timezone.as_deref(),
                 group_context_for_turn.clone(),
@@ -873,7 +788,7 @@ async fn run_real_turn(
     // No routing prose: this path doesn't ship a tool catalogue.
     // Turn context still helps — even a no-tool answer benefits
     // from "what time is it" awareness.
-    let turn_context = build_turn_context_prose(
+    let mut turn_context = build_turn_context_prose(
         chrono::Utc::now(),
         cid.as_str(),
         sender_principal_id.as_deref(),
@@ -882,6 +797,15 @@ async fn run_real_turn(
         caller_timezone,
         group_context.as_ref(),
     );
+    // 2026-05-18 — Phase C of the python-sandbox attach-file UX:
+    // tell the agent about any non-image attachments on this
+    // conversation so it knows to reach for python.execute against
+    // /work/uploads/<filename>. Best-effort — query failure is
+    // logged + skipped.
+    if let Some(block) = build_attached_files_block(state, cid) {
+        turn_context.push_str("\n\n");
+        turn_context.push_str(&block);
+    }
     let composed_system = assemble_system_prompt(
         &state.db,
         Some(cid.as_str()),
@@ -1035,6 +959,8 @@ async fn run_real_turn(
         chat_template_kwargs: Some(serde_json::json!({
             "enable_thinking": reasoning_enabled,
         })),
+        tool_choice: None,
+        guided_decoding_backend: None,
     };
     let adapter = execlaw_model_adapter::adapter_for(execlaw_model_adapter::ModelFamily::detect(
         &resolved_model_id,
@@ -1158,6 +1084,55 @@ async fn run_real_turn(
 /// principals)` directly when they land. The web case maps every
 /// controller-initiated chat to the same `(web, {controller})`
 /// group.
+/// 2026-05-16 — resolve which principal_group's runner a SPA
+/// send should execute on.
+///
+/// Lookup order:
+///
+///   1. **Conversation's bound `principal_group_id`** — when the
+///      conversation is already linked to a transport group (a
+///      Signal group, WhatsApp group, controller's Signal-DM
+///      thread, etc.), the turn runs on THAT group's runner. The
+///      Controller is one participant; the runner identity
+///      belongs to the conversation, not to the Controller. Pre-
+///      fix this path always returned the Controller's own group,
+///      so a Controller reply into a 5-person Signal group thread
+///      executed on the Controller's private runner — comingling
+///      KV cache, tool side-effects, and event traces with the
+///      Controller's other threads. Symmetric with the inbound
+///      side in `dispatch_external_turn`: both directions of a
+///      Signal-group thread now converge on the SAME runner.
+///
+///   2. **Fall back to `resolve_chat_group`** — fresh web-only
+///      conversation with no binding yet. `resolve_chat_group`
+///      mints + binds a Controller-only principal_group, so the
+///      next turn on this conversation hits step 1's fast path.
+///
+/// Returns `None` only when both lookups fail (DB error). Callers
+/// that get `None` should fall through to the in-process turn
+/// path rather than failing the request.
+pub(crate) async fn resolve_runner_routed_group(
+    state: &AppState,
+    cid: &ConversationId,
+    principal: &execlaw_core::principal::Principal,
+) -> Option<String> {
+    use execlaw_core::principal_groups::PrincipalGroupStore;
+    if let Some(g) = PrincipalGroupStore::new(&state.db)
+        .principal_group_id_for(cid.as_str())
+        .ok()
+        .flatten()
+    {
+        return Some(g);
+    }
+    match resolve_chat_group(state, cid, principal).await {
+        Ok(group_id) => Some(group_id),
+        Err(e) => {
+            tracing::warn!(error = %e, "runner routing skipped: group resolve failed");
+            None
+        }
+    }
+}
+
 async fn resolve_chat_group(
     state: &AppState,
     cid: &ConversationId,
@@ -1227,6 +1202,14 @@ pub(crate) struct RunnerTurnCtx<'a> {
     pub cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub caller_caps: Vec<String>,
     pub caller_trust: TrustLevel,
+    /// §9.2 planner/executor split — when `true` (i.e. policy fires
+    /// the split because `effective_trust < KnownTrusted`), the
+    /// runner is shipped an EMPTY `tool_catalog`. A prompt-injected
+    /// executor can't exfiltrate via `tool_use` args when there are
+    /// no tool_use slots available; stripping tools is the load-
+    /// bearing invariant of the split. Mirrors `use_tool_path = false`
+    /// in the in-process branch.
+    pub planner_executor: bool,
     /// Originating transport when the turn was triggered by an
     /// inbound transport message (signal / email / etc.). Stamped
     /// into the user_msg + model_turn payloads so the SPA can
@@ -1267,6 +1250,363 @@ pub(crate) struct RunnerTurnCtx<'a> {
     pub applied_skill_names: Vec<String>,
 }
 
+/// Build the `tool_catalog` the runner advertises to the model for one
+/// turn. Filtering rules (mirrors the dispatch-time gates so the model
+/// only ever sees a tool it could actually invoke):
+///
+/// 1. `planner_executor = true` (effective_trust < KnownTrusted) →
+///    EMPTY catalog. §9.2 invariant: untrusted planner has no tool
+///    slots, so a prompt-injected executor can't exfiltrate via
+///    tool_use args.
+/// 2. `config_tool_access` — `caller_trust` must be in `allowed_classes`,
+///    `enabled = true`, `removed_at IS NULL`. A missing row is
+///    treated as "allow" (boot-transient default, same as
+///    `ChainedToolDispatch::check_access`). DB error on lookup
+///    excludes the tool (fail-closed).
+/// 2026-05-16 — fix #P2 (Codex review): bundles the filtered tool
+/// declarations with the categorized name lists the routing-prose
+/// builder needs, so callers never derive prose from the
+/// *unfiltered* registry while the catalog is filtered (which leaks
+/// tool names to the model that policy has removed).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RunnerToolView {
+    /// Tool declarations to ship in `TurnRequest.tool_catalog`.
+    pub declarations: Vec<execlaw_inference_api::ToolDeclaration>,
+    /// Names of built-in tools that survived filtering. Feeds the
+    /// routing-prose block in the system prompt.
+    pub builtin_names: Vec<String>,
+    /// Names of agent-callable plugin tools that survived filtering.
+    pub plugin_tool_names: Vec<String>,
+}
+
+/// 3. Plugin tools: `caller_caps` must be a superset of
+///    `required_capabilities`, with `"*"` as a wildcard. Same rule
+///    the plugin host's `call_tool` enforces at dispatch.
+/// 4. Built-in tools: every `Capability` the descriptor declares is
+///    cross-checked against `caller_caps` via
+///    [`execlaw_policy::trust::check_builtin_capability`]. Pre-fix
+///    built-ins were advertised to the model regardless of caller
+///    caps (the dispatch gate from fix #4 would deny at call time),
+///    so the model burned prompt tokens on tool schemas it could
+///    never invoke. Filtering here keeps the model's view aligned
+///    with what dispatch will let through.
+///
+/// Returns a [`RunnerToolView`] carrying the declarations the runner
+/// receives PLUS the categorized name lists the routing-prose
+/// builder needs. Single source of truth for "what does the model
+/// see this turn" — pre-fix the catalog was filtered but the routing
+/// prose was generated from the unfiltered registry, so the system
+/// prompt told the model about tools the catalog had stripped.
+pub(crate) fn build_runner_tool_catalog(
+    db: &execlaw_core::Database,
+    plugin_host: &execlaw_plugin_host::PluginHost,
+    caller_trust: TrustLevel,
+    caller_caps: &[String],
+    planner_executor: bool,
+) -> RunnerToolView {
+    use execlaw_core::tool_access::ToolAccessStore;
+    use execlaw_inference_api::ToolDeclaration;
+
+    if planner_executor {
+        return RunnerToolView::default();
+    }
+
+    let access_store = ToolAccessStore::new(db);
+    let caller_trust_tag = caller_trust.as_str();
+    let caller_has_wildcard = caller_caps.iter().any(|c| c == "*");
+
+    let access_allows = |tool_name: &str| -> bool {
+        match access_store.get(tool_name) {
+            Ok(None) => true,
+            Ok(Some(row)) => {
+                row.enabled
+                    && row.removed_at.is_none()
+                    && row.allowed_classes.iter().any(|c| c == caller_trust_tag)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "chats::run_runner_turn",
+                    tool = %tool_name,
+                    error = %e,
+                    "tool_access lookup failed; excluding tool from catalog",
+                );
+                false
+            }
+        }
+    };
+
+    let mut decls: Vec<ToolDeclaration> = Vec::new();
+    let mut builtin_names: Vec<String> = Vec::new();
+    let mut plugin_tool_names: Vec<String> = Vec::new();
+    // Pre-build the `&[&str]` view of `caller_caps` once; the cap
+    // helper takes `&[&str]` and we'd otherwise rebuild this on
+    // every iteration.
+    let caps_slice: Vec<&str> = caller_caps.iter().map(|s| s.as_str()).collect();
+    for t in plugin_host.registry().all_builtins().iter() {
+        let d = t.descriptor();
+        if !access_allows(&d.name) {
+            continue;
+        }
+        // Capability filter (Codex P2): drop the tool from the
+        // catalog when ANY of its declared `Capability` entries
+        // maps to a policy tag the caller doesn't hold. Wildcard
+        // `"*"` (Controller) short-circuits inside the helper.
+        let mut caps_ok = true;
+        for c in &d.capabilities {
+            if execlaw_policy::trust::check_builtin_capability(*c, &caps_slice).is_err() {
+                caps_ok = false;
+                break;
+            }
+        }
+        if !caps_ok {
+            continue;
+        }
+        builtin_names.push(d.name.clone());
+        decls.push(ToolDeclaration::function(
+            d.name.clone(),
+            d.description.clone(),
+            d.schema.clone(),
+        ));
+    }
+    for t in plugin_host.registry().agent_callable_tools().iter() {
+        if !access_allows(&t.tool_name) {
+            continue;
+        }
+        if !caller_has_wildcard {
+            let caps_ok = t
+                .required_capabilities
+                .iter()
+                .all(|req| caller_caps.iter().any(|c| c == req));
+            if !caps_ok {
+                continue;
+            }
+        }
+        let description = t.description.clone().unwrap_or_else(|| {
+            format!(
+                "Plugin tool '{}' from '{}' (latency: {}). \
+                 The plugin manifest did not supply a description; \
+                 ask the operator to add one for better tool selection.",
+                t.tool_name, t.plugin_id, t.latency,
+            )
+        });
+        let schema = t
+            .schema_json
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+        plugin_tool_names.push(t.tool_name.clone());
+        decls.push(ToolDeclaration::function(
+            t.tool_name.clone(),
+            description,
+            schema,
+        ));
+    }
+    RunnerToolView {
+        declarations: decls,
+        builtin_names,
+        plugin_tool_names,
+    }
+}
+
+/// 2026-05-16 — Codex P4: build the `ChatMessage` history the runner
+/// receives from the conversation's event log. Mirrors
+/// [`execlaw_runner_local::turn::hydrate_messages`] (which is what
+/// the in-process executor uses), so the two paths see an identical
+/// projection — `UserMsg`, `ModelTurn` with attached `tool_calls`,
+/// and standalone `tool_result` messages keyed by `call_<ordinal>`.
+///
+/// Pre-fix this function emitted only `User` + `Assistant` text
+/// rows, dropping `ToolUse` / `ToolResult` events. A runner turn
+/// after a previous turn with tool calls then saw the
+/// user→assistant exchange but had no record of WHICH tools the
+/// agent had called, so re-asking the model "what did you find?"
+/// produced a hallucinated reconstruction instead of the actual
+/// tool output.
+///
+/// Truncation: groups events into "turn blocks" by `UserMsg`
+/// boundary, then drops oldest WHOLE turns until the total estimated
+/// token count fits `budget`. This preserves the assistant ↔
+/// tool_use/tool_result pairing — splitting a tool round off its
+/// assistant would leave the model with orphan `tool` messages.
+///
+/// Skips the just-appended `UserMsg` for the CURRENT turn (caller
+/// passes that as `TurnRequest.user_text` so the runner can
+/// spotlight-wrap it on the runner side).
+fn build_runner_history_messages(
+    history: &[execlaw_core::events::EventRecord],
+    current_user_seq: execlaw_core::ids::EventSeq,
+    spotlight: Option<&execlaw_policy::spotlighting::Spotlight>,
+    budget: u32,
+) -> Vec<execlaw_inference_api::ChatMessage> {
+    use execlaw_core::events::{EventKind, ToolResultPayload, ToolUsePayload};
+    use execlaw_inference_api::{ChatMessage, ToolCall, ToolCallFunction};
+    // UserMessagePayload + the model-turn payloads live in
+    // `chats::types`; the canonical event encoding uses these.
+
+    // First pass: bucket events into "turn groups". A new group
+    // starts at every UserMsg; subsequent ToolUse/ToolResult/ModelTurn
+    // events attach to the open group. The CURRENT turn's UserMsg
+    // is skipped entirely (the runner gets it via
+    // `TurnRequest.user_text`).
+    struct TurnGroup<'a> {
+        events: Vec<&'a execlaw_core::events::EventRecord>,
+        approx_chars: usize,
+    }
+    let mut groups: Vec<TurnGroup<'_>> = Vec::new();
+    for ev in history.iter() {
+        match ev.kind {
+            EventKind::UserMsg => {
+                if ev.seq == current_user_seq {
+                    continue;
+                }
+                groups.push(TurnGroup {
+                    events: vec![ev],
+                    approx_chars: ev
+                        .decode_payload::<UserMessagePayload>()
+                        .ok()
+                        .map(|p| p.text.len())
+                        .unwrap_or(0),
+                });
+            }
+            EventKind::ModelTurn | EventKind::ToolUse | EventKind::ToolResult => {
+                if let Some(g) = groups.last_mut() {
+                    let payload_chars = match ev.kind {
+                        EventKind::ModelTurn => ev
+                            .decode_payload::<RealModelTurnPayload>()
+                            .ok()
+                            .map(|p| p.text.len())
+                            .or_else(|| {
+                                ev.decode_payload::<StubModelTurnPayload>()
+                                    .ok()
+                                    .map(|p| p.text.len())
+                            })
+                            .unwrap_or(0),
+                        EventKind::ToolUse => ev
+                            .decode_payload::<ToolUsePayload>()
+                            .ok()
+                            .map(|p| p.tool_name.len() + p.args_json.to_string().len())
+                            .unwrap_or(0),
+                        EventKind::ToolResult => ev
+                            .decode_payload::<ToolResultPayload>()
+                            .ok()
+                            .map(|p| match &p.outcome {
+                                Ok(v) => v.to_string().len(),
+                                Err(e) => e.len() + 16,
+                            })
+                            .unwrap_or(0),
+                        _ => 0,
+                    };
+                    g.events.push(ev);
+                    g.approx_chars = g.approx_chars.saturating_add(payload_chars);
+                }
+                // Otherwise: events before any UserMsg — ignore.
+            }
+            _ => {}
+        }
+    }
+
+    // Truncation: drop oldest whole groups until the total fits the
+    // budget. Token estimate = chars / 4 (rough Qwen tokenizer ratio,
+    // same heuristic as `history_budget::estimate_tokens`).
+    let budget_chars = (budget as usize).saturating_mul(4);
+    let mut total: usize = groups.iter().map(|g| g.approx_chars).sum();
+    let mut drop_from_front = 0usize;
+    while total > budget_chars && drop_from_front < groups.len() {
+        total = total.saturating_sub(groups[drop_from_front].approx_chars);
+        drop_from_front += 1;
+    }
+    let kept_groups = &groups[drop_from_front..];
+
+    // Second pass: materialise ChatMessages in OpenAI-compliant order.
+    //
+    // OpenAI's chat-completions schema requires every `tool` role
+    // message to be preceded by an `assistant` message whose
+    // `tool_calls` array contains the matching `tool_call_id`. The
+    // event log doesn't commit the intermediate assistant(tool_calls)
+    // message — only the final `ModelTurn` text-only response is
+    // logged per turn — so we synthesise one assistant-with-tool_calls
+    // per `ToolUse` event. The final `ModelTurn` then becomes a
+    // plain assistant message with no `tool_calls`.
+    //
+    // Pre-fix this mirrored `runner-local::hydrate_messages`, which
+    // buffers ToolUse events and dumps them all onto the final
+    // ModelTurn's `tool_calls` after the tool messages have already
+    // landed. That order is `[user, tool, assistant(tool_calls)]` —
+    // structurally invalid for OpenAI. vLLM with
+    // `--enable-auto-tool-choice` may reject it outright; otherwise
+    // the model sees "future tool calls" instead of "past ones" and
+    // confabulates.
+    //
+    // Loses the "parallel calls in one round" grouping (we emit one
+    // assistant message per call). Parallel calls are rare at the
+    // operator's temperature 0.3 setting, and the model still sees
+    // each call → result correctly.
+    let mut messages: Vec<ChatMessage> = Vec::new();
+    for g in kept_groups {
+        for ev in &g.events {
+            match ev.kind {
+                EventKind::UserMsg => {
+                    if let Ok(p) = ev.decode_payload::<UserMessagePayload>() {
+                        let text = match spotlight {
+                            Some(s) => s.wrap(&p.text),
+                            None => p.text,
+                        };
+                        messages.push(ChatMessage::user(text));
+                    }
+                }
+                EventKind::ToolUse => {
+                    if let Ok(p) = ev.decode_payload::<ToolUsePayload>() {
+                        let call = ToolCall {
+                            id: format!("call_{}", p.ordinal),
+                            kind: "function".into(),
+                            function: ToolCallFunction {
+                                name: p.tool_name,
+                                arguments: p.args_json.to_string(),
+                            },
+                        };
+                        // Synthetic assistant message that BEARS the
+                        // tool_call this ToolResult will match against.
+                        // Empty content per OpenAI convention for
+                        // tool-only assistant turns.
+                        let mut m = ChatMessage::assistant(String::new());
+                        m.tool_calls = vec![call];
+                        messages.push(m);
+                    }
+                }
+                EventKind::ToolResult => {
+                    if let Ok(p) = ev.decode_payload::<ToolResultPayload>() {
+                        let body = match &p.outcome {
+                            Ok(v) => v.to_string(),
+                            Err(e) => serde_json::json!({"error": e}).to_string(),
+                        };
+                        messages.push(ChatMessage::tool_result(
+                            format!("call_{}", p.ordinal),
+                            body,
+                        ));
+                    }
+                }
+                EventKind::ModelTurn => {
+                    let text = ev
+                        .decode_payload::<RealModelTurnPayload>()
+                        .ok()
+                        .map(|p| p.text)
+                        .or_else(|| {
+                            ev.decode_payload::<StubModelTurnPayload>()
+                                .ok()
+                                .map(|p| p.text)
+                        })
+                        .unwrap_or_default();
+                    // Terminal assistant turn — plain text, no
+                    // tool_calls (any preceding tool_use events have
+                    // already been materialised above).
+                    messages.push(ChatMessage::assistant(text));
+                }
+                _ => {}
+            }
+        }
+    }
+    messages
+}
+
 pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, String, i64), String> {
     let RunnerTurnCtx {
         state,
@@ -1278,6 +1618,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         cancel_flag,
         caller_caps,
         caller_trust,
+        planner_executor,
         inbound_channel_origin,
         caller_timezone,
         group_context,
@@ -1323,28 +1664,32 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
     } else {
         None
     };
-    // Collect tool-name lists upfront so the system prompt can carry
-    // the routing-prose block (delta #2 — the model needs a "which
-    // family handles which task" map BEFORE the per-tool descriptions).
-    let builtin_names: Vec<String> = state
-        .plugin_host
-        .registry()
-        .all_builtins()
-        .iter()
-        .map(|t| t.descriptor().name.clone())
-        .collect();
-    let plugin_tool_names: Vec<String> = state
-        .plugin_host
-        .registry()
-        .agent_callable_tools()
-        .iter()
-        .map(|t| t.tool_name.clone())
-        .collect();
-    let routing_prose = build_tool_routing_prose(&builtin_names, &plugin_tool_names);
+    // 2026-05-16 — fix #P2: build the filtered catalog FIRST, then
+    // derive the routing prose from its categorized name lists. Pre-
+    // fix the prose was built from the unfiltered registry while the
+    // catalog was filtered, so the model's system prompt routed it
+    // to tool names the catalog had stripped — confusing for the
+    // model, wasteful of prompt tokens, and a policy hygiene gap.
+    let tool_view = build_runner_tool_catalog(
+        &state.db,
+        &state.plugin_host,
+        caller_trust,
+        &caller_caps,
+        planner_executor,
+    );
+    if planner_executor {
+        tracing::debug!(
+            target: "chats::run_runner_turn",
+            caller_trust = ?caller_trust,
+            "planner/executor split active; advertising empty tool catalog",
+        );
+    }
+    let routing_prose =
+        build_tool_routing_prose(&tool_view.builtin_names, &tool_view.plugin_tool_names);
     // Per-turn context — wall-clock + identity facts the model
     // would otherwise have to ask a tool for. Always emitted; cost
     // is negligible vs. the LLM round-trip (delta #3).
-    let turn_context = build_turn_context_prose(
+    let mut turn_context = build_turn_context_prose(
         chrono::Utc::now(),
         cid.as_str(),
         sender_principal_id.as_deref(),
@@ -1353,6 +1698,14 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         caller_timezone,
         group_context.as_ref(),
     );
+    // 2026-05-18 — Phase C of the python-sandbox attach-file UX.
+    // Runner turns (this path) are the most common place CSV /
+    // PDF / etc. flow through — the agent has tools and can act
+    // on the file. Block-build is best-effort; logged on failure.
+    if let Some(block) = build_attached_files_block(state, cid) {
+        turn_context.push_str("\n\n");
+        turn_context.push_str(&block);
+    }
     let composed_system = assemble_system_prompt(
         &state.db,
         Some(cid.as_str()),
@@ -1360,74 +1713,39 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         &routing_prose,
         &turn_context,
     );
-    // Hydrate into role-tagged history first, run the sliding-window
-    // truncation, then convert to ChatMessage with spotlighting. See
-    // the matching block in `run_real_turn` for the rationale; the
-    // tool-capable path has one extra step — skipping the user_msg
-    // we just appended this turn (the runner receives that as
-    // `TurnRequest.user_text`, not as part of history).
-    let raw_history: Vec<execlaw_core::history_budget::HistoryMessage> = history
-        .iter()
-        .filter_map(|ev| match ev.kind {
-            EventKind::UserMsg => {
-                if ev.seq == user_seq {
-                    // Current turn — runner gets it via `user_text`.
-                    return None;
-                }
-                ev.decode_payload::<UserMessagePayload>().ok().map(|p| {
-                    execlaw_core::history_budget::HistoryMessage {
-                        role: execlaw_core::history_budget::HistoryRole::User,
-                        text: p.text,
-                    }
-                })
-            }
-            EventKind::ModelTurn => ev
-                .decode_payload::<RealModelTurnPayload>()
-                .ok()
-                .map(|p| execlaw_core::history_budget::HistoryMessage {
-                    role: execlaw_core::history_budget::HistoryRole::Assistant,
-                    text: p.text,
-                })
-                .or_else(|| {
-                    ev.decode_payload::<StubModelTurnPayload>().ok().map(|p| {
-                        execlaw_core::history_budget::HistoryMessage {
-                            role: execlaw_core::history_budget::HistoryRole::Assistant,
-                            text: p.text,
-                        }
-                    })
-                }),
-            _ => None,
-        })
-        .collect();
+    // 2026-05-16 — Codex P4: hydrate `tool_use` / `tool_result` events
+    // into runner history. Pre-fix only `UserMsg` / `ModelTurn` were
+    // emitted, so a runner turn that followed a previous turn with
+    // tool calls saw the user → assistant exchange but had NO record
+    // of what tools were called in between — replay diverged from
+    // the in-process executor's `hydrate_messages` and weakened the
+    // event log as the canonical transcript.
+    //
+    // Mirrors `runner-local::turn::hydrate_messages`: buffer
+    // `ToolUse` events into `pending_tool_calls`, attach them onto
+    // the following `ModelTurn`'s assistant message; emit
+    // `ToolResult` events as standalone `tool` messages keyed by
+    // `call_<ordinal>`. Spotlighting still wraps `UserMsg` content.
+    //
+    // Turn-group truncation: we drop OLDEST whole turns until under
+    // the token budget, never splitting an assistant from its
+    // tool_use/tool_result pair (which would leave the model
+    // confused by orphan tool messages). A "turn group" is every
+    // event from one `UserMsg` up to (and including) the
+    // `ModelTurn` that closes it.
     let budget = execlaw_core::history_budget::load_max_history_tokens(&state.db)
         .unwrap_or(execlaw_core::history_budget::DEFAULT_HISTORY_TOKENS);
-    let truncated = execlaw_core::history_budget::truncate_to_budget(raw_history, budget);
-    if truncated.dropped_count > 0 {
-        tracing::debug!(
-            target: "chats::run_tool_capable_turn",
-            conversation_id = %cid.as_str(),
-            dropped = truncated.dropped_count,
-            kept = truncated.kept.len(),
-            kept_tokens_estimate = truncated.kept_tokens_estimate,
-            budget,
-            "truncated conversation history to fit token budget",
-        );
-    }
-    let mut hist_messages: Vec<ChatMessage> = Vec::with_capacity(truncated.kept.len());
-    for m in truncated.kept {
-        match m.role {
-            execlaw_core::history_budget::HistoryRole::User => {
-                let content = match &spotlight {
-                    Some(s) => s.wrap(&m.text),
-                    None => m.text,
-                };
-                hist_messages.push(ChatMessage::user(content));
-            }
-            execlaw_core::history_budget::HistoryRole::Assistant => {
-                hist_messages.push(ChatMessage::assistant(m.text));
-            }
-        }
-    }
+    let hist_messages: Vec<ChatMessage> =
+        build_runner_history_messages(&history, user_seq, spotlight.as_ref(), budget);
+    // Bookkeeping log so an operator can confirm how many turns
+    // survived the budget.
+    tracing::debug!(
+        target: "chats::run_runner_turn",
+        conversation_id = %cid.as_str(),
+        history_msgs = hist_messages.len(),
+        budget,
+        "runner history hydrated (tool events included)",
+    );
 
     // Step 3 — build TurnRequest.
     let turn_id = supervisor.mint_turn_id();
@@ -1455,52 +1773,11 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
     // model id; see `ResolvedInference::reasoning_enabled`.
     let reasoning_enabled = resolved.reasoning_enabled;
 
-    // Build the tool catalog the runner advertises to the model.
-    // Includes BOTH the trait-based built-in tier (registered at
-    // boot via `register_core_builtins`) AND every plugin-supplied
-    // tool. Tools whose `config_tool_access` row excludes this
-    // trust class are rejected on dispatch — the catalogue itself
-    // doesn't filter, so the LLM still sees the name and can read
-    // its schema even if it can't call it.
-    let mut tool_decls: Vec<ToolDeclaration> = state
-        .plugin_host
-        .registry()
-        .all_builtins()
-        .iter()
-        .map(|t| {
-            let d = t.descriptor();
-            ToolDeclaration::function(d.name.clone(), d.description.clone(), d.schema.clone())
-        })
-        .collect();
-    tool_decls.extend(
-        state
-            .plugin_host
-            .registry()
-            .agent_callable_tools()
-            .iter()
-            .map(|t| {
-                // Pre-fix this advertised every plugin tool as
-                // `Plugin tool 'X' (latency: Y)` with an empty
-                // `{"type":"object"}` schema — the model couldn't
-                // tell what any of them did. Now we ship the
-                // manifest's `description` + the JSON Schema loaded
-                // at register time. Falls back only when the plugin
-                // itself omitted them.
-                let description = t.description.clone().unwrap_or_else(|| {
-                    format!(
-                        "Plugin tool '{}' from '{}' (latency: {}). \
-                         The plugin manifest did not supply a description; \
-                         ask the operator to add one for better tool selection.",
-                        t.tool_name, t.plugin_id, t.latency,
-                    )
-                });
-                let schema = t
-                    .schema_json
-                    .clone()
-                    .unwrap_or_else(|| serde_json::json!({"type": "object"}));
-                ToolDeclaration::function(t.tool_name.clone(), description, schema)
-            }),
-    );
+    // The filtered catalog was already built upstream alongside the
+    // routing-prose name lists (see `tool_view` above). Same source
+    // of truth feeds both the runner's `tool_catalog` field and the
+    // system prompt's routing block.
+    let tool_decls: Vec<ToolDeclaration> = tool_view.declarations.clone();
 
     // Trust-class string the runner copies into log lines + the
     // model's "from:" header. The flat policy tag is canonical.
@@ -1550,6 +1827,13 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         // the wrap; the runner mirrors policy::Spotlight::wrap on
         // its side.
         spotlight: spotlight.as_ref().map(|s| s.open.clone()),
+        // 2026-05-16 — per-turn `max_tool_rounds` from the
+        // operator's `config_general` setting (default 16). The
+        // runner clamps to its own `RUNNER_MAX_TOOL_ROUNDS` (24)
+        // belt-and-suspenders ceiling so a misconfiguration can't
+        // push the cap arbitrarily high. Pre-fix the runner used a
+        // hard-coded 24 ignoring this knob entirely.
+        max_tool_rounds: state.config.max_tool_rounds,
     };
 
     // Build the tool dispatcher we'll use to honour the runner's
@@ -1650,6 +1934,11 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
 
     // Drain. Sign + commit each EventLogAppend the runner proposes.
     let mut pending: Vec<execlaw_core::events::PendingEvent> = Vec::new();
+    // Per-turn ordinal for tool_use / tool_result pairing. Mirrors the
+    // in-process executor (`runner-local::turn`) so replay/audit on a
+    // runner-served turn reconstructs the same paired-event shape.
+    // Increments AFTER each ToolCallRequest is handled.
+    let mut tool_ordinal: u32 = 0;
     let mut assistant_text = String::new();
     let mut got_complete = false;
     let mut error_message: Option<String> = None;
@@ -1688,6 +1977,36 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
                     status: "started".into(),
                 });
 
+                // Pair the call with a durable `tool_use` BEFORE we
+                // dispatch. The matching `tool_result` (success OR
+                // failure) is pushed below; both land in the same
+                // `commit_turn` as the eventual `model_turn`, so the
+                // event log's pairing invariant (§7.4) is preserved
+                // and replay can reconstruct what tools ran.
+                let this_ordinal = tool_ordinal;
+                tool_ordinal = tool_ordinal.saturating_add(1);
+                match PendingEvent::encode(
+                    EventKind::ToolUse,
+                    &ToolUsePayload {
+                        ordinal: this_ordinal,
+                        tool_name: tool_name.clone(),
+                        args_json: args.clone(),
+                    },
+                    Some("agent".into()),
+                ) {
+                    Ok(ev) => pending.push(ev),
+                    Err(e) => {
+                        tracing::error!(
+                            target: "chats::run_runner_turn",
+                            error = %e,
+                            tool = %tool_name,
+                            "failed to encode tool_use event; aborting turn",
+                        );
+                        error_message = Some(format!("encode tool_use: {e}"));
+                        break;
+                    }
+                }
+
                 let outcome = match dispatch.call(&tool_name, &args).await {
                     Ok(value) => execlaw_runner_protocol::ToolOutcome::Ok { value },
                     Err(message) => execlaw_runner_protocol::ToolOutcome::Err { message },
@@ -1711,13 +2030,37 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
                 let result = execlaw_runner_protocol::ToolCallResult {
                     turn_id: turn_id.clone(),
                     call_id,
-                    outcome,
+                    outcome: outcome.clone(),
                 };
                 supervisor.submit_tool_result(group_id, result).await;
-                // The runner emits its own `tool_use`/`tool_result`
-                // events into the log via subsequent `EventLogAppend`
-                // frames once the model finalises the round; we
-                // don't pre-write them from the server here.
+
+                // Same-commit pair for the `tool_use` pushed above.
+                // We log success/failure identically so replay can
+                // reconstruct the outcome the model actually saw.
+                let result_payload = ToolResultPayload {
+                    ordinal: this_ordinal,
+                    outcome: match outcome {
+                        execlaw_runner_protocol::ToolOutcome::Ok { value } => Ok(value),
+                        execlaw_runner_protocol::ToolOutcome::Err { message } => Err(message),
+                    },
+                };
+                match PendingEvent::encode(
+                    EventKind::ToolResult,
+                    &result_payload,
+                    Some("system".into()),
+                ) {
+                    Ok(ev) => pending.push(ev),
+                    Err(e) => {
+                        tracing::error!(
+                            target: "chats::run_runner_turn",
+                            error = %e,
+                            tool = %tool_name,
+                            "failed to encode tool_result event; aborting turn",
+                        );
+                        error_message = Some(format!("encode tool_result: {e}"));
+                        break;
+                    }
+                }
             }
             TurnEvent::EventLogAppend {
                 kind,
@@ -1771,21 +2114,75 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
     }
     cancel_watcher.abort();
 
-    if !got_complete && error_message.is_some() {
-        // Surface as a turn error. Don't commit any partials.
+    // 2026-05-16 — error/cancel commit invariant. Pre-fix this branch
+    // returned `Err(...)` without committing `pending`, so any
+    // `tool_use` + `tool_result` events the drain loop had already
+    // pushed (for tools that ALREADY executed — HTTP fetches fired,
+    // memory written, calendar events created) were silently dropped.
+    // The audit-trail-integrity invariant from §7.4 requires that the
+    // event log record every executed side effect; we must commit
+    // those pairs even when the turn ends abnormally.
+    //
+    // Three cases:
+    //   1. got_complete: runner's terminal `model_turn` is in `pending`
+    //      already (pushed via the `EventLogAppend` arm). Normal commit.
+    //   2. was_cancelled (operator stop): synthesise a
+    //      "(stopped...)" model_turn so the transcript stays well-
+    //      formed and the SPA's "stop button" UX returns a reply.
+    //      Commit, return Ok.
+    //   3. plain error with pending NON-empty: synthesise a model_turn
+    //      with `finish_reason = "error"` so the executed-tools audit
+    //      trail lands, then return Err so the handler still surfaces
+    //      the failure to the SPA. With pending EMPTY (dispatch
+    //      failed before any tool ran), preserve the prior behaviour
+    //      and return Err WITHOUT committing — there's nothing
+    //      audit-relevant to record and the user_msg already in the
+    //      log keeps the prior SPA contract.
+    let abnormal_end = !got_complete && error_message.is_some();
+    if abnormal_end && pending.is_empty() && !was_cancelled {
         return Err(error_message.unwrap_or_else(|| "runner error".into()));
     }
-    if was_cancelled {
-        // Synthesise a "stopped" reply so the transcript stays
-        // well-formed.
+    if abnormal_end {
         if assistant_text.is_empty() {
-            assistant_text = "(stopped before any output)".into();
+            assistant_text = if was_cancelled {
+                "(stopped before any output)".to_owned()
+            } else {
+                "(turn errored before completion)".to_owned()
+            };
+        }
+        let finish_reason = if was_cancelled { "cancelled" } else { "error" };
+        let synth_payload = serde_json::json!({
+            // Model id is unknown on this branch — the runner errored
+            // before TurnEvent::Complete carried it.
+            "model": "",
+            "text": assistant_text.clone(),
+            "finish_reason": finish_reason,
+        });
+        match execlaw_core::events::PendingEvent::encode(
+            EventKind::ModelTurn,
+            &synth_payload,
+            Some("system".into()),
+        ) {
+            Ok(ev) => pending.push(ev),
+            Err(e) => {
+                tracing::error!(
+                    target: "chats::run_runner_turn",
+                    error = %e,
+                    "failed to encode synthetic model_turn on error/cancel; \
+                     audit-trail commit will rely on commit_turn's tool_result \
+                     synthesis only",
+                );
+            }
         }
     }
 
-    // Step 5 — commit accumulated events. The runner currently
-    // sends one model_turn per turn; richer flows (tool_use /
-    // tool_result pairs) land when tool RPC arrives.
+    // Step 5 — commit accumulated events. On the happy path `pending`
+    // holds the runner's `model_turn` plus every paired `tool_use` /
+    // `tool_result` we pushed during the drain loop. On error/cancel
+    // it holds the synthetic model_turn above plus any tool pairs
+    // for tools that already executed. Either way `commit_turn`
+    // enforces the §7.4 pairing invariant — any dangling `tool_use`
+    // gets a synthesized cancellation `tool_result`.
     let latest = log.last_seq(cid).map_err(|e| format!("last_seq: {e}"))?;
     let written = log
         .commit_turn(cid, latest, pending)
@@ -1795,6 +2192,15 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         .find(|e| e.kind == EventKind::ModelTurn)
         .map(|e| e.seq.0)
         .unwrap_or(latest.0 + 1);
+
+    // Plain error (not cancellation): commit landed the audit trail;
+    // now surface the underlying failure to the handler so the SPA
+    // sees a 500. Cancellation falls through and returns the
+    // "(stopped...)" reply normally — that's the operator-stop UX
+    // contract.
+    if abnormal_end && !was_cancelled {
+        return Err(error_message.unwrap_or_else(|| "runner error".into()));
+    }
 
     // Touch the principal group's last_active_at so the reaper
     // measures from "this turn ended" not "row inserted."
@@ -1823,6 +2229,8 @@ async fn run_tool_capable_turn(
     sender_principal_id: Option<String>,
     caller_caps: Vec<String>,
     caller_trust: TrustLevel,
+    spotlight_content: bool,
+    planner_executor: bool,
     inbound_channel_origin: Option<&str>,
     caller_timezone: Option<&str>,
     group_context: Option<GroupTurnContext>,
@@ -1830,6 +2238,7 @@ async fn run_tool_capable_turn(
     applied_skill_names: Vec<String>,
 ) -> Result<(i64, String, i64), String> {
     use execlaw_inference_api::ToolDeclaration;
+    use execlaw_policy::spotlighting::Spotlight;
     use execlaw_runner_local::turn::{TurnConfig, TurnExecutor};
     // 2026-05-13 — see the rationale comment on `run_real_turn`:
     // client + model_id are paired from one row read so they
@@ -1857,49 +2266,20 @@ async fn run_tool_capable_turn(
         "turn entry (chats.rs handler)"
     );
 
-    // Same description/schema plumbing fix as the runner-turn path
-    // (delta #1) — without this the in-process tool-capable path
-    // shipped `Plugin tool 'X' (latency: Y)` + an empty schema.
-    //
-    // Tool catalog = built-ins ∪ plugin tools. Pre-fix this only
-    // included plugin tools, so a Controller messaging through the
-    // tool-capable path (typical for Signal-bridged turns when the
-    // operator has plugins installed) saw signal.* but NOT
-    // research_* / memory_* / etc. The dispatch chain already
-    // routes built-ins via `try_registry_builtin`; we just need to
-    // tell the model they're there.
+    // 2026-05-16 — fix #P2: build the filtered catalog ONCE via the
+    // shared helper. The returned `RunnerToolView` carries the
+    // declarations AND the categorized name lists the routing-prose
+    // builder needs, so the system prompt and the model's tool
+    // catalog stay in sync.
     let catalog_started_at = std::time::Instant::now();
-    let mut tool_decls: Vec<ToolDeclaration> = state
-        .plugin_host
-        .registry()
-        .all_builtins()
-        .iter()
-        .map(|t| {
-            let d = t.descriptor();
-            ToolDeclaration::function(d.name.clone(), d.description.clone(), d.schema.clone())
-        })
-        .collect();
-    tool_decls.extend(
-        state
-            .plugin_host
-            .registry()
-            .agent_callable_tools()
-            .iter()
-            .map(|t| {
-                let description = t.description.clone().unwrap_or_else(|| {
-                    format!(
-                        "Plugin tool '{}' from '{}' (latency: {}). The plugin manifest did not \
-                 supply a description; ask the operator to add one for better tool selection.",
-                        t.tool_name, t.plugin_id, t.latency,
-                    )
-                });
-                let schema = t
-                    .schema_json
-                    .clone()
-                    .unwrap_or_else(|| serde_json::json!({"type": "object"}));
-                ToolDeclaration::function(t.tool_name.clone(), description, schema)
-            }),
+    let tool_view = build_runner_tool_catalog(
+        &state.db,
+        &state.plugin_host,
+        caller_trust,
+        &caller_caps,
+        planner_executor,
     );
+    let tool_decls: Vec<ToolDeclaration> = tool_view.declarations.clone();
     let catalog_ms = catalog_started_at.elapsed().as_millis() as u64;
     let catalog_bytes: usize = tool_decls
         .iter()
@@ -1911,6 +2291,7 @@ async fn run_tool_capable_turn(
         catalog_ms,
         tool_count = tool_decls.len(),
         catalog_bytes,
+        planner_executor,
         "tool catalog assembled"
     );
 
@@ -1957,31 +2338,17 @@ async fn run_tool_capable_turn(
             events: state.events.clone(),
             conversation_id: cid.as_str().to_owned(),
         });
-    // The in-process tool-capable path doesn't have built-ins
-    // wired into `tool_decls` above (NoBuiltinTools below), so the
-    // routing prose only needs the plugin tool names. Built-ins
-    // are still in the registry though; pass them so the model
-    // gets routing hints for the families it can use via the
-    // dispatch chain (read_memory etc. land via `with_builtins`
-    // wiring later — for now this matches what the runner path
-    // exposes).
-    let routing_builtins: Vec<String> = state
-        .plugin_host
-        .registry()
-        .all_builtins()
-        .iter()
-        .map(|t| t.descriptor().name.clone())
-        .collect();
-    let routing_plugins: Vec<String> = state
-        .plugin_host
-        .registry()
-        .agent_callable_tools()
-        .iter()
-        .map(|t| t.tool_name.clone())
-        .collect();
+    // 2026-05-16 — fix #P2: derive routing prose from the FILTERED
+    // catalog name lists (`tool_view`). Pre-fix this pulled names
+    // directly from `all_builtins()` / `agent_callable_tools()` —
+    // the unfiltered registry — so the system prompt routed the
+    // model to tools the catalog had stripped via
+    // `config_tool_access`, capability_set, or the
+    // planner/executor split.
     let prompt_started_at = std::time::Instant::now();
-    let routing_prose = build_tool_routing_prose(&routing_builtins, &routing_plugins);
-    let turn_context = build_turn_context_prose(
+    let routing_prose =
+        build_tool_routing_prose(&tool_view.builtin_names, &tool_view.plugin_tool_names);
+    let mut turn_context = build_turn_context_prose(
         chrono::Utc::now(),
         cid.as_str(),
         sender_principal_id.as_deref(),
@@ -1990,6 +2357,13 @@ async fn run_tool_capable_turn(
         caller_timezone,
         group_context.as_ref(),
     );
+    // 2026-05-18 — Phase C: announce non-image attachments to the
+    // agent. Third call site (the run_agent_turn path); same
+    // best-effort semantics as the other two.
+    if let Some(block) = build_attached_files_block(state, cid) {
+        turn_context.push_str("\n\n");
+        turn_context.push_str(&block);
+    }
     let composed_system_prompt = assemble_system_prompt(
         &state.db,
         Some(cid.as_str()),
@@ -2007,6 +2381,18 @@ async fn run_tool_capable_turn(
         turn_context_chars = turn_context.chars().count(),
         "system prompt assembled"
     );
+    // 2026-05-16 — spotlight delimiter (§7.4). Mirrors the runner
+    // path's `req.spotlight`: when policy says
+    // `effective_trust < KnownTrusted`, every UserMsg the executor
+    // renders gets `delim\n<text>\n delim` wrapped so a prompt-
+    // injection payload from a KnownLimited / UnknownPending contact
+    // can't masquerade as agent instructions. Event log stores the
+    // unwrapped text — audit/replay are unchanged.
+    let spotlight_delim: Option<String> = if spotlight_content {
+        Some(Spotlight::generate().open)
+    } else {
+        None
+    };
     let cfg = TurnConfig {
         model: ModelId(resolved_model_id.clone()),
         system_prompt: composed_system_prompt,
@@ -2028,6 +2414,7 @@ async fn run_tool_capable_turn(
         // window with the model id field.
         reasoning_enabled: resolved.reasoning_enabled,
         inbound_channel_origin: inbound_channel_origin.map(|s| s.to_owned()),
+        spotlight_delim,
     };
     let exec_started_at = std::time::Instant::now();
     tracing::debug!(
@@ -2230,91 +2617,6 @@ async fn handle_cold_contact(
         .into_response()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ColdContactPayload {
-    text: String,
-    sender_principal_id: String,
-    approval_id: String,
-}
-
-/// Build an `EventLog` with the server's HMAC key attached (when set).
-fn event_log(state: &AppState) -> EventLog<'_> {
-    let log = EventLog::new(&state.db);
-    match &state.event_log_hmac_key {
-        Some(k) => log.with_hmac_key((**k).clone()),
-        None => log,
-    }
-}
-
-/// Phase 11.A — bridge from the runner's `PhaseObserver` trait to the
-/// server's WS event bus. Construct one per turn with the active
-/// `conversation_id`; every callback publishes a
-/// `ConversationPhaseChanged` event that downstream subscribers
-/// (SPA tabs, transport plugins) translate into typing-indicator
-/// transitions.
-struct BusPhaseObserver {
-    events: crate::events::EventBus,
-    conversation_id: String,
-}
-
-impl execlaw_runner_local::turn::PhaseObserver for BusPhaseObserver {
-    fn observe(&self, phase: Phase) {
-        self.events.publish(UiEvent::ConversationPhaseChanged {
-            conversation_id: self.conversation_id.clone(),
-            phase: phase.as_str().to_owned(),
-        });
-    }
-}
-
-/// RAII guard that publishes `phase=idle` on Drop unless explicitly
-/// disarmed first. Closes the Phase 11 audit gap where every
-/// `err_500` early-return left the typing indicator stuck on
-/// "thinking" forever — every failure path now drops the guard,
-/// which fires Idle on the way out.
-///
-/// Success paths call `disarm_after_publishing_idle()` to take
-/// ownership of the publish (so the explicit Idle event still fires
-/// before `ChatMessageOutbound`, matching the human "typing dots
-/// stop a beat before the message lands" UX). After disarming, the
-/// Drop is a no-op so we don't double-publish.
-struct IdlePhaseGuard {
-    events: crate::events::EventBus,
-    conversation_id: String,
-    armed: bool,
-}
-
-impl IdlePhaseGuard {
-    fn new(events: crate::events::EventBus, conversation_id: String) -> Self {
-        Self {
-            events,
-            conversation_id,
-            armed: true,
-        }
-    }
-
-    /// Publish Idle now and disable the Drop publish. Use on the
-    /// success path so the Idle beat fires *before* the outbound
-    /// reply event.
-    fn disarm_after_publishing_idle(mut self) {
-        self.events.publish(UiEvent::ConversationPhaseChanged {
-            conversation_id: self.conversation_id.clone(),
-            phase: Phase::Idle.as_str().to_owned(),
-        });
-        self.armed = false;
-    }
-}
-
-impl Drop for IdlePhaseGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.events.publish(UiEvent::ConversationPhaseChanged {
-                conversation_id: self.conversation_id.clone(),
-                phase: Phase::Idle.as_str().to_owned(),
-            });
-        }
-    }
-}
-
 /// Result of a routine-triggered turn dispatch.
 #[derive(Debug, Clone)]
 pub struct RoutineDispatchOutcome {
@@ -2379,6 +2681,18 @@ pub async fn dispatch_routine_turn(
     let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
     // Phase 12.E — same per-turn resolver as send_message uses.
     let inference_for_turn = state.inference.resolve(&state.db, BackendPurpose::Standard);
+    // 2026-05-16 — sister fix to `dispatch_external_turn`'s
+    // runner-routing branch (chats.rs ~line 3015). Pre-fix, this
+    // path always fell into `run_tool_capable_turn` / `run_real_turn`,
+    // so a routine fired against a Signal-group-bound conversation
+    // ran inside the server process instead of inside the group's
+    // dedicated runner — same isolation violation the send_message
+    // path used to have. Route to `run_runner_turn` when the
+    // conversation is already bound to a principal_group AND the
+    // supervisor + inference are available. No `resolve_chat_group`
+    // fallback here on purpose — a routine should not mint a
+    // Controller-only group as a side effect for an unbound
+    // conversation; let those keep using the in-process arms.
     // Routine timezone: each routine row stores its own IANA zone
     // (the scheduler uses it for cron evaluation). Read it once here
     // so the agent's per-turn context renders bare clock times in
@@ -2406,8 +2720,58 @@ pub async fn dispatch_routine_turn(
         crate::group_addressing::AddressedReason::EligibilityBypass,
     );
 
-    let result = match inference_for_turn {
-        Some(inference) if has_plugin_tools => {
+    let runner_routed_group: Option<String> =
+        if state.runner_supervisor.is_some() && inference_for_turn.is_some() {
+            use execlaw_core::principal_groups::PrincipalGroupStore;
+            match PrincipalGroupStore::new(&state.db).principal_group_id_for(cid.as_str()) {
+                Ok(opt) => opt,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "chats::dispatch_routine_turn",
+                        conversation_id = %cid.as_str(),
+                        error = %e,
+                        "runner routing skipped: principal_group lookup failed",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    let result = match (inference_for_turn, runner_routed_group.as_deref()) {
+        (Some(_inference), Some(group_id)) => {
+            let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
+                state.turn_cancel.clone(),
+                cid.as_str().to_owned(),
+            );
+            let cancel_flag = cancel_guard.flag.clone();
+            let res = run_runner_turn(RunnerTurnCtx {
+                state,
+                group_id,
+                cid: &cid,
+                user_text: prompt,
+                sender_principal_id: sender.clone(),
+                // Controller-authored cron firing — no untrusted
+                // content to spotlight.
+                spotlight_content: false,
+                cancel_flag,
+                caller_caps: caller_caps.clone(),
+                caller_trust,
+                // Controller-trust → planner/executor split is OFF.
+                planner_executor: false,
+                inbound_channel_origin: None,
+                caller_timezone: routine_tz_ref,
+                group_context: routine_group_ctx.clone(),
+                attachment_ids: Vec::new(),
+                // Routines don't surface a skill picker.
+                applied_skill_names: Vec::new(),
+            })
+            .await;
+            drop(cancel_guard);
+            res
+        }
+        (Some(inference), None) if has_plugin_tools => {
             run_tool_capable_turn(
                 state,
                 inference.clone(),
@@ -2416,6 +2780,11 @@ pub async fn dispatch_routine_turn(
                 sender.clone(),
                 caller_caps,
                 caller_trust,
+                // Routines fire as Controller — no untrusted content
+                // to spotlight.
+                false,
+                // Controller-trust → planner/executor split is OFF.
+                false,
                 None,
                 routine_tz_ref,
                 routine_group_ctx.clone(),
@@ -2426,7 +2795,7 @@ pub async fn dispatch_routine_turn(
             )
             .await
         }
-        Some(inference) => {
+        (Some(inference), None) => {
             // Spotlighting off: the prompt comes from the operator,
             // not from an external sender, so no untrusted-content
             // wrapping needed.
@@ -2461,7 +2830,7 @@ pub async fn dispatch_routine_turn(
             drop(cancel_guard);
             res
         }
-        None => run_stub_turn(
+        (None, _) => run_stub_turn(
             state,
             &cid,
             prompt,
@@ -2488,65 +2857,6 @@ pub async fn dispatch_routine_turn(
         }
     }
     mapped
-}
-
-/// Phase 4 — public wrapper over the file-private `ensure_conversation`
-/// helper. The Signal inbound consumer needs to make sure the
-/// `state_conversations` row exists before it binds the conversation
-/// to a principal_group; exposing the helper avoids duplicating the
-/// default-row construction.
-pub fn ensure_conversation_for(db: &execlaw_core::Database, cid: &ConversationId) {
-    let store = ConversationStore::new(db);
-    ensure_conversation(&store, cid);
-}
-
-/// Apply a transport-supplied display_name to the conversation row.
-/// Used by every transport inbound (Signal `groupName`, Signal DM
-/// `source_name`, future WhatsApp / email / etc.) so the SPA's
-/// sidebar mirrors whatever the source-of-truth system calls the
-/// thread.
-///
-/// Tracking semantics (migration 0034):
-///   * If the row's `display_name_source = 'manual'` (operator
-///     renamed via `PATCH /api/chats/{id}`), leave it alone — the
-///     operator's intent locks the value.
-///   * If the row's source is `'auto'` (or unset, i.e. fresh row),
-///     write the new name and tag it `'auto'`. Re-runs of the
-///     same name are no-ops at the SQL layer (the `UPDATE ... WHERE
-///     display_name <> ?` guard).
-///
-/// This is the path that picks up Signal group renames: signal-cli
-/// sends `groupName` on every inbound, and an unchanged source
-/// means a re-name from the original landed in our table the next
-/// time someone posts.
-///
-/// Best-effort: errors log at debug and the routing flow continues.
-/// Display name is a UX nicety, not correctness — failing the
-/// inbound over a sidebar label would be the wrong trade-off.
-pub fn apply_auto_display_name(
-    db: &execlaw_core::Database,
-    cid: &ConversationId,
-    name: Option<&str>,
-) {
-    let trimmed = match name {
-        Some(s) => s.trim(),
-        None => return,
-    };
-    if trimmed.is_empty() {
-        return;
-    }
-    let store = ConversationStore::new(db);
-    match store.apply_auto_display_name(cid, trimmed) {
-        Ok(_changed) => {}
-        Err(e) => {
-            tracing::debug!(
-                target: "chats::apply_auto_display_name",
-                conversation_id = %cid.as_str(),
-                error = %e,
-                "failed to apply transport-supplied display_name; sidebar will keep the old label",
-            );
-        }
-    }
 }
 
 /// Phase 4 — cold-contact handler scoped to a non-HTTP caller (the
@@ -2783,11 +3093,76 @@ pub async fn dispatch_external_turn(
     // event from a Signal "6pm" message. Future: read a per-
     // controller `config_general.controller_timezone` setting.
     let caller_timezone: Option<&str> = None;
-    let result = match inference_for_turn {
-        Some(inference) if has_plugin_tools => {
+
+    // 2026-05-16 — mirror `send_message`'s runner-routing branch
+    // (chats.rs::send_message ~line 472). Pre-fix, this function
+    // ALWAYS fell into `run_tool_capable_turn` whenever any plugin
+    // tools were registered — which is every Signal-enabled
+    // deployment, because Signal itself is a plugin. That path
+    // ships the full tool catalog (built-ins ∪ every plugin tool,
+    // with JSON schemas) on every request, so quantized models
+    // (Qwen3.5-27B-AWQ) thrashed on prefill and decoded at ~1
+    // token / 3 sec on Signal while the web path (which already
+    // routes through the runner) stayed fast. Resolve the bound
+    // `principal_group_id` for this conversation up front — the
+    // inbound router (`generic_inbound::route_inbound`) already
+    // bound it during step 3 — and route to `run_runner_turn` when
+    // both supervisor + inference are available. Fall back to the
+    // legacy in-process branches when runners aren't configured
+    // or the group binding can't be read.
+    let runner_routed_group: Option<String> =
+        if state.runner_supervisor.is_some() && inference_for_turn.is_some() {
+            use execlaw_core::principal_groups::PrincipalGroupStore;
+            match PrincipalGroupStore::new(&state.db).principal_group_id_for(cid.as_str()) {
+                Ok(opt) => opt,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "chats::dispatch_external_turn",
+                        conversation_id = %cid.as_str(),
+                        error = %e,
+                        "runner routing skipped: principal_group lookup failed",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    let result = match (inference_for_turn, runner_routed_group.as_deref()) {
+        (Some(_inference), Some(group_id)) => {
+            let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
+                state.turn_cancel.clone(),
+                cid_str.clone(),
+            );
+            let cancel_flag = cancel_guard.flag.clone();
+            let res = run_runner_turn(RunnerTurnCtx {
+                state,
+                group_id,
+                cid,
+                user_text: text,
+                sender_principal_id: sender.clone(),
+                spotlight_content: policy.spotlighting,
+                cancel_flag,
+                caller_caps: caller_caps.clone(),
+                caller_trust,
+                planner_executor: policy.planner_executor,
+                inbound_channel_origin,
+                caller_timezone,
+                group_context: group_context.clone(),
+                attachment_ids: attachment_ids.clone(),
+                // Transports don't surface a skill picker.
+                applied_skill_names: Vec::new(),
+            })
+            .await;
+            drop(cancel_guard);
+            res
+        }
+        (Some(inference), None) if has_plugin_tools => {
             // 2026-05-15 — inbound transports (Signal etc.) reach
-            // here when plugin tools are registered, which is the
-            // common production shape. `attachment_ids` is the
+            // here when plugin tools are registered AND the runner
+            // supervisor is not configured (or the group binding
+            // lookup above failed). `attachment_ids` is the
             // persisted-image list `route_inbound` produced from
             // `<channel>.fetch_attachment`; `run_tool_capable_turn`
             // resolves the data URLs server-side and feeds them
@@ -2800,6 +3175,16 @@ pub async fn dispatch_external_turn(
                 sender.clone(),
                 caller_caps,
                 caller_trust,
+                policy.spotlighting,
+                // 2026-05-16 — Codex P2: forward the planner/executor
+                // split into the fallback path too. Pre-fix this site
+                // routed to `run_tool_capable_turn` whenever the
+                // supervisor was unavailable + plugins existed,
+                // regardless of `policy.planner_executor`, so a
+                // KnownLimited contact would have seen the full tool
+                // catalog through this branch. The helper now strips
+                // the catalog when the split is on.
+                policy.planner_executor,
                 inbound_channel_origin,
                 caller_timezone,
                 group_context.clone(),
@@ -2809,7 +3194,7 @@ pub async fn dispatch_external_turn(
             )
             .await
         }
-        Some(inference) => {
+        (Some(inference), None) => {
             let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
                 state.turn_cancel.clone(),
                 cid_str.clone(),
@@ -2834,7 +3219,7 @@ pub async fn dispatch_external_turn(
             drop(cancel_guard);
             res
         }
-        None => run_stub_turn(
+        (None, _) => run_stub_turn(
             state,
             cid,
             text,
@@ -3240,6 +3625,15 @@ pub async fn dispatch_clarification_turn(
 
     let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
     let inference_for_turn = state.inference.resolve(&state.db, BackendPurpose::Standard);
+    // 2026-05-16 — sister fix to `dispatch_external_turn` +
+    // `dispatch_routine_turn`. Route this synthetic
+    // orchestrator-fired turn through the conversation's bound
+    // runner so a research clarification firing inside a
+    // multi-party Signal chat executes in that group's dedicated
+    // container, not the shared server process. Same lookup-only
+    // shape: no `resolve_chat_group` fallback, because an unbound
+    // clarification has no business minting a Controller-only
+    // group on the side.
     // Synthetic clarification turn — no operator-supplied timezone.
     // The model just relays a question; date arithmetic isn't on
     // this path's hot list.
@@ -3254,8 +3648,56 @@ pub async fn dispatch_clarification_turn(
         cid,
         crate::group_addressing::AddressedReason::EligibilityBypass,
     );
-    let result = match inference_for_turn {
-        Some(inference) if has_plugin_tools => {
+    let runner_routed_group: Option<String> =
+        if state.runner_supervisor.is_some() && inference_for_turn.is_some() {
+            use execlaw_core::principal_groups::PrincipalGroupStore;
+            match PrincipalGroupStore::new(&state.db).principal_group_id_for(cid.as_str()) {
+                Ok(opt) => opt,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "chats::dispatch_clarification_turn",
+                        conversation_id = %cid.as_str(),
+                        error = %e,
+                        "runner routing skipped: principal_group lookup failed",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    let result = match (inference_for_turn, runner_routed_group.as_deref()) {
+        (Some(_inference), Some(group_id)) => {
+            let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
+                state.turn_cancel.clone(),
+                cid.as_str().to_owned(),
+            );
+            let cancel_flag = cancel_guard.flag.clone();
+            let res = run_runner_turn(RunnerTurnCtx {
+                state,
+                group_id,
+                cid,
+                user_text: &prompt,
+                sender_principal_id: sender.clone(),
+                // Server-authored orchestrator prompt — no untrusted
+                // content to spotlight.
+                spotlight_content: false,
+                cancel_flag,
+                caller_caps: caller_caps.clone(),
+                caller_trust,
+                // Controller-trust → planner/executor split is OFF.
+                planner_executor: false,
+                inbound_channel_origin: None,
+                caller_timezone,
+                group_context: synth_group_ctx.clone(),
+                attachment_ids: Vec::new(),
+                applied_skill_names: Vec::new(),
+            })
+            .await;
+            drop(cancel_guard);
+            res
+        }
+        (Some(inference), None) if has_plugin_tools => {
             run_tool_capable_turn(
                 state,
                 inference.clone(),
@@ -3264,6 +3706,11 @@ pub async fn dispatch_clarification_turn(
                 sender.clone(),
                 caller_caps,
                 caller_trust,
+                // Synthetic orchestrator turn: prompt is server-authored,
+                // not from an untrusted contact — no spotlighting.
+                false,
+                // Controller-trust → planner/executor split is OFF.
+                false,
                 None,
                 caller_timezone,
                 synth_group_ctx.clone(),
@@ -3273,7 +3720,7 @@ pub async fn dispatch_clarification_turn(
             )
             .await
         }
-        Some(inference) => {
+        (Some(inference), None) => {
             let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
                 state.turn_cancel.clone(),
                 cid.as_str().to_owned(),
@@ -3298,7 +3745,7 @@ pub async fn dispatch_clarification_turn(
             drop(cancel_guard);
             res
         }
-        None => run_stub_turn(
+        (None, _) => run_stub_turn(
             state,
             cid,
             &prompt,
@@ -3359,772 +3806,6 @@ pub async fn dispatch_clarification_turn(
         Err(_) => drop(idle_guard),
     }
     mapped
-}
-
-/// Per-turn group-conversation context. Threaded into
-/// [`build_turn_context_prose`] so the agent's system prompt can
-/// describe the room it's answering in: how many other humans are
-/// present, what the group is called, and **why** the upstream
-/// router decided this turn should run.
-///
-/// `None` for DM / web / single-actor conversations. The value of
-/// telling a model "you're in a DM, behave normally" is low; the
-/// value of telling it "you're in a group with 5 people, default
-/// to staying quiet unless directly addressed" is high — so the
-/// block only renders for actual groups.
-#[derive(Debug, Clone)]
-pub struct GroupTurnContext {
-    /// User-facing group name when the transport supplies one
-    /// (Signal does, WhatsApp doesn't yet, Slack channels surface
-    /// as the channel id). Renders as a quoted phrase in the
-    /// prompt; `None` falls back to "this group" wording.
-    pub group_name: Option<String>,
-    /// Total participants in the principal_group, including the
-    /// Controller. Drives the "you are in a group with N other
-    /// participants" line. We don't subtract the agent — the agent
-    /// isn't a `Principal`, the group's members are the humans.
-    pub member_count: usize,
-    /// Why the router decided this turn should reach the agent.
-    /// See [`crate::group_addressing::AddressedReason`] for the
-    /// full taxonomy. The strength of the signal shapes how
-    /// reserved the agent should be in its reply — a transport
-    /// `<@mention>` is a clear invitation; a fall-open dispatch
-    /// is a hint to be cautious.
-    pub addressed_reason: crate::group_addressing::AddressedReason,
-}
-
-/// Resolve the group-conversation context from runtime state, when
-/// applicable. Returns `None` for conversations the
-/// [`build_turn_context_prose`] group block should NOT render for:
-///
-/// * No `principal_group` binding (web-only / unbridged conversation).
-/// * Single-member group (just the Controller — degenerate "group").
-/// * All-Controller group (every member is the operator's identity —
-///   no other humans to barge in front of).
-///
-/// In every other case, builds a [`GroupTurnContext`] from the
-/// `conversation_display_name` (group name) + member count + the
-/// caller-supplied addressed reason. The reason MUST come from the
-/// router's `should_dispatch_to_agent` decision so the agent's
-/// prompt accurately reflects why the turn ran.
-///
-/// Cheap (one principal_group lookup, one members query, one
-/// conversation row read). Safe to call on every turn — but the
-/// production hot path threads the value through from
-/// `route_inbound` to avoid a redundant DB round-trip.
-pub fn resolve_group_turn_context(
-    state: &AppState,
-    cid: &ConversationId,
-    addressed_reason: crate::group_addressing::AddressedReason,
-) -> Option<GroupTurnContext> {
-    use execlaw_core::principal::{PrincipalStore, TrustLevel};
-    use execlaw_core::principal_groups::PrincipalGroupStore;
-
-    let pg_store = PrincipalGroupStore::new(&state.db);
-    let pg_id = pg_store
-        .principal_group_id_for(cid.as_str())
-        .ok()
-        .flatten()?;
-    let members = pg_store.members(&pg_id).ok()?;
-    if members.len() < 2 {
-        return None;
-    }
-    // Skip all-Controller groups for the same reason
-    // `should_dispatch_to_agent` does — there's nobody to be careful
-    // about. The `any` short-circuits the moment it sees a
-    // non-Controller, so the lookup cost is bounded.
-    let principals = PrincipalStore::new(&state.db);
-    let has_non_controller = members.iter().any(|pid| {
-        match principals.get(pid) {
-            Ok(Some(p)) => !matches!(p.trust_level, TrustLevel::Controller),
-            // Lookup failure → treat as non-controller. The block
-            // is informational; over-rendering is harmless, under-
-            // rendering misses the "behave like a group" nudge.
-            _ => true,
-        }
-    });
-    if !has_non_controller {
-        return None;
-    }
-
-    // Read the conversation row's display_name as the group's
-    // user-facing title — `apply_auto_display_name` seeds this from
-    // the inbound `group_name` field for transports that supply one.
-    let group_name = ConversationStore::new(&state.db)
-        .get(cid)
-        .ok()
-        .flatten()
-        .and_then(|row| row.display_name);
-
-    Some(GroupTurnContext {
-        group_name,
-        member_count: members.len(),
-        addressed_reason,
-    })
-}
-
-/// Build the per-turn context block — runtime facts the model
-/// needs to answer recency- and identity-sensitive questions
-/// without round-tripping a tool. Selfhosted-claw baked these
-/// into every turn; pre-fix execlaw shipped none of them.
-///
-/// Includes:
-///   * current UTC time (RFC 3339) — answers "what time is it",
-///     drives "today / this week" comparisons, lets the model
-///     pick reasonable default windows for `calendar.list_events`
-///     etc;
-///   * conversation id — handy when the operator asks the agent
-///     to "use this thread's id" in a tool call;
-///   * caller's principal id — usually `controller`, sometimes a
-///     plugin-resolved contact id;
-///   * caller's trust class — drives the model's posture for
-///     approval-gated tools and confidential output;
-///   * **group context (when present)** — name, member count, and
-///     the upstream router's "why this turn ran" verdict, plus an
-///     explicit "default to silence in groups" posture nudge that
-///     replaces the implicit "DM behavior" fallback.
-///
-/// Pure function — caller assembles the inputs. `pub` (not
-/// `pub(crate)`) so the benchmark suite can measure it in isolation;
-/// the function has no side effects so the wider visibility doesn't
-/// invite misuse.
-pub fn build_turn_context_prose(
-    now_utc: chrono::DateTime<chrono::Utc>,
-    conversation_id: &str,
-    sender_principal_id: Option<&str>,
-    sender_trust: &str,
-    origin_channel: Option<&str>,
-    caller_timezone: Option<&str>,
-    group: Option<&GroupTurnContext>,
-) -> String {
-    let mut out = String::from("## Turn context\n\n");
-    // Date framing matters more than it looks. Earlier prompts
-    // emitted only the ISO timestamp ("2026-05-05T13:00:00Z");
-    // models with a sub-2026 training cutoff recognized 2026 as
-    // "future relative to me," second-guessed the system prompt,
-    // and refused tasks ("I cannot do research about 2026 because
-    // it's a future year"). Two-line fix:
-    //   1. Render the date in human-prose form alongside the ISO
-    //      timestamp — the model's tokenizer chunks "May 5, 2026"
-    //      and "2026-05-05" differently, and the prose form
-    //      reinforces "this is the actual current date" against a
-    //      stale training prior.
-    //   2. Add an explicit cutoff-confusion guard so the model
-    //      doesn't refuse tasks that reference dates past its
-    //      training data. Frames training data as a starting point,
-    //      not a ceiling, and points at web_search / research as
-    //      the right tools for "I don't know about events after my
-    //      cutoff."
-    //
-    // Timezone framing: when the SPA supplies the operator's IANA
-    // zone, render the local clock + offset alongside UTC and tell
-    // the agent which one to anchor on. Without this, "create a
-    // calendar event at 6pm" was being emitted as `2026-05-05T18:00:00Z`
-    // — i.e. 11am Pacific, the regression that prompted this fix.
-    let local_block = caller_timezone
-        .and_then(|tz| tz.parse::<chrono_tz::Tz>().ok())
-        .map(|tz| {
-            let local = now_utc.with_timezone(&tz);
-            format!(
-                "* Current date: {} ({} {})\n  (UTC: {})\n",
-                local.format("%A, %B %-d, %Y %-I:%M %p"),
-                tz.name(),
-                local.format("%Z"),
-                now_utc.format("%Y-%m-%dT%H:%M:%SZ"),
-            )
-        });
-    if let Some(b) = local_block {
-        out.push_str(&b);
-        out.push_str(
-            "* Bare clock times in the operator's message (\"6pm\", \"tomorrow at 9\") \
-             refer to the local zone above. When emitting RFC3339 timestamps to tools \
-             (calendar, routines, etc.), use the local offset (e.g. \
-             `2026-05-05T18:00:00-07:00`), NOT a `Z` suffix — a `Z` will land the event \
-             in UTC and surface in Google Calendar shifted by the offset.\n",
-        );
-    } else {
-        out.push_str(&format!(
-            "* Current date: {} (UTC: {})\n",
-            now_utc.format("%A, %B %-d, %Y"),
-            now_utc.format("%Y-%m-%dT%H:%M:%SZ"),
-        ));
-        out.push_str(
-            "* Operator timezone is unknown — if the user gives a bare clock time \
-             (\"6pm\"), ask which zone they mean before emitting an RFC3339 timestamp.\n",
-        );
-    }
-    out.push_str(
-        "* Date above is real, not hypothetical — for post-cutoff facts use \
-         `web_search` or `research_start`.\n",
-    );
-    out.push_str(&format!("* Conversation id: `{conversation_id}`\n"));
-    if let Some(p) = sender_principal_id {
-        out.push_str(&format!("* From principal: `{p}`\n"));
-    }
-    out.push_str(&format!("* Trust class: `{sender_trust}`\n"));
-    if let Some(ch) = origin_channel {
-        out.push_str(&format!("* Origin channel: `{ch}`\n"));
-        if ch != "web" {
-            // Channel-awareness nudge so the model doesn't ship
-            // web-UI specific phrasing ("the card will appear",
-            // "click the download button") to a user on a
-            // text-only transport. The host auto-bridges plain
-            // text replies, so the model can answer naturally
-            // without picking a channel-specific tool.
-            out.push_str(&format!(
-                "* This turn was triggered by an inbound message on the `{ch}` channel. \
-                 The host will auto-deliver your text reply back through `{ch}` — \
-                 reply naturally as you would in any chat. Do NOT describe web-UI \
-                 surfaces (no \"card,\" \"chip,\" \"download button,\" \"sidebar\") \
-                 since the user is not in a browser. File deliverables (research \
-                 PDFs, etc.) are auto-attached to your reply by the host.\n",
-            ));
-        }
-    } else {
-        out.push_str("* Origin channel: `web`\n");
-    }
-    // Group-conversation block. Only renders for actual groups
-    // (mixed-membership with ≥1 non-Controller human) — the
-    // resolver returns `None` for DMs / web / single-actor flows
-    // so the prompt stays small there. The block has three jobs:
-    //
-    //   1. Tell the agent it's in a group (it had no way to know
-    //      before this — the system prompt looked identical to a
-    //      DM, which is why operators saw the agent barge into
-    //      group conversations).
-    //
-    //   2. Give it the room's shape: name when known, member
-    //      count so it can calibrate "many people are talking"
-    //      vs "small group."
-    //
-    //   3. Surface the upstream router's verdict so the agent
-    //      can match its posture to the strength of the signal
-    //      that woke it up. An explicit `<@mention>` is a clear
-    //      invitation; a fall-open dispatch is "you might NOT
-    //      have been addressed, behave accordingly."
-    if let Some(g) = group {
-        // Short, directive group block. Earlier wording was a
-        // multi-line "posture" paragraph that the agent ignored —
-        // operators saw the model reply "I don't have that
-        // information either, should I ask Elyssa?" to a message
-        // clearly addressed at Elyssa. The fix is to make the
-        // group rules concrete and absolute, frame the router's
-        // verdict as a fallible guess (not authoritative
-        // permission), and be terse — small models lose nuance
-        // under verbose instructions.
-        out.push_str("\n## Group conversation\n\n");
-        let group_label = match &g.group_name {
-            Some(n) => format!("\"{}\"", n.replace('"', "\\\"")),
-            None => "an unnamed group".to_owned(),
-        };
-        out.push_str(&format!(
-            "You are in {group_label} ({n} participants). Every other participant \
-             can read every message — you are not a relay.\n\n",
-            n = g.member_count,
-        ));
-        // The "Hard rules" framing matters: small/cheap models
-        // ignore wishy-washy "should" wording but follow numbered
-        // hard rules. Rule #1 is the one that actually fires for
-        // the failure mode the user reported (a message addressing
-        // someone else by name).
-        out.push_str(
-            "Hard rules:\n\
-             1. If this message addresses ANY person by name and that name is NOT yours, \
-             reply with NOTHING. The named person will answer. Do not offer to ask them — \
-             they are in this group and have already seen the message.\n\
-             2. If this message is one word, an emoji, a reaction, or generic chatter \
-             between humans, reply with NOTHING.\n\
-             3. Default is silence. Only speak when directly named, @-mentioned, or \
-             continuing a thread you started.\n\
-             4. When you do reply, one line. No \"happy to help,\" no offers to do things \
-             you weren't asked to do.\n\n",
-        );
-        // Reframe the verdict so the agent doesn't read it as
-        // authoritative permission to answer. The classifier is
-        // upstream; its guess can be wrong; the agent is the
-        // last line of defense.
-        out.push_str(&format!(
-            "Router's guess about why you woke up (often wrong — apply the hard rules \
-             regardless): {desc}.\n",
-            desc = g.addressed_reason.description(),
-        ));
-    }
-    out
-}
-
-/// Phase 11.B — assemble the turn's system prompt. Four halves:
-///
-///   1. **Operator-editable personality** (§5.5). Pulled from
-///      `config_personality` via `compose_system_prompt`. Includes
-///      the conversation-scope override merged on top of the global
-///      default. Best-effort — a missing/corrupt personality table
-///      collapses to an empty chunk so the static base alone still
-///      flies.
-///   2. **Static system base** (§2.8). The trust-class rules,
-///      refusal behaviour, etc. that operators don't tweak. Comes
-///      from `state.config.system_prompt`. Sits *after* the
-///      personality so it has the final word on conflict.
-///   3. **Tool routing prose** (delta #2 from the agent-prompting
-///      audit, 2026-05). Built dynamically from the live tool
-///      catalogue so the model gets a "Quick reference: which tool
-///      family handles which kind of task" map BEFORE it scans the
-///      individual descriptions. Mirrors what selfhosted-claw's
-///      `buildSystemPrompt` baked in statically; here the prefixes
-///      we recognise drive emission so newly-installed plugins
-///      light up automatically without a code change.
-///
-/// Operators override "agent voice"; the static base owns
-/// non-negotiable safety rules; the routing block teaches the
-/// model when to reach for which family.
-/// Turn `(tool_name, args)` into a one-liner the operator can
-/// read while the agent works. Mirrors the "Searching for X…" UX
-/// selfhosted-claw used to surface in its activity pill, but
-/// generated server-side so the SPA stays a dumb subscriber.
-///
-/// The mapping is a hand-tuned table for the families execlaw
-/// ships today; tools without a match get a generic fallback so a
-/// freshly-installed plugin's tool still surfaces something
-/// readable instead of a raw symbol name.
-///
-/// Args are inspected with `serde_json::Value::get` — every lookup
-/// returns `Option`, so a missing or wrongly-shaped arg never
-/// panics; we just fall back to the no-arg form of the verb.
-pub(crate) fn humanise_tool_call(tool_name: &str, args: &serde_json::Value) -> String {
-    let s = |key: &str| args.get(key).and_then(|v| v.as_str()).map(str::to_owned);
-    let truncate = |opt: Option<String>, max: usize| -> Option<String> {
-        opt.map(|v| {
-            if v.chars().count() > max {
-                let mut t = v.chars().take(max).collect::<String>();
-                t.push('…');
-                t
-            } else {
-                v
-            }
-        })
-    };
-    match tool_name {
-        "web_search" => match truncate(s("query"), 60) {
-            Some(q) => format!("Searching the web for “{q}”"),
-            None => "Searching the web".into(),
-        },
-        "web_fetch" => match truncate(s("url"), 80) {
-            Some(u) => format!("Reading {u}"),
-            None => "Fetching a page".into(),
-        },
-        "read_memory" => match s("key") {
-            Some(k) => format!("Looking up note ‘{k}’"),
-            None => "Looking through saved notes".into(),
-        },
-        "list_memory" => "Listing saved notes".into(),
-        "write_memory" => match s("key") {
-            Some(k) => format!("Saving note ‘{k}’"),
-            None => "Saving a note".into(),
-        },
-        "read_chat_history" => "Reviewing the conversation".into(),
-        "list_chats" => "Listing your chats".into(),
-        "get_thread" => "Inspecting a chat thread".into(),
-        "set_thread_name" => "Renaming this thread".into(),
-        "notify_controller" => "Pinging you on your priority channel".into(),
-        "delegate_task" => "Spinning up a sub-agent".into(),
-        "research_start" => match truncate(s("query"), 60) {
-            Some(q) => format!("Kicking off research on “{q}”"),
-            None => "Starting a research job".into(),
-        },
-        "research_status" => "Checking research status".into(),
-        "research_list" => "Listing research jobs".into(),
-        "research_get_report" => "Reading a research report".into(),
-        "routine_create" => match s("name") {
-            Some(n) => format!("Creating routine ‘{n}’"),
-            None => "Creating a routine".into(),
-        },
-        "routine_list" => "Listing routines".into(),
-        "routine_get" | "routine_pause" | "routine_resume" | "routine_update"
-        | "routine_delete" => {
-            // routine_<verb> — fold them into one phrasing.
-            let verb = tool_name.trim_start_matches("routine_");
-            let pretty = match verb {
-                "get" => "checking",
-                "pause" => "pausing",
-                "resume" => "resuming",
-                "update" => "updating",
-                "delete" => "deleting",
-                _ => verb,
-            };
-            format!(
-                "{} a routine",
-                pretty
-                    .chars()
-                    .next()
-                    .map(|c| c.to_uppercase().collect::<String>() + &pretty[c.len_utf8()..])
-                    .unwrap_or_else(|| pretty.into())
-            )
-        }
-        // === Transport-plugin tools (any channel) ===
-        //
-        // The convention is `{channel}.{verb}` — `signal.send_message`,
-        // `sms.send_message`, `whatsapp.create_group`, etc. We
-        // recognise the verb and surface a transport-aware label,
-        // formatting the channel name human-readable. Previously
-        // these arms were hardcoded per-Signal; that broke the
-        // moment plugins for sms / whatsapp / slack landed because
-        // their tools fell through to the generic dotted-namespace
-        // fallback below ("send message via whatsapp"), which is
-        // awkward and doesn't surface the recipient.
-        n if n.contains('.') && is_transport_tool_verb(n) => {
-            let (channel, verb) = n.split_once('.').unwrap();
-            humanise_transport_tool(channel, verb, &s)
-        }
-        // Plugin-namespaced tools (`google.calendar.list_events`
-        // etc) get a "<verb> via <namespace>" rendering. Operators
-        // have plugin descriptions in the catalogue; the loader
-        // just needs to read like English.
-        n if n.contains('.') => {
-            let parts: Vec<&str> = n.splitn(2, '.').collect();
-            let ns = parts[0];
-            let verb = parts.get(1).copied().unwrap_or("call").replace('_', " ");
-            format!("{verb} via {ns}")
-        }
-        // Last-resort fallback. `read_chat_history` style
-        // snake_case becomes "Read chat history".
-        _ => {
-            let pretty = tool_name.replace('_', " ");
-            let mut chars = pretty.chars();
-            match chars.next() {
-                Some(c) => c.to_uppercase().chain(chars).collect(),
-                None => "Working".into(),
-            }
-        }
-    }
-}
-
-/// True iff the part after the first `.` in a dotted tool name is
-/// one of the known transport-plugin verbs. Keeps `humanise_tool_call`'s
-/// transport-aware branch from claiming non-transport namespaced
-/// tools (e.g. `google_calendar.create_event` would otherwise look
-/// like a "create_event" verb on a `google_calendar` channel).
-fn is_transport_tool_verb(tool_name: &str) -> bool {
-    match tool_name.split_once('.') {
-        Some((_, verb)) => matches!(
-            verb,
-            "send_message"
-                | "reply"
-                | "create_group"
-                | "add_group_members"
-                | "remove_group_members"
-                | "list_groups"
-                | "leave_group"
-        ),
-        None => false,
-    }
-}
-
-/// Format a transport-plugin tool call into human prose, given the
-/// channel and the verb. Recipient / title args come through `s`
-/// (a getter built from the JSON args earlier in `humanise_tool_call`).
-fn humanise_transport_tool(
-    channel: &str,
-    verb: &str,
-    s: &impl Fn(&str) -> Option<String>,
-) -> String {
-    let label = display_label_for_channel(channel);
-    match verb {
-        "send_message" => match s("to") {
-            Some(to) => format!("Sending {label} message to {to}"),
-            None => format!("Sending a {label} message"),
-        },
-        "reply" => format!("Replying on {label}"),
-        "create_group" => match s("title").or_else(|| s("name")) {
-            Some(t) => format!("Creating {label} group “{t}”"),
-            None => format!("Creating a {label} group"),
-        },
-        "add_group_members" => match s("groupName").or_else(|| s("group_name")) {
-            Some(g) => format!("Adding members to “{g}”"),
-            None => format!("Adding members to a {label} group"),
-        },
-        "remove_group_members" => match s("groupName").or_else(|| s("group_name")) {
-            Some(g) => format!("Removing members from “{g}”"),
-            None => format!("Removing members from a {label} group"),
-        },
-        "list_groups" => format!("Listing {label} groups"),
-        "leave_group" => match s("groupName").or_else(|| s("group_name")) {
-            Some(g) => format!("Leaving {label} group “{g}”"),
-            None => format!("Leaving a {label} group"),
-        },
-        _ => format!("{verb} via {channel}").replace('_', " "),
-    }
-}
-
-/// Convert a channel id (`signal`, `sms`, `whatsapp`, `slack`) into
-/// the prose form operators expect to read in the loader pill. We
-/// special-case channels with non-Title-case canonical spellings
-/// (`SMS`, `MMS`-future) and Title-case the rest.
-///
-/// For unknown channels installed at runtime we fall back to
-/// Title-Case-ing the id; future improvement: read the channel's
-/// human name from the plugin manifest's `[transport].label` field.
-fn display_label_for_channel(channel: &str) -> String {
-    match channel {
-        "sms" | "mms" => channel.to_uppercase(),
-        other => {
-            let mut chars = other.chars();
-            match chars.next() {
-                Some(c) => c.to_uppercase().chain(chars).collect(),
-                None => other.to_string(),
-            }
-        }
-    }
-}
-
-pub(crate) fn assemble_system_prompt(
-    db: &execlaw_core::Database,
-    conversation_id: Option<&str>,
-    static_base: &str,
-    routing_prose: &str,
-    turn_context: &str,
-) -> String {
-    let store = execlaw_core::personality::PersonalityStore::new(db);
-    let personality_chunk =
-        execlaw_core::personality::compose_system_prompt(&store, conversation_id)
-            .unwrap_or_default();
-    let p = personality_chunk.trim();
-    let b = static_base.trim();
-    let r = routing_prose.trim();
-    let c = turn_context.trim();
-    let mut out = String::new();
-    let mut sep = |s: &mut String| {
-        if !s.is_empty() {
-            s.push_str("\n\n---\n\n");
-        }
-    };
-    if !p.is_empty() {
-        out.push_str(p);
-    }
-    if !b.is_empty() {
-        sep(&mut out);
-        out.push_str(b);
-    }
-    if !r.is_empty() {
-        sep(&mut out);
-        out.push_str(r);
-    }
-    // Turn context is LAST so the most-recent runtime facts are
-    // closest to the user message in the request order — recency
-    // bias generally helps the model pick them up.
-    if !c.is_empty() {
-        sep(&mut out);
-        out.push_str(c);
-    }
-    out
-}
-
-/// Build the per-turn tool-routing block from the live tool
-/// catalogue. The prose is grouped by tool-name prefix:
-///
-///   * known prefixes from the built-in catalogue get a curated
-///     one-liner that tells the model when to reach for that
-///     family;
-///   * plugin namespaces (anything containing a `.`) get a generic
-///     "tools prefixed `X.` come from the X plugin — read each
-///     tool's description for usage" line so newly-installed
-///     plugins are surfaced automatically;
-///   * the block is empty when no tools are registered (defensive
-///     — a turn with zero tools shouldn't read like the model is
-///     forgetting capabilities).
-///
-/// This runs once per turn; it allocates a few small strings and
-/// walks the catalogue once. Cheap relative to the LLM call.
-pub(crate) fn build_tool_routing_prose(
-    builtin_names: &[String],
-    plugin_names: &[String],
-) -> String {
-    use std::collections::BTreeSet;
-
-    // Sentences keyed by tool-family prefix. Hand-tuned to mirror
-    // the routing prose selfhosted-claw used to bake into its
-    // system prompt — the model needs WHEN, not just WHAT.
-    let routing_lines: &[(&str, &str)] = &[
-        (
-            "memory",
-            "* `read_memory` / `list_memory` / `write_memory` — durable per-controller notes. \
-             Read BEFORE answering questions about prior conversations or operator preferences. \
-             Write only when the operator explicitly says \"remember\" or shares a stable fact \
-             (preferences, recurring contacts, ongoing projects). Do NOT write summaries of \
-             every chat.",
-        ),
-        (
-            "web",
-            "* `web_search` + `web_fetch` — use as a PAIR for facts you don't know or that may \
-             have changed since training. Search to find URLs, then fetch the most-promising 1-3 \
-             to read. Don't fetch arbitrary URLs the operator didn't ask about.",
-        ),
-        (
-            "research",
-            "* `research_*` — multi-step deep-research jobs that run in the background. Use ONLY \
-             when the operator asks for a written report or comparative analysis; for a quick \
-             question, prefer `web_search` + `web_fetch` directly.",
-        ),
-        (
-            "routine",
-            "* `routine_*` — schedule recurring agent work (cron-shaped). Use when the operator \
-             says \"every Monday\", \"each morning\", or describes anything that should fire \
-             repeatedly without re-prompting. Do NOT use for one-shot reminders.",
-        ),
-        (
-            "chat",
-            "* `read_chat_history` / `list_chats` / `get_thread` / `set_thread_name` — inspect \
-             other conversations the operator is having. Use when the user references \"that \
-             thread\", \"the conversation about X\", or to find a thread to rename.",
-        ),
-        (
-            "controller",
-            "* `notify_controller` — sends a private message to the operator on their highest-\
-             priority channel. Use ONLY when (a) you need approval before acting, (b) you hit a \
-             blocker that needs a human decision, or (c) the operator told you to follow up out-\
-             of-band. Do NOT use for normal answers in this thread.",
-        ),
-        (
-            "delegate",
-            "* `delegate_task` — spin up a sub-agent for a self-contained task you can finish \
-             in the background. Use sparingly: it costs a fresh inference round and an isolated \
-             context.",
-        ),
-        (
-            "mcp",
-            "* `mcp_list_servers` / `mcp_add_server` / `mcp_remove_server` — install MCP \
-             (Model Context Protocol) servers so their tools flow into your catalog. Use when \
-             the operator says \"integrate / install / wire up the X MCP server\" (e.g. \
-             Atlassian, Linear, GitHub). Workflow: (1) `mcp_list_servers` to check what's \
-             already wired so you don't double-add; (2) `web_search` + `web_fetch` if you \
-             don't know the server's URL or auth shape; (3) ASK the user for any required API \
-             token / bearer in plain text — do NOT make one up; (4) call `mcp_add_server` with \
-             `transport: \"streamable_http\"`, the URL, and `auth_token` if needed. After the \
-             call returns, the server's tools auto-flow into your catalog as `mcp:<id>:<name>` \
-             — you can call them on the next turn. For Atlassian Rovo specifically: URL is \
-             `https://mcp.atlassian.com/v1/mcp/authv2`, auth via API token from \
-             id.atlassian.com.",
-        ),
-        (
-            // 2026-05-15 — added because the routing prose previously
-            // had no chart entry, and `chart.render` was bucketed as
-            // a "plugin-prefixed" tool with the generic
-            // "read its description" prose. Result: model didn't
-            // recognise chart-rendering as a workflow with a fetch
-            // step, defaulted to the "no tool helps, answer from
-            // own knowledge" escape hatch, and hallucinated stock
-            // prices. Top-level entry tells the model the chain
-            // BEFORE it scans individual descriptions.
-            "chart",
-            "* `chart.render` (built-in) — for ANY visualisation request, ALWAYS fetch real \
-             data via the matching data-source tool FIRST, then pipe the values into \
-             `chart.render`. Examples: stocks/ETFs/indices/crypto/FX → \
-             `yahoo_finance.historical_candles` first; weather → `open_meteo.forecast` / \
-             `.historical` first; anything else with an API → `web_fetch` first. NEVER \
-             invent data points to chart — if you cannot fetch them, say so instead of \
-             fabricating. After the chart renders it shows inline; your follow-up reply \
-             should be one short line of context, NOT a recap of the data.",
-        ),
-    ];
-
-    // 2026-05-15 — built-in tool namespaces that look plugin-like
-    // (have a `.` in the name) but aren't actually plugin-supplied.
-    // Catch these BEFORE the plugin-namespace bucketing so they don't
-    // get the misleading "comes from the X plugin" prose. The
-    // matching `routing_lines` entry above carries the right guidance.
-    const BUILTIN_NAMESPACES: &[&str] = &["chart"];
-
-    // Bucket every tool by its family prefix.
-    let mut present: BTreeSet<&str> = BTreeSet::new();
-    let mut plugin_namespaces: BTreeSet<String> = BTreeSet::new();
-    for name in builtin_names.iter().chain(plugin_names.iter()) {
-        if let Some(dot) = name.find('.') {
-            let ns = &name[..dot];
-            // Built-in dotted names route through the explicit
-            // `routing_lines` entry (e.g. "chart"). Look up the
-            // 'static str so we can insert into `present` (which
-            // holds &'static str matching the routing_lines keys),
-            // and skip the plugin-namespace bucket below so we
-            // don't double-emit prose.
-            if let Some(builtin_ns) = BUILTIN_NAMESPACES.iter().find(|b| **b == ns) {
-                present.insert(*builtin_ns);
-                continue;
-            }
-            // `calendar.list_events` → namespace `calendar`.
-            plugin_namespaces.insert(ns.to_owned());
-            continue;
-        }
-        let prefix = name.split('_').next().unwrap_or(name);
-        match prefix {
-            "read" | "write" | "list" => {
-                if name.contains("memory") {
-                    present.insert("memory");
-                } else if name.contains("chat") || name == "list_chats" {
-                    present.insert("chat");
-                }
-            }
-            "web" => {
-                present.insert("web");
-            }
-            "research" => {
-                present.insert("research");
-            }
-            "routine" => {
-                present.insert("routine");
-            }
-            "set" if name.contains("thread") => {
-                present.insert("chat");
-            }
-            "get" if name.contains("thread") => {
-                present.insert("chat");
-            }
-            "notify" => {
-                present.insert("controller");
-            }
-            "delegate" => {
-                present.insert("delegate");
-            }
-            "mcp" => {
-                present.insert("mcp");
-            }
-            _ => {}
-        }
-    }
-
-    let mut lines: Vec<String> = Vec::new();
-    for (key, prose) in routing_lines {
-        if present.contains(*key) {
-            lines.push((*prose).to_owned());
-        }
-    }
-    for ns in &plugin_namespaces {
-        lines.push(format!(
-            "* Tools prefixed `{ns}.` come from the `{ns}` plugin — read each tool's \
-             description for usage hints. The plugin's OAuth account (if any) is already \
-             connected when these tools appear in your catalogue.",
-        ));
-    }
-
-    if lines.is_empty() {
-        return String::new();
-    }
-
-    let mut out = String::from(
-        "## Tool routing — quick reference\n\n\
-         Match the operator's request to the right tool family BEFORE scanning individual \
-         descriptions:\n\n",
-    );
-    for line in lines {
-        out.push_str(&line);
-        out.push('\n');
-    }
-    out.push_str(
-        "\nWhen multiple families could apply, prefer the most specific one. If no tool helps \
-         AND the question is general knowledge (definitions, history, how-things-work, your own \
-         opinion), answer from your own knowledge. If no tool helps AND the question needs LIVE \
-         or DATED data (current prices, today's weather, breaking news, the operator's calendar, \
-         anything that may have changed since training), say you cannot fetch it — never \
-         invent values.",
-    );
-    out
 }
 
 /// `POST /api/chats/:id/stop` — flip the in-flight turn's cancel
@@ -4291,106 +3972,9 @@ pub async fn list_cards(
 ///
 /// Auth-gated. The single-controller setup means we don't role-check
 /// further here — `AuthedUser` is sufficient.
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct PatchThreadRequest {
-    /// `Some(Some(name))` to set, `Some(None)` to clear, `None` to skip.
-    /// Serde maps both `"display_name": null` and a missing field to
-    /// `None`; we distinguish via a custom `#[serde(default,
-    /// deserialize_with)]` shim so the operator can clear the name.
-    #[serde(default, deserialize_with = "deserialize_optional_field")]
-    #[schema(value_type = Option<String>)]
-    pub display_name: Option<Option<String>>,
-    pub is_pinned: Option<bool>,
-    /// When `Some(true)` AND `ephemeral_expires_at` is set, marks the
-    /// thread incognito with that expiry. When `Some(false)`, clears
-    /// the incognito flag (and clears the expiry implicitly).
-    pub is_ephemeral: Option<bool>,
-    /// Unix-seconds expiry for incognito threads. Only honored when
-    /// `is_ephemeral = Some(true)`. Ignored on `Some(false)`.
-    pub ephemeral_expires_at: Option<i64>,
-}
-
-/// Custom deserializer so `null` and missing are distinct: `None` =
-/// missing field (leave alone), `Some(None)` = explicit null (clear),
-/// `Some(Some(v))` = set.
-fn deserialize_optional_field<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: serde::Deserialize<'de>,
-{
-    Ok(Some(Option::deserialize(de)?))
-}
-
-#[derive(Debug, Serialize)]
-pub struct PatchThreadResponse {
-    pub conversation_id: String,
-    pub display_name: Option<String>,
-    pub is_pinned: bool,
-    pub is_ephemeral: bool,
-    pub ephemeral_expires_at: Option<i64>,
-}
-
-/// One thread row in `GET /api/chats`.
-#[derive(Debug, Serialize)]
-pub struct ThreadSummaryView {
-    pub conversation_id: String,
-    pub kind: String,
-    pub phase: String,
-    pub trust_class: String,
-    pub modality: String,
-    pub display_name: Option<String>,
-    pub is_pinned: bool,
-    pub is_ephemeral: bool,
-    pub ephemeral_expires_at: Option<i64>,
-    pub last_seq: i64,
-    /// Wall-clock unix-seconds of the last committed turn. Sidebar
-    /// orders by this (recency); zero for never-touched conversations.
-    pub last_activity_at: i64,
-    /// Channel name (`signal`, `whatsapp`, `email`, ...) for threads
-    /// bridged onto a non-web transport. `None` for web-only chats
-    /// (Control thread, ad-hoc threads created in the SPA). The
-    /// sidebar's "External channels" filter and per-row icon both
-    /// key on this — the binding store is the source of truth, not
-    /// the conversation `kind` column (which the inbound path stamps
-    /// generically, see `chats::ensure_conversation`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub transport_channel: Option<String>,
-    /// Bootstrap-icons name (sans `bi-` prefix) the SPA renders next
-    /// to the title for bridged threads. Resolved through
-    /// `HostTransportRegistry::icon_for(channel)`, which returns the
-    /// plugin-manifest-supplied value or the trait-default `"phone"`.
-    /// `None` when `transport_channel` is `None`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub transport_icon: Option<String>,
-}
-
-impl From<ThreadSummary> for ThreadSummaryView {
-    fn from(s: ThreadSummary) -> Self {
-        Self {
-            conversation_id: s.conversation_id.as_str().to_owned(),
-            kind: s.kind.as_str().to_owned(),
-            phase: s.phase.as_str().to_owned(),
-            trust_class: s.trust_class,
-            modality: s.modality.as_str().to_owned(),
-            display_name: s.display_name,
-            is_pinned: s.is_pinned,
-            is_ephemeral: s.is_ephemeral,
-            ephemeral_expires_at: s.ephemeral_expires_at,
-            last_seq: s.last_seq.0,
-            last_activity_at: s.last_activity_at,
-            // Filled in by `list_threads` after a binding lookup;
-            // `From` impls don't have DB access, so the conversion
-            // produces None and the handler stamps the real values.
-            transport_channel: None,
-            transport_icon: None,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-pub struct ThreadListResponse {
-    pub threads: Vec<ThreadSummaryView>,
-}
+//
+// Request/response types and the `From<ThreadSummary>` impl moved
+// to `chats/types.rs`. The handler body still lives below.
 
 /// `GET /api/chats` — every thread in the store, pinned first then by
 /// recent activity. Auth-gated; the SPA's sidebar polls this on mount
@@ -4607,6 +4191,8 @@ async fn run_incognito_send(
         chat_template_kwargs: Some(serde_json::json!({
             "enable_thinking": reasoning_enabled,
         })),
+        tool_choice: None,
+        guided_decoding_backend: None,
     };
     let adapter = execlaw_model_adapter::adapter_for(execlaw_model_adapter::ModelFamily::detect(
         &resolved_model_id,
@@ -4837,6 +4423,8 @@ pub async fn generate_title(
         // enable_thinking:false here regardless because Plain hint
         // never wants reasoning).
         chat_template_kwargs: None,
+        tool_choice: None,
+        guided_decoding_backend: None,
     };
     let adapter = execlaw_model_adapter::adapter_for(execlaw_model_adapter::ModelFamily::detect(
         &resolved_model_id,
@@ -4887,59 +4475,6 @@ pub async fn generate_title(
         .into_response()
 }
 
-/// Trim and clean a model-generated title so the sidebar shows
-/// something presentable. Strips wrapping quotes/backticks, trailing
-/// punctuation, and `<think>` blocks the model might leak. Caps at
-/// 60 chars defensively — the `<span>` ellipsis-truncates anyway,
-/// but a 200-char "title" would blow the SPA's tooltip.
-fn sanitize_generated_title(raw: &str) -> String {
-    // Drop any think blocks the chat-template knob didn't catch.
-    let stripped = strip_think_blocks(raw);
-    let mut s = stripped.trim().to_owned();
-    // Some models prefix with "Title:" despite the system prompt.
-    for prefix in ["Title:", "title:", "TITLE:"] {
-        if let Some(rest) = s.strip_prefix(prefix) {
-            s = rest.trim().to_owned();
-        }
-    }
-    // Strip wrapping quotes/backticks (single or paired).
-    let trims: &[char] = &['"', '\'', '`', '*', '#'];
-    s = s.trim_matches(trims).to_owned();
-    // Take just the first non-empty line — models occasionally
-    // append a follow-up sentence.
-    if let Some(first_line) = s.lines().find(|l| !l.trim().is_empty()) {
-        s = first_line.trim().to_owned();
-    }
-    // Trailing period/comma/semicolon — strip.
-    s = s.trim_end_matches(['.', ',', ';', ':']).to_owned();
-    if s.chars().count() > 60 {
-        s = s.chars().take(60).collect::<String>().trim().to_owned();
-    }
-    s
-}
-
-fn strip_think_blocks(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    loop {
-        let lower = rest.to_ascii_lowercase();
-        if let Some(open) = lower.find("<think>") {
-            out.push_str(&rest[..open]);
-            if let Some(close_rel) = lower[open..].find("</think>") {
-                let close = open + close_rel + "</think>".len();
-                rest = &rest[close..];
-            } else {
-                // Unterminated — drop the rest.
-                break;
-            }
-        } else {
-            out.push_str(rest);
-            break;
-        }
-    }
-    out
-}
-
 /// `DELETE /api/chats/:id` — hard-delete a conversation. Wipes the
 /// event log + the conversation row in one transaction. Idempotent:
 /// removing a non-existent thread returns 200 with `existed=false`.
@@ -4971,6 +4506,28 @@ pub async fn delete_thread(
     // streaming for this thread halts cleanly rather than racing
     // against the row going away.
     state.turn_cancel.cancel(cid.as_str());
+    // 2026-05-18 — python-sandbox cleanup hook (Phase 8d). Deletes
+    // the sidecar's per-conversation work dir at
+    // `~/.execlaw/sidecars/python-sandbox/kernel-gateway/work/<cid>/`
+    // so disk doesn't accumulate dead conversation state. Also
+    // tears down the conversation's pooled kernel if any. Best-
+    // effort — `service()` returns None when the python-sandbox
+    // plugin isn't installed or its sidecar didn't come healthy
+    // at boot, in which case the delete still succeeds (there's
+    // nothing on disk to clean up).
+    //
+    // The cleanup spawns into the tokio runtime rather than
+    // awaiting inline so the HTTP response doesn't block on a slow
+    // `docker exec rm -rf` if the work dir is large; the handler
+    // returns immediately and the cleanup races to completion in
+    // the background. Errors are logged at WARN by the service
+    // itself.
+    if let Some(svc) = crate::python_sandbox::service() {
+        let cid_for_cleanup = cid.clone();
+        tokio::spawn(async move {
+            svc.on_conversation_deleted(&cid_for_cleanup).await;
+        });
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -4981,764 +4538,13 @@ pub async fn delete_thread(
         .into_response()
 }
 
-/// Rewrite a URL so a Docker container can reach a service that
-/// the host is running on its loopback. `127.0.0.1` and `localhost`
-/// inside a container point at the container itself; the host is
-/// reachable via `host.docker.internal` (Docker Desktop) or via
-/// the `host-gateway` alias on Linux Docker (the bollard launcher
-/// adds `--add-host host.docker.internal:host-gateway` for us).
-///
-/// Only rewrites the host portion of `http://localhost:...` and
-/// `http://127.0.0.1:...`. Other hosts (real DNS names, container-
-/// network names, IPs in non-loopback ranges) pass through
-/// untouched — those already resolve correctly inside the runner.
-///
-/// Operators can override entirely via the `EXECLAW_RUNNER_HOST_ALIAS`
-/// env var if their network setup uses a different name.
-pub(crate) fn rewrite_url_for_container(url: &str) -> String {
-    let alias = std::env::var("EXECLAW_RUNNER_HOST_ALIAS")
-        .unwrap_or_else(|_| "host.docker.internal".to_owned());
-    rewrite_url_with_alias(url, &alias)
-}
-
-/// Pure helper, alias supplied explicitly. Drives both the
-/// production caller (`rewrite_url_for_container`) and the unit
-/// tests so we don't have to mutate process env (which Rust
-/// 2024 marks unsafe).
-fn rewrite_url_with_alias(url: &str, alias: &str) -> String {
-    // Cheap string scan: replace `://127.0.0.1` and `://localhost`
-    // with `://<alias>` only when they appear immediately after the
-    // scheme separator. Avoids accidentally munging path segments
-    // that happen to contain "localhost".
-    let lower = url.to_ascii_lowercase();
-    if let Some(idx) = lower.find("://127.0.0.1") {
-        let prefix = &url[..idx + 3];
-        let suffix = &url[idx + 3 + "127.0.0.1".len()..];
-        return format!("{prefix}{alias}{suffix}");
-    }
-    if let Some(idx) = lower.find("://localhost") {
-        let prefix = &url[..idx + 3];
-        let suffix = &url[idx + 3 + "localhost".len()..];
-        return format!("{prefix}{alias}{suffix}");
-    }
-    url.to_owned()
-}
-
-fn ensure_conversation(store: &ConversationStore<'_>, cid: &ConversationId) {
-    if matches!(store.get(cid), Ok(Some(_))) {
-        return;
-    }
-    let row = ConversationRow {
-        conversation_id: cid.clone(),
-        kind: ConversationKind::ControllerDM,
-        last_seq: EventSeq(0),
-        phase: Phase::Idle,
-        controller_id: None,
-        trust_class: "Controller".into(),
-        snapshot_blob: None,
-        snapshot_seq: None,
-        lease_owner: None,
-        lease_expires: None,
-        modality: Modality::Text,
-        display_name: None,
-        display_name_source: "auto".into(),
-        is_pinned: false,
-        is_ephemeral: false,
-        ephemeral_expires_at: None,
-        // 2026-04-28 — stamp so a freshly-minted conversation lands
-        // at the TOP of the sidebar even before its first turn
-        // commits. The chat handler bumps this again after the turn
-        // completes; the first send overwrites this with whatever
-        // wall-clock the turn finishes at.
-        last_activity_at: chrono::Utc::now().timestamp(),
-    };
-    let _ = store.upsert(&row);
-}
-
-/// Re-derive the conversation kind + trust class after an inbound
-/// message lands. Walks the existing row + the new sender's class
-/// tag and persists the result. Single-participant for web chat
-/// today; group conversations land with Phase 8 transports.
-fn refresh_conversation_kind(
-    store: &ConversationStore<'_>,
-    cid: &ConversationId,
-    sender_trust_tag: &str,
-) {
-    if let Ok(Some(mut row)) = store.get(cid) {
-        let kind = ConversationKind::derive(&[sender_trust_tag]);
-        if row.kind != kind {
-            row.kind = kind;
-        }
-        // Track the most-restrictive trust class on the conversation
-        // row — UI uses this to render the policy badge.
-        row.trust_class = sender_trust_tag.to_owned();
-        let _ = store.upsert(&row);
-    }
-}
-
-fn err_500(msg: &str) -> axum::response::Response {
-    tracing::error!("{msg}");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({"error": msg})),
-    )
-        .into_response()
-}
-
-/// Max accepted attachment bytes after base64 decode. ~20 MiB
-/// per image, comfortably above what the SPA pre-resizes to (~1 MiB
-/// on a 1024px JPEG) but small enough that an accidental "drop a
-/// 50 MB raw" doesn't blow up the request body parser or vLLM's
-/// per-image budget.
-const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
-
-/// Allowed mime types for composer-attached images. Anything outside
-/// this set fails with `attachment_mime_unsupported` so a malformed
-/// SPA upload doesn't end up routed to a vision model that rejects
-/// the format. Order doesn't matter — substring `eq` lookup.
-const ALLOWED_ATTACHMENT_MIMES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
-
-/// Decode + persist every `InlineAttachmentRequest` in the send
-/// payload, returning the new attachment ids in input order. The
-/// web-composer path (POST /api/chats/{id}/messages) calls this;
-/// the inbound transport-bridge path (Signal etc.) calls
-/// [`persist_inbound_attachment_bytes`] directly, which both share
-/// the [`write_attachment_blob`] core.
-///
-/// Errors translate to `ApiError`-shaped 4xx so the SPA can surface
-/// the specific failure (mime unsupported / data URL invalid / too
-/// large) inline next to the offending chip.
-fn persist_inline_attachments(
-    state: &AppState,
-    cid: &ConversationId,
-    requests: &[InlineAttachmentRequest],
-) -> Result<Vec<String>, crate::routes::ApiError> {
-    use base64::Engine;
-
-    let mut ids = Vec::with_capacity(requests.len());
-    for (idx, att) in requests.iter().enumerate() {
-        let mime = att.mime.trim().to_lowercase();
-        if !ALLOWED_ATTACHMENT_MIMES.contains(&mime.as_str()) {
-            return Err(crate::routes::ApiError {
-                status: StatusCode::BAD_REQUEST,
-                code: "attachment_mime_unsupported",
-                message: format!(
-                    "attachment #{idx}: mime '{}' is not supported (allowed: {})",
-                    att.mime,
-                    ALLOWED_ATTACHMENT_MIMES.join(", "),
-                ),
-            });
-        }
-        // Parse `data:<mime>;base64,<bytes>`. Tolerate optional
-        // parameters between the mime and `;base64,` (e.g.
-        // `data:image/png;name=foo;base64,...`) since some SPAs add
-        // them; we extract the comma-prefix and decode whatever
-        // follows.
-        let url = att.data_url.as_str();
-        let stripped = url
-            .strip_prefix("data:")
-            .ok_or_else(|| crate::routes::ApiError {
-                status: StatusCode::BAD_REQUEST,
-                code: "attachment_data_url_invalid",
-                message: format!("attachment #{idx}: data URL must start with 'data:'"),
-            })?;
-        let (meta, body) = stripped
-            .split_once(',')
-            .ok_or_else(|| crate::routes::ApiError {
-                status: StatusCode::BAD_REQUEST,
-                code: "attachment_data_url_invalid",
-                message: format!("attachment #{idx}: data URL has no comma separator"),
-            })?;
-        if !meta.contains("base64") {
-            return Err(crate::routes::ApiError {
-                status: StatusCode::BAD_REQUEST,
-                code: "attachment_data_url_invalid",
-                message: format!("attachment #{idx}: only base64 data URLs are accepted"),
-            });
-        }
-        let meta_mime = meta.split(';').next().unwrap_or("").trim().to_lowercase();
-        if !meta_mime.is_empty() && meta_mime != mime {
-            return Err(crate::routes::ApiError {
-                status: StatusCode::BAD_REQUEST,
-                code: "attachment_data_url_invalid",
-                message: format!(
-                    "attachment #{idx}: mime '{}' in data URL doesn't match declared '{}'",
-                    meta_mime, mime
-                ),
-            });
-        }
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(body.trim())
-            .map_err(|e| crate::routes::ApiError {
-                status: StatusCode::BAD_REQUEST,
-                code: "attachment_data_url_invalid",
-                message: format!("attachment #{idx}: base64 decode failed: {e}"),
-            })?;
-        if bytes.len() > MAX_ATTACHMENT_BYTES {
-            return Err(crate::routes::ApiError {
-                status: StatusCode::PAYLOAD_TOO_LARGE,
-                code: "attachment_too_large",
-                message: format!(
-                    "attachment #{idx} is {} bytes (max {})",
-                    bytes.len(),
-                    MAX_ATTACHMENT_BYTES
-                ),
-            });
-        }
-        let id = write_attachment_blob(state, cid, &mime, &bytes).map_err(|e| {
-            crate::routes::ApiError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                code: "attachment_write_failed",
-                message: format!("attachment #{idx}: {e}"),
-            }
-        })?;
-        ids.push(id);
-    }
-    Ok(ids)
-}
-
-/// Shared core for persisting an attachment's raw bytes. Writes
-/// `<data_dir>/blobs/<sha256>` content-addressed (identical bytes
-/// share one on-disk file) and inserts a `state_attachments` row
-/// scoped to the conversation, returning the fresh attachment id.
-///
-/// Called from both:
-///   * `persist_inline_attachments` — web composer's `+` flow, after
-///     decoding the data URL.
-///   * `persist_inbound_attachment_bytes` — transport-bridge flow
-///     (Signal etc.), after fetching the bytes via the plugin's
-///     `<channel>.fetch_attachment` tool.
-///
-/// Errors are returned as plain strings so callers can wrap them in
-/// the right error type for their surface (ApiError for the web
-/// path, tracing::warn-and-skip for the inbound path where a single
-/// bad attachment shouldn't fail the whole turn).
-fn write_attachment_blob(
-    state: &AppState,
-    cid: &ConversationId,
-    mime: &str,
-    bytes: &[u8],
-) -> Result<String, String> {
-    use execlaw_core::attachments::{AttachmentRow, AttachmentStore};
-    use execlaw_core::ids::AttachmentId;
-    use sha2::{Digest, Sha256};
-
-    let data_dir = state
-        .db_config
-        .path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let blobs_dir = data_dir.join("blobs");
-    std::fs::create_dir_all(&blobs_dir)
-        .map_err(|e| format!("create blobs dir {}: {e}", blobs_dir.display()))?;
-
-    let mut h = Sha256::new();
-    h.update(bytes);
-    let sha = format!("{:x}", h.finalize());
-    let path = blobs_dir.join(&sha);
-    if !path.exists() {
-        std::fs::write(&path, bytes).map_err(|e| format!("write blob {}: {e}", path.display()))?;
-    }
-
-    let att_id = AttachmentId::new();
-    let row = AttachmentRow {
-        id: att_id.clone(),
-        conversation_id: cid.clone(),
-        mime_type: mime.to_owned(),
-        path: path.to_string_lossy().into_owned(),
-        sha256: sha,
-        received_at: chrono::Utc::now().timestamp(),
-    };
-    AttachmentStore::new(&state.db)
-        .insert(&row)
-        .map_err(|e| format!("insert state_attachments row: {e}"))?;
-    Ok(att_id.as_str().to_owned())
-}
-
-/// Inbound-side: fetch every image attachment on an inbound
-/// transport message via the originating channel's
-/// `<channel>.fetch_attachment` plugin tool, persist via the same
-/// content-addressed `state_attachments` path as the web composer,
-/// and return the fresh attachment ids in input order.
-///
-/// Non-image MIME types are skipped silently (vision models can
-/// only see images; PDFs / audio / video would need separate
-/// preprocessors). Oversize blobs are rejected per-attachment so a
-/// single bad file doesn't kill the rest of the turn. Plugin-tool
-/// failures (sidecar offline, network hiccup) are logged at WARN
-/// and the failing attachment is dropped — the agent still gets
-/// the surviving subset.
-pub async fn persist_inbound_attachments(
-    state: &AppState,
-    cid: &ConversationId,
-    channel: &str,
-    attachments: &[execlaw_script::InboundAttachmentMeta],
-) -> Vec<String> {
-    use base64::Engine;
-
-    if attachments.is_empty() {
-        return Vec::new();
-    }
-    let tool_name = format!("{channel}.fetch_attachment");
-    let mut ids = Vec::new();
-    for att in attachments {
-        // Filter to images upfront — every other media type just
-        // wastes a fetch + on-disk blob the LLM can't use.
-        let content_type = att.content_type.as_deref().unwrap_or("");
-        if !content_type.starts_with("image/") {
-            tracing::debug!(
-                target: "chats::inbound_attachments",
-                bridge_id = %att.bridge_id,
-                content_type,
-                "non-image inbound attachment skipped (vision-only for now)",
-            );
-            continue;
-        }
-        if let Some(size) = att.size_bytes {
-            if size as usize > MAX_ATTACHMENT_BYTES {
-                tracing::warn!(
-                    target: "chats::inbound_attachments",
-                    bridge_id = %att.bridge_id,
-                    size_bytes = size,
-                    max = MAX_ATTACHMENT_BYTES,
-                    "inbound attachment exceeds size cap; skipping",
-                );
-                continue;
-            }
-        }
-
-        // Call the plugin's fetch_attachment tool. Controller-trust
-        // call site (the inbound consumer is host-driven), no
-        // capability gate.
-        let args = serde_json::json!({"attachment_id": att.bridge_id});
-        let resp = match state
-            .plugin_host
-            .call_tool(&tool_name, args, &["*"], Some("Controller"))
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    target: "chats::inbound_attachments",
-                    channel,
-                    bridge_id = %att.bridge_id,
-                    error = %e,
-                    "fetch_attachment tool failed; skipping",
-                );
-                continue;
-            }
-        };
-
-        // Parse the plugin's response shape:
-        //   { data_url: "data:<mime>;base64,...", mime_type, size_bytes }
-        let data_url = match resp.get("data_url").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => {
-                tracing::warn!(
-                    target: "chats::inbound_attachments",
-                    channel,
-                    bridge_id = %att.bridge_id,
-                    "fetch_attachment response missing data_url; skipping",
-                );
-                continue;
-            }
-        };
-        let reported_mime = resp
-            .get("mime_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or(content_type)
-            .to_lowercase();
-        // Same parse rules as the web composer's data-URL flow.
-        let Some(stripped) = data_url.strip_prefix("data:") else {
-            tracing::warn!(
-                target: "chats::inbound_attachments",
-                bridge_id = %att.bridge_id,
-                "fetch_attachment data_url missing 'data:' prefix; skipping",
-            );
-            continue;
-        };
-        let Some((meta, body)) = stripped.split_once(',') else {
-            tracing::warn!(
-                target: "chats::inbound_attachments",
-                bridge_id = %att.bridge_id,
-                "fetch_attachment data_url missing comma; skipping",
-            );
-            continue;
-        };
-        if !meta.contains("base64") {
-            tracing::warn!(
-                target: "chats::inbound_attachments",
-                bridge_id = %att.bridge_id,
-                "fetch_attachment data_url is not base64; skipping",
-            );
-            continue;
-        }
-        let bytes = match base64::engine::general_purpose::STANDARD.decode(body.trim()) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    target: "chats::inbound_attachments",
-                    bridge_id = %att.bridge_id,
-                    error = %e,
-                    "fetch_attachment base64 decode failed; skipping",
-                );
-                continue;
-            }
-        };
-        if bytes.len() > MAX_ATTACHMENT_BYTES {
-            tracing::warn!(
-                target: "chats::inbound_attachments",
-                bridge_id = %att.bridge_id,
-                size_bytes = bytes.len(),
-                max = MAX_ATTACHMENT_BYTES,
-                "inbound attachment exceeds size cap after decode; skipping",
-            );
-            continue;
-        }
-        // Final mime check — even if the plugin self-reported, only
-        // accept what the vision pipeline can ingest.
-        if !ALLOWED_ATTACHMENT_MIMES.contains(&reported_mime.as_str()) {
-            tracing::debug!(
-                target: "chats::inbound_attachments",
-                bridge_id = %att.bridge_id,
-                mime = %reported_mime,
-                "fetched attachment is not an accepted image type; skipping",
-            );
-            continue;
-        }
-        match write_attachment_blob(state, cid, &reported_mime, &bytes) {
-            Ok(id) => ids.push(id),
-            Err(e) => {
-                tracing::warn!(
-                    target: "chats::inbound_attachments",
-                    bridge_id = %att.bridge_id,
-                    error = %e,
-                    "persist inbound attachment failed; skipping",
-                );
-            }
-        }
-    }
-    ids
-}
-
-/// Load each attachment id from `state_attachments`, read the bytes,
-/// and emit a `data:<mime>;base64,<bytes>` URL. Ids missing from the
-/// store or pointing at another conversation are skipped silently so
-/// a half-broken row can't fail the turn; the agent sees the
-/// surviving subset rather than crashing the chat.
-///
-/// Shared between `run_real_turn` (non-runner path) and
-/// `run_runner_turn`. Used to build the OpenAI vision content array
-/// that gets sent to the inference backend for the current turn.
-fn encode_attachments_as_data_urls(
-    db: &execlaw_core::Database,
-    cid: &ConversationId,
-    attachment_ids: &[String],
-) -> Vec<String> {
-    use base64::Engine;
-    if attachment_ids.is_empty() {
-        return Vec::new();
-    }
-    let store = execlaw_core::attachments::AttachmentStore::new(db);
-    let mut out: Vec<String> = Vec::with_capacity(attachment_ids.len());
-    for id_str in attachment_ids {
-        let id = execlaw_core::ids::AttachmentId::from(id_str.as_str());
-        let Ok(Some(row)) = store.get(&id) else {
-            tracing::warn!(
-                target: "chats::encode_attachments",
-                attachment_id = %id_str,
-                "attachment row missing — image will not reach the model",
-            );
-            continue;
-        };
-        if row.conversation_id.as_str() != cid.as_str() {
-            tracing::warn!(
-                target: "chats::encode_attachments",
-                attachment_id = %id_str,
-                "attachment cross-conversation; refusing to include in LLM call",
-            );
-            continue;
-        }
-        match std::fs::read(&row.path) {
-            Ok(bytes) => {
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                out.push(format!("data:{};base64,{}", row.mime_type, b64));
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "chats::encode_attachments",
-                    attachment_id = %id_str,
-                    path = %row.path,
-                    error = %e,
-                    "attachment blob read failed — skipping",
-                );
-            }
-        }
-    }
-    out
-}
-
-/// Resolve operator-picked skill names to a single prepended block
-/// that gets prefixed onto the user text before the model sees it.
-/// Returns the prepended block (empty `String` when no skills were
-/// picked) — caller concatenates it with the original text. Each
-/// skill renders as:
-///
-/// ```text
-/// <skill name="foo/bar">
-/// {body_md}
-/// </skill>
-///
-/// ```
-///
-/// XML-style tags because the model parses them cleanly and the SPA
-/// can regex-strip the same shape from the prepended `text` when
-/// rendering the original user message in the bubble.
-///
-/// Errors:
-///   * Unknown / archived skill → `(StatusCode::NOT_FOUND, "skill_not_found")`.
-///   * Sum of resolved body bytes exceeds [`MAX_PREPEND_SKILL_BYTES`]
-///     → `(StatusCode::PAYLOAD_TOO_LARGE, "skill_prepend_too_large")`.
-fn resolve_skill_prepend(
-    db: &execlaw_core::Database,
-    names: &[String],
-) -> Result<String, (StatusCode, &'static str, String)> {
-    if names.is_empty() {
-        return Ok(String::new());
-    }
-    let store = execlaw_skills::SkillStore::new(db.clone());
-    let mut blocks = String::new();
-    let mut total_bytes: usize = 0;
-    for name in names {
-        let view = store.view(name).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "skill_lookup_failed",
-                format!("skill '{name}' lookup failed: {e}"),
-            )
-        })?;
-        let Some(view) = view else {
-            return Err((
-                StatusCode::NOT_FOUND,
-                "skill_not_found",
-                format!("no skill named '{name}' (or it is archived)"),
-            ));
-        };
-        total_bytes = total_bytes.saturating_add(view.body_md.len());
-        if total_bytes > MAX_PREPEND_SKILL_BYTES {
-            return Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "skill_prepend_too_large",
-                format!(
-                    "selected skills exceed the {MAX_PREPEND_SKILL_BYTES}-byte prepend cap; \
-                     remove one or pick smaller skills"
-                ),
-            ));
-        }
-        blocks.push_str(&format!(
-            "<skill name=\"{name}\">\n{body}\n</skill>\n\n",
-            body = view.body_md.trim_end_matches('\n'),
-        ));
-    }
-    Ok(blocks)
-}
-
-/// Pull the attachment-ids list off a `user_msg` payload. Empty for
-/// other kinds and for legacy events that pre-date the field. Used
-/// by `list_messages` to surface image refs on the SPA bubble and by
-/// the chat-history hydration in `run_real_turn` to encode images as
-/// content parts when calling a vision-capable model.
-fn extract_attachment_ids(e: &EventRecord) -> Vec<String> {
-    match e.kind {
-        EventKind::UserMsg => e
-            .decode_payload::<UserMessagePayload>()
-            .ok()
-            .map(|p| p.attachment_ids)
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
-/// Pull the `applied_skill_names` list off a `user_msg` payload.
-/// Empty for other kinds and for legacy events that pre-date the
-/// field. Surfaced on `MessageView` so the SPA can render an
-/// "applied: foo, bar" chip under the message bubble.
-fn extract_applied_skill_names(e: &EventRecord) -> Vec<String> {
-    match e.kind {
-        EventKind::UserMsg => e
-            .decode_payload::<UserMessagePayload>()
-            .ok()
-            .map(|p| p.applied_skill_names)
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
-/// Resolve attachment ids → `MessageAttachmentView` rows. Hydrates
-/// mime types from `state_attachments`; ids that can't be looked up
-/// (deleted blob, cross-conversation probe attempt, DB hiccup) are
-/// silently dropped from the response so the SPA renders the
-/// best-effort subset rather than failing the whole list call.
-fn hydrate_message_attachments(
-    db: &execlaw_core::Database,
-    cid: &ConversationId,
-    ids: &[String],
-) -> Vec<MessageAttachmentView> {
-    if ids.is_empty() {
-        return Vec::new();
-    }
-    let store = execlaw_core::attachments::AttachmentStore::new(db);
-    let mut out = Vec::with_capacity(ids.len());
-    for id in ids {
-        let att_id = execlaw_core::ids::AttachmentId::from(id.as_str());
-        match store.get(&att_id) {
-            Ok(Some(row)) if row.conversation_id.as_str() == cid.as_str() => {
-                out.push(MessageAttachmentView {
-                    id: id.clone(),
-                    mime: row.mime_type,
-                });
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-fn extract_text(e: &EventRecord) -> Option<String> {
-    match e.kind {
-        EventKind::UserMsg => e
-            .decode_payload::<UserMessagePayload>()
-            .ok()
-            .map(|p| p.text),
-        EventKind::ModelTurn => e
-            .decode_payload::<StubModelTurnPayload>()
-            .ok()
-            .map(|p| p.text)
-            .or_else(|| {
-                // Fall back to the richer ModelTurnPayload shape produced
-                // by the full TurnExecutor.
-                e.decode_payload::<RealModelTurnPayload>()
-                    .ok()
-                    .map(|p| p.text)
-            }),
-        // 2026-05-15 — surface ToolUse + ToolResult payloads as JSON
-        // strings so the SPA's MessageStream can:
-        //   * dispatch tool_result events to the chat-component
-        //     registry (`detectChatComponent` parses this JSON
-        //     looking for `chat_component_kind: "<kind>"`); and
-        //   * fall back to a readable `renderToolFallback` for
-        //     unknown kinds (better than the empty-text view that
-        //     shipped before — was the bug behind "agent ran
-        //     chart.render but the chart never appeared").
-        //
-        // For ToolResult, prefer the inner Ok(...) value when
-        // success — that's the JSON the tool actually emitted (and
-        // what the chat-component dispatcher needs). Errors get
-        // wrapped in a small envelope so the SPA's fallback shows
-        // "tool failed: <reason>" rather than dumping the raw Result
-        // discriminant.
-        EventKind::ToolUse => e
-            .decode_payload::<ToolUsePayload>()
-            .ok()
-            .and_then(|p| serde_json::to_string(&p.args_json).ok()),
-        EventKind::ToolResult => e
-            .decode_payload::<ToolResultPayload>()
-            .ok()
-            .and_then(|p| match p.outcome {
-                Ok(value) => serde_json::to_string(&value).ok(),
-                Err(reason) => serde_json::to_string(&serde_json::json!({
-                    "error": reason,
-                }))
-                .ok(),
-            }),
-        _ => None,
-    }
-}
-
-/// Pull `channel_origin` out of the payload for events that carry
-/// it (user_msg + model_turn). Returns None for other event kinds
-/// or when the field is absent (legacy events / web-originated
-/// turns). Surfaced on `MessageView` so the SPA can render a
-/// per-message transport icon.
-fn extract_channel_origin(e: &EventRecord) -> Option<String> {
-    match e.kind {
-        EventKind::UserMsg => e
-            .decode_payload::<UserMessagePayload>()
-            .ok()
-            .and_then(|p| p.channel_origin),
-        EventKind::ModelTurn => e
-            .decode_payload::<RealModelTurnPayload>()
-            .ok()
-            .and_then(|p| p.channel_origin)
-            .or_else(|| {
-                e.decode_payload::<StubModelTurnPayload>()
-                    .ok()
-                    .and_then(|p| p.channel_origin)
-            }),
-        _ => None,
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct UserMessagePayload {
-    text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    sender_principal_id: Option<String>,
-    /// Transport this message arrived on. `None` for the default
-    /// web path (the SPA falls back to "web" when absent), set to
-    /// the bridge name (`signal`, `email`, `voice`, `sms`, ...) for
-    /// transport-triggered turns. The SPA reads this off
-    /// `MessageView` to render a per-message channel icon so the
-    /// operator can tell at a glance "this came in via Signal".
-    /// Backward-compatible: existing events without this field
-    /// deserialize as `None` and the SPA shows no icon.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    channel_origin: Option<String>,
-    /// 2026-05-15 — IDs into `state_attachments` for image attachments
-    /// the operator added via the composer's `+` menu. Backward-
-    /// compatible default `Vec::new()` so prior events without the
-    /// field deserialize cleanly. When non-empty, the chat-history
-    /// projection (in `run_real_turn`) fetches each row, base64-
-    /// encodes the bytes, and emits the user turn as an OpenAI
-    /// vision content array.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    attachment_ids: Vec<String>,
-    /// 2026-05-15 — names of skills the operator selected from the
-    /// composer's `+` menu for THIS turn. The skill bodies were
-    /// already resolved + prepended onto `text` server-side before
-    /// the model saw them; this field is purely metadata for the
-    /// SPA to render an "applied: foo, bar" chip on the message
-    /// bubble (and for forensics — an audit reader can see which
-    /// guidance shaped this turn). Backward-compatible default
-    /// `Vec::new()` so prior events without the field deserialize.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    applied_skill_names: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StubModelTurnPayload {
-    model: String,
-    text: String,
-    finish_reason: Option<String>,
-    /// Transport the agent's reply went out on (when bridged via a
-    /// transport). Same encoding as [`UserMessagePayload::channel_origin`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    channel_origin: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RealModelTurnPayload {
-    model: String,
-    text: String,
-    finish_reason: Option<String>,
-    prompt_tokens: Option<u32>,
-    completion_tokens: Option<u32>,
-    /// Transport the agent's reply went out on (when bridged via a
-    /// transport). Same encoding as [`UserMessagePayload::channel_origin`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    channel_origin: Option<String>,
-}
+// Attachment helpers (persist_inline_attachments, write_attachment_blob,
+// persist_inbound_attachments, encode_attachments_as_data_urls,
+// hydrate_message_attachments, extract_*) moved to `chats/attachments.rs`.
+// Persisted event payload structs (UserMessagePayload,
+// StubModelTurnPayload, RealModelTurnPayload) moved to
+// `chats/types.rs`. They're crate-private; `chats.rs` imports them
+// from the submodule above.
 
 #[cfg(test)]
 mod tests {
@@ -6690,8 +5496,13 @@ mod tests {
             prose.contains("ALWAYS fetch real data"),
             "chart entry must spell out the fetch-first chain, got: {prose}",
         );
+        // 2026-05-16 — commit 146b0d4 trimmed the verbose chart prose
+        // from "NEVER invent data" to "Never invent points; never
+        // retype data into points." The invariant (forbid
+        // hallucinating data) is preserved; this assertion follows
+        // the current wording rather than the original phrasing.
         assert!(
-            prose.contains("NEVER invent data"),
+            prose.contains("Never invent points"),
             "chart entry must explicitly forbid hallucinating data points, got: {prose}",
         );
         // Plugin-namespace fallback is NOT used for chart (it IS used
@@ -6968,11 +5779,14 @@ mod tests {
     #[test]
     fn build_turn_context_prose_renders_group_block_with_strong_signal() {
         // Pin the wording the agent reads in a group: the block
-        // names the group + member count, includes the "hard rules"
-        // section that the model reliably follows (the verbose
-        // posture-paragraph version was being ignored), and frames
-        // the router's verdict as a fallible guess rather than
-        // authoritative permission.
+        // names the group, includes the "hard rules" section that
+        // the model reliably follows, and surfaces the router's
+        // verdict in compact form. The verbose posture-paragraph
+        // version (member count, "you are not a relay" preamble,
+        // multi-sentence router framing) was trimmed 2026-05-16
+        // because the cumulative context volume correlated with
+        // out-of-distribution drift on tool_call emission for
+        // Signal-tier chart turns.
         let now = chrono::Utc::now();
         let g = super::GroupTurnContext {
             group_name: Some("Project Loon".into()),
@@ -6990,7 +5804,6 @@ mod tests {
         );
         assert!(prose.contains("Group conversation"));
         assert!(prose.contains("\"Project Loon\""));
-        assert!(prose.contains("4 participants"));
         // The hard-rules block is the load-bearing piece — without
         // these the model defaults to "be helpful" and barges in.
         assert!(prose.to_lowercase().contains("hard rules"));
@@ -7002,14 +5815,12 @@ mod tests {
                 .contains("addresses any person by name"),
             "rule against addressing-someone-else must be present; got: {prose}",
         );
-        // The router's verdict must be present AND framed as a
-        // guess, not as permission. The "often wrong" framing is
-        // what stops the model from reading the verdict as
-        // authoritative.
+        // Compact router-verdict footer ("(Woke for: <desc>.)"). The
+        // pre-trim version had a multi-sentence "often wrong"
+        // hedge that the model sometimes parroted back at users.
         assert!(
-            prose.to_lowercase().contains("router's guess")
-                && prose.to_lowercase().contains("often wrong"),
-            "router verdict must be framed as a fallible guess; got: {prose}",
+            prose.to_lowercase().contains("woke for"),
+            "router verdict must surface in trimmed form; got: {prose}",
         );
     }
 
@@ -7594,6 +6405,700 @@ mod tests {
         );
     }
 
+    /// 2026-05-16 — planner/executor containment: when policy fires
+    /// the split (`effective_trust < KnownTrusted`), the runner's
+    /// `tool_catalog` must be EMPTY. Pre-fix the runner branch won
+    /// over the `use_tool_path` filter in send_message AND
+    /// `run_runner_turn` advertised every tool unconditionally — so
+    /// a Limited contact reaching the runner saw the full plugin +
+    /// built-in catalog and could be jailbroken into exfil via tool
+    /// args. The catalog-build helper is the load-bearing fix.
+    #[test]
+    fn build_runner_tool_catalog_strips_all_tools_when_planner_executor() {
+        let state = test_app_state();
+        // Seed one plugin tool so an unfiltered catalog would be non-empty.
+        let manifest = execlaw_plugin_sdk::PluginManifest::parse(
+            r#"
+[plugin]
+id = "p"
+name = "p"
+version = "1.0.0"
+
+[[tools]]
+name = "p.tool_a"
+latency = "low"
+required_capabilities = []
+"#,
+        )
+        .unwrap();
+        state.plugin_host.registry().enable(&manifest).unwrap();
+
+        // Sanity: catalog is non-empty WITHOUT the split.
+        let with_split_off = super::build_runner_tool_catalog(
+            &state.db,
+            &state.plugin_host,
+            TrustLevel::Controller,
+            &["*".to_owned()],
+            false,
+        );
+        assert!(
+            !with_split_off.declarations.is_empty(),
+            "baseline: catalog must be non-empty for Controller without split"
+        );
+        // Routing-prose name list must mirror declarations (P2):
+        // pre-fix prose was built from the unfiltered registry while
+        // declarations were filtered, so the model's system prompt
+        // routed it to stripped names.
+        assert!(
+            !with_split_off.builtin_names.is_empty()
+                || !with_split_off.plugin_tool_names.is_empty(),
+            "name lists must also be populated for routing prose"
+        );
+
+        // With the split on → empty regardless of caller trust / caps.
+        let with_split_on = super::build_runner_tool_catalog(
+            &state.db,
+            &state.plugin_host,
+            TrustLevel::Controller,
+            &["*".to_owned()],
+            true,
+        );
+        assert!(
+            with_split_on.declarations.is_empty(),
+            "planner/executor split MUST strip all tools (§9.2 invariant)"
+        );
+        assert!(
+            with_split_on.builtin_names.is_empty() && with_split_on.plugin_tool_names.is_empty(),
+            "name lists must also be empty when the split fires (otherwise routing prose leaks tool names)"
+        );
+    }
+
+    /// `config_tool_access` pre-filter: a tool whose `allowed_classes`
+    /// excludes the caller's trust class is removed from the catalog,
+    /// so the model never sees a name it would just get denied on at
+    /// dispatch. Mirrors `ChainedToolDispatch::check_access`.
+    #[test]
+    fn build_runner_tool_catalog_filters_by_tool_access_row() {
+        use execlaw_core::tool_access::{ToolAccessSeed, ToolAccessStore, ToolSource};
+
+        let state = test_app_state();
+        let manifest = execlaw_plugin_sdk::PluginManifest::parse(
+            r#"
+[plugin]
+id = "p"
+name = "p"
+version = "1.0.0"
+
+[[tools]]
+name = "controller_only_tool"
+latency = "low"
+required_capabilities = []
+
+[[tools]]
+name = "open_tool"
+latency = "low"
+required_capabilities = []
+"#,
+        )
+        .unwrap();
+        state.plugin_host.registry().enable(&manifest).unwrap();
+
+        // Seed an access row that restricts `controller_only_tool` to
+        // `["Controller"]`. `open_tool` has no row → allow-by-default.
+        let store = ToolAccessStore::new(&state.db);
+        store
+            .upsert_seen(
+                &ToolAccessSeed {
+                    tool_name: "controller_only_tool".into(),
+                    source: ToolSource::Plugin,
+                    source_id: Some("p".into()),
+                    description: None,
+                    input_schema: None,
+                    default_allowed_classes: vec!["Controller".into()],
+                },
+                100,
+            )
+            .unwrap();
+
+        // KnownLimited caller: `controller_only_tool` is excluded; `open_tool` survives.
+        let limited = super::build_runner_tool_catalog(
+            &state.db,
+            &state.plugin_host,
+            TrustLevel::KnownLimited,
+            &["messaging.reply_current_transport".to_owned()],
+            false,
+        );
+        let names: Vec<&str> = limited
+            .declarations
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
+        assert!(
+            !names.contains(&"controller_only_tool"),
+            "Controller-only tool must NOT appear in a KnownLimited catalog"
+        );
+        assert!(
+            names.contains(&"open_tool"),
+            "missing-row tool must be allow-by-default"
+        );
+        // Routing-prose names track declarations.
+        assert!(
+            !limited
+                .plugin_tool_names
+                .contains(&"controller_only_tool".to_owned())
+        );
+        assert!(limited.plugin_tool_names.contains(&"open_tool".to_owned()));
+
+        // Controller caller: both tools appear.
+        let controller = super::build_runner_tool_catalog(
+            &state.db,
+            &state.plugin_host,
+            TrustLevel::Controller,
+            &["*".to_owned()],
+            false,
+        );
+        let names: Vec<&str> = controller
+            .declarations
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
+        assert!(names.contains(&"controller_only_tool"));
+        assert!(names.contains(&"open_tool"));
+    }
+
+    /// 2026-05-16 — Codex P2: built-in tools are now capability-
+    /// filtered before being advertised to the model. A KnownLimited
+    /// caller seeing a memory_write built-in in the catalog would
+    /// waste prompt tokens on a tool the dispatch gate (fix #4) will
+    /// just deny; aligning catalog with dispatch policy keeps the two
+    /// in sync.
+    #[test]
+    fn build_runner_tool_catalog_filters_builtins_by_caller_caps() {
+        use async_trait::async_trait;
+        use execlaw_core::tool::{
+            Capability, ToolCtx, ToolDescriptor, ToolImpl, ToolLatency,
+            ToolOutcome as CoreToolOutcome, ToolSource as CoreToolSource,
+        };
+
+        struct Builtin {
+            d: ToolDescriptor,
+        }
+        #[async_trait]
+        impl ToolImpl for Builtin {
+            fn descriptor(&self) -> &ToolDescriptor {
+                &self.d
+            }
+            async fn invoke(&self, _ctx: ToolCtx, _args: serde_json::Value) -> CoreToolOutcome {
+                CoreToolOutcome::ok(serde_json::json!({}))
+            }
+        }
+
+        let state = test_app_state();
+        state
+            .plugin_host
+            .registry()
+            .register_builtin(std::sync::Arc::new(Builtin {
+                d: ToolDescriptor {
+                    name: "memory_write_test".into(),
+                    description: "writes memory".into(),
+                    schema: serde_json::json!({"type": "object"}),
+                    source: CoreToolSource::Builtin,
+                    latency: ToolLatency::Low,
+                    capabilities: vec![Capability::MemoryWrite],
+                    default_allowed_classes: vec!["Controller".into(), "KnownTrusted".into()],
+                },
+            }))
+            .unwrap();
+        state
+            .plugin_host
+            .registry()
+            .register_builtin(std::sync::Arc::new(Builtin {
+                d: ToolDescriptor {
+                    name: "no_caps_test".into(),
+                    description: "no capability requirements".into(),
+                    schema: serde_json::json!({"type": "object"}),
+                    source: CoreToolSource::Builtin,
+                    latency: ToolLatency::Low,
+                    capabilities: vec![],
+                    default_allowed_classes: vec!["Controller".into(), "KnownLimited".into()],
+                },
+            }))
+            .unwrap();
+
+        // KnownLimited (only `messaging.reply_current_transport`) —
+        // memory_write_test is filtered out, no_caps_test survives.
+        let limited = super::build_runner_tool_catalog(
+            &state.db,
+            &state.plugin_host,
+            TrustLevel::KnownLimited,
+            &["messaging.reply_current_transport".to_owned()],
+            false,
+        );
+        let names: Vec<&str> = limited
+            .declarations
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
+        assert!(
+            !names.contains(&"memory_write_test"),
+            "built-in declaring MemoryWrite must be filtered from a \
+             KnownLimited catalog — caller has no memory.write cap"
+        );
+        assert!(
+            names.contains(&"no_caps_test"),
+            "built-in with no capability requirements must survive"
+        );
+        // Routing-prose builtin_names tracks the filtered declarations.
+        assert!(
+            !limited
+                .builtin_names
+                .contains(&"memory_write_test".to_owned())
+        );
+        assert!(limited.builtin_names.contains(&"no_caps_test".to_owned()));
+
+        // Controller wildcard — both visible.
+        let controller = super::build_runner_tool_catalog(
+            &state.db,
+            &state.plugin_host,
+            TrustLevel::Controller,
+            &["*".to_owned()],
+            false,
+        );
+        let names: Vec<&str> = controller
+            .declarations
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
+        assert!(names.contains(&"memory_write_test"));
+        assert!(names.contains(&"no_caps_test"));
+    }
+
+    /// Plugin-tool capability pre-filter: a plugin tool whose
+    /// `required_capabilities` exceeds the caller's `caller_caps` is
+    /// removed from the catalog. Wildcard `"*"` (Controller) bypasses.
+    #[test]
+    fn build_runner_tool_catalog_filters_plugin_tools_by_required_capabilities() {
+        let state = test_app_state();
+        let manifest = execlaw_plugin_sdk::PluginManifest::parse(
+            r#"
+[plugin]
+id = "p"
+name = "p"
+version = "1.0.0"
+
+[[tools]]
+name = "needs_memory"
+latency = "low"
+required_capabilities = ["memory.read", "memory.write"]
+
+[[tools]]
+name = "needs_nothing"
+latency = "low"
+required_capabilities = []
+"#,
+        )
+        .unwrap();
+        state.plugin_host.registry().enable(&manifest).unwrap();
+
+        // KnownLimited caller (no memory caps) — `needs_memory` is filtered.
+        let limited = super::build_runner_tool_catalog(
+            &state.db,
+            &state.plugin_host,
+            TrustLevel::KnownLimited,
+            &["messaging.reply_current_transport".to_owned()],
+            false,
+        );
+        let names: Vec<&str> = limited
+            .declarations
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
+        assert!(
+            !names.contains(&"needs_memory"),
+            "tool with required_capabilities not in caller_caps must be filtered"
+        );
+        assert!(
+            names.contains(&"needs_nothing"),
+            "tool with zero required_capabilities must remain visible"
+        );
+
+        // KnownTrusted caller (has memory.read + memory.write) — both visible.
+        let trusted = super::build_runner_tool_catalog(
+            &state.db,
+            &state.plugin_host,
+            TrustLevel::KnownTrusted,
+            &[
+                "messaging.reply_current_transport".to_owned(),
+                "memory.read".to_owned(),
+                "memory.write".to_owned(),
+                "tools.safe".to_owned(),
+            ],
+            false,
+        );
+        let names: Vec<&str> = trusted
+            .declarations
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
+        assert!(names.contains(&"needs_memory"));
+        assert!(names.contains(&"needs_nothing"));
+    }
+
+    /// 2026-05-16 — runner-path durability: when the runner dispatches
+    /// tools via the WS `ToolCallRequest` / `ToolCallResult` round-trip,
+    /// the server is responsible for emitting paired `tool_use` +
+    /// `tool_result` events into the log (the runner only emits
+    /// `model_turn`). This test mirrors the exact `pending`-Vec shape
+    /// `run_runner_turn` builds for a two-call turn (one success, one
+    /// failure) and confirms `commit_turn` accepts it and replay
+    /// reconstructs both pairs with matching ordinals.
+    ///
+    /// Pre-fix this didn't pair: the drain loop submitted the result
+    /// to the supervisor and updated in-memory `messages` but never
+    /// pushed `tool_use`/`tool_result` `PendingEvent`s, so replay/audit
+    /// couldn't see what tools ran.
+    #[tokio::test]
+    async fn runner_path_emits_paired_tool_events() {
+        use execlaw_core::events::{
+            EventKind, EventLog, PendingEvent, ToolResultPayload, ToolUsePayload,
+        };
+        use execlaw_core::ids::{ConversationId, EventSeq};
+
+        let state = test_app_state();
+        let log = EventLog::new(&state.db)
+            .with_hmac_key(state.event_log_hmac_key.as_ref().unwrap().as_ref().clone());
+        let cid = ConversationId::from("runner-pair-conv");
+
+        // Mirror the exact `pending`-Vec shape the drain loop builds
+        // for a turn with two tool calls (ordinal 0 ok, ordinal 1 err)
+        // followed by a `model_turn`.
+        let mut tool_ordinal: u32 = 0;
+        let mut pending: Vec<PendingEvent> = Vec::new();
+
+        // Call 1 — success.
+        let o0 = tool_ordinal;
+        tool_ordinal += 1;
+        pending.push(
+            PendingEvent::encode(
+                EventKind::ToolUse,
+                &ToolUsePayload {
+                    ordinal: o0,
+                    tool_name: "web.fetch".into(),
+                    args_json: serde_json::json!({"url": "https://example.test"}),
+                },
+                Some("agent".into()),
+            )
+            .unwrap(),
+        );
+        pending.push(
+            PendingEvent::encode(
+                EventKind::ToolResult,
+                &ToolResultPayload {
+                    ordinal: o0,
+                    outcome: Ok(serde_json::json!({"status": 200, "body": "ok"})),
+                },
+                Some("system".into()),
+            )
+            .unwrap(),
+        );
+
+        // Call 2 — failure (e.g. plugin denied). No further reads of
+        // `tool_ordinal` after this branch, so the trailing `+= 1`
+        // would be dead.
+        let o1 = tool_ordinal;
+        pending.push(
+            PendingEvent::encode(
+                EventKind::ToolUse,
+                &ToolUsePayload {
+                    ordinal: o1,
+                    tool_name: "memory.write".into(),
+                    args_json: serde_json::json!({"key": "k", "value": "v"}),
+                },
+                Some("agent".into()),
+            )
+            .unwrap(),
+        );
+        pending.push(
+            PendingEvent::encode(
+                EventKind::ToolResult,
+                &ToolResultPayload {
+                    ordinal: o1,
+                    outcome: Err("capability not granted".into()),
+                },
+                Some("system".into()),
+            )
+            .unwrap(),
+        );
+
+        // Terminal model_turn.
+        pending.push(
+            PendingEvent::encode(
+                EventKind::ModelTurn,
+                &serde_json::json!({"text": "done"}),
+                Some("agent".into()),
+            )
+            .unwrap(),
+        );
+
+        let written = log.commit_turn(&cid, EventSeq(0), pending).unwrap();
+        // No synthesized cancel — every tool_use already has a paired
+        // tool_result, so commit_turn emits exactly what we passed.
+        assert_eq!(
+            written.len(),
+            5,
+            "expected 2x (tool_use + tool_result) + model_turn",
+        );
+
+        // Replay and verify the pairs reconstruct.
+        let events = log.replay_since(&cid, EventSeq(0)).unwrap();
+        let uses: Vec<u32> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::ToolUse)
+            .map(|e| e.decode_payload::<ToolUsePayload>().unwrap().ordinal)
+            .collect();
+        let results: Vec<(u32, bool)> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::ToolResult)
+            .map(|e| {
+                let r: ToolResultPayload = e.decode_payload().unwrap();
+                (r.ordinal, r.outcome.is_err())
+            })
+            .collect();
+        assert_eq!(uses, vec![0, 1]);
+        assert_eq!(results, vec![(0, false), (1, true)]);
+        assert!(
+            events.iter().any(|e| e.kind == EventKind::ModelTurn),
+            "model_turn must be in the same commit"
+        );
+    }
+
+    /// 2026-05-16 — Codex P4: the runner-mediated history hydration
+    /// must include `tool_use` / `tool_result` events. Pre-fix only
+    /// `UserMsg` / `ModelTurn` were emitted, so a turn that followed
+    /// a prior turn with tool calls saw "user asked X / assistant
+    /// said Y" but had no record of WHICH tools the agent had
+    /// invoked to produce Y. The runner path now mirrors
+    /// `runner-local::hydrate_messages`: buffer `ToolUse` into a
+    /// pending list, attach them to the next `ModelTurn`'s
+    /// `tool_calls`, and emit `ToolResult` as standalone `tool`
+    /// messages keyed by `call_<ordinal>`.
+    #[test]
+    fn build_runner_history_messages_includes_tool_traces() {
+        use execlaw_core::events::{
+            EventKind, EventLog, PendingEvent, ToolResultPayload, ToolUsePayload,
+        };
+        use execlaw_core::ids::{ConversationId, EventSeq};
+        use execlaw_inference_api::Role;
+
+        let state = test_app_state();
+        let log = EventLog::new(&state.db)
+            .with_hmac_key(state.event_log_hmac_key.as_ref().unwrap().as_ref().clone());
+        let cid = ConversationId::from("runner-hydrate-conv");
+
+        // Turn 1: user → tool_use → tool_result → model_turn.
+        log.commit_turn(
+            &cid,
+            EventSeq(0),
+            vec![
+                PendingEvent::encode(
+                    EventKind::UserMsg,
+                    &serde_json::json!({"text": "find me a chart"}),
+                    Some("controller".into()),
+                )
+                .unwrap(),
+                PendingEvent::encode(
+                    EventKind::ToolUse,
+                    &ToolUsePayload {
+                        ordinal: 0,
+                        tool_name: "chart.render".into(),
+                        args_json: serde_json::json!({"spec": "..."}),
+                    },
+                    Some("agent".into()),
+                )
+                .unwrap(),
+                PendingEvent::encode(
+                    EventKind::ToolResult,
+                    &ToolResultPayload {
+                        ordinal: 0,
+                        outcome: Ok(serde_json::json!({"chart_id": "c1"})),
+                    },
+                    Some("system".into()),
+                )
+                .unwrap(),
+                PendingEvent::encode(
+                    EventKind::ModelTurn,
+                    &serde_json::json!({
+                        "model": "Q",
+                        "text": "here is the chart",
+                        "finish_reason": "stop",
+                    }),
+                    Some("agent".into()),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        // Turn 2: a new user_msg representing the CURRENT turn (which
+        // the runner will receive via `TurnRequest.user_text` and so
+        // must be skipped from history).
+        let latest = log.last_seq(&cid).unwrap();
+        let current_user_event = execlaw_core::events::EventRecord::new(
+            cid.clone(),
+            latest.next(),
+            EventKind::UserMsg,
+            &serde_json::json!({"text": "what color was that?"}),
+            Some("controller".into()),
+        )
+        .unwrap();
+        log.append(&current_user_event).unwrap();
+
+        let history = log.replay_since(&cid, EventSeq(0)).unwrap();
+
+        let messages = super::build_runner_history_messages(
+            &history,
+            current_user_event.seq,
+            None,
+            execlaw_core::history_budget::DEFAULT_HISTORY_TOKENS,
+        );
+
+        // Expected shape (OpenAI-compliant; the assistant message
+        // bearing tool_calls MUST precede the matching tool message):
+        //   [0] User "find me a chart"
+        //   [1] Assistant (content="", tool_calls=[call_0])
+        //   [2] Tool (tool_call_id="call_0", chart result)
+        //   [3] Assistant "here is the chart" (terminal ModelTurn,
+        //       no tool_calls)
+        // The current turn's user_msg is SKIPPED — runner gets it via
+        // `TurnRequest.user_text`.
+        assert_eq!(
+            messages.len(),
+            4,
+            "user + assistant(tool_calls) + tool + assistant(final) must all hydrate; \
+             current-turn user_msg must be skipped"
+        );
+        assert!(matches!(messages[0].role, Role::User));
+        assert!(matches!(messages[1].role, Role::Assistant));
+        assert!(matches!(messages[2].role, Role::Tool));
+        assert!(matches!(messages[3].role, Role::Assistant));
+        // The synthetic assistant(tool_calls) message bears the call.
+        assert_eq!(
+            messages[1].tool_calls.len(),
+            1,
+            "synthetic assistant message must carry the matching tool_call"
+        );
+        assert_eq!(messages[1].tool_calls[0].function.name, "chart.render");
+        assert_eq!(messages[1].tool_calls[0].id, "call_0");
+        // The tool message references that call id.
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_0"));
+        // The terminal ModelTurn assistant carries the final text and
+        // NO tool_calls (per fix #P1a — tool_calls live on the
+        // synthetic assistant, not the terminal one).
+        assert_eq!(
+            messages[3].content.as_ref().map(|c| c.as_text().to_owned()),
+            Some("here is the chart".to_owned()),
+        );
+        assert!(
+            messages[3].tool_calls.is_empty(),
+            "terminal ModelTurn assistant must not carry tool_calls"
+        );
+    }
+
+    /// 2026-05-16 — runner-path error/cancel audit invariant
+    /// (Codex P1). If the runner emits `TurnEvent::Error` (cancel OR
+    /// real failure) AFTER one or more tools have already executed,
+    /// the drain loop's `pending` Vec must STILL land in the event
+    /// log along with a synthetic `model_turn` carrying the cancel/
+    /// error reason. Pre-fix the abnormal-end branch returned
+    /// `Err(...)` without committing, dropping the audit trail for
+    /// side effects (HTTP fetches fired, memory written, etc.) that
+    /// had already happened.
+    ///
+    /// This test pins the on-disk shape `run_runner_turn` produces
+    /// in the abnormal-end branch: tool_use + tool_result + a
+    /// system-actor model_turn with `finish_reason = "cancelled"`.
+    #[tokio::test]
+    async fn runner_abnormal_end_still_commits_executed_tools() {
+        use execlaw_core::events::{
+            EventKind, EventLog, PendingEvent, ToolResultPayload, ToolUsePayload,
+        };
+        use execlaw_core::ids::{ConversationId, EventSeq};
+
+        let state = test_app_state();
+        let log = EventLog::new(&state.db)
+            .with_hmac_key(state.event_log_hmac_key.as_ref().unwrap().as_ref().clone());
+        let cid = ConversationId::from("runner-cancel-conv");
+
+        // Mirror exactly what `run_runner_turn`'s abnormal-end branch
+        // pushes: one already-executed tool pair + a synthetic
+        // model_turn marked cancelled.
+        let mut pending: Vec<PendingEvent> = Vec::new();
+        pending.push(
+            PendingEvent::encode(
+                EventKind::ToolUse,
+                &ToolUsePayload {
+                    ordinal: 0,
+                    tool_name: "calendar.create_event".into(),
+                    args_json: serde_json::json!({"title": "lunch"}),
+                },
+                Some("agent".into()),
+            )
+            .unwrap(),
+        );
+        pending.push(
+            PendingEvent::encode(
+                EventKind::ToolResult,
+                &ToolResultPayload {
+                    ordinal: 0,
+                    outcome: Ok(serde_json::json!({"event_id": "evt-1"})),
+                },
+                Some("system".into()),
+            )
+            .unwrap(),
+        );
+        pending.push(
+            PendingEvent::encode(
+                EventKind::ModelTurn,
+                &serde_json::json!({
+                    "model": "",
+                    "text": "(stopped before any output)",
+                    "finish_reason": "cancelled",
+                }),
+                Some("system".into()),
+            )
+            .unwrap(),
+        );
+
+        let written = log.commit_turn(&cid, EventSeq(0), pending).unwrap();
+        assert_eq!(
+            written.len(),
+            3,
+            "tool_use + tool_result + synth model_turn must all land"
+        );
+
+        let events = log.replay_since(&cid, EventSeq(0)).unwrap();
+        let kinds: Vec<EventKind> = events.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::ToolUse,
+                EventKind::ToolResult,
+                EventKind::ModelTurn
+            ],
+            "executed tool pair must survive the abnormal-end commit \
+             so audit can reconstruct what side effects happened"
+        );
+        // The synthetic model_turn carries the cancel marker so
+        // replay can distinguish "(stopped...)" from a normal reply.
+        let mt = events
+            .iter()
+            .find(|e| e.kind == EventKind::ModelTurn)
+            .unwrap();
+        let payload: serde_json::Value = mt.decode_payload().unwrap();
+        assert_eq!(payload["finish_reason"], "cancelled");
+        assert_eq!(payload["text"], "(stopped before any output)");
+    }
+
     /// **Phase 1 crash test (b):** replay after a simulated crash
     /// reconstructs the conversation exactly — same events, same
     /// order, all HMAC-verified. Models the "worker restarts, reads
@@ -7658,6 +7163,105 @@ mod tests {
             resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "tampered log must fail the read, not return forged rows"
+        );
+    }
+
+    /// 2026-05-16 — fix #6: when the sender is unknown (cold-contact
+    /// flow parks the turn awaiting approval), any inline attachments
+    /// the SPA shipped MUST NOT be persisted. Pre-fix
+    /// `persist_inline_attachments` ran upfront, so a malicious caller
+    /// could drop bytes-on-disk + `state_attachments` rows for a
+    /// conversation it had no policy right to send to. Now the bytes
+    /// are decoded in-memory only and committed at the end, past the
+    /// cold-contact short-circuit.
+    #[tokio::test]
+    async fn parked_cold_contact_turn_does_not_persist_attachments() {
+        let state = test_app_state();
+        let db = state.db.clone();
+        let app = crate::routes::build_router(state);
+
+        // Tiny valid base64 string (4 bytes after decode). Mime
+        // matches the allowlist; the body passes Phase A validation
+        // so the request would have hit Phase B persist on the pre-fix
+        // path.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "text": "smuggle this in",
+            "sender_principal_id": "stranger-attach-1",
+            "attachments": [{
+                "mime": "image/png",
+                "data_url": "data:image/png;base64,AAAA",
+            }],
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/chats/cold-conv-attach/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // Cold-contact path returns 202 (parked).
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // Now confirm NO state_attachments row was written for this
+        // conversation. The pre-fix bug would have left exactly one
+        // row pointing at a blob file under <data_dir>/blobs/.
+        let row_count: i64 = db
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM state_attachments WHERE conversation_id = ?1",
+                    rusqlite::params!["cold-conv-attach"],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(execlaw_core::db::DbError::Sqlite)
+            })
+            .unwrap();
+        assert_eq!(
+            row_count, 0,
+            "fix #6: a parked cold-contact turn must NOT leak persisted attachments"
+        );
+    }
+
+    /// Sanity companion: a successful Controller turn DOES persist
+    /// its attachment. Asserts the commit-point still fires on the
+    /// happy path so we haven't regressed the success path while
+    /// fixing the drop path.
+    #[tokio::test]
+    async fn controller_turn_persists_attachments_through_commit_point() {
+        let state = test_app_state();
+        let db = state.db.clone();
+        let app = crate::routes::build_router(state);
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "text": "look at this",
+            "attachments": [{
+                "mime": "image/png",
+                "data_url": "data:image/png;base64,AAAA",
+            }],
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/chats/persist-happy/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let row_count: i64 = db
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM state_attachments WHERE conversation_id = ?1",
+                    rusqlite::params!["persist-happy"],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(execlaw_core::db::DbError::Sqlite)
+            })
+            .unwrap();
+        assert_eq!(
+            row_count, 1,
+            "Controller turn must persist its inline attachment exactly once"
         );
     }
 
@@ -8099,5 +7703,131 @@ required_capabilities = []
         )
         .await;
         assert!(body["display_name"].is_null(), "explicit null must clear");
+    }
+
+    // ==================================================================
+    // resolve_runner_routed_group (2026-05-16)
+    //
+    // The Controller SPA-send path used to route every turn to the
+    // Controller's own runner regardless of whether the conversation
+    // was bridged onto a transport. Replies into a 5-person Signal
+    // group thread executed on the Controller's private runner,
+    // co-mingling group-chat KV cache + tool side-effects with the
+    // Controller's other threads. Fix: read the conversation's bound
+    // `principal_group_id` first; only fall back to `resolve_chat_group`
+    // when no binding exists yet.
+    //
+    // These tests pin both branches:
+    //   1. Binding present → return it (Signal-group runner case).
+    //   2. Binding absent → fall back AND leave a binding behind
+    //      (the second turn on this conversation hits branch 1).
+    // ==================================================================
+
+    fn controller_principal_for_test() -> execlaw_core::principal::Principal {
+        execlaw_core::principal::Principal {
+            id: execlaw_core::ids::PrincipalId::from("controller"),
+            identifiers: vec![],
+            trust_level: execlaw_core::principal::TrustLevel::Controller,
+            resolved_by: vec![],
+            metadata: serde_json::json!({}),
+            first_seen: chrono::Utc::now().timestamp(),
+            last_seen: None,
+            controller_notes: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_runner_routed_group_prefers_conversation_binding_over_controller_default() {
+        // Simulates a Signal-group thread the Controller is typing
+        // into via the SPA. The conversation is already bound to
+        // the group's principal_group (the inbound path bound it
+        // when the group first messaged). A SPA send must route
+        // onto the GROUP's runner — not re-resolve via
+        // resolve_chat_group (which always yields the Controller's
+        // group).
+        use execlaw_core::ids::PrincipalId;
+        use execlaw_core::principal_groups::{GroupKey, PrincipalGroupStore};
+
+        let state = test_app_state();
+        let cid = ConversationId::from("conv-signal-group-thread");
+        ensure_conversation_for(&state.db, &cid);
+
+        // Mint a Signal-group principal_group (someone other than
+        // the Controller — channel="signal", native_group_id set).
+        let pg_store = PrincipalGroupStore::new(&state.db);
+        let other = PrincipalId::from("pri_signal_someone");
+        let group = pg_store
+            .resolve(
+                &GroupKey {
+                    channel: "signal",
+                    native_group_id: Some("test-native-group"),
+                    principals: &[other.clone()],
+                    includes_controller: true,
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .unwrap();
+        pg_store
+            .bind_conversation(cid.as_str(), &group.group_id)
+            .unwrap();
+
+        let principal = controller_principal_for_test();
+        let resolved = super::resolve_runner_routed_group(&state, &cid, &principal).await;
+        assert_eq!(
+            resolved.as_deref(),
+            Some(group.group_id.as_str()),
+            "SPA send on a transport-bound conversation MUST route onto the bound \
+             principal_group's runner, not the Controller's default group",
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_runner_routed_group_falls_back_to_resolve_chat_group_for_unbound_conv() {
+        // Brand-new web-only conversation with no binding yet —
+        // the resolver mints + binds the Controller's group via
+        // `resolve_chat_group`. Side effect: the second call
+        // hits the binding fast path. This mirrors how a fresh
+        // SPA thread behaves on first send.
+        use execlaw_core::principal_groups::PrincipalGroupStore;
+
+        let state = test_app_state();
+        let cid = ConversationId::from("conv-fresh-unbound");
+        ensure_conversation_for(&state.db, &cid);
+
+        // Pre-condition: no binding.
+        let pg_store = PrincipalGroupStore::new(&state.db);
+        assert!(
+            pg_store
+                .principal_group_id_for(cid.as_str())
+                .unwrap()
+                .is_none(),
+            "test precondition: fresh conversation must start with no binding",
+        );
+
+        let principal = controller_principal_for_test();
+        let first = super::resolve_runner_routed_group(&state, &cid, &principal).await;
+        assert!(
+            first.is_some(),
+            "fallback to resolve_chat_group must yield SOME group_id"
+        );
+        let first_id = first.unwrap();
+
+        // Side effect: the conversation is now bound to that
+        // group, so the second call goes through the fast path
+        // and yields the same id without re-resolving.
+        let after_binding = pg_store.principal_group_id_for(cid.as_str()).unwrap();
+        assert_eq!(
+            after_binding.as_deref(),
+            Some(first_id.as_str()),
+            "first call must leave a binding behind so subsequent turns are O(1) lookup",
+        );
+
+        let second = super::resolve_runner_routed_group(&state, &cid, &principal).await;
+        assert_eq!(
+            second.as_deref(),
+            Some(first_id.as_str()),
+            "second call (binding now present) must return the same group_id via the \
+             fast path — NOT mint a duplicate via resolve_chat_group",
+        );
     }
 }

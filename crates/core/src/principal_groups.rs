@@ -342,6 +342,38 @@ impl<'db> PrincipalGroupStore<'db> {
         })
     }
 
+    /// True iff `group_id` is the controller's solo DM runner —
+    /// exactly one member AND `includes_controller=true`. The runner
+    /// supervisor uses this to decide whether a runner is reap-exempt.
+    ///
+    /// A group that merely INCLUDES the controller (a Signal /
+    /// WhatsApp / Slack group the operator's identity is one of N
+    /// members of) is a regular group-context runner that follows
+    /// the normal idle-reap lifecycle, NOT the always-warm controller
+    /// runner that backs the SPA.
+    ///
+    /// Pre-fix the supervisor read `includes_controller` straight
+    /// into `RunnerHandle.controller_runner`. That marked every
+    /// Signal-group runner as un-reapable — shared group runners
+    /// stayed up forever and the operator saw "N runners owned by
+    /// the controller" in diagnostics.
+    pub fn is_controller_solo(&self, group_id: &str) -> Result<bool, DbError> {
+        self.db.with_conn(|c| {
+            let row = c
+                .query_row(
+                    "SELECT includes_controller, \
+                            (SELECT COUNT(*) FROM state_principal_group_members \
+                             WHERE group_id = ?1) AS member_count \
+                     FROM state_principal_groups \
+                     WHERE group_id = ?1",
+                    params![group_id],
+                    |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)?)),
+                )
+                .ok();
+            Ok(matches!(row, Some((true, 1))))
+        })
+    }
+
     /// List every member principal_id of `group_id`. Empty when the
     /// group doesn't exist.
     pub fn members(&self, group_id: &str) -> Result<Vec<PrincipalId>, DbError> {
@@ -886,5 +918,80 @@ mod tests {
             })
             .unwrap();
         assert_eq!(bound, g.group_id);
+    }
+
+    #[test]
+    fn is_controller_solo_true_for_one_member_controller_dm() {
+        // The web/SPA controller runner — single-member, includes
+        // controller, must stay un-reapable.
+        let db = fresh_db();
+        let store = PrincipalGroupStore::new(&db);
+        let g = store
+            .resolve(
+                &GroupKey {
+                    channel: "web",
+                    native_group_id: None,
+                    principals: &pids(&["controller"]),
+                    includes_controller: true,
+                },
+                1000,
+            )
+            .unwrap();
+        assert!(store.is_controller_solo(&g.group_id).unwrap());
+    }
+
+    #[test]
+    fn is_controller_solo_false_for_multi_member_group_with_controller() {
+        // The repro: a Signal group that the controller is a passive
+        // member of. Pre-fix the supervisor flagged this as
+        // `controller_runner=true` and the reaper skipped it forever.
+        // These runners should follow the regular ephemeral
+        // group-container lifecycle.
+        let db = fresh_db();
+        let store = PrincipalGroupStore::new(&db);
+        let g = store
+            .resolve(
+                &GroupKey {
+                    channel: "signal",
+                    native_group_id: Some("signal:group:abc"),
+                    principals: &pids(&["controller", "alice", "bob"]),
+                    includes_controller: true,
+                },
+                1000,
+            )
+            .unwrap();
+        assert!(g.includes_controller);
+        assert!(
+            !store.is_controller_solo(&g.group_id).unwrap(),
+            "multi-member groups must not be treated as controller-solo \
+             even when the controller is a member"
+        );
+    }
+
+    #[test]
+    fn is_controller_solo_false_for_one_member_non_controller_dm() {
+        // A DM with a non-controller principal: single member but
+        // includes_controller=false, so not the controller solo runner.
+        let db = fresh_db();
+        let store = PrincipalGroupStore::new(&db);
+        let g = store
+            .resolve(
+                &GroupKey {
+                    channel: "signal",
+                    native_group_id: None,
+                    principals: &pids(&["alice"]),
+                    includes_controller: false,
+                },
+                1000,
+            )
+            .unwrap();
+        assert!(!store.is_controller_solo(&g.group_id).unwrap());
+    }
+
+    #[test]
+    fn is_controller_solo_false_for_unknown_group_id() {
+        let db = fresh_db();
+        let store = PrincipalGroupStore::new(&db);
+        assert!(!store.is_controller_solo("does-not-exist").unwrap());
     }
 }

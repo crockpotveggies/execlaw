@@ -28,6 +28,12 @@ import {
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
+import {
+    LANGUAGE_OPTIONS,
+    setLanguage,
+    useCurrentLanguage,
+    useT,
+} from "../i18n";
 
 /// Literal the operator must type into the danger-zone input. Kept
 /// in sync with `factory_reset::CONFIRM_TOKEN` server-side; if these
@@ -36,6 +42,7 @@ const FACTORY_RESET_CONFIRM = "RESET";
 
 export function GeneralPage() {
     const auth = useAuth();
+    const t = useT();
     const getToken = auth.getAccessToken;
     const [settings, setSettings] = useState<GeneralSettings | null>(null);
     const [error, setError] = useState<string | null>(null);
@@ -134,32 +141,43 @@ export function GeneralPage() {
 
     return (
         <div data-testid="settings-general">
-            <h3 className="h6 mb-3">General</h3>
+            <h3 className="h6 mb-3">{t("general.title", "General")}</h3>
             <p className="execlaw-muted small mb-3">
-                Operator settings for the host service. The control plane
-                runs as a systemd / launchd / Windows service — see{" "}
-                <code>execlaw service status</code> from a terminal for
-                live state and log paths.
+                {t(
+                    "general.introPre",
+                    "Operator settings for the host service. The control plane runs as a systemd / launchd / Windows service — see ",
+                )}
+                <code>execlaw service status</code>
+                {t(
+                    "general.introPost",
+                    " from a terminal for live state and log paths.",
+                )}
             </p>
 
             {!canMutate && (
                 <div className="execlaw-muted small mb-3">
-                    Read-only view. Only Controllers can change general
-                    settings.
+                    {t(
+                        "general.readOnly",
+                        "Read-only view. Only Controllers can change general settings.",
+                    )}
                 </div>
             )}
+
+            <LanguagePicker />
 
             <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
             {settings === null ? (
-                <div className="execlaw-muted small">Loading…</div>
+                <div className="execlaw-muted small">
+                    {t("general.loading", "Loading…")}
+                </div>
             ) : (
                 <div className="execlaw-card" data-testid="general-form">
                     <Form.Group className="mb-3">
                         <Form.Check
                             type="switch"
                             id="general-start-on-boot"
-                            label="Start at boot"
+                            label={t("general.startAtBoot", "Start at boot")}
                             checked={startOnBoot}
                             disabled={!canMutate || busy}
                             onChange={(e) => {
@@ -169,11 +187,15 @@ export function GeneralPage() {
                             data-testid="general-start-on-boot"
                         />
                         <Form.Text className="execlaw-muted">
-                            When on, the host service launches automatically
-                            at OS boot. The toggle is honoured by the next{" "}
-                            <code>execlaw service install</code> run; the
-                            service-manager registration on disk doesn't
-                            change until then.
+                            {t(
+                                "general.startAtBootHelpPre",
+                                "When on, the host service launches automatically at OS boot. The toggle is honoured by the next ",
+                            )}
+                            <code>execlaw service install</code>
+                            {t(
+                                "general.startAtBootHelpPost",
+                                " run; the service-manager registration on disk doesn’t change until then.",
+                            )}
                         </Form.Text>
                         {bootDirty && (
                             <div
@@ -184,17 +206,19 @@ export function GeneralPage() {
                                     className="bi bi-info-circle me-1"
                                     aria-hidden
                                 />
-                                Re-run{" "}
-                                <code>execlaw service install</code> from a
-                                terminal to apply the new autostart flag (or
-                                an elevated PowerShell on Windows).
+                                {t("general.bootReinstallPre", "Re-run ")}
+                                <code>execlaw service install</code>
+                                {t(
+                                    "general.bootReinstallPost",
+                                    " from a terminal to apply the new autostart flag (or an elevated PowerShell on Windows).",
+                                )}
                             </div>
                         )}
                     </Form.Group>
 
                     <Form.Group className="mb-3">
                         <Form.Label className="execlaw-muted small mb-1">
-                            Bind address (host:port)
+                            {t("general.bindAddress", "Bind address (host:port)")}
                         </Form.Label>
                         <Form.Control
                             value={bindAddress}
@@ -207,12 +231,10 @@ export function GeneralPage() {
                             data-testid="general-bind-address"
                         />
                         <Form.Text className="execlaw-muted">
-                            The address the control plane listens on. Use{" "}
-                            <code>127.0.0.1:3031</code> for loopback only,{" "}
-                            <code>0.0.0.0:3031</code> to bind every
-                            interface (put a reverse proxy in front for TLS),
-                            or an IPv6 literal like{" "}
-                            <code>[::1]:3031</code>.
+                            {t(
+                                "general.bindAddressHelp",
+                                "The address the control plane listens on. Use 127.0.0.1:3031 for loopback only, 0.0.0.0:3031 to bind every interface (put a reverse proxy in front for TLS), or an IPv6 literal like [::1]:3031.",
+                            )}
                         </Form.Text>
                         {bindDirty && settings.bind_address_requires_restart && (
                             <div
@@ -223,8 +245,12 @@ export function GeneralPage() {
                                     className="bi bi-info-circle me-1"
                                     aria-hidden
                                 />
-                                Bind address takes effect on the next{" "}
-                                <code>execlaw service restart</code>.
+                                {t(
+                                    "general.bindRestartHintPre",
+                                    "Bind address takes effect on the next ",
+                                )}
+                                <code>execlaw service restart</code>
+                                {t("general.bindRestartHintPost", ".")}
                             </div>
                         )}
                     </Form.Group>
@@ -234,7 +260,7 @@ export function GeneralPage() {
                             className="execlaw-muted small mb-1"
                             htmlFor="general-history-retention"
                         >
-                            History retention
+                            {t("general.historyRetention", "History retention")}
                         </Form.Label>
                         <Form.Select
                             id="general-history-retention"
@@ -253,10 +279,10 @@ export function GeneralPage() {
                             ))}
                         </Form.Select>
                         <Form.Text className="execlaw-muted">
-                            How long conversation history, scheduled-task runs,
-                            structured logs, and (forthcoming) research jobs
-                            stick around before automatic deletion. Memory
-                            entries and the audit log are not affected.
+                            {t(
+                                "general.historyRetentionHelp",
+                                "How long conversation history, scheduled-task runs, structured logs, and (forthcoming) research jobs stick around before automatic deletion. Memory entries and the audit log are not affected.",
+                            )}
                         </Form.Text>
                         {retentionNarrowing && (
                             <div
@@ -267,10 +293,10 @@ export function GeneralPage() {
                                     className="bi bi-exclamation-triangle me-1"
                                     aria-hidden
                                 />
-                                This is a shorter window. Saving will trigger
-                                a one-time bulk deletion of older history on
-                                the next sweep tick (within ~30 minutes).
-                                This cannot be undone.
+                                {t(
+                                    "general.retentionNarrowing",
+                                    "This is a shorter window. Saving will trigger a one-time bulk deletion of older history on the next sweep tick (within ~30 minutes). This cannot be undone.",
+                                )}
                             </div>
                         )}
                     </Form.Group>
@@ -283,7 +309,7 @@ export function GeneralPage() {
                                 onClick={() => void onSave()}
                                 data-testid="general-save"
                             >
-                                Save
+                                {t("general.save", "Save")}
                             </Button>
                             {dirty && (
                                 <Button
@@ -292,7 +318,7 @@ export function GeneralPage() {
                                     onClick={() => void refresh()}
                                     data-testid="general-revert"
                                 >
-                                    Revert
+                                    {t("general.revert", "Revert")}
                                 </Button>
                             )}
                         </div>
@@ -305,6 +331,49 @@ export function GeneralPage() {
     );
 }
 
+/// Per-client language picker. Persists to localStorage via the i18n
+/// module (key: `execlaw.preferred-language`), so it's a UI
+/// preference rather than server state — every role can change it,
+/// and changes apply immediately without a Save button. The
+/// pre-auth surfaces (Login + SetupWizard) read the same key via
+/// the floating LanguageSwitcher chip.
+function LanguagePicker() {
+    const t = useT();
+    const current = useCurrentLanguage();
+    return (
+        <div className="execlaw-card mb-3" data-testid="general-language-card">
+            <Form.Group>
+                <Form.Label
+                    className="execlaw-muted small mb-1"
+                    htmlFor="general-language"
+                >
+                    {t("general.language", "Language")}
+                </Form.Label>
+                <Form.Select
+                    id="general-language"
+                    value={current}
+                    onChange={(e) => {
+                        void setLanguage(e.target.value);
+                    }}
+                    data-testid="general-language"
+                >
+                    {LANGUAGE_OPTIONS.map((o) => (
+                        <option key={o.value} value={o.value}>
+                            {o.label}
+                        </option>
+                    ))}
+                </Form.Select>
+                <Form.Text className="execlaw-muted">
+                    {t(
+                        "general.languageHelp",
+                        "Stored per browser. Detection falls back to your OS language on first run; changes here override it.",
+                    )}
+                </Form.Text>
+            </Form.Group>
+        </div>
+    );
+}
+
 /// Bottom-of-page card that wipes every persistent table and signs the
 /// operator out. Two-step confirm: (1) operator types the literal
 /// `RESET` into the input — only then is the button enabled —, then
@@ -313,6 +382,7 @@ export function GeneralPage() {
 /// detects the missing controller user and bounces to /setup.
 function DangerZone() {
     const auth = useAuth();
+    const t = useT();
     const getToken = auth.getAccessToken;
     const [confirmText, setConfirmText] = useState("");
     const [busy, setBusy] = useState(false);
@@ -323,12 +393,10 @@ function DangerZone() {
     const onReset = useCallback(async () => {
         if (!armed) return;
         const ok = window.confirm(
-            "Wipe ALL data and factory-reset the service?\n\n" +
-                "This deletes every conversation, plugin, contact, " +
-                "routine, oauth token, and operator account. The " +
-                "service stays running but you'll be signed out and " +
-                "the next visit will start the setup wizard.\n\n" +
-                "This cannot be undone.",
+            t(
+                "general.dangerConfirm",
+                "Wipe ALL data and factory-reset the service?\n\nThis deletes every conversation, plugin, contact, routine, oauth token, and operator account. The service stays running but you'll be signed out and the next visit will start the setup wizard.\n\nThis cannot be undone.",
+            ),
         );
         if (!ok) return;
         setBusy(true);
@@ -347,7 +415,7 @@ function DangerZone() {
             setError(e instanceof Error ? e.message : String(e));
             setBusy(false);
         }
-    }, [armed, auth, getToken]);
+    }, [armed, auth, getToken, t]);
 
     return (
         <div
@@ -356,15 +424,13 @@ function DangerZone() {
         >
             <div className="execlaw-card__title text-danger">
                 <i className="bi bi-exclamation-triangle me-2" aria-hidden />
-                Danger zone
+                {t("general.dangerZone", "Danger zone")}
             </div>
             <div className="execlaw-muted small mb-2">
-                Erases every conversation, plugin, contact, routine,
-                stored token, and operator account, then signs you
-                out. The service keeps running but the next visit
-                starts at the setup wizard. Filesystem artifacts
-                (research workspaces, attachments) are not removed;
-                restart the host service for a truly clean slate.
+                {t(
+                    "general.dangerZoneBody",
+                    "Erases every conversation, plugin, contact, routine, stored token, and operator account, then signs you out. The service keeps running but the next visit starts at the setup wizard. Filesystem artifacts (research workspaces, attachments) are not removed; restart the host service for a truly clean slate.",
+                )}
             </div>
             <ErrorBanner
                 message={error}
@@ -376,11 +442,11 @@ function DangerZone() {
                     className="execlaw-muted small mb-1"
                     htmlFor="general-danger-confirm"
                 >
-                    Type{" "}
+                    {t("general.dangerTypePre", "Type ")}
                     <code data-testid="general-danger-token">
                         {FACTORY_RESET_CONFIRM}
-                    </code>{" "}
-                    to enable the button.
+                    </code>
+                    {t("general.dangerTypePost", " to enable the button.")}
                 </Form.Label>
                 <Form.Control
                     id="general-danger-confirm"
@@ -407,12 +473,15 @@ function DangerZone() {
                             className="bi bi-hourglass-split me-1"
                             aria-hidden
                         />
-                        Wiping…
+                        {t("general.wiping", "Wiping…")}
                     </>
                 ) : (
                     <>
                         <i className="bi bi-trash3 me-1" aria-hidden />
-                        Erase all data and factory reset
+                        {t(
+                            "general.dangerReset",
+                            "Erase all data and factory reset",
+                        )}
                     </>
                 )}
             </Button>

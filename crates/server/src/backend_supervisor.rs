@@ -56,6 +56,11 @@ pub fn host_port_for(purpose: BackendPurpose) -> u16 {
         BackendPurpose::Small => 8102,
         BackendPurpose::VoiceStt => 8103,
         BackendPurpose::VoiceTts => 8104,
+        // 2026-05-17 (M5) — Vision purpose slot. Continues the 81xx
+        // run; gives the supervisor a stable port for managed VL
+        // backends (Qwen-VL / Pixtral / LLaVA / etc.) without
+        // colliding with vLLM's default 8000.
+        BackendPurpose::Vision => 8105,
     }
 }
 
@@ -528,6 +533,12 @@ fn default_tool_parser_for_args(args: &[String]) -> &'static str {
 /// `POST /api/pull` into the supervisor's existing download-task
 /// machinery so the SPA can surface "Pulling 47%…" the same way it
 /// does for HF model downloads on vLLM today.
+// Convenience wrapper used by unit tests that already have a
+// `ServiceSpec` in scope. The reconcile loop itself goes straight to
+// `health_path_for_hint` against the `BackendRow`, so the wrapper has
+// no production callers — gated to `#[cfg(test)]` to keep the lib
+// build warning-free.
+#[cfg(test)]
 fn health_path_for(spec: &ServiceSpec) -> &'static str {
     health_path_for_hint(&spec.binary_hint)
 }
@@ -1076,6 +1087,97 @@ impl BackendSupervisor {
                     );
                     match self.controller.health_check(&url).await {
                         Ok(true) => {
+                            // Ollama-native gate: the daemon's
+                            // `/api/tags` answers 200 the instant
+                            // `ollama serve` binds its port — long
+                            // before any model is in the cache. If
+                            // we flipped to Healthy here the first
+                            // chat would 404 with "model 'X' not
+                            // found" (the v1 punt documented in
+                            // docs/setup-mac.md). Instead, before
+                            // promoting, check if the configured
+                            // model is in the local cache; if not,
+                            // POST /api/pull and hold the slot in
+                            // DownloadingModel until the pull
+                            // finishes. See
+                            // crates/server/src/ollama_puller.rs.
+                            //
+                            // We reuse `slot.download_task` /
+                            // `slot.download_progress` — a single
+                            // row can't have an HF download AND an
+                            // Ollama pull running concurrently
+                            // (runtime selects exactly one path), so
+                            // sharing the field keeps the state
+                            // machine simple.
+                            if is_ollama_row(&row) {
+                                if let Some(model_id) = extract_ollama_model_id(&row) {
+                                    let host_port = handle.host_port;
+                                    if let Some(task) = slot.download_task.clone() {
+                                        if let Ok(p) = task.progress.try_lock() {
+                                            slot.download_progress = *p;
+                                        }
+                                        if !task.done.load(std::sync::atomic::Ordering::SeqCst) {
+                                            slot.stage = LifecycleStage::DownloadingModel;
+                                            slot.status = ServiceStatus::Pulling;
+                                            continue;
+                                        }
+                                        let failure = task.failure.lock().await.clone();
+                                        slot.download_task = None;
+                                        slot.download_progress = None;
+                                        if let Some(err) = failure {
+                                            warn!(
+                                                purpose = %key,
+                                                model = %model_id,
+                                                "Ollama model pull failed: {err}"
+                                            );
+                                            slot.status = ServiceStatus::CrashLooping {
+                                                restart_count: slot.restart_attempts + 1,
+                                            };
+                                            slot.stage = LifecycleStage::Failed;
+                                            slot.restart_attempts += 1;
+                                            emit_crashloop_alert(
+                                                &self.db,
+                                                row.purpose,
+                                                "(native Ollama)",
+                                                &format!("Ollama pull of {model_id} failed: {err}"),
+                                            );
+                                            continue;
+                                        }
+                                        info!(
+                                            purpose = %key,
+                                            model = %model_id,
+                                            "Ollama model pull complete; marking Healthy"
+                                        );
+                                    } else {
+                                        let present =
+                                            crate::ollama_puller::is_model_present(
+                                                host_port,
+                                                &model_id,
+                                            )
+                                            .await
+                                            .unwrap_or_else(|e| {
+                                                warn!(
+                                                    purpose = %key,
+                                                    model = %model_id,
+                                                    "/api/tags probe failed ({e}); assuming model absent"
+                                                );
+                                                false
+                                            });
+                                        if !present {
+                                            info!(
+                                                purpose = %key,
+                                                model = %model_id,
+                                                "Ollama model not in cache; starting /api/pull"
+                                            );
+                                            let task = spawn_ollama_pull_task(host_port, &model_id);
+                                            slot.download_task = Some(task);
+                                            slot.stage = LifecycleStage::DownloadingModel;
+                                            slot.status = ServiceStatus::Pulling;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
                             slot.status = ServiceStatus::Healthy;
                             slot.stage = LifecycleStage::Healthy;
                             slot.restart_attempts = 0;
@@ -1331,6 +1433,91 @@ pub(crate) fn attach_hf_cache_mount(spec: &mut ServiceSpec, primary_cache: &std:
     }
 }
 
+/// Detect the Apple-Silicon Ollama-native preset envelope. The
+/// wizard's `materialise_spec` writes `runtime: "native"` and
+/// `binary_hint: "ollama"` together; both must be present for the
+/// supervisor to use the Ollama post-spawn pull path. Future native
+/// engines (`service-mlx`, `service-llama-cpp`) will get their own
+/// detection helpers as they land.
+pub(crate) fn is_ollama_row(row: &BackendRow) -> bool {
+    let obj = match row.model_spec_json.as_object() {
+        Some(o) => o,
+        None => return false,
+    };
+    let is_native = obj
+        .get("runtime")
+        .and_then(|v| v.as_str())
+        .map(|s| s.eq_ignore_ascii_case("native"))
+        .unwrap_or(false);
+    let is_ollama = obj
+        .get("binary_hint")
+        .and_then(|v| v.as_str())
+        .map(|s| s.eq_ignore_ascii_case("ollama"))
+        .unwrap_or(false);
+    is_native && is_ollama
+}
+
+/// Pull the Ollama tag name out of the row. Sibling to
+/// `extract_model_id` (which parses HF model ids out of `--model`
+/// CLI args for vLLM). Ollama's tag is stored as a dedicated
+/// `model` field at the top level of `model_spec_json` — see
+/// `materialise_spec` in `backend_presets.rs`.
+pub(crate) fn extract_ollama_model_id(row: &BackendRow) -> Option<String> {
+    row.model_spec_json
+        .get("model")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned())
+}
+
+/// Spawn a background task that calls Ollama's `/api/pull` for
+/// `model_id`, mirrors progress into `DownloadTaskState`, and
+/// signals `done` on completion. Mirrors `spawn_download_task` but
+/// targets the daemon's HTTP API rather than `HfDownloader`.
+///
+/// `file_idx`/`file_count` are pinned at `(1, 1)` because Ollama's
+/// stream reports a single rolling aggregate per layer rather than
+/// the per-file breakdown HF gives us. The SPA pill renders the
+/// percentage from `bytes_downloaded/total_bytes` and the
+/// `1 of 1` line stays informative ("we're pulling one model").
+fn spawn_ollama_pull_task(host_port: u16, model_id: &str) -> DownloadTaskState {
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let progress: Arc<Mutex<Option<DownloadProgress>>> = Arc::new(Mutex::new(None));
+    let model_id_owned = model_id.to_owned();
+    let done_clone = done.clone();
+    let failure_clone = failure.clone();
+    let progress_clone = progress.clone();
+    tokio::spawn(async move {
+        let result =
+            crate::ollama_puller::pull_model(host_port, &model_id_owned, |completed, total| {
+                // try_lock so a contended progress mirror doesn't
+                // back-pressure the streaming HTTP body parser.
+                // Missing an update is fine — the supervisor reads
+                // the latest snapshot on the next reconcile.
+                if let Ok(mut guard) = progress_clone.try_lock() {
+                    *guard = Some(DownloadProgress {
+                        bytes_downloaded: completed,
+                        total_bytes: total,
+                        file_idx: 1,
+                        file_count: 1,
+                    });
+                }
+            })
+            .await;
+        if let Err(e) = result {
+            *failure_clone.lock().await = Some(e.to_string());
+        }
+        done_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    DownloadTaskState {
+        model_id: model_id.to_owned(),
+        done,
+        failure,
+        progress,
+    }
+}
+
 /// Spawn a background task that downloads `model_id` via the host
 /// `HfDownloader`, mirrors progress into `DownloadTaskState`, and
 /// signals `done` on completion. Returns the state struct so the
@@ -1418,6 +1605,77 @@ mod tests {
         let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
         MigrationRunner::new(&db).apply_all().unwrap();
         db
+    }
+
+    fn ollama_row(model: &str) -> BackendRow {
+        // Matches the envelope `materialise_spec` in backend_presets.rs
+        // emits for the Apple-Silicon Ollama presets.
+        BackendRow {
+            purpose: BackendPurpose::Standard,
+            inference_backend: "service-ollama".into(),
+            model_spec_json: serde_json::json!({
+                "runtime": "native",
+                "binary_hint": "ollama",
+                "args": ["serve"],
+                "container_port": 11434,
+                "model": model,
+            }),
+            gpu_id: Some("apple-m3".into()),
+            endpoint: None,
+            notes: None,
+            reasoning_enabled: true,
+            mode: BackendMode::Managed,
+            created_at: 0,
+            updated_at: 100,
+        }
+    }
+
+    #[test]
+    fn is_ollama_row_detects_apple_native_envelope() {
+        let row = ollama_row("qwen2.5:7b-instruct-q4_K_M");
+        assert!(is_ollama_row(&row));
+    }
+
+    #[test]
+    fn is_ollama_row_rejects_vllm_envelope() {
+        // A managed vLLM row has `image` + no `runtime` field, so the
+        // Ollama gate must NOT fire on it (otherwise the supervisor
+        // would try to /api/pull against a Docker container that
+        // doesn't expose that endpoint).
+        let row = BackendRow {
+            purpose: BackendPurpose::Standard,
+            inference_backend: "service-vllm".into(),
+            model_spec_json: serde_json::json!({
+                "image": "vllm/vllm-openai:v0.6.2",
+                "args": ["--model", "Qwen/Qwen2.5-7B-Instruct-AWQ"],
+                "container_port": 8000,
+            }),
+            gpu_id: Some("0".into()),
+            endpoint: None,
+            notes: None,
+            reasoning_enabled: true,
+            mode: BackendMode::Managed,
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert!(!is_ollama_row(&row));
+    }
+
+    #[test]
+    fn extract_ollama_model_id_reads_top_level_model_field() {
+        let row = ollama_row("qwen2.5:32b-instruct-q4_K_M");
+        assert_eq!(
+            extract_ollama_model_id(&row).as_deref(),
+            Some("qwen2.5:32b-instruct-q4_K_M")
+        );
+    }
+
+    #[test]
+    fn extract_ollama_model_id_returns_none_for_blank_model_field() {
+        // A misconfigured row (model field empty string) must NOT
+        // trigger a pull — Ollama would 400 on a blank name.
+        let row = ollama_row("");
+        assert!(extract_ollama_model_id(&row).is_none());
     }
 
     fn upsert_managed(

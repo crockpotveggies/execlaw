@@ -36,6 +36,14 @@ ignore = [
     # vulnerable, no safe upgrade, transitive. Drops out of our
     # graph when `utoipa-axum` migrates.
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained — transitive via utoipa-axum; no safe upgrade; not a vulnerability" },
+    # instant 0.1.13 — pulled in transitively by `notify` v7's
+    # `notify-types` v1 (filesystem watcher used across the
+    # python-sandbox + skill-capture watchers). Author recommends
+    # `web-time` as the maintained replacement, but only `notify`'s
+    # upstream can swap it out. Not vulnerable; an unmaintained
+    # status flag. Drops when `notify` releases a version that
+    # adopts web-time.
+    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained — transitive via notify-types v1 → notify v7; no safe upgrade; not a vulnerability" },
 ]
 
 # ---- licenses: project compatibility ----

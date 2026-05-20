@@ -117,7 +117,9 @@ Key invariants the executor enforces (`crates/runner-local/src/turn.rs`):
 
 - **`tool_use ↔ tool_result` pairing.** Every `ToolUse` event committed in a turn has a matching `ToolResult` with the same `ordinal`. Even tool-dispatch errors get a paired `ToolResult` carrying the error string — the chat history must not contain a dangling tool_use, because that wedges resume. `[shipped]` — see `commit_turn` in `crates/core/src/events.rs`.
 - **Atomic commit.** All events from one turn land in a single SQLite transaction. The runner can crash anywhere inside the loop; either the whole turn lands or none of it does. `[shipped]`
-- **Bounded tool rounds.** `max_tool_rounds` (default 6) caps the loop. Exceeding it commits an `LlmCancelled` event and returns `TurnError::MaxRounds`. `[shipped]`
+- **Audit-trail on error/cancel.** When a runner-mediated turn aborts mid-loop (cancel button, mid-tool error), any `tool_use` + `tool_result` pairs for tools that **already executed** are committed alongside a synthetic `model_turn` carrying `finish_reason = "cancelled"` or `"error"`. Pre-2026-05-16 these were dropped on the `Err(...)` return path, so executed side effects (HTTP fetches fired, memory written) had no audit trace. `[shipped]` — see `run_runner_turn`'s abnormal-end branch in `crates/server/src/chats.rs`.
+- **OpenAI tool-message order on replay.** When `hydrate_messages` (in-process) or `build_runner_history_messages` (runner-mediated) reconstruct chat history from the event log, every `tool` role message is preceded by an `assistant` message bearing a `tool_calls` array with the matching `tool_call_id`. One synthetic `assistant(content="", tool_calls=[call])` is emitted per `ToolUse` event; the terminal `ModelTurn` becomes a plain `assistant(text=final, tool_calls=[])`. Pre-2026-05-16 the swap-into-final-ModelTurn pattern produced `[user, tool, assistant(tool_calls)]` which vLLM with `--enable-auto-tool-choice` may reject outright and confuses the model into reading past calls as future. `[shipped]`
+- **Bounded tool rounds.** `max_tool_rounds` (default 16, configurable per turn via `TurnRequest.max_tool_rounds`) caps the loop. The runner clamps the requested cap to `min(req, RUNNER_MAX_TOOL_ROUNDS = 24)` as a belt-and-suspenders ceiling. Exceeding it commits an `LlmCancelled` event and returns `TurnError::MaxRounds`. `[shipped]`
 - **Phase observer.** `AwaitingTool` / `Thinking` transitions are signalled to a phase observer the server wires to the WebSocket bus, so transports can keep typing-indicators on through tool calls. `[shipped]`
 - **HMAC chaining.** Every event the executor writes is signed with the server's HMAC key. The chain is `tag_n = HMAC(key, prev_tag || payload)`, making the log tamper-evident. `[shipped]`
 
@@ -134,7 +136,7 @@ The runner is **stateless against the event log**. Memorise this — it's the pr
 
 ## 4. Memory model
 
-### 4.1 The four layers (from §2.7 of `MIGRATION_PLAN.md`)
+### 4.1 The four layers
 
 ```
    ┌────────────────────────────────────────────────────────────────┐
@@ -389,6 +391,9 @@ After a turn completes, the agent has new evidence about what the user actually 
    └─────────────────────────────────────────────────────────────┘
 ```
 
+**Catalog ↔ routing-prose alignment invariant (2026-05-16).**
+`build_runner_tool_catalog` returns a `RunnerToolView { declarations, builtin_names, plugin_tool_names }`. The runner's `tool_catalog` field, the dispatch-time built-in capability gate (`execlaw_policy::trust::check_builtin_capability`), AND the system prompt's tool-routing prose block all derive their tool-name lists from the same filtered view. A tool stripped by `config_tool_access`, `caller_caps`, or the planner/executor split is invisible in every surface the model sees — pre-fix the catalog was filtered but the routing prose was generated from the unfiltered registry, so the system prompt told the model about tools the catalog had stripped. `[shipped]`
+
 **The trust ladder** (high → low):
 
 ```
@@ -401,7 +406,7 @@ Read-down memory cascade: a `KnownTrusted` caller can read entries written at `K
 
 ---
 
-## 8. Rule of Two / planner-executor split `[design]`
+## 8. Rule of Two / planner-executor split `[partial - containment shipped]`
 
 For turns that ingest *untrusted content* (web fetch, email body, PDF text), the runner switches to a two-role split:
 
@@ -433,6 +438,8 @@ Same model both times — cost is in the second forward pass, not in a different
 - The planner can ask the executor to "extract X from this text and report" — a constrained sub-goal — and the executor can only return text. That text gets fed back to the planner, which decides the next move.
 
 This is the CaMeL pattern (DeepMind) translated to a single local model. It's not a complete defense — `The Attacker Moves Second` showed every defense shipped in 2025 is breakable in human red-team — but the architectural containment closes the most common vector cheaply.
+
+**Shipped today (2026-05-16):** the *containment half* of the split — when `policy.planner_executor` fires (i.e. `effective_trust < KnownTrusted`), `build_runner_tool_catalog` returns an empty `RunnerToolView` and the runner advertises no tools to the model. The full two-pass planner↔executor choreography (planner runs first with tools, hands a constrained sub-goal to a no-tools executor that sees the untrusted content) is still on the design list. The load-bearing invariant — "the role that sees untrusted content has no tool slots" — is enforced.
 
 ---
 
@@ -546,7 +553,7 @@ Mapping the patterns from §6 of the project memory (proactive-agent / self-impr
 
 ---
 
-## 12. What's actually wired today (2026-05-08)
+## 12. What's actually wired today (2026-05-16)
 
 A precise read of the codebase, not a status report:
 
@@ -567,13 +574,25 @@ A precise read of the codebase, not a status report:
 - Plugin transport surface mature: signal, whatsapp, slack, sms-socket all ship as full-loop transports with inbound (WS or webhook) and outbound (send/reply/typing/markread) wired through the auto-bridge
 - Webhook handlers for HTTP-third-party integrations (e.g. WhatsApp via wuzapi) use `host_route_inbound_spawn` so the HTTP ack returns in single-digit milliseconds — without this, third-party retry loops (wuzapi's 30 s default) cause the agent to run 3–5× per inbound and the user receives duplicate replies. The plugin layer also dedupes by upstream message ID as defense in depth.
 
+**Audit-driven invariants landed 2026-05-16 (Codex review):**
+- Runner-mediated turns durably commit paired `tool_use` + `tool_result` events through the WS round-trip; the abnormal-end branch commits already-executed pairs alongside a synthetic `model_turn` carrying the cancel/error reason. Replay/audit reconstructs every executed side effect.
+- `run_runner_turn` and `run_tool_capable_turn` both build their tool catalog via `build_runner_tool_catalog`, which filters on `config_tool_access`, `caller_caps`, and the planner/executor split. The returned `RunnerToolView` feeds both the runner's `tool_catalog` field AND the system prompt's routing-prose block — single source of truth, no drift.
+- `ChainedToolDispatch::dispatch` consults the descriptor capabilities of each built-in tool via `execlaw_policy::trust::check_builtin_capability` and rejects when the caller lacks the matching policy cap. Built-ins now gate at parity with plugin tools.
+- `dispatch_external_turn` honours `policy.spotlighting` (was hard-coded `false`); `run_tool_capable_turn` threads a `spotlight_delim` into `TurnConfig` so the in-process executor's `hydrate_messages` wraps untrusted user content with the same delimiter the runner uses on its side.
+- `TurnRequest.max_tool_rounds` is part of the runner protocol; the runner clamps to `min(req, RUNNER_MAX_TOOL_ROUNDS)`. Pre-fix the runner used a hard-coded 24, ignoring `config_general.max_tool_rounds`.
+- Inline composer attachments validate up front but persist (blob + `state_attachments` row) only AFTER every identity/Blocked/UnknownPending/Rule-of-Two gate has passed — dropped turns leave no orphan rows or blobs.
+- `inference_probe_handler` enforces Controller-only via the same `require_controller` helper every other admin route uses (was binding `_user: AuthedUser` and discarding the role).
+- `runner-local::hydrate_messages` and `build_runner_history_messages` emit OpenAI-compliant tool-message order — `assistant(content="", tool_calls=[tc])` before each matching `tool` role message, terminal `assistant(text=final, tool_calls=[])`. Replay across multi-turn tool conversations no longer trips vLLM's strict tool-choice validation.
+- `advance_job_handler` wraps the spawned-phase work in an inner `async {}.await` block so the `cancel_tokens` registry cleanup runs on every exit path (success, gather error, missing-notes branch). The `ResearchSupervisor` DashMap no longer leaks entries when a phase errors.
+- `skill_err` maps `InvalidFrontmatter` → 400, `BodyTooLarge` / `ResourceTooLarge` → 413 with structured error codes the SPA's composer can render inline (was 500 catch-all).
+
 **Schema-ready, runner-side glue not yet in main:**
 - HOT slot injection in `assemble_system_prompt` — needs a call to `MemoryStore::list_hot` with byte cap
 - Promotion sweeper — periodic background task feeding `promotion_candidates` into `PromotionStore::propose`
 - Demotion sweeper — periodic background task feeding `demotion_candidates` into `PromotionStore::propose`
 
 **Designed, not yet implemented:**
-- Planner/executor split for untrusted-content turns
+- Full two-pass planner/executor choreography (the *containment half* — empty tool catalog when the split fires — landed 2026-05-16; the planner-then-executor hand-off is still on the design list)
 - Post-turn reflection pass (planner role)
 - Heuristic gate that decides when reflection fires
 - SPA UI for the memory promotion approval queue (uses the same dropdown infra as skill proposals)

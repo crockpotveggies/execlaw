@@ -1,0 +1,174 @@
+{
+  "general": {
+    "title": "Allgemein",
+    "introPre": "Bediener-Einstellungen für den Host-Dienst. Die Steuerungsebene läuft als systemd- / launchd- / Windows-Dienst — siehe ",
+    "introPost": " in einem Terminal für den Live-Status und die Log-Pfade.",
+    "readOnly": "Schreibgeschützte Ansicht. Nur Controller können allgemeine Einstellungen ändern.",
+    "loading": "Lädt…",
+    "startAtBoot": "Beim Systemstart starten",
+    "startAtBootHelpPre": "Wenn aktiviert, startet der Host-Dienst automatisch beim Hochfahren des Systems. Der nächste Aufruf von ",
+    "startAtBootHelpPost": " übernimmt die Änderung; die Registrierung im Dienstverwalter auf der Festplatte ändert sich bis dahin nicht.",
+    "bootReinstallPre": "Führe ",
+    "bootReinstallPost": " erneut in einem Terminal aus, um das neue Autostart-Flag zu übernehmen (oder eine PowerShell mit erhöhten Rechten unter Windows).",
+    "bindAddress": "Bind-Adresse (Host:Port)",
+    "bindAddressHelp": "Die Adresse, auf der die Steuerungsebene lauscht. Verwende 127.0.0.1:3031 nur für Loopback, 0.0.0.0:3031 zum Binden aller Schnittstellen (stelle einen Reverse-Proxy für TLS davor) oder ein IPv6-Literal wie [::1]:3031.",
+    "bindRestartHintPre": "Die Bind-Adresse wird beim nächsten ",
+    "bindRestartHintPost": " wirksam.",
+    "historyRetention": "Verlaufsaufbewahrung",
+    "historyRetentionHelp": "Wie lange Konversationsverlauf, geplante Aufgabenläufe, strukturierte Logs und (in Kürze) Recherche-Jobs vor der automatischen Löschung erhalten bleiben. Speichereinträge und das Audit-Log sind nicht betroffen.",
+    "retentionNarrowing": "Dies ist ein kürzeres Zeitfenster. Beim Speichern wird beim nächsten Bereinigungsdurchlauf (innerhalb von ca. 30 Minuten) eine einmalige Massenlöschung des älteren Verlaufs ausgelöst. Das lässt sich nicht rückgängig machen.",
+    "save": "Speichern",
+    "revert": "Zurücksetzen",
+    "language": "Sprache",
+    "languageHelp": "Pro Browser gespeichert. Beim ersten Start wird auf die Betriebssystemsprache zurückgegriffen; Änderungen hier überschreiben sie.",
+    "dangerConfirm": "ALLE Daten löschen und den Dienst auf Werkseinstellungen zurücksetzen?\n\nDies löscht jede Konversation, jedes Plug-in, jeden Kontakt, jede Routine, jedes OAuth-Token und jedes Bedienerkonto. Der Dienst läuft weiter, aber du wirst abgemeldet und der nächste Besuch startet den Einrichtungsassistenten.\n\nDas lässt sich nicht rückgängig machen.",
+    "dangerZone": "Gefahrenzone",
+    "dangerZoneBody": "Löscht jede Konversation, jedes Plug-in, jeden Kontakt, jede Routine, jedes gespeicherte Token und jedes Bedienerkonto und meldet dich anschließend ab. Der Dienst läuft weiter, der nächste Besuch startet jedoch den Einrichtungsassistenten. Dateisystem-Artefakte (Recherche-Arbeitsbereiche, Anhänge) werden nicht entfernt; starte den Host-Dienst für einen wirklich sauberen Zustand neu.",
+    "dangerTypePre": "Tippe ",
+    "dangerTypePost": " ein, um die Schaltfläche zu aktivieren.",
+    "wiping": "Wird gelöscht…",
+    "dangerReset": "Alle Daten löschen und auf Werkseinstellungen zurücksetzen"
+  },
+  "composer": {
+    "dismiss": "Schließen",
+    "placeholder": "Wie kann ich helfen?",
+    "attach": "Anhängen",
+    "attachPhoto": "Foto anhängen",
+    "attachFile": "Datei anhängen",
+    "attachSkill": "Skill anhängen",
+    "backToAttach": "Zurück zum Anhang-Menü",
+    "pickSkills": "Skills für diesen Zug wählen",
+    "loading": "Lädt…",
+    "stop": "Generierung stoppen",
+    "send": "Senden"
+  },
+  "sidebar": {
+    "newChat": "Neuer Chat",
+    "browse": "Stöbern",
+    "routines": "Routinen",
+    "automations": "Automationen",
+    "research": "Recherche",
+    "skills": "Skills",
+    "approvals": "Genehmigungen",
+    "more": "Mehr",
+    "contacts": "Kontakte",
+    "threads": "Unterhaltungen",
+    "filters": "Filter",
+    "externalChannels": "Externe Kanäle",
+    "off": "aus",
+    "on": "an",
+    "noThreads": "Noch keine Unterhaltungen. Starte einen neuen Chat, um zu beginnen.",
+    "controlThread": "Steuerungs-Thread",
+    "newChatLabel": "Neuer Chat · {{id}}",
+    "deleteConfirm": "„{{name}}“ löschen? Das löscht den Verlauf der Konversation.",
+    "settings": "Einstellungen",
+    "signOut": "Abmelden",
+    "status": {
+      "offline": "Server nicht erreichbar",
+      "reconnecting": "Verbindung zum Server wird neu aufgebaut",
+      "alertSingular": "{{count}} aktive Warnung",
+      "alertPlural": "{{count}} aktive Warnungen",
+      "installing": "Backend wird installiert — Seite „Backends“ öffnen",
+      "online": "Online — Warnungen öffnen"
+    }
+  },
+  "welcome": {
+    "incognitoOnAria": "Inkognito aktiv — deaktivieren",
+    "incognitoOffAria": "Inkognito-Chat starten (wird nicht gespeichert)",
+    "incognitoOnTitle": "Inkognito aktiv — dieser Chat wird nicht gespeichert",
+    "incognitoOffTitle": "Inkognito aus — einen privaten Chat starten",
+    "fallbackName": "Freund",
+    "suggestionsLabel": "Vorschläge",
+    "suggestions": {
+      "capabilities": {
+        "title": "Zeig mir, was du kannst",
+        "sub": "deine Fähigkeiten auflisten",
+        "prompt": "Gib mir einen kurzen Überblick, wobei du helfen kannst."
+      },
+      "plan": {
+        "title": "Hilf mir zu planen",
+        "sub": "die Prioritäten von heute",
+        "prompt": "Hilf mir herauszufinden, was heute am wichtigsten zu tun ist."
+      },
+      "brainstorm": {
+        "title": "Brainstorming",
+        "sub": "eine offene Frage, die mir nachgeht",
+        "prompt": "Ich denke über ein Problem bei der Arbeit nach. Können wir gemeinsam brainstormen?"
+      }
+    }
+  },
+  "login": {
+    "webauthnUnsupported": "Dieser Browser unterstützt WebAuthn nicht. Verwende einen modernen Browser oder entferne den registrierten Passkey.",
+    "webauthnNoCredential": "Der Authentifikator hat keine Anmeldedaten zurückgegeben.",
+    "usernameAndPasswordRequired": "Gib Benutzername und Passwort ein.",
+    "passkeyStepFailedWithReason": "Passkey-Schritt fehlgeschlagen: {{reason}}",
+    "passkeyStepFailed": "Passkey-Schritt fehlgeschlagen.",
+    "incorrectCredentials": "Falscher Benutzername oder falsches Passwort.",
+    "failed": "Anmeldung fehlgeschlagen.",
+    "intro": "Melde dich an, um fortzufahren.",
+    "passkeyRequired": "Passkey erforderlich",
+    "passkeyRequiredBody": "Tippe deinen Sicherheitsschlüssel an oder nutze den Authentifikator deiner Plattform, um die Anmeldung abzuschließen.",
+    "tryPasskeyAgain": "Passkey erneut versuchen",
+    "username": "Benutzername",
+    "password": "Passwort",
+    "signingIn": "Anmeldung läuft…",
+    "signIn": "Anmelden"
+  },
+  "setup": {
+    "validation": {
+      "required": "Pflichtfeld.",
+      "usernameTooShort": "Muss mindestens {{n}} Zeichen lang sein.",
+      "usernameTooLong": "Darf höchstens {{n}} Zeichen lang sein.",
+      "usernameChars": "Nur Buchstaben, Ziffern, Unterstrich, Bindestrich.",
+      "passwordTooShort": "Muss mindestens {{n}} Zeichen lang sein.",
+      "email": "Sieht nicht nach einer E-Mail-Adresse aus."
+    },
+    "stepper": {
+      "aria": "Fortschritt der Einrichtung",
+      "account": "Konto",
+      "docker": "Docker",
+      "backend": "Backend"
+    },
+    "account": {
+      "submitErrorFallback": "Einrichtung fehlgeschlagen; bitte erneut versuchen.",
+      "intro": "Willkommen — lass uns dein Controller-Konto anlegen.",
+      "username": "Benutzername",
+      "usernameHelp": "Wird zur Anmeldung verwendet. Buchstaben, Ziffern, Unterstrich, Bindestrich.",
+      "displayName": "Anzeigename",
+      "password": "Administratorpasswort",
+      "passwordHelp": "Mindestens {{n}} Zeichen. Du kannst es später ändern.",
+      "email": "E-Mail",
+      "optional": "(optional)",
+      "creating": "Wird erstellt…",
+      "submit": "Konto erstellen"
+    },
+    "docker": {
+      "checking": "Docker wird geprüft…",
+      "probing": "Docker-Daemon wird abgefragt…",
+      "preflightFailed": "Preflight-Endpunkt konnte nicht erreicht werden.",
+      "retry": "Wiederholen",
+      "skip": "Überspringen",
+      "lookingForPrereqs": "Suche nach Voraussetzungen…",
+      "reachable": "Docker ist erreichbar",
+      "serverVersion": "Serverversion:",
+      "continue": "Weiter",
+      "rechecking": "Erneute Prüfung…",
+      "recheck": "Erneut prüfen",
+      "needed": "Docker wird für verwaltete Inferenz-Backends benötigt.",
+      "notDetected": "Docker Desktop nicht erkannt",
+      "notDetectedBody": "execlaw verwendet Docker, um die Inferenz-Container für Whisper, Kokoro und dein LLM zu starten. Ohne Docker kannst du execlaw weiterhin auf einen externen OpenAI-kompatiblen Endpunkt zeigen, aber der integrierte Backend-Assistent kann keine Container für dich verwalten.",
+      "installLink": "Docker Desktop installieren",
+      "installedRecheck": "Ist installiert, erneut prüfen",
+      "skipForNow": "Vorerst überspringen"
+    },
+    "backend": {
+      "intro": "Wähle, wo dein Standard-Chat-Modell läuft."
+    },
+    "hardware": {
+      "title": "Erkannte Hardware",
+      "none": "Keine unterstützte GPU erkannt. Schließe eine an (oder behebe die Treiber) und klicke auf Aktualisieren, oder überspringe und nutze unten einen externen Endpunkt.",
+      "refreshing": "Aktualisiert…",
+      "refresh": "Aktualisieren"
+    }
+  }
+}
