@@ -129,7 +129,22 @@ pub async fn get_handler(
     State(_state): State<AppState>,
     _user: AuthedUser,
 ) -> Json<PreflightResponse> {
-    let docker = detect_docker();
+    // `detect_docker` shells out to `docker info`, which can block
+    // for tens of seconds when Docker Desktop is in a half-broken
+    // state (running but not serving — observed under WSLg with a
+    // Docker Desktop WSL-integration distro). The previous direct
+    // call held the tokio worker for the entire blocked duration,
+    // which made the SPA spin forever on the wizard's docker check.
+    // Wrapping in `spawn_blocking` lifts the syscall off the runtime
+    // so other requests still flow; the timeout inside
+    // `detect_docker` caps the wait at ~3 seconds, after which we
+    // surface `available: false` and let the operator decide.
+    let docker = tokio::task::spawn_blocking(detect_docker)
+        .await
+        .unwrap_or(DockerStatus {
+            available: false,
+            version: None,
+        });
     let ollama = detect_ollama();
     let profile = detect();
     let (disk_free_bytes, disk_free_path) = detect_disk_free();
@@ -359,27 +374,79 @@ fn detect_docker() -> DockerStatus {
 /// the result into `Option<DockerStatus>`. Returns `Some` when the
 /// command exited 0 (Docker is reachable) and `None` otherwise so
 /// the caller can fall through to the next candidate path.
+///
+/// Bounded by [`DOCKER_PROBE_TIMEOUT`]: a daemon that's installed
+/// but unresponsive (Docker Desktop transitioning between states,
+/// stale WSL2 socket bridge, swap-bound host) used to hang the
+/// caller forever — pre-fix the SPA's setup wizard would spin
+/// indefinitely on the docker-check screen. Now we kill the child
+/// after the timeout and treat the result as `None` (unreachable)
+/// so the wizard falls through to its "install Docker" branch.
 fn try_docker_at(binary: &str) -> Option<DockerStatus> {
-    use std::process::Command;
-    let output = Command::new(binary)
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let mut child = Command::new(binary)
         .arg("info")
         .arg("--format")
         .arg("{{.ServerVersion}}")
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
-        return None;
+
+    let deadline = Instant::now() + DOCKER_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let mut buf = String::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    let _ = stdout.read_to_string(&mut buf);
+                }
+                let version = buf.trim().to_owned();
+                return Some(DockerStatus {
+                    available: true,
+                    version: if version.is_empty() {
+                        None
+                    } else {
+                        Some(version)
+                    },
+                });
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Daemon is unresponsive. Best-effort kill; if
+                    // the kill itself blocks (rare on Linux/macOS,
+                    // unusual on Windows), we drop the Child handle
+                    // and let the OS reap it after our process
+                    // exits — preferable to hanging the runtime.
+                    tracing::warn!(
+                        binary,
+                        timeout_ms = DOCKER_PROBE_TIMEOUT.as_millis() as u64,
+                        "docker info probe exceeded timeout — treating as unavailable",
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
     }
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    Some(DockerStatus {
-        available: true,
-        version: if version.is_empty() {
-            None
-        } else {
-            Some(version)
-        },
-    })
 }
+
+/// How long [`try_docker_at`] waits for `docker info` to return
+/// before declaring the daemon unreachable. Three seconds is a
+/// generous budget for a healthy daemon (typical response is
+/// 50-200 ms) and short enough that the SPA's setup wizard feels
+/// responsive on a broken-Docker host.
+const DOCKER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Probe whether Ollama is installed and runnable. Two-step check
 /// so a stale symlink / permission-denied binary doesn't surface as
