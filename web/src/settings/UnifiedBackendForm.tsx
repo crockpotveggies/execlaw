@@ -225,21 +225,43 @@ function targetLabel(t: Target): string {
     return gpuLabel(t.gpu);
 }
 
-function servingMethodsFor(gpu: DetectedGpu): ServingMethod[] {
-    switch (gpu.vendor) {
-        case "Nvidia":
-            return ["vllm"];
-        case "Intel":
-            return ["openvino", "openarc"];
-        case "Apple":
-            // Native Ollama subprocess — no Docker. The form's Apple
-            // branch renders the install-prompt panel when
-            // ollamaAvailable === false, otherwise the standard
-            // model picker.
-            return ["ollama"];
-        default:
-            return [];
+function servingMethodsFor(
+    gpu: DetectedGpu,
+    ollamaAvailable: boolean,
+): ServingMethod[] {
+    // Per-vendor Docker-backed engines. Apple has no Docker path
+    // because Metal doesn't pass through to containers.
+    const dockerEngines: ServingMethod[] = (() => {
+        switch (gpu.vendor) {
+            case "Nvidia":
+                return ["vllm"];
+            case "Intel":
+                return ["openvino", "openarc"];
+            case "Apple":
+                return [];
+            default:
+                return [];
+        }
+    })();
+    // Ollama is the universal non-Docker option: native subprocess
+    // that uses CUDA on NVIDIA, ROCm on AMD, Metal on Apple, CPU
+    // everywhere else. Show it as a serving choice whenever the
+    // host has the binary installed. For Apple GPUs Ollama is the
+    // ONLY option (no Docker passthrough). For NVIDIA / Intel it's
+    // an alternative to the heavier Docker-backed engines —
+    // operators on hosts with broken Docker Desktop or no NVIDIA
+    // Container Toolkit can still spawn a managed local LLM. The
+    // form's serving dropdown renders these in the order returned.
+    // Apple Silicon has NO Docker path — Ollama is the only managed
+    // option even when Ollama isn't installed yet. We still return
+    // `["ollama"]` so the target surfaces and the form's install
+    // panel can guide the operator through `brew install ollama`.
+    // Submit stays disabled (gated on `ollamaAvailable`) until the
+    // binary is actually present.
+    if (gpu.vendor === "Apple") {
+        return ["ollama"];
     }
+    return ollamaAvailable ? [...dockerEngines, "ollama"] : dockerEngines;
 }
 
 function modelsFor(serving: ServingMethod, memory_mb: number | null): ModelOption[] {
@@ -336,16 +358,45 @@ function fmtBytes(b: number): string {
 /// the same `available` flag so the operator can't submit a backend
 /// row the supervisor will reject at spawn time.
 ///
+/// Detect the operator's host OS at runtime via the userAgent.
+/// `navigator.platform` is deprecated; `navigator.userAgent` still
+/// reliably identifies the three families we care about. The result
+/// drives the per-OS install command the panel shows.
+function detectHostOs(): "macos" | "windows" | "linux" {
+    if (typeof navigator === "undefined") return "linux";
+    const ua = navigator.userAgent;
+    if (/Mac/i.test(ua)) return "macos";
+    if (/Win/i.test(ua)) return "windows";
+    return "linux";
+}
+
+/// The per-OS install command. Pinned to the canonical installer
+/// channel for each: Homebrew on macOS, the curl|sh script on Linux
+/// (matches what ollama.com's website hands operators), and winget
+/// on Windows (matches `Ollama.Ollama` from the public manifest).
+const OLLAMA_INSTALL_COMMAND: Record<
+    "macos" | "windows" | "linux",
+    string
+> = {
+    macos: "brew install ollama",
+    windows: "winget install Ollama.Ollama",
+    linux: "curl https://ollama.com/install.sh | sh",
+};
+
 /// Mirrors the Docker-Desktop install nudge the wizard already shows
 /// when `dockerAvailable === false` and the operator picks an
-/// NVIDIA/Intel target — but with Apple-specific copy.
-function ApplePreflightPanel({
+/// NVIDIA/Intel target — but for the native-Ollama runtime, with
+/// per-OS install copy. Apple Silicon ALWAYS routes through this
+/// panel (it has no Docker path); other GPUs route through it only
+/// when the operator picks "ollama" from the serving dropdown.
+function OllamaPreflightPanel({
     available,
     version,
     path,
     onRecheck,
     submitting,
     testIdPrefix,
+    hostOs,
 }: {
     available: boolean;
     version: string | null;
@@ -353,6 +404,7 @@ function ApplePreflightPanel({
     onRecheck?: () => Promise<void> | void;
     submitting: boolean;
     testIdPrefix: string;
+    hostOs: "macos" | "windows" | "linux";
 }) {
     const [rechecking, setRechecking] = useState(false);
     const handleRecheck = useCallback(async () => {
@@ -380,6 +432,18 @@ function ApplePreflightPanel({
         );
     }
 
+    const installCommand = OLLAMA_INSTALL_COMMAND[hostOs];
+    const explainer = (() => {
+        switch (hostOs) {
+            case "macos":
+                return "Apple Silicon has no Metal-to-container passthrough, so execlaw spawns Ollama as a native macOS subprocess instead of a Docker container.";
+            case "windows":
+                return "On Windows, execlaw spawns Ollama as a native subprocess (faster than running Ollama inside a Docker container, and works without WSL2 GPU passthrough).";
+            case "linux":
+                return "On Linux, execlaw can spawn Ollama as a native subprocess — faster than the Docker path and works on hosts without `nvidia-container-toolkit`.";
+        }
+    })();
+
     return (
         <div
             className="execlaw-card mb-3"
@@ -391,13 +455,11 @@ function ApplePreflightPanel({
                     className="bi bi-exclamation-triangle-fill me-2"
                     aria-hidden
                 />
-                Install Ollama to enable Apple-Silicon inference
+                Install Ollama to enable the native runtime
             </div>
             <p className="execlaw-muted small mb-2">
-                Apple Silicon has no Metal-to-container passthrough, so
-                execlaw spawns Ollama as a native macOS subprocess
-                instead of a Docker container. Install it once and
-                we&rsquo;ll detect it on Recheck:
+                {explainer}{" "}
+                Install it once and we&rsquo;ll detect it on Recheck:
             </p>
             <pre
                 className="execlaw-code mb-2"
@@ -409,7 +471,7 @@ function ApplePreflightPanel({
                     overflowX: "auto",
                 }}
             >
-                <code>brew install ollama</code>
+                <code>{installCommand}</code>
             </pre>
             {path && (
                 <p className="execlaw-muted small mb-2">
@@ -468,16 +530,24 @@ export function UnifiedBackendForm({
     skipLabel = "Skip for now",
     testIdPrefix = "unified-backend",
 }: UnifiedBackendFormProps) {
+    const ollamaIsAvailable = ollamaAvailable === true;
     const targets: Target[] = [];
-    // Apple GPUs go through the native Ollama runtime — no Docker
-    // required. Docker-dependent GPUs (NVIDIA, Intel) stay gated on
-    // dockerAvailable so a Mac-without-Docker host still sees its
-    // Apple GPU as a target option (and the install-prompt panel
-    // tells the operator how to make it work).
+    // Surface a GPU as a target when AT LEAST ONE of its serving
+    // methods is usable on the current host. A method needs Docker
+    // when it's vLLM / OpenVINO / OpenArc; Ollama is native and
+    // doesn't. Pre-2026-05 this was gated strictly on `Apple ||
+    // dockerAvailable`, which hid NVIDIA / Intel GPUs from operators
+    // who had Ollama installed but no working Docker — now those
+    // hosts still see their GPU surfaced with Ollama as the sole
+    // (or default) serving option.
     gpus.forEach((g, idx) => {
-        if (servingMethodsFor(g).length === 0) return;
-        const requiresDocker = g.vendor !== "Apple";
-        if (requiresDocker && !dockerAvailable) return;
+        const methods = servingMethodsFor(g, ollamaIsAvailable);
+        if (methods.length === 0) return;
+        const hasNonDockerOption = methods.includes("ollama");
+        const hasDockerOption = methods.some((m) => m !== "ollama");
+        const usable =
+            (hasDockerOption && dockerAvailable) || hasNonDockerOption;
+        if (!usable) return;
         targets.push({ kind: "gpu", gpu: g, gpuIdx: idx });
     });
     targets.push({ kind: "remote" });
@@ -486,17 +556,19 @@ export function UnifiedBackendForm({
     const target = targets[targetIdx] ?? targets[0];
 
     const availableServing =
-        target.kind === "gpu" ? servingMethodsFor(target.gpu) : [];
+        target.kind === "gpu"
+            ? servingMethodsFor(target.gpu, ollamaIsAvailable)
+            : [];
     const [serving, setServing] = useState<ServingMethod>(
         availableServing[0] ?? "vllm",
     );
     useEffect(() => {
         if (target.kind === "gpu") {
-            const opts = servingMethodsFor(target.gpu);
+            const opts = servingMethodsFor(target.gpu, ollamaIsAvailable);
             if (!opts.includes(serving)) setServing(opts[0]);
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [targetIdx]);
+    }, [targetIdx, ollamaIsAvailable]);
 
     const availableModels =
         target.kind === "gpu"
@@ -660,14 +732,25 @@ export function UnifiedBackendForm({
                     )}
                 </Form.Group>
 
-                {target.kind === "gpu" && target.gpu.vendor === "Apple" && (
-                    <ApplePreflightPanel
-                        available={ollamaAvailable}
-                        version={ollamaVersion}
-                        path={ollamaPath}
+                {target.kind === "gpu" && serving === "ollama" && (
+                    <OllamaPreflightPanel
+                        available={ollamaAvailable === true}
+                        version={ollamaVersion ?? null}
+                        path={ollamaPath ?? null}
                         onRecheck={onRecheckOllama}
                         submitting={submitting}
                         testIdPrefix={testIdPrefix}
+                        // Apple GPUs are macOS-only — short-circuit
+                        // the userAgent probe and pin the install
+                        // command to `brew install ollama`. For
+                        // NVIDIA / Intel targets, fall back to UA
+                        // detection (Linux vs Windows) since the
+                        // GPU vendor doesn't disambiguate.
+                        hostOs={
+                            target.gpu.vendor === "Apple"
+                                ? "macos"
+                                : detectHostOs()
+                        }
                     />
                 )}
 
@@ -714,13 +797,17 @@ export function UnifiedBackendForm({
                             </Form.Group>
                         )}
 
-                        {/* Apple/Ollama: skip the model picker until
+                        {/* Ollama path: skip the model picker until
                             the install panel above reports the binary
                             is runnable. Avoids the operator picking a
                             model into a spec that the supervisor will
-                            then reject at spawn time. */}
+                            then reject at spawn time. Applies to
+                            every target where Ollama is the chosen
+                            serving method — Apple (only option),
+                            NVIDIA / Intel (operator picked it from
+                            the dropdown over the Docker engine). */}
                         {target.kind === "gpu" &&
-                        target.gpu.vendor === "Apple" &&
+                        serving === "ollama" &&
                         !ollamaAvailable ? null : (
                         <Form.Group className="mb-3">
                             <Form.Label className="execlaw-muted small mb-1">
@@ -826,16 +913,20 @@ export function UnifiedBackendForm({
                     <Button
                         type="submit"
                         variant="primary"
-                        // Apple/Ollama: don't let the operator submit
-                        // until Ollama is actually present. The form
-                        // would otherwise write a spec the supervisor
-                        // can't spawn and the row would flip to
-                        // CrashLooping after the wizard already
-                        // claimed success — bad UX.
+                        // Ollama-as-serving: don't let the operator
+                        // submit until Ollama is actually present on
+                        // the host. The form would otherwise write a
+                        // spec the supervisor can't spawn and the
+                        // row would flip to CrashLooping after the
+                        // wizard already claimed success — bad UX.
+                        // Fires for Apple (Ollama is the only option)
+                        // AND for NVIDIA / Intel hosts where the
+                        // operator picked Ollama over the Docker
+                        // engine but doesn't have the binary yet.
                         disabled={
                             submitting ||
                             (target.kind === "gpu" &&
-                                target.gpu.vendor === "Apple" &&
+                                serving === "ollama" &&
                                 !ollamaAvailable)
                         }
                         data-testid={`${testIdPrefix}-submit`}

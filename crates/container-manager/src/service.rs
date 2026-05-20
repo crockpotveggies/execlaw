@@ -876,20 +876,55 @@ impl NativeServiceController {
         if let Some(p) = path_lookup("ollama") {
             return Ok(p);
         }
-        // Apple-Silicon Homebrew prefix only. Intel-Mac brew lives
-        // at `/usr/local/bin/` but execlaw doesn't support Intel
-        // Macs, so we don't probe it — a stray `/usr/local/bin/ollama`
-        // on a Linux host would be a host-administrator decision
-        // best handled via OLLAMA_BINARY rather than implicit pickup.
-        let homebrew = PathBuf::from("/opt/homebrew/bin/ollama");
-        if homebrew.exists() {
-            return Ok(homebrew);
+        // Well-known install locations the operator's PATH might not
+        // include — covers Macs spawned via launchd (minimal PATH),
+        // Linux installs via the curl|sh script (writes to
+        // `/usr/local/bin/`), apt packages on Debian-family distros
+        // (`/usr/bin/`), and the Windows MSI installer's per-user
+        // Programs directory. First match wins.
+        let candidates: &[&str] = &[
+            // macOS — Apple-Silicon Homebrew prefix. Intel-Mac brew at
+            // `/usr/local/bin/` is covered by the same entry below
+            // (the curl|sh installer also drops there on Linux).
+            "/opt/homebrew/bin/ollama",
+            // Linux — curl|sh from ollama.com.
+            "/usr/local/bin/ollama",
+            // Linux — distro packages on Debian/Ubuntu/Arch/Fedora.
+            "/usr/bin/ollama",
+            // Windows — `winget install Ollama.Ollama` and the .exe
+            // installer from ollama.com both write here.
+            #[cfg(windows)]
+            "C:\\Users\\Default\\AppData\\Local\\Programs\\Ollama\\ollama.exe",
+        ];
+        for cand in candidates {
+            let p = PathBuf::from(cand);
+            if p.exists() {
+                return Ok(p);
+            }
         }
-        Err(ServiceError::Invalid(
-            "ollama binary not found — install with `brew install ollama`, or \
-             set OLLAMA_BINARY to an absolute path"
-                .to_owned(),
-        ))
+        // Windows-only: the per-user install path. `USERPROFILE` is
+        // set on every interactive Windows session — fall back to it
+        // when the default-profile candidate above doesn't apply.
+        #[cfg(windows)]
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            let p = PathBuf::from(profile).join("AppData\\Local\\Programs\\Ollama\\ollama.exe");
+            if p.exists() {
+                return Ok(p);
+            }
+        }
+        // Per-OS install hint so the wizard's banner suggests the
+        // right thing.
+        let hint = if cfg!(target_os = "macos") {
+            "install with `brew install ollama`"
+        } else if cfg!(target_os = "windows") {
+            "install with `winget install Ollama.Ollama` (or download the installer from https://ollama.com/download/windows)"
+        } else {
+            // Linux + everything else
+            "install with `curl https://ollama.com/install.sh | sh` (or your distro's package manager)"
+        };
+        Err(ServiceError::Invalid(format!(
+            "ollama binary not found — {hint}, or set OLLAMA_BINARY to an absolute path"
+        )))
     }
 
     /// Pick the binary path for a given hint. Future engines slot in
@@ -1657,16 +1692,24 @@ mod tests {
 
     #[test]
     fn discover_ollama_no_env_no_path_yields_install_hint() {
-        // Default install state on a Mac that hasn't run brew yet:
-        // no env override, nothing on PATH, brew prefixes empty.
-        // The wizard renders this string directly — pin the
-        // copy so a refactor doesn't silently regress it.
+        // Default install state on a host that hasn't installed
+        // Ollama: no env override, nothing on PATH, none of the
+        // well-known per-OS paths exist. The wizard renders this
+        // string directly — pin the per-OS copy so a refactor
+        // doesn't silently regress it.
         let err = NativeServiceController::discover_ollama_with(None, |_| None).unwrap_err();
         match err {
             ServiceError::Invalid(msg) => {
+                let expected_hint = if cfg!(target_os = "macos") {
+                    "brew install ollama"
+                } else if cfg!(target_os = "windows") {
+                    "winget install Ollama.Ollama"
+                } else {
+                    "curl https://ollama.com/install.sh"
+                };
                 assert!(
-                    msg.contains("brew install ollama"),
-                    "install hint must call out brew, got '{msg}'"
+                    msg.contains(expected_hint),
+                    "install hint must call out the per-OS installer ({expected_hint}), got '{msg}'"
                 );
                 assert!(
                     msg.contains("OLLAMA_BINARY"),
