@@ -50,11 +50,16 @@ pub const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 /// runs.
 pub const DEFAULT_WORKER_CONCURRENCY: usize = 16;
 
-/// Internal poller tick. 100ms is the latency floor for in-process
-/// producers — they write durably and the poller picks them up on
-/// the next tick. Trades fast internal-event response against
-/// frequency of idle wakeups.
-pub const INTERNAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Internal poller tick. Acts as a **safety net** for the
+/// event-driven kick: `publish_internal` / `publish_sync(internal=true)`
+/// wakes the poller immediately via `internal_kick`, so the tick only
+/// has to catch the rare case where a row landed durably but the kick
+/// was lost (e.g., process crash + restart between INSERT and notify,
+/// or a sync producer that doesn't reach the bus handle). 5 s keeps
+/// the idle-load floor 50× lower than the prior 100 ms tick while
+/// preserving at-most-5-s tail latency in degenerate cases. Steady-
+/// state in-process publishes pay zero idle DB cost.
+pub const INTERNAL_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Per-tick batch size for the poller and the crash-recovery sweep.
 /// Big enough that a busy poller doesn't fall behind; small enough
@@ -81,6 +86,14 @@ pub struct AutomationBus {
 struct AutomationBusInner {
     db: Database,
     tx: mpsc::Sender<String>,
+    /// Wake-up signal for the internal poller. Notified by every
+    /// `publish_internal` / `publish_sync(internal=true)` after a
+    /// durable row insert, so the poller picks the row up immediately
+    /// instead of waiting for the next safety-net tick. `Notify`'s
+    /// stored-permit semantics make this safe across the
+    /// publish→poller race: if no waiter is parked, the next
+    /// `notified().await` consumes the permit without sleeping.
+    internal_kick: Arc<Notify>,
 }
 
 /// Handles to the spawned dispatcher + poller. Caller can `.join()`
@@ -120,10 +133,12 @@ impl AutomationBus {
         stop: Arc<Notify>,
     ) -> (Self, BusTasks) {
         let (tx, rx) = mpsc::channel::<String>(channel_capacity);
+        let internal_kick = Arc::new(Notify::new());
         let bus = Self {
             inner: Arc::new(AutomationBusInner {
                 db: db.clone(),
                 tx: tx.clone(),
+                internal_kick: internal_kick.clone(),
             }),
         };
         let workers = Arc::new(Semaphore::new(worker_concurrency));
@@ -134,7 +149,13 @@ impl AutomationBus {
             handler.clone(),
             stop.clone(),
         ));
-        let poller = tokio::spawn(internal_poller_loop(db, tx, poll_interval, stop));
+        let poller = tokio::spawn(internal_poller_loop(
+            db,
+            tx,
+            poll_interval,
+            internal_kick,
+            stop,
+        ));
         (bus, BusTasks { dispatcher, poller })
     }
 
@@ -170,15 +191,24 @@ impl AutomationBus {
     }
 
     /// Publish an internal event. Persists durable-only with
-    /// `internal=1` and does NOT touch the channel — the poller
-    /// picks it up on the next tick.
+    /// `internal=1`, does NOT touch the channel, and wakes the
+    /// internal poller via `internal_kick` so the row is picked up
+    /// immediately (not on the next safety-net tick).
     ///
     /// Use this from in-process producers (automation side effects,
     /// plugin emits) to avoid producer-consumer deadlock through
     /// the channel.
     pub async fn publish_internal(&self, evt: Event) -> Result<PublishOutcome, BusEventError> {
         let store = BusEventStore::new(&self.inner.db);
-        store.publish(&evt, true)
+        let outcome = store.publish(&evt, true)?;
+        // Only kick on a fresh insert. `Duplicate` means the row was
+        // already there (and either dispatched, or a prior publish
+        // already kicked); kicking again wastes a poller wakeup on a
+        // SELECT that returns no new work.
+        if matches!(outcome, PublishOutcome::Inserted) {
+            self.inner.internal_kick.notify_one();
+        }
+        Ok(outcome)
     }
 
     /// Synchronous, channel-free publish path — exposed for the
@@ -186,12 +216,20 @@ impl AutomationBus {
     /// have an async context. Internal events are durable-only and
     /// the poller picks them up; external events skip the channel
     /// and rely on the crash-recovery scan to land in the dispatcher.
+    /// Internal inserts kick the poller (same semantics as
+    /// `publish_internal`); external inserts do not — that path is
+    /// reserved for callers who deliberately want recovery-scan
+    /// semantics.
     pub fn publish_sync(
         &self,
         evt: &Event,
         internal: bool,
     ) -> Result<PublishOutcome, BusEventError> {
-        BusEventStore::new(&self.inner.db).publish(evt, internal)
+        let outcome = BusEventStore::new(&self.inner.db).publish(evt, internal)?;
+        if internal && matches!(outcome, PublishOutcome::Inserted) {
+            self.inner.internal_kick.notify_one();
+        }
+        Ok(outcome)
     }
 
     /// Construct a non-dispatching bus. `publish` still writes durable
@@ -212,7 +250,15 @@ impl AutomationBus {
         // even without a live dispatcher.
         drop(rx);
         Self {
-            inner: Arc::new(AutomationBusInner { db, tx }),
+            inner: Arc::new(AutomationBusInner {
+                db,
+                tx,
+                // No poller runs in a stubbed bus, so this Notify is
+                // never observed. We still construct one so the
+                // `publish_internal` / `publish_sync(true)` paths
+                // don't have to branch on Option<Notify>.
+                internal_kick: Arc::new(Notify::new()),
+            }),
         }
     }
 }
@@ -358,6 +404,7 @@ async fn internal_poller_loop(
     db: Database,
     tx: mpsc::Sender<String>,
     poll_interval: Duration,
+    internal_kick: Arc<Notify>,
     stop: Arc<Notify>,
 ) {
     // Same race-shield as `dispatcher_loop`: register the Notify
@@ -391,21 +438,28 @@ async fn internal_poller_loop(
                 info!("automation bus internal poller: stop received, exiting");
                 return;
             }
-            _ = tick.tick() => {
-                let store = BusEventStore::new(&db);
-                match store.fetch_pending(true, POLL_BATCH_SIZE) {
-                    Ok(ids) if ids.is_empty() => continue,
-                    Ok(ids) => {
-                        for id in ids {
-                            if tx.send(id.clone()).await.is_err() {
-                                warn!(event_id = %id, "automation bus poller: dispatch channel closed");
-                                return;
-                            }
-                        }
+            // Event-driven path: a publisher inserted a fresh internal
+            // row and called `internal_kick.notify_one()`. `Notify`'s
+            // single-permit semantics mean a notify that fires BEFORE
+            // we reach `.notified().await` is still observed on the
+            // next loop iteration — so the publish→poll race can't
+            // drop the wake-up. Either branch falls through to the
+            // shared `fetch_pending` below.
+            _ = internal_kick.notified() => {}
+            _ = tick.tick() => {}
+        }
+        let store = BusEventStore::new(&db);
+        match store.fetch_pending(true, POLL_BATCH_SIZE) {
+            Ok(ids) if ids.is_empty() => continue,
+            Ok(ids) => {
+                for id in ids {
+                    if tx.send(id.clone()).await.is_err() {
+                        warn!(event_id = %id, "automation bus poller: dispatch channel closed");
+                        return;
                     }
-                    Err(e) => warn!(error = %e, "automation bus poller: fetch_pending failed"),
                 }
             }
+            Err(e) => warn!(error = %e, "automation bus poller: fetch_pending failed"),
         }
     }
 }
@@ -572,6 +626,77 @@ mod tests {
             "poller should pick up internal event",
         );
         assert_eq!(*seen.lock().unwrap(), vec!["int".to_string()]);
+
+        stop.notify_waiters();
+        tasks.join().await;
+    }
+
+    #[tokio::test]
+    async fn internal_publish_wakes_poller_immediately_via_kick() {
+        // Regression guard for the perf fix: the safety-net tick is
+        // now 5 s (was 100 ms), so without the `internal_kick` path
+        // an internal publish would wait up to 5 s before dispatch.
+        // Configure the poller with a 60-second tick — only the kick
+        // can wake it — then publish and assert the handler fires
+        // well before that.
+        let db = fresh_db();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(Notify::new());
+        let (bus, tasks) = AutomationBus::spawn_with_config(
+            db.clone(),
+            counting_handler(counter.clone(), seen.clone()),
+            DEFAULT_CHANNEL_CAPACITY,
+            DEFAULT_WORKER_CONCURRENCY,
+            Duration::from_secs(60),
+            stop.clone(),
+        );
+
+        let start = std::time::Instant::now();
+        bus.publish_internal(evt("kicked", 100)).await.unwrap();
+
+        assert!(
+            wait_for_count(&counter, 1, Duration::from_secs(2)).await,
+            "internal_kick should wake the poller without waiting for the 60 s tick",
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "kick path should fire well under the safety-net tick; took {:?}",
+            start.elapsed(),
+        );
+        assert_eq!(*seen.lock().unwrap(), vec!["kicked".to_string()]);
+
+        stop.notify_waiters();
+        tasks.join().await;
+    }
+
+    #[tokio::test]
+    async fn sync_internal_publish_also_kicks_the_poller() {
+        // `publish_sync(evt, internal=true)` is the channel-free path
+        // used by callers without an async context (retention sweeper
+        // tests, sync producers). Same kick semantics as the async
+        // `publish_internal` — otherwise sync producers would pay the
+        // full safety-net latency.
+        let db = fresh_db();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(Notify::new());
+        let (bus, tasks) = AutomationBus::spawn_with_config(
+            db.clone(),
+            counting_handler(counter.clone(), seen.clone()),
+            DEFAULT_CHANNEL_CAPACITY,
+            DEFAULT_WORKER_CONCURRENCY,
+            Duration::from_secs(60),
+            stop.clone(),
+        );
+
+        bus.publish_sync(&evt("sync-kick", 100), true).unwrap();
+
+        assert!(
+            wait_for_count(&counter, 1, Duration::from_secs(2)).await,
+            "publish_sync(internal=true) should wake the poller via internal_kick",
+        );
+        assert_eq!(*seen.lock().unwrap(), vec!["sync-kick".to_string()]);
 
         stop.notify_waiters();
         tasks.join().await;

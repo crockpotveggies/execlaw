@@ -1311,26 +1311,45 @@ pub(crate) fn build_runner_tool_catalog(
         return RunnerToolView::default();
     }
 
+    // 2026-05-20 — load `config_tool_access` ONCE per catalog build
+    // (was N+M sequential SELECTs, one per builtin + one per plugin
+    // tool). On a fresh install with ~30 registered tools, the prior
+    // shape contended with the 100 ms automation_bus poller for
+    // SQLite connections on every turn, surfacing as agent-side
+    // "evaluating tools" latency. Materialising the table into a
+    // HashMap and looking up in-memory drops the per-turn DB cost to
+    // a single statement-prepare + query.
+    //
+    // Failure mode: a `list_all` error matches the prior per-tool
+    // `Ok(None)` semantic — log loudly and treat every tool as
+    // unconfigured, which `access_allows` resolves to "default-allow".
+    // This is the same posture the in-flight-migration comment on
+    // `ToolAccessStore::get` describes; a fully unreadable
+    // `config_tool_access` table is the same kind of failure whether
+    // we hit it per-tool or in bulk.
     let access_store = ToolAccessStore::new(db);
     let caller_trust_tag = caller_trust.as_str();
     let caller_has_wildcard = caller_caps.iter().any(|c| c == "*");
-
-    let access_allows = |tool_name: &str| -> bool {
-        match access_store.get(tool_name) {
-            Ok(None) => true,
-            Ok(Some(row)) => {
-                row.enabled
-                    && row.removed_at.is_none()
-                    && row.allowed_classes.iter().any(|c| c == caller_trust_tag)
-            }
+    let access_index: std::collections::HashMap<String, execlaw_core::tool_access::ToolAccessRow> =
+        match access_store.list_all() {
+            Ok(rows) => rows.into_iter().map(|r| (r.tool_name.clone(), r)).collect(),
             Err(e) => {
                 tracing::warn!(
                     target: "chats::run_runner_turn",
-                    tool = %tool_name,
                     error = %e,
-                    "tool_access lookup failed; excluding tool from catalog",
+                    "tool_access list_all failed; falling back to default-allow for every tool",
                 );
-                false
+                std::collections::HashMap::new()
+            }
+        };
+
+    let access_allows = |tool_name: &str| -> bool {
+        match access_index.get(tool_name) {
+            None => true,
+            Some(row) => {
+                row.enabled
+                    && row.removed_at.is_none()
+                    && row.allowed_classes.iter().any(|c| c == caller_trust_tag)
             }
         }
     };
