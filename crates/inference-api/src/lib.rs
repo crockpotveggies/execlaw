@@ -711,6 +711,147 @@ impl InferenceClient {
 
         Ok(Box::pin(chunk_stream))
     }
+
+    /// Streamed chat completion with token-by-token callback.
+    ///
+    /// Drop-in replacement for [`chat_completions`](Self::chat_completions)
+    /// when the caller wants live tokens (e.g. broadcasting to a
+    /// WebSocket UI) without giving up the single fully-assembled
+    /// [`ChatResponse`] the non-streaming method returns. Internally
+    /// opens an SSE / NDJSON stream via
+    /// [`chat_completions_stream`](Self::chat_completions_stream),
+    /// invokes `on_text_delta` for every non-empty content chunk, and
+    /// aggregates the stream into a synthesized `ChatResponse` whose
+    /// shape matches what the non-streaming endpoint would have
+    /// returned (one Choice with role=Assistant, the joined content,
+    /// stitched tool_calls, the final `finish_reason`).
+    ///
+    /// `usage` is `None` — token counts aren't carried on the
+    /// per-chunk wire shape today. Callers that need both streaming
+    /// and token counts should consume
+    /// [`chat_completions_stream`](Self::chat_completions_stream)
+    /// directly and read usage from the final frame themselves.
+    pub async fn chat_completions_streamed<F>(
+        &self,
+        req: &ChatRequest,
+        mut on_text_delta: F,
+    ) -> Result<ChatResponse, InferenceError>
+    where
+        F: FnMut(&str),
+    {
+        use futures::StreamExt;
+        let mut stream = self.chat_completions_stream(req).await?;
+
+        let mut response_id = String::new();
+        let mut model = String::new();
+        let mut content_acc = String::new();
+        let mut finish_reason: Option<String> = None;
+        let mut tool_acc: Vec<StreamingToolCallAcc> = Vec::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if response_id.is_empty() && !chunk.id.is_empty() {
+                response_id = chunk.id.clone();
+            }
+            if model.is_empty() && !chunk.model.is_empty() {
+                model = chunk.model.clone();
+            }
+            for ch in chunk.choices {
+                if let Some(c) = ch.delta.content {
+                    if !c.is_empty() {
+                        on_text_delta(&c);
+                        content_acc.push_str(&c);
+                    }
+                }
+                for tc_delta in ch.delta.tool_calls {
+                    accumulate_tool_call_delta(tc_delta, &mut tool_acc);
+                }
+                if let Some(fr) = ch.finish_reason {
+                    finish_reason = Some(fr);
+                }
+            }
+        }
+        drop(stream);
+
+        if model.is_empty() {
+            model = req.model.as_str().to_owned();
+        }
+        let tool_calls: Vec<ToolCall> = tool_acc.iter().map(|a| a.finalize()).collect();
+        let content = if content_acc.is_empty() {
+            None
+        } else {
+            Some(MessageContent::Text(content_acc))
+        };
+
+        Ok(ChatResponse {
+            id: response_id,
+            model,
+            choices: vec![Choice {
+                index: 0,
+                message: ChatMessage {
+                    role: Role::Assistant,
+                    content,
+                    tool_call_id: None,
+                    name: None,
+                    tool_calls,
+                },
+                finish_reason,
+            }],
+            usage: None,
+        })
+    }
+}
+
+/// Internal accumulator for stitching OpenAI-style streaming
+/// `tool_call` deltas back into a fully-formed [`ToolCall`]. The wire
+/// spec sends `id` + `type` + `function.name` on the first delta and
+/// concatenates `function.arguments` chars across subsequent deltas;
+/// Ollama's NDJSON adapter emits the whole thing in one delta but
+/// goes through the same path so a single code shape handles both.
+struct StreamingToolCallAcc {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl StreamingToolCallAcc {
+    fn finalize(&self) -> ToolCall {
+        ToolCall {
+            id: self.id.clone(),
+            kind: "function".into(),
+            function: ToolCallFunction {
+                name: self.name.clone(),
+                arguments: self.arguments.clone(),
+            },
+        }
+    }
+}
+
+fn accumulate_tool_call_delta(delta: ToolCallDelta, acc: &mut Vec<StreamingToolCallAcc>) {
+    let idx = delta.index as usize;
+    while acc.len() <= idx {
+        acc.push(StreamingToolCallAcc {
+            id: String::new(),
+            name: String::new(),
+            arguments: String::new(),
+        });
+    }
+    let entry = &mut acc[idx];
+    if let Some(id) = delta.id {
+        if !id.is_empty() {
+            entry.id = id;
+        }
+    }
+    if let Some(func) = delta.function {
+        if let Some(n) = func.name {
+            if !n.is_empty() {
+                entry.name = n;
+            }
+        }
+        if let Some(a) = func.arguments {
+            entry.arguments.push_str(&a);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,6 +1246,93 @@ mod tests {
         }
         assert!(saw_err, "expected a decode error for malformed chunk");
         assert_eq!(ok_content, "ok", "subsequent chunks must still stream");
+    }
+
+    /// `chat_completions_streamed` aggregates content deltas into a
+    /// single ChatResponse, stitches tool_call deltas across chunks,
+    /// preserves the final finish_reason, AND invokes the per-delta
+    /// observer in order — exactly what the tool-capable in-process
+    /// executor needs for the live-token UX without giving up the
+    /// non-streaming aggregation shape.
+    #[tokio::test]
+    async fn streamed_helper_aggregates_and_fires_observer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            use tokio::io::AsyncWriteExt;
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_millis(500), sock.read(&mut buf))
+                    .await;
+            // OpenAI-style streamed reply: two content deltas, a
+            // tool_call split across two deltas, then a final
+            // finish_reason chunk.
+            let body_chunks = [
+                "data: {\"id\":\"r1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"He\"}}]}\n\n",
+                "data: {\"id\":\"r1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"llo\"}}]}\n\n",
+                "data: {\"id\":\"r1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc1\",\"type\":\"function\",\"function\":{\"name\":\"echo\",\"arguments\":\"{\\\"a\\\":\"}}]}}]}\n\n",
+                "data: {\"id\":\"r1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]}}]}\n\n",
+                "data: {\"id\":\"r1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ];
+            let body: String = body_chunks.join("");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 content-type: text/event-stream\r\n\
+                 content-length: {}\r\n\
+                 connection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+
+        let client = InferenceClient::new(format!("http://{addr}/v1"));
+        let req = ChatRequest {
+            model: ModelId("m".into()),
+            messages: vec![ChatMessage::user("hi")],
+            tools: None,
+            stream: true,
+            temperature: None,
+            max_tokens: None,
+            chat_template_kwargs: None,
+            tool_choice: None,
+            guided_decoding_backend: None,
+        };
+        let observed: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_clone = observed.clone();
+        let resp = client
+            .chat_completions_streamed(&req, |delta| {
+                observed_clone.lock().unwrap().push(delta.to_owned());
+            })
+            .await
+            .unwrap();
+
+        // Observer fired once per non-empty content delta, in order.
+        assert_eq!(*observed.lock().unwrap(), vec!["He".to_owned(), "llo".to_owned()]);
+        // Synthesised response matches what the non-streaming path
+        // would have returned for the same model output.
+        assert_eq!(resp.id, "r1");
+        assert_eq!(resp.model, "m");
+        assert_eq!(resp.choices.len(), 1);
+        let choice = &resp.choices[0];
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(
+            choice.message.content.as_ref().map(|c| c.as_text()),
+            Some("Hello".to_owned())
+        );
+        // Tool-call deltas stitched into one fully-formed ToolCall —
+        // id from the first delta, arguments concatenated across both.
+        assert_eq!(choice.message.tool_calls.len(), 1);
+        let tc = &choice.message.tool_calls[0];
+        assert_eq!(tc.id, "tc1");
+        assert_eq!(tc.function.name, "echo");
+        assert_eq!(tc.function.arguments, "{\"a\":1}");
     }
 
     /// Integration-style test: spin up a tokio TCP listener that pretends to

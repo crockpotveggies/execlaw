@@ -180,6 +180,19 @@ pub struct TurnConfig {
     /// The event log is unaffected — the `user_msg` event still
     /// stores the operator's raw text.
     pub turn_context_user_prefix: Option<String>,
+    /// 2026-05-20 — optional per-token observer. When `Some`, the
+    /// executor streams `/v1/chat/completions` and invokes the
+    /// callback for every non-empty content delta as the model
+    /// emits it, so the caller can broadcast live tokens to a UI
+    /// (e.g. `UiEvent::ChatTokenDelta` on the WS bus). When `None`,
+    /// the executor takes the non-streaming path — preserves the
+    /// existing behaviour for callers that don't care about live
+    /// tokens (background automation runs, eval-harness, tests).
+    ///
+    /// The callback is invoked from inside the executor's async
+    /// loop; keep it cheap (clone strings out, do real work
+    /// elsewhere) so it doesn't stall chunk consumption.
+    pub token_observer: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 impl std::fmt::Debug for TurnConfig {
@@ -193,6 +206,7 @@ impl std::fmt::Debug for TurnConfig {
             .field("tools_len", &self.tools.len())
             .field("hmac_key_set", &self.event_log_hmac_key.is_some())
             .field("phase_observer_set", &self.phase_observer.is_some())
+            .field("token_observer_set", &self.token_observer.is_some())
             .finish()
     }
 }
@@ -405,11 +419,20 @@ impl TurnExecutor {
                 return Err(TurnError::MaxRounds(cfg.max_tool_rounds));
             }
 
+            // When the caller wired a `token_observer`, ask the wire
+            // for a streamed response so the observer can fire per
+            // content delta (live tokens in the UI). The aggregator
+            // in `chat_completions_streamed` returns the same
+            // `ChatResponse` shape `chat_completions` would have,
+            // so everything below is unchanged. Without an observer
+            // (background runs, eval, tests) stay on the cheaper
+            // non-streaming path that also surfaces `usage`.
+            let streaming_requested = cfg.token_observer.is_some();
             let req = ChatRequest {
                 model: cfg.model.clone(),
                 messages: messages.clone(),
                 tools: Some(cfg.tools.clone()),
-                stream: false,
+                stream: streaming_requested,
                 temperature: cfg.temperature,
                 max_tokens: cfg.max_tokens,
                 // 2026-04-28 — forward the operator's reasoning toggle
@@ -430,7 +453,15 @@ impl TurnExecutor {
             let inference_started_at = std::time::Instant::now();
             let inference_messages_count = messages.len();
             let inference_tools_count = cfg.tools.len();
-            let resp = self.inference.chat_completions(&req).await?;
+            let resp = match cfg.token_observer.as_ref() {
+                Some(obs) => {
+                    let obs = obs.clone();
+                    self.inference
+                        .chat_completions_streamed(&req, move |delta| obs(delta))
+                        .await?
+                }
+                None => self.inference.chat_completions(&req).await?,
+            };
             let inference_elapsed_ms = inference_started_at.elapsed().as_millis() as u64;
             let choice = match resp.choices.first() {
                 Some(c) => c.clone(),
@@ -897,6 +928,7 @@ mod tests {
             inbound_channel_origin: None,
             spotlight_delim: None,
             turn_context_user_prefix: None,
+            token_observer: None,
         };
 
         let summary = exec
@@ -913,6 +945,90 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].kind, EventKind::UserMsg);
         assert_eq!(events[1].kind, EventKind::ModelTurn);
+    }
+
+    #[tokio::test]
+    async fn token_observer_fires_per_delta_and_assembles_full_text() {
+        // Regression: tool-capable turns historically used
+        // `chat_completions` (stream:false) so a "hi" reply only
+        // showed up after the model finished generating — multi-second
+        // dead air on Apple-Silicon Ollama. Wiring a `token_observer`
+        // flips the executor onto `chat_completions_streamed`; the
+        // observer fires per content delta (live tokens for the SPA)
+        // and the rest of the turn loop is unchanged (still sees an
+        // assembled `ChatResponse`, still commits one model_turn).
+        let db = fresh_db();
+
+        // Streaming SSE mock — three content deltas + a final
+        // finish_reason chunk. Same wire shape the SPA receives on
+        // the streaming path today.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                sock.read(&mut buf),
+            )
+            .await;
+            let body_chunks = [
+                "data: {\"id\":\"r1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n",
+                "data: {\"id\":\"r1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" \"}}]}\n\n",
+                "data: {\"id\":\"r1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"there\"}}]}\n\n",
+                "data: {\"id\":\"r1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ];
+            let body: String = body_chunks.join("");
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+
+        let exec = TurnExecutor::new(
+            InferenceClient::new(format!("http://{addr}/v1")),
+            Arc::new(NullTools),
+        );
+        let cid = ConversationId::from("conv-stream");
+        let observed: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_clone = observed.clone();
+        let cfg = TurnConfig {
+            model: ModelId("QuantTrio/Qwen3.5-27B-AWQ".to_owned()),
+            system_prompt: "test".into(),
+            temperature: None,
+            max_tokens: None,
+            max_tool_rounds: 3,
+            tools: vec![],
+            event_log_hmac_key: None,
+            phase_observer: None,
+            reasoning_enabled: false,
+            inbound_channel_origin: None,
+            spotlight_delim: None,
+            turn_context_user_prefix: None,
+            token_observer: Some(Arc::new(move |delta: &str| {
+                observed_clone.lock().unwrap().push(delta.to_owned());
+            })),
+        };
+
+        let summary = exec
+            .run_turn(&db, &cid, "hello", None, &cfg)
+            .await
+            .unwrap();
+
+        // Observer fired in order, one entry per non-empty content delta.
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec!["hi".to_owned(), " ".to_owned(), "there".to_owned()],
+        );
+        // Assembled assistant text matches what the non-streaming
+        // path would have returned, so commit_turn sees the right body.
+        assert_eq!(summary.assistant_text, "hi there");
+        assert_eq!(summary.tool_rounds, 0);
     }
 
     #[tokio::test]
@@ -992,6 +1108,7 @@ mod tests {
             inbound_channel_origin: None,
             spotlight_delim: None,
             turn_context_user_prefix: None,
+            token_observer: None,
         };
 
         let summary = exec
@@ -1138,6 +1255,7 @@ mod tests {
             inbound_channel_origin: None,
             spotlight_delim: None,
             turn_context_user_prefix: None,
+            token_observer: None,
         };
         let _ = exec
             .run_turn(&db, &cid, "try it", None, &cfg)
@@ -1215,6 +1333,7 @@ mod tests {
             inbound_channel_origin: None,
             spotlight_delim: None,
             turn_context_user_prefix: None,
+            token_observer: None,
         };
         let err = exec
             .run_turn(&db, &cid, "go", None, &cfg)

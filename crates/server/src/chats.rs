@@ -2427,6 +2427,30 @@ async fn run_tool_capable_turn(
     } else {
         None
     };
+    // 2026-05-20 — live-token observer. Without this the tool-capable
+    // executor takes the non-streaming `chat_completions` path and
+    // the SPA only sees a single `ChatMessageOutbound` event when
+    // the model is done — for a "hi"-style turn that's 2-10 s of
+    // dead air on Apple-Silicon Ollama. With the observer wired the
+    // executor switches to `chat_completions_streamed` and the
+    // closure here republishes each content delta as a
+    // `ChatTokenDelta` on the WS bus, exactly what `run_real_turn`
+    // does for the tool-less path. The final `ChatMessageOutbound`
+    // (committed by the executor) is still emitted at turn end and
+    // remains the canonical assistant text — the deltas are an
+    // optimistic UX layer the SPA can replace.
+    let events_for_obs = state.events.clone();
+    let cid_for_obs = cid.as_str().to_owned();
+    let token_observer: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+        std::sync::Arc::new(move |delta: &str| {
+            if delta.is_empty() {
+                return;
+            }
+            events_for_obs.publish(UiEvent::ChatTokenDelta {
+                conversation_id: cid_for_obs.clone(),
+                text: delta.to_owned(),
+            });
+        });
     let cfg = TurnConfig {
         model: ModelId(resolved_model_id.clone()),
         system_prompt: composed_system_prompt,
@@ -2458,6 +2482,7 @@ async fn run_tool_capable_turn(
         } else {
             Some(turn_context.clone())
         },
+        token_observer: Some(token_observer),
     };
     let exec_started_at = std::time::Instant::now();
     tracing::debug!(
