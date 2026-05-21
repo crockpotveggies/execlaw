@@ -82,6 +82,7 @@ pub mod python_sandbox_admin;
 /// the plugin-encapsulation rule.
 #[doc(hidden)]
 pub mod python_sandbox;
+pub mod reply_router;
 pub mod research;
 pub mod research_admin;
 pub mod routes;
