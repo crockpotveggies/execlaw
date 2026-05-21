@@ -207,7 +207,13 @@ fn run_one(
             );
         }
     };
-    let outcome = execute_graph(&automation.definition, &mut state, ctx, &mut trace_sink);
+    let outcome = execute_graph(
+        &automation.definition,
+        &mut state,
+        ctx,
+        &evt.envelope,
+        &mut trace_sink,
+    );
     let finished_at = chrono::Utc::now().timestamp_millis();
     let final_status = match outcome {
         ExecOutcome::Success => AutomationRunStatus::Success,
@@ -253,6 +259,7 @@ pub fn dry_run(
         &automation.definition,
         &mut state,
         ctx,
+        &sample.envelope,
         &mut |t: StepTrace| traces.push(t),
     );
     DryRunResult {
@@ -286,6 +293,7 @@ fn execute_graph(
     def: &AutomationDef,
     state: &mut HashMap<String, serde_json::Value>,
     ctx: &ExecutorContext,
+    envelope: &execlaw_core::event_envelope::EventEnvelope,
     trace_sink: &mut dyn FnMut(StepTrace),
 ) -> ExecOutcome {
     let mut current = TRIGGER_SENTINEL.to_string();
@@ -320,7 +328,7 @@ fn execute_graph(
 
         let start = Instant::now();
         let input_snapshot = snapshot_state(state);
-        let exec_result = execute_node(node, state, ctx);
+        let exec_result = execute_node(node, state, ctx, envelope);
         let ms = start.elapsed().as_millis() as u64;
 
         match exec_result {
@@ -433,6 +441,7 @@ fn execute_node(
     node: &NodeDef,
     state: &HashMap<String, serde_json::Value>,
     ctx: &ExecutorContext,
+    envelope: &execlaw_core::event_envelope::EventEnvelope,
 ) -> NodeOutcome {
     match node.kind {
         NodeKind::Filter => execute_filter(node, state),
@@ -448,11 +457,146 @@ fn execute_node(
         NodeKind::AskAgent => execute_ask_agent(node, state, &ctx.pool),
         NodeKind::Notify => execute_notify(node, state, &ctx.db),
         NodeKind::CallPlugin => execute_call_plugin(node, state, ctx.plugin_host.as_ref()),
+        NodeKind::SendReply => execute_send_reply(node, state, ctx, envelope),
         _ => NodeOutcome::Error(format!(
             "node kind '{}' not implemented in this milestone",
             node.kind.as_str()
         )),
     }
+}
+
+/// SendReply (M6) — build a `ReplyPayload` per the node's config and
+/// hand it to the [`crate::reply_router`]. Output = serialized
+/// `RouteResult` for downstream Branches.
+fn execute_send_reply(
+    node: &NodeDef,
+    state: &HashMap<String, serde_json::Value>,
+    ctx: &ExecutorContext,
+    envelope: &execlaw_core::event_envelope::EventEnvelope,
+) -> NodeOutcome {
+    let cfg = &node.config;
+    let source = cfg
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("from_agent");
+
+    let payload = match build_reply_payload(source, cfg, state) {
+        Ok(p) => p,
+        Err(msg) => return NodeOutcome::Error(format!("SendReply: {msg}")),
+    };
+
+    let effective_envelope = match cfg.get("target_override") {
+        Some(v) if !v.is_null() => match serde_json::from_value::<
+            execlaw_core::event_envelope::OriginRef,
+        >(v.clone())
+        {
+            Ok(origin) => execlaw_core::event_envelope::EventEnvelope {
+                origin,
+                identity: envelope.identity.clone(),
+                correlation_id: envelope.correlation_id.clone(),
+                parent_event_id: envelope.parent_event_id.clone(),
+            },
+            Err(e) => {
+                return NodeOutcome::Error(format!(
+                    "SendReply: target_override is not a valid OriginRef: {e}"
+                ));
+            }
+        },
+        _ => envelope.clone(),
+    };
+
+    let router_ctx =
+        crate::reply_router::RouterCtx::new(ctx.db.clone(), ctx.plugin_host.clone());
+
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => {
+            return NodeOutcome::Error(
+                "SendReply: no tokio runtime in scope".into(),
+            );
+        }
+    };
+    let result = handle.block_on(crate::reply_router::route(
+        &router_ctx,
+        &effective_envelope,
+        payload,
+    ));
+    NodeOutcome::Output(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null))
+}
+
+fn build_reply_payload(
+    source: &str,
+    cfg: &serde_json::Value,
+    state: &HashMap<String, serde_json::Value>,
+) -> Result<execlaw_core::reply::ReplyPayload, String> {
+    use execlaw_core::reply::{ReplyHints, ReplyPart, ReplyPayload};
+
+    let hints: ReplyHints = cfg
+        .get("hints")
+        .cloned()
+        .map(|h| serde_json::from_value::<ReplyHints>(h).unwrap_or_default())
+        .unwrap_or_default();
+
+    match source {
+        "from_agent" | "from_node_output" => {
+            let node_id = cfg
+                .get("from_node")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned())
+                .or_else(|| infer_last_ask_node(state))
+                .ok_or_else(|| "could not infer upstream node — set config.from_node".to_owned())?;
+            let out = state
+                .get(&node_id)
+                .ok_or_else(|| format!("upstream node '{node_id}' has no recorded output"))?;
+            // AskAgent emits `{ tool, args }`; the exit-tool args may
+            // already be a `ReplyPayload` shape. If so, use it; else
+            // synthesize.
+            let args = out.get("args").cloned().unwrap_or(out.clone());
+            if let Ok(p) = serde_json::from_value::<ReplyPayload>(args.clone()) {
+                let mut p = p;
+                p.hints = hints;
+                Ok(p)
+            } else {
+                let text = args
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                Ok(ReplyPayload {
+                    text,
+                    parts: vec![],
+                    hints,
+                })
+            }
+        }
+        "template" => {
+            let text_template = cfg.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let text = render_template(text_template, state);
+            let parts: Vec<ReplyPart> = cfg
+                .get("parts")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            Ok(ReplyPayload {
+                text,
+                parts,
+                hints,
+            })
+        }
+        other => Err(format!(
+            "unknown SendReply.source '{other}' (expected from_agent | from_node_output | template)"
+        )),
+    }
+}
+
+fn infer_last_ask_node(state: &HashMap<String, serde_json::Value>) -> Option<String> {
+    let mut candidates: Vec<&String> = state
+        .iter()
+        .filter(|(_, v)| v.get("tool").is_some())
+        .map(|(k, _)| k)
+        .collect();
+    candidates.sort_by_key(|k| std::cmp::Reverse(k.len()));
+    candidates.into_iter().next().cloned()
 }
 
 /// Notify (M6) Ã¢â‚¬â€ insert a row into `state_alerts` via

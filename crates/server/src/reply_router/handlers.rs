@@ -35,7 +35,7 @@ pub enum SendError {
 
 /// Dispatch one prepared reply to its handler.
 pub async fn send(
-    state: &AppState,
+    ctx: &super::RouterCtx,
     origin: &OriginRef,
     caps: &Capabilities,
     prepared: &PreparedReply,
@@ -44,12 +44,12 @@ pub async fn send(
         // Built-in handler — dispatch on origin variant.
         match origin {
             OriginRef::WebSocketSession { session_id } => {
-                send_web_socket(state, session_id, prepared).await
+                send_web_socket(ctx, session_id, prepared).await
             }
             OriginRef::ChatAppend { conversation_id } => {
-                send_chat_append(state, conversation_id, prepared).await
+                send_chat_append(ctx, conversation_id, prepared).await
             }
-            OriginRef::Alert => send_alert(state, prepared),
+            OriginRef::Alert => send_alert(ctx, prepared),
             OriginRef::None => Ok(String::new()),
             OriginRef::PluginChannel { .. } => Err(SendError::Permanent(format!(
                 "origin claims plugin_channel but resolved handler is core/{}",
@@ -58,7 +58,7 @@ pub async fn send(
         }
     } else {
         // Plugin-owned handler — call its registered send_reply tool.
-        send_via_plugin(state, origin, caps, prepared).await
+        send_via_plugin(ctx, origin, caps, prepared).await
     }
 }
 
@@ -66,7 +66,7 @@ pub async fn send(
 /// SPA. For now we mark the reply as accepted so the tier ladder
 /// completes; slice 6 wires the actual SSE push.
 async fn send_web_socket(
-    _state: &AppState,
+    _ctx: &super::RouterCtx,
     _session_id: &str,
     _prepared: &PreparedReply,
 ) -> Result<String, SendError> {
@@ -81,7 +81,7 @@ async fn send_web_socket(
 ///   3. Carry the prepared parts as inline attachments / cards.
 /// For now we return Ok so the fallback ladder doesn't hang.
 async fn send_chat_append(
-    _state: &AppState,
+    _ctx: &super::RouterCtx,
     _conversation_id: &str,
     _prepared: &PreparedReply,
 ) -> Result<String, SendError> {
@@ -91,7 +91,7 @@ async fn send_chat_append(
 /// Fire an alert from the prepared text. Real implementation — used
 /// by both `OriginRef::Alert` deliveries AND the fallback path's
 /// "delivery failed" notification.
-fn send_alert(state: &AppState, prepared: &PreparedReply) -> Result<String, SendError> {
+fn send_alert(ctx: &super::RouterCtx, prepared: &PreparedReply) -> Result<String, SendError> {
     let id = AlertId::new();
     let now = chrono::Utc::now().timestamp_millis();
     let title = first_line(&prepared.text).chars().take(120).collect::<String>();
@@ -120,7 +120,7 @@ fn send_alert(state: &AppState, prepared: &PreparedReply) -> Result<String, Send
         incident_id: None,
         actions_json: None,
     };
-    AlertStore::new(&state.db)
+    AlertStore::new(&ctx.db)
         .insert_firing(&row)
         .map(|_| id.as_str().to_owned())
         .map_err(|e| SendError::Transient(format!("alert insert failed: {e}")))
@@ -130,7 +130,7 @@ fn send_alert(state: &AppState, prepared: &PreparedReply) -> Result<String, Send
 /// `{ "text": <string>, "parts": <ReplyPart[]>, "origin": <OriginRef> }`.
 /// Plugins decode this in their Rhai handler.
 async fn send_via_plugin(
-    state: &AppState,
+    ctx: &super::RouterCtx,
     origin: &OriginRef,
     caps: &Capabilities,
     prepared: &PreparedReply,
@@ -141,8 +141,14 @@ async fn send_via_plugin(
         "parts": prepared.parts.iter().map(prepared_part_to_json).collect::<Vec<_>>(),
         "origin": origin,
     });
-    match state
-        .plugin_host
+    match match &ctx.plugin_host {
+        Some(h) => h,
+        None => {
+            return Err(SendError::Permanent(
+                "no plugin_host wired into RouterCtx".into(),
+            ));
+        }
+    }
         .call_tool(&tool_name, args, &["*"], Some("Controller"))
         .await
     {
@@ -166,15 +172,15 @@ async fn send_via_plugin(
 /// Last-resort: push the prepared payload into the operator's Inbox
 /// thread. Used by `FailureFallback::ChatAppendHome`.
 pub async fn deliver_to_operator_home(
-    state: &AppState,
+    ctx: &super::RouterCtx,
     _payload: &ReplyPayload,
     primary_err: &str,
 ) -> Result<String, String> {
     // Look up (or mint) the controller's Inbox thread. In a multi-
     // operator setup we'd resolve from the run's actor principal;
     // for slice 4 we use the singleton controller.
-    let controller_id = resolve_controller_principal_id(state)?;
-    let _inbox = execlaw_core::operator_home::ensure_operator_home(&state.db, &controller_id)
+    let controller_id = resolve_controller_principal_id(ctx)?;
+    let _inbox = execlaw_core::operator_home::ensure_operator_home(&ctx.db, &controller_id)
         .map_err(|e| format!("ensure_operator_home: {e}"))?;
     // TODO(slice 7) — actually append a system-authored event to the
     // Inbox with the prepared payload + banner "Failed to deliver:
@@ -192,7 +198,7 @@ pub async fn deliver_to_operator_home(
 /// fallback path so the operator notices something went wrong even
 /// when the work product was successfully diverted to Inbox.
 pub fn fire_delivery_failure_alert(
-    state: &AppState,
+    ctx: &super::RouterCtx,
     payload: &ReplyPayload,
     primary_err: &str,
 ) -> Result<String, String> {
@@ -223,7 +229,7 @@ pub fn fire_delivery_failure_alert(
         incident_id: None,
         actions_json: None,
     };
-    AlertStore::new(&state.db)
+    AlertStore::new(&ctx.db)
         .insert_firing(&row)
         .map(|_| id.as_str().to_owned())
         .map_err(|e| format!("alert insert failed: {e}"))
@@ -232,9 +238,9 @@ pub fn fire_delivery_failure_alert(
 /// Single-controller installs: resolve the Controller principal id
 /// from `state_principals`. For multi-operator installs (future) this
 /// becomes a per-run lookup based on the envelope's principal.
-fn resolve_controller_principal_id(state: &AppState) -> Result<String, String> {
+fn resolve_controller_principal_id(ctx: &super::RouterCtx) -> Result<String, String> {
     use rusqlite::OptionalExtension;
-    state
+    ctx
         .db
         .with_conn(|c| {
             let id: Option<String> = c

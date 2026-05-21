@@ -33,11 +33,26 @@ mod tiers;
 
 pub use capabilities::Capabilities;
 
+use execlaw_core::Database;
 use execlaw_core::event_envelope::{EventEnvelope, OriginRef};
 use execlaw_core::event_registry::{EventRegistry, RegisteredReplyHandler};
 use execlaw_core::reply::{FailureFallback, ReplyHints, ReplyPayload};
+use execlaw_plugin_host::PluginHost;
 
-use crate::state::AppState;
+/// Slim handle the router needs — pulled out of `AppState` so the
+/// automation runtime's `ExecutorContext` can hand the router what
+/// it owns without taking a runtime dep on the full server state.
+#[derive(Clone)]
+pub struct RouterCtx {
+    pub db: Database,
+    pub plugin_host: Option<PluginHost>,
+}
+
+impl RouterCtx {
+    pub fn new(db: Database, plugin_host: Option<PluginHost>) -> Self {
+        Self { db, plugin_host }
+    }
+}
 
 /// Outcome of one routing attempt. Recorded in the flow run's
 /// step_trace so the operator can see which tier landed.
@@ -72,7 +87,7 @@ pub enum RouteResult {
 /// `route_streaming()` sibling that drives a stream over the run
 /// channel until `StreamItem::Done`.
 pub async fn route(
-    state: &AppState,
+    ctx: &RouterCtx,
     envelope: &EventEnvelope,
     payload: ReplyPayload,
 ) -> RouteResult {
@@ -82,12 +97,12 @@ pub async fn route(
         return RouteResult::DroppedByHint;
     }
 
-    let caps = match resolve_capabilities(state, &envelope.origin) {
+    let caps = match resolve_capabilities(ctx, &envelope.origin) {
         Ok(c) => c,
         Err(err) => {
             // No handler registered for this origin — fall straight
             // to fallback.
-            return fallback(state, &payload, err).await;
+            return fallback(ctx, &payload, err).await;
         }
     };
 
@@ -96,7 +111,7 @@ pub async fn route(
     let tiers = tiers::build_tiers(&payload, &caps);
     let mut last_err: Option<String> = None;
     for (tier_label, prepared) in tiers {
-        match handlers::send(state, &envelope.origin, &caps, &prepared).await {
+        match handlers::send(ctx, &envelope.origin, &caps, &prepared).await {
             Ok(receipt) => {
                 return RouteResult::Sent {
                     tier: tier_label,
@@ -114,7 +129,7 @@ pub async fn route(
         }
     }
     fallback(
-        state,
+        ctx,
         &payload,
         last_err.unwrap_or_else(|| "all tiers failed without reason".into()),
     )
@@ -125,7 +140,7 @@ pub async fn route(
 /// handlers (web_socket_session, chat_append, alert, drop) MUST
 /// exist in the registry — `cmd_serve` seeds them at boot.
 fn resolve_capabilities(
-    state: &AppState,
+    ctx: &RouterCtx,
     origin: &OriginRef,
 ) -> Result<Capabilities, String> {
     let name = match origin {
@@ -135,7 +150,7 @@ fn resolve_capabilities(
         OriginRef::Alert => "alert",
         OriginRef::None => "drop",
     };
-    let reg = EventRegistry::new(&state.db);
+    let reg = EventRegistry::new(&ctx.db);
     let handler = reg
         .get_reply_handler(name)
         .map_err(|e| format!("registry lookup failed: {e}"))?
@@ -151,7 +166,7 @@ fn resolve_capabilities(
 /// Last-resort delivery path. Tries the hint's fallback target. If
 /// THAT fails too, fires an alert and returns RouteResult::Failed
 /// (operator sees the alert; payload is recorded in the flow trace).
-async fn fallback(state: &AppState, payload: &ReplyPayload, err: String) -> RouteResult {
+async fn fallback(ctx: &RouterCtx, payload: &ReplyPayload, err: String) -> RouteResult {
     let hint = payload
         .hints
         .on_failure
@@ -164,7 +179,7 @@ async fn fallback(state: &AppState, payload: &ReplyPayload, err: String) -> Rout
             RouteResult::DroppedByHint
         }
         FailureFallback::AlertOnly => {
-            if let Err(e2) = handlers::fire_delivery_failure_alert(state, payload, &err) {
+            if let Err(e2) = handlers::fire_delivery_failure_alert(ctx, payload, &err) {
                 return RouteResult::Failed {
                     err: format!("primary={err}; alert_fallback={e2}"),
                 };
@@ -178,9 +193,9 @@ async fn fallback(state: &AppState, payload: &ReplyPayload, err: String) -> Rout
             // Mint/find the operator Inbox, append the payload as a
             // system-authored message, then ALSO fire an alert so the
             // operator notices something failed.
-            match handlers::deliver_to_operator_home(state, payload, &err).await {
+            match handlers::deliver_to_operator_home(ctx, payload, &err).await {
                 Ok(_) => {
-                    let _ = handlers::fire_delivery_failure_alert(state, payload, &err);
+                    let _ = handlers::fire_delivery_failure_alert(ctx, payload, &err);
                     RouteResult::Recovered {
                         tier: "chat_append_home",
                         original_err: err,
@@ -188,7 +203,7 @@ async fn fallback(state: &AppState, payload: &ReplyPayload, err: String) -> Rout
                 }
                 Err(home_err) => {
                     // Even Inbox failed — last gasp is the alert.
-                    if let Err(alert_err) = handlers::fire_delivery_failure_alert(state, payload, &err) {
+                    if let Err(alert_err) = handlers::fire_delivery_failure_alert(ctx, payload, &err) {
                         return RouteResult::Failed {
                             err: format!(
                                 "primary={err}; home_fallback={home_err}; alert_fallback={alert_err}"
@@ -209,7 +224,7 @@ async fn fallback(state: &AppState, payload: &ReplyPayload, err: String) -> Rout
 /// direct admin-triggered "post this to my Inbox"). Wraps the
 /// fallback path so the same delivery + alert behavior fires.
 pub async fn route_to_inbox(
-    state: &AppState,
+    ctx: &RouterCtx,
     payload: ReplyPayload,
     reason: &str,
 ) -> RouteResult {
@@ -217,7 +232,7 @@ pub async fn route_to_inbox(
     // attributes the delivery to operator-intent rather than
     // an upstream failure.
     fallback(
-        state,
+        ctx,
         &payload,
         format!("explicit-route-to-inbox: {reason}"),
     )

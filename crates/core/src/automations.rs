@@ -58,6 +58,10 @@ pub enum NodeKind {
     CallAutomation,
     Parallel,
     Join,
+    /// M6 — emit a reply through the ReplyRouter using
+    /// `envelope.origin`. Validator rejects this kind in flows whose
+    /// trigger has `expects_reply = false`.
+    SendReply,
 }
 
 impl NodeKind {
@@ -76,6 +80,7 @@ impl NodeKind {
             NodeKind::CallAutomation => "CallAutomation",
             NodeKind::Parallel => "Parallel",
             NodeKind::Join => "Join",
+            NodeKind::SendReply => "SendReply",
         }
     }
 
@@ -94,6 +99,7 @@ impl NodeKind {
             "CallAutomation" => Some(NodeKind::CallAutomation),
             "Parallel" => Some(NodeKind::Parallel),
             "Join" => Some(NodeKind::Join),
+            "SendReply" => Some(NodeKind::SendReply),
             _ => None,
         }
     }
@@ -111,6 +117,7 @@ impl NodeKind {
                 | NodeKind::AskAgent
                 | NodeKind::Notify
                 | NodeKind::CallPlugin
+                | NodeKind::SendReply
         )
     }
 }
@@ -397,6 +404,40 @@ pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
                     "CallPlugin node '{}': config.args must be a JSON object (got {})",
                     n.id,
                     args_kind(args),
+                )));
+            }
+        }
+        if matches!(n.kind, NodeKind::SendReply) {
+            // source must be one of the three known values (or
+            // absent — defaults to "from_agent").
+            let source = n
+                .config
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("from_agent");
+            if !matches!(source, "from_agent" | "from_node_output" | "template") {
+                return Err(AutomationError::Validation(format!(
+                    "SendReply node '{}': unknown source '{}' (expected from_agent | from_node_output | template)",
+                    n.id, source
+                )));
+            }
+            // For template source, `text` must be present.
+            if source == "template"
+                && n.config.get("text").and_then(|v| v.as_str()).is_none()
+            {
+                return Err(AutomationError::Validation(format!(
+                    "SendReply node '{}': template source requires config.text",
+                    n.id
+                )));
+            }
+            // target_override (if present) must be a valid OriginRef.
+            if let Some(t) = n.config.get("target_override")
+                && !t.is_null()
+                && serde_json::from_value::<crate::event_envelope::OriginRef>(t.clone()).is_err()
+            {
+                return Err(AutomationError::Validation(format!(
+                    "SendReply node '{}': target_override is not a valid OriginRef shape",
+                    n.id
                 )));
             }
         }
