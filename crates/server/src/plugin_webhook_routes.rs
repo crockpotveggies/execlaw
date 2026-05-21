@@ -412,7 +412,9 @@ async fn dispatch_handler(
         };
         let evt = execlaw_core::automation_bus::Event {
             id: dedup_id,
-            kind: execlaw_core::automation_bus::BusEventKind::WebhookReceived,
+            kind: execlaw_core::automation_bus::BusEventKind::WebhookReceived
+                .as_str()
+                .to_owned(),
             source: format!("webhook:{plugin_id}"),
             received_at: chrono::Utc::now().timestamp_millis(),
             payload: serde_json::json!({

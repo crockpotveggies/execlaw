@@ -138,10 +138,10 @@ pub fn build_handler(ctx: ExecutorContext) -> EventHandler {
 /// filter by trigger predicate, run each that matches.
 fn run_matching_automations(ctx: &ExecutorContext, evt: &BusEventRow) {
     let store = AutomationStore::new(&ctx.db);
-    let matched = match store.list_enabled_for_kind(evt.kind) {
+    let matched = match store.list_enabled_for_kind(&evt.kind) {
         Ok(rows) => rows,
         Err(e) => {
-            warn!(error = %e, kind = %evt.kind.as_str(), "automation runtime: list_enabled_for_kind failed");
+            warn!(error = %e, kind = %evt.kind, "automation runtime: list_enabled_for_kind failed");
             return;
         }
     };
@@ -173,7 +173,7 @@ fn run_matching_automations(ctx: &ExecutorContext, evt: &BusEventRow) {
 fn event_context(evt: &BusEventRow) -> serde_json::Value {
     serde_json::json!({
         "id": evt.id,
-        "kind": evt.kind.as_str(),
+        "kind": evt.kind,
         "source": evt.source,
         "received_at": evt.received_at,
         "payload": evt.payload,
@@ -1152,7 +1152,7 @@ mod tests {
         AskAgentError, AutomationsAgentPool, ExitToolCall, StubAgentInvoker,
     };
     use execlaw_core::Database;
-    use execlaw_core::automation_bus::{BusEventKind, BusEventStore, Event as BusEvent};
+    use execlaw_core::automation_bus::{BusEventStore, Event as BusEvent};
     use execlaw_core::automations::{
         AutomationDef, AutomationStore, AutomationUpsert, EdgeDef, NodeDef, NodeKind, TriggerDef,
     };
@@ -1195,7 +1195,7 @@ mod tests {
         let store = BusEventStore::new(db);
         let evt = BusEvent {
             id: id.into(),
-            kind: BusEventKind::WebhookReceived,
+            kind: "webhook.received".to_owned(),
             source: "test".into(),
             received_at: 100,
             payload,
@@ -1244,7 +1244,7 @@ mod tests {
     fn def_filter_pass(filter_expr: &str) -> AutomationDef {
         AutomationDef {
             trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
+                kind: "webhook.received".to_owned(),
                 when: None,
             },
             nodes: vec![
@@ -1343,7 +1343,7 @@ mod tests {
                 .publish(
                     &BusEvent {
                         id: id.into(),
-                        kind: BusEventKind::WebhookReceived,
+                        kind: "webhook.received".to_owned(),
                         source: source.into(),
                         received_at: 100,
                         payload: serde_json::json!({}),
@@ -1392,7 +1392,7 @@ mod tests {
         // Ã¢â€ â€™ terminal-a if doubled > 15 else terminal-b
         let def = AutomationDef {
             trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
+                kind: "webhook.received".to_owned(),
                 when: None,
             },
             nodes: vec![
@@ -1596,7 +1596,7 @@ mod tests {
         // Publish a matching event through the bus.
         let evt = BusEvent {
             id: "e-ring-1".into(),
-            kind: BusEventKind::WebhookReceived,
+            kind: "webhook.received".to_owned(),
             source: "ring".into(),
             received_at: 100,
             payload: serde_json::json!({"zone": "driveway"}),
@@ -1634,7 +1634,7 @@ mod tests {
     fn ask_agent_def_two_outcomes() -> AutomationDef {
         AutomationDef {
             trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
+                kind: "webhook.received".to_owned(),
                 when: None,
             },
             nodes: vec![
@@ -1926,7 +1926,7 @@ mod tests {
         );
         let def = AutomationDef {
             trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
+                kind: "webhook.received".to_owned(),
                 when: None,
             },
             nodes: vec![
@@ -2019,7 +2019,7 @@ mod tests {
         // HTTP request, so the URL is dummy.
         let def = AutomationDef {
             trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
+                kind: "webhook.received".to_owned(),
                 when: None,
             },
             nodes: vec![
@@ -2118,7 +2118,7 @@ mod tests {
 
         // Automation only matches RoutineFired kind.
         let mut def = def_filter_pass("true");
-        def.trigger.kind = BusEventKind::RoutineFired;
+        def.trigger.kind = "routine.fired".to_owned();
         let row = auto_store
             .upsert(
                 &AutomationUpsert {
@@ -2138,7 +2138,7 @@ mod tests {
         // Publish a WebhookReceived event Ã¢â‚¬â€ wrong kind, must not trigger.
         bus.publish(BusEvent {
             id: "e-webhook".into(),
-            kind: BusEventKind::WebhookReceived,
+            kind: "webhook.received".to_owned(),
             source: "ring".into(),
             received_at: 100,
             payload: serde_json::json!({}),
@@ -2162,7 +2162,7 @@ mod tests {
     fn def_notify(notify_cfg: serde_json::Value) -> AutomationDef {
         AutomationDef {
             trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
+                kind: "webhook.received".to_owned(),
                 when: None,
             },
             nodes: vec![
@@ -2317,7 +2317,7 @@ mod tests {
     fn def_call_plugin(cfg: serde_json::Value) -> AutomationDef {
         AutomationDef {
             trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
+                kind: "webhook.received".to_owned(),
                 when: None,
             },
             nodes: vec![

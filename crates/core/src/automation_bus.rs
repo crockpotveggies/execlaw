@@ -101,6 +101,14 @@ impl BusEventKind {
 /// upstream retries supply a stable ID (content hash, upstream
 /// message ID); producers that don't care supply a random ULID.
 ///
+/// `kind` (M6+): widened from the closed [`BusEventKind`] enum to
+/// a free-form string so plugins can publish their own semantic
+/// event kinds (`whatsapp.message.received`, `gmail.message.received`,
+/// etc.) without them collapsing to `Other` on the way through.
+/// Well-known kinds still have type-safe constants on
+/// [`BusEventKind`] (use `BusEventKind::WebhookReceived.as_str()`
+/// for type-checked construction).
+///
 /// `envelope` (M6) carries the reply target, sender identity, and
 /// correlation id. Producers from before the M6 migration may omit
 /// it (`None`) â€” the matcher fills in `EventEnvelope::system_internal()`
@@ -108,7 +116,7 @@ impl BusEventKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub id: String,
-    pub kind: BusEventKind,
+    pub kind: String,
     pub source: String,
     pub received_at: i64,
     pub payload: serde_json::Value,
@@ -123,7 +131,7 @@ pub struct Event {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BusEventRow {
     pub id: String,
-    pub kind: BusEventKind,
+    pub kind: String,
     pub source: String,
     pub received_at: i64,
     pub payload: serde_json::Value,
@@ -277,7 +285,7 @@ impl<'a> BusEventStore<'a> {
                     let envelope = decode_envelope(r.get::<_, Option<String>>(7)?);
                     Ok(BusEventRow {
                         id: row_id,
-                        kind: BusEventKind::parse(&r.get::<_, String>(1)?),
+                        kind: r.get::<_, String>(1)?,
                         source: r.get(2)?,
                         received_at: r.get(3)?,
                         payload,
@@ -299,10 +307,9 @@ impl<'a> BusEventStore<'a> {
     /// they don't have to hand-craft the payload.
     pub fn list_recent_for_kind(
         &self,
-        kind: BusEventKind,
+        kind: &str,
         limit: i64,
     ) -> Result<Vec<BusEventRow>, BusEventError> {
-        let kind_str = kind.as_str();
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, kind, source, received_at, payload, internal, dispatched_at, envelope_json \
@@ -311,7 +318,7 @@ impl<'a> BusEventStore<'a> {
                  ORDER BY received_at DESC \
                  LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![kind_str, limit], |r| {
+            let rows = stmt.query_map(params![kind, limit], |r| {
                 let row_id: String = r.get(0)?;
                 let payload_str: String = r.get(4)?;
                 let payload: serde_json::Value = match serde_json::from_str(&payload_str) {
@@ -322,7 +329,7 @@ impl<'a> BusEventStore<'a> {
                 let envelope = decode_envelope(r.get::<_, Option<String>>(7)?);
                 Ok(BusEventRow {
                     id: row_id,
-                    kind: BusEventKind::parse(&r.get::<_, String>(1)?),
+                    kind: r.get::<_, String>(1)?,
                     source: r.get(2)?,
                     received_at: r.get(3)?,
                     payload,
@@ -406,7 +413,7 @@ mod tests {
     fn sample_event(id: &str, source: &str, ts: i64) -> Event {
         Event {
             id: id.into(),
-            kind: BusEventKind::WebhookReceived,
+            kind: "webhook.received".to_owned(),
             source: source.into(),
             received_at: ts,
             payload: serde_json::json!({"k": "v"}),
@@ -422,7 +429,7 @@ mod tests {
         let out = store.publish(&e, false).unwrap();
         assert_eq!(out, PublishOutcome::Inserted);
         let row = store.get("evt-1").unwrap().unwrap();
-        assert_eq!(row.kind, BusEventKind::WebhookReceived);
+        assert_eq!(row.kind, "webhook.received");
         assert_eq!(row.source, "ring");
         assert_eq!(row.received_at, 100);
         assert!(!row.internal);
@@ -436,7 +443,7 @@ mod tests {
         let first = sample_event("evt-1", "ring", 100);
         let second = Event {
             id: "evt-1".into(),
-            kind: BusEventKind::PluginEmit,           // different
+            kind: "plugin.emit".to_owned(),           // different
             source: "different".into(),               // different
             received_at: 999,                         // different
             payload: serde_json::json!({"k2": "v2"}), // different
@@ -453,7 +460,7 @@ mod tests {
         let row = store.get("evt-1").unwrap().unwrap();
         // PK conflict does NOT overwrite â€” operator intent is
         // preserved by the producer's choice of stable ID.
-        assert_eq!(row.kind, BusEventKind::WebhookReceived);
+        assert_eq!(row.kind, "webhook.received");
         assert_eq!(row.source, "ring");
         assert_eq!(row.received_at, 100);
     }
@@ -629,7 +636,7 @@ mod tests {
                 let store = BusEventStore::new(&db);
                 let evt = Event {
                     id: "shared".into(),
-                    kind: BusEventKind::WebhookReceived,
+                    kind: "webhook.received".to_owned(),
                     source: format!("thread-{i}"),
                     received_at: i as i64,
                     payload: serde_json::json!({"thread": i}),
@@ -667,7 +674,7 @@ mod tests {
                 let store = BusEventStore::new(&db);
                 let evt = Event {
                     id: format!("evt-{i}"),
-                    kind: BusEventKind::WebhookReceived,
+                    kind: "webhook.received".to_owned(),
                     source: "stress".into(),
                     received_at: i as i64,
                     payload: serde_json::json!({"i": i}),
@@ -725,7 +732,7 @@ mod tests {
         let store = BusEventStore::new(&db);
         let evt = Event {
             id: "json-test".into(),
-            kind: BusEventKind::PluginEmit,
+            kind: "plugin.emit".to_owned(),
             source: "plugin:weather".into(),
             received_at: 42,
             payload: serde_json::json!({
@@ -763,7 +770,7 @@ mod tests {
         };
         let evt = Event {
             id: "env-test".into(),
-            kind: BusEventKind::PluginEmit,
+            kind: "plugin.emit".to_owned(),
             source: "plugin:whatsapp".into(),
             received_at: 7,
             payload: serde_json::json!({"text": "hi"}),
@@ -782,7 +789,7 @@ mod tests {
         let store = BusEventStore::new(&db);
         let evt = Event {
             id: "legacy".into(),
-            kind: BusEventKind::WebhookReceived,
+            kind: "webhook.received".to_owned(),
             source: "x".into(),
             received_at: 1,
             payload: serde_json::json!({}),

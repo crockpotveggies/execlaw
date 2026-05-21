@@ -1,10 +1,10 @@
-//! Automations data model + store (M2 of Automations).
+﻿//! Automations data model + store (M2 of Automations).
 //!
 //! Owns `state_automations`. An automation is a typed graph:
 //!
 //!   * Exactly one [`TriggerDef`] (the bus-event kind + optional
 //!     payload-match predicate).
-//!   * N typed [`NodeDef`]s â€” Filter / Transform / Branch / Terminal
+//!   * N typed [`NodeDef`]s Ã¢â‚¬â€ Filter / Transform / Branch / Terminal
 //!     in M2; AskAgent / CallPlugin / HttpFetch / Notify reserved.
 //!   * Directed [`EdgeDef`]s connecting nodes (and the synthetic
 //!     `"trigger"` and `"END"` sentinels).
@@ -16,7 +16,6 @@
 //! [`AutomationStore::list_for_kind`] (matcher hot path) and
 //! [`AutomationStore::get`] (full-fetch on dispatch).
 
-use crate::automation_bus::BusEventKind;
 use crate::db::{Database, DbError};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -30,7 +29,7 @@ pub const END_SENTINEL: &str = "END";
 
 /// The kinds we know how to execute as of M2. Reserved kinds are
 /// stored in the JSON but rejected by the validator with a
-/// not-yet-implemented error â€” so a future schema bump can land
+/// not-yet-implemented error Ã¢â‚¬â€ so a future schema bump can land
 /// without breaking persisted definitions that pre-declared them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 pub enum NodeKind {
@@ -42,10 +41,10 @@ pub enum NodeKind {
     Transform,
     /// Multi-way switch: each `case` is a (Rhai-expr, edge-target).
     /// The first matching case picks the outgoing edge. If none
-    /// match the node fails â€” author should provide a default
+    /// match the node fails Ã¢â‚¬â€ author should provide a default
     /// (`when: "true"`) case.
     Branch,
-    /// Explicit no-op end. Optional â€” a node with no outgoing edges
+    /// Explicit no-op end. Optional Ã¢â‚¬â€ a node with no outgoing edges
     /// also ends the run.
     Terminal,
     // Reserved (validator rejects with NotYetImplemented):
@@ -58,7 +57,7 @@ pub enum NodeKind {
     CallAutomation,
     Parallel,
     Join,
-    /// M6 — emit a reply through the ReplyRouter using
+    /// M6 â€” emit a reply through the ReplyRouter using
     /// `envelope.origin`. Validator rejects this kind in flows whose
     /// trigger has `expects_reply = false`.
     SendReply,
@@ -145,12 +144,12 @@ pub struct ExitToolDef {
 ///   * Per-flow `reasoning_tools` palette (subset of `KnownLimited.allowed_tools`).
 ///   * `max_turns` defaults to 3 (single-turn enforced in M3a; multi-turn loop in a follow-up).
 ///   * First exit-tool call wins; later calls in the same turn are logged and ignored.
-///   * Missing exit-tool call by `max_turns` â†’ node fails.
-///   * Vision-required attachments on a text-only model â†’ node fails fast.
+///   * Missing exit-tool call by `max_turns` Ã¢â€ â€™ node fails.
+///   * Vision-required attachments on a text-only model Ã¢â€ â€™ node fails fast.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct AskAgentConfig {
     /// The user-message body sent to the agent. Rendered as-is (no
-    /// templating in M3 â€” author writes the literal prompt or uses
+    /// templating in M3 Ã¢â‚¬â€ author writes the literal prompt or uses
     /// upstream Transform nodes to compose it).
     pub prompt: String,
     /// Attachment refs. Today each entry is either a `data:` URL or
@@ -170,7 +169,7 @@ pub struct AskAgentConfig {
     /// edge and its args become the node's output.
     pub exit_tools: Vec<ExitToolDef>,
     /// Per-node `max_turns` override. `None` means "use the default
-    /// (3)". M3a treats anything â‰¥ 1 as a single-turn call.
+    /// (3)". M3a treats anything Ã¢â€°Â¥ 1 as a single-turn call.
     #[serde(default)]
     pub max_turns: Option<u32>,
 }
@@ -190,11 +189,15 @@ pub fn parse_ask_agent_config(config: &serde_json::Value) -> Result<AskAgentConf
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct TriggerDef {
-    /// The bus-event kind to subscribe to.
-    pub kind: BusEventKind,
+    /// The bus-event kind to subscribe to. Free-form string (M6+);
+    /// well-known kinds have type-safe constants on
+    /// [`BusEventKind`] (`BusEventKind::WebhookReceived.as_str()`),
+    /// but plugin-defined kinds like `whatsapp.message.received`
+    /// flow through as their literal string identity.
+    pub kind: String,
     /// Optional payload-match predicate, as a Rhai expression
-    /// evaluated against `{ event: { id, kind, source, payload } }`.
-    /// `None` means "match every event of this kind".
+    /// evaluated against `{ event: { id, kind, source, payload,
+    /// envelope } }`. `None` means "match every event of this kind".
     #[serde(default)]
     pub when: Option<String>,
 }
@@ -216,7 +219,7 @@ pub struct NodeDef {
     /// editor. `None` means "the editor computes a default layout";
     /// `Some({x, y})` is the operator's manual placement, persisted so
     /// reloads land on the same canvas layout. The runtime ignores
-    /// this field â€” it's purely UI metadata.
+    /// this field Ã¢â‚¬â€ it's purely UI metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<NodePosition>,
 }
@@ -256,12 +259,12 @@ pub struct AutomationRow {
     pub definition: AutomationDef,
     pub created_at: i64,
     pub updated_at: i64,
-    /// M6 — provenance. `"operator"` for operator-authored,
+    /// M6 â€” provenance. `"operator"` for operator-authored,
     /// `"core"` for built-in defaults, `"plugin:<id>"` for plugin-
     /// shipped defaults. Deletion is gated to operator-source rows
     /// only; defaults are managed by the install lifecycle.
     pub source: String,
-    /// M6 — `true` when the operator has edited a non-operator
+    /// M6 â€” `true` when the operator has edited a non-operator
     /// row. Plugin upgrades surface a diff card instead of silently
     /// overwriting these. Default rows that the operator hasn't
     /// touched stay `false`.
@@ -269,9 +272,9 @@ pub struct AutomationRow {
 }
 
 impl AutomationRow {
-    /// `true` for rows the operator did NOT author — built-in core
+    /// `true` for rows the operator did NOT author â€” built-in core
     /// defaults + plugin-shipped defaults. The delete endpoint
-    /// refuses these (they're managed by the install lifecycle —
+    /// refuses these (they're managed by the install lifecycle â€”
     /// uninstall the plugin, or the row is removed by a future
     /// migration if core retires it). The SPA hides the delete
     /// button for these rows.
@@ -329,12 +332,12 @@ pub enum AutomationError {
 ///     a sentinel.
 ///   * Every node has at least one outgoing edge OR is `Terminal`.
 ///     (A non-Terminal node with no outgoing edges runs to no-op
-///     end; we reject as ambiguous â€” the author probably forgot
+///     end; we reject as ambiguous Ã¢â‚¬â€ the author probably forgot
 ///     an edge.)
 ///   * All node kinds are implemented (rejects AskAgent / Notify /
 ///     etc. with NotYetImplemented).
 ///
-/// Rhai expression *syntax* is NOT validated here â€” that requires
+/// Rhai expression *syntax* is NOT validated here Ã¢â‚¬â€ that requires
 /// constructing an engine, which lives in the server crate. The
 /// server-side validator at the API/runtime layer rejects malformed
 /// Rhai. Persisting a parseable JSON with bad Rhai is harmless: the
@@ -396,7 +399,7 @@ pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
                     )));
                 }
             }
-            // Reasoning_tools is reserved in M3a â€” author can declare
+            // Reasoning_tools is reserved in M3a Ã¢â‚¬â€ author can declare
             // intent but we don't surface those tools to the model yet.
             // Document this implicitly: empty list is fine, non-empty
             // is also fine (forward-compatible).
@@ -445,7 +448,7 @@ pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
         }
         if matches!(n.kind, NodeKind::SendReply) {
             // source must be one of the three known values (or
-            // absent — defaults to "from_agent").
+            // absent â€” defaults to "from_agent").
             let source = n
                 .config
                 .get("source")
@@ -492,7 +495,7 @@ pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
             )));
         }
     }
-    // Every non-Terminal node must have â‰¥1 outgoing edge OR be the
+    // Every non-Terminal node must have Ã¢â€°Â¥1 outgoing edge OR be the
     // explicit end (i.e., have Terminal kind).
     for n in &def.nodes {
         if matches!(n.kind, NodeKind::Terminal) {
@@ -506,7 +509,7 @@ pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
             )));
         }
     }
-    // Exactly one entry edge from the trigger sentinel â€” otherwise
+    // Exactly one entry edge from the trigger sentinel Ã¢â‚¬â€ otherwise
     // the run has no starting point.
     let entry_edges = def
         .edges
@@ -515,14 +518,14 @@ pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
         .count();
     if entry_edges == 0 {
         return Err(AutomationError::Validation(
-            "no edge from trigger â€” automation has no entry point".into(),
+            "no edge from trigger Ã¢â‚¬â€ automation has no entry point".into(),
         ));
     }
     Ok(())
 }
 
 /// Lower-cased JSON-type label for validator error messages, so the
-/// operator sees "got string" rather than `String("…")`.
+/// operator sees "got string" rather than `String("â€¦")`.
 fn args_kind(v: &serde_json::Value) -> &'static str {
     match v {
         serde_json::Value::Null => "null",
@@ -644,14 +647,13 @@ impl<'a> AutomationStore<'a> {
         Ok(rows)
     }
 
-    /// Matcher hot path â€” enabled automations whose trigger kind
+    /// Matcher hot path Ã¢â‚¬â€ enabled automations whose trigger kind
     /// matches. The expression index `idx_automations_enabled_trigger_kind`
     /// keeps this cheap regardless of total automation count.
     pub fn list_enabled_for_kind(
         &self,
-        kind: BusEventKind,
+        kind: &str,
     ) -> Result<Vec<AutomationRow>, AutomationError> {
-        let kind_str = kind.as_str();
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, name, enabled, definition, created_at, updated_at, \
@@ -661,7 +663,7 @@ impl<'a> AutomationStore<'a> {
                    AND json_extract(definition, '$.trigger.kind') = ?1 \
                  ORDER BY created_at ASC",
             )?;
-            let rows = stmt.query_map([kind_str], |r| {
+            let rows = stmt.query_map([kind], |r| {
                 let def_str: String = r.get(3)?;
                 let definition: AutomationDef = serde_json::from_str(&def_str).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -692,7 +694,7 @@ impl<'a> AutomationStore<'a> {
     }
 
     /// Delete an automation by id. Refuses to delete default flows
-    /// (rows with `source != 'operator'`) — those are managed by the
+    /// (rows with `source != 'operator'`) â€” those are managed by the
     /// install lifecycle (plugin install / uninstall, core upgrades).
     /// Returns `DeleteOutcome::Refused` so the HTTP layer can surface
     /// a 403 with an actionable message.
@@ -738,6 +740,7 @@ impl<'a> AutomationStore<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::automation_bus::BusEventKind;
     use crate::db::DbConfig;
     use crate::migrations::MigrationRunner;
 
@@ -750,7 +753,7 @@ mod tests {
     fn linear_def() -> AutomationDef {
         AutomationDef {
             trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
+                kind: "webhook.received".to_owned(),
                 when: None,
             },
             nodes: vec![
@@ -846,7 +849,7 @@ mod tests {
     fn ask_agent_def() -> AutomationDef {
         AutomationDef {
             trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
+                kind: "webhook.received".to_owned(),
                 when: None,
             },
             nodes: vec![
@@ -943,7 +946,7 @@ mod tests {
         let mut def = ask_agent_def();
         def.nodes[0].config = serde_json::json!({
             "prompt": "hi"
-            // missing exit_tools â€” required field
+            // missing exit_tools Ã¢â‚¬â€ required field
         });
         let err = validate(&def).unwrap_err();
         assert!(format!("{err}").contains("AskAgent config"));
@@ -954,7 +957,7 @@ mod tests {
     fn notify_def(cfg: serde_json::Value) -> AutomationDef {
         AutomationDef {
             trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
+                kind: "webhook.received".to_owned(),
                 when: None,
             },
             nodes: vec![
@@ -1017,7 +1020,7 @@ mod tests {
     fn call_plugin_def(cfg: serde_json::Value) -> AutomationDef {
         AutomationDef {
             trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
+                kind: "webhook.received".to_owned(),
                 when: None,
             },
             nodes: vec![
@@ -1157,7 +1160,7 @@ mod tests {
             ("wh-disabled", BusEventKind::WebhookReceived, false),
         ] {
             let mut def = linear_def();
-            def.trigger.kind = kind;
+            def.trigger.kind = kind.as_str().to_owned();
             store
                 .upsert(
                     &AutomationUpsert {
@@ -1171,15 +1174,15 @@ mod tests {
                 .unwrap();
         }
         let webhook = store
-            .list_enabled_for_kind(BusEventKind::WebhookReceived)
+            .list_enabled_for_kind("webhook.received")
             .unwrap();
         assert_eq!(webhook.len(), 2);
         let routine = store
-            .list_enabled_for_kind(BusEventKind::RoutineFired)
+            .list_enabled_for_kind("routine.fired")
             .unwrap();
         assert_eq!(routine.len(), 1);
         let socket = store
-            .list_enabled_for_kind(BusEventKind::SocketMessage)
+            .list_enabled_for_kind("socket.message")
             .unwrap();
         assert_eq!(socket.len(), 0);
     }
@@ -1222,7 +1225,7 @@ mod tests {
             .unwrap();
         assert_eq!(store.delete(&row.id).unwrap(), DeleteOutcome::Deleted);
         assert!(store.get(&row.id).unwrap().is_none());
-        // Idempotent — second delete reports NotFound, not an error.
+        // Idempotent â€” second delete reports NotFound, not an error.
         assert_eq!(store.delete(&row.id).unwrap(), DeleteOutcome::NotFound);
     }
 

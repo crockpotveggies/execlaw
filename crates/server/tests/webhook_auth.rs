@@ -234,7 +234,7 @@ async fn post_webhook(
 
 fn count_webhook_events(state: &AppState) -> usize {
     BusEventStore::new(&state.db)
-        .list_recent_for_kind(BusEventKind::WebhookReceived, 100)
+        .list_recent_for_kind(BusEventKind::WebhookReceived.as_str(), 100)
         .unwrap()
         .len()
 }
@@ -322,7 +322,7 @@ async fn query_token_valid_accepts_and_redacts_payload() {
     );
 
     let events = BusEventStore::new(&state.db)
-        .list_recent_for_kind(BusEventKind::WebhookReceived, 10)
+        .list_recent_for_kind(BusEventKind::WebhookReceived.as_str(), 10)
         .unwrap();
     assert_eq!(
         events.len(),
@@ -462,7 +462,7 @@ async fn legacy_mode_still_redacts_known_secret_keys() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let events = BusEventStore::new(&state.db)
-        .list_recent_for_kind(BusEventKind::WebhookReceived, 10)
+        .list_recent_for_kind(BusEventKind::WebhookReceived.as_str(), 10)
         .unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].payload["query"]["token"], "<redacted>");

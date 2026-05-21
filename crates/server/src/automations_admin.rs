@@ -32,7 +32,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, post};
-use execlaw_core::automation_bus::{BusEventKind, BusEventRow, BusEventStore};
+use execlaw_core::automation_bus::{BusEventRow, BusEventStore};
 use execlaw_core::automation_runs::{AutomationRunRow, AutomationRunStore};
 use execlaw_core::automation_suggestions::SuggestionStore;
 use execlaw_core::automations::{
@@ -235,7 +235,7 @@ pub struct MetricsDto {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RecentBusEventDto {
     pub id: String,
-    pub kind: BusEventKind,
+    pub kind: String,
     pub source: String,
     pub received_at: i64,
     #[schema(value_type = Object)]
@@ -257,7 +257,7 @@ impl From<BusEventRow> for RecentBusEventDto {
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct RecentEventsQuery {
-    pub kind: BusEventKind,
+    pub kind: String,
     #[serde(default = "default_recent_limit")]
     pub limit: i64,
 }
@@ -287,7 +287,7 @@ pub struct TestRunRequest {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SampleEventBody {
-    pub kind: BusEventKind,
+    pub kind: String,
     pub source: String,
     #[schema(value_type = Object)]
     pub payload: serde_json::Value,
@@ -296,7 +296,7 @@ pub struct SampleEventBody {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SuggestionDto {
     pub id: String,
-    pub kind: BusEventKind,
+    pub kind: String,
     pub source: String,
     pub event_count: i64,
     pub sample_event_ids: Vec<String>,
@@ -530,7 +530,7 @@ pub async fn list_recent_events(
 ) -> Result<Json<Vec<RecentBusEventDto>>, ApiError> {
     let limit = q.limit.clamp(1, 200);
     let rows = BusEventStore::new(&state.db)
-        .list_recent_for_kind(q.kind, limit)
+        .list_recent_for_kind(&q.kind, limit)
         .map_err(|e| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "recent_events_failed",
@@ -911,7 +911,7 @@ mod tests {
     use crate::routes::test_app_state;
     use axum::body::{self, Body};
     use axum::http::{Request, header};
-    use execlaw_core::automation_bus::{BusEventKind, BusEventStore, Event as BusEvent};
+    use execlaw_core::automation_bus::{BusEventStore, Event as BusEvent};
     use execlaw_core::automations::{
         AutomationDef, EdgeDef, NodeDef, NodeKind, TRIGGER_SENTINEL, TriggerDef,
     };
@@ -920,7 +920,7 @@ mod tests {
     fn minimal_def() -> AutomationDef {
         AutomationDef {
             trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
+                kind: "webhook.received".to_owned(),
                 when: None,
             },
             nodes: vec![NodeDef {
@@ -1017,7 +1017,7 @@ mod tests {
     async fn create_invalid_returns_400_with_validator_message() {
         let bad_def = AutomationDef {
             trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
+                kind: "webhook.received".to_owned(),
                 when: None,
             },
             nodes: vec![],
@@ -1156,7 +1156,7 @@ mod tests {
             bus.publish(
                 &BusEvent {
                     id: format!("e-{i}"),
-                    kind: BusEventKind::WebhookReceived,
+                    kind: "webhook.received".to_owned(),
                     source: "webhook:ring".into(),
                     received_at: now_ms - i,
                     payload: serde_json::json!({}),
@@ -1183,7 +1183,7 @@ mod tests {
             bus.publish(
                 &BusEvent {
                     id: format!("e-{i}"),
-                    kind: BusEventKind::WebhookReceived,
+                    kind: "webhook.received".to_owned(),
                     source: "webhook:ring".into(),
                     received_at: now_ms - i,
                     payload: serde_json::json!({}),
@@ -1217,7 +1217,7 @@ mod tests {
         // Create the automation.
         let def = AutomationDef {
             trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
+                kind: "webhook.received".to_owned(),
                 when: None,
             },
             nodes: vec![
@@ -1298,7 +1298,7 @@ mod tests {
                 enabled: true,
                 definition: AutomationDef {
                     trigger: TriggerDef {
-                        kind: BusEventKind::WebhookReceived,
+                        kind: "webhook.received".to_owned(),
                         when: None,
                     },
                     nodes: vec![NodeDef {
@@ -1357,7 +1357,7 @@ mod tests {
             bus.publish(
                 &execlaw_core::automation_bus::Event {
                     id: format!("wh-{i}"),
-                    kind: BusEventKind::WebhookReceived,
+                    kind: "webhook.received".to_owned(),
                     source: "x".into(),
                     received_at: now_ms - i,
                     payload: serde_json::json!({"i": i}),
@@ -1371,7 +1371,7 @@ mod tests {
             bus.publish(
                 &execlaw_core::automation_bus::Event {
                     id: format!("rt-{i}"),
-                    kind: BusEventKind::RoutineFired,
+                    kind: "routine.fired".to_owned(),
                     source: "x".into(),
                     received_at: now_ms - i,
                     payload: serde_json::json!({}),
@@ -1421,7 +1421,7 @@ mod tests {
             bus.publish(
                 &BusEvent {
                     id: format!("e-{i}"),
-                    kind: BusEventKind::WebhookReceived,
+                    kind: "webhook.received".to_owned(),
                     source: "webhook:ring".into(),
                     received_at: now_ms - i,
                     payload: serde_json::json!({}),

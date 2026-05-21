@@ -1,5 +1,5 @@
 {
-  "trigger": { "kind": "other", "when": null },
+  "trigger": { "kind": "calendar.event.starting_soon", "when": null },
   "nodes": [
     {
       "id": "brief",

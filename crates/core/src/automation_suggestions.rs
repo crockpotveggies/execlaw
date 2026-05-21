@@ -82,7 +82,7 @@ impl SuggestionStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SuggestionRow {
     pub id: String,
-    pub kind: BusEventKind,
+    pub kind: String,
     pub source: String,
     pub event_count: i64,
     pub sample_event_ids: Vec<String>,
@@ -101,7 +101,7 @@ pub struct SuggestionRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutedPatternRow {
-    pub kind: BusEventKind,
+    pub kind: String,
     pub source: String,
     pub muted_at: i64,
 }
@@ -142,7 +142,7 @@ impl<'a> SuggestionStore<'a> {
             BusEventKind::RoutineFired,
         ] {
             if !auto_store
-                .list_enabled_for_kind(k)
+                .list_enabled_for_kind(k.as_str())
                 .map_err(|e| SuggestionError::Db(DbError::Migration(format!("{e}"))))?
                 .is_empty()
             {
@@ -359,7 +359,7 @@ impl<'a> SuggestionStore<'a> {
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok(MutedPatternRow {
-                    kind: BusEventKind::parse(&r.get::<_, String>(0)?),
+                    kind: r.get::<_, String>(0)?,
                     source: r.get(1)?,
                     muted_at: r.get(2)?,
                 })
@@ -464,7 +464,7 @@ fn row_to_suggestion(r: &rusqlite::Row<'_>) -> rusqlite::Result<SuggestionRow> {
     };
     Ok(SuggestionRow {
         id: r.get(0)?,
-        kind: BusEventKind::parse(&r.get::<_, String>(1)?),
+        kind: r.get::<_, String>(1)?,
         source: r.get(2)?,
         event_count: r.get(3)?,
         sample_event_ids,
@@ -496,7 +496,7 @@ mod tests {
                 .publish(
                     &BusEvent {
                         id: format!("{source}-{i}"),
-                        kind: BusEventKind::WebhookReceived,
+                        kind: "webhook.received".to_owned(),
                         source: source.into(),
                         received_at: received_at_ms + i,
                         payload: serde_json::json!({}),
@@ -589,7 +589,7 @@ mod tests {
                     enabled: true,
                     definition: AutomationDef {
                         trigger: TriggerDef {
-                            kind: BusEventKind::WebhookReceived,
+                            kind: "webhook.received".to_owned(),
                             when: None,
                         },
                         nodes: vec![NodeDef {
@@ -632,7 +632,7 @@ mod tests {
             bus.publish(
                 &BusEvent {
                     id: format!("webhook:burst-{i}"),
-                    kind: BusEventKind::WebhookReceived,
+                    kind: "webhook.received".to_owned(),
                     source: "webhook:burst".into(),
                     received_at: now * 1000 + i,
                     payload: serde_json::json!({}),
@@ -677,7 +677,7 @@ mod tests {
             bus.publish(
                 &BusEvent {
                     id: format!("webhook:annoying-extra-{i}"),
-                    kind: BusEventKind::WebhookReceived,
+                    kind: "webhook.received".to_owned(),
                     source: "webhook:annoying".into(),
                     received_at: now * 1000 + 1000 + i,
                     payload: serde_json::json!({}),
@@ -738,7 +738,7 @@ mod tests {
         let id = store.list_pending().unwrap()[0].id.clone();
         let def = AutomationDef {
             trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
+                kind: "webhook.received".to_owned(),
                 when: None,
             },
             nodes: vec![NodeDef {
@@ -778,7 +778,7 @@ mod tests {
         // Set draft Ã¢â€ â€™ list_pending surfaces it.
         let def = AutomationDef {
             trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
+                kind: "webhook.received".to_owned(),
                 when: None,
             },
             nodes: vec![NodeDef {

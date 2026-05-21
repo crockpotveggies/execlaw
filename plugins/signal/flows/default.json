@@ -1,5 +1,5 @@
 {
-  "trigger": { "kind": "other", "when": null },
+  "trigger": { "kind": "signal.message.received", "when": null },
   "nodes": [
     {
       "id": "ask",

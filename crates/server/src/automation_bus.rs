@@ -471,7 +471,7 @@ pub fn noop_handler() -> EventHandler {
         Box::pin(async move {
             debug!(
                 event_id = %row.id,
-                kind = %row.kind.as_str(),
+                kind = %row.kind,
                 source = %row.source,
                 "automation bus: event dispatched (no automations registered yet)",
             );
@@ -502,7 +502,7 @@ pub(crate) fn counting_handler(
 mod tests {
     use super::*;
     use execlaw_core::Database;
-    use execlaw_core::automation_bus::{BusEventKind, BusEventStore, Event};
+    use execlaw_core::automation_bus::{BusEventStore, Event};
     use execlaw_core::db::DbConfig;
     use execlaw_core::migrations::MigrationRunner;
     use std::sync::Arc;
@@ -519,7 +519,7 @@ mod tests {
     fn evt(id: &str, ts: i64) -> Event {
         Event {
             id: id.into(),
-            kind: BusEventKind::WebhookReceived,
+            kind: "webhook.received".to_owned(),
             source: "test".into(),
             received_at: ts,
             payload: serde_json::json!({}),

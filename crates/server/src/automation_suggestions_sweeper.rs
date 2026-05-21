@@ -92,7 +92,7 @@ impl AutomationSuggestionsSweeper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use execlaw_core::automation_bus::{BusEventKind, BusEventStore, Event as BusEvent};
+    use execlaw_core::automation_bus::{BusEventStore, Event as BusEvent};
     use execlaw_core::db::DbConfig;
     use execlaw_core::migrations::MigrationRunner;
     use std::time::Duration;
@@ -110,7 +110,7 @@ mod tests {
             bus.publish(
                 &BusEvent {
                     id: format!("{source}-{i}"),
-                    kind: BusEventKind::WebhookReceived,
+                    kind: "webhook.received".to_owned(),
                     source: source.into(),
                     received_at: now_ms + i,
                     payload: serde_json::json!({}),

@@ -124,7 +124,7 @@ impl BusEventRetentionSweeper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::automation_bus::{BusEventKind, BusEventStore, Event};
+    use crate::automation_bus::{BusEventStore, Event};
     use crate::db::DbConfig;
     use crate::migrations::MigrationRunner;
 
@@ -137,7 +137,7 @@ mod tests {
     fn evt(id: &str, ts: i64) -> Event {
         Event {
             id: id.into(),
-            kind: BusEventKind::WebhookReceived,
+            kind: "webhook.received".to_owned(),
             source: "test".into(),
             received_at: ts,
             payload: serde_json::json!({}),

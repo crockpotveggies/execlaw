@@ -26,7 +26,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::Json;
 use axum::routing::{get, post};
 use axum::Router;
-use execlaw_core::automation_bus::{BusEventKind, Event as BusEvent};
+use execlaw_core::automation_bus::Event as BusEvent;
 use execlaw_core::event_envelope::{EventEnvelope, OriginRef, SenderIdentity};
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
@@ -102,7 +102,9 @@ pub async fn submit_prompt(
     };
     let evt = BusEvent {
         id: event_id.clone(),
-        kind: BusEventKind::Other, // until we widen BusEventKind to free-form strings (M6.5)
+        // M6+ — free-form kind. The default web flow's trigger
+        // matches on this exact string.
+        kind: "web.prompt.submitted".to_owned(),
         source: "core:web".into(),
         received_at: chrono::Utc::now().timestamp_millis(),
         payload,
@@ -173,7 +175,7 @@ fn event_kind_str(ev: &FlowChannelEvent) -> Option<&'static str> {
 /// path keeps working until the operator opts in.
 pub fn default_web_flow_json() -> serde_json::Value {
     serde_json::json!({
-        "trigger": {"kind": "other", "when": null},
+        "trigger": {"kind": "web.prompt.submitted", "when": null},
         "nodes": [
             {
                 "id": "ask",

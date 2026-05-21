@@ -163,7 +163,9 @@ impl Inner {
         // today, but designs change), the bus dedups silently.
         let bus_evt = execlaw_core::automation_bus::Event {
             id: format!("routine:{}:{}", routine.id, run_id),
-            kind: execlaw_core::automation_bus::BusEventKind::RoutineFired,
+            kind: execlaw_core::automation_bus::BusEventKind::RoutineFired
+                .as_str()
+                .to_owned(),
             source: format!("routine:{}", routine.id),
             received_at: chrono::Utc::now().timestamp_millis(),
             payload: serde_json::json!({
