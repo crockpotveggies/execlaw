@@ -70,6 +70,98 @@ pub fn router() -> Router<AppState> {
             "/api/admin/automations/recent-events",
             get(list_recent_events),
         )
+        // M6 — registry inspection endpoints.
+        .route(
+            "/api/admin/automations/registered-events",
+            get(list_registered_events),
+        )
+        .route(
+            "/api/admin/automations/registered-reply-handlers",
+            get(list_registered_reply_handlers),
+        )
+        .route(
+            "/api/admin/automations/default-flows",
+            get(list_default_flows),
+        )
+}
+
+// --- M6 registry inspection handlers --------------------------------
+
+#[axum::debug_handler]
+async fn list_registered_events(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<execlaw_core::event_registry::RegisteredEventKind>>, ApiError> {
+    let reg = execlaw_core::event_registry::EventRegistry::new(&state.db);
+    let kinds = reg.list_event_kinds().map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "registry_list_failed",
+        message: format!("{e}"),
+    })?;
+    Ok(Json(kinds))
+}
+
+#[axum::debug_handler]
+async fn list_registered_reply_handlers(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<execlaw_core::event_registry::RegisteredReplyHandler>>, ApiError> {
+    let reg = execlaw_core::event_registry::EventRegistry::new(&state.db);
+    let handlers = reg.list_reply_handlers().map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "registry_list_failed",
+        message: format!("{e}"),
+    })?;
+    Ok(Json(handlers))
+}
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct DefaultFlowDto {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub source: String,
+    pub source_version: Option<String>,
+    pub operator_modified: bool,
+}
+
+#[axum::debug_handler]
+async fn list_default_flows(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<DefaultFlowDto>>, ApiError> {
+    // Pull all automations + filter to source != "operator". For
+    // slice 9 we read the source columns directly via SQL since the
+    // AutomationRow struct doesn't surface them yet.
+    use rusqlite::params;
+    let rows = state
+        .db
+        .with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, name, enabled, source, source_version, operator_modified \
+                 FROM state_automations \
+                 WHERE source != 'operator' \
+                 ORDER BY name ASC",
+            )?;
+            let rows = stmt.query_map(params![], |r| {
+                Ok(DefaultFlowDto {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    enabled: r.get::<_, i64>(2)? != 0,
+                    source: r.get(3)?,
+                    source_version: r.get(4)?,
+                    operator_modified: r.get::<_, i64>(5)? != 0,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok::<_, execlaw_core::db::DbError>(out)
+        })
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "default_flows_list_failed",
+            message: format!("{e}"),
+        })?;
+    Ok(Json(rows))
 }
 
 // ---------------------------------------------------------------------------

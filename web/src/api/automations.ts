@@ -311,6 +311,98 @@ export async function listRecentBusEvents(
     );
 }
 
+// ---- M6 registry inspection ----
+
+export interface RegisteredEventKind {
+    kind: string;
+    source: string;
+    description: string;
+    payload_schema?: unknown;
+    expects_reply: boolean;
+    default_origin_kind: string;
+}
+
+export interface RegisteredReplyHandler {
+    name: string;
+    plugin_id: string;
+    description: string;
+    supports_streaming: boolean;
+    supports_attachments: boolean;
+    supports_inline_chart: boolean;
+    supports_table: boolean;
+    supports_card: boolean;
+    supports_markdown: boolean;
+    max_attachment_size_bytes?: number;
+    max_attachments_per_message?: number;
+    max_text_length?: number;
+    allowed_mime_prefixes?: string[];
+}
+
+export interface DefaultFlowSummary {
+    id: string;
+    name: string;
+    enabled: boolean;
+    source: string;
+    source_version?: string;
+    operator_modified: boolean;
+}
+
+export async function listRegisteredEvents(
+    tokenAccessor: () => string | null,
+): Promise<RegisteredEventKind[]> {
+    return apiFetch<RegisteredEventKind[]>(
+        `${BASE}/registered-events`,
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function listRegisteredReplyHandlers(
+    tokenAccessor: () => string | null,
+): Promise<RegisteredReplyHandler[]> {
+    return apiFetch<RegisteredReplyHandler[]>(
+        `${BASE}/registered-reply-handlers`,
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function listDefaultFlows(
+    tokenAccessor: () => string | null,
+): Promise<DefaultFlowSummary[]> {
+    return apiFetch<DefaultFlowSummary[]>(
+        `${BASE}/default-flows`,
+        {},
+        tokenAccessor,
+    );
+}
+
+/** POST /api/web/prompt — M6 web-prompt entrypoint (shadow mode). */
+export interface SubmitPromptRequest {
+    text: string;
+    session_id: string;
+    conversation_id?: string;
+    attachment_ids?: string[];
+}
+
+export interface SubmitPromptResponse {
+    event_id: string;
+}
+
+export async function submitWebPrompt(
+    body: SubmitPromptRequest,
+    tokenAccessor: () => string | null,
+): Promise<SubmitPromptResponse> {
+    return apiFetch<SubmitPromptResponse>(
+        "/api/web/prompt",
+        {
+            method: "POST",
+            body,
+        },
+        tokenAccessor,
+    );
+}
+
 // ---- Helpers for templated defaults the UI uses ----
 
 /** Minimal valid graph: trigger → Terminal. Used as the seed when the
