@@ -70,7 +70,12 @@ interface TileDef {
 // ---- Active-tile preference (localStorage) -------------------------
 
 const ACTIVE_TILE_KEY = "execlaw:welcome-tile-active";
-const DEFAULT_TILE_ID = "todays-brief";
+// 2026-05-21 — default tile on first run. Was `todays-brief` while
+// the brief was visually prominent; switched to `quick-prompts`
+// because the prompt pills are the most discoverable first-touch
+// affordance on the welcome view and the brief is happiest as a
+// secondary option the operator selects deliberately.
+const DEFAULT_TILE_ID = "quick-prompts";
 
 function readActiveTile(): string {
     try {

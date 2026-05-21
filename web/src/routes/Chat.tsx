@@ -828,12 +828,23 @@ export function Chat() {
         return <Navigate to="/login" replace />;
     }
 
+    // 2026-05-21 — rail mode. When no thread is active (welcome
+    // view) the sidebar collapses to an icon-only rail and slides
+    // out to its full 16rem on hover. The `.is-rail` class on the
+    // shell drops the main pane's `margin-left` so the welcome
+    // content recentres against the narrower rail.
+    const railMode = activeId === null;
+
     return (
-        <div ref={shellRef} className="execlaw-shell">
+        <div
+            ref={shellRef}
+            className={"execlaw-shell" + (railMode ? " is-rail" : "")}
+        >
             <Sidebar
                     onNewThread={onNewThread}
                     onSignOut={handleSignOut}
                     uiPanels={uiPanels}
+                    compact={railMode}
                 />
             <main className="execlaw-main">
                 <ErrorBanner

@@ -572,6 +572,74 @@ body {
     }
 }
 
+// ---- Rail mode (welcome view) -------------------------------------
+//
+// 2026-05-21 — when the operator is on the new-chat landing
+// (`activeId === null`), the sidebar defaults to an icon-only rail
+// and slides out to full 16rem on hover. The shell carries
+// `.is-rail` (set by `routes/Chat.tsx` based on the active-thread
+// state) which shrinks the main pane's `margin-left` so the
+// welcome content recentres against the narrower rail. Sidebar
+// itself is `position: fixed` — when it expands on hover, it
+// floats above main rather than pushing it.
+//
+// GSAP (`useGSAP` inside Sidebar) drives the width + label
+// opacity tween. The CSS rules here close the layout gaps GSAP
+// can't reach: section-header rows collapse to height 0 (otherwise
+// they'd leave bands of empty padding), the brand head centres
+// its status pip, and the foot rebalances so the gear / signout
+// icons don't drift on collapse.
+.execlaw-shell.is-rail .execlaw-main {
+    // Rail width (6rem) + 2× gutter (1rem each). Keeps the welcome
+    // content centred in the wider remaining viewport.
+    margin-left: 8rem;
+}
+
+.execlaw-sidebar.is-collapsed {
+    // 2026-05-21 — transparent panel in rail mode. The rail reads
+    // as a small column of icons floating against the body
+    // background, not as a card. The expanded state restores the
+    // surface fill via the default `.execlaw-sidebar` rule.
+    background-color: transparent;
+
+    // Section headers ("Browse", "Threads", "More") collapse to
+    // zero height so the icon column stays tight. GSAP also fades
+    // their text opacity, but height: 0 removes the gap left over
+    // after the fade.
+    .execlaw-sidebar__section {
+        height: 0;
+        padding-top: 0;
+        padding-bottom: 0;
+        margin: 0;
+        overflow: hidden;
+        pointer-events: none;
+    }
+
+    // Tighten head padding so the wordmark + status pip fit
+    // comfortably inside the narrower rail without clipping.
+    .execlaw-sidebar__head {
+        padding-left: 0.65rem;
+        padding-right: 0.4rem;
+        gap: 0.35rem;
+    }
+
+    // Hide the signout button when the rail is collapsed — at 6rem
+    // wide there's not enough room for both the gear and signout
+    // icons without one clipping. The operator can sign out from
+    // the expanded hover state.
+    .execlaw-sidebar__foot > button {
+        opacity: 0;
+        pointer-events: none;
+    }
+}
+
+// When the sidebar is in compact mode AND expanded (hovered) it's
+// overlaying the main pane. A soft drop shadow makes it read as a
+// layer above the content instead of clipping into it.
+.execlaw-sidebar.is-compact:not(.is-collapsed) {
+    box-shadow: $shadow-float;
+}
+
 // Small uppercase-tracking-widest section label inside the
 // sidebar — "Browse" on the reference site. Render as
 // `<div class="execlaw-sidebar__section">Threads</div>` etc.
@@ -2706,6 +2774,13 @@ body {
 // weight.
 .execlaw-welcome-tile--brief {
     position: relative;
+    // 2026-05-21 — transparent in the brief tile too. The
+    // severity-coloured icon badges + bold headlines carry enough
+    // visual weight on their own; an outer surface fill made the
+    // tile feel boxed-in against the welcome view's body. Inner
+    // badges keep their tinted backgrounds.
+    background: transparent;
+    padding: 0;
 }
 
 .execlaw-welcome-tile__brief-refresh {
