@@ -9,7 +9,7 @@
 // changes are visible immediately; no separate "save" inside the
 // panel (the page's top-bar Save button persists the full def).
 
-import { useEffect, useState, type ChangeEvent } from "react";
+import { useEffect, useMemo, useState, type ChangeEvent } from "react";
 import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
 import type {
@@ -1194,11 +1194,15 @@ export function TriggerPanel({
 export function EdgePanel({
     edgeId,
     edge,
+    definition,
     onWhenChange,
     onClose,
 }: {
     edgeId: string;
     edge: EdgeDef;
+    /** Whole def — needed so we can look up the upstream node's
+     *  exit_tools and suggest click-to-paste `when` snippets. */
+    definition: AutomationDef;
     /** Replace the edge's `when` clause. Pass `null` to clear it. */
     onWhenChange: (edgeId: string, whenExpr: string | null) => void;
     onClose: () => void;
@@ -1214,6 +1218,42 @@ export function EdgePanel({
             onWhenChange(edgeId, next);
         }
     };
+
+    /** Suggestions for the `when` clause based on the upstream node's
+     *  kind. AskAgent exits via a tool call whose name is recorded as
+     *  `{node_id}.tool` in state — so the canonical predicate is
+     *  `<node_id>.tool == "<exit_tool>"`. Audit fix #10. */
+    const suggestions = useMemo<string[]>(() => {
+        if (edge.from === "trigger") {
+            return [
+                'event.envelope.identity.trust == "controller"',
+                'event.envelope.origin.kind == "web_socket_session"',
+                "event.internal == false",
+            ];
+        }
+        const upstream = definition.nodes.find((n) => n.id === edge.from);
+        if (!upstream) return [];
+        if (upstream.kind === "AskAgent") {
+            const cfg = (upstream.config ?? {}) as Record<string, unknown>;
+            const exitTools = (cfg.exit_tools as ExitToolDef[] | undefined) ?? [];
+            return exitTools.map(
+                (t) => `${edge.from}.tool == "${t.name}"`,
+            );
+        }
+        if (upstream.kind === "Filter" || upstream.kind === "Transform") {
+            // For Transform, the node output is whatever the Rhai
+            // expression returned. We don't know the shape — suggest
+            // a generic pattern.
+            return [`${edge.from}.field == "value"`];
+        }
+        if (upstream.kind === "CallPlugin") {
+            return [
+                `${edge.from}.ok == true`,
+                `${edge.from}.status == 200`,
+            ];
+        }
+        return [];
+    }, [definition, edge.from]);
     return (
         <div
             className="execlaw-automation-edge-panel border rounded shadow-sm"
@@ -1292,6 +1332,33 @@ export function EdgePanel({
                     node's output as <code>{`{node_id}.field`}</code>.
                 </div>
             </Form.Group>
+
+            {suggestions.length > 0 && (
+                <div className="mb-2" data-testid="edge-panel-suggestions">
+                    <div className="small text-muted mb-1">
+                        <i className="bi bi-lightbulb me-1" aria-hidden />
+                        Suggestions {edge.from !== "trigger" && `from ${edge.from}`}
+                    </div>
+                    <div className="d-flex flex-wrap gap-1">
+                        {suggestions.map((s, i) => (
+                            <Button
+                                key={i}
+                                variant="outline-secondary"
+                                size="sm"
+                                className="font-monospace"
+                                style={{ fontSize: 11 }}
+                                onClick={() => {
+                                    setDraft(s);
+                                    onWhenChange(edgeId, s);
+                                }}
+                                data-testid={`edge-panel-suggestion-${i}`}
+                            >
+                                {s}
+                            </Button>
+                        ))}
+                    </div>
+                </div>
+            )}
 
             <Button
                 variant="outline-secondary"

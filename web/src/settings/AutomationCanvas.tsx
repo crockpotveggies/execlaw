@@ -728,6 +728,7 @@ function CanvasInner({ definition, onChange }: Props) {
                 <EdgePanel
                     edgeId={selectedEdge.id}
                     edge={selectedEdge.def}
+                    definition={definition}
                     onWhenChange={onEdgeWhenChange}
                     onClose={() => setSelectedEdgeId(null)}
                 />
