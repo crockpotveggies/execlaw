@@ -9,9 +9,13 @@
 //!   * `PUT  /api/admin/python-sandbox` — updates any subset of the
 //!     config row. Operator-supplied tunables are bounds-checked
 //!     server-side; out-of-range returns 400 with a descriptive
-//!     error. Changes take effect on the next server restart —
-//!     same "applies on next restart" UX the previous plugin
-//!     settings panel had.
+//!     error. The `enabled` toggle takes effect **immediately**:
+//!     enable=true registers the native sidecar with the registry,
+//!     kicks the supervisor, and spawns a background task that
+//!     wires the python.* tool surface once the kernel-gateway is
+//!     healthy; enable=false drops the python.* tools + the
+//!     sidecar slot from the registry, and the supervisor's next
+//!     reconcile stops the container. No server restart required.
 //!
 //! Status surface: when the python-sandbox feature is on AND
 //! Docker is reachable, the sidecar's runtime state is included
@@ -202,7 +206,120 @@ pub async fn put_handler(
             code: "db_error",
             message: e.to_string(),
         })?;
+
+    // Live-toggle lifecycle. The DB write above is the durable
+    // source of truth; this block makes the change take effect
+    // RIGHT NOW so the operator doesn't have to restart. Idle
+    // toggles (no change to `enabled`) skip this entirely.
+    if let Some(new_enabled) = req.enabled {
+        apply_enabled_change(&state, new_enabled);
+    }
+
     Ok(Json(updated.into()))
+}
+
+/// Drive the side effects of the `enabled` toggle: register /
+/// unregister the sidecar with the host registry, kick the
+/// supervisor to reconcile immediately, and (on enable) spawn a
+/// background task that wires the python.* tool surface once the
+/// kernel-gateway is healthy.
+///
+/// Best-effort: failures inside this function are logged but DO
+/// NOT propagate up to the HTTP response. The DB row was already
+/// updated, so the boot path will pick up the toggle next time
+/// even if this live attempt didn't fully succeed.
+fn apply_enabled_change(state: &AppState, new_enabled: bool) {
+    let Some(supervisor) = state.sidecar_supervisor.clone() else {
+        // Docker unavailable → boot path didn't construct a
+        // supervisor → nothing for us to drive here. The validator
+        // above already rejected enable=true in this branch, so
+        // we only reach this with enable=false on a Docker-less
+        // host, which is a clean no-op.
+        return;
+    };
+    let registry = state.plugin_host.registry().clone();
+    if new_enabled {
+        match crate::python_sandbox::register_now(&registry) {
+            Ok(_) => {
+                supervisor.kick();
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "python_sandbox::live_toggle",
+                    error = %e,
+                    "live register failed; operator may need to restart to fully wire the feature"
+                );
+                return;
+            }
+        }
+        // The kernel-gateway container takes ~3-10s to start +
+        // become responsive. Spawn a background task that polls
+        // `host_port_for` until populated then wires the tools.
+        // Returns Ok(None) silently when the feature is somehow
+        // disabled mid-flight (operator toggled twice fast).
+        let db = state.db.clone();
+        let events = state.events.clone();
+        let sup = supervisor.clone();
+        let registry_for_wire = registry.clone();
+        tokio::spawn(async move {
+            // Wait up to 60s for the kernel-gateway to surface a
+            // host port. 60s is conservative — the legacy boot path
+            // historically waited ~2s. Container pull + first-boot
+            // initialization on a cold host can stretch longer.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                if sup
+                    .host_port_for(crate::python_sandbox::wiring::SIDECAR_NAME)
+                    .await
+                    .is_some()
+                {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        target: "python_sandbox::live_toggle",
+                        "kernel-gateway sidecar didn't surface a host port within 60s; \
+                         tools NOT wired. Operator can re-toggle to retry, or check supervisor logs."
+                    );
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            let now_unix = chrono::Utc::now().timestamp();
+            match crate::python_sandbox::wire_python_sandbox(
+                &sup,
+                &registry_for_wire,
+                &db,
+                &events,
+                now_unix,
+            )
+            .await
+            {
+                Ok(Some(_)) => {
+                    tracing::info!(
+                        target: "python_sandbox::live_toggle",
+                        "python.* tools wired against live kernel-gateway after toggle-on"
+                    );
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        target: "python_sandbox::live_toggle",
+                        "wire_python_sandbox returned None — config may have flipped back to disabled mid-wire"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "python_sandbox::live_toggle",
+                        error = ?e,
+                        "wire_python_sandbox failed after live toggle-on"
+                    );
+                }
+            }
+        });
+    } else {
+        crate::python_sandbox::unregister_now(&registry);
+        supervisor.kick();
+    }
 }
 
 /// Look up the kernel-gateway sidecar's runtime status from the

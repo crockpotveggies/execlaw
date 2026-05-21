@@ -120,34 +120,8 @@ pub fn register_native_sidecar_if_enabled(
         return Ok(false);
     }
 
-    // Build the native sidecar spec. Mirror of what the plugin
-    // manifest used to declare; now hardcoded since the feature
-    // is native. Mounts use `state://work` (special source the
-    // supervisor resolves to the per-feature state dir) so the
-    // bind-mount path is identical to the legacy plugin install.
-    let sidecar = RegisteredSidecar {
-        plugin_id: SIDECAR_SOURCE_ID.to_owned(),
-        name: SIDECAR_NAME.to_owned(),
-        image: SIDECAR_IMAGE.to_owned(),
-        rpc_port: SIDECAR_RPC_PORT,
-        rpc_health_path: SIDECAR_HEALTH_PATH.to_owned(),
-        env: Vec::new(),
-        mounts: vec![MountDecl {
-            // `state://work` resolves to the per-feature host
-            // state dir + a `work` subdir. The supervisor's
-            // mount-resolution picks this up and binds it into
-            // the container at `/work`. Same path the plugin
-            // manifest used to declare, so existing dev installs
-            // see no on-disk churn.
-            source: "state://work".to_owned(),
-            target: "/work".to_owned(),
-            read_only: false,
-        }],
-        entrypoint: None,
-        stage_path: None,
-    };
     registry
-        .register_native_sidecar(sidecar)
+        .register_native_sidecar(python_sandbox_sidecar_spec())
         .map_err(WireError::SidecarRegister)?;
     tracing::info!(
         target: "python_sandbox::wiring",
@@ -156,6 +130,77 @@ pub fn register_native_sidecar_if_enabled(
         "python_sandbox: native sidecar registered; supervisor will spawn on reconcile"
     );
     Ok(true)
+}
+
+/// Canonical sidecar spec for the python-sandbox kernel-gateway.
+/// Mirror of what the plugin manifest used to declare; now
+/// hardcoded since the feature is native. Mounts use
+/// `state://work` (special source the supervisor resolves to the
+/// per-feature state dir) so the bind-mount path is identical to
+/// the legacy plugin install.
+pub(crate) fn python_sandbox_sidecar_spec() -> RegisteredSidecar {
+    RegisteredSidecar {
+        plugin_id: SIDECAR_SOURCE_ID.to_owned(),
+        name: SIDECAR_NAME.to_owned(),
+        image: SIDECAR_IMAGE.to_owned(),
+        rpc_port: SIDECAR_RPC_PORT,
+        rpc_health_path: SIDECAR_HEALTH_PATH.to_owned(),
+        env: Vec::new(),
+        mounts: vec![MountDecl {
+            source: "state://work".to_owned(),
+            target: "/work".to_owned(),
+            read_only: false,
+        }],
+        entrypoint: None,
+        stage_path: None,
+    }
+}
+
+/// Live-toggle register. Used by the admin PUT handler when the
+/// operator flips the toggle on AFTER boot. Idempotent — calling
+/// twice (or after the boot path already registered) is a no-op
+/// success. Returns `Ok(true)` if a fresh slot was inserted,
+/// `Ok(false)` if the slot already existed with the same spec.
+pub fn register_now(registry: &HookRegistry) -> Result<bool, WireError> {
+    let spec = python_sandbox_sidecar_spec();
+    // Capture whether a slot already existed so we can report
+    // back. `register_native_sidecar_idempotent` swallows
+    // identical re-registers; we infer by querying after.
+    let pre_existed = registry.sidecar(SIDECAR_NAME).is_some();
+    registry
+        .register_native_sidecar_idempotent(spec)
+        .map_err(WireError::SidecarRegister)?;
+    if !pre_existed {
+        tracing::info!(
+            target: "python_sandbox::wiring",
+            image = SIDECAR_IMAGE,
+            rpc_port = SIDECAR_RPC_PORT,
+            "python_sandbox: live-registered native sidecar (toggle-on); supervisor will spawn on reconcile"
+        );
+    }
+    Ok(!pre_existed)
+}
+
+/// Live-toggle unregister. Used by the admin PUT handler when the
+/// operator flips the toggle off. Drops the sidecar slot AND the
+/// python.* builtins so the agent can't call them anymore. The
+/// supervisor's next reconcile tick observes the missing slot and
+/// stops the container.
+///
+/// Returns `(sidecar_dropped, tool_count_dropped)` for the log
+/// breadcrumb / response envelope.
+pub fn unregister_now(registry: &HookRegistry) -> (bool, usize) {
+    let dropped = registry.unregister_native_sidecar(SIDECAR_NAME);
+    let tool_count = registry.unregister_builtins_by_prefix("python.");
+    if dropped || tool_count > 0 {
+        tracing::info!(
+            target: "python_sandbox::wiring",
+            sidecar_dropped = dropped,
+            tools_dropped = tool_count,
+            "python_sandbox: live-unregistered (toggle-off); supervisor will stop the container on next reconcile"
+        );
+    }
+    (dropped, tool_count)
 }
 
 /// Wire the python-sandbox tool surface into the running host.
