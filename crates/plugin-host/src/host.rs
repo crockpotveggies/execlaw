@@ -551,6 +551,19 @@ impl PluginHost {
             }
         }
 
+        // Step 5 (M6) — import event-bus kinds + reply handlers + default
+        // automations from the manifest into the runtime registry. Best-
+        // effort: failures are warnings, not fatal — a malformed schema
+        // path doesn't roll back the install (the plugin's tools /
+        // transport are already useful).
+        import_m6_registry(
+            &self.inner.db,
+            &plugin_id,
+            &version,
+            stage_path,
+            &manifest,
+        );
+
         info!(plugin_id, version, "plugin installed");
 
         // Fire on_enable for script plugins on the install/upgrade
@@ -723,6 +736,20 @@ impl PluginHost {
                     error = %e,
                     "failed to archive plugin skills (uninstall continued)"
                 ),
+            }
+        }
+
+        // M6 — drop event kinds + reply handlers contributed by this
+        // plugin. Best-effort: stale rows would just clutter the
+        // Automations UI; they don't break execution.
+        {
+            let reg = execlaw_core::event_registry::EventRegistry::new(&self.inner.db);
+            if let Err(e) = reg.remove_by_plugin(plugin_id) {
+                warn!(
+                    plugin_id,
+                    error = %e,
+                    "failed to remove event-registry rows on uninstall"
+                );
             }
         }
 
@@ -952,6 +979,15 @@ impl PluginHost {
                 warn!(plugin_id = %row.plugin_id, error = %e, "skipping plugin with hook conflict on hydrate");
                 continue;
             }
+            // M6 — re-import the registry rows on hydrate so a fresh
+            // boot re-creates them (idempotent upsert).
+            import_m6_registry(
+                &self.inner.db,
+                &row.plugin_id,
+                &row.version,
+                std::path::Path::new(&row.stage_path),
+                &manifest,
+            );
             let needs_runtime = !manifest.tools.is_empty()
                 || manifest.transport.is_some()
                 || manifest.identity_provider.is_some()
@@ -1595,6 +1631,107 @@ fn oauth_map_from_params(params: &serde_json::Value) -> serde_json::Map<String, 
         .and_then(|v| v.as_object())
         .cloned()
         .unwrap_or_default()
+}
+
+/// M6 — import `[[bus_events]]` + `[[reply_handlers]]` from the
+/// manifest into the runtime registry. Best-effort: a malformed
+/// schema file is logged and skipped; one bad row doesn't roll
+/// back the rest of the install. Default automations are imported
+/// separately by the `automations_admin` install hook (slice 8).
+fn import_m6_registry(
+    db: &execlaw_core::db::Database,
+    plugin_id: &str,
+    _plugin_version: &str,
+    stage_path: &Path,
+    manifest: &PluginManifest,
+) {
+    use execlaw_core::event_registry::{
+        EventRegistry, RegisteredEventKind, RegisteredReplyHandler,
+    };
+
+    if manifest.bus_events.is_empty() && manifest.reply_handlers.is_empty() {
+        return;
+    }
+
+    let reg = EventRegistry::new(db);
+
+    for e in &manifest.bus_events {
+        // Resolve payload schema. Prefer inline `payload_schema`; fall
+        // back to `payload_schema_path` (relative to stage_path).
+        let payload_schema = if let Some(inline) = &e.payload_schema {
+            Some(inline.clone())
+        } else if let Some(path) = &e.payload_schema_path {
+            let resolved = stage_path.join(path);
+            match std::fs::read_to_string(&resolved) {
+                Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
+                    Ok(v) => Some(v),
+                    Err(parse_err) => {
+                        warn!(
+                            plugin_id,
+                            path = %resolved.display(),
+                            error = %parse_err,
+                            "M6: payload_schema_path is not valid JSON (skipping schema; event still registered)"
+                        );
+                        None
+                    }
+                },
+                Err(io_err) => {
+                    warn!(
+                        plugin_id,
+                        path = %resolved.display(),
+                        error = %io_err,
+                        "M6: payload_schema_path not readable (skipping schema; event still registered)"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let row = RegisteredEventKind {
+            kind: e.kind.clone(),
+            source: format!("plugin:{plugin_id}"),
+            description: e.description.clone(),
+            payload_schema,
+            expects_reply: e.expects_reply,
+            default_origin_kind: e.default_origin_kind.clone(),
+        };
+        if let Err(err) = reg.upsert_event_kind(&row) {
+            warn!(
+                plugin_id,
+                kind = %e.kind,
+                error = %err,
+                "M6: failed to register event kind (install continued)"
+            );
+        }
+    }
+
+    for h in &manifest.reply_handlers {
+        let row = RegisteredReplyHandler {
+            name: h.name.clone(),
+            plugin_id: plugin_id.to_owned(),
+            description: h.description.clone(),
+            supports_streaming: h.supports_streaming,
+            supports_attachments: h.supports_attachments,
+            supports_inline_chart: h.supports_inline_chart,
+            supports_table: h.supports_table,
+            supports_card: h.supports_card,
+            supports_markdown: h.supports_markdown,
+            max_attachment_size_bytes: h.max_attachment_size_bytes,
+            max_attachments_per_message: h.max_attachments_per_message,
+            max_text_length: h.max_text_length,
+            allowed_mime_prefixes: h.allowed_mime_prefixes.clone(),
+        };
+        if let Err(err) = reg.upsert_reply_handler(&row) {
+            warn!(
+                plugin_id,
+                name = %h.name,
+                error = %err,
+                "M6: failed to register reply handler (install continued)"
+            );
+        }
+    }
 }
 
 fn resolve_executable(stage: &Path, declared: &str) -> String {

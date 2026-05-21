@@ -861,6 +861,9 @@ mod tests {
             admin_routes: vec![],
             webhook_routes: vec![],
             runtime: None,
+            bus_events: vec![],
+            reply_handlers: vec![],
+            default_automations: vec![],
         };
         state
             .plugin_host

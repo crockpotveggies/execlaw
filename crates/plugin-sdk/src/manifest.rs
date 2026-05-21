@@ -77,6 +77,37 @@ pub struct PluginManifest {
     /// transport MUST set `[runtime]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeDecl>,
+
+    // ---------------- M6 event-driven architecture ------------------
+
+    /// Bus event kinds the plugin PUBLISHES (producer side — distinct
+    /// from `event_subscriptions` which is the consumer side). One
+    /// row per `(kind, schema, expects_reply)` triple — the host
+    /// registers each into `state_registered_event_kinds` at install
+    /// / hydrate time so the Automations UI trigger picker lists
+    /// them.
+    #[serde(default)]
+    pub bus_events: Vec<BusEventDecl>,
+
+    /// Reply handlers the plugin advertises — i.e., "I know how to
+    /// deliver an agent-authored reply back to channel X." Each row
+    /// declares the capability matrix the `ReplyRouter` consults to
+    /// decide how to pack rich payloads. The router invokes
+    /// `<plugin_id>.send_reply` (the canonical reply-tool name) when
+    /// dispatching.
+    #[serde(default)]
+    pub reply_handlers: Vec<ReplyHandlerDecl>,
+
+    /// Automation flow definitions shipped by the plugin as
+    /// "defaults" the operator can use / fork. Each row references a
+    /// JSON file relative to the plugin root (e.g.,
+    /// `flows/whatsapp_default.json`) containing the full
+    /// `AutomationDef` shape. The host imports these at install time
+    /// with `source = "plugin:<id>"` + `source_version = <plugin
+    /// version>` so the Automations UI can diff them on plugin
+    /// upgrade.
+    #[serde(default)]
+    pub default_automations: Vec<DefaultAutomationDecl>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -569,6 +600,108 @@ pub struct SkillDecl {
     /// admin-UI filtering; the LLM doesn't see them directly.
     #[serde(default)]
     pub tags: Vec<String>,
+}
+
+// ------------------- M6 event-driven architecture ---------------------
+
+/// One bus event kind the plugin publishes. Imported into
+/// `state_registered_event_kinds` at install time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BusEventDecl {
+    /// Globally unique, dot-separated, lowercase
+    /// (e.g., `whatsapp.message.received`).
+    pub kind: String,
+    /// One-line human description shown in the Automations UI
+    /// trigger picker.
+    #[serde(default)]
+    pub description: String,
+    /// Optional JSON Schema string (`json` field) OR path to a JSON
+    /// file (`schema_path` field) describing the `payload` shape.
+    /// Surfaced as autocomplete hints when authoring Rhai filters /
+    /// templates. Both fields are optional; provide at most one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_schema_path: Option<String>,
+    /// Inline JSON Schema (alternative to `payload_schema_path`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_schema: Option<serde_json::Value>,
+    /// Validator gate. When `false`, the automations validator
+    /// rejects flows that attach a `SendReply` node to a trigger
+    /// with this kind. Default: `false` (safer — explicit reply
+    /// declaration required for two-way channels).
+    #[serde(default)]
+    pub expects_reply: bool,
+    /// UI hint for which `OriginRef` variant this kind typically
+    /// uses. Free-form string; common values:
+    /// `"plugin_channel"`, `"none"`, `"web_socket_session"`,
+    /// `"chat_append"`.
+    #[serde(default = "default_origin_kind_none")]
+    pub default_origin_kind: String,
+}
+
+fn default_origin_kind_none() -> String {
+    "none".to_string()
+}
+
+/// One reply handler the plugin advertises. The router invokes the
+/// plugin's `send_reply` tool when an `OriginRef::PluginChannel`
+/// resolves to this handler.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplyHandlerDecl {
+    /// Handler name. Convention: same as the plugin id
+    /// (`"whatsapp"`, `"signal"`). Used as the `plugin_id` in
+    /// `OriginRef::PluginChannel`.
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    // Capability matrix — conservative defaults (text-only, no
+    // attachments). A manifest that forgets to declare a capability
+    // degrades gracefully — the router never panics; it just
+    // delivers a text-only fallback.
+    #[serde(default)]
+    pub supports_streaming: bool,
+    #[serde(default)]
+    pub supports_attachments: bool,
+    #[serde(default)]
+    pub supports_inline_chart: bool,
+    #[serde(default)]
+    pub supports_table: bool,
+    #[serde(default)]
+    pub supports_card: bool,
+    #[serde(default)]
+    pub supports_markdown: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attachment_size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attachments_per_message: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_text_length: Option<u32>,
+    /// Allowed MIME prefixes (e.g., `["image/", "application/pdf"]`).
+    /// `None` = any mime; empty list = no attachments allowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_mime_prefixes: Option<Vec<String>>,
+}
+
+/// One default flow the plugin ships. Imported into
+/// `state_automations` with `source = "plugin:<id>"` at install.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DefaultAutomationDecl {
+    /// Operator-facing flow name. Must be unique across the plugin.
+    pub name: String,
+    /// Path to the JSON flow file, relative to the plugin's staged
+    /// root. The file's content is the full `AutomationDef` shape
+    /// (trigger + nodes + edges).
+    pub flow_path: String,
+    /// `true` if this flow should start enabled. Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Short description displayed in the Automations UI when the
+    /// operator browses default flows.
+    #[serde(default)]
+    pub description: String,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// How the plugin's code actually runs.
@@ -1597,5 +1730,138 @@ mod tests {
         assert_eq!(rt.parsed_tier(), Some(RuntimeTier::Subprocess));
         assert_eq!(rt.executable.as_deref(), Some("./hello"));
         assert!(rt.source.is_none());
+    }
+
+    // -------------- M6 manifest sections ----------------------------
+
+    #[test]
+    fn parses_bus_events_and_reply_handlers() {
+        let s = r#"
+            [plugin]
+            id = "whatsapp"
+            name = "WhatsApp"
+            version = "0.1.0"
+
+            [[bus_events]]
+            kind = "whatsapp.message.received"
+            description = "Inbound WA message (DM or group)"
+            expects_reply = true
+            default_origin_kind = "plugin_channel"
+
+            [[bus_events]]
+            kind = "whatsapp.delivery.failed"
+            description = "WA reported a delivery failure"
+            expects_reply = false
+
+            [[reply_handlers]]
+            name = "whatsapp"
+            description = "Send agent text back to the originating WA chat"
+            supports_streaming = false
+            supports_attachments = true
+            supports_markdown = true
+            max_attachment_size_bytes = 16777216
+            max_attachments_per_message = 1
+            max_text_length = 4096
+            allowed_mime_prefixes = ["image/", "video/", "audio/", "application/pdf"]
+        "#;
+        let m = PluginManifest::parse(s).unwrap();
+        assert_eq!(m.bus_events.len(), 2);
+        assert_eq!(m.bus_events[0].kind, "whatsapp.message.received");
+        assert!(m.bus_events[0].expects_reply);
+        assert_eq!(m.bus_events[0].default_origin_kind, "plugin_channel");
+        assert!(!m.bus_events[1].expects_reply);
+
+        assert_eq!(m.reply_handlers.len(), 1);
+        let h = &m.reply_handlers[0];
+        assert!(h.supports_attachments);
+        assert!(h.supports_markdown);
+        assert!(!h.supports_streaming);
+        assert_eq!(h.max_attachment_size_bytes, Some(16_777_216));
+        assert_eq!(h.max_attachments_per_message, Some(1));
+        assert_eq!(h.max_text_length, Some(4096));
+        assert_eq!(
+            h.allowed_mime_prefixes.as_ref().unwrap(),
+            &vec![
+                "image/".to_string(),
+                "video/".to_string(),
+                "audio/".to_string(),
+                "application/pdf".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn reply_handler_conservative_defaults_when_unset() {
+        let s = r#"
+            [plugin]
+            id = "minimal"
+            name = "Minimal"
+            version = "0.1.0"
+
+            [[reply_handlers]]
+            name = "minimal"
+        "#;
+        let m = PluginManifest::parse(s).unwrap();
+        let h = &m.reply_handlers[0];
+        assert!(!h.supports_streaming);
+        assert!(!h.supports_attachments);
+        assert!(!h.supports_markdown);
+        assert!(h.max_attachment_size_bytes.is_none());
+    }
+
+    #[test]
+    fn parses_default_automations() {
+        let s = r#"
+            [plugin]
+            id = "whatsapp"
+            name = "WhatsApp"
+            version = "0.1.0"
+
+            [[default_automations]]
+            name = "WhatsApp default"
+            flow_path = "flows/whatsapp_default.json"
+            description = "Default flow: route incoming WA messages to the agent"
+
+            [[default_automations]]
+            name = "WhatsApp delivery alerts"
+            flow_path = "flows/delivery_alerts.json"
+            enabled = false
+            description = "Fire alerts on WA delivery failures"
+        "#;
+        let m = PluginManifest::parse(s).unwrap();
+        assert_eq!(m.default_automations.len(), 2);
+        assert_eq!(m.default_automations[0].flow_path, "flows/whatsapp_default.json");
+        assert!(m.default_automations[0].enabled);
+        assert!(!m.default_automations[1].enabled);
+    }
+
+    #[test]
+    fn bus_event_with_inline_schema() {
+        let s = r#"
+            [plugin]
+            id = "calendar"
+            name = "Calendar"
+            version = "0.1.0"
+
+            [[bus_events]]
+            kind = "calendar.event.starting_soon"
+            description = "A calendar event is starting within 15 minutes"
+            expects_reply = false
+            [bus_events.payload_schema]
+            type = "object"
+            required = ["attendee_name", "start_at"]
+        "#;
+        let m = PluginManifest::parse(s).unwrap();
+        assert_eq!(m.bus_events.len(), 1);
+        assert!(m.bus_events[0].payload_schema.is_some());
+        assert_eq!(
+            m.bus_events[0]
+                .payload_schema
+                .as_ref()
+                .unwrap()
+                .get("type")
+                .and_then(|v| v.as_str()),
+            Some("object")
+        );
     }
 }

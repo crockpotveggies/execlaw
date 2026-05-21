@@ -1271,6 +1271,14 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     let (db, db_config) = open_db_with_config(&db_path, no_encrypt)?;
     execlaw_core::MigrationRunner::new(&db).apply_all()?;
 
+    // M6 — seed the core event-kind + reply-handler registry. Plugins
+    // contribute their own rows on install / hydrate (see
+    // `import_m6_registry` in plugin-host). Idempotent upsert; safe
+    // to re-run on every boot.
+    if let Err(e) = execlaw_core::event_registry::register_core_event_kinds(&db) {
+        tracing::warn!(error = %e, "M6: core event registry seed failed (continuing)");
+    }
+
     // Resolve the data directory once at boot so downstream code
     // (bundled-plugins mirror, settings paths, etc.) doesn't have
     // to re-derive it. `db_path` always lives under the data dir
