@@ -263,9 +263,39 @@ pub async fn upsert_handler(
     // row that was parked CrashLooping gets a fresh runway after
     // the operator edits its spec. Both are no-ops for external
     // rows; the supervisor only acts on Managed.
+    //
+    // Managed-edit case: when an operator edits a still-running
+    // managed row (e.g. swapping the model on Apple-Silicon Ollama,
+    // changing vLLM args, switching the container image), the
+    // supervisor's reconcile loop won't re-evaluate `spec_from_row`
+    // unless the slot's handle is None — so the new spec sits in
+    // the DB while the existing container/native daemon keeps
+    // serving the old one. Operators saw this as "Edit does
+    // nothing; I have to Clear + Add." Force a `restart` here when
+    // a spawn-relevant field actually changed: that stops the
+    // running container, clears the slot, and kicks; the next
+    // reconcile reads the fresh row and respawns with the new spec
+    // — the same path Clear + Add already takes. Trivial edits
+    // (notes, reasoning_enabled, endpoint-only) intentionally skip
+    // the stop+respawn to avoid a 1–3 minute model-load tax on a
+    // metadata change.
+    let spawn_relevant_change = match prior.as_ref() {
+        Some(p) if p.mode == BackendMode::Managed && mode == BackendMode::Managed => {
+            p.model_spec_json != row.model_spec_json
+                || p.inference_backend != row.inference_backend
+                || p.gpu_id != row.gpu_id
+        }
+        _ => false,
+    };
     if let Some(sup) = state.backend_supervisor.as_ref() {
-        sup.reset_attempts(purpose).await;
-        sup.kick();
+        if spawn_relevant_change {
+            // restart() internally resets attempts + kicks, so it
+            // subsumes the no-change branch's work too.
+            let _ = sup.restart(purpose).await;
+        } else {
+            sup.reset_attempts(purpose).await;
+            sup.kick();
+        }
     }
 
     let _ = AuditStore::new(&state.db).insert(
@@ -1223,6 +1253,151 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["mode"], "external");
         assert_eq!(v["endpoint"], "http://192.168.1.50:8000/v1");
+    }
+
+    #[tokio::test]
+    async fn editing_managed_row_spec_forces_supervisor_restart() {
+        // Regression: operators reported that "Edit" on an
+        // already-deployed managed backend (e.g. Apple-Silicon
+        // Ollama) didn't take effect — the new spec sat in the DB
+        // while the running container/native daemon kept serving the
+        // old one. Workaround was Clear + Add. Fix: the upsert
+        // handler detects a spawn-relevant change on a still-managed
+        // row and calls `supervisor.restart`, which stops the
+        // current handle and kicks; the next reconcile reads the
+        // fresh row and respawns. Mirrors what Clear + Add does
+        // without the round-trip.
+        use execlaw_container_manager::MockServiceController;
+        let mut state = test_app_state();
+        let mock = std::sync::Arc::new(MockServiceController::new());
+        let sup =
+            crate::backend_supervisor::BackendSupervisor::new(state.db.clone(), mock.clone());
+        state.backend_supervisor = Some(sup.clone());
+        let app = build_router(state);
+        let tok = setup_controller_token(&app).await;
+
+        // PUT a managed row, drive the supervisor until it spawns.
+        let mut body = upsert_body();
+        body["mode"] = serde_json::Value::String("managed".into());
+        body["endpoint"] = serde_json::Value::Null;
+        body["model_spec"] = serde_json::json!({
+            "image": "vllm:test-A",
+            "args": ["--model", "Qwen3.5-27B-AWQ"],
+            "container_port": 8000,
+        });
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/admin/backends/Standard")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        sup.reconcile_once().await;
+        sup.reconcile_once().await;
+        assert_eq!(mock.spawn_count().await, 1, "initial spawn");
+        assert_eq!(mock.stop_count().await, 0);
+
+        // Edit with a different image — the handler must call
+        // restart, which stops the handle inline before returning.
+        let mut body2 = upsert_body();
+        body2["mode"] = serde_json::Value::String("managed".into());
+        body2["endpoint"] = serde_json::Value::Null;
+        body2["model_spec"] = serde_json::json!({
+            "image": "vllm:test-B",
+            "args": ["--model", "Qwen3.5-27B-AWQ"],
+            "container_port": 8000,
+        });
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/admin/backends/Standard")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body2.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            mock.stop_count().await,
+            1,
+            "spawn-relevant edit must stop the running container synchronously"
+        );
+
+        // Reconcile picks up the kick + respawns with the new spec.
+        sup.reconcile_once().await;
+        assert_eq!(
+            mock.spawn_count().await,
+            2,
+            "next reconcile must spawn fresh container for the new spec"
+        );
+    }
+
+    #[tokio::test]
+    async fn editing_managed_row_notes_only_does_not_restart_supervisor() {
+        // Companion to `editing_managed_row_spec_forces_supervisor_restart`:
+        // make sure trivial metadata edits (notes, reasoning_enabled,
+        // endpoint-only on external) don't stop+respawn a healthy
+        // container — that would add a 1–3 min model-load tax to
+        // every typo fix in the notes box.
+        use execlaw_container_manager::MockServiceController;
+        let mut state = test_app_state();
+        let mock = std::sync::Arc::new(MockServiceController::new());
+        let sup =
+            crate::backend_supervisor::BackendSupervisor::new(state.db.clone(), mock.clone());
+        state.backend_supervisor = Some(sup.clone());
+        let app = build_router(state);
+        let tok = setup_controller_token(&app).await;
+
+        let mut body = upsert_body();
+        body["mode"] = serde_json::Value::String("managed".into());
+        body["endpoint"] = serde_json::Value::Null;
+        body["model_spec"] = serde_json::json!({
+            "image": "vllm:test",
+            "args": ["--model", "Qwen3.5-27B-AWQ"],
+            "container_port": 8000,
+        });
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/admin/backends/Standard")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let _ = app.clone().oneshot(req).await.unwrap();
+        sup.reconcile_once().await;
+        sup.reconcile_once().await;
+        assert_eq!(mock.spawn_count().await, 1);
+
+        // Same spec, new notes. Must NOT trigger restart.
+        let mut body2 = upsert_body();
+        body2["mode"] = serde_json::Value::String("managed".into());
+        body2["endpoint"] = serde_json::Value::Null;
+        body2["model_spec"] = serde_json::json!({
+            "image": "vllm:test",
+            "args": ["--model", "Qwen3.5-27B-AWQ"],
+            "container_port": 8000,
+        });
+        body2["notes"] = serde_json::Value::String("just renamed for clarity".into());
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/admin/backends/Standard")
+            .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body2.to_string()))
+            .unwrap();
+        let _ = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            mock.stop_count().await,
+            0,
+            "metadata-only edit must NOT stop the running container"
+        );
+        sup.reconcile_once().await;
+        assert_eq!(
+            mock.spawn_count().await,
+            1,
+            "metadata-only edit must NOT cause a respawn"
+        );
     }
 
     #[tokio::test]
