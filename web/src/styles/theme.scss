@@ -2921,3 +2921,80 @@ body {
     font-size: 0.9rem;
 }
 
+// =====================================================================
+// Automations canvas (M5 ReactFlow editor) — dark-theme alignment.
+//
+// The vendor library ships light-mode defaults (white pane, light
+// gray dots, dark edges). We override its custom-property contract
+// so the canvas pane reads as a continuation of the surrounding
+// dark UI rather than a bright rectangle in the middle of it.
+//
+// Scoped to `.execlaw-automation-canvas` so we don't accidentally
+// theme any future flow chart elsewhere in the app.
+// =====================================================================
+.execlaw-automation-canvas {
+    // Pane + pattern colors. The dots pattern is the only visible
+    // backdrop element under nodes so it has to read as a faint
+    // texture, not a contrast point.
+    --xy-background-color-default: #{$bg-deep};
+    --xy-background-pattern-dots-color-default: #{rgba($text-muted, 0.18)};
+    --xy-background-pattern-lines-color-default: #{rgba($border-subtle, 0.4)};
+    --xy-background-pattern-cross-color-default: #{rgba($border-subtle, 0.4)};
+
+    // Edges. Selected edges get the accent color so the operator can
+    // see which one is highlighted for delete-on-backspace.
+    --xy-edge-stroke-default: #{$text-muted};
+    --xy-edge-stroke-selected-default: #{$accent};
+    --xy-connectionline-stroke-default: #{rgba($accent, 0.7)};
+
+    // Connection handles (the little dots on the top/bottom of each
+    // node where the operator drags to draw an edge).
+    --xy-handle-background-color-default: #{$accent};
+    --xy-handle-border-color-default: #{$bg-surface};
+
+    // Selection rubber-band overlay (drag-to-select).
+    --xy-selection-background-color-default: #{rgba($accent, 0.12)};
+    --xy-selection-border-default: 1px dotted #{rgba($accent, 0.8)};
+
+    // Controls toolbar (zoom in/out/fit buttons, bottom-left).
+    --xy-controls-button-background-color-default: #{$bg-elev};
+    --xy-controls-button-background-color-hover-default: #{$bg-surface};
+    --xy-controls-button-color-default: #{$text-primary};
+    --xy-controls-button-color-hover-default: #{$text-primary};
+    --xy-controls-button-border-color-default: #{$border-subtle};
+    --xy-controls-box-shadow-default: #{$shadow-soft};
+
+    // MiniMap (bottom-right by default).
+    --xy-minimap-background-color-default: #{$bg-surface};
+    --xy-minimap-mask-background-color-default: #{rgba($bg-deep, 0.6)};
+    --xy-minimap-mask-stroke-color-default: #{$border-subtle};
+    --xy-minimap-node-background-color-default: #{$bg-elev};
+    --xy-minimap-node-stroke-color-default: #{$border-subtle};
+
+    // Attribution chip (the "react flow" link in the corner).
+    --xy-attribution-background-color-default: #{rgba($bg-surface, 0.5)};
+
+    // Defensive cursor — we set `grab` inline on the node shell but
+    // the library's `.react-flow__node` rule sometimes ships
+    // `cursor: pointer` and wins on specificity. Force `grab` (and
+    // `grabbing` mid-drag) so the affordance is unambiguous.
+    .react-flow__node {
+        cursor: grab;
+
+        &.dragging,
+        &:active {
+            cursor: grabbing;
+        }
+    }
+
+    // Edge labels: the bg pill we set inline is dark; keep the
+    // foreground text readable when the label happens to overlap a
+    // node tint.
+    .react-flow__edge-textbg {
+        fill: $bg-elev;
+    }
+    .react-flow__edge-text {
+        fill: $text-primary;
+    }
+}
+

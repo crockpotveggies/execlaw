@@ -21,20 +21,38 @@ export type CanvasNodeData = {
 };
 
 interface KindStyle {
+    /** Tinted background — a translucent wash of the kind's accent
+     *  color over the dark canvas surface. */
     bg: string;
+    /** Border / left-rail / icon accent — the kind's "identity" hue
+     *  drawn from the app theme palette. */
     border: string;
     icon: string; // bootstrap-icon class fragment, e.g. "bi-funnel"
 }
 
+// Color palette aligned with `web/src/styles/theme.scss` so tiles
+// read cleanly on the dark canvas (no light pastel backgrounds, no
+// black-on-white text). Backgrounds are an 18% alpha tint of the
+// border hue over the elevated surface; borders use the theme
+// accent tokens directly so they stay distinguishable from each
+// other while still feeling on-brand.
 const STYLES: Record<string, KindStyle> = {
-    Trigger: { bg: "#e7f1ff", border: "#4a8cff", icon: "bi-lightning-charge-fill" },
-    Filter: { bg: "#fef9c3", border: "#ca8a04", icon: "bi-funnel" },
-    Transform: { bg: "#dcfce7", border: "#16a34a", icon: "bi-arrow-left-right" },
-    Branch: { bg: "#ede9fe", border: "#7c3aed", icon: "bi-signpost-split" },
-    Terminal: { bg: "#f3f4f6", border: "#6b7280", icon: "bi-stop-circle" },
-    AskAgent: { bg: "#ffedd5", border: "#ea580c", icon: "bi-robot" },
-    Notify: { bg: "#fee2e2", border: "#dc2626", icon: "bi-bell-fill" },
-    CallPlugin: { bg: "#dbeafe", border: "#2563eb", icon: "bi-puzzle" },
+    // $accent (controller blue)
+    Trigger: { bg: "rgba(68, 147, 248, 0.18)", border: "#4493f8", icon: "bi-lightning-charge-fill" },
+    // $warning (amber)
+    Filter: { bg: "rgba(210, 153, 34, 0.18)", border: "#d29922", icon: "bi-funnel" },
+    // $success (green)
+    Transform: { bg: "rgba(63, 185, 80, 0.18)", border: "#3fb950", icon: "bi-arrow-left-right" },
+    // muted purple — distinct from accent + info
+    Branch: { bg: "rgba(163, 113, 247, 0.18)", border: "#a371f7", icon: "bi-signpost-split" },
+    // $text-muted
+    Terminal: { bg: "rgba(125, 133, 144, 0.18)", border: "#7d8590", icon: "bi-stop-circle" },
+    // orange — agent identity color, kept distinct from amber Filter
+    AskAgent: { bg: "rgba(255, 138, 56, 0.18)", border: "#ff8a38", icon: "bi-robot" },
+    // $danger (red) — alarm tile
+    Notify: { bg: "rgba(248, 81, 73, 0.18)", border: "#f85149", icon: "bi-bell-fill" },
+    // $info (lighter blue) — sits beside Trigger without conflicting
+    CallPlugin: { bg: "rgba(88, 166, 255, 0.18)", border: "#58a6ff", icon: "bi-puzzle" },
 };
 
 function nodeShellStyle(
@@ -45,13 +63,20 @@ function nodeShellStyle(
     return {
         background: s.bg,
         border: `${selected ? "2px" : "1px"} solid ${s.border}`,
-        borderRadius: 6,
+        borderRadius: 8,
         padding: "8px 10px",
         minWidth: 160,
         maxWidth: 220,
         fontSize: 12,
-        boxShadow: selected ? `0 0 0 3px ${s.border}33` : "0 1px 2px rgba(0,0,0,0.05)",
-        cursor: "pointer",
+        color: "#e6edf3", // $text-primary
+        // Outer ring on selection (translucent accent halo); subtle
+        // depth otherwise.
+        boxShadow: selected
+            ? `0 0 0 3px ${s.border}55`
+            : "0 1px 2px rgba(0, 0, 0, 0.35)",
+        // `grab` makes the affordance legible — React Flow flips this
+        // to `grabbing` during the drag via its own classes.
+        cursor: "grab",
     };
 }
 
@@ -59,9 +84,13 @@ function NodeHeader({ kind, label }: { kind: keyof typeof STYLES; label: string 
     return (
         <div
             className="d-flex align-items-center mb-1"
-            style={{ fontWeight: 600 }}
+            style={{ fontWeight: 600, color: "#e6edf3" }}
         >
-            <i className={`bi ${STYLES[kind].icon} me-2`} aria-hidden />
+            <i
+                className={`bi ${STYLES[kind].icon} me-2`}
+                style={{ color: STYLES[kind].border }}
+                aria-hidden
+            />
             <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {label}
             </span>
@@ -73,8 +102,14 @@ function NodeDetail({ detail }: { detail?: string }) {
     if (!detail) return null;
     return (
         <div
-            className="font-monospace small text-muted"
-            style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 60, overflow: "hidden" }}
+            className="font-monospace small"
+            style={{
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+                maxHeight: 60,
+                overflow: "hidden",
+                color: "#9aa6b2", // muted, but readable on dark tint
+            }}
         >
             {detail}
         </div>

@@ -42,7 +42,7 @@ export function AutomationNodePanel({
     if (!node) return null;
     return (
         <div
-            className="execlaw-automation-node-panel border rounded shadow-sm bg-white"
+            className="execlaw-automation-node-panel border rounded shadow-sm"
             style={{
                 position: "absolute",
                 top: 12,
@@ -52,6 +52,12 @@ export function AutomationNodePanel({
                 overflowY: "auto",
                 zIndex: 10,
                 padding: 12,
+                // Match the floating-panel chrome used elsewhere in
+                // the app's dark theme ($bg-surface + $border-subtle).
+                background: "#161b22",
+                borderColor: "#30363d",
+                color: "#e6edf3",
+                boxShadow: "0 4px 12px rgba(0, 0, 0, 0.45)",
             }}
             data-testid="node-panel"
             onKeyDown={(e) => e.stopPropagation()}
@@ -387,7 +393,13 @@ function ExitToolRow({
     return (
         <div
             className="border rounded p-2 mb-2"
-            style={{ background: "#fafafa" }}
+            style={{
+                // Slight lift from the panel's own $bg-surface so
+                // exit-tool rows are visually grouped without being
+                // bright against the dark canvas.
+                background: "#1f2630",
+                borderColor: "#30363d",
+            }}
             data-testid={testId}
         >
             <div className="d-flex gap-2 mb-1">

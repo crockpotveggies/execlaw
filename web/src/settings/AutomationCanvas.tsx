@@ -159,9 +159,13 @@ function buildGraph(
         source: e.from === "trigger" ? TRIGGER_NODE_ID : e.from,
         target: e.to,
         label: e.when ?? undefined,
-        labelStyle: { fontSize: 11, fill: "#444" },
-        labelBgStyle: { fill: "#fff", fillOpacity: 0.85 },
-        style: { stroke: "#888", strokeWidth: 1.5 },
+        // Edge labels: light text on a dark pill so `when` clauses
+        // stay readable on the dark canvas.
+        labelStyle: { fontSize: 11, fill: "#e6edf3" },
+        labelBgStyle: { fill: "#1f2630", fillOpacity: 0.85 },
+        // Stroke uses `$text-muted` so edges are visible but don't
+        // outshout the node tiles.
+        style: { stroke: "#7d8590", strokeWidth: 1.5 },
         animated: e.when !== null && e.when !== undefined,
     }));
     return { nodes, edges };
@@ -413,6 +417,7 @@ function CanvasInner({ definition, onChange }: Props) {
     return (
         <div
             ref={wrapperRef}
+            className="execlaw-automation-canvas"
             style={{ width: "100%", height: "560px", position: "relative" }}
             data-testid="automation-canvas"
             onDrop={onDrop}
@@ -468,18 +473,23 @@ function NodePalette() {
                 position: "absolute",
                 bottom: 12,
                 left: 12,
-                background: "white",
-                border: "1px solid #ddd",
+                // $bg-surface w/ subtle border + soft shadow — matches
+                // the rest of the app's floating-panel chrome.
+                background: "#161b22",
+                border: "1px solid #30363d",
                 borderRadius: 8,
                 padding: 8,
                 display: "flex",
                 gap: 6,
                 zIndex: 5,
-                boxShadow: "0 2px 6px rgba(0,0,0,0.08)",
+                boxShadow: "0 4px 12px rgba(0, 0, 0, 0.45)",
+                color: "#e6edf3",
             }}
             data-testid="node-palette"
         >
-            <div className="small text-muted me-2 align-self-center">Drag:</div>
+            <div className="small me-2 align-self-center" style={{ color: "#7d8590" }}>
+                Drag:
+            </div>
             {PALETTE_KINDS.map((kind) => (
                 <PaletteTile key={kind} kind={kind} />
             ))}
@@ -488,6 +498,7 @@ function NodePalette() {
 }
 
 function PaletteTile({ kind }: { kind: NodeKind }) {
+    const accent = KIND_COLORS[kind] ?? "#7d8590";
     return (
         <div
             draggable
@@ -496,18 +507,23 @@ function PaletteTile({ kind }: { kind: NodeKind }) {
                 e.dataTransfer.effectAllowed = "move";
             }}
             style={{
-                border: `1px dashed ${KIND_COLORS[kind] ?? "#888"}`,
+                border: `1px dashed ${accent}`,
                 borderRadius: 4,
                 padding: "4px 8px",
                 fontSize: 11,
                 cursor: "grab",
-                background: "#fafafa",
+                background: "#1f2630", // $bg-elev — slight lift from $bg-surface palette
+                color: "#e6edf3",
                 userSelect: "none",
             }}
             data-testid={`palette-${kind}`}
             title={`Drag a ${kind} node onto the canvas`}
         >
-            <i className={`bi ${KIND_ICONS[kind] ?? "bi-square"} me-1`} aria-hidden />
+            <i
+                className={`bi ${KIND_ICONS[kind] ?? "bi-square"} me-1`}
+                style={{ color: accent }}
+                aria-hidden
+            />
             {kind}
         </div>
     );
