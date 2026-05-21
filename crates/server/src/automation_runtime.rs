@@ -171,12 +171,19 @@ fn run_matching_automations(ctx: &ExecutorContext, evt: &BusEventRow) {
 /// [`BusEvent`] envelope so flow authors write `event.payload.foo`
 /// without having to think about persistence shape.
 fn event_context(evt: &BusEventRow) -> serde_json::Value {
+    // The Rhai scope sees one object: `event`. Anything not exposed here
+    // is invisible to trigger.when / edge.when expressions, which is
+    // why the envelope is included verbatim — flows need to discriminate
+    // between operator-internal events and external traffic, and need
+    // sender identity for routing decisions. See audit fix #2.
     serde_json::json!({
         "id": evt.id,
         "kind": evt.kind,
         "source": evt.source,
         "received_at": evt.received_at,
         "payload": evt.payload,
+        "envelope": evt.envelope,
+        "internal": evt.internal,
     })
 }
 
@@ -1224,6 +1231,60 @@ mod tests {
         let mut scope = build_scope_with_event(&event);
         assert!(eval_bool(r#"event.payload.zone == "driveway""#, &mut scope).unwrap());
         assert!(eval_bool("event.payload.confidence > 0.5", &mut scope).unwrap());
+    }
+
+    #[test]
+    fn rhai_can_read_event_envelope_and_internal_flag() {
+        // Audit fix #2: envelope must be reachable from trigger.when /
+        // edge.when. Without this, flows can't gate on sender trust,
+        // origin kind, or the "did another flow emit this?" signal.
+        let event = serde_json::json!({
+            "id": "e1",
+            "kind": "web.prompt.submitted",
+            "source": "web",
+            "payload": {},
+            "envelope": {
+                "origin": {"kind": "web_socket_session", "session_id": "sess-1"},
+                "identity": {"kind": "principal", "id": "p_op", "trust": "controller"},
+                "correlation_id": "corr-1",
+                "parent_event_id": null,
+            },
+            "internal": false,
+        });
+        let mut scope = build_scope_with_event(&event);
+        assert!(
+            eval_bool(r#"event.envelope.origin.kind == "web_socket_session""#, &mut scope)
+                .unwrap()
+        );
+        assert!(
+            eval_bool(r#"event.envelope.identity.trust == "controller""#, &mut scope).unwrap()
+        );
+        assert!(eval_bool("event.internal == false", &mut scope).unwrap());
+    }
+
+    #[test]
+    fn event_context_exposes_envelope_field() {
+        // Construct a real BusEventRow and verify the JSON we hand
+        // Rhai actually contains an "envelope" key. Guards against
+        // someone deleting the line in event_context().
+        use execlaw_core::event_envelope::EventEnvelope;
+        let evt = BusEventRow {
+            id: "e1".into(),
+            kind: "web.prompt.submitted".into(),
+            source: "web".into(),
+            received_at: 0,
+            payload: serde_json::json!({}),
+            internal: false,
+            dispatched_at: None,
+            envelope: EventEnvelope::system_internal(),
+        };
+        let ctx = event_context(&evt);
+        assert!(ctx.get("envelope").is_some(), "event_context() must include envelope");
+        assert!(ctx.get("internal").is_some(), "event_context() must include internal");
+        assert_eq!(
+            ctx["envelope"]["identity"]["kind"], "system",
+            "system_internal() should serialize identity.kind = system"
+        );
     }
 
     #[test]
