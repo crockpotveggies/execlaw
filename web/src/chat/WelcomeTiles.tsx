@@ -38,6 +38,7 @@ import {
     getPythonSandbox,
     listAlerts,
     listPendingApprovals,
+    listRoutines,
     listThreads,
 } from "../api/endpoints";
 import {
@@ -371,19 +372,36 @@ function MissionControlTile({ getToken }: TileProps) {
     const [metrics, setMetrics] = useState<AutomationMetrics | null>(null);
     const [pending, setPending] = useState<number | null>(null);
     const [alerts, setAlerts] = useState<number | null>(null);
+    // 2026-05-21 — the first Mission Control card was rewired from
+    // "Automations" to "Routines" since routines are the more
+    // operator-facing concept and the welcome view already
+    // dedicates a "Today's brief" line to automation activity.
+    // Tracks total + enabled counts via `listRoutines`.
+    const [routines, setRoutines] = useState<{
+        total: number;
+        enabled: number;
+    } | null>(null);
 
     useEffect(() => {
         let cancelled = false;
         void (async () => {
-            const [m, p, a] = await Promise.allSettled([
+            const [m, p, a, r] = await Promise.allSettled([
                 getAutomationMetrics(getToken),
                 listPendingApprovals(getToken),
                 listAlerts({ status: ["Firing"], limit: 1 }, getToken),
+                listRoutines(getToken),
             ]);
             if (cancelled) return;
             if (m.status === "fulfilled") setMetrics(m.value);
             if (p.status === "fulfilled") setPending(p.value.approvals.length);
             if (a.status === "fulfilled") setAlerts(a.value.firing_count);
+            if (r.status === "fulfilled") {
+                const total = r.value.routines.length;
+                const enabled = r.value.routines.filter(
+                    (x) => x.enabled,
+                ).length;
+                setRoutines({ total, enabled });
+            }
         })();
         return () => {
             cancelled = true;
@@ -392,13 +410,17 @@ function MissionControlTile({ getToken }: TileProps) {
 
     const cells: Metric[] = [
         {
-            label: "Automations",
-            value: metrics?.active_count ?? "—",
-            sub: metrics
-                ? `${metrics.runs_24h} runs · 24h`
-                : "active",
-            icon: "bi-lightning-charge-fill",
-            to: "/automations",
+            label: "Routines",
+            value: routines?.enabled ?? "—",
+            sub: routines
+                ? routines.total === 0
+                    ? "none scheduled"
+                    : routines.enabled === routines.total
+                      ? `of ${routines.total} · all on`
+                      : `of ${routines.total} scheduled`
+                : "scheduled",
+            icon: "bi-clock-history",
+            to: "/routines",
         },
         {
             label: "Approvals",
