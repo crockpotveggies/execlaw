@@ -1,4 +1,4 @@
-//! Phase 13.C/D audit closure — end-to-end WebSocket voice round-trip.
+﻿//! Phase 13.C/D audit closure â€” end-to-end WebSocket voice round-trip.
 //!
 //! Unit tests cover every voice component in isolation: frame parser,
 //! session registry, runtime, clients, control-message dispatch. This
@@ -72,6 +72,8 @@ fn build_state(transcript: &'static str) -> AppState {
                 "test pool: no LLM",
             )),
         ),
+            flow_channel: execlaw_server::flow_channel::FlowChannelHub::new(),
+
         data_dir: std::env::temp_dir().join(format!("execlaw-test-{}", uuid::Uuid::new_v4())),
         inference_metrics: execlaw_server::inference_metrics::InferenceMetrics::new(),
     }
@@ -190,7 +192,7 @@ async fn ws_voice_round_trip_emits_session_started_transcript_and_session_ended(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_disconnect_mid_utterance_cleans_up_voice_session() {
-    // Audit closure — track per-WS owned sessions and clean on
+    // Audit closure â€” track per-WS owned sessions and clean on
     // disconnect. Without the fix, a tab close mid-utterance would
     // leave the session in the registry until the 30s reaper sweep.
     let state = build_state("won't be needed");

@@ -500,8 +500,10 @@ pub async fn test_run(
     let db = state.db.clone();
     let pool = state.automation_agent_pool.clone();
     let plugin_host = Some(state.plugin_host.clone());
+    let flow_channel = state.flow_channel.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let ctx = automation_runtime::ExecutorContext::new(db, pool, plugin_host);
+        let ctx = automation_runtime::ExecutorContext::new(db, pool, plugin_host)
+            .with_flow_channel(flow_channel);
         automation_runtime::dry_run(&ctx, &automation, &event)
     })
     .await

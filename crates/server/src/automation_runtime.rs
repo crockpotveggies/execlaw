@@ -60,6 +60,12 @@ pub struct ExecutorContext {
     /// turns CallPlugin into a clean per-node error rather than a
     /// runtime panic.
     pub plugin_host: Option<PluginHost>,
+    /// M6 — live event hub. Executor publishes `FlowChannelEvent`
+    /// frames during graph execution; the SPA subscribes by `run_id`.
+    /// Tests that don't subscribe still get publishes (they go to a
+    /// channel with no listeners and are dropped — no panic, no
+    /// backpressure on the executor).
+    pub flow_channel: crate::flow_channel::FlowChannelHub,
 }
 
 impl ExecutorContext {
@@ -68,7 +74,13 @@ impl ExecutorContext {
             db,
             pool,
             plugin_host,
+            flow_channel: crate::flow_channel::FlowChannelHub::new(),
         }
+    }
+
+    pub fn with_flow_channel(mut self, hub: crate::flow_channel::FlowChannelHub) -> Self {
+        self.flow_channel = hub;
+        self
     }
 }
 
@@ -212,6 +224,7 @@ fn run_one(
         &mut state,
         ctx,
         &evt.envelope,
+        &run_id,
         &mut trace_sink,
     );
     let finished_at = chrono::Utc::now().timestamp_millis();
@@ -227,6 +240,16 @@ fn run_one(
             "automation runtime: failed to finalize run row",
         );
     }
+    // M6 — emit the run-finished event onto the live channel.
+    ctx.flow_channel.publish(crate::flow_channel::FlowChannelEvent::RunFinished {
+        run_id: run_id.to_string(),
+        outcome: match outcome {
+            ExecOutcome::Success => "success",
+            ExecOutcome::Skipped => "skipped",
+            ExecOutcome::Failed => "failed",
+        }
+        .to_owned(),
+    });
 }
 
 /// Result of a [`dry_run`] Ã¢â‚¬â€ outcome + captured per-node trace.
@@ -255,11 +278,13 @@ pub fn dry_run(
     let mut state: HashMap<String, serde_json::Value> = HashMap::new();
     state.insert("event".to_string(), event_ctx);
     let mut traces: Vec<StepTrace> = Vec::new();
+    let dry_run_id = format!("dry-{}", uuid::Uuid::new_v4());
     let outcome = execute_graph(
         &automation.definition,
         &mut state,
         ctx,
         &sample.envelope,
+        &dry_run_id,
         &mut |t: StepTrace| traces.push(t),
     );
     DryRunResult {
@@ -294,6 +319,7 @@ fn execute_graph(
     state: &mut HashMap<String, serde_json::Value>,
     ctx: &ExecutorContext,
     envelope: &execlaw_core::event_envelope::EventEnvelope,
+    run_id: &str,
     trace_sink: &mut dyn FnMut(StepTrace),
 ) -> ExecOutcome {
     let mut current = TRIGGER_SENTINEL.to_string();
@@ -328,6 +354,12 @@ fn execute_graph(
 
         let start = Instant::now();
         let input_snapshot = snapshot_state(state);
+        // M6 — emit NodeStarted onto the run channel.
+        ctx.flow_channel.publish(crate::flow_channel::FlowChannelEvent::NodeStarted {
+            run_id: run_id.to_string(),
+            node_id: node.id.clone(),
+            node_kind: node.kind.as_str().to_owned(),
+        });
         let exec_result = execute_node(node, state, ctx, envelope);
         let ms = start.elapsed().as_millis() as u64;
 
@@ -341,6 +373,14 @@ fn execute_graph(
                     error: None,
                 };
                 trace_sink(trace);
+                ctx.flow_channel
+                    .publish(crate::flow_channel::FlowChannelEvent::NodeFinished {
+                        run_id: run_id.to_string(),
+                        node_id: node.id.clone(),
+                        output: value.clone(),
+                        ms,
+                        error: None,
+                    });
                 state.insert(node.id.clone(), value);
                 current = node.id.clone();
             }

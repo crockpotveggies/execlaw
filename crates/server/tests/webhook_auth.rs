@@ -1,4 +1,4 @@
-//! Integration tests for host-enforced webhook authentication.
+﻿//! Integration tests for host-enforced webhook authentication.
 //!
 //! Covers the security regression from the 2026-05 audit: webhook
 //! POSTs were being persisted to the automation bus BEFORE the
@@ -11,7 +11,7 @@
 //!   1. Wire-level: 401 vs 200 on the HTTP response.
 //!   2. Durable: the `state_bus_events` table is or isn't populated.
 //!
-//! These are the regression tests the audit specifically asked for —
+//! These are the regression tests the audit specifically asked for â€”
 //! "add tests proving invalid webhook tokens do not create bus
 //! events or automation runs."
 
@@ -74,7 +74,7 @@ tier = "script"
 source = "main.rhai"
 "#;
 
-/// Legacy plugin — no `auth` field. Asserts the dispatcher preserves
+/// Legacy plugin â€” no `auth` field. Asserts the dispatcher preserves
 /// today's behavior (handler validates) for backward compatibility.
 const MANIFEST_LEGACY: &str = r#"
 [plugin]
@@ -95,7 +95,7 @@ source = "main.rhai"
 
 const SCRIPT: &str = r#"
 fn on_event(args) {
-    // Handler doesn't re-check auth — the test is asserting the
+    // Handler doesn't re-check auth â€” the test is asserting the
     // host's check. A 200 from this means the host let us through.
     #{ "ok": true }
 }
@@ -170,6 +170,7 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
                 "test pool: no LLM",
             )),
         ),
+        flow_channel: execlaw_server::flow_channel::FlowChannelHub::new(),
         data_dir: std::env::temp_dir().join(format!("execlaw-test-{}", uuid::Uuid::new_v4())),
         inference_metrics: execlaw_server::inference_metrics::InferenceMetrics::new(),
     };
@@ -238,7 +239,7 @@ fn count_webhook_events(state: &AppState) -> usize {
         .len()
 }
 
-/// Critical: missing token → 401, NO bus event, NO handler call.
+/// Critical: missing token â†’ 401, NO bus event, NO handler call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn query_token_missing_rejects_with_no_bus_event() {
     let tmp = tempfile::tempdir().unwrap();
@@ -256,7 +257,7 @@ async fn query_token_missing_rejects_with_no_bus_event() {
     );
 }
 
-/// Critical: wrong token → 401, NO bus event.
+/// Critical: wrong token â†’ 401, NO bus event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn query_token_mismatch_rejects_with_no_bus_event() {
     let tmp = tempfile::tempdir().unwrap();
@@ -279,15 +280,15 @@ async fn query_token_mismatch_rejects_with_no_bus_event() {
     );
 }
 
-/// Critical: vault row absent → 401, NO bus event, even if caller
+/// Critical: vault row absent â†’ 401, NO bus event, even if caller
 /// supplied an empty `?token=`. A missing secret is not "no auth
-/// required" — it's a misconfigured plugin and must fail closed.
+/// required" â€” it's a misconfigured plugin and must fail closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn query_token_with_missing_vault_row_rejects() {
     let tmp = tempfile::tempdir().unwrap();
     let (app, state) = build_app(tmp.path().to_path_buf());
     install_plugin(app.clone(), MANIFEST_QUERY_TOKEN).await;
-    // NOTE: deliberately not calling seed_secret — the vault row
+    // NOTE: deliberately not calling seed_secret â€” the vault row
     // is missing.
 
     let (status, _body) = post_webhook(
@@ -301,7 +302,7 @@ async fn query_token_with_missing_vault_row_rejects() {
     assert_eq!(count_webhook_events(&state), 0);
 }
 
-/// Happy path: correct token → 200 from handler AND a bus event.
+/// Happy path: correct token â†’ 200 from handler AND a bus event.
 /// Bus event payload must NOT contain the literal secret (the
 /// `token` query key is redacted).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -341,7 +342,7 @@ async fn query_token_valid_accepts_and_redacts_payload() {
     );
 }
 
-/// HMAC-SHA256 header auth: matching signature → 200 + bus event.
+/// HMAC-SHA256 header auth: matching signature â†’ 200 + bus event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hmac_header_valid_accepts() {
     let tmp = tempfile::tempdir().unwrap();
@@ -365,7 +366,7 @@ async fn hmac_header_valid_accepts() {
     assert_eq!(count_webhook_events(&state), 1);
 }
 
-/// HMAC-SHA256 header auth: wrong signature → 401, no bus event.
+/// HMAC-SHA256 header auth: wrong signature â†’ 401, no bus event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hmac_header_mismatch_rejects() {
     let tmp = tempfile::tempdir().unwrap();
@@ -390,7 +391,7 @@ async fn hmac_header_mismatch_rejects() {
     assert_eq!(count_webhook_events(&state), 0);
 }
 
-/// HMAC-SHA256 header auth: signature header absent entirely → 401.
+/// HMAC-SHA256 header auth: signature header absent entirely â†’ 401.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hmac_header_missing_rejects() {
     let tmp = tempfile::tempdir().unwrap();
@@ -410,7 +411,7 @@ async fn hmac_header_missing_rejects() {
 }
 
 /// Backward compatibility: a plugin manifest with NO `auth` field
-/// still works — the dispatcher falls back to the legacy "handler
+/// still works â€” the dispatcher falls back to the legacy "handler
 /// validates" model and the bus event IS published. This preserves
 /// today's behavior for any external plugin not yet migrated to
 /// host-enforced auth. The deprecation warning is logged (we don't

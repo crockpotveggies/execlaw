@@ -235,6 +235,10 @@ pub struct AppState {
     /// under the hood, so a test-run honors the pool's concurrency
     /// cap alongside live runs.
     pub automation_agent_pool: AutomationsAgentPool,
+    /// M6 — per-run flow-channel broadcast hub. The executor
+    /// publishes `FlowChannelEvent` frames during each run; the SPA
+    /// subscribes by `run_id` to render the live flow trace.
+    pub flow_channel: crate::flow_channel::FlowChannelHub,
     /// M5 — per-consumer inference observability. Wrapping LLM
     /// calls with `metrics.observe(consumer, fut)` records
     /// in_flight, totals, and per-call latency for the

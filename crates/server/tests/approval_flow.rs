@@ -1,6 +1,6 @@
-//! Phase 3 approval-flow integration tests.
+﻿//! Phase 3 approval-flow integration tests.
 //!
-//! Covers the end-to-end cold-contact → controller-approves →
+//! Covers the end-to-end cold-contact â†’ controller-approves â†’
 //! conversation-resumes flow, plus every `ApprovalVerb` branch.
 
 use axum::body::{self, Body};
@@ -65,6 +65,8 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
                 "test pool: no LLM",
             )),
         ),
+            flow_channel: execlaw_server::flow_channel::FlowChannelHub::new(),
+
         data_dir: std::env::temp_dir().join(format!("execlaw-test-{}", uuid::Uuid::new_v4())),
         inference_metrics: execlaw_server::inference_metrics::InferenceMetrics::new(),
     };
@@ -112,7 +114,7 @@ async fn respond(
     (status, serde_json::from_slice(&bytes).unwrap_or_default())
 }
 
-/// End-to-end happy path: cold contact → `Trust` verb → principal
+/// End-to-end happy path: cold contact â†’ `Trust` verb â†’ principal
 /// upgraded to KnownTrusted; TrustChanged event committed; original
 /// message replayed on the bus; conversation un-parked.
 #[tokio::test]
@@ -256,7 +258,7 @@ async fn ignore_once_clears_parked_state_without_trust_change() {
 
     // Second cold message from same sender re-parks the conversation.
     let init2 = send_cold_contact(app.clone(), "flow-4", "maybe-user", "hello again").await;
-    // New approval_id — each cold-contact event mints its own.
+    // New approval_id â€” each cold-contact event mints its own.
     assert!(init2["approval_id"].as_str().unwrap().starts_with("appr-"));
     assert_ne!(init2["approval_id"], init["approval_id"]);
 }
@@ -350,7 +352,7 @@ async fn revoke_unknown_principal_is_404() {
 }
 
 /// Cold-contact response now includes a signed `approval_token`
-/// (§2.11). The token's `jti` matches the approval_id.
+/// (Â§2.11). The token's `jti` matches the approval_id.
 #[tokio::test]
 async fn cold_contact_emits_signed_approval_token() {
     let tmp = tempfile::tempdir().unwrap();
@@ -388,7 +390,7 @@ async fn approval_with_mismatched_token_jti_is_rejected() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     // Either 401 (token jti mismatch) or 404 (approval id not found
-    // because it doesn't exist) — both are correct rejections.
+    // because it doesn't exist) â€” both are correct rejections.
     let status = resp.status();
     assert!(
         status == StatusCode::UNAUTHORIZED || status == StatusCode::NOT_FOUND,

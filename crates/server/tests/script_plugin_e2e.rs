@@ -1,14 +1,14 @@
-//! End-to-end smoke test for the script-tier (Rhai) plugin runtime.
+﻿//! End-to-end smoke test for the script-tier (Rhai) plugin runtime.
 //!
 //! Builds a tiny `.rhai` plugin in memory, packs it into an install
 //! ZIP, posts to `/api/admin/plugins/install`, then drives an
 //! `identity.resolve` through the host's dispatch path. The script
 //! returns a canned match for one (transport, handle) pair and
-//! null for everything else — proves the registry registered the
+//! null for everything else â€” proves the registry registered the
 //! identity_provider hook + the dispatcher routed the call to the
 //! script + the script's return JSON round-tripped cleanly.
 //!
-//! Cross-platform: no shell scripts, no native binaries — the
+//! Cross-platform: no shell scripts, no native binaries â€” the
 //! whole runtime is in-process Rust + Rhai.
 
 use axum::body::{self, Body};
@@ -132,6 +132,8 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
                 "test pool: no LLM",
             )),
         ),
+            flow_channel: execlaw_server::flow_channel::FlowChannelHub::new(),
+
         data_dir: std::env::temp_dir().join(format!("execlaw-test-{}", uuid::Uuid::new_v4())),
         inference_metrics: execlaw_server::inference_metrics::InferenceMetrics::new(),
     };
@@ -185,14 +187,14 @@ async fn script_plugin_installs_and_resolves_identity() {
     assert_eq!(matches[0]["resolved_by"], PLUGIN_ID);
     assert_eq!(matches[0]["trust_hint"], "Contact");
 
-    // Non-match case: unknown email → no match.
+    // Non-match case: unknown email â†’ no match.
     let none = state
         .plugin_host
         .resolve_identity("email", "stranger@example.com")
         .await;
     assert!(none.is_empty(), "expected no matches, got {none:?}");
 
-    // Wrong transport: phone is not in `resolves` → still no match.
+    // Wrong transport: phone is not in `resolves` â†’ still no match.
     let wrong_transport = state
         .plugin_host
         .resolve_identity("phone", "alice@example.com")
@@ -215,7 +217,7 @@ async fn install_rejects_script_plugin_with_unparseable_rhai() {
     let (status, body) = post_zip(app, zip).await;
     // The install endpoint surfaces script-load failures as 4xx /
     // 5xx (whichever the host's error mapping picks). The
-    // important thing is it does NOT return 200 — a half-installed
+    // important thing is it does NOT return 200 â€” a half-installed
     // plugin would leak hooks.
     assert_ne!(
         status,
@@ -318,7 +320,7 @@ async fn install_a_second_time_without_if_existing_returns_409() {
     let (status, _) = post_zip_with_query(app.clone(), v1_zip.clone(), "").await;
     assert_eq!(status, StatusCode::OK);
 
-    // Second install with the SAME ZIP must 409 — the safer
+    // Second install with the SAME ZIP must 409 â€” the safer
     // default protects against typo replacements.
     let (status, body) = post_zip_with_query(app, v1_zip, "").await;
     assert_eq!(
@@ -412,7 +414,7 @@ license = "Apache-2.0"
 
 [[tools]]
 name = "rt.search"
-description = "Search the operator's notes for a topic. Use when the user asks 'do I have anything about X' — returns up to 10 matching note ids + first-line excerpts."
+description = "Search the operator's notes for a topic. Use when the user asks 'do I have anything about X' â€” returns up to 10 matching note ids + first-line excerpts."
 latency = "low"
 
 [runtime]
@@ -436,7 +438,7 @@ source = "main.rhai"
     assert_eq!(
         tool.description.as_deref(),
         Some(
-            "Search the operator's notes for a topic. Use when the user asks 'do I have anything about X' — returns up to 10 matching note ids + first-line excerpts."
+            "Search the operator's notes for a topic. Use when the user asks 'do I have anything about X' â€” returns up to 10 matching note ids + first-line excerpts."
         ),
     );
 }
@@ -504,7 +506,7 @@ async fn upgrade_refreshes_config_tool_access_so_settings_tools_isnt_stale() {
     // Regression: lifecycle handlers used to skip the
     // `sync_tool_access` + `mark_plugin_tools_removed` calls, so an
     // operator who upgraded a plugin to a manifest with new tools
-    // saw the OLD tool list in Settings → Tools until the next
+    // saw the OLD tool list in Settings â†’ Tools until the next
     // server restart.
     use execlaw_core::tool_access::ToolAccessStore;
 
@@ -564,7 +566,7 @@ source = "main.rhai"
     let stage_dir = tempfile::tempdir().unwrap();
     let (app, state) = build_app(stage_dir.path().to_path_buf());
 
-    // Install v0.1 — registers tut.alpha + tut.beta.
+    // Install v0.1 â€” registers tut.alpha + tut.beta.
     let v1_zip = build_zip(&[
         ("plugin.toml", MANIFEST_V1_TWO_TOOLS.as_bytes()),
         ("main.rhai", TINY_SCRIPT.as_bytes()),
@@ -599,7 +601,7 @@ source = "main.rhai"
     let (status, body) = post_zip_with_query(app, v2_zip, "if_existing=upgrade").await;
     assert_eq!(status, StatusCode::OK, "upgrade body: {body}");
 
-    // tut.alpha must be marked removed — it's gone from the new
+    // tut.alpha must be marked removed â€” it's gone from the new
     // manifest, the dispatch gate should refuse it.
     let alpha_after = store.get("tut.alpha").unwrap().expect("row stays");
     assert!(
@@ -631,7 +633,7 @@ async fn if_existing_upgrade_falls_through_to_install_when_no_existing_row() {
     // Operator's SPA flow: hit install with ?if_existing=upgrade
     // unconditionally on the second attempt after a 409. If the
     // operator had meanwhile uninstalled the plugin manually, the
-    // upgrade call should NOT 404 — it should install fresh.
+    // upgrade call should NOT 404 â€” it should install fresh.
     let stage_dir = tempfile::tempdir().unwrap();
     let (app, _state) = build_app(stage_dir.path().to_path_buf());
     let v1_zip = build_zip(&[

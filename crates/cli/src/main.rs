@@ -1879,6 +1879,10 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                 inference_metrics.clone(),
             ),
         ));
+    // M6 — shared flow-channel hub. Same instance lives on
+    // `AppState.flow_channel` AND inside the executor's ctx so SPA
+    // subscribers see events from real bus-driven runs.
+    let flow_channel = execlaw_server::flow_channel::FlowChannelHub::new();
     let (automation_bus, automation_bus_tasks) =
         execlaw_server::automation_bus::AutomationBus::spawn(
             db.clone(),
@@ -1887,7 +1891,8 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                     db.clone(),
                     automation_agent_pool.clone(),
                     Some(plugin_host.clone()),
-                ),
+                )
+                .with_flow_channel(flow_channel.clone()),
             ),
             automation_bus_stop.clone(),
         );
@@ -1921,6 +1926,7 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         data_dir: data_dir.clone(),
         automation_bus,
         automation_agent_pool,
+        flow_channel,
         // M5 — same handle as the automations invoker holds, so the
         // `/admin/inference` snapshot endpoint sees AskAgent calls.
         inference_metrics,

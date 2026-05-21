@@ -948,6 +948,8 @@ pub fn test_app_state() -> AppState {
                 "test fixture pool: no LLM wired",
             )),
         ),
+        // M6 — fresh flow-channel hub per test fixture.
+        flow_channel: crate::flow_channel::FlowChannelHub::new(),
         // M5 — empty metrics handle. Tests that exercise the metrics
         // page can pre-populate this via `state.inference_metrics
         // .observe(...)` and snapshot.
