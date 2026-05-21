@@ -152,6 +152,7 @@ export function WelcomeView({
                         auth.user?.username ||
                         t("welcome.fallbackName", "friend")
                     }
+                    incognito={!!incognito}
                 />
             </div>
 

@@ -8,6 +8,8 @@
 // section.
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useGSAP } from "@gsap/react";
+import gsap from "gsap";
 import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { useT } from "../i18n";
@@ -46,9 +48,24 @@ interface SidebarProps {
      * when no plugins are installed; `null` while loading.
      */
     uiPanels?: UiPanelSummary[] | null;
+    /**
+     * 2026-05-21 — rail mode. When `true`, the sidebar defaults to
+     * an icon-only rail (3.5rem wide) and expands back to the full
+     * 16rem on hover. Used by the welcome view to give the new-chat
+     * landing more horizontal breathing room — the operator hasn't
+     * picked a thread yet, so the thread list doesn't need to be
+     * spelled out. On any active-thread route the sidebar stays at
+     * full width.
+     */
+    compact?: boolean;
 }
 
-export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
+export function Sidebar({
+    onNewThread,
+    onSignOut,
+    uiPanels,
+    compact = false,
+}: SidebarProps) {
     const auth = useAuth();
     const tr = useT();
     const navigate = useNavigate();
@@ -208,8 +225,139 @@ export function Sidebar({ onNewThread, onSignOut, uiPanels }: SidebarProps) {
     // See note inside the More section for why.
     void uiPanels;
 
+    // ---- Rail-mode hover + GSAP -----------------------------------
+    //
+    // When `compact === true` the sidebar defaults to an icon-only
+    // rail and slides out to its full 16rem on hover. Implementation
+    // is a single boolean (`isExpanded`) computed from compact +
+    // hover + a small debounce on hover-leave so the operator
+    // doesn't lose the expansion the moment they nudge the cursor
+    // away from a label.
+    //
+    // GSAP animates the sidebar's width + the opacity / translate of
+    // every label-bearing element. We collect those via
+    // `.execlaw-sidebar__label` (added below as a className alongside
+    // the existing semantic ones) so the selector is stable.
+    const asideRef = useRef<HTMLElement | null>(null);
+    const [isHovered, setIsHovered] = useState(false);
+    const hoverLeaveTimeoutRef = useRef<number | null>(null);
+    // Tracks whether the rail-state useGSAP has fired before. First
+    // run uses `gsap.set` (instant, no animation) so the labels
+    // start collapsed without flashing in from opacity 1; subsequent
+    // runs animate the transition.
+    const isFirstRailRunRef = useRef(true);
+    // Only collapse when in compact mode AND not hovered.
+    const isCollapsed = compact && !isHovered;
+
+    const onSidebarEnter = () => {
+        if (!compact) return;
+        if (hoverLeaveTimeoutRef.current !== null) {
+            window.clearTimeout(hoverLeaveTimeoutRef.current);
+            hoverLeaveTimeoutRef.current = null;
+        }
+        setIsHovered(true);
+    };
+
+    const onSidebarLeave = () => {
+        if (!compact) return;
+        // ~180ms debounce — long enough that nudging the cursor
+        // briefly past the sidebar edge doesn't immediately collapse,
+        // short enough that the collapse still feels intentional.
+        if (hoverLeaveTimeoutRef.current !== null) {
+            window.clearTimeout(hoverLeaveTimeoutRef.current);
+        }
+        hoverLeaveTimeoutRef.current = window.setTimeout(() => {
+            setIsHovered(false);
+            hoverLeaveTimeoutRef.current = null;
+        }, 180);
+    };
+
+    useEffect(() => {
+        // Clean up the pending timeout on unmount so we don't try to
+        // setState on an unmounted component.
+        return () => {
+            if (hoverLeaveTimeoutRef.current !== null) {
+                window.clearTimeout(hoverLeaveTimeoutRef.current);
+            }
+        };
+    }, []);
+
+    useGSAP(
+        () => {
+            const sidebar = asideRef.current;
+            if (!sidebar) return;
+            // Collect every text-bearing element that should fade
+            // out in collapsed mode. The icons (`.bi-*` glyphs +
+            // `.execlaw-thread-item__icon` wrappers) intentionally
+            // stay visible — that's the whole point of the rail.
+            //
+            // `.execlaw-brand` is intentionally EXCLUDED so the
+            // "execlaw" wordmark + green status pip stay anchored
+            // at the top of the rail at all widths.
+            const labels = sidebar.querySelectorAll(
+                ".execlaw-thread-item__name, .execlaw-sidebar__section",
+            );
+
+            // First run on mount: set state instantly via gsap.set
+            // so the labels don't flash in from opacity 1 before
+            // animating out to 0. Subsequent runs animate transitions.
+            if (isFirstRailRunRef.current) {
+                isFirstRailRunRef.current = false;
+                if (isCollapsed) {
+                    gsap.set(sidebar, { width: "6rem" });
+                    gsap.set(labels, { opacity: 0, x: -6 });
+                }
+                return;
+            }
+
+            if (isCollapsed) {
+                gsap.to(sidebar, {
+                    // 6rem fits the "execlaw" wordmark (which stays
+                    // visible in rail mode) + the status pip + a
+                    // little padding without clipping.
+                    width: "6rem",
+                    duration: 0.28,
+                    ease: "power2.out",
+                });
+                // Fade + small translate so labels glide off the
+                // right edge rather than just blink out.
+                gsap.to(labels, {
+                    opacity: 0,
+                    x: -6,
+                    duration: 0.18,
+                    ease: "power2.out",
+                    stagger: { each: 0.005, from: "end" },
+                });
+            } else {
+                gsap.to(sidebar, {
+                    width: "16rem",
+                    duration: 0.32,
+                    ease: "power3.out",
+                });
+                gsap.to(labels, {
+                    opacity: 1,
+                    x: 0,
+                    duration: 0.22,
+                    ease: "power2.out",
+                    delay: 0.06,
+                    stagger: { each: 0.008, from: "start" },
+                });
+            }
+        },
+        { scope: asideRef, dependencies: [isCollapsed] },
+    );
+
     return (
-        <aside className="execlaw-sidebar">
+        <aside
+            ref={asideRef}
+            className={
+                "execlaw-sidebar" +
+                (compact ? " is-compact" : "") +
+                (isCollapsed ? " is-collapsed" : "")
+            }
+            onMouseEnter={onSidebarEnter}
+            onMouseLeave={onSidebarLeave}
+        >
             <div className="execlaw-sidebar__head">
                 <h1 className="execlaw-brand h6 mb-0">execlaw</h1>
                 <BrandStatusIndicator

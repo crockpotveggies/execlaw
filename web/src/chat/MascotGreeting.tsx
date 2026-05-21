@@ -55,6 +55,14 @@ interface Props {
     userName?: string;
     /** Optional className passthrough for layout/spacing. */
     className?: string;
+    /**
+     * 2026-05-21 — when `true` the mascot transitions to its
+     * incognito look: colour shifts from accent-blue to
+     * danger-red and the iris (the small pupil blob) cross-
+     * fades into an X cross. Default `false`. Reverses
+     * cleanly when toggled back off.
+     */
+    incognito?: boolean;
 }
 
 // ---- Tuning knobs ---------------------------------------------------
@@ -148,6 +156,7 @@ export function MascotGreeting({
     size = 216,
     userName = "friend",
     className,
+    incognito = false,
 }: Props) {
     const stageRef = useRef<HTMLDivElement | null>(null);
     const svgRef = useRef<SVGSVGElement | null>(null);
@@ -158,6 +167,12 @@ export function MascotGreeting({
     const eyeOuterRef = useRef<SVGGElement | null>(null);
     const eyePathRef = useRef<SVGPathElement | null>(null);
     const irisRef = useRef<SVGGElement | null>(null);
+    // 2026-05-21 — alternate "iris" shape rendered for incognito
+    // mode: an X cross stroked over the eye where the iris blob
+    // sits in regular mode. The two shapes share the eye-outer
+    // group so they inherit the same blink / lift transforms; the
+    // incognito useGSAP cross-fades opacity between them.
+    const irisXRef = useRef<SVGGElement | null>(null);
 
     const welcomeRef = useRef<HTMLSpanElement | null>(null);
     const particleRefs = useRef<Array<HTMLDivElement | null>>([]);
@@ -182,6 +197,11 @@ export function MascotGreeting({
             const svg = svgRef.current;
             const eye = eyePathRef.current;
             const iris = irisRef.current;
+            // 2026-05-21 — the incognito X cross sits at the same rest
+            // position as the iris pupil and should track the cursor
+            // in lockstep so the swap feels continuous rather than
+            // popping between a moving iris and a static X.
+            const irisX = irisXRef.current;
             if (!svg || !eye || !iris) return;
 
             const eyeCenter = readCenter(
@@ -197,7 +217,14 @@ export function MascotGreeting({
 
             const baseOffsetX = eyeCenter.cx - irisCenter.cx;
             const baseOffsetY = eyeCenter.cy - irisCenter.cy;
+            // Park both the iris blob and the X cross at the same
+            // rest position. They share `FALLBACK_IRIS_CX/Y` as
+            // their natural drawn centre, so the same translate
+            // moves both to align with the eye centre.
             gsap.set(iris, { x: baseOffsetX, y: baseOffsetY });
+            if (irisX) {
+                gsap.set(irisX, { x: baseOffsetX, y: baseOffsetY });
+            }
 
             const xTo = gsap.quickTo(iris, "x", {
                 duration: 0.3,
@@ -207,6 +234,24 @@ export function MascotGreeting({
                 duration: 0.3,
                 ease: "power3.out",
             });
+            // Separate quickTo setters for the X — quickTo only
+            // accepts a single target, so we keep two parallel
+            // setter pairs and call all four with the same value
+            // per mousemove. Tiny perf cost (two extra tweens) for
+            // a much simpler structure than wrapping iris + X in a
+            // shared `<g>`.
+            const xToX = irisX
+                ? gsap.quickTo(irisX, "x", {
+                      duration: 0.3,
+                      ease: "power3.out",
+                  })
+                : null;
+            const yToX = irisX
+                ? gsap.quickTo(irisX, "y", {
+                      duration: 0.3,
+                      ease: "power3.out",
+                  })
+                : null;
 
             const onMove = (e: MouseEvent) => {
                 const rect = svg.getBoundingClientRect();
@@ -221,12 +266,18 @@ export function MascotGreeting({
                 if (dist === 0) {
                     xTo(baseOffsetX);
                     yTo(baseOffsetY);
+                    xToX?.(baseOffsetX);
+                    yToX?.(baseOffsetY);
                     return;
                 }
                 const ratio = Math.min(1, dist / IRIS_SATURATION_PX);
                 const travel = IRIS_MAX_TRAVEL_VB * ratio;
-                xTo(baseOffsetX + (dx / dist) * travel);
-                yTo(baseOffsetY + (dy / dist) * travel);
+                const nextX = baseOffsetX + (dx / dist) * travel;
+                const nextY = baseOffsetY + (dy / dist) * travel;
+                xTo(nextX);
+                yTo(nextY);
+                xToX?.(nextX);
+                yToX?.(nextY);
             };
 
             window.addEventListener("mousemove", onMove, { passive: true });
@@ -626,6 +677,89 @@ export function MascotGreeting({
         { dependencies: [] },
     );
 
+    // ---- Incognito state: red palette + X iris -----------------------
+    //
+    // Toggling incognito mode on the welcome view animates two
+    // changes in lockstep:
+    //
+    //   * The SVG's `color` (inherited by every `fill="currentColor"`
+    //     path — hair, beard, eye) tweens from `$accent` (#4493f8)
+    //     to `$danger` (#f85149). GSAP can animate CSS color
+    //     properties; SVG paths follow.
+    //
+    //   * The iris (the blob pupil) cross-fades into an X cross.
+    //     Both shapes live inside the eye-outer group so they
+    //     inherit the same blink / lift / breath transforms — the
+    //     animation is purely an opacity swap.
+    //
+    // First-render `gsap.set` avoids a flash: if the mascot mounts
+    // with `incognito === true` already, we want the red colour +
+    // X-iris in place before paint, not animated in from blue.
+    const incognitoFirstRunRef = useRef(true);
+    useGSAP(
+        () => {
+            const svg = svgRef.current;
+            const iris = irisRef.current;
+            const irisX = irisXRef.current;
+            if (!svg || !iris || !irisX) return;
+
+            // Brand palette literals — keep these in sync with
+            // `$accent` / `$danger` in `styles/theme.scss`. SCSS
+            // tokens aren't reachable from runtime JS, so the
+            // values live duplicated here. If the theme palette
+            // changes, update both.
+            const ACCENT = "#4493f8";
+            const DANGER = "#f85149";
+
+            if (incognitoFirstRunRef.current) {
+                incognitoFirstRunRef.current = false;
+                if (incognito) {
+                    gsap.set(svg, { color: DANGER });
+                    gsap.set(iris, { opacity: 0 });
+                    gsap.set(irisX, { opacity: 1 });
+                }
+                return;
+            }
+
+            if (incognito) {
+                gsap.to(svg, {
+                    color: DANGER,
+                    duration: 0.4,
+                    ease: "power2.out",
+                });
+                gsap.to(iris, {
+                    opacity: 0,
+                    duration: 0.25,
+                    ease: "power2.in",
+                });
+                gsap.to(irisX, {
+                    opacity: 1,
+                    duration: 0.3,
+                    ease: "power2.out",
+                    delay: 0.1,
+                });
+            } else {
+                gsap.to(svg, {
+                    color: ACCENT,
+                    duration: 0.4,
+                    ease: "power2.out",
+                });
+                gsap.to(iris, {
+                    opacity: 1,
+                    duration: 0.3,
+                    ease: "power2.out",
+                    delay: 0.1,
+                });
+                gsap.to(irisX, {
+                    opacity: 0,
+                    duration: 0.25,
+                    ease: "power2.in",
+                });
+            }
+        },
+        { dependencies: [incognito] },
+    );
+
     return (
         <div
             ref={stageRef}
@@ -673,6 +807,39 @@ export function MascotGreeting({
                     />
                     <g ref={irisRef} className="execlaw-mascot__iris">
                         <path d={IRIS_PATH} />
+                    </g>
+                    {/* Incognito iris — an X cross stroked over the
+                        eye in the same colour the iris blob uses
+                        ($bg-deep), so it reads as "punched out" of
+                        the eye in either colour state. Starts at
+                        opacity 0; the incognito useGSAP fades it in
+                        when the toggle activates. The two `<line>`
+                        elements are centred on the iris rest
+                        position (FALLBACK_IRIS_CX/Y) so the cross
+                        sits exactly where the pupil would be. */}
+                    <g
+                        ref={irisXRef}
+                        className="execlaw-mascot__iris-x"
+                        opacity="0"
+                    >
+                        <line
+                            x1={FALLBACK_IRIS_CX - 22}
+                            y1={FALLBACK_IRIS_CY - 22}
+                            x2={FALLBACK_IRIS_CX + 22}
+                            y2={FALLBACK_IRIS_CY + 22}
+                            stroke="var(--bs-body-bg, #0d1117)"
+                            strokeWidth={14}
+                            strokeLinecap="round"
+                        />
+                        <line
+                            x1={FALLBACK_IRIS_CX - 22}
+                            y1={FALLBACK_IRIS_CY + 22}
+                            x2={FALLBACK_IRIS_CX + 22}
+                            y2={FALLBACK_IRIS_CY - 22}
+                            stroke="var(--bs-body-bg, #0d1117)"
+                            strokeWidth={14}
+                            strokeLinecap="round"
+                        />
                     </g>
                 </g>
             </svg>
