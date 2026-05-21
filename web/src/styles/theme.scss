@@ -60,11 +60,30 @@ $radius-card:    1rem;     // 16 px — sidebar wrapper, dialogs
 // $radius-pill) — soft 12 px reads cleanly for both.
 $radius-md:      0.75rem;  // 12 px — card-task wrapper, inline errors
 $radius-pill:    0.5rem;   // 8 px — nav items, buttons, inputs
-// 2026-04-28 — chat thread column max-width. Matches ChatGPT's
-// `--max-thread-content-width: 48rem` so message + composer line
-// up at a consistent 768 px column on wide displays. Smaller
-// viewports fall back to 100% naturally via `max-width`.
-$thread-max-width: 48rem;
+// Chat thread column max-width.
+//
+// 2026-04-28 — initially 48rem (768 px), matching ChatGPT's
+//   `--max-thread-content-width: 48rem`. Conservative reading
+//   column; messages clamp + centre on wide displays, smaller
+//   viewports fall back to 100% naturally via `max-width`.
+//
+// 2026-05-21 — bumped to 56rem (896 px). At 0.95rem base in IBM
+//   Plex Sans this gives ~104 characters per line — still within
+//   the 45–90-chars best-practice range for mixed prose / code /
+//   table content (typography literature caps pure prose at 75
+//   chars/line, but chat surfaces routinely run wider for code
+//   blocks, tool-result cards, and tables). Picked over 60rem
+//   because anything past ~110 chars/line starts to read as
+//   sparse in long agent monologues. Matches the wider patterns
+//   used by Perplexity / Substack wide / Linear's expanded view
+//   rather than ChatGPT's tighter 48rem column.
+//
+//   Cascades to every callsite of `$thread-max-width`:
+//   `.execlaw-msg`, `.execlaw-composer__form`, `.execlaw-card-task`,
+//   and `.execlaw-welcome__composer` — keeping the message
+//   bubble, composer chip, tool-result cards, and welcome-view
+//   composer locked to the same column.
+$thread-max-width: 56rem;
 $shadow-float:   0 0.75rem 2.5rem rgba(0, 0, 0, 0.45);
 $shadow-soft:    0 0.25rem 0.75rem rgba(0, 0, 0, 0.25);
 
@@ -888,15 +907,35 @@ body {
     // hugs the right edge of the column. The bubble itself
     // (`.execlaw-msg__bubble.is-user`) does shrink-to-fit so the
     // pill width tracks the text.
+    //
+    // 2026-05-21 — `padding-top` (NOT `margin-top`) restores the
+    // vertical rhythm around a user bubble. Web-origin user
+    // messages skip their own `__meta` (MessageStream sets
+    // `showMeta = false` for the "you said this" case), so the
+    // gap ABOVE the bubble is just the previous message's 1rem
+    // margin-bottom, while the gap BELOW carries the next agent
+    // message's meta (~0.85rem tall after the tightening below) +
+    // its margin. A `margin-top` here would COLLAPSE with the
+    // previous `.execlaw-msg`'s `margin-bottom` and net to 0 —
+    // padding doesn't collapse, so it lands reliably.
     &.is-user {
         align-items: flex-end;
+        padding-top: 0.75rem;
     }
 }
 
 .execlaw-msg__meta {
     color: $text-muted;
-    font-size: 0.75rem;
-    margin-bottom: 0.2rem;
+    // 2026-05-21 — tightened from 0.75rem / default-line-height /
+    // 0.2rem-margin to 0.7rem / 1.2 / 0.15rem-margin so the
+    // "agent · timestamp" label contributes ~0.85rem of vertical
+    // space instead of ~1.3rem. Without this the next agent
+    // reply sits visibly further below a user bubble than the
+    // previous turn sits above it, making the user bubble cluster
+    // with the wrong turn.
+    font-size: 0.7rem;
+    line-height: 1.2;
+    margin-bottom: 0.15rem;
 }
 
 .execlaw-msg__attachments {
