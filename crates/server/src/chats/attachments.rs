@@ -815,32 +815,22 @@ pub(crate) fn format_attached_files_block(
         };
         latest_by_name.insert(display_name, *r);
     }
-    if !python_available {
-        if let Some(cid) = cid_for_log {
-            // 2026-05-20 — generalized to avoid naming any specific
-            // plugin or sidecar in host-level logs. The block is
-            // gated on the agent-callable tool `python.execute`
-            // being present in the catalog; the host shouldn't be
-            // telling operators about plugin internals (which
-            // plugin owns the tool, what sidecar backs it) on
-            // every turn that happens to have a non-image
-            // attachment.
-            tracing::debug!(
-                target: "chats::attached_files_block",
-                conversation_id = %cid,
-                attachment_count = non_image.len(),
-                "skipping attached-files block — python.execute is not in the tool catalog",
-            );
-        }
-        return None;
-    }
+    // Always emit the block when non-image attachments exist — the
+    // attachment-ref contract is: surface every attached file to
+    // the agent and let the agent decide what to do with it. The
+    // wording adapts to whether `python.execute` is available so
+    // the agent knows which read path it has, but absence of the
+    // sandbox NEVER causes a silent drop. Modern multimodal models
+    // can natively process PDFs / read pasted contents / ask for
+    // clarification; gaslighting the model with "no file" because
+    // the host doesn't have one specific tool installed is the
+    // wrong contract.
+    let _ = cid_for_log; // logging not needed in the always-emit branch
     let mut out = String::from(
         "## Attached files\n\n\
-         The operator has attached the following files to this conversation. They are \
-         available at the paths below inside the python sandbox — call `python.execute` \
-         with `open()` / `pandas.read_csv()` / `PyPDF2.PdfReader()` / etc. as appropriate \
-         when the operator asks about them. Do NOT re-prompt the operator for the contents; \
-         read the file directly.\n\n",
+         The operator has attached the following files to this conversation. \
+         Acknowledge them when the operator asks; do not claim the files \
+         don't exist.\n\n",
     );
     // Iterate the deduped map. Order doesn't matter to the agent
     // (the model uses the filenames, not their position), and
@@ -849,13 +839,30 @@ pub(crate) fn format_attached_files_block(
     // for KV-cache reuse.
     for (display_name, r) in &latest_by_name {
         let size = std::fs::metadata(&r.path).map(|m| m.len()).unwrap_or(0);
-        out.push_str(&format!(
-            "* `{name}` ({mime}, {size} bytes) — available at `/work/uploads/{name}` \
-             in `python.execute`\n",
-            name = display_name,
-            mime = r.mime_type,
-            size = size,
-        ));
+        if python_available {
+            out.push_str(&format!(
+                "* `{name}` ({mime}, {size} bytes) — available at \
+                 `/work/uploads/{name}` inside `python.execute`. Read the \
+                 file with `open()` / `pandas.read_csv()` / `PyPDF2.PdfReader()` \
+                 / etc. as appropriate.\n",
+                name = display_name,
+                mime = r.mime_type,
+                size = size,
+            ));
+        } else {
+            out.push_str(&format!(
+                "* `{name}` ({mime}, {size} bytes) — the file is attached but \
+                 no sandbox tool is currently installed for the host to read \
+                 it on your behalf. If the operator asks about its contents, \
+                 (a) describe what you can infer from the filename + mime, \
+                 (b) ask the operator to paste the relevant excerpt, or \
+                 (c) note that enabling the python sandbox in Settings would \
+                 let you read it directly.\n",
+                name = display_name,
+                mime = r.mime_type,
+                size = size,
+            ));
+        }
     }
     Some(out)
 }
@@ -1361,12 +1368,36 @@ mod tests {
     }
 
     #[test]
-    fn format_block_returns_none_when_python_unavailable() {
+    fn format_block_always_emitted_when_attachments_exist_regardless_of_python() {
+        // Attachment-ref contract: the agent ALWAYS learns about
+        // every attached file. Tooling availability shapes the
+        // prose (read paths the agent has vs. doesn't have), but
+        // never silently drops attachments — gaslighting the agent
+        // with "no file" because one specific tool isn't installed
+        // is the wrong contract, especially for multimodal models
+        // that can natively process documents.
         let rows = [row(Some("data.csv"), "text/csv", "sha1")];
+        let block = format_attached_files_block(&rows, false, None)
+            .expect("block must emit even when python.execute is unavailable");
         assert!(
-            format_attached_files_block(&rows, false, None).is_none(),
-            "block must be None when python.execute is not in the tool catalog \
-             (agent would otherwise emit a tool call that doesn't exist)",
+            block.contains("data.csv"),
+            "block must name the file so the agent can acknowledge it:\n\n{block}",
+        );
+        assert!(
+            !block.contains("/work/uploads/"),
+            "when python.execute is unavailable the block must NOT promise a /work/uploads/ path that doesn't exist:\n\n{block}",
+        );
+    }
+
+    #[test]
+    fn format_block_with_python_available_promises_work_uploads_path() {
+        let rows = [row(Some("data.csv"), "text/csv", "sha1")];
+        let block = format_attached_files_block(&rows, true, None)
+            .expect("block must emit when attachments exist");
+        assert!(block.contains("data.csv"));
+        assert!(
+            block.contains("/work/uploads/data.csv"),
+            "with python.execute available, the agent should be told where to read the file:\n\n{block}",
         );
     }
 
