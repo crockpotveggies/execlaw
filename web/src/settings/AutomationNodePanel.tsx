@@ -275,6 +275,7 @@ function AskAgentForm({
     const attachments = (cfg.attachments as string[] | undefined) ?? [];
     const exitTools = (cfg.exit_tools as ExitToolDef[] | undefined) ?? [];
     const maxTurns = (cfg.max_turns as number | undefined) ?? null;
+    const reasoningTools = (cfg.reasoning_tools as string[] | undefined) ?? [];
 
     const update = (next: Record<string, unknown>) =>
         onChange({ ...node, config: { ...cfg, ...next } });
@@ -341,6 +342,36 @@ function AskAgentForm({
                     placeholder="3"
                     data-testid="node-panel-askagent-maxturns"
                 />
+            </Form.Group>
+
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">
+                    Reasoning tools (one tool name per line, optional)
+                </Form.Label>
+                <Form.Control
+                    as="textarea"
+                    rows={2}
+                    size="sm"
+                    value={reasoningTools.join("\n")}
+                    onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                        update({
+                            reasoning_tools: e.target.value
+                                .split("\n")
+                                .map((s) => s.trim())
+                                .filter((s) => s !== ""),
+                        })
+                    }
+                    placeholder="python.execute&#10;web.search"
+                    spellCheck={false}
+                    className="font-monospace small"
+                    data-testid="node-panel-askagent-reasoning-tools"
+                />
+                <div className="small text-muted mt-1">
+                    Optional palette the agent may call while reasoning,
+                    before committing to an exit_tool. Must be a subset
+                    of the trust profile's allowed_tools — out-of-palette
+                    names are rejected at invoke time.
+                </div>
             </Form.Group>
 
             <Form.Group className="mb-2">
@@ -660,9 +691,57 @@ function SendReplyForm({
     const source = ((cfg.source as string | undefined) ?? "from_agent") as SendReplySource;
     const fromNode = (cfg.from_node as string | undefined) ?? "";
     const text = (cfg.text as string | undefined) ?? "";
+    const targetOverride = cfg.target_override as unknown;
+    const hints = (cfg.hints as Record<string, unknown> | undefined) ?? {};
+    const splitPerPart = (hints.split_per_part as boolean | undefined) ?? false;
+    const onFailureRaw = hints.on_failure as Record<string, unknown> | undefined;
+    const onFailureKind = (onFailureRaw?.kind as string | undefined) ?? "chat_append_home";
+    const minChartForm = (hints.min_chart_form as string | undefined) ?? "";
+
+    // target_override is rendered as JSON in a textarea so authors can
+    // edit a free-shape OriginRef (the validator on save rejects bad
+    // shapes). Empty textarea = field absent = use envelope.origin.
+    const [targetDraft, setTargetDraft] = useState(
+        targetOverride && targetOverride !== null
+            ? JSON.stringify(targetOverride, null, 2)
+            : "",
+    );
+    const [targetErr, setTargetErr] = useState<string | null>(null);
 
     const update = (next: Record<string, unknown>) =>
         onChange({ ...node, config: { ...cfg, ...next } });
+
+    const updateHints = (next: Record<string, unknown>) =>
+        update({ hints: { ...hints, ...next } });
+
+    const commitTarget = () => {
+        const trimmed = targetDraft.trim();
+        if (trimmed === "") {
+            // Clear the field entirely so the server falls back to
+            // envelope.origin.
+            setTargetErr(null);
+            const { target_override: _omit, ...rest } = cfg;
+            void _omit;
+            onChange({ ...node, config: rest });
+            return;
+        }
+        try {
+            const parsed = JSON.parse(trimmed);
+            if (
+                parsed === null ||
+                typeof parsed !== "object" ||
+                Array.isArray(parsed) ||
+                typeof (parsed as { kind?: unknown }).kind !== "string"
+            ) {
+                setTargetErr("target_override must be an OriginRef object with a 'kind' field");
+                return;
+            }
+            setTargetErr(null);
+            update({ target_override: parsed });
+        } catch (e) {
+            setTargetErr((e as Error).message);
+        }
+    };
 
     return (
         <>
@@ -751,6 +830,122 @@ function SendReplyForm({
                 plugin's <code>send_reply</code> tool, fire-and-forget
                 triggers drop silently.
             </div>
+
+            <hr className="my-3" />
+            <div className="small text-muted mb-1">
+                <i className="bi bi-sliders me-1" aria-hidden />
+                Advanced
+            </div>
+
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">
+                    Target override (OriginRef JSON, optional)
+                </Form.Label>
+                <Form.Control
+                    as="textarea"
+                    rows={3}
+                    size="sm"
+                    value={targetDraft}
+                    onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                        setTargetDraft(e.target.value)
+                    }
+                    onBlur={commitTarget}
+                    placeholder='{"kind":"chat_append","thread_id":"…"}'
+                    spellCheck={false}
+                    className="font-monospace small"
+                    data-testid="node-panel-sendreply-target"
+                />
+                {targetErr && (
+                    <div
+                        className="small text-danger mt-1"
+                        data-testid="node-panel-sendreply-target-error"
+                    >
+                        {targetErr}
+                    </div>
+                )}
+                <div className="small text-muted mt-1">
+                    Defaults to the trigger's <code>envelope.origin</code>.
+                    Override to route the reply to a different transport
+                    (e.g., always post into the operator Inbox even when
+                    triggered by WhatsApp). Empty = use envelope.
+                </div>
+            </Form.Group>
+
+            <Form.Group className="mb-2">
+                <Form.Check
+                    type="checkbox"
+                    id={`${node.id}-split-per-part`}
+                    label="Split per part (one transport message per ReplyPart)"
+                    checked={splitPerPart}
+                    onChange={(e) =>
+                        updateHints({ split_per_part: e.target.checked })
+                    }
+                    data-testid="node-panel-sendreply-split-per-part"
+                />
+                <div className="small text-muted mt-1">
+                    WhatsApp/Signal often want one message per attachment
+                    for readability; web chat usually wants bundled.
+                </div>
+            </Form.Group>
+
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">
+                    On delivery failure
+                </Form.Label>
+                <Form.Select
+                    size="sm"
+                    value={onFailureKind}
+                    onChange={(e: ChangeEvent<HTMLSelectElement>) =>
+                        updateHints({
+                            on_failure: { kind: e.target.value },
+                        })
+                    }
+                    data-testid="node-panel-sendreply-on-failure"
+                >
+                    <option value="chat_append_home">
+                        chat_append_home — append into operator Inbox + alert
+                    </option>
+                    <option value="alert_only">
+                        alert_only — fire alert, drop payload
+                    </option>
+                    <option value="drop">
+                        drop — silently discard
+                    </option>
+                </Form.Select>
+            </Form.Group>
+
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">
+                    Minimum chart fidelity (optional)
+                </Form.Label>
+                <Form.Select
+                    size="sm"
+                    value={minChartForm}
+                    onChange={(e: ChangeEvent<HTMLSelectElement>) => {
+                        const v = e.target.value;
+                        if (v === "") {
+                            // Clear field entirely.
+                            const { min_chart_form: _omit, ...rest } = hints;
+                            void _omit;
+                            update({ hints: rest });
+                        } else {
+                            updateHints({ min_chart_form: v });
+                        }
+                    }}
+                    data-testid="node-panel-sendreply-min-chart-form"
+                >
+                    <option value="">— No floor —</option>
+                    <option value="inline">inline (web only)</option>
+                    <option value="image">image (PNG/JPEG)</option>
+                    <option value="url">url</option>
+                    <option value="text_ok">text_ok (any)</option>
+                </Form.Select>
+                <div className="small text-muted mt-1">
+                    If the transport can't satisfy this floor, the router
+                    refuses to degrade and fires a{" "}
+                    <code>ReplyDegradationRefused</code> alert.
+                </div>
+            </Form.Group>
         </>
     );
 }

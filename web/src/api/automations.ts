@@ -299,10 +299,58 @@ export interface RecentBusEvent {
     payload: unknown;
 }
 
+/**
+ * Origin reference — mirrors the Rust `OriginRef` enum's `serde(tag =
+ * "kind")` shape. Used in the test-run drawer to test envelope-gated
+ * trigger filters without having to wait for a real event of the
+ * matching kind.
+ */
+export type OriginRef =
+    | { kind: "web_socket_session"; session_id: string }
+    | {
+          kind: "plugin_channel";
+          plugin_id: string;
+          channel_ref: unknown;
+          expires_at_ms?: number | null;
+      }
+    | { kind: "chat_append"; thread_id: string }
+    | { kind: "alert" }
+    | { kind: "none" };
+
+/** Mirrors the Rust `SenderIdentity` enum. */
+export type SenderIdentity =
+    | { kind: "principal"; id: string; trust: TrustClass }
+    | {
+          kind: "external";
+          plugin_id: string;
+          handle: string;
+          trust: TrustClass;
+      }
+    | { kind: "system" };
+
+/** Trust class — keep in lockstep with Rust `core::trust::TrustClass`.
+ *  Lower-cased per `#[serde(rename_all = "snake_case")]`. */
+export type TrustClass =
+    | "controller"
+    | "known_high"
+    | "known_limited"
+    | "cold_contact"
+    | "blocked";
+
+export interface EventEnvelope {
+    origin: OriginRef;
+    identity: SenderIdentity;
+    correlation_id: string;
+    parent_event_id?: string | null;
+}
+
 export interface SampleEventBody {
     kind: BusEventKind;
     source: string;
     payload: unknown;
+    /** Optional envelope. When omitted the server defaults to
+     *  `EventEnvelope::system_internal()`. */
+    envelope?: EventEnvelope;
 }
 
 export interface TestRunRequest {

@@ -291,6 +291,12 @@ pub struct SampleEventBody {
     pub source: String,
     #[schema(value_type = Object)]
     pub payload: serde_json::Value,
+    /// Optional envelope override. When omitted the test-run path
+    /// synthesizes `EventEnvelope::system_internal()` — the same
+    /// behavior as legacy rows. Operators set this to test trigger
+    /// filters that gate on origin / identity / correlation.
+    #[serde(default)]
+    pub envelope: Option<execlaw_core::event_envelope::EventEnvelope>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -587,6 +593,10 @@ pub async fn test_run(
         (None, Some(s)) => {
             // Synthesize a non-persisted BusEventRow. ID is
             // informational (the dry-run path never writes it back).
+            // Envelope defaults to `system_internal()` so legacy
+            // callers keep working; the SPA passes a built envelope
+            // when the operator wants to test envelope-gated
+            // triggers (origin.kind, identity.trust, etc.).
             BusEventRow {
                 id: format!("test-run:{}", uuid::Uuid::new_v4()),
                 kind: s.kind,
@@ -595,7 +605,9 @@ pub async fn test_run(
                 payload: s.payload,
                 internal: false,
                 dispatched_at: None,
-                envelope: execlaw_core::event_envelope::EventEnvelope::system_internal(),
+                envelope: s
+                    .envelope
+                    .unwrap_or_else(execlaw_core::event_envelope::EventEnvelope::system_internal),
             }
         }
         (None, None) => {

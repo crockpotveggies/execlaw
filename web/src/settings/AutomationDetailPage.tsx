@@ -38,9 +38,70 @@ import {
     type AutomationRunView,
     type BusEventKind,
     type DryRunResult,
+    type EventEnvelope,
     type RecentBusEvent,
     type StepTrace,
+    type TrustClass,
 } from "../api/automations";
+
+/**
+ * Compose an `EventEnvelope` from the test-run drawer's three
+ * dropdowns. `system_internal` (the default) returns the same shape
+ * as the server's `EventEnvelope::system_internal()` so this stays a
+ * no-op when the operator hasn't customized the envelope. */
+function buildSampleEnvelope(
+    originKind: string,
+    identityKind: string,
+    identityTrust: string,
+): EventEnvelope {
+    // Origin
+    let origin: EventEnvelope["origin"];
+    switch (originKind) {
+        case "web_socket_session":
+            origin = { kind: "web_socket_session", session_id: "test-session" };
+            break;
+        case "chat_append":
+            origin = { kind: "chat_append", thread_id: "test-thread" };
+            break;
+        case "alert":
+            origin = { kind: "alert" };
+            break;
+        case "none":
+            origin = { kind: "none" };
+            break;
+        default:
+            // Default = "system" / no replyable origin. We map this to
+            // OriginRef::None which is what `system_internal()` uses.
+            origin = { kind: "none" };
+            break;
+    }
+    // Identity
+    let identity: EventEnvelope["identity"];
+    const trust = (identityTrust as TrustClass);
+    switch (identityKind) {
+        case "principal":
+            identity = { kind: "principal", id: "test-operator", trust };
+            break;
+        case "external":
+            identity = {
+                kind: "external",
+                plugin_id: "test-plugin",
+                handle: "test-handle",
+                trust,
+            };
+            break;
+        case "system":
+        default:
+            identity = { kind: "system" };
+            break;
+    }
+    return {
+        origin,
+        identity,
+        correlation_id: `test-${crypto.randomUUID()}`,
+        parent_event_id: null,
+    };
+}
 
 interface Props {
     /** Automation id or the literal "new" for create mode. */
@@ -73,6 +134,16 @@ export function AutomationDetailPage({ id }: Props) {
     const [selectedEventId, setSelectedEventId] = useState<string>("");
     const [testRunResult, setTestRunResult] = useState<DryRunResult | null>(null);
     const [testRunBusy, setTestRunBusy] = useState<boolean>(false);
+    // Audit fix #9: envelope override used to test trigger filters that
+    // gate on `event.envelope.origin.kind`, `identity.trust`, etc. The
+    // form composes these strings into an `EventEnvelope` JSON object
+    // when the operator hits Run. `null` means "let the server default
+    // to system_internal()".
+    const [sampleOriginKind, setSampleOriginKind] = useState<string>("system_internal");
+    const [sampleIdentityKind, setSampleIdentityKind] = useState<string>("system");
+    const [sampleIdentityTrust, setSampleIdentityTrust] = useState<string>("controller");
+    const [samplePayloadJson, setSamplePayloadJson] = useState<string>("{}");
+    const [samplePayloadErr, setSamplePayloadErr] = useState<string | null>(null);
 
     // Parsed definition for canvas rendering. `null` when the JSON
     // textarea contains invalid syntax — we render an inline parse
@@ -226,15 +297,37 @@ export function AutomationDetailPage({ id }: Props) {
         setError(null);
         setTestRunResult(null);
         try {
-            const body = selectedEventId
-                ? { event_id: selectedEventId }
-                : {
-                      sample_event: {
-                          kind: parsedDef.def.trigger.kind,
-                          source: "test-run",
-                          payload: {},
-                      },
-                  };
+            let body;
+            if (selectedEventId) {
+                body = { event_id: selectedEventId };
+            } else {
+                // Synthesize-mode: build payload + envelope from the
+                // form. Bail with an inline error if the payload JSON
+                // is bad so the run never hits the server with junk.
+                let payload: unknown = {};
+                try {
+                    payload = samplePayloadJson.trim() === ""
+                        ? {}
+                        : JSON.parse(samplePayloadJson);
+                    setSamplePayloadErr(null);
+                } catch (e) {
+                    setSamplePayloadErr((e as Error).message);
+                    setTestRunBusy(false);
+                    return;
+                }
+                body = {
+                    sample_event: {
+                        kind: parsedDef.def.trigger.kind,
+                        source: "test-run",
+                        payload,
+                        envelope: buildSampleEnvelope(
+                            sampleOriginKind,
+                            sampleIdentityKind,
+                            sampleIdentityTrust,
+                        ),
+                    },
+                };
+            }
             const result = await testRunAutomation(id, body, token);
             setTestRunResult(result);
         } catch (e) {
@@ -242,7 +335,17 @@ export function AutomationDetailPage({ id }: Props) {
         } finally {
             setTestRunBusy(false);
         }
-    }, [id, isNew, parsedDef.def, selectedEventId, token]);
+    }, [
+        id,
+        isNew,
+        parsedDef.def,
+        selectedEventId,
+        token,
+        samplePayloadJson,
+        sampleOriginKind,
+        sampleIdentityKind,
+        sampleIdentityTrust,
+    ]);
 
     const onDelete = useCallback(async () => {
         if (isNew) return;
@@ -426,6 +529,15 @@ export function AutomationDetailPage({ id }: Props) {
                     onRun={onTestRun}
                     busy={testRunBusy}
                     result={testRunResult}
+                    samplePayloadJson={samplePayloadJson}
+                    onSamplePayloadJsonChange={setSamplePayloadJson}
+                    samplePayloadErr={samplePayloadErr}
+                    sampleOriginKind={sampleOriginKind}
+                    onSampleOriginKindChange={setSampleOriginKind}
+                    sampleIdentityKind={sampleIdentityKind}
+                    onSampleIdentityKindChange={setSampleIdentityKind}
+                    sampleIdentityTrust={sampleIdentityTrust}
+                    onSampleIdentityTrustChange={setSampleIdentityTrust}
                 />
             )}
 
@@ -451,6 +563,16 @@ interface TestRunDrawerProps {
     onRun: () => void;
     busy: boolean;
     result: DryRunResult | null;
+    // Synthesize-mode envelope override fields (audit fix #9).
+    samplePayloadJson: string;
+    onSamplePayloadJsonChange: (s: string) => void;
+    samplePayloadErr: string | null;
+    sampleOriginKind: string;
+    onSampleOriginKindChange: (s: string) => void;
+    sampleIdentityKind: string;
+    onSampleIdentityKindChange: (s: string) => void;
+    sampleIdentityTrust: string;
+    onSampleIdentityTrustChange: (s: string) => void;
 }
 
 function TestRunDrawer({
@@ -462,7 +584,20 @@ function TestRunDrawer({
     onRun,
     busy,
     result,
+    samplePayloadJson,
+    onSamplePayloadJsonChange,
+    samplePayloadErr,
+    sampleOriginKind,
+    onSampleOriginKindChange,
+    sampleIdentityKind,
+    onSampleIdentityKindChange,
+    sampleIdentityTrust,
+    onSampleIdentityTrustChange,
 }: TestRunDrawerProps) {
+    // The envelope-builder block is only useful in synthesize mode
+    // (selectedEventId === "") because real captured events already
+    // carry their own envelope.
+    const synthesizeMode = selectedEventId === "";
     return (
         <section className="mt-4" data-testid="test-run-drawer">
             <div className="d-flex justify-content-between align-items-center">
@@ -501,10 +636,117 @@ function TestRunDrawer({
                         </Form.Select>
                         <div className="small text-muted mt-1">
                             Pick from the last 50 events of this trigger's kind.
-                            "Synthesize" runs against an empty-payload event of
-                            the trigger kind — useful for shape-only smoke tests.
+                            "Synthesize" runs against an envelope you compose
+                            below — useful for testing trigger filters that gate
+                            on origin / identity / payload.
                         </div>
                     </Form.Group>
+                    {synthesizeMode && (
+                        <div
+                            className="border rounded p-2 mb-2"
+                            style={{ background: "#0e131a", borderColor: "#30363d" }}
+                            data-testid="test-run-synthesize-block"
+                        >
+                            <div className="small text-muted mb-1">
+                                Synthesize event details
+                            </div>
+                            <Form.Group className="mb-2">
+                                <Form.Label className="small text-muted mb-1">
+                                    Payload (JSON)
+                                </Form.Label>
+                                <Form.Control
+                                    as="textarea"
+                                    rows={3}
+                                    size="sm"
+                                    value={samplePayloadJson}
+                                    onChange={(e) =>
+                                        onSamplePayloadJsonChange(e.target.value)
+                                    }
+                                    spellCheck={false}
+                                    className="font-monospace small"
+                                    data-testid="test-run-payload"
+                                />
+                                {samplePayloadErr && (
+                                    <div
+                                        className="small text-danger mt-1"
+                                        data-testid="test-run-payload-error"
+                                    >
+                                        {samplePayloadErr}
+                                    </div>
+                                )}
+                            </Form.Group>
+                            <div className="row g-2">
+                                <Form.Group className="col">
+                                    <Form.Label className="small text-muted mb-1">
+                                        Origin kind
+                                    </Form.Label>
+                                    <Form.Select
+                                        size="sm"
+                                        value={sampleOriginKind}
+                                        onChange={(e) =>
+                                            onSampleOriginKindChange(e.target.value)
+                                        }
+                                        data-testid="test-run-origin-kind"
+                                    >
+                                        <option value="system_internal">
+                                            system_internal (default)
+                                        </option>
+                                        <option value="web_socket_session">
+                                            web_socket_session
+                                        </option>
+                                        <option value="chat_append">chat_append</option>
+                                        <option value="alert">alert</option>
+                                        <option value="none">none</option>
+                                    </Form.Select>
+                                </Form.Group>
+                                <Form.Group className="col">
+                                    <Form.Label className="small text-muted mb-1">
+                                        Identity kind
+                                    </Form.Label>
+                                    <Form.Select
+                                        size="sm"
+                                        value={sampleIdentityKind}
+                                        onChange={(e) =>
+                                            onSampleIdentityKindChange(e.target.value)
+                                        }
+                                        data-testid="test-run-identity-kind"
+                                    >
+                                        <option value="system">system</option>
+                                        <option value="principal">principal</option>
+                                        <option value="external">external</option>
+                                    </Form.Select>
+                                </Form.Group>
+                                <Form.Group className="col">
+                                    <Form.Label className="small text-muted mb-1">
+                                        Trust
+                                    </Form.Label>
+                                    <Form.Select
+                                        size="sm"
+                                        value={sampleIdentityTrust}
+                                        onChange={(e) =>
+                                            onSampleIdentityTrustChange(e.target.value)
+                                        }
+                                        disabled={sampleIdentityKind === "system"}
+                                        data-testid="test-run-identity-trust"
+                                    >
+                                        <option value="controller">controller</option>
+                                        <option value="known_high">known_high</option>
+                                        <option value="known_limited">
+                                            known_limited
+                                        </option>
+                                        <option value="cold_contact">cold_contact</option>
+                                        <option value="blocked">blocked</option>
+                                    </Form.Select>
+                                </Form.Group>
+                            </div>
+                            <div className="small text-muted mt-1">
+                                The envelope is reachable from Rhai as{" "}
+                                <code>event.envelope.origin.kind</code> and{" "}
+                                <code>event.envelope.identity.trust</code>.
+                                System identity ignores the trust field.
+                            </div>
+                        </div>
+                    )}
                     <Button
                         variant="primary"
                         size="sm"
