@@ -35,6 +35,7 @@ import {
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
+import { ZeroState } from "../components/ZeroState";
 
 const STATE_BADGE: Record<SkillState, string> = {
     trial: "bg-info",
@@ -249,39 +250,37 @@ function SkillsEmptyState({
     onCreate: () => void;
 }) {
     return (
-        <div
-            className="execlaw-skills__detail-empty"
-            data-testid="skills-empty-state"
-        >
-            <i
-                className="bi bi-stars d-block mb-2"
-                style={{ fontSize: "2rem" }}
-                aria-hidden
-            />
-            <div className="mb-2">
-                {includeArchived ? (
+        <ZeroState
+            testId="skills-empty-state"
+            icon="bi-stars"
+            title={
+                includeArchived ? (
                     <>No skills exist yet — not even archived ones.</>
                 ) : (
                     <>No active skills yet.</>
-                )}
-            </div>
-            <div className="small execlaw-muted mb-3" style={{ maxWidth: 32 + "rem" }}>
-                Skills are procedural-knowledge documents the agent reads to
-                shape its behavior. Create one to capture a workflow the
-                agent should reuse.
-            </div>
-            {canCreate && (
-                <button
-                    type="button"
-                    className="btn btn-sm btn-primary"
-                    onClick={onCreate}
-                    data-testid="skills-empty-new-btn"
-                >
-                    <i className="bi bi-plus-lg me-1" aria-hidden />
-                    New skill
-                </button>
-            )}
-        </div>
+                )
+            }
+            description={
+                <>
+                    Skills are procedural-knowledge documents the agent reads
+                    to shape its behavior. Create one to capture a workflow
+                    the agent should reuse.
+                </>
+            }
+            action={
+                canCreate && (
+                    <button
+                        type="button"
+                        className="btn btn-sm btn-primary"
+                        onClick={onCreate}
+                        data-testid="skills-empty-new-btn"
+                    >
+                        <i className="bi bi-plus-lg me-1" aria-hidden />
+                        New skill
+                    </button>
+                )
+            }
+        />
     );
 }
 

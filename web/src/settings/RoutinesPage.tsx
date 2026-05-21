@@ -27,6 +27,7 @@ import {
 } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
+import { ZeroState } from "../components/ZeroState";
 
 interface FormState {
     id: string | null; // null → create mode
@@ -459,13 +460,31 @@ export function RoutinesPage() {
             {routines === null ? (
                 <div className="execlaw-muted small">Loading routines…</div>
             ) : routines.length === 0 ? (
-                <div
-                    className="execlaw-muted small"
-                    data-testid="routines-empty"
-                >
-                    No routines yet. Click "+ New routine" to define your
-                    first cron-shaped automation.
-                </div>
+                <ZeroState
+                    testId="routines-empty"
+                    icon="bi-clock-history"
+                    title={<>No routines yet.</>}
+                    description={
+                        <>
+                            Routines are cron-shaped automations the agent
+                            runs on its own — daily summaries, weekly
+                            triages, anything that should happen on a
+                            schedule. Trust class is yours; tool-allowlist
+                            is the same as a normal turn.
+                        </>
+                    }
+                    action={
+                        <Button
+                            size="sm"
+                            variant="primary"
+                            onClick={onCreateClick}
+                            data-testid="routines-empty-new-btn"
+                        >
+                            <i className="bi bi-plus-lg me-1" aria-hidden />
+                            New routine
+                        </Button>
+                    }
+                />
             ) : (
                 routines.map((r) => (
                     <div

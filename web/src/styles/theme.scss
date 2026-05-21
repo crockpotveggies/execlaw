@@ -1696,6 +1696,58 @@ body {
     padding: 2rem 1rem;
 }
 
+// Shared "first-run" empty-state primitive — see
+// `components/ZeroState.tsx` for the React side. Vertical-centred
+// icon + title + description + optional CTA; takes whatever flex
+// space the parent gives it. The Skills page set the precedent
+// (`.execlaw-skills__detail-empty` previously); these tokens
+// generalise that look to Routines / Automations / Research.
+.execlaw-zero-state {
+    flex: 1 1 auto;
+    min-height: 18rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 3rem 1.5rem;
+    gap: 0.6rem;
+    color: $text-muted;
+}
+
+.execlaw-zero-state__icon {
+    font-size: 2rem;
+    line-height: 1;
+    opacity: 0.7;
+    margin-bottom: 0.25rem;
+}
+
+.execlaw-zero-state__title {
+    color: $text-primary;
+    font-family: $font-body;
+    font-size: 1rem;
+    font-weight: 500;
+}
+
+.execlaw-zero-state__body {
+    color: $text-muted;
+    font-size: 0.875rem;
+    line-height: 1.55;
+    max-width: 34rem;
+
+    code {
+        background-color: $bg-elev;
+        color: $text-primary;
+        padding: 0.05rem 0.35rem;
+        border-radius: 0.25rem;
+        font-size: 0.8rem;
+    }
+}
+
+.execlaw-zero-state__action {
+    margin-top: 0.5rem;
+}
+
 // ---- Settings modal ----------------------------------------------
 //
 // 2026-05-20 — Settings was a top-level route with 22 horizontal

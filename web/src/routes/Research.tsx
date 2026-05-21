@@ -25,6 +25,7 @@ import { useAuth } from "../auth/AuthContext";
 import { Sidebar } from "../chat/Sidebar";
 import { setActiveThread } from "../chat/store";
 import { ErrorBanner } from "../components/ErrorBanner";
+import { ZeroState } from "../components/ZeroState";
 
 const POLL_INTERVAL_MS = 5_000;
 
@@ -125,11 +126,24 @@ export function Research() {
                     ) : jobs === null ? (
                         <div className="m-3 execlaw-muted small">Loading…</div>
                     ) : jobs.length === 0 ? (
-                        <div className="m-3 execlaw-muted small">
-                            No research jobs yet. Ask the agent to{" "}
-                            <code>research_start</code> a question, or fire
-                            one from any chat thread.
-                        </div>
+                        <ZeroState
+                            testId="research-empty"
+                            icon="bi-binoculars"
+                            title={<>No research jobs yet.</>}
+                            description={
+                                <>
+                                    Deep research runs as a background job.
+                                    Start one from any chat thread — ask the
+                                    agent something like{" "}
+                                    <em>“research the history of the Apollo
+                                    program”</em> or have it call{" "}
+                                    <code>research_start</code> directly.
+                                    The supervisor plans, fans out gather
+                                    workers, and lands the final report
+                                    here when it's done.
+                                </>
+                            }
+                        />
                     ) : (
                         <ResearchTwoPane
                             jobs={jobs}

@@ -15,6 +15,7 @@ import Button from "react-bootstrap/Button";
 import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { ErrorBanner } from "../components/ErrorBanner";
+import { ZeroState } from "../components/ZeroState";
 import {
     actionSuggestion,
     dismissSuggestion,
@@ -143,12 +144,30 @@ export function AutomationsPage() {
 
             <h3 className="h6 mt-4 mb-2">Your automations</h3>
             {automations.length === 0 ? (
-                <div className="execlaw-card" data-testid="automations-empty">
-                    <div className="execlaw-muted small">
-                        No automations yet. Create one from a suggestion above,
-                        or click <strong>New automation</strong>.
-                    </div>
-                </div>
+                <ZeroState
+                    testId="automations-empty"
+                    icon="bi-lightning-charge-fill"
+                    title={<>No automations yet.</>}
+                    description={
+                        <>
+                            Event-triggered flows fire when webhooks,
+                            routines, or plugins land matching events on
+                            the bus — each run writes a per-step trace
+                            you can replay. Start from a suggestion above,
+                            or build one from scratch.
+                        </>
+                    }
+                    action={
+                        <Link
+                            to="/automations/new"
+                            className="btn btn-sm btn-primary"
+                            data-testid="automations-empty-new-btn"
+                        >
+                            <i className="bi bi-plus-lg me-1" aria-hidden />
+                            New automation
+                        </Link>
+                    }
+                />
             ) : (
                 <AutomationsTable
                     automations={automations}
