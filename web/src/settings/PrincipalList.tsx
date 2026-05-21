@@ -111,7 +111,6 @@ export function PrincipalList(props: PrincipalListProps) {
 
     return (
         <div data-testid={props.testId}>
-            <h3 className="h6 mb-1">{props.heading}</h3>
             {props.subhead && (
                 <p className="execlaw-muted small mb-3">{props.subhead}</p>
             )}

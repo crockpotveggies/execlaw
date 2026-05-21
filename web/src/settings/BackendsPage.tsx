@@ -477,8 +477,14 @@ export function BackendsPage() {
 
     return (
         <div data-testid="settings-backends">
-            <div className="d-flex align-items-center mb-3">
-                <h3 className="h6 mb-0 flex-grow-1">Backends</h3>
+            <div className="d-flex align-items-start gap-2 mb-3">
+                <p className="execlaw-muted small mb-0 flex-grow-1">
+                    One inference backend per runner-purpose. Runners are
+                    spawned automatically per conversation and pick the
+                    backend matching their current modality / capability
+                    tier — see <code>Settings → Runners</code> for live
+                    runner state.
+                </p>
                 <Button
                     size="sm"
                     variant="outline-secondary"
@@ -489,14 +495,6 @@ export function BackendsPage() {
                     Refresh
                 </Button>
             </div>
-
-            <p className="execlaw-muted small mb-3">
-                One inference backend per runner-purpose. Runners are
-                spawned automatically per conversation and pick the
-                backend matching their current modality / capability
-                tier — see <code>Settings → Runners</code> for live
-                runner state.
-            </p>
 
             {!canMutate && (
                 <div className="execlaw-muted small mb-3">

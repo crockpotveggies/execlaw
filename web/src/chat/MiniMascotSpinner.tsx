@@ -1,14 +1,30 @@
-// Tiny execlaw mascot rendered as a spinner: the hair + beard +
-// eye outline rotate together around the canvas centre while the
-// iris stays fixed (in screen-space terms) and tracks the cursor
-// just like `MascotGreeting`'s. Used by `ToolActivityPill` to
-// surface "the agent is working" without dragging in a generic
-// CSS spinner.
+// Tiny execlaw mascot rendered as a working-indicator.
 //
-// The rotation is pure CSS so we don't pay a JS animation tick
-// per frame for a tiny icon. Iris tracking IS JS — same
-// mousemove handler shape as MascotGreeting.
+// 2026-05-20 — was a flat CSS 360° spin of the whole face. Replaced
+// with a GSAP timeline that reads as "the mascot is thinking":
+//
+//   * Hair pops up away from the head with a slight tilt, as if the
+//     top of the skull lifts off so the brain can buzz.
+//   * While suspended, the hair vibrates — quick low-amplitude
+//     oscillation to suggest energy / processing.
+//   * Hair drops back into place with a bounce. The beard, which
+//     squashed inward to "inhale" while the hair was airborne,
+//     catches the impact with a tiny rebound.
+//   * The eye widens during the lift (subtle scale-up) and relaxes
+//     when the hair lands.
+//   * A short breath beat closes the cycle before the next pop.
+//
+// Iris cursor-tracking continues to run as a separate effect so the
+// pupil chases the operator's cursor independently of the GSAP
+// timeline. The two paint to different elements (eye-outer `<g>` vs
+// inner iris translate via setAttribute) so they don't fight for
+// the same transform.
+//
+// `prefers-reduced-motion` callers see a calmer breathing scale on
+// the hair only — no lift, no vibration, no bounce.
 
+import { useGSAP } from "@gsap/react";
+import gsap from "gsap";
 import { useEffect, useRef } from "react";
 import {
     EYE_PATH,
@@ -35,17 +51,16 @@ interface Props {
 
 export function MiniMascotSpinner({ size = 22, className }: Props) {
     const svgRef = useRef<SVGSVGElement | null>(null);
+    const hairRef = useRef<SVGPathElement | null>(null);
+    const beardRef = useRef<SVGPathElement | null>(null);
     const eyeOuterRef = useRef<SVGGElement | null>(null);
     const eyePathRef = useRef<SVGPathElement | null>(null);
     const irisRef = useRef<SVGGElement | null>(null);
     const irisPathRef = useRef<SVGPathElement | null>(null);
 
-    // Iris cursor-tracking — copy of MascotGreeting's logic but
-    // operating only on the iris (the rotating outer group keeps
-    // the eye outline + iris parent moving in lock-step around
-    // the canvas centre, but we counter-rotate the iris translate
-    // so the pupil reads as "looking at the cursor" regardless of
-    // current rotation).
+    // Iris cursor tracking — runs every frame the mouse moves.
+    // Independent from the GSAP "pop" timeline so the pupil keeps
+    // chasing the cursor even mid-bounce.
     useEffect(() => {
         const svg = svgRef.current;
         const irisG = irisRef.current;
@@ -87,17 +102,6 @@ export function MiniMascotSpinner({ size = 22, className }: Props) {
                 const travel = IRIS_MAX_TRAVEL_VB * ratio;
                 const tx = (dx / dist) * travel;
                 const ty = (dy / dist) * travel;
-                // Translate the iris in viewBox units. The
-                // `irisOffset` puts it back at its rest position
-                // INSIDE the eye, then we add the pointer-relative
-                // delta on top. We DON'T counter-rotate against
-                // the spinner: the iris should rotate with the
-                // eye since it's part of the eyeball, but the
-                // tracking offset adds on top so the pupil drift
-                // matches the cursor in screen-space at the
-                // moment of the frame. The brief
-                // visual-anti-pattern of the iris tracking through
-                // a rotation is acceptable for a 22px icon.
                 irisG.setAttribute(
                     "transform",
                     `translate(${irisOffset.x + tx} ${irisOffset.y + ty})`,
@@ -105,8 +109,6 @@ export function MiniMascotSpinner({ size = 22, className }: Props) {
             });
         };
         window.addEventListener("mousemove", onMove, { passive: true });
-        // Park the iris at its rest position before the first
-        // mousemove so it doesn't render at the SVG origin.
         irisG.setAttribute(
             "transform",
             `translate(${irisOffset.x} ${irisOffset.y})`,
@@ -116,6 +118,152 @@ export function MiniMascotSpinner({ size = 22, className }: Props) {
             if (rafId !== null) cancelAnimationFrame(rafId);
         };
     }, []);
+
+    // Pop-and-vibrate timeline. Loops as long as the spinner is
+    // mounted. `useGSAP` ties the timeline to the component's
+    // lifetime so it cleans up on unmount.
+    useGSAP(
+        () => {
+            const hair = hairRef.current;
+            const beard = beardRef.current;
+            const eye = eyeOuterRef.current;
+            if (!hair || !beard || !eye) return;
+
+            // Honour the operator's motion preference — drop the lift
+            // and vibration, keep a gentle breath on the hair so the
+            // indicator is still visibly alive.
+            const reducedMotion =
+                typeof window !== "undefined" &&
+                window.matchMedia?.("(prefers-reduced-motion: reduce)")
+                    .matches;
+
+            // Pivots: hair sits ABOVE the rest of the face, so when we
+            // tilt it we want the pivot at the BOTTOM of the hair
+            // bbox (where it would "hinge" off the head). Beard
+            // pivots at its TOP so a vertical squash compresses
+            // toward the eye like an inhale. Eye stays centred.
+            gsap.set(hair, { transformOrigin: "50% 100%" });
+            gsap.set(beard, { transformOrigin: "50% 0%" });
+            gsap.set(eye, { transformOrigin: "50% 50%" });
+
+            if (reducedMotion) {
+                gsap.to(hair, {
+                    scale: 1.04,
+                    duration: 1.4,
+                    repeat: -1,
+                    yoyo: true,
+                    ease: "sine.inOut",
+                });
+                return;
+            }
+
+            const tl = gsap.timeline({ repeat: -1, defaults: { overwrite: "auto" } });
+
+            // 1. POP — hair leaps up + tilts, beard inhales, eye widens.
+            //    Values are in viewBox units (1254 wide); -150 ≈ 12% of
+            //    icon height, which reads as a noticeable hop on the
+            //    22px render.
+            tl.to(
+                hair,
+                {
+                    y: -150,
+                    scale: 1.06,
+                    rotation: -4,
+                    duration: 0.32,
+                    ease: "back.out(2)",
+                },
+                0,
+            )
+                .to(
+                    beard,
+                    {
+                        scaleY: 0.88,
+                        scaleX: 1.06,
+                        duration: 0.32,
+                        ease: "power2.out",
+                    },
+                    0,
+                )
+                .to(
+                    eye,
+                    {
+                        scale: 1.08,
+                        duration: 0.32,
+                        ease: "power2.out",
+                    },
+                    0,
+                );
+
+            // 2. VIBRATE — hair buzzes in mid-air for ~0.4s. Five fast
+            //    yoyo cycles cover the dwell with a perceptible jitter
+            //    without descending into a blur.
+            tl.to(
+                hair,
+                {
+                    rotation: "+=8",
+                    x: 18,
+                    y: -158,
+                    duration: 0.07,
+                    repeat: 5,
+                    yoyo: true,
+                    ease: "sine.inOut",
+                },
+                0.34,
+            );
+
+            // 3. DROP — hair falls back into place with a bounce.
+            tl.to(
+                hair,
+                {
+                    y: 0,
+                    x: 0,
+                    scale: 1,
+                    rotation: 0,
+                    duration: 0.45,
+                    ease: "bounce.out",
+                },
+                0.78,
+            )
+                // Beard catches the impact: tiny over-extension then a
+                // springy settle. Timed so the peak of the catch lines
+                // up with the moment the hair "lands" (about 0.95s in).
+                .to(
+                    beard,
+                    {
+                        scaleY: 1.05,
+                        scaleX: 0.97,
+                        duration: 0.18,
+                        ease: "power3.out",
+                    },
+                    1.05,
+                )
+                .to(
+                    beard,
+                    {
+                        scaleY: 1,
+                        scaleX: 1,
+                        duration: 0.35,
+                        ease: "elastic.out(1, 0.45)",
+                    },
+                    1.23,
+                )
+                .to(
+                    eye,
+                    {
+                        scale: 1,
+                        duration: 0.3,
+                        ease: "power2.out",
+                    },
+                    1.0,
+                );
+
+            // 4. BREATH — short hold before the next pop. Keeps the
+            //    cycle from feeling frantic; a working-indicator
+            //    needs to feel like steady thinking, not panic.
+            tl.to({}, { duration: 0.45 }, ">");
+        },
+        { dependencies: [] },
+    );
 
     return (
         <svg
@@ -129,36 +277,18 @@ export function MiniMascotSpinner({ size = 22, className }: Props) {
                 "execlaw-mini-mascot" + (className ? " " + className : "")
             }
         >
-            {/* Rotating outer group — hair + beard + eye outline.
-                Pivot is the viewBox centre, not the group's
-                bounding-box centre: the mascot's hair extends
-                higher than the beard extends low, so the bbox
-                centre is below-of-eye and rotating around that
-                makes the face wobble. We pivot in viewBox-space
-                coordinates instead — see the `transform-box:
-                view-box` rule on `.execlaw-mini-mascot__rotor`
-                in theme.scss. CSS class drives the spin so we
-                don't pay a JS animation tick per frame on every
-                WS event flush. */}
-            <g className="execlaw-mini-mascot__rotor">
-                <path d={HAIR_PATH} fill="currentColor" />
-                <path d={BEARD_PATH} fill="currentColor" />
-                {/* Eye + iris share a parent <g ref> so the
-                    iris's `transform` is relative to the eye's
-                    coordinate frame. */}
-                <g ref={eyeOuterRef}>
+            <path ref={hairRef} d={HAIR_PATH} fill="currentColor" />
+            <path ref={beardRef} d={BEARD_PATH} fill="currentColor" />
+            {/* Eye + iris share a parent <g> so iris transform is
+                relative to the eye coordinate frame. */}
+            <g ref={eyeOuterRef}>
+                <path ref={eyePathRef} d={EYE_PATH} fill="currentColor" />
+                <g ref={irisRef} className="execlaw-mini-mascot__iris">
                     <path
-                        ref={eyePathRef}
-                        d={EYE_PATH}
-                        fill="currentColor"
+                        ref={irisPathRef}
+                        d={IRIS_PATH}
+                        fill="var(--bs-body-bg, #0d1117)"
                     />
-                    <g ref={irisRef} className="execlaw-mini-mascot__iris">
-                        <path
-                            ref={irisPathRef}
-                            d={IRIS_PATH}
-                            fill="var(--bs-body-bg, #0d1117)"
-                        />
-                    </g>
                 </g>
             </g>
         </svg>

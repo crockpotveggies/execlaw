@@ -108,18 +108,22 @@ export function AutomationsPage() {
     );
 
     return (
-        <div className="execlaw-automations" data-testid="automations-landing">
-            <ErrorBanner message={error} onDismiss={() => setError(null)} />
+        <div data-testid="automations-landing">
+            <ErrorBanner
+                message={error}
+                onDismiss={() => setError(null)}
+                className="mb-3"
+            />
 
-            <div className="d-flex justify-content-between align-items-center mb-3">
-                <p className="text-muted small mb-0">
+            <div className="d-flex justify-content-between align-items-start gap-3 mb-3">
+                <p className="execlaw-muted small mb-0">
                     Event-triggered flows. Webhooks, routines, and plugin
                     emits land on the bus; matching automations run their
                     graph and write a per-step trace you can replay.
                 </p>
                 <Link
                     to="/automations/new"
-                    className="btn btn-primary btn-sm"
+                    className="btn btn-primary btn-sm flex-shrink-0"
                     data-testid="new-automation-btn"
                 >
                     <i className="bi bi-plus-lg me-1" aria-hidden /> New automation
@@ -137,14 +141,13 @@ export function AutomationsPage() {
                 />
             )}
 
-            <h3 className="h6 mt-4">Your automations</h3>
+            <h3 className="h6 mt-4 mb-2">Your automations</h3>
             {automations.length === 0 ? (
-                <div
-                    className="execlaw-muted small p-3 border rounded"
-                    data-testid="automations-empty"
-                >
-                    No automations yet. Create one from a suggestion above, or
-                    click <strong>New automation</strong>.
+                <div className="execlaw-card" data-testid="automations-empty">
+                    <div className="execlaw-muted small">
+                        No automations yet. Create one from a suggestion above,
+                        or click <strong>New automation</strong>.
+                    </div>
                 </div>
             ) : (
                 <AutomationsTable
@@ -191,10 +194,13 @@ function MetricCards({ metrics }: { metrics: AutomationMetrics | null }) {
         >
             {cards.map((c) => (
                 <div key={c.label} className="col">
-                    <div className="border rounded p-3 h-100" data-testid={c.testId}>
-                        <div className="text-muted small">{c.label}</div>
+                    <div
+                        className="execlaw-card h-100 mb-0"
+                        data-testid={c.testId}
+                    >
+                        <div className="execlaw-muted small">{c.label}</div>
                         <div className="h4 mb-0">{c.value}</div>
-                        <div className="text-muted small mt-1">{c.help}</div>
+                        <div className="execlaw-muted small mt-1">{c.help}</div>
                     </div>
                 </div>
             ))}
@@ -217,7 +223,7 @@ function SuggestionsSection({
 }: SuggestionsSectionProps) {
     return (
         <section className="mt-4" data-testid="suggestions-section">
-            <h3 className="h6">
+            <h3 className="h6 mb-2">
                 <i className="bi bi-lightbulb me-1" aria-hidden />
                 Suggestions ({suggestions.length})
             </h3>
@@ -225,11 +231,11 @@ function SuggestionsSection({
                 {suggestions.map((s) => (
                     <li
                         key={s.id}
-                        className="border rounded p-3 mb-2 d-flex justify-content-between align-items-center"
+                        className="execlaw-card d-flex justify-content-between align-items-center"
                         data-testid={`suggestion-${s.id}`}
                     >
                         <div className="me-3">
-                            <div className="small text-muted">
+                            <div className="small execlaw-muted">
                                 {s.event_count} {kindLabel(s.kind).toLowerCase()} events
                                 from <code>{s.source}</code> with no automation
                             </div>

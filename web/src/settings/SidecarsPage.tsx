@@ -117,7 +117,7 @@ export function SidecarsPage() {
     return (
         <div data-testid="settings-sidecars">
             <div className="d-flex align-items-center mb-3">
-                <h3 className="h6 mb-0 flex-grow-1">Sidecars</h3>
+                <div className="flex-grow-1" />
                 <Button
                     size="sm"
                     variant="outline-secondary"

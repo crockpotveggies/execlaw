@@ -261,7 +261,11 @@ export function AutomationDetailPage({ id }: Props) {
 
     return (
         <div className="execlaw-automation-detail" data-testid="automation-detail">
-            <ErrorBanner message={error} onDismiss={() => setError(null)} />
+            <ErrorBanner
+                message={error}
+                onDismiss={() => setError(null)}
+                className="mb-3"
+            />
 
             <div className="d-flex justify-content-between align-items-start mb-3">
                 <div className="flex-grow-1 me-3">

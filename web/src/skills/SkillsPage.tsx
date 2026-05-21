@@ -73,32 +73,34 @@ export function SkillsPage() {
                 onDismiss={() => setError(null)}
                 className="m-3"
             />
-            <ul className="nav nav-tabs px-3 pt-2" role="tablist">
-                <li className="nav-item">
-                    <button
-                        type="button"
-                        className={
-                            "nav-link" + (tab === "skills" ? " active" : "")
-                        }
-                        onClick={() => setTab("skills")}
-                        data-testid="skills-tab-skills"
-                    >
-                        Skills
-                    </button>
-                </li>
-                <li className="nav-item">
-                    <button
-                        type="button"
-                        className={
-                            "nav-link" + (tab === "proposals" ? " active" : "")
-                        }
-                        onClick={() => setTab("proposals")}
-                        data-testid="skills-tab-proposals"
-                    >
-                        Proposals
-                    </button>
-                </li>
-            </ul>
+            <nav className="execlaw-skills__tabs" role="tablist" aria-label="Skills sections">
+                <button
+                    type="button"
+                    role="tab"
+                    aria-selected={tab === "skills"}
+                    className={
+                        "execlaw-skills__tab" +
+                        (tab === "skills" ? " is-active" : "")
+                    }
+                    onClick={() => setTab("skills")}
+                    data-testid="skills-tab-skills"
+                >
+                    Skills
+                </button>
+                <button
+                    type="button"
+                    role="tab"
+                    aria-selected={tab === "proposals"}
+                    className={
+                        "execlaw-skills__tab" +
+                        (tab === "proposals" ? " is-active" : "")
+                    }
+                    onClick={() => setTab("proposals")}
+                    data-testid="skills-tab-proposals"
+                >
+                    Proposals
+                </button>
+            </nav>
             {tab === "skills" ? (
                 <SkillsTab isController={isController} onError={setError} />
             ) : (

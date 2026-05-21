@@ -36,7 +36,12 @@ $info:           #58a6ff;
 // sidebar card's corresponding edge. Mirrors the Hanaoka reference's
 // 2rem inset; a touch tighter so we don't lose horizontal space on
 // 13" laptops.
-$shell-gutter:   1.5rem;
+//
+// 2026-05-20 — dropped from 1.5rem to 1rem. The wider gutter ate
+// horizontal real estate without adding visual hierarchy and made
+// the sidebar feel adrift from the main content. 1rem keeps the
+// "floating card" affordance while pulling the page closer.
+$shell-gutter:   1rem;
 // Width of the floating sidebar (excluding its gutter on either
 // side).
 $sidebar-width:  16rem;
@@ -778,7 +783,12 @@ body {
     // adds 1.1rem of its own __head padding, so its `.execlaw-brand`
     // sits `$shell-gutter + 1.1rem` from the viewport top. The main
     // pane is in normal flow, so we have to cover the gutter here.
-    padding: calc(#{$shell-gutter} + 1.1rem) 1.25rem 0.85rem;
+    //
+    // 2026-05-20 — horizontal padding bumped to 1.5rem so the page
+    // title lines up with `.execlaw-page--scroll` / `.execlaw-stream`
+    // content below. Previously 1.25rem, leaving the title slightly
+    // left of the body on every non-chat page.
+    padding: calc(#{$shell-gutter} + 1.1rem) 1.5rem 0.85rem;
     display: flex;
     align-items: center;
     gap: 0.5rem;
@@ -815,7 +825,10 @@ body {
     // `margin-inline: auto` below, so the reading column is
     // 48rem max while the scroll background extends to the
     // sidebar's right edge.
-    padding: 1.25rem 1.25rem 0.5rem;
+    // 2026-05-20 — horizontal padding aligned to 1.5rem (was 1.25rem)
+    // so narrow-viewport message column matches `.execlaw-main__head`
+    // and `.execlaw-page--scroll`.
+    padding: 1.25rem 1.5rem 0.5rem;
     min-height: 0;
 }
 
@@ -1155,38 +1168,27 @@ body {
     opacity: 0.85;
 }
 
-// Mini mascot used by the loader. The outer rotor group spins
-// at a leisurely pace; the iris stays put visually because its
-// `transform` is set per-frame from the cursor-tracking JS.
+// Mini mascot used by the loader. Pre-2026-05-20 the whole face
+// spun 360° in a CSS keyframe — readable but generic, didn't
+// signal "thinking" so much as "buffering." Replaced with a GSAP
+// timeline driven from `MiniMascotSpinner.tsx`: the hair pops up
+// and vibrates as if the agent's brain is buzzing, while the
+// beard squashes-and-catches to anchor the motion. Each shape
+// has its own ref/transform-origin (set by GSAP at runtime), so
+// no CSS animation lives here anymore.
+//
+// transform-box: fill-box makes SVG transforms operate in each
+// path's own bounding-box frame, which keeps the hair pivoting
+// around the bottom of the hair (not the SVG canvas centre).
 .execlaw-mini-mascot {
     color: $text-muted;
     flex-shrink: 0;
     display: inline-block;
     vertical-align: middle;
-}
 
-.execlaw-mini-mascot__rotor {
-    // 2026-05-02 — `view-box` is the spec default for SVG
-    // elements but several browsers (Safari, older Chromium)
-    // silently fall back to `fill-box`, which puts the
-    // transform-origin in the rotor's own bounding-box frame.
-    // The mascot's hair extends much higher than the beard
-    // extends low, so the bbox centre is below the eye and the
-    // face wobbles in a tilted ellipse. Pinning to `view-box` +
-    // `50% 50%` rotates around the SVG canvas centre (627, 627
-    // for the 1254-unit viewBox), which is where the operator
-    // expects the pivot.
-    transform-box: view-box;
-    transform-origin: 50% 50%;
-    animation: execlaw-mini-mascot-spin 1.6s linear infinite;
-}
-
-@keyframes execlaw-mini-mascot-spin {
-    from {
-        transform: rotate(0deg);
-    }
-    to {
-        transform: rotate(360deg);
+    path,
+    g {
+        transform-box: fill-box;
     }
 }
 
@@ -1694,49 +1696,104 @@ body {
     padding: 2rem 1rem;
 }
 
-// ---- Settings shell ----------------------------------------------
-.execlaw-settings {
-    flex: 1 1 auto;
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
-    overflow-y: auto;
-    padding: 1.5rem 2rem 3rem;
+// ---- Settings modal ----------------------------------------------
+//
+// 2026-05-20 — Settings was a top-level route with 22 horizontal
+// wrapping tabs. The tab strip looked busy on every viewport and
+// pulled the operator out of context (full route change) for what
+// is usually a small targeted edit. Rebuilt as a large modal that
+// overlays the chat shell: a vertical sub-sidebar holds every
+// section (scrollable when the list outgrows the viewport), and the
+// right pane scrolls independently for the active sub-page's body.
+// The /settings/* route still drives which sub-page is active, so
+// deep links and back-button navigation keep working.
+.execlaw-settings-modal__backdrop {
+    position: fixed;
+    inset: 0;
+    background-color: rgba(0, 0, 0, 0.55);
+    z-index: 1040;
+    // Soft fade-in so the overlay doesn't snap onto the screen.
+    animation: execlaw-settings-modal-fade 0.15s ease-out;
 }
 
-.execlaw-settings__head {
+.execlaw-settings-modal {
+    position: fixed;
+    // Inset the card so a sliver of the chat shell shows through —
+    // anchors the modal to the surrounding app rather than feeling
+    // detached. 4vh top/bottom, 4vw sides clamp to 2rem min so it
+    // doesn't collide with the viewport edge on narrow windows.
+    inset: max(2rem, 4vh) max(2rem, 4vw);
+    background-color: $bg-surface;
+    border-radius: $radius-card;
+    box-shadow: $shadow-float;
     display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    margin-bottom: 1rem;
+    flex-direction: row;
+    overflow: hidden;
+    z-index: 1041;
+    animation: execlaw-settings-modal-pop 0.18s ease-out;
+}
 
-    // Page titles in IBM Plex Sans (matches chat header).
-    h1,
-    h2,
-    h3 {
-        font-family: $font-body;
-        font-weight: 500;
+@keyframes execlaw-settings-modal-fade {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+}
+
+@keyframes execlaw-settings-modal-pop {
+    from { opacity: 0; transform: translateY(0.5rem); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+// Left sub-sidebar — vertical scrollable nav listing every settings
+// section. Surface-tone matches the main app sidebar so the modal
+// "matches" the chrome it's overlaying.
+.execlaw-settings-modal__nav {
+    flex: 0 0 16rem;
+    background-color: $bg-deep;
+    overflow-y: auto;
+    padding: 1rem 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+
+    @media (max-width: 767.98px) {
+        flex: 0 0 12rem;
     }
 }
 
-.execlaw-settings__tabs {
+.execlaw-settings-modal__nav-head {
+    padding: 0.4rem 0.85rem 0.75rem;
     display: flex;
-    flex-wrap: wrap;
-    gap: 0.4rem;
-    padding-bottom: 0.5rem;
-    margin-bottom: 1.5rem;
+    align-items: center;
+    gap: 0.5rem;
+    font-family: $font-body;
+    font-weight: 500;
+    font-size: 1rem;
+    color: $text-primary;
 }
 
-.execlaw-settings__tab {
-    background: transparent;
-    border: 0;
-    color: $text-muted;
+.execlaw-settings-modal__nav-item {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
     padding: 0.4rem 0.85rem;
     border-radius: $radius-pill;
-    font-size: 0.9rem;
-    cursor: pointer;
+    color: $text-muted;
+    font-size: 0.85rem;
     text-decoration: none;
     transition: background-color 0.12s ease, color 0.12s ease;
+    cursor: pointer;
+    background: transparent;
+    border: 0;
+    text-align: left;
+    width: 100%;
+
+    i {
+        font-size: 0.95rem;
+        width: 1.1rem;
+        flex: 0 0 1.1rem;
+        text-align: center;
+        opacity: 0.85;
+    }
 
     &:hover {
         background-color: $bg-surface;
@@ -1748,6 +1805,56 @@ body {
         color: color.adjust($accent, $lightness: 18%);
     }
 }
+
+// Right pane — scrollable content surface for the active sub-page.
+.execlaw-settings-modal__pane {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    background-color: $bg-surface;
+}
+
+.execlaw-settings-modal__head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 1.1rem 1.5rem 0.85rem;
+
+    h2 {
+        font-family: $font-body;
+        font-weight: 500;
+        margin: 0;
+    }
+}
+
+.execlaw-settings-modal__close {
+    margin-left: auto;
+    background: transparent;
+    border: 0;
+    color: $text-muted;
+    width: 2rem;
+    height: 2rem;
+    border-radius: 50%;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background-color 0.12s ease, color 0.12s ease;
+
+    &:hover {
+        background-color: $bg-elev;
+        color: $text-primary;
+    }
+}
+
+.execlaw-settings-modal__body {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 0.5rem 1.5rem 1.75rem;
+    min-height: 0;
+}
+
 
 .execlaw-card {
     background-color: $bg-surface;
@@ -2241,7 +2348,9 @@ body {
 
 .execlaw-page--scroll {
     overflow-y: auto;
-    padding: 1.25rem 1.75rem 3rem;
+    // 2026-05-20 — horizontal padding aligned to 1.5rem so the body
+    // sits flush under `.execlaw-main__head`'s title on every page.
+    padding: 1.25rem 1.5rem 3rem;
 
     @media (max-width: 767.98px) {
         padding: 1rem 1rem 2rem;
@@ -2513,6 +2622,38 @@ body {
 // inside the remaining height instead of pushing past it.
 .execlaw-skills {
     // Inherits flex column + min-height: 0 + bg from `.execlaw-page`.
+}
+
+// 2026-05-20 — Skills tabs were using raw `.nav.nav-tabs` from
+// Bootstrap, which doesn't match the pill-style affordance used
+// elsewhere (Research filters, the old Settings tabs). Custom token
+// matches `.execlaw-research__filters` / `.execlaw-research__filter`
+// in spirit so the operator sees consistent chrome across pages.
+.execlaw-skills__tabs {
+    display: flex;
+    gap: 0.4rem;
+    padding: 0.75rem 1.5rem 0.5rem;
+}
+
+.execlaw-skills__tab {
+    background: transparent;
+    border: 0;
+    color: $text-muted;
+    padding: 0.4rem 0.85rem;
+    border-radius: $radius-pill;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: background-color 0.12s ease, color 0.12s ease;
+
+    &:hover {
+        background-color: $bg-surface;
+        color: $text-primary;
+    }
+
+    &.is-active {
+        background-color: rgba($accent, 0.18);
+        color: color.adjust($accent, $lightness: 18%);
+    }
 }
 
 .execlaw-skills__toolbar {

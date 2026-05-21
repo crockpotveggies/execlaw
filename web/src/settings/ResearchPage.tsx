@@ -201,7 +201,6 @@ export function ResearchPage() {
 
     return (
         <div data-testid="settings-research">
-            <h3 className="h6 mb-3">Research</h3>
             <p className="execlaw-muted small mb-3">
                 Defaults for the deep-research subsystem. The agent uses
                 <code className="ms-1 me-1">research_start</code>

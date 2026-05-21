@@ -146,7 +146,6 @@ export function TrustPolicyPage() {
 
     return (
         <div data-testid="settings-trust-policy">
-            <h3 className="h6 mb-1">Trust policy</h3>
             <p className="execlaw-muted small mb-3">
                 Rules the cold-contact trust ladder and mixed-trust group
                 resolution follow. Defaults match the documented behaviour;

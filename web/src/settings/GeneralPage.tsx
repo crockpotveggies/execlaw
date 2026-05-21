@@ -141,7 +141,6 @@ export function GeneralPage() {
 
     return (
         <div data-testid="settings-general">
-            <h3 className="h6 mb-3">{t("general.title", "General")}</h3>
             <p className="execlaw-muted small mb-3">
                 {t(
                     "general.introPre",

@@ -33,8 +33,6 @@ export function EvalFlagsPage() {
 
     return (
         <div data-testid="settings-eval">
-            <h3 className="h6 mb-3">Eval flags</h3>
-
             <div className="execlaw-card">
                 <Form className="d-flex gap-2 align-items-end">
                     <Form.Group className="flex-grow-1">

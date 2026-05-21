@@ -119,12 +119,9 @@ export function AlertsPage() {
 
     return (
         <div data-testid="settings-alerts">
-            <div className="d-flex align-items-baseline gap-2 mb-2">
-                <h3 className="h6 mb-0 flex-grow-1">Alerts</h3>
-                {headerCount && (
-                    <span className="execlaw-muted small">{headerCount}</span>
-                )}
-            </div>
+            {headerCount && (
+                <div className="execlaw-muted small mb-2">{headerCount}</div>
+            )}
             <p className="execlaw-muted small mb-3">
                 Operational anomalies — plugin failures, OAuth expiries,
                 rate-limits, runner crashes. Ack to silence the badge;

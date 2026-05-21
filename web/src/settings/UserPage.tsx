@@ -70,9 +70,6 @@ export function UserPage() {
 
     return (
         <div data-testid="settings-user">
-            <div className="d-flex align-items-center mb-3">
-                <h3 className="h6 mb-0 flex-grow-1">User</h3>
-            </div>
             <p className="execlaw-muted small mb-3">
                 Operator accounts, your password, your passkeys, and
                 active sessions — everything that controls how you (and

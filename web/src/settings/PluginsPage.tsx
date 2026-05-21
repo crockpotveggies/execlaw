@@ -64,8 +64,6 @@ export function PluginsPage() {
 
     return (
         <div data-testid="settings-plugins">
-            <h3 className="h6 mb-3">Plugins</h3>
-
             <InstallCard onInstalled={fetchList} />
 
             <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />

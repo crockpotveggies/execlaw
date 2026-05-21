@@ -32,8 +32,6 @@ export function AuditPage() {
 
     return (
         <div data-testid="settings-audit">
-            <h3 className="h6 mb-3">Audit log</h3>
-
             <ErrorBanner message={error} onDismiss={() => setError(null)} className="mb-3" />
 
             <div className="execlaw-card">

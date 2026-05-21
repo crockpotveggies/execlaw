@@ -73,8 +73,6 @@ export function LogsPage() {
 
     return (
         <div data-testid="settings-logs">
-            <h3 className="h6 mb-3">Logs</h3>
-
             <div className="execlaw-card">
                 <Form className="row g-2 align-items-end">
                     <Form.Group className="col-sm-2">

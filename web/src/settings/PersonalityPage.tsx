@@ -162,7 +162,6 @@ export function PersonalityPage() {
 
     return (
         <div data-testid="settings-personality">
-            <h3 className="h6 mb-1">Personality</h3>
             <p className="execlaw-muted small mb-3">
                 Operator-editable system-prompt fields — the agent's voice,
                 tone, persona, and any standing instructions you want it to
