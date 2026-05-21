@@ -81,6 +81,14 @@ export interface AutomationView {
     definition: AutomationDef;
     created_at: number;
     updated_at: number;
+    /** M6 — `"operator"` | `"core"` | `"plugin:<id>"`. */
+    source?: string;
+    /** M6 — `true` when the operator has edited a non-operator row. */
+    operator_modified?: boolean;
+    /** M6 — convenience: `true` for core- + plugin-shipped defaults.
+     *  When true the SPA hides the delete button (server-side
+     *  delete returns 403 with code `automation_is_default`). */
+    is_default?: boolean;
 }
 
 export interface UpsertAutomationBody {

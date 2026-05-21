@@ -62,6 +62,10 @@ export function AutomationDetailPage({ id }: Props) {
     const [error, setError] = useState<string | null>(null);
     const [busy, setBusy] = useState<boolean>(false);
     const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
+    // M6 — provenance fields, surfaced for the delete-button guard
+    // and (future) the diff-on-upgrade card.
+    const [source, setSource] = useState<string>("operator");
+    const [isDefault, setIsDefault] = useState<boolean>(false);
     // M4c additions:
     const [view, setView] = useState<"canvas" | "code">("canvas");
     const [testRunOpen, setTestRunOpen] = useState<boolean>(false);
@@ -137,6 +141,8 @@ export function AutomationDetailPage({ id }: Props) {
                 setEnabled(row.enabled);
                 setDefJson(JSON.stringify(row.definition, null, 2));
                 setRuns(runRows);
+                setSource(row.source ?? "operator");
+                setIsDefault(Boolean(row.is_default));
                 setLoaded(true);
             } catch (e) {
                 if (!cancelled) {
@@ -240,6 +246,18 @@ export function AutomationDetailPage({ id }: Props) {
 
     const onDelete = useCallback(async () => {
         if (isNew) return;
+        if (isDefault) {
+            // Belt-and-suspenders — the button is hidden when
+            // isDefault, but a stale-state click would otherwise hit
+            // the server and get a 403. Surface the same message
+            // the server returns without round-tripping.
+            setError(
+                `Default flows shipped by '${source}' cannot be deleted. Disable via the Enabled switch, or uninstall the source ${
+                    source === "core" ? "feature" : "plugin"
+                }.`,
+            );
+            return;
+        }
         if (!confirm("Delete this automation? This cannot be undone.")) return;
         setBusy(true);
         try {
@@ -249,7 +267,7 @@ export function AutomationDetailPage({ id }: Props) {
             setError((e as Error).message || "Delete failed");
             setBusy(false);
         }
-    }, [id, isNew, navigate, token]);
+    }, [id, isNew, isDefault, source, navigate, token]);
 
     if (!loaded) {
         return (
@@ -304,7 +322,7 @@ export function AutomationDetailPage({ id }: Props) {
                     >
                         Save
                     </Button>
-                    {!isNew && (
+                    {!isNew && !isDefault && (
                         <Button
                             variant="outline-danger"
                             size="sm"
@@ -314,6 +332,18 @@ export function AutomationDetailPage({ id }: Props) {
                         >
                             Delete
                         </Button>
+                    )}
+                    {!isNew && isDefault && (
+                        <span
+                            className="badge text-bg-secondary align-self-center"
+                            title={`This is a default flow shipped by '${source}'. Disable it via the Enabled switch instead, or uninstall the source ${
+                                source === "core" ? "feature" : "plugin"
+                            } to remove it.`}
+                            data-testid="automation-default-badge"
+                        >
+                            <i className="bi bi-shield-lock-fill me-1" aria-hidden />
+                            {source === "core" ? "Core default" : `From ${source}`}
+                        </span>
                     )}
                 </div>
             </div>

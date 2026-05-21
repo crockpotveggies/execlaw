@@ -1781,7 +1781,7 @@ fn import_m6_registry(
                 }
             };
             let now = chrono::Utc::now().timestamp_millis();
-            if let Err(e) = store.upsert(
+            match store.upsert(
                 &AutomationUpsert {
                     id: None,
                     name: d.name.clone(),
@@ -1790,19 +1790,46 @@ fn import_m6_registry(
                 },
                 now,
             ) {
-                warn!(
-                    plugin_id,
-                    name = %d.name,
-                    error = %e,
-                    "M6: default automation upsert failed (install continued)"
-                );
-            } else {
-                tracing::info!(
-                    plugin_id,
-                    name = %d.name,
-                    enabled = d.enabled,
-                    "M6: imported default automation"
-                );
+                Ok(row) => {
+                    // Stamp provenance so the row is protected from
+                    // operator deletion + the SPA hides the delete
+                    // button. AutomationUpsert intentionally doesn't
+                    // expose the source column for operator-driven
+                    // writes; we set it via direct SQL on the just-
+                    // inserted id.
+                    let source = format!("plugin:{plugin_id}");
+                    let version = _plugin_version.to_owned();
+                    if let Err(e) = db.with_conn(|c| {
+                        c.execute(
+                            "UPDATE state_automations \
+                             SET source = ?1, source_version = ?2 \
+                             WHERE id = ?3",
+                            rusqlite::params![source, version, row.id],
+                        )?;
+                        Ok(())
+                    }) {
+                        warn!(
+                            plugin_id,
+                            name = %d.name,
+                            error = %e,
+                            "M6: failed to stamp source on default automation (row still installed)"
+                        );
+                    }
+                    tracing::info!(
+                        plugin_id,
+                        name = %d.name,
+                        enabled = d.enabled,
+                        "M6: imported default automation"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        plugin_id,
+                        name = %d.name,
+                        error = %e,
+                        "M6: default automation upsert failed (install continued)"
+                    );
+                }
             }
         }
     }

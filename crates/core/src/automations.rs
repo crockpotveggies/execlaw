@@ -256,6 +256,28 @@ pub struct AutomationRow {
     pub definition: AutomationDef,
     pub created_at: i64,
     pub updated_at: i64,
+    /// M6 — provenance. `"operator"` for operator-authored,
+    /// `"core"` for built-in defaults, `"plugin:<id>"` for plugin-
+    /// shipped defaults. Deletion is gated to operator-source rows
+    /// only; defaults are managed by the install lifecycle.
+    pub source: String,
+    /// M6 — `true` when the operator has edited a non-operator
+    /// row. Plugin upgrades surface a diff card instead of silently
+    /// overwriting these. Default rows that the operator hasn't
+    /// touched stay `false`.
+    pub operator_modified: bool,
+}
+
+impl AutomationRow {
+    /// `true` for rows the operator did NOT author — built-in core
+    /// defaults + plugin-shipped defaults. The delete endpoint
+    /// refuses these (they're managed by the install lifecycle —
+    /// uninstall the plugin, or the row is removed by a future
+    /// migration if core retires it). The SPA hides the delete
+    /// button for these rows.
+    pub fn is_default(&self) -> bool {
+        self.source != "operator"
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -265,6 +287,20 @@ pub struct AutomationUpsert {
     pub name: String,
     pub enabled: bool,
     pub definition: AutomationDef,
+}
+
+/// Result of [`AutomationStore::delete`]. Carries enough info for
+/// the HTTP layer to choose the right status code + message.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeleteOutcome {
+    Deleted,
+    NotFound,
+    /// Refused because the row is a default flow shipped by core or
+    /// a plugin. Carries the `source` value so the error message
+    /// can say which install layer owns it.
+    RefusedDefault {
+        source: String,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -538,7 +574,8 @@ impl<'a> AutomationStore<'a> {
     pub fn get(&self, id: &str) -> Result<Option<AutomationRow>, AutomationError> {
         let row = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, name, enabled, definition, created_at, updated_at \
+                "SELECT id, name, enabled, definition, created_at, updated_at, \
+                        COALESCE(source, 'operator'), COALESCE(operator_modified, 0) \
                  FROM state_automations WHERE id = ?1",
             )?;
             let r = stmt
@@ -560,6 +597,8 @@ impl<'a> AutomationStore<'a> {
                         definition,
                         created_at: r.get(4)?,
                         updated_at: r.get(5)?,
+                        source: r.get(6)?,
+                        operator_modified: r.get::<_, i64>(7)? != 0,
                     })
                 })
                 .ok();
@@ -571,7 +610,8 @@ impl<'a> AutomationStore<'a> {
     pub fn list_all(&self) -> Result<Vec<AutomationRow>, AutomationError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, name, enabled, definition, created_at, updated_at \
+                "SELECT id, name, enabled, definition, created_at, updated_at, \
+                        COALESCE(source, 'operator'), COALESCE(operator_modified, 0) \
                  FROM state_automations ORDER BY created_at ASC",
             )?;
             let rows = stmt.query_map([], |r| {
@@ -591,6 +631,8 @@ impl<'a> AutomationStore<'a> {
                     definition,
                     created_at: r.get(4)?,
                     updated_at: r.get(5)?,
+                    source: r.get(6)?,
+                    operator_modified: r.get::<_, i64>(7)? != 0,
                 })
             })?;
             let mut out = Vec::new();
@@ -612,7 +654,8 @@ impl<'a> AutomationStore<'a> {
         let kind_str = kind.as_str();
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, name, enabled, definition, created_at, updated_at \
+                "SELECT id, name, enabled, definition, created_at, updated_at, \
+                        COALESCE(source, 'operator'), COALESCE(operator_modified, 0) \
                  FROM state_automations \
                  WHERE enabled = 1 \
                    AND json_extract(definition, '$.trigger.kind') = ?1 \
@@ -635,6 +678,8 @@ impl<'a> AutomationStore<'a> {
                     definition,
                     created_at: r.get(4)?,
                     updated_at: r.get(5)?,
+                    source: r.get(6)?,
+                    operator_modified: r.get::<_, i64>(7)? != 0,
                 })
             })?;
             let mut out = Vec::new();
@@ -646,12 +691,34 @@ impl<'a> AutomationStore<'a> {
         Ok(rows)
     }
 
-    pub fn delete(&self, id: &str) -> Result<bool, AutomationError> {
+    /// Delete an automation by id. Refuses to delete default flows
+    /// (rows with `source != 'operator'`) — those are managed by the
+    /// install lifecycle (plugin install / uninstall, core upgrades).
+    /// Returns `DeleteOutcome::Refused` so the HTTP layer can surface
+    /// a 403 with an actionable message.
+    pub fn delete(&self, id: &str) -> Result<DeleteOutcome, AutomationError> {
+        // Inspect first so we know whether to refuse + surface a
+        // useful error to the operator instead of a silent no-op.
+        let row = self.get(id)?;
+        let Some(row) = row else {
+            return Ok(DeleteOutcome::NotFound);
+        };
+        if row.is_default() {
+            return Ok(DeleteOutcome::RefusedDefault {
+                source: row.source.clone(),
+            });
+        }
         let n = self.db.with_conn(|c| {
             let n = c.execute("DELETE FROM state_automations WHERE id = ?1", params![id])?;
             Ok(n)
         })?;
-        Ok(n > 0)
+        if n > 0 {
+            Ok(DeleteOutcome::Deleted)
+        } else {
+            // Race: the row was deleted between our get() and the
+            // execute(). Treat as NotFound rather than panicking.
+            Ok(DeleteOutcome::NotFound)
+        }
     }
 
     pub fn set_enabled(&self, id: &str, enabled: bool, now: i64) -> Result<bool, AutomationError> {
@@ -1153,8 +1220,73 @@ mod tests {
                 1000,
             )
             .unwrap();
-        assert!(store.delete(&row.id).unwrap());
+        assert_eq!(store.delete(&row.id).unwrap(), DeleteOutcome::Deleted);
         assert!(store.get(&row.id).unwrap().is_none());
-        assert!(!store.delete(&row.id).unwrap()); // idempotent
+        // Idempotent — second delete reports NotFound, not an error.
+        assert_eq!(store.delete(&row.id).unwrap(), DeleteOutcome::NotFound);
+    }
+
+    #[test]
+    fn delete_refuses_default_source_rows() {
+        let db = fresh_db();
+        let store = AutomationStore::new(&db);
+        let row = store
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: "default web prompt flow".into(),
+                    enabled: true,
+                    definition: linear_def(),
+                },
+                1000,
+            )
+            .unwrap();
+        // Promote to a core-shipped default row by patching source
+        // directly (operator manifests would normally do this via
+        // the plugin-host install path).
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_automations SET source = 'core' WHERE id = ?1",
+                rusqlite::params![row.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let outcome = store.delete(&row.id).unwrap();
+        match outcome {
+            DeleteOutcome::RefusedDefault { source } => assert_eq!(source, "core"),
+            other => panic!("expected RefusedDefault, got {other:?}"),
+        }
+        // Row still exists.
+        assert!(store.get(&row.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_refuses_plugin_source_rows() {
+        let db = fresh_db();
+        let store = AutomationStore::new(&db);
+        let row = store
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: "whatsapp default".into(),
+                    enabled: true,
+                    definition: linear_def(),
+                },
+                1000,
+            )
+            .unwrap();
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_automations SET source = 'plugin:whatsapp' WHERE id = ?1",
+                rusqlite::params![row.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let outcome = store.delete(&row.id).unwrap();
+        assert!(
+            matches!(outcome, DeleteOutcome::RefusedDefault { source } if source == "plugin:whatsapp")
+        );
     }
 }

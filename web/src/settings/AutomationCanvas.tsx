@@ -25,6 +25,8 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import OverlayTrigger from "react-bootstrap/OverlayTrigger";
+import Tooltip from "react-bootstrap/Tooltip";
 import {
     AutomationNodePanel,
 } from "./AutomationNodePanel";
@@ -554,9 +556,40 @@ function NodePalette() {
     );
 }
 
+/// Operator-facing one-line description per kind. Surfaced in the
+/// palette tile's hover tooltip so an author who doesn't recognize a
+/// kind learns what dropping it does without leaving the canvas.
+const PALETTE_TOOLTIPS: Record<NodeKind, string> = {
+    Filter:
+        "Drops the run unless a Rhai bool expression evaluates truthy. Common gate: only proceed when the event payload matches some condition.",
+    Transform:
+        "Rewrites the event/state into a new shape via a Rhai value expression. Use to extract or compute fields before downstream nodes see them.",
+    Branch:
+        "Routing junction with no config. Add multiple outgoing edges and set each one's `when` clause to fan out the flow.",
+    Terminal:
+        "Ends the run with status `success`. Optional — flows without an explicit Terminal also end at implicit graph leaves.",
+    AskAgent:
+        "Invokes the LLM with a prompt + attachments + exit tools. The agent picks one exit tool to terminate the turn; downstream Branches route on that tool name.",
+    Notify:
+        "Inserts an alert row (Info / Warning / Error / Critical). Useful for surfacing flow outcomes in the alerts dropdown without sending a chat reply.",
+    CallPlugin:
+        "Calls a plugin-registered tool by name (e.g., `calendar.create_event`) with templated args. The tool's return value becomes the node's output.",
+    SendReply:
+        "Delivers a reply back through the trigger's `envelope.origin` — chat thread, WhatsApp/Signal, the operator Inbox, or none, depending on the origin.",
+    // Reserved — these tiles aren't in the default palette but the
+    // typechecker forces an entry for every NodeKind variant.
+    AppendToChat: "(reserved — not yet implemented)",
+    HttpFetch: "(reserved — not yet implemented)",
+    AwaitApproval: "(reserved — not yet implemented)",
+    CallAutomation: "(reserved — not yet implemented)",
+    Parallel: "(reserved — not yet implemented)",
+    Join: "(reserved — not yet implemented)",
+};
+
 function PaletteTile({ kind }: { kind: NodeKind }) {
     const accent = KIND_COLORS[kind] ?? "#7d8590";
-    return (
+    const description = PALETTE_TOOLTIPS[kind];
+    const tile = (
         <div
             draggable
             onDragStart={(e) => {
@@ -574,7 +607,6 @@ function PaletteTile({ kind }: { kind: NodeKind }) {
                 userSelect: "none",
             }}
             data-testid={`palette-${kind}`}
-            title={`Drag a ${kind} node onto the canvas`}
         >
             <i
                 className={`bi ${KIND_ICONS[kind] ?? "bi-square"} me-1`}
@@ -583,6 +615,37 @@ function PaletteTile({ kind }: { kind: NodeKind }) {
             />
             {kind}
         </div>
+    );
+    return (
+        <OverlayTrigger
+            placement="top"
+            // Slight delay-show so the tooltip doesn't fight a drag
+            // gesture (drag starts immediately on mousedown; tooltip
+            // would otherwise flash for the cursor's first pixel of
+            // travel toward the canvas).
+            delay={{ show: 250, hide: 0 }}
+            overlay={
+                <Tooltip
+                    id={`palette-tooltip-${kind}`}
+                    data-testid={`palette-tooltip-${kind}`}
+                    style={{ maxWidth: 280 }}
+                >
+                    <div style={{ fontWeight: 600, marginBottom: 2 }}>
+                        <i
+                            className={`bi ${KIND_ICONS[kind] ?? "bi-square"} me-1`}
+                            style={{ color: accent }}
+                            aria-hidden
+                        />
+                        {kind}
+                    </div>
+                    <div style={{ fontSize: 11, lineHeight: 1.4, textAlign: "left" }}>
+                        {description}
+                    </div>
+                </Tooltip>
+            }
+        >
+            {tile}
+        </OverlayTrigger>
     );
 }
 

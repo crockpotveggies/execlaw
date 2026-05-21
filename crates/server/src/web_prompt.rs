@@ -218,15 +218,14 @@ pub fn default_web_flow_json() -> serde_json::Value {
     })
 }
 
-/// Seed the core default flow into `state_automations` if no row
-/// with `source = "core"` and matching name exists yet. Idempotent
-/// and disabled-by-default so the existing chat path isn't
-/// shadowed without operator consent.
+/// Seed the core default web prompt flow into `state_automations`
+/// if no row claims the slot yet. Idempotent. Stamps `source = 'core'`
+/// so the row is protected from operator deletion via the regular
+/// admin endpoint (the install lifecycle owns these rows).
 pub fn ensure_default_web_flow(db: &execlaw_core::Database) -> Result<(), String> {
     use execlaw_core::automations::{AutomationStore, AutomationUpsert};
 
     let store = AutomationStore::new(db);
-    // Check whether ANY row claims the slot.
     let rows = store.list_all().map_err(|e| format!("list: {e}"))?;
     const NAME: &str = "Default web prompt flow";
     if rows.iter().any(|r| r.name == NAME) {
@@ -236,7 +235,7 @@ pub fn ensure_default_web_flow(db: &execlaw_core::Database) -> Result<(), String
         serde_json::from_value(default_web_flow_json())
             .map_err(|e| format!("default flow parse: {e}"))?;
     let now = chrono::Utc::now().timestamp_millis();
-    store
+    let row = store
         .upsert(
             &AutomationUpsert {
                 id: None,
@@ -247,7 +246,19 @@ pub fn ensure_default_web_flow(db: &execlaw_core::Database) -> Result<(), String
             now,
         )
         .map_err(|e| format!("upsert default flow: {e}"))?;
-    tracing::info!("M6: seeded default web prompt flow (enabled)");
+    // Flip the source column so the row reads as a core default —
+    // delete is refused, the SPA hides the delete button. Direct
+    // SQL because `AutomationUpsert` intentionally doesn't expose
+    // the source column to operator-driven writes.
+    db.with_conn(|c| {
+        c.execute(
+            "UPDATE state_automations SET source = 'core' WHERE id = ?1",
+            rusqlite::params![row.id],
+        )?;
+        Ok(())
+    })
+    .map_err(|e| format!("stamp source=core: {e}"))?;
+    tracing::info!("M6: seeded default web prompt flow (enabled, source=core)");
     Ok(())
 }
 

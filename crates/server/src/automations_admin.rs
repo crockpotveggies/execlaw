@@ -176,10 +176,21 @@ pub struct AutomationDto {
     pub definition: AutomationDef,
     pub created_at: i64,
     pub updated_at: i64,
+    /// M6 — provenance: `"operator"` | `"core"` | `"plugin:<id>"`.
+    /// Drives the SPA's hide-the-delete-button logic for default
+    /// flows.
+    pub source: String,
+    /// M6 — `true` when the operator has edited a non-operator
+    /// row.
+    pub operator_modified: bool,
+    /// M6 — convenience flag = `source != "operator"`. The SPA
+    /// hides the delete button when this is `true`.
+    pub is_default: bool,
 }
 
 impl From<AutomationRow> for AutomationDto {
     fn from(r: AutomationRow) -> Self {
+        let is_default = r.is_default();
         Self {
             id: r.id,
             name: r.name,
@@ -187,6 +198,9 @@ impl From<AutomationRow> for AutomationDto {
             definition: r.definition,
             created_at: r.created_at,
             updated_at: r.updated_at,
+            source: r.source,
+            operator_modified: r.operator_modified,
+            is_default,
         }
     }
 }
@@ -429,17 +443,24 @@ pub async fn delete_one(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let removed = AutomationStore::new(&state.db)
+    use execlaw_core::automations::DeleteOutcome;
+    let outcome = AutomationStore::new(&state.db)
         .delete(&id)
         .map_err(automation_err)?;
-    if removed {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError {
+    match outcome {
+        DeleteOutcome::Deleted => Ok(StatusCode::NO_CONTENT),
+        DeleteOutcome::NotFound => Err(ApiError {
             status: StatusCode::NOT_FOUND,
             code: "automation_not_found",
             message: format!("no automation with id '{id}'"),
-        })
+        }),
+        DeleteOutcome::RefusedDefault { source } => Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            code: "automation_is_default",
+            message: format!(
+                "cannot delete a default flow shipped by '{source}' — disable it instead, or uninstall the source plugin"
+            ),
+        }),
     }
 }
 
