@@ -231,6 +231,19 @@ html, body, #root {
     height: 100%;
 }
 
+// 2026-05-21 — bulletproof page-level scroll suppression. The
+// `body { overflow: hidden }` below USUALLY propagates to the
+// viewport scroll, but a child with `position: absolute` extending
+// past the body or with `overflow: visible` can still trigger an
+// html-level scrollbar in some browsers (notably Safari and older
+// Chromium). Setting `overflow: hidden` on `html` too closes that
+// loophole — no element above the chat shell can scroll, and the
+// chat shell owns its own scroll surfaces (welcome view, message
+// stream, settings modal, etc.).
+html {
+    overflow: hidden;
+}
+
 // Bootstrap's `[data-bs-theme=dark]` rule (which `index.html` opts
 // into) re-defines `--bs-body-bg`, `--bs-body-color`, etc. to its
 // stock dark palette (`#212529` etc.). That override has higher
@@ -411,6 +424,14 @@ body {
     display: flex;
     height: 100vh;
     width: 100%;
+    // 2026-05-21 — hard clip at the shell boundary. Per-route
+    // surfaces (chat stream, welcome view, settings modal, etc.)
+    // own their own scroll containers via `overflow-y: auto`;
+    // anything that extends past the shell (a rare misbehaving
+    // child or a long line that escaped `min-width: 0`) gets
+    // clipped here rather than leaking up to body / html and
+    // triggering a subtle page-level scrollbar.
+    overflow: hidden;
 }
 
 // Phase 14.D — floating sidebar.
@@ -789,6 +810,15 @@ body {
     min-height: 0;
     background-color: $bg-deep;
     margin-left: $main-offset;
+    // 2026-05-21 — clip overflow at the main-pane boundary so a
+    // misbehaving child (e.g. a long unwrapped code line in a
+    // markdown message bubble) can't push the layout horizontally
+    // and trigger a page-level scrollbar. Per-route scroll surfaces
+    // inside main (chat stream, welcome view, page--scroll) have
+    // their own `overflow-y: auto` and create their own scroll
+    // containers, so this `hidden` doesn't kill any intentional
+    // scrolling.
+    overflow: hidden;
 }
 
 @media (max-width: 767.98px) {
@@ -2127,12 +2157,25 @@ body {
     // overflow without touching the mascot's visual size.
     gap: 1rem;
     padding: 1.25rem 1.5rem;
+    // Allow the welcome to shrink below its content's intrinsic
+    // width inside the flex column. Without this, a wide greeting
+    // (e.g. "GOOD AFTERNOON, JUSTIN." in Antonio with wide
+    // letter-spacing) can force the welcome wider than its parent
+    // and push the absolute-positioned incognito button off-screen.
     min-height: 0;
-    // Y scrolls when content is tall; X stays visible so any
-    // off-canvas particles or animations can extend past the
-    // welcome view's nominal slot without being clipped or
-    // triggering a horizontal scrollbar.
-    overflow-x: visible;
+    min-width: 0;
+    // 2026-05-21 — `overflow-x: clip` (was `visible`). The mascot
+    // greeting text uses `white-space: nowrap` and can render
+    // wider than the welcome on narrow viewports; the GSAP
+    // particle burst also briefly translates dots well past the
+    // mascot's bounding box. Both used to leak past the welcome
+    // edges into the main pane, which on some browsers triggered
+    // a tiny html-level horizontal scroll (subtle, but enough to
+    // shift the absolute-positioned incognito button out of
+    // view). `clip` clips at the welcome boundary WITHOUT
+    // reserving a scrollbar (unlike `hidden`, which creates a
+    // scroll container even when no overflow exists).
+    overflow-x: clip;
     overflow-y: auto;
 }
 
