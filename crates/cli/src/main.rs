@@ -1278,6 +1278,11 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     if let Err(e) = execlaw_core::event_registry::register_core_event_kinds(&db) {
         tracing::warn!(error = %e, "M6: core event registry seed failed (continuing)");
     }
+    // M6 — seed the core default web prompt flow (shadow mode,
+    // disabled by default). Idempotent.
+    if let Err(e) = execlaw_server::web_prompt::ensure_default_web_flow(&db) {
+        tracing::warn!(error = %e, "M6: default web flow seed failed (continuing)");
+    }
 
     // Resolve the data directory once at boot so downstream code
     // (bundled-plugins mirror, settings paths, etc.) doesn't have

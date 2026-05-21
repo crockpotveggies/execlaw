@@ -85,6 +85,9 @@ pub mod python_sandbox;
 pub mod flow_channel;
 pub mod reply_router;
 pub mod research;
+
+// M6 — web-prompt entrypoint + flow-run SSE subscription.
+pub mod web_prompt;
 pub mod research_admin;
 pub mod routes;
 pub mod routine_runner;
