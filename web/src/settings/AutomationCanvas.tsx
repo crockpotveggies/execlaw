@@ -15,6 +15,8 @@ import {
     MiniMap,
     ReactFlow,
     ReactFlowProvider,
+    useEdgesState,
+    useNodesState,
     useReactFlow,
     type Connection,
     type Edge,
@@ -23,7 +25,7 @@ import {
     type EdgeChange,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
     AutomationNodePanel,
 } from "./AutomationNodePanel";
@@ -297,16 +299,41 @@ function CanvasInner({ definition, onChange }: Props) {
     const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
     const editable = !!onChange;
 
-    const { nodes, edges } = useMemo(
+    // Visual node/edge state owned by ReactFlow. We let the lib drive
+    // intermediate position updates during a drag (so the tile actually
+    // follows the cursor instead of snapping back on release), and only
+    // sync to the canonical `definition` once the drag ends or the
+    // user otherwise mutates the graph. The `useEffect` below re-seeds
+    // visuals when the parent's `definition` changes for an external
+    // reason (palette drop, delete, rename, save-and-reload).
+    const initial = useMemo(
         () => buildGraph(definition, selectedNodeId),
-        [definition, selectedNodeId],
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [],
     );
+    const [nodes, setNodes, onNodesChangeXY] = useNodesState(initial.nodes);
+    const [edges, setEdges, onEdgesChangeXY] = useEdgesState(initial.edges);
+
+    // Re-seed visuals when `definition` changes for a reason other
+    // than an in-flight drag (the dragstop branch in `onNodesChange`
+    // calls `onChange`, but by then ReactFlow's internal position is
+    // already where we want it, so the re-seed is a no-op visually).
+    useEffect(() => {
+        const built = buildGraph(definition, selectedNodeId);
+        setNodes(built.nodes);
+        setEdges(built.edges);
+    }, [definition, selectedNodeId, setNodes, setEdges]);
 
     // Position updates: ReactFlow fires `position` changes during the
-    // drag (intermediate) AND on dragstop. We only persist on stop —
-    // intermediate positions are visual-only.
+    // drag (intermediate, `dragging: true`) AND on dragstop
+    // (`dragging: false`). We hand all changes back to the lib via
+    // `onNodesChangeXY` so the tile follows the cursor, then persist
+    // to the parent only on stop. Select / remove changes flow through
+    // the lib too — same reason: the visual state should advance
+    // immediately while we batch the canonical-def update.
     const onNodesChange = useCallback(
         (changes: NodeChange[]) => {
+            onNodesChangeXY(changes);
             if (!onChange) return;
             for (const ch of changes) {
                 if (ch.type === "position" && ch.dragging === false && ch.position) {
@@ -326,11 +353,12 @@ function CanvasInner({ definition, onChange }: Props) {
                 }
             }
         },
-        [definition, onChange, selectedNodeId],
+        [definition, onChange, onNodesChangeXY, selectedNodeId],
     );
 
     const onEdgesChange = useCallback(
         (changes: EdgeChange[]) => {
+            onEdgesChangeXY(changes);
             if (!onChange) return;
             for (const ch of changes) {
                 if (ch.type === "remove") {
@@ -338,7 +366,7 @@ function CanvasInner({ definition, onChange }: Props) {
                 }
             }
         },
-        [definition, onChange],
+        [definition, onChange, onEdgesChangeXY],
     );
 
     const onConnect = useCallback(

@@ -6,6 +6,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { useState as reactUseState } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { AutomationDetailPage } from "../settings/AutomationDetailPage";
 import { AuthProvider } from "../auth/AuthContext";
@@ -13,23 +14,38 @@ import { AuthProvider } from "../auth/AuthContext";
 // Mock ReactFlow at module level — the real lib needs ResizeObserver +
 // SVG measurement which jsdom doesn't ship. Our canvas test only cares
 // that the component renders a placeholder with the testid.
-vi.mock("@xyflow/react", () => ({
-    ReactFlow: ({ children }: { children?: React.ReactNode }) => (
-        <div data-testid="mock-reactflow">{children}</div>
-    ),
-    ReactFlowProvider: ({ children }: { children?: React.ReactNode }) => (
-        <>{children}</>
-    ),
-    Background: () => null,
-    Controls: () => null,
-    MiniMap: () => null,
-    Handle: () => null,
-    Position: { Top: "top", Bottom: "bottom", Left: "left", Right: "right" },
-    addEdge: (_c: unknown, edges: unknown[]) => edges,
-    useReactFlow: () => ({
-        screenToFlowPosition: ({ x, y }: { x: number; y: number }) => ({ x, y }),
-    }),
-}));
+vi.mock("@xyflow/react", () => {
+    // Tiny stand-ins for the `useNodesState` / `useEdgesState` hooks
+    // — we don't exercise drag in jsdom, but the canvas imports them
+    // unconditionally so the symbols need to exist.
+    const useNodesState = (initial: unknown[]) => {
+        const [s, set] = reactUseState(initial);
+        return [s, set, () => {}] as const;
+    };
+    const useEdgesState = (initial: unknown[]) => {
+        const [s, set] = reactUseState(initial);
+        return [s, set, () => {}] as const;
+    };
+    return {
+        ReactFlow: ({ children }: { children?: React.ReactNode }) => (
+            <div data-testid="mock-reactflow">{children}</div>
+        ),
+        ReactFlowProvider: ({ children }: { children?: React.ReactNode }) => (
+            <>{children}</>
+        ),
+        Background: () => null,
+        Controls: () => null,
+        MiniMap: () => null,
+        Handle: () => null,
+        Position: { Top: "top", Bottom: "bottom", Left: "left", Right: "right" },
+        addEdge: (_c: unknown, edges: unknown[]) => edges,
+        useReactFlow: () => ({
+            screenToFlowPosition: ({ x, y }: { x: number; y: number }) => ({ x, y }),
+        }),
+        useNodesState,
+        useEdgesState,
+    };
+});
 vi.mock("@xyflow/react/dist/style.css", () => ({}));
 
 let fetchMock: ReturnType<typeof vi.fn>;

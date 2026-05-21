@@ -21,6 +21,10 @@ vi.mock("@xyflow/react", () => ({
     Handle: () => null,
     Position: { Top: "top", Bottom: "bottom", Left: "left", Right: "right" },
     addEdge: (_c: unknown, edges: unknown[]) => edges,
+    // The helpers test doesn't render the canvas, so these hooks
+    // never get called — they just need to be importable.
+    useNodesState: () => [[], () => {}, () => {}],
+    useEdgesState: () => [[], () => {}, () => {}],
     useReactFlow: () => ({
         screenToFlowPosition: ({ x, y }: { x: number; y: number }) => ({ x, y }),
     }),
