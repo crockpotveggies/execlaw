@@ -17,7 +17,6 @@ vi.mock("@xyflow/react", () => ({
     ReactFlowProvider: ({ children }: { children?: unknown }) => children,
     Background: () => null,
     Controls: () => null,
-    MiniMap: () => null,
     Handle: () => null,
     Position: { Top: "top", Bottom: "bottom", Left: "left", Right: "right" },
     addEdge: (_c: unknown, edges: unknown[]) => edges,

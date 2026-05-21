@@ -3018,47 +3018,47 @@ body {
     --xy-controls-button-color-hover: #{$text-primary};
     --xy-controls-button-border-color: #{$border-subtle};
 
-    --xy-minimap-background-color: #{$bg-surface};
-    --xy-minimap-mask-background-color: #{rgba($bg-deep, 0.6)};
-    --xy-minimap-mask-stroke-color: #{$border-subtle};
-    --xy-minimap-node-background-color: #{$bg-elev};
-    --xy-minimap-node-stroke-color: #{$border-subtle};
-
     --xy-attribution-background-color: #{rgba($bg-surface, 0.5)};
     --xy-edge-label-background-color: #{$bg-elev};
     --xy-edge-label-color: #{$text-primary};
 
-    // Belt-and-suspenders: some vendor selectors set `background`
-    // (not `background-color`) directly. Force-paint here so the
-    // controls toolbar + minimap don't appear as bare white panels
-    // even if a future lib upgrade tightens its selector specificity.
-    .react-flow__controls,
-    .react-flow__controls-button {
-        background: $bg-elev;
-        border-color: $border-subtle;
-        color: $text-primary;
-        box-shadow: $shadow-soft;
-        fill: $text-primary;
-
-        svg {
-            fill: $text-primary;
-        }
-
-        &:hover {
-            background: $bg-surface;
-            color: $text-primary;
-        }
-    }
-
-    .react-flow__minimap {
-        background-color: $bg-surface;
+    // Vertical zoom toolbar (top-left). Each button is themed
+    // directly here — the vendor's `background` shorthand wins over
+    // `--xy-*` variables in some lib versions, so we paint
+    // explicitly + add a rounded card around the column to match
+    // the rest of the app's floating-panel chrome.
+    .react-flow__controls {
+        background: $bg-surface;
         border: 1px solid $border-subtle;
         border-radius: $radius-pill;
+        box-shadow: $shadow-soft;
         overflow: hidden;
     }
 
-    .react-flow__minimap-mask {
-        fill: rgba($bg-deep, 0.55);
+    .react-flow__controls-button {
+        background: $bg-surface;
+        border: 0;
+        border-bottom: 1px solid $border-subtle;
+        color: $text-primary;
+        fill: $text-primary;
+        width: 28px;
+        height: 28px;
+        padding: 0;
+
+        &:last-child {
+            border-bottom: 0;
+        }
+
+        svg {
+            fill: $text-primary;
+            max-width: 14px;
+            max-height: 14px;
+        }
+
+        &:hover {
+            background: $bg-elev;
+            color: $text-primary;
+        }
     }
 
     .react-flow__attribution {

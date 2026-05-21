@@ -12,7 +12,6 @@
 import {
     Background,
     Controls,
-    MiniMap,
     ReactFlow,
     ReactFlowProvider,
     useEdgesState,
@@ -446,7 +445,15 @@ function CanvasInner({ definition, onChange }: Props) {
         <div
             ref={wrapperRef}
             className="execlaw-automation-canvas"
-            style={{ width: "100%", height: "560px", position: "relative" }}
+            style={{
+                width: "100%",
+                // Fill the remaining viewport height below the page
+                // chrome (top nav + name/save bar + view toggle). The
+                // floor keeps the canvas usable on short windows.
+                height: "calc(100vh - 280px)",
+                minHeight: 480,
+                position: "relative",
+            }}
             data-testid="automation-canvas"
             onDrop={onDrop}
             onDragOver={onDragOver}
@@ -466,8 +473,16 @@ function CanvasInner({ definition, onChange }: Props) {
                 fitViewOptions={{ padding: 0.2 }}
             >
                 <Background />
-                <Controls position="bottom-left" showInteractive={false} />
-                <MiniMap pannable zoomable />
+                {/* Zoom toolbar — vertical (default orientation),
+                 *  top-left so it doesn't fight the draggable palette
+                 *  at bottom-left. `showFitView` defaults to true and
+                 *  renders the four-arrow icon; we drop the lock with
+                 *  `showInteractive={false}`. */}
+                <Controls
+                    position="top-left"
+                    orientation="vertical"
+                    showInteractive={false}
+                />
             </ReactFlow>
             {editable && <NodePalette />}
             {editable && selectedNode && (
