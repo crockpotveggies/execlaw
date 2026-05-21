@@ -9,12 +9,26 @@ import { ApiError, apiFetch } from "./client";
 
 // ---- Wire shapes (mirror Rust DTOs in server/automations_admin.rs) ----
 
-export type BusEventKind =
-    | "webhook.received"
-    | "socket.message"
-    | "plugin.emit"
-    | "routine.fired"
-    | "other";
+/**
+ * Bus-event kind. Open alphabet — any dotted string is valid; plugins
+ * declare their own kinds via the registry (see RegisteredEventKind).
+ * The canonical list at runtime comes from
+ * `/api/admin/automations/registered-events`.
+ *
+ * The constants below are the well-known kinds that ship with core or
+ * are referenced in legacy code paths; the type stays `string` so
+ * plugin-defined kinds work too.
+ */
+export type BusEventKind = string;
+
+export const KNOWN_BUS_EVENT_KINDS = [
+    "webhook.received",
+    "socket.message",
+    "plugin.emit",
+    "routine.fired",
+    "web.prompt.submitted",
+    "other",
+] as const;
 
 export type NodeKind =
     | "Filter"
@@ -429,7 +443,13 @@ export function emptyAutomationDef(kind: BusEventKind = "webhook.received"): Aut
     };
 }
 
-/** Friendly label for the trigger-kind dropdown. */
+/** Friendly label for a trigger-kind shown in dropdowns and badges.
+ *
+ *  With BusEventKind open to plugin-defined kinds, we humanize the
+ *  dotted form: `whatsapp.message.received` -> "WhatsApp message
+ *  received". The registry's `description` field (when available) is a
+ *  better source, but callers without registry context fall through to
+ *  this. */
 export function kindLabel(k: BusEventKind): string {
     switch (k) {
         case "webhook.received":
@@ -440,9 +460,18 @@ export function kindLabel(k: BusEventKind): string {
             return "Plugin emit";
         case "routine.fired":
             return "Routine fired";
+        case "web.prompt.submitted":
+            return "Web prompt submitted";
         case "other":
             return "Other";
     }
+    // Humanize plugin-declared kinds:
+    //   "whatsapp.message.received" -> "Whatsapp message received"
+    //   "calendar.event.starting_soon" -> "Calendar event starting soon"
+    if (!k) return "(unknown)";
+    const words = k.replace(/[._]/g, " ").trim();
+    if (words.length === 0) return k;
+    return words.charAt(0).toUpperCase() + words.slice(1).toLowerCase();
 }
 
 export function formatPercent(v: number | null): string {

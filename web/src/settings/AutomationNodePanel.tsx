@@ -9,10 +9,18 @@
 // changes are visible immediately; no separate "save" inside the
 // panel (the page's top-bar Save button persists the full def).
 
-import { useState, type ChangeEvent } from "react";
+import { useEffect, useState, type ChangeEvent } from "react";
 import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
-import type { AutomationDef, ExitToolDef, NodeDef } from "../api/automations";
+import type {
+    AutomationDef,
+    ExitToolDef,
+    NodeDef,
+    RegisteredEventKind,
+    TriggerDef,
+} from "../api/automations";
+import { listRegisteredEvents } from "../api/automations";
+import { useAuth } from "../auth/AuthContext";
 
 interface Props {
     /** The node being edited. `null` closes the panel. */
@@ -743,5 +751,234 @@ function SendReplyForm({
                 triggers drop silently.
             </div>
         </>
+    );
+}
+
+/**
+ * Side panel that opens when the operator clicks the trigger sentinel
+ * on the canvas. Audit fix #4+#5: the trigger block was previously
+ * only editable from the JSON view. This surfaces both fields
+ * (`kind`, `when`) on the canvas and uses the live event registry to
+ * populate the kind dropdown so plugin-declared kinds are reachable.
+ *
+ * The kind dropdown is sourced from
+ * `/api/admin/automations/registered-events`. While the request is in
+ * flight the dropdown still shows the current value so the form is
+ * never empty. Free-text fallback (operator typing a kind that isn't
+ * registered yet) is supported via the trailing "Other…" option.
+ */
+export function TriggerPanel({
+    trigger,
+    onChange,
+    onClose,
+}: {
+    trigger: TriggerDef;
+    onChange: (updated: TriggerDef) => void;
+    onClose: () => void;
+}) {
+    const auth = useAuth();
+    const [registry, setRegistry] = useState<RegisteredEventKind[] | null>(null);
+    const [registryErr, setRegistryErr] = useState<string | null>(null);
+    const [customKind, setCustomKind] = useState<string>("");
+    const [usingCustom, setUsingCustom] = useState(false);
+
+    useEffect(() => {
+        let cancelled = false;
+        listRegisteredEvents(auth.getAccessToken)
+            .then((kinds) => {
+                if (cancelled) return;
+                setRegistry(kinds);
+                // If the current trigger.kind isn't in the registry,
+                // flip to free-text mode so the operator sees their
+                // current value and can keep editing it.
+                if (!kinds.some((k) => k.kind === trigger.kind)) {
+                    setUsingCustom(true);
+                    setCustomKind(trigger.kind);
+                }
+            })
+            .catch((e: Error) => {
+                if (cancelled) return;
+                setRegistryErr(e.message);
+            });
+        return () => {
+            cancelled = true;
+        };
+        // Intentionally only run on mount — trigger.kind changes are
+        // driven by the operator interacting with this panel, so we
+        // don't want the effect re-flipping `usingCustom` mid-edit.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    const selectedFromRegistry = registry?.find((k) => k.kind === trigger.kind);
+
+    return (
+        <div
+            className="execlaw-automation-trigger-panel border rounded shadow-sm"
+            style={{
+                position: "absolute",
+                top: 12,
+                right: 12,
+                width: 380,
+                maxHeight: "calc(100% - 24px)",
+                overflowY: "auto",
+                zIndex: 10,
+                padding: 12,
+                background: "#161b22",
+                borderColor: "#30363d",
+                color: "#e6edf3",
+                boxShadow: "0 4px 12px rgba(0, 0, 0, 0.45)",
+            }}
+            data-testid="trigger-panel"
+            onKeyDown={(e) => e.stopPropagation()}
+        >
+            <div className="d-flex justify-content-between align-items-start mb-2">
+                <div>
+                    <div className="text-muted small">Trigger</div>
+                    <div className="h6 mb-0">
+                        <i className="bi bi-lightning-fill me-1" aria-hidden />
+                        Event entrypoint
+                    </div>
+                </div>
+                <Button
+                    variant="link"
+                    size="sm"
+                    onClick={onClose}
+                    aria-label="Close panel"
+                    data-testid="trigger-panel-close"
+                >
+                    <i className="bi bi-x-lg" aria-hidden />
+                </Button>
+            </div>
+
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">Event kind</Form.Label>
+                {registry === null && !registryErr && (
+                    <div className="small text-muted mb-1">
+                        Loading registered events…
+                    </div>
+                )}
+                {registryErr && (
+                    <div
+                        className="small text-warning mb-1"
+                        data-testid="trigger-panel-registry-error"
+                    >
+                        Failed to load registry ({registryErr}). Falling
+                        back to free-text entry.
+                    </div>
+                )}
+                {!usingCustom && registry !== null && (
+                    <Form.Select
+                        size="sm"
+                        value={trigger.kind}
+                        onChange={(e: ChangeEvent<HTMLSelectElement>) => {
+                            const next = e.target.value;
+                            if (next === "__custom__") {
+                                setUsingCustom(true);
+                                setCustomKind(trigger.kind);
+                                return;
+                            }
+                            onChange({ ...trigger, kind: next });
+                        }}
+                        data-testid="trigger-panel-kind"
+                    >
+                        {/* If the current kind isn't registered (shouldn't
+                            happen with the useEffect above, but defensive)
+                            show it at top so the form isn't blank. */}
+                        {!registry.some((k) => k.kind === trigger.kind) && (
+                            <option value={trigger.kind}>
+                                {trigger.kind} (not registered)
+                            </option>
+                        )}
+                        {registry.map((k) => (
+                            <option key={k.kind} value={k.kind}>
+                                {k.kind} — {k.source}
+                            </option>
+                        ))}
+                        <option value="__custom__">
+                            Other (type a custom kind)…
+                        </option>
+                    </Form.Select>
+                )}
+                {(usingCustom || registryErr) && (
+                    <div className="d-flex gap-2 align-items-start">
+                        <Form.Control
+                            type="text"
+                            size="sm"
+                            value={customKind}
+                            onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                                setCustomKind(e.target.value)
+                            }
+                            onBlur={() => {
+                                const trimmed = customKind.trim();
+                                if (trimmed && trimmed !== trigger.kind) {
+                                    onChange({ ...trigger, kind: trimmed });
+                                }
+                            }}
+                            placeholder="e.g. my_plugin.thing.happened"
+                            spellCheck={false}
+                            className="font-monospace small"
+                            data-testid="trigger-panel-kind-custom"
+                        />
+                        {registry !== null && !registryErr && (
+                            <Button
+                                variant="outline-secondary"
+                                size="sm"
+                                onClick={() => setUsingCustom(false)}
+                                title="Back to registered kinds"
+                            >
+                                <i className="bi bi-arrow-left" aria-hidden />
+                            </Button>
+                        )}
+                    </div>
+                )}
+                {selectedFromRegistry && (
+                    <div
+                        className="small text-muted mt-1"
+                        data-testid="trigger-panel-kind-description"
+                    >
+                        {selectedFromRegistry.description || "(no description)"}
+                        {" "}
+                        <span style={{ color: "#7d8590" }}>
+                            · expects_reply ={" "}
+                            <code>{String(selectedFromRegistry.expects_reply)}</code>
+                        </span>
+                    </div>
+                )}
+            </Form.Group>
+
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">
+                    Trigger filter (Rhai bool, optional)
+                </Form.Label>
+                <Form.Control
+                    as="textarea"
+                    rows={3}
+                    value={trigger.when ?? ""}
+                    onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                        onChange({
+                            ...trigger,
+                            when: e.target.value === "" ? null : e.target.value,
+                        })
+                    }
+                    placeholder='event.envelope.identity.trust == "controller"'
+                    spellCheck={false}
+                    className="font-monospace small"
+                    data-testid="trigger-panel-when"
+                />
+                <div className="small text-muted mt-1">
+                    Evaluated for every event of this kind. Falsy → the
+                    flow doesn't run. The scope exposes{" "}
+                    <code>event.kind</code>, <code>event.source</code>,{" "}
+                    <code>event.payload</code>, <code>event.envelope</code>,{" "}
+                    <code>event.internal</code>.
+                </div>
+            </Form.Group>
+
+            <div className="small text-muted mt-2">
+                The trigger and the End sentinel are structural — every
+                flow has exactly one of each. Drag operator nodes from
+                the palette and wire them between trigger and End.
+            </div>
+        </div>
     );
 }

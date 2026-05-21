@@ -29,6 +29,7 @@ import OverlayTrigger from "react-bootstrap/OverlayTrigger";
 import Tooltip from "react-bootstrap/Tooltip";
 import {
     AutomationNodePanel,
+    TriggerPanel,
 } from "./AutomationNodePanel";
 import {
     KIND_COLORS,
@@ -40,6 +41,7 @@ import type {
     AutomationDef,
     NodeDef,
     NodeKind,
+    TriggerDef,
 } from "../api/automations";
 
 const TRIGGER_NODE_ID = "__trigger__";
@@ -173,6 +175,7 @@ function bodyFor(n: NodeDef): string | undefined {
 function buildGraph(
     def: AutomationDef,
     selectedNodeId: string | null,
+    triggerSelected: boolean,
 ): { nodes: Node[]; edges: Edge[] } {
     const triggerNode: Node = {
         id: TRIGGER_NODE_ID,
@@ -182,9 +185,11 @@ function buildGraph(
             label: def.trigger.kind,
             detail: def.trigger.when ?? undefined,
             sentinel: "trigger",
+            selected: triggerSelected,
         } satisfies CanvasNodeData,
         type: "Trigger",
         draggable: true,
+        selected: triggerSelected,
     };
     const typedNodes: Node[] = def.nodes.map((n) => ({
         id: n.id,
@@ -328,6 +333,18 @@ export function withUpdatedNode(def: AutomationDef, updated: NodeDef): Automatio
     };
 }
 
+/** Replace the trigger block. Pass `when: ""` and we coerce to `null`
+ *  so empty-textarea state doesn't get saved as a literal empty Rhai
+ *  expression (which would always evaluate to a parser error and
+ *  silently drop every event). */
+export function withUpdatedTrigger(
+    def: AutomationDef,
+    updated: TriggerDef,
+): AutomationDef {
+    const when = updated.when?.trim() ? updated.when : null;
+    return { ...def, trigger: { ...updated, when } };
+}
+
 function withAddedNode(def: AutomationDef, n: NodeDef): AutomationDef {
     return { ...def, nodes: [...def.nodes, n] };
 }
@@ -382,6 +399,11 @@ function CanvasInner({ definition, onChange }: Props) {
     const reactFlow = useReactFlow();
     const wrapperRef = useRef<HTMLDivElement | null>(null);
     const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+    // The trigger sentinel and operator nodes share the click->panel
+    // mechanic, but trigger has its own panel (kind dropdown + when
+    // editor) and isn't in `def.nodes`. Tracked separately so a single
+    // boolean tells us "is the trigger panel open?".
+    const [triggerSelected, setTriggerSelected] = useState(false);
     const editable = !!onChange;
 
     // Visual node/edge state owned by ReactFlow. We let the lib drive
@@ -392,7 +414,7 @@ function CanvasInner({ definition, onChange }: Props) {
     // visuals when the parent's `definition` changes for an external
     // reason (palette drop, delete, rename, save-and-reload).
     const initial = useMemo(
-        () => buildGraph(definition, selectedNodeId),
+        () => buildGraph(definition, selectedNodeId, triggerSelected),
         // eslint-disable-next-line react-hooks/exhaustive-deps
         [],
     );
@@ -404,10 +426,10 @@ function CanvasInner({ definition, onChange }: Props) {
     // calls `onChange`, but by then ReactFlow's internal position is
     // already where we want it, so the re-seed is a no-op visually).
     useEffect(() => {
-        const built = buildGraph(definition, selectedNodeId);
+        const built = buildGraph(definition, selectedNodeId, triggerSelected);
         setNodes(built.nodes);
         setEdges(built.edges);
-    }, [definition, selectedNodeId, setNodes, setEdges]);
+    }, [definition, selectedNodeId, triggerSelected, setNodes, setEdges]);
 
     // Position updates: ReactFlow fires `position` changes during the
     // drag (intermediate, `dragging: true`) AND on dragstop
@@ -438,14 +460,20 @@ function CanvasInner({ definition, onChange }: Props) {
                     if (selectedNodeId === ch.id) setSelectedNodeId(null);
                 }
                 if (ch.type === "select") {
-                    // Neither sentinel has config to edit — don't
-                    // open the side panel for them.
-                    if (
-                        ch.selected &&
-                        ch.id !== TRIGGER_NODE_ID &&
-                        ch.id !== END_NODE_ID
-                    ) {
+                    // END sentinel has no config; everyone else opens
+                    // a panel — the trigger gets its own panel
+                    // (kind + when), operator nodes get the per-kind
+                    // panel.
+                    if (ch.selected && ch.id === END_NODE_ID) {
+                        // no-op — End has no editable state.
+                    } else if (ch.selected && ch.id === TRIGGER_NODE_ID) {
+                        setTriggerSelected(true);
+                        setSelectedNodeId(null);
+                    } else if (ch.selected) {
                         setSelectedNodeId(ch.id);
+                        setTriggerSelected(false);
+                    } else if (!ch.selected && ch.id === TRIGGER_NODE_ID) {
+                        setTriggerSelected(false);
                     } else if (!ch.selected && selectedNodeId === ch.id) {
                         setSelectedNodeId(null);
                     }
@@ -523,6 +551,14 @@ function CanvasInner({ definition, onChange }: Props) {
         [definition, onChange],
     );
 
+    const onTriggerChange = useCallback(
+        (updated: TriggerDef) => {
+            if (!onChange) return;
+            onChange(withUpdatedTrigger(definition, updated));
+        },
+        [definition, onChange],
+    );
+
     const onRename = useCallback(
         (oldId: string, newId: string) => {
             if (!onChange) return;
@@ -593,6 +629,13 @@ function CanvasInner({ definition, onChange }: Props) {
                     onRename={onRename}
                     onDelete={onDelete}
                     onClose={() => setSelectedNodeId(null)}
+                />
+            )}
+            {editable && triggerSelected && (
+                <TriggerPanel
+                    trigger={definition.trigger}
+                    onChange={onTriggerChange}
+                    onClose={() => setTriggerSelected(false)}
                 />
             )}
         </div>

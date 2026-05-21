@@ -126,9 +126,12 @@ function NodeDetail({ detail }: { detail?: string }) {
 export function TriggerNode(props: NodeProps) {
     const data = props.data as unknown as CanvasNodeData;
     return (
-        <div style={nodeShellStyle("Trigger", !!data.selected)}>
+        <div
+            style={nodeShellStyle("Trigger", !!props.selected)}
+            data-testid="node-trigger"
+        >
             <NodeHeader kind="Trigger" label={data.label} />
-            <NodeDetail detail={data.detail} />
+            <NodeDetail detail={data.detail ?? "Click to edit kind & filter"} />
             <Handle type="source" position={Position.Bottom} />
         </div>
     );
