@@ -1,6 +1,7 @@
 // Centered "fresh chat" view — shown when no active thread is set
 // or the active thread has no messages yet. Composer is the focal
-// point; a small list of suggested starter prompts sits below.
+// point; an operator-customisable tile grid sits below (see
+// `WelcomeTiles.tsx` for the tile framework + registry).
 //
 // Sending from here mints a thread (handled by the parent's onSend
 // callback) so the user never has to think about creating one
@@ -12,36 +13,8 @@ import { Composer } from "./Composer";
 import { MascotGreeting } from "./MascotGreeting";
 import { useVoiceReadiness } from "./useVoiceReadiness";
 
-interface SuggestionDef {
-    key: string;
-    titleDefault: string;
-    subDefault: string;
-    promptDefault: string;
-}
-
-const SUGGESTIONS: ReadonlyArray<SuggestionDef> = [
-    {
-        key: "capabilities",
-        titleDefault: "Show me what you can do",
-        subDefault: "list your capabilities",
-        promptDefault: "Give me a quick tour of what you can help with.",
-    },
-    {
-        key: "plan",
-        titleDefault: "Help me plan",
-        subDefault: "today's priorities",
-        promptDefault: "Help me figure out what's most important to do today.",
-    },
-    {
-        key: "brainstorm",
-        titleDefault: "Brainstorm",
-        subDefault: "open question I've been chewing on",
-        promptDefault:
-            "I've been thinking about a problem at work. Can we brainstorm together?",
-    },
-];
-
 import type { InlineAttachment, SkillListEntry } from "../api/endpoints";
+import { WelcomeTiles } from "./WelcomeTiles";
 
 interface Props {
     onSend: (
@@ -199,42 +172,7 @@ export function WelcomeView({
                 />
             </div>
 
-            <div className="execlaw-welcome__suggestions">
-                <div className="execlaw-welcome__suggestions-label">
-                    <i className="bi bi-lightning-charge" aria-hidden />
-                    {t("welcome.suggestionsLabel", "Suggested")}
-                </div>
-                {SUGGESTIONS.map((s) => {
-                    const title = t(
-                        `welcome.suggestions.${s.key}.title`,
-                        s.titleDefault,
-                    );
-                    const sub = t(
-                        `welcome.suggestions.${s.key}.sub`,
-                        s.subDefault,
-                    );
-                    const prompt = t(
-                        `welcome.suggestions.${s.key}.prompt`,
-                        s.promptDefault,
-                    );
-                    return (
-                        <button
-                            key={s.key}
-                            type="button"
-                            className="execlaw-welcome__suggestion"
-                            data-testid="welcome-suggestion"
-                            onClick={() => void onSend(prompt, [], [])}
-                        >
-                            <span className="execlaw-welcome__suggestion-title">
-                                {title}
-                            </span>
-                            <span className="execlaw-welcome__suggestion-sub">
-                                {sub}
-                            </span>
-                        </button>
-                    );
-                })}
-            </div>
+            <WelcomeTiles onSend={onSend} getToken={getToken} />
         </div>
     );
 }
