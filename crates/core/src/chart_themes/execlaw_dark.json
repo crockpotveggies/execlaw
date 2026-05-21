@@ -1,0 +1,72 @@
+{
+  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+  "config": {
+    "background": "#0d1117",
+    "title": {
+      "color": "#e6edf3",
+      "subtitleColor": "#7d8590",
+      "fontWeight": 600
+    },
+    "view": {
+      "stroke": "transparent"
+    },
+    "axis": {
+      "domainColor": "#30363d",
+      "tickColor": "#30363d",
+      "gridColor": "#1f2630",
+      "labelColor": "#7d8590",
+      "titleColor": "#e6edf3",
+      "labelFontSize": 11,
+      "titleFontSize": 12
+    },
+    "legend": {
+      "labelColor": "#e6edf3",
+      "titleColor": "#e6edf3",
+      "labelFontSize": 11,
+      "titleFontSize": 12
+    },
+    "header": {
+      "labelColor": "#e6edf3",
+      "titleColor": "#e6edf3"
+    },
+    "range": {
+      "category": [
+        "#4493f8",
+        "#3fb950",
+        "#d29922",
+        "#f85149",
+        "#58a6ff",
+        "#a371f7",
+        "#ff8a38",
+        "#7d8590"
+      ],
+      "ramp": ["#0d1117", "#1f2630", "#30363d", "#58a6ff", "#4493f8"],
+      "heatmap": ["#0d1117", "#1f2630", "#58a6ff", "#4493f8", "#f85149"]
+    },
+    "mark": {
+      "color": "#4493f8"
+    },
+    "bar": {
+      "color": "#4493f8"
+    },
+    "line": {
+      "color": "#4493f8",
+      "strokeWidth": 2
+    },
+    "area": {
+      "color": "#4493f8",
+      "fillOpacity": 0.4
+    },
+    "point": {
+      "color": "#4493f8",
+      "size": 50,
+      "filled": true
+    },
+    "rule": {
+      "color": "#7d8590"
+    },
+    "text": {
+      "color": "#e6edf3"
+    }
+  }
+}

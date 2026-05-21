@@ -422,6 +422,11 @@ async fn dispatch_handler(
                 "query": query_value_redacted,
                 "body": body_value.clone(),
             }),
+            // TODO(M6 Phase 6): populate envelope.origin with a
+            // PluginChannel ref so flows can `SendReply` back through
+            // the webhook caller. For now webhooks remain
+            // fire-and-forget (Phase 5+ migration).
+            envelope: None,
         };
         if let Err(e) = state.automation_bus.publish(evt).await {
             tracing::warn!(

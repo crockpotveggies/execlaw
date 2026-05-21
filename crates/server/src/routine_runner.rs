@@ -173,6 +173,7 @@ impl Inner {
                 "conversation_id": conversation_id,
                 "error": dispatch_error,
             }),
+            envelope: None,
         };
         if let Err(e) = self.state.automation_bus.publish(bus_evt).await {
             tracing::warn!(

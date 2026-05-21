@@ -1,4 +1,4 @@
-//! Daily sweeper that populates `state_automation_suggestions` (M4).
+﻿//! Daily sweeper that populates `state_automation_suggestions` (M4).
 //!
 //! Mirrors the shape of `EventRetentionSweeper` /
 //! `BusEventRetentionSweeper`: a long-running tokio actor that wakes
@@ -6,7 +6,7 @@
 //! cleanly on a stop signal.
 //!
 //! Cadence: once per day by default (24h). Suggestions are a
-//! discovery surface, not an alerting one — daily freshness is
+//! discovery surface, not an alerting one â€” daily freshness is
 //! plenty, and a slower cadence keeps the sweep out of the way
 //! of more time-sensitive workers.
 
@@ -43,7 +43,7 @@ impl AutomationSuggestionsSweeper {
         }
     }
 
-    /// Wake the sweeper outside its normal cadence — handy on first
+    /// Wake the sweeper outside its normal cadence â€” handy on first
     /// boot so the landing page has fresh suggestions without waiting
     /// 24h, and exercised in tests.
     pub fn kick(&self) {
@@ -114,6 +114,7 @@ mod tests {
                     source: source.into(),
                     received_at: now_ms + i,
                     payload: serde_json::json!({}),
+                    envelope: None,
                 },
                 false,
             )
@@ -125,7 +126,7 @@ mod tests {
     async fn kick_produces_a_sweep_run() {
         let db = fresh_db();
         seed(&db, "webhook:ring", 15);
-        // Long interval — the test relies on `kick` to trigger.
+        // Long interval â€” the test relies on `kick` to trigger.
         let sweeper =
             AutomationSuggestionsSweeper::with_interval(db.clone(), Duration::from_secs(60 * 60));
         let stop = Arc::new(Notify::new());
@@ -153,7 +154,7 @@ mod tests {
         let stop_clone = stop.clone();
         let sweeper_clone = sweeper.clone();
         let handle = tokio::spawn(async move { sweeper_clone.run(stop_clone).await });
-        // Don't kick — go straight to stop. The select! arm for stop
+        // Don't kick â€” go straight to stop. The select! arm for stop
         // does a final sweep on its way out.
         tokio::time::sleep(Duration::from_millis(20)).await;
         stop.notify_one();

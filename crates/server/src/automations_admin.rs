@@ -482,6 +482,7 @@ pub async fn test_run(
                 payload: s.payload,
                 internal: false,
                 dispatched_at: None,
+                envelope: execlaw_core::event_envelope::EventEnvelope::system_internal(),
             }
         }
         (None, None) => {
@@ -1040,6 +1041,7 @@ mod tests {
                     source: "webhook:ring".into(),
                     received_at: now_ms - i,
                     payload: serde_json::json!({}),
+                    envelope: None,
                 },
                 false,
             )
@@ -1066,6 +1068,7 @@ mod tests {
                     source: "webhook:ring".into(),
                     received_at: now_ms - i,
                     payload: serde_json::json!({}),
+                    envelope: None,
                 },
                 false,
             )
@@ -1239,6 +1242,7 @@ mod tests {
                     source: "x".into(),
                     received_at: now_ms - i,
                     payload: serde_json::json!({"i": i}),
+                    envelope: None,
                 },
                 false,
             )
@@ -1252,6 +1256,7 @@ mod tests {
                     source: "x".into(),
                     received_at: now_ms - i,
                     payload: serde_json::json!({}),
+                    envelope: None,
                 },
                 false,
             )
@@ -1301,6 +1306,7 @@ mod tests {
                     source: "webhook:ring".into(),
                     received_at: now_ms - i,
                     payload: serde_json::json!({}),
+                    envelope: None,
                 },
                 false,
             )

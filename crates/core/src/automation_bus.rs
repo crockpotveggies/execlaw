@@ -1,6 +1,6 @@
-//! Durable substrate for the automation event bus (M1).
+﻿//! Durable substrate for the automation event bus (M1).
 //!
-//! Owns the `state_bus_events` table — DISTINCT from `state_events`
+//! Owns the `state_bus_events` table â€” DISTINCT from `state_events`
 //! (the per-conversation event log). The two tables share no foreign
 //! keys, no rows, and no invariants. They are independent substrates:
 //!
@@ -30,7 +30,7 @@ use utoipa::ToSchema;
 /// Kinds of events flowing through the automation bus.
 ///
 /// Distinct from the per-conversation `crate::events::EventKind` enum.
-/// Additive — new kinds land without breaking existing consumers
+/// Additive â€” new kinds land without breaking existing consumers
 /// because `parse` falls back to `Other` for unknown strings.
 ///
 /// Serde representation: each variant uses `#[serde(rename = ...)]`
@@ -43,7 +43,7 @@ use utoipa::ToSchema;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 pub enum BusEventKind {
     /// A webhook arrived at `/api/webhooks/{plugin_id}/...`. Fired
-    /// alongside the existing plugin Rhai handler dispatch — the bus
+    /// alongside the existing plugin Rhai handler dispatch â€” the bus
     /// emission does not change webhook handling, it just makes the
     /// raw receipt observable to automations.
     #[serde(rename = "webhook.received")]
@@ -64,7 +64,7 @@ pub enum BusEventKind {
     /// separate cron trigger.
     #[serde(rename = "routine.fired")]
     RoutineFired,
-    /// Escape hatch — only emitted by `parse` when an unknown kind
+    /// Escape hatch â€” only emitted by `parse` when an unknown kind
     /// string is read from disk. NOT a meaningful producer-side
     /// value: a producer that constructs `Event { kind: Other, .. }`
     /// writes the literal string `"other"` to the row, losing any
@@ -100,17 +100,27 @@ impl BusEventKind {
 /// `state_bus_events`). Producers that want dedup semantics across
 /// upstream retries supply a stable ID (content hash, upstream
 /// message ID); producers that don't care supply a random ULID.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `envelope` (M6) carries the reply target, sender identity, and
+/// correlation id. Producers from before the M6 migration may omit
+/// it (`None`) â€” the matcher fills in `EventEnvelope::system_internal()`
+/// before dispatch so flow authors always see a populated envelope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub id: String,
     pub kind: BusEventKind,
     pub source: String,
     pub received_at: i64,
     pub payload: serde_json::Value,
+    /// Optional on the publish-side for backward compat (existing
+    /// call sites in cmd_serve / plugin_webhook_routes don't yet
+    /// build envelopes). Defaults to `system_internal()` at insert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<crate::event_envelope::EventEnvelope>,
 }
 
 /// Stored row, fetched by the dispatcher / poller / retention sweeper.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BusEventRow {
     pub id: String,
     pub kind: BusEventKind,
@@ -119,6 +129,9 @@ pub struct BusEventRow {
     pub payload: serde_json::Value,
     pub internal: bool,
     pub dispatched_at: Option<i64>,
+    /// Always populated post-read â€” defaults to `system_internal()`
+    /// for legacy rows that wrote NULL.
+    pub envelope: crate::event_envelope::EventEnvelope,
 }
 
 #[derive(Debug, Error)]
@@ -135,18 +148,31 @@ pub enum BusEventError {
 pub enum PublishOutcome {
     /// Row was newly inserted. The dispatcher should pick it up.
     Inserted,
-    /// PK collision — a duplicate. Caller can treat as success but
+    /// PK collision â€” a duplicate. Caller can treat as success but
     /// MUST NOT re-enqueue (the original row's dispatch is the
     /// authoritative one). First write wins; later writes are
     /// silently dropped.
     Duplicate,
 }
 
-/// DB-facing primitives. Owns no async + no channel — purely sync
+/// DB-facing primitives. Owns no async + no channel â€” purely sync
 /// SQLite. The server-side `AutomationBus` wraps this and layers
 /// the `tokio::sync::mpsc` dispatch channel on top.
 pub struct BusEventStore<'a> {
     db: &'a Database,
+}
+
+/// Decode `envelope_json` from a row, falling back to
+/// `system_internal()` on null / parse failure so downstream code
+/// always sees a populated envelope (M6 backward-compat shim â€” once
+/// every producer is migrated, NULL rows should age out via the
+/// `state_bus_events` retention sweeper).
+fn decode_envelope(raw: Option<String>) -> crate::event_envelope::EventEnvelope {
+    match raw {
+        Some(s) => serde_json::from_str(&s)
+            .unwrap_or_else(|_| crate::event_envelope::EventEnvelope::system_internal()),
+        None => crate::event_envelope::EventEnvelope::system_internal(),
+    }
 }
 
 impl<'a> BusEventStore<'a> {
@@ -162,11 +188,19 @@ impl<'a> BusEventStore<'a> {
         let payload = serde_json::to_string(&evt.payload)?;
         let kind = evt.kind.as_str();
         let internal_flag: i64 = if internal { 1 } else { 0 };
+        // M6: persist envelope when present. Producers that haven't
+        // been migrated yet write NULL; the read-side fills in
+        // `system_internal()` so flow authors always see a populated
+        // envelope.
+        let envelope_json = evt
+            .envelope
+            .as_ref()
+            .map(|e| serde_json::to_string(e).expect("envelope must serialize"));
         let inserted = self.db.with_conn(|c| {
             let n = c.execute(
                 "INSERT INTO state_bus_events \
-                 (id, kind, source, received_at, payload, internal) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 (id, kind, source, received_at, payload, internal, envelope_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT(id) DO NOTHING",
                 params![
                     &evt.id,
@@ -175,6 +209,7 @@ impl<'a> BusEventStore<'a> {
                     evt.received_at,
                     &payload,
                     internal_flag,
+                    envelope_json,
                 ],
             )?;
             Ok(n)
@@ -208,11 +243,11 @@ impl<'a> BusEventStore<'a> {
     }
 
     /// Fetch a single row by id. The dispatcher uses this after
-    /// pulling an id off the mpsc — the channel carries only ids
+    /// pulling an id off the mpsc â€” the channel carries only ids
     /// to keep the queue layer trivially cheap.
     ///
     /// Payload deserialization fallback: if the stored JSON is
-    /// somehow malformed (only possible via DB corruption — the
+    /// somehow malformed (only possible via DB corruption â€” the
     /// publish path always writes valid JSON via `serde_json::to_string`)
     /// the payload surfaces as `Null` and a warning is logged. We
     /// don't fail the read, because the dispatcher should keep
@@ -220,7 +255,7 @@ impl<'a> BusEventStore<'a> {
     pub fn get(&self, id: &str) -> Result<Option<BusEventRow>, BusEventError> {
         let row = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, kind, source, received_at, payload, internal, dispatched_at \
+                "SELECT id, kind, source, received_at, payload, internal, dispatched_at, envelope_json \
                  FROM state_bus_events WHERE id = ?1",
             )?;
             let r = stmt
@@ -239,6 +274,7 @@ impl<'a> BusEventStore<'a> {
                         }
                     };
                     let internal_flag: i64 = r.get(5)?;
+                    let envelope = decode_envelope(r.get::<_, Option<String>>(7)?);
                     Ok(BusEventRow {
                         id: row_id,
                         kind: BusEventKind::parse(&r.get::<_, String>(1)?),
@@ -247,6 +283,7 @@ impl<'a> BusEventStore<'a> {
                         payload,
                         internal: internal_flag != 0,
                         dispatched_at: r.get(6)?,
+                        envelope,
                     })
                 })
                 .ok();
@@ -256,7 +293,7 @@ impl<'a> BusEventStore<'a> {
     }
 
     /// Return the last `limit` events of a given kind, newest first.
-    /// Backs the editor's "sample payload" picker (M4c) — when the
+    /// Backs the editor's "sample payload" picker (M4c) â€” when the
     /// operator wants to test-run an automation, they pick from a
     /// dropdown of recently-observed events of the matching kind so
     /// they don't have to hand-craft the payload.
@@ -268,7 +305,7 @@ impl<'a> BusEventStore<'a> {
         let kind_str = kind.as_str();
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, kind, source, received_at, payload, internal, dispatched_at \
+                "SELECT id, kind, source, received_at, payload, internal, dispatched_at, envelope_json \
                  FROM state_bus_events \
                  WHERE kind = ?1 \
                  ORDER BY received_at DESC \
@@ -282,6 +319,7 @@ impl<'a> BusEventStore<'a> {
                     Err(_) => serde_json::Value::Null,
                 };
                 let internal_flag: i64 = r.get(5)?;
+                let envelope = decode_envelope(r.get::<_, Option<String>>(7)?);
                 Ok(BusEventRow {
                     id: row_id,
                     kind: BusEventKind::parse(&r.get::<_, String>(1)?),
@@ -290,6 +328,7 @@ impl<'a> BusEventStore<'a> {
                     payload,
                     internal: internal_flag != 0,
                     dispatched_at: r.get(6)?,
+                    envelope,
                 })
             })?;
             let mut out = Vec::new();
@@ -336,7 +375,7 @@ impl<'a> BusEventStore<'a> {
     }
 
     /// Retention sweep: delete dispatched rows older than the cutoff.
-    /// Pending rows are NEVER swept regardless of age — retention
+    /// Pending rows are NEVER swept regardless of age â€” retention
     /// should not paper over a stuck dispatcher.
     pub fn purge_dispatched_older_than(&self, cutoff_unix: i64) -> Result<usize, BusEventError> {
         let n = self.db.with_conn(|c| {
@@ -371,6 +410,7 @@ mod tests {
             source: source.into(),
             received_at: ts,
             payload: serde_json::json!({"k": "v"}),
+            envelope: None,
         }
     }
 
@@ -400,6 +440,7 @@ mod tests {
             source: "different".into(),               // different
             received_at: 999,                         // different
             payload: serde_json::json!({"k2": "v2"}), // different
+            envelope: None,
         };
         assert_eq!(
             store.publish(&first, false).unwrap(),
@@ -410,7 +451,7 @@ mod tests {
             PublishOutcome::Duplicate
         );
         let row = store.get("evt-1").unwrap().unwrap();
-        // PK conflict does NOT overwrite — operator intent is
+        // PK conflict does NOT overwrite â€” operator intent is
         // preserved by the producer's choice of stable ID.
         assert_eq!(row.kind, BusEventKind::WebhookReceived);
         assert_eq!(row.source, "ring");
@@ -490,7 +531,7 @@ mod tests {
     fn mark_dispatched_returns_false_for_unknown_id() {
         let db = fresh_db();
         let store = BusEventStore::new(&db);
-        // No row inserted — claim of a phantom id must return false
+        // No row inserted â€” claim of a phantom id must return false
         // rather than create or error.
         let claimed = store.mark_dispatched("ghost", 100).unwrap();
         assert!(!claimed);
@@ -522,7 +563,7 @@ mod tests {
         assert!(store.mark_dispatched("old-done", 100).unwrap());
         let n = store.purge_dispatched_older_than(1000).unwrap();
         assert_eq!(n, 1);
-        // Pending row survives — retention must not paper over a
+        // Pending row survives â€” retention must not paper over a
         // stuck dispatcher.
         assert!(store.get("old-pending").unwrap().is_some());
         assert!(store.get("old-done").unwrap().is_none());
@@ -563,7 +604,7 @@ mod tests {
         ] {
             assert_eq!(BusEventKind::parse(k.as_str()), k);
         }
-        // Unknown string falls into Other — the additive escape hatch
+        // Unknown string falls into Other â€” the additive escape hatch
         // that keeps old binaries forward-compatible with new kinds.
         assert_eq!(BusEventKind::parse("future.kind"), BusEventKind::Other);
     }
@@ -573,7 +614,7 @@ mod tests {
         // The PK is the dedup contract. If N threads race to publish
         // the same id, exactly one must see `Inserted` and the rest
         // must see `Duplicate`. The on-disk row is the FIRST writer's
-        // payload — readers must never observe a partially-applied
+        // payload â€” readers must never observe a partially-applied
         // overwrite.
         use std::sync::atomic::{AtomicUsize, Ordering};
         let db = std::sync::Arc::new(fresh_db());
@@ -592,6 +633,7 @@ mod tests {
                     source: format!("thread-{i}"),
                     received_at: i as i64,
                     payload: serde_json::json!({"thread": i}),
+                    envelope: None,
                 };
                 match store.publish(&evt, false).unwrap() {
                     PublishOutcome::Inserted => inserted.fetch_add(1, Ordering::SeqCst),
@@ -608,7 +650,7 @@ mod tests {
             "exactly one INSERT wins"
         );
         assert_eq!(duplicate.load(Ordering::SeqCst), 15);
-        // First writer's row is what's persisted — we can't predict
+        // First writer's row is what's persisted â€” we can't predict
         // *which* thread won, but exactly one did. Spot-check the
         // source matches some thread-N pattern.
         let row = BusEventStore::new(&db).get("shared").unwrap().unwrap();
@@ -629,6 +671,7 @@ mod tests {
                     source: "stress".into(),
                     received_at: i as i64,
                     payload: serde_json::json!({"i": i}),
+                    envelope: None,
                 };
                 assert_eq!(
                     store.publish(&evt, false).unwrap(),
@@ -691,9 +734,63 @@ mod tests {
                 "null": null,
                 "string": "hello"
             }),
+            envelope: None,
         };
         store.publish(&evt, false).unwrap();
         let row = store.get("json-test").unwrap().unwrap();
         assert_eq!(row.payload, evt.payload);
+    }
+
+    #[test]
+    fn envelope_round_trips_through_persistence() {
+        use crate::event_envelope::{EventEnvelope, OriginRef, SenderIdentity, TrustClass};
+
+        let db = fresh_db();
+        let store = BusEventStore::new(&db);
+        let env = EventEnvelope {
+            origin: OriginRef::PluginChannel {
+                plugin_id: "whatsapp".into(),
+                channel_ref: serde_json::json!({"chat_id": "+15551234"}),
+                expires_at: Some(1_700_000_000_000),
+            },
+            identity: SenderIdentity::External {
+                plugin_id: "whatsapp".into(),
+                handle: "+15551234".into(),
+                trust: TrustClass::ColdContact,
+            },
+            correlation_id: "corr-1".into(),
+            parent_event_id: None,
+        };
+        let evt = Event {
+            id: "env-test".into(),
+            kind: BusEventKind::PluginEmit,
+            source: "plugin:whatsapp".into(),
+            received_at: 7,
+            payload: serde_json::json!({"text": "hi"}),
+            envelope: Some(env.clone()),
+        };
+        store.publish(&evt, false).unwrap();
+        let row = store.get("env-test").unwrap().unwrap();
+        assert_eq!(row.envelope, env);
+    }
+
+    #[test]
+    fn legacy_row_without_envelope_decodes_as_system_internal() {
+        use crate::event_envelope::{OriginRef, SenderIdentity};
+
+        let db = fresh_db();
+        let store = BusEventStore::new(&db);
+        let evt = Event {
+            id: "legacy".into(),
+            kind: BusEventKind::WebhookReceived,
+            source: "x".into(),
+            received_at: 1,
+            payload: serde_json::json!({}),
+            envelope: None,
+        };
+        store.publish(&evt, false).unwrap();
+        let row = store.get("legacy").unwrap().unwrap();
+        assert!(matches!(row.envelope.origin, OriginRef::None));
+        assert!(matches!(row.envelope.identity, SenderIdentity::System));
     }
 }

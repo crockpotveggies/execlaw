@@ -1,4 +1,4 @@
-//! `BusEventRetentionSweeper` — purges dispatched `state_bus_events`
+﻿//! `BusEventRetentionSweeper` â€” purges dispatched `state_bus_events`
 //! rows past the global `history_retention_days` window.
 //!
 //! Mirrors `LogRetentionSweeper`, `EventRetentionSweeper`, and
@@ -23,7 +23,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
-/// Default sweep cadence — once every two hours. Matches
+/// Default sweep cadence â€” once every two hours. Matches
 /// `EventRetentionSweeper` so the two history sweepers share a
 /// schedule and operators see consistent disk-reclaim timing.
 pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
@@ -51,7 +51,7 @@ pub struct BusEventRetentionSweeper {
     interval: Duration,
     /// `Some(d)` pins retention regardless of operator policy
     /// (tests). `None` means "load [`RetentionPolicy`] on each tick"
-    /// — the production path. Mirrors `EventRetentionSweeper`.
+    /// â€” the production path. Mirrors `EventRetentionSweeper`.
     static_retention: Option<Duration>,
     kick: Arc<Notify>,
 }
@@ -141,6 +141,7 @@ mod tests {
             source: "test".into(),
             received_at: ts,
             payload: serde_json::json!({}),
+            envelope: None,
         }
     }
 
@@ -153,7 +154,7 @@ mod tests {
         store.publish(&evt("recent-done", 999_999), false).unwrap();
         assert!(store.mark_dispatched("old-done", 100).unwrap());
         assert!(store.mark_dispatched("recent-done", 999_999).unwrap());
-        // retention=500 → cutoff=999_500. Old (100) gets swept;
+        // retention=500 â†’ cutoff=999_500. Old (100) gets swept;
         // pending (any age) is preserved; recent (999_999) stays.
         let n = sweep_once(&db, 1_000_000, 500).unwrap();
         assert_eq!(n, 1);

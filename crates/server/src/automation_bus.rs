@@ -1,4 +1,4 @@
-//! Server-side dispatch + poller for the automation event bus (M1).
+﻿//! Server-side dispatch + poller for the automation event bus (M1).
 //!
 //! Layers on top of [`execlaw_core::automation_bus`] (which owns the
 //! durable [`state_bus_events`] table and the sync `BusEventStore`)
@@ -10,7 +10,7 @@
 //!   * Dispatcher task that pops IDs, loads the row, claims it, and
 //!     hands it to an [`EventHandler`].
 //!   * Worker pool ([`tokio::sync::Semaphore`]) bounding concurrent
-//!     in-flight handlers — backpressure surface #2.
+//!     in-flight handlers â€” backpressure surface #2.
 //!   * Internal poller task that, every [`INTERNAL_POLL_INTERVAL`],
 //!     scans `state_bus_events` for rows with `internal=1` and no
 //!     `dispatched_at`, and pushes their IDs onto the main mpsc.
@@ -22,7 +22,7 @@
 //!     starts taking from the channel. Survives ungraceful exits
 //!     between the INSERT and `mark_dispatched`.
 //!
-//! Delivery is at-least-once. The handler MUST be idempotent — both
+//! Delivery is at-least-once. The handler MUST be idempotent â€” both
 //! because of the crash-recovery scan and because a race between the
 //! recovery scan and a live mpsc delivery could (rarely) double-fire
 //! the handler for the same row. In M1 the handler is a no-op stub
@@ -56,7 +56,7 @@ pub const DEFAULT_WORKER_CONCURRENCY: usize = 16;
 /// has to catch the rare case where a row landed durably but the kick
 /// was lost (e.g., process crash + restart between INSERT and notify,
 /// or a sync producer that doesn't reach the bus handle). 5 s keeps
-/// the idle-load floor 50× lower than the prior 100 ms tick while
+/// the idle-load floor 50Ã— lower than the prior 100 ms tick while
 /// preserving at-most-5-s tail latency in degenerate cases. Steady-
 /// state in-process publishes pay zero idle DB cost.
 pub const INTERNAL_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -70,7 +70,7 @@ type BoxFut = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// Handler invoked for each event the dispatcher receives.
 ///
-/// In M1 the only handler is [`noop_handler`] — the matcher arrives
+/// In M1 the only handler is [`noop_handler`] â€” the matcher arrives
 /// in M2. Kept as a function-type so M2's swap is a one-line change
 /// at the `cmd_serve` wiring point.
 pub type EventHandler = Arc<dyn Fn(BusEventRow) -> BoxFut + Send + Sync>;
@@ -91,7 +91,7 @@ struct AutomationBusInner {
     /// durable row insert, so the poller picks the row up immediately
     /// instead of waiting for the next safety-net tick. `Notify`'s
     /// stored-permit semantics make this safe across the
-    /// publish→poller race: if no waiter is parked, the next
+    /// publishâ†’poller race: if no waiter is parked, the next
     /// `notified().await` consumes the permit without sleeping.
     internal_kick: Arc<Notify>,
 }
@@ -123,7 +123,7 @@ impl AutomationBus {
         )
     }
 
-    /// Test/tuning constructor — exposes the otherwise-default knobs.
+    /// Test/tuning constructor â€” exposes the otherwise-default knobs.
     pub fn spawn_with_config(
         db: Database,
         handler: EventHandler,
@@ -163,9 +163,9 @@ impl AutomationBus {
     ///
     /// 1. Persists to SQLite via [`BusEventStore::publish`] with
     ///    `internal=false`. PK collisions return [`PublishOutcome::Duplicate`]
-    ///    (treated as success — see core docs).
+    ///    (treated as success â€” see core docs).
     /// 2. On `Inserted`, sends the event id on the bounded mpsc.
-    ///    The `await` here is the backpressure point — caller blocks
+    ///    The `await` here is the backpressure point â€” caller blocks
     ///    when the dispatcher is behind.
     /// 3. On `Duplicate`, the channel is NOT touched (the original
     ///    insertion's send already happened, or will be picked up
@@ -173,7 +173,7 @@ impl AutomationBus {
     ///
     /// If the channel is closed (dispatcher dropped), the row is
     /// already durable and the next-boot crash-recovery scan will
-    /// pick it up. We log and continue — failure to enqueue is not
+    /// pick it up. We log and continue â€” failure to enqueue is not
     /// a publish failure.
     pub async fn publish(&self, evt: Event) -> Result<PublishOutcome, BusEventError> {
         let store = BusEventStore::new(&self.inner.db);
@@ -211,13 +211,13 @@ impl AutomationBus {
         Ok(outcome)
     }
 
-    /// Synchronous, channel-free publish path — exposed for the
+    /// Synchronous, channel-free publish path â€” exposed for the
     /// retention sweeper's tests and the rare caller that doesn't
     /// have an async context. Internal events are durable-only and
     /// the poller picks them up; external events skip the channel
     /// and rely on the crash-recovery scan to land in the dispatcher.
     /// Internal inserts kick the poller (same semantics as
-    /// `publish_internal`); external inserts do not — that path is
+    /// `publish_internal`); external inserts do not â€” that path is
     /// reserved for callers who deliberately want recovery-scan
     /// semantics.
     pub fn publish_sync(
@@ -233,7 +233,7 @@ impl AutomationBus {
     }
 
     /// Construct a non-dispatching bus. `publish` still writes durable
-    /// rows but the mpsc channel is closed up front — sends fall back
+    /// rows but the mpsc channel is closed up front â€” sends fall back
     /// to the "channel closed; rely on crash-recovery" log line.
     ///
     /// Used by `routes::test_app_state` so sync `#[test]` fixtures can
@@ -246,7 +246,7 @@ impl AutomationBus {
         let (tx, rx) = mpsc::channel::<String>(1);
         // Drop the receiver immediately so sends return Err and the
         // "no dispatcher" code path in `publish` activates. The
-        // closure is intentional — every test publish is durable
+        // closure is intentional â€” every test publish is durable
         // even without a live dispatcher.
         drop(rx);
         Self {
@@ -271,7 +271,7 @@ async fn dispatcher_loop(
     stop: Arc<Notify>,
 ) {
     // Register a stop watcher BEFORE doing any synchronous work.
-    // `Notify::notify_waiters()` is fire-and-forget — if it fires
+    // `Notify::notify_waiters()` is fire-and-forget â€” if it fires
     // before we've reached a `.notified().await`, the wake-up is
     // silently lost. The crash-recovery scan below can hold this
     // task for many milliseconds (one DB round-trip per pending
@@ -281,7 +281,7 @@ async fn dispatcher_loop(
     // without anyone ever notifying it). Spawning a watcher task
     // registers the Notify waiter immediately so any subsequent
     // `notify_waiters()` reaches us reliably. The watcher task
-    // costs ~1 µs / few hundred bytes and ends as soon as the
+    // costs ~1 Âµs / few hundred bytes and ends as soon as the
     // first stop fires; the main loop polls its JoinHandle.
     let mut stop_watcher = tokio::spawn({
         let stop = stop.clone();
@@ -333,7 +333,7 @@ async fn dispatcher_loop(
     }
 }
 
-/// Quick checks first — no permit needed for skips. Only acquire a
+/// Quick checks first â€” no permit needed for skips. Only acquire a
 /// worker slot for events that actually need handler-bound work.
 ///
 /// Race guard: we **claim** the row (atomic `mark_dispatched`) BEFORE
@@ -371,7 +371,7 @@ async fn dispatch_one(db: &Database, handler: &EventHandler, workers: &Arc<Semap
         return;
     }
     // Atomically claim. If we lose the race, another dispatcher path
-    // owns this event — bail without running the handler. This is
+    // owns this event â€” bail without running the handler. This is
     // the at-most-once-handler-call invariant.
     let now = chrono::Utc::now().timestamp();
     let claimed = match BusEventStore::new(db).mark_dispatched(&row.id, now) {
@@ -385,7 +385,7 @@ async fn dispatch_one(db: &Database, handler: &EventHandler, workers: &Arc<Semap
         debug!(event_id = %id, "automation bus: event already claimed by another dispatcher path, skipping");
         return;
     }
-    // Real work — gate on the worker semaphore (backpressure #2).
+    // Real work â€” gate on the worker semaphore (backpressure #2).
     let permit = match workers.clone().acquire_owned().await {
         Ok(p) => p,
         Err(_) => {
@@ -442,7 +442,7 @@ async fn internal_poller_loop(
             // row and called `internal_kick.notify_one()`. `Notify`'s
             // single-permit semantics mean a notify that fires BEFORE
             // we reach `.notified().await` is still observed on the
-            // next loop iteration — so the publish→poll race can't
+            // next loop iteration â€” so the publishâ†’poll race can't
             // drop the wake-up. Either branch falls through to the
             // shared `fetch_pending` below.
             _ = internal_kick.notified() => {}
@@ -523,6 +523,7 @@ mod tests {
             source: "test".into(),
             received_at: ts,
             payload: serde_json::json!({}),
+            envelope: None,
         }
     }
 
@@ -636,8 +637,8 @@ mod tests {
         // Regression guard for the perf fix: the safety-net tick is
         // now 5 s (was 100 ms), so without the `internal_kick` path
         // an internal publish would wait up to 5 s before dispatch.
-        // Configure the poller with a 60-second tick — only the kick
-        // can wake it — then publish and assert the handler fires
+        // Configure the poller with a 60-second tick â€” only the kick
+        // can wake it â€” then publish and assert the handler fires
         // well before that.
         let db = fresh_db();
         let counter = Arc::new(AtomicUsize::new(0));
@@ -675,7 +676,7 @@ mod tests {
         // `publish_sync(evt, internal=true)` is the channel-free path
         // used by callers without an async context (retention sweeper
         // tests, sync producers). Same kick semantics as the async
-        // `publish_internal` — otherwise sync producers would pay the
+        // `publish_internal` â€” otherwise sync producers would pay the
         // full safety-net latency.
         let db = fresh_db();
         let counter = Arc::new(AtomicUsize::new(0));
@@ -742,7 +743,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(Notify::new());
 
-        // Slow handler — sleeps 100ms before completing.
+        // Slow handler â€” sleeps 100ms before completing.
         let slow_handler: EventHandler = {
             let counter = counter.clone();
             Arc::new(move |_row: BusEventRow| {
@@ -783,7 +784,7 @@ mod tests {
         // through a 1-deep / 1-worker pipeline with a 100ms handler
         // took at least ONE handler-duration's worth of time. (Best
         // case: e1 starts immediately, e2 enters slot when e1 starts
-        // running, e3 awaits until e1 finishes → ~100ms minimum.)
+        // running, e3 awaits until e1 finishes â†’ ~100ms minimum.)
         assert!(
             elapsed >= Duration::from_millis(80),
             "three publishes through 1-deep+1-worker should backpressure to >= ~100ms, got {:?}",
@@ -879,7 +880,7 @@ mod tests {
         );
         // Also push the same id via the live publish path. The id
         // is the same, so the INSERT is rejected as Duplicate and
-        // the channel is NOT touched — meaning the recovery scan is
+        // the channel is NOT touched â€” meaning the recovery scan is
         // the only path that should fire the handler. But if a
         // dispatcher ever DID re-enqueue a duplicate id (M2 retry
         // path, future bug, etc.), the claim guard keeps the count
