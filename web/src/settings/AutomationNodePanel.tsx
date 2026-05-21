@@ -209,6 +209,8 @@ function KindForm({
             return <NotifyForm node={node} onChange={onChange} />;
         case "CallPlugin":
             return <CallPluginForm node={node} onChange={onChange} />;
+        case "SendReply":
+            return <SendReplyForm node={node} onChange={onChange} />;
         default:
             return (
                 <div className="small text-danger">
@@ -627,6 +629,119 @@ function CallPluginForm({
                     templating at run time.
                 </div>
             </Form.Group>
+        </>
+    );
+}
+
+const SEND_REPLY_SOURCES = [
+    "from_agent",
+    "from_node_output",
+    "template",
+] as const;
+type SendReplySource = (typeof SEND_REPLY_SOURCES)[number];
+
+function SendReplyForm({
+    node,
+    onChange,
+}: {
+    node: NodeDef;
+    onChange: (updated: NodeDef) => void;
+}) {
+    const cfg = (node.config ?? {}) as Record<string, unknown>;
+    const source = ((cfg.source as string | undefined) ?? "from_agent") as SendReplySource;
+    const fromNode = (cfg.from_node as string | undefined) ?? "";
+    const text = (cfg.text as string | undefined) ?? "";
+
+    const update = (next: Record<string, unknown>) =>
+        onChange({ ...node, config: { ...cfg, ...next } });
+
+    return (
+        <>
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">
+                    Reply source
+                </Form.Label>
+                <Form.Select
+                    size="sm"
+                    value={source}
+                    onChange={(e: ChangeEvent<HTMLSelectElement>) =>
+                        update({ source: e.target.value })
+                    }
+                    data-testid="node-panel-sendreply-source"
+                >
+                    <option value="from_agent">
+                        from_agent — use upstream AskAgent's exit-tool args
+                    </option>
+                    <option value="from_node_output">
+                        from_node_output — copy a node's output verbatim
+                    </option>
+                    <option value="template">
+                        template — author-supplied templated text
+                    </option>
+                </Form.Select>
+                <div className="small text-muted mt-1">
+                    Defaults to <code>from_agent</code> — the common single-
+                    AskAgent flow case.
+                </div>
+            </Form.Group>
+
+            {(source === "from_agent" || source === "from_node_output") && (
+                <Form.Group className="mb-2">
+                    <Form.Label className="small text-muted mb-1">
+                        Upstream node id
+                    </Form.Label>
+                    <Form.Control
+                        type="text"
+                        size="sm"
+                        value={fromNode}
+                        onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                            update({ from_node: e.target.value })
+                        }
+                        placeholder="(auto-detect last AskAgent)"
+                        spellCheck={false}
+                        className="font-monospace small"
+                        data-testid="node-panel-sendreply-from-node"
+                    />
+                    <div className="small text-muted mt-1">
+                        Leave blank to auto-detect the most recent AskAgent
+                        output in state.
+                    </div>
+                </Form.Group>
+            )}
+
+            {source === "template" && (
+                <Form.Group className="mb-2">
+                    <Form.Label className="small text-muted mb-1">
+                        Reply text template
+                    </Form.Label>
+                    <Form.Control
+                        as="textarea"
+                        rows={3}
+                        size="sm"
+                        value={text}
+                        onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                            update({ text: e.target.value })
+                        }
+                        placeholder="Acknowledged: {{event.payload.subject}}"
+                        spellCheck={false}
+                        className="small"
+                        data-testid="node-panel-sendreply-text"
+                    />
+                    <div className="small text-muted mt-1">
+                        Supports <code>{`{{event.payload.x}}`}</code> and
+                        upstream node refs like{" "}
+                        <code>{`{{node_id.field}}`}</code>.
+                    </div>
+                </Form.Group>
+            )}
+
+            <div className="small text-muted mt-2">
+                Routes through the ReplyRouter using the trigger event's{" "}
+                <code>envelope.origin</code> — web chat replies land via{" "}
+                <code>chat_append</code>, channel-plugin replies via the
+                plugin's <code>send_reply</code> tool, fire-and-forget
+                triggers drop silently.
+            </div>
         </>
     );
 }

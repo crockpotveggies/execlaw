@@ -22,11 +22,13 @@ export type NodeKind =
     | "Branch"
     | "Terminal"
     | "AskAgent"
-    // Reserved (server-side validator rejects with NotYetImplemented):
+    | "Notify"
     | "CallPlugin"
+    // M6 — emits a reply through the ReplyRouter using envelope.origin
+    | "SendReply"
+    // Reserved (server-side validator rejects with NotYetImplemented):
     | "AppendToChat"
     | "HttpFetch"
-    | "Notify"
     | "AwaitApproval"
     | "CallAutomation"
     | "Parallel"

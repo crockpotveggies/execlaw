@@ -53,6 +53,9 @@ const STYLES: Record<string, KindStyle> = {
     Notify: { bg: "rgba(248, 81, 73, 0.18)", border: "#f85149", icon: "bi-bell-fill" },
     // $info (lighter blue) — sits beside Trigger without conflicting
     CallPlugin: { bg: "rgba(88, 166, 255, 0.18)", border: "#58a6ff", icon: "bi-puzzle" },
+    // teal — distinct outbound-reply identity, sits between Transform's
+    // green and Trigger's blue without overlapping either
+    SendReply: { bg: "rgba(45, 212, 191, 0.18)", border: "#2dd4bf", icon: "bi-reply-fill" },
 };
 
 function nodeShellStyle(
@@ -211,6 +214,18 @@ export function CallPluginNode(props: NodeProps) {
     );
 }
 
+export function SendReplyNode(props: NodeProps) {
+    const data = props.data as unknown as CanvasNodeData;
+    return (
+        <div style={nodeShellStyle("SendReply", !!data.selected)} data-testid={`node-${props.id}`}>
+            <Handle type="target" position={Position.Top} />
+            <NodeHeader kind="SendReply" label={data.label} />
+            <NodeDetail detail={data.detail ?? "Reply via envelope.origin"} />
+            <Handle type="source" position={Position.Bottom} />
+        </div>
+    );
+}
+
 /** Map ReactFlow `type` string → React component for `nodeTypes`. */
 export const NODE_TYPES = {
     Trigger: TriggerNode,
@@ -221,6 +236,7 @@ export const NODE_TYPES = {
     AskAgent: AskAgentNode,
     Notify: NotifyNode,
     CallPlugin: CallPluginNode,
+    SendReply: SendReplyNode,
 } as const;
 
 export const KIND_ICONS: Record<string, string> = {
@@ -231,6 +247,7 @@ export const KIND_ICONS: Record<string, string> = {
     AskAgent: STYLES.AskAgent.icon,
     Notify: STYLES.Notify.icon,
     CallPlugin: STYLES.CallPlugin.icon,
+    SendReply: STYLES.SendReply.icon,
 };
 
 export const KIND_COLORS: Record<string, string> = {
@@ -241,4 +258,5 @@ export const KIND_COLORS: Record<string, string> = {
     AskAgent: STYLES.AskAgent.border,
     Notify: STYLES.Notify.border,
     CallPlugin: STYLES.CallPlugin.border,
+    SendReply: STYLES.SendReply.border,
 };

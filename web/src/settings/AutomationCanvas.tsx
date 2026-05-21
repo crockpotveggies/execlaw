@@ -120,6 +120,14 @@ function bodyFor(n: NodeDef): string | undefined {
         }
         case "CallPlugin":
             return shorten((cfg.tool as string | undefined) ?? "");
+        case "SendReply": {
+            const source = (cfg.source as string | undefined) ?? "from_agent";
+            if (source === "template") {
+                return shorten((cfg.text as string | undefined) ?? "(empty template)");
+            }
+            const fromNode = (cfg.from_node as string | undefined) ?? "(upstream agent)";
+            return shorten(`${source} ← ${fromNode}`);
+        }
         default:
             return undefined;
     }
@@ -286,6 +294,11 @@ function defaultConfigFor(kind: NodeKind): unknown {
             return {
                 tool: "",
                 args: {},
+            };
+        case "SendReply":
+            return {
+                source: "from_agent",
+                from_node: "",
             };
         default:
             return {};
@@ -507,6 +520,7 @@ const PALETTE_KINDS: NodeKind[] = [
     "AskAgent",
     "Notify",
     "CallPlugin",
+    "SendReply",
 ];
 
 function NodePalette() {
