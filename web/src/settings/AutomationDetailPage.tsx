@@ -246,7 +246,7 @@ export function AutomationDetailPage({ id }: Props) {
                 setLoaded(true);
             } catch (e) {
                 if (!cancelled) {
-                    setError((e as Error).message || "Failed to load automation");
+                    setError((e as Error).message || "Failed to load flow");
                     setLoaded(true);
                 }
             }
@@ -313,7 +313,7 @@ export function AutomationDetailPage({ id }: Props) {
 
     const onTestRun = useCallback(async () => {
         if (isNew) {
-            setError("Save the automation before test-running.");
+            setError("Save the flow before test-running.");
             return;
         }
         if (!parsedDef.def) {
@@ -334,47 +334,54 @@ export function AutomationDetailPage({ id }: Props) {
         const clientRunId = `dry-${crypto.randomUUID()}`;
         // Close any previous EventSource before opening a new one.
         liveSourceRef.current?.close();
-        const es = new EventSource(
-            `/api/automations/flow-runs/${encodeURIComponent(clientRunId)}/events`,
-        );
-        liveSourceRef.current = es;
-        const eventTypes = [
-            "node_started",
-            "node_finished",
-            "agent_turn_started",
-            "agent_text_delta",
-            "agent_tool_call_delta",
-            "agent_turn_finished",
-            "reply_routed",
-            "run_finished",
-        ];
-        for (const t of eventTypes) {
-            es.addEventListener(t, (ev) => {
-                let data: Record<string, unknown> = {};
-                try {
-                    data = JSON.parse((ev as MessageEvent).data);
-                } catch {
-                    // Leave data empty — the SSE channel guarantees
-                    // valid JSON per the server but defensive parse
-                    // keeps a single bad frame from crashing the UI.
-                }
-                setLiveTrace((prev) => [...prev, { ts: Date.now(), t, data }]);
-                if (t === "run_finished") {
-                    es.close();
+        // EventSource is missing under jsdom (test env) and could be
+        // missing in older WebViews — gate the live-trace plumbing
+        // behind a feature detect. The POST response still carries
+        // the full DryRunResult so the run remains usable; we just
+        // don't get the per-step streaming UI.
+        if (typeof EventSource !== "undefined") {
+            const es = new EventSource(
+                `/api/automations/flow-runs/${encodeURIComponent(clientRunId)}/events`,
+            );
+            liveSourceRef.current = es;
+            const eventTypes = [
+                "node_started",
+                "node_finished",
+                "agent_turn_started",
+                "agent_text_delta",
+                "agent_tool_call_delta",
+                "agent_turn_finished",
+                "reply_routed",
+                "run_finished",
+            ];
+            for (const t of eventTypes) {
+                es.addEventListener(t, (ev) => {
+                    let data: Record<string, unknown> = {};
+                    try {
+                        data = JSON.parse((ev as MessageEvent).data);
+                    } catch {
+                        // Leave data empty — the SSE channel guarantees
+                        // valid JSON per the server but defensive parse
+                        // keeps a single bad frame from crashing the UI.
+                    }
+                    setLiveTrace((prev) => [...prev, { ts: Date.now(), t, data }]);
+                    if (t === "run_finished") {
+                        es.close();
+                        liveSourceRef.current = null;
+                    }
+                });
+            }
+            es.onerror = () => {
+                // Broadcast channels may close cleanly when the run
+                // finishes BEFORE the run_finished event lands (race in
+                // the publish/close path). We don't surface this — the
+                // POST response carries the canonical outcome.
+                es.close();
+                if (liveSourceRef.current === es) {
                     liveSourceRef.current = null;
                 }
-            });
+            };
         }
-        es.onerror = () => {
-            // Broadcast channels may close cleanly when the run
-            // finishes BEFORE the run_finished event lands (race in
-            // the publish/close path). We don't surface this — the
-            // POST response carries the canonical outcome.
-            es.close();
-            if (liveSourceRef.current === es) {
-                liveSourceRef.current = null;
-            }
-        };
         try {
             let body: Record<string, unknown>;
             if (selectedEventId) {
@@ -441,7 +448,7 @@ export function AutomationDetailPage({ id }: Props) {
             );
             return;
         }
-        if (!confirm("Delete this automation? This cannot be undone.")) return;
+        if (!confirm("Delete this flow? This cannot be undone.")) return;
         setBusy(true);
         try {
             await deleteAutomation(id, token);

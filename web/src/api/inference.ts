@@ -42,7 +42,7 @@ export function consumerLabel(c: InferenceConsumer): string {
         case "research":
             return "Research";
         case "automations":
-            return "Automations";
+            return "Flows";
         case "other":
             return "Other";
     }

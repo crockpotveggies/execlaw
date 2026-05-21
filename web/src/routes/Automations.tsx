@@ -40,7 +40,7 @@ export function Automations() {
         return <Navigate to="/login" replace />;
     }
 
-    const headerTitle = id ? "Automation" : "Automations";
+    const headerTitle = id ? "Flow" : "Flows";
 
     return (
         <div className="execlaw-shell">

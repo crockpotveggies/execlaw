@@ -402,7 +402,7 @@ export function Sidebar({
                 <SidebarNavLink
                     to="/automations"
                     icon="bi-lightning-charge-fill"
-                    label={tr("sidebar.automations", "Automations")}
+                    label={tr("sidebar.automations", "Flows")}
                     testId="sidebar-automations"
                 />
                 <SidebarNavLink

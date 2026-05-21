@@ -71,7 +71,7 @@ export function InferencePage() {
             <div className="d-flex justify-content-between align-items-center mb-3">
                 <p className="text-muted small mb-0">
                     Per-consumer LLM call load. The same inference backend
-                    serves chat, routines, research, and automations — this
+                    serves chat, routines, research, and flows — this
                     table tells you who's driving the load.
                 </p>
                 <div className="d-flex gap-2 align-items-center">
@@ -114,7 +114,7 @@ export function InferencePage() {
                     data-testid="inference-empty"
                 >
                     No LLM calls observed yet. Counters populate as chat
-                    turns, automation runs, routines, or research jobs make
+                    turns, flow runs, routines, or research jobs make
                     inference requests.
                 </div>
             ) : (
