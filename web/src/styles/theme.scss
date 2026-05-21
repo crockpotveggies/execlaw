@@ -615,14 +615,6 @@ body {
         pointer-events: none;
     }
 
-    // Tighten head padding so the wordmark + status pip fit
-    // comfortably inside the narrower rail without clipping.
-    .execlaw-sidebar__head {
-        padding-left: 0.65rem;
-        padding-right: 0.4rem;
-        gap: 0.35rem;
-    }
-
     // Hide the signout button when the rail is collapsed — at 6rem
     // wide there's not enough room for both the gear and signout
     // icons without one clipping. The operator can sign out from
