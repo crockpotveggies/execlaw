@@ -449,35 +449,62 @@ function MissionControlTile({ getToken }: TileProps) {
 
 // ---- Tile #3: Quick prompts (tool-shaped pills) --------------------
 //
-// Three compact pills that each fire a concrete, tool-shaped
-// prompt — the agent's tools / sandbox / multimodal path do the
-// rest. Renders horizontally to match the row-of-affordances
-// pattern (visually echoes Claude's "Write / Learn / Code"
-// pills below the composer; the labels are ours).
+// Compact pills that each fire a concrete, tool-shaped prompt —
+// the agent's tools / sandbox path does the rest. Renders
+// horizontally to match the row-of-affordances pattern (visually
+// echoes Claude's "Write / Learn / Code" pills below the composer;
+// the labels are ours).
 //
 // Pills:
 //   * Analyze CSV    — Palmer Penguins dataset → group by species
 //                       → bar chart via the Python sandbox. Only
 //                       rendered when the operator has the sandbox
 //                       enabled (sandbox can't run otherwise).
-//   * Describe image — describes an Unsplash photo in detail using
-//                       the multimodal backend.
-//   * Current weather — picks a random city at click time and
+//   * Deep Research  — picks a random topic from a curated list
+//                       and kicks off a deep research job via
+//                       `research_start`. Exercises the planner +
+//                       gather-worker pipeline end-to-end.
+//   * Latest news    — fetches the BBC News top-stories RSS feed
+//                       and asks the agent to summarise. Pure
+//                       web-fetch + XML/text synthesis — works
+//                       with any text-only model. BBC's RSS has
+//                       been openly available, no key/auth, for
+//                       20+ years and is a stable demo target.
+//   * Current Weather — picks a random city at click time and
 //                        asks the agent to fetch live conditions
 //                        via the open-meteo API.
+//
+// 2026-05-21 — replaced the "Describe image" pill (required a
+// multimodal backend, broke silently when the loaded model was
+// text-only) with the Research + news pills, both of which
+// exercise the universal web-fetch tool path.
 
 const PENGUINS_CSV_URL =
     "https://raw.githubusercontent.com/mwaskom/seaborn-data/master/penguins.csv";
 
-// Unsplash photo — Manarola (Cinque Terre, Italy). Picked for
-// colourful detail and recognisable composition; the agent has
-// plenty to describe without the operator having to upload
-// anything.
-const DESCRIBE_IMAGE_URL =
-    "https://images.unsplash.com/photo-1499856871958-5b9627545d1a?w=1600&q=80";
+// Eclectic research topics — picked so the planner has genuine
+// breadth to work with and back-to-back clicks land somewhere
+// different.
+const RESEARCH_TOPICS = [
+    "the history of the Voyager spacecraft missions",
+    "how mechanical watch escapements actually work",
+    "the geopolitics of rare earth metal mining",
+    "the science behind sourdough fermentation",
+    "the evolution of typography in software UIs",
+    "how nuclear waste storage works in practice today",
+    "underwater volcanoes and the ecosystems around them",
+    "the architecture of the Roman Pantheon",
+    "the chemistry of pigment in oil paintings",
+    "why airliners cruise at 35,000 feet",
+    "the rise and fall of FORTRAN",
+    "how a particle accelerator finds new physics",
+    "the state of fusion energy in 2026",
+    "how DNS got centralised over time",
+];
 
-// Deliberately eclectic city sample so back-to-back clicks land in
-// genuinely different climates / hemispheres / time zones.
+// City sample for the weather pill — deliberately eclectic so
+// back-to-back clicks land in genuinely different climates /
+// hemispheres / time zones.
 const WEATHER_CITIES = [
     "Tokyo, Japan",
     "Lisbon, Portugal",
@@ -524,18 +551,35 @@ const PILLS: ReadonlyArray<QuickPill> = [
             `in the Python sandbox and return the chart inline.`,
     },
     {
-        id: "describe-image",
-        icon: "bi-image",
-        label: "Describe image",
+        id: "deep-research",
+        icon: "bi-binoculars",
+        label: "Deep Research",
+        buildPrompt: () => {
+            const topic =
+                RESEARCH_TOPICS[
+                    Math.floor(Math.random() * RESEARCH_TOPICS.length)
+                ];
+            return (
+                `Kick off deep research on ${topic}. Have the planner ` +
+                `outline a few sub-questions, fan out gather workers, ` +
+                `and bring back a thorough report.`
+            );
+        },
+    },
+    {
+        id: "latest-news",
+        icon: "bi-newspaper",
+        label: "Latest News",
         buildPrompt: () =>
-            `Describe this image in detail — setting, colour palette, ` +
-            `composition, lighting, and anything notable about it. ` +
-            `Image URL: ${DESCRIBE_IMAGE_URL}`,
+            `Fetch the BBC News top-stories RSS feed at ` +
+            `https://feeds.bbci.co.uk/news/rss.xml. Parse the XML, ` +
+            `pull the top 5 items, summarise each in one line, and ` +
+            `tell me which one looks most worth my time.`,
     },
     {
         id: "weather",
         icon: "bi-cloud-sun",
-        label: "Current weather",
+        label: "Current Weather",
         buildPrompt: () => {
             const city =
                 WEATHER_CITIES[
