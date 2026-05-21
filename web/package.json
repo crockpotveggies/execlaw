@@ -17,7 +17,11 @@
     "build-all-plugins": "node ../scripts/build-plugin-ui.mjs --all"
   },
   "dependencies": {
+    "@fontsource/antonio": "^5.2.8",
     "@fontsource/ibm-plex-sans": "^5.2.8",
+    "@fontsource/instrument-serif": "^5.2.8",
+    "@fontsource/orbitron": "^5.2.8",
+    "@fontsource/unica-one": "^5.2.8",
     "@gsap/react": "2.1.2",
     "@xyflow/react": "^12.10.2",
     "bootstrap": "5.3.8",

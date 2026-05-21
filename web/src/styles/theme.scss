@@ -2117,12 +2117,20 @@ body {
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 1.5rem;
-    padding: 2rem 1.5rem;
+    // 2026-05-21 — tightened from `gap: 1.5rem; padding: 2rem 1.5rem`.
+    // The mascot greeting block grew ~50px when it switched from a
+    // single 216px overlay (text on top of mascot) to mascot-on-top
+    // + text-below. That tipped the welcome content past the
+    // viewport on 13" laptop windows and forced an internal scroll
+    // — visually it read as if the whole page was scrolling. The
+    // ~40px we save here (16px gap, 24px padding) recovers the
+    // overflow without touching the mascot's visual size.
+    gap: 1rem;
+    padding: 1.25rem 1.5rem;
     min-height: 0;
-    // Y scrolls when content is tall; X stays visible so the
-    // mascot greeting's morphed brackets can extend past the
-    // mascot's nominal slot without being clipped or
+    // Y scrolls when content is tall; X stays visible so any
+    // off-canvas particles or animations can extend past the
+    // welcome view's nominal slot without being clipped or
     // triggering a horizontal scrollbar.
     overflow-x: visible;
     overflow-y: auto;
@@ -2216,22 +2224,74 @@ body {
     .execlaw-mascot__iris path {
         fill: $bg-deep;
     }
+
+    // 2026-05-21 — hair / beard use `transform-box: fill-box` so
+    // the greeting-sequence transforms (hair lift + beard squash)
+    // pivot from each shape's OWN bbox via `transform-origin:
+    // 50% 100%` / `50% 0%`. Without fill-box those percentages
+    // resolve to the SVG canvas, tilting the lift off-axis.
+    //
+    // The eye-outer is intentionally EXCLUDED. It uses GSAP's
+    // `svgOrigin` (a user-space coordinate pinned to the eye
+    // path's measured centre) for both the lift's eye-widen AND
+    // the idle blink — fill-box on `<g>` bboxes that include the
+    // iris path drifts the pivot off the visual eye centre,
+    // which made the blink slide vertically. svgOrigin sidesteps
+    // the bbox entirely.
+    //
+    // The iris is intentionally excluded for the same reason —
+    // it stays in viewBox-unit world so the cursor-tracking
+    // math (operating in user-space units) keeps working.
+    .execlaw-mascot__hair,
+    .execlaw-mascot__beard {
+        transform-box: fill-box;
+    }
 }
 
-// Mascot greeting stage — the host frame for the mascot SVG and
-// the welcome overlay. The SVG's own shapes morph into bracket-
-// like silhouettes via GSAP; the welcome line is a plain HTML
-// span centred over the SVG, fading in once the morph completes.
-// `overflow: visible` mirrors the SVG override above — when the
-// brackets slide outward they extend horizontally past the
-// stage's nominal `size × size` slot.
+// Mascot greeting stage — the host frame for the mascot SVG, the
+// particle constellation overlay, and the greeting line.
+//
+// 2026-05-21 — restructured for the constellation-reveal redesign.
+// Stage is now a flex column: mascot on top, greeting below
+// (was previously absolute-centred over the mascot for the
+// bracket morph). `position: relative` so the particle overlay
+// can absolute-position into stage-local coordinates.
 .execlaw-mascot-stage {
     position: relative;
     display: inline-flex;
+    flex-direction: column;
     align-items: center;
-    justify-content: center;
     flex-shrink: 0;
     overflow: visible;
+}
+
+// Particles overlay — fixed at the stage's natural box. Each
+// particle is absolutely positioned at 50% / 50% (mascot centre)
+// as its CSS home; GSAP translates it from there to the burst
+// scatter and on to a converge target near the greeting line.
+// `pointer-events: none` so the particles don't intercept clicks
+// on whatever sits underneath them.
+.execlaw-mascot-stage__particles {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 1;
+}
+
+.execlaw-mascot-stage__particle {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 6px;
+    height: 6px;
+    margin: -3px 0 0 -3px;
+    border-radius: 50%;
+    background-color: $accent;
+    // Soft outer glow so the particle reads as a "spark" rather
+    // than a hard dot, especially against the deep background.
+    box-shadow: 0 0 6px rgba($accent, 0.55);
+    opacity: 0;
+    will-change: transform, opacity;
 }
 
 // Centred over the SVG, allowed to overflow horizontally so
@@ -2339,22 +2399,86 @@ body {
 }
 
 .execlaw-mascot-stage__text {
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    // Match `.execlaw-brand` — same monospace stack, same weight,
-    // same tight letter-spacing. The welcome greeting reads as a
-    // continuation of the brand identity rather than a separate
-    // typographic register.
-    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    font-size: 1.4rem;
-    font-weight: 600;
+    // 2026-05-21 — sits below the mascot via flex flow (no longer
+    // overlaid on top). The greeting fades in once the particle
+    // constellation has converged onto its baseline; GSAP drives
+    // opacity + a small upward translate.
+    //
+    // `margin-top` is intentionally NEGATIVE — the mascot SVG has
+    // ~22% of the viewBox of empty space below the beard (the
+    // bottom of the actual mascot art sits ~48px above the SVG
+    // box's bottom edge at size=216). Pulling the text up by
+    // -1rem closes that visual gap so the text feels coupled to
+    // the mascot's chin rather than floating in space.
+    //
+    // Pairs with the inline `marginTop: 0.5rem` on the SVG: the
+    // mascot drops 8px while the text rises 16px, putting them
+    // closer together without growing the stage's total height.
+    //
+    // The base rule only carries layout / colour / animation
+    // hooks. Typography (font-family / size / weight / casing /
+    // letter-spacing / italic) is set per-variant below so the
+    // randomised font lands with the right cinematic feel.
+    margin-top: -1rem;
     color: $text-primary;
-    letter-spacing: -0.02em;
     white-space: nowrap;
     pointer-events: none;
     opacity: 0;
+    z-index: 2;
+    // Tweak text rendering for the display faces — antialiased on
+    // dark backgrounds keeps the thin strokes (Antonio, Unica One)
+    // from breaking up.
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+// ---- Greeting font variants ---------------------------------------
+//
+// 2026-05-21 — MascotGreeting picks one of these at random per
+// page load. Each variant is tuned (size + letter-spacing + casing)
+// so the greeting reads as the cinematic / title-card version of
+// itself rather than a default render. The sci-fi-leaning sans
+// faces (Unica One, Orbitron, Antonio) are rendered ALL CAPS with
+// wide tracking — Blade Runner / Dune / Eurostile heritage. The
+// editorial serif (Instrument Serif) stays mixed-case italic for
+// the "literary opening line" feel.
+.execlaw-mascot-stage__text--unica-one {
+    font-family: "Unica One", $font-system;
+    font-size: 1.7rem;
+    font-weight: 400;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+}
+
+.execlaw-mascot-stage__text--orbitron {
+    font-family: "Orbitron", $font-system;
+    // Orbitron's glyphs are wider than the other sci-fi faces, so
+    // we dial the size down + push letter-spacing up to keep the
+    // line proportionally similar.
+    font-size: 1.25rem;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+}
+
+.execlaw-mascot-stage__text--antonio {
+    font-family: "Antonio", $font-system;
+    // Antonio is heavily condensed — it can carry a larger size
+    // without overrunning the column.
+    font-size: 1.8rem;
+    font-weight: 400;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.execlaw-mascot-stage__text--instrument-serif {
+    font-family: "Instrument Serif", Georgia, "Times New Roman", serif;
+    font-size: 1.9rem;
+    font-weight: 400;
+    font-style: italic;
+    // Mixed case here — italic editorial serif, no transform.
+    text-transform: none;
+    letter-spacing: 0;
 }
 
 .execlaw-welcome__composer {
