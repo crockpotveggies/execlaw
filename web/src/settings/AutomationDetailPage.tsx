@@ -14,6 +14,7 @@ import {
     useCallback,
     useEffect,
     useMemo,
+    useRef,
     useState,
     type ChangeEvent,
 } from "react";
@@ -43,6 +44,21 @@ import {
     type StepTrace,
     type TrustClass,
 } from "../api/automations";
+
+/**
+ * Live trace event surfaced from the FlowChannelHub SSE feed. Matches
+ * the Rust `FlowChannelEvent` union — but tagged narrowly here so the
+ * render code can switch on `t` without needing the full Rust schema
+ * mirror. We keep the unparsed JSON in `raw` for debugging.
+ */
+interface LiveTraceEvent {
+    /** Local ms timestamp the SPA received the frame. */
+    ts: number;
+    /** SSE `event:` header (e.g. "node_started", "agent_text_delta"). */
+    t: string;
+    /** Decoded data payload. */
+    data: Record<string, unknown>;
+}
 
 /**
  * Compose an `EventEnvelope` from the test-run drawer's three
@@ -134,6 +150,19 @@ export function AutomationDetailPage({ id }: Props) {
     const [selectedEventId, setSelectedEventId] = useState<string>("");
     const [testRunResult, setTestRunResult] = useState<DryRunResult | null>(null);
     const [testRunBusy, setTestRunBusy] = useState<boolean>(false);
+    // Audit fix #8: live SSE trace events buffered as the run executes.
+    // Cleared at the start of each new run. The Eventsource ref is
+    // held so the unmount cleanup can close it even if the run is
+    // still streaming.
+    const [liveTrace, setLiveTrace] = useState<LiveTraceEvent[]>([]);
+    const liveSourceRef = useRef<EventSource | null>(null);
+    useEffect(() => {
+        // Close any open SSE on page unmount.
+        return () => {
+            liveSourceRef.current?.close();
+            liveSourceRef.current = null;
+        };
+    }, []);
     // Audit fix #9: envelope override used to test trigger filters that
     // gate on `event.envelope.origin.kind`, `identity.trust`, etc. The
     // form composes these strings into an `EventEnvelope` JSON object
@@ -296,10 +325,60 @@ export function AutomationDetailPage({ id }: Props) {
         setTestRunBusy(true);
         setError(null);
         setTestRunResult(null);
+        setLiveTrace([]);
+        // Mint the run id client-side and open SSE FIRST so we don't
+        // race the executor publishing NodeStarted events before our
+        // subscriber attaches to the broadcast channel. The endpoint
+        // accepts un-keyed `flow-runs/{id}/events`; the hub creates
+        // the broadcast channel on first subscribe.
+        const clientRunId = `dry-${crypto.randomUUID()}`;
+        // Close any previous EventSource before opening a new one.
+        liveSourceRef.current?.close();
+        const es = new EventSource(
+            `/api/automations/flow-runs/${encodeURIComponent(clientRunId)}/events`,
+        );
+        liveSourceRef.current = es;
+        const eventTypes = [
+            "node_started",
+            "node_finished",
+            "agent_turn_started",
+            "agent_text_delta",
+            "agent_tool_call_delta",
+            "agent_turn_finished",
+            "reply_routed",
+            "run_finished",
+        ];
+        for (const t of eventTypes) {
+            es.addEventListener(t, (ev) => {
+                let data: Record<string, unknown> = {};
+                try {
+                    data = JSON.parse((ev as MessageEvent).data);
+                } catch {
+                    // Leave data empty — the SSE channel guarantees
+                    // valid JSON per the server but defensive parse
+                    // keeps a single bad frame from crashing the UI.
+                }
+                setLiveTrace((prev) => [...prev, { ts: Date.now(), t, data }]);
+                if (t === "run_finished") {
+                    es.close();
+                    liveSourceRef.current = null;
+                }
+            });
+        }
+        es.onerror = () => {
+            // Broadcast channels may close cleanly when the run
+            // finishes BEFORE the run_finished event lands (race in
+            // the publish/close path). We don't surface this — the
+            // POST response carries the canonical outcome.
+            es.close();
+            if (liveSourceRef.current === es) {
+                liveSourceRef.current = null;
+            }
+        };
         try {
-            let body;
+            let body: Record<string, unknown>;
             if (selectedEventId) {
-                body = { event_id: selectedEventId };
+                body = { event_id: selectedEventId, client_run_id: clientRunId };
             } else {
                 // Synthesize-mode: build payload + envelope from the
                 // form. Bail with an inline error if the payload JSON
@@ -326,6 +405,7 @@ export function AutomationDetailPage({ id }: Props) {
                             sampleIdentityTrust,
                         ),
                     },
+                    client_run_id: clientRunId,
                 };
             }
             const result = await testRunAutomation(id, body, token);
@@ -529,6 +609,7 @@ export function AutomationDetailPage({ id }: Props) {
                     onRun={onTestRun}
                     busy={testRunBusy}
                     result={testRunResult}
+                    liveTrace={liveTrace}
                     samplePayloadJson={samplePayloadJson}
                     onSamplePayloadJsonChange={setSamplePayloadJson}
                     samplePayloadErr={samplePayloadErr}
@@ -563,6 +644,8 @@ interface TestRunDrawerProps {
     onRun: () => void;
     busy: boolean;
     result: DryRunResult | null;
+    /** Live SSE trace events for the in-flight run. */
+    liveTrace: LiveTraceEvent[];
     // Synthesize-mode envelope override fields (audit fix #9).
     samplePayloadJson: string;
     onSamplePayloadJsonChange: (s: string) => void;
@@ -584,6 +667,7 @@ function TestRunDrawer({
     onRun,
     busy,
     result,
+    liveTrace,
     samplePayloadJson,
     onSamplePayloadJsonChange,
     samplePayloadErr,
@@ -756,11 +840,134 @@ function TestRunDrawer({
                     >
                         {busy ? "Running…" : "Run"}
                     </Button>
+                    {liveTrace.length > 0 && (
+                        <LiveTraceView trace={liveTrace} runningStill={busy} />
+                    )}
                     {result && <TestRunResultView result={result} />}
                 </div>
             )}
         </section>
     );
+}
+
+function LiveTraceView({
+    trace,
+    runningStill,
+}: {
+    trace: LiveTraceEvent[];
+    runningStill: boolean;
+}) {
+    // Aggregate AgentTextDelta frames per (run_id, node_id) so the
+    // running agent text is shown as one growing block rather than
+    // 60+ rows. Other event kinds render verbatim.
+    type Row =
+        | { kind: "event"; ts: number; t: string; data: Record<string, unknown> }
+        | { kind: "agent-text"; nodeId: string; text: string };
+    const rows: Row[] = useMemo(() => {
+        const out: Row[] = [];
+        for (const ev of trace) {
+            if (ev.t === "agent_text_delta") {
+                const nodeId =
+                    (ev.data.node_id as string | undefined) ?? "(unknown)";
+                const delta = (ev.data.delta as string | undefined) ?? "";
+                const last = out[out.length - 1];
+                if (
+                    last &&
+                    last.kind === "agent-text" &&
+                    last.nodeId === nodeId
+                ) {
+                    last.text += delta;
+                } else {
+                    out.push({ kind: "agent-text", nodeId, text: delta });
+                }
+            } else {
+                out.push({
+                    kind: "event",
+                    ts: ev.ts,
+                    t: ev.t,
+                    data: ev.data,
+                });
+            }
+        }
+        return out;
+    }, [trace]);
+    return (
+        <div
+            className="mt-3 border rounded p-2"
+            style={{ background: "#0e131a", borderColor: "#30363d" }}
+            data-testid="live-trace"
+        >
+            <div className="small text-muted mb-1">
+                <i
+                    className={`bi ${
+                        runningStill ? "bi-broadcast" : "bi-check-circle"
+                    } me-1`}
+                    aria-hidden
+                />
+                Live trace · {trace.length} event(s){" "}
+                {runningStill && (
+                    <span className="text-info"> · streaming…</span>
+                )}
+            </div>
+            <ul
+                className="small mb-0 font-monospace"
+                style={{ listStyle: "none", paddingLeft: 0, maxHeight: 200, overflowY: "auto" }}
+            >
+                {rows.map((r, i) => {
+                    if (r.kind === "agent-text") {
+                        return (
+                            <li
+                                key={`a-${i}`}
+                                style={{ color: "#a5d8ff" }}
+                                data-testid="live-trace-agent-text"
+                            >
+                                <span style={{ color: "#7d8590" }}>
+                                    [agent_text {r.nodeId}]
+                                </span>{" "}
+                                {r.text}
+                            </li>
+                        );
+                    }
+                    return (
+                        <li
+                            key={`e-${i}`}
+                            data-testid={`live-trace-row-${r.t}`}
+                        >
+                            <span style={{ color: "#7d8590" }}>
+                                [{r.t}]
+                            </span>{" "}
+                            {summarizeEventData(r.t, r.data)}
+                        </li>
+                    );
+                })}
+            </ul>
+        </div>
+    );
+}
+
+function summarizeEventData(t: string, data: Record<string, unknown>): string {
+    // One-line summary per FlowChannelEvent variant. Keeps the trace
+    // readable — the raw JSON is debug-only and would explode the
+    // viewport on a chatty run.
+    const node = (data.node_id as string | undefined) ?? "";
+    switch (t) {
+        case "node_started":
+            return `→ ${node}`;
+        case "node_finished":
+            return `✓ ${node} (${(data.outcome as string | undefined) ?? "?"})`;
+        case "agent_turn_started":
+            return `agent ${node} turn ${data.turn_index ?? "?"}`;
+        case "agent_turn_finished":
+            return `agent ${node} done (${(data.exit_tool as string | undefined) ?? "?"})`;
+        case "agent_tool_call_delta":
+            return `agent ${node} tool ${(data.tool_name as string | undefined) ?? "?"}`;
+        case "reply_routed":
+            return `reply (${(data.route as string | undefined) ?? "?"})`;
+        case "run_finished":
+            return `outcome=${(data.outcome as string | undefined) ?? "?"}`;
+        default:
+            return JSON.stringify(data);
+    }
 }
 
 function TestRunResultView({ result }: { result: DryRunResult }) {

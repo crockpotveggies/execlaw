@@ -356,6 +356,9 @@ export interface SampleEventBody {
 export interface TestRunRequest {
     event_id?: string;
     sample_event?: SampleEventBody;
+    /** Caller-supplied run id. When set, FlowChannelHub publishes
+     *  under this id so SSE subscribers can correlate. */
+    client_run_id?: string;
 }
 
 export async function testRunAutomation(

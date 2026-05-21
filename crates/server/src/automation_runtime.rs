@@ -301,11 +301,25 @@ pub fn dry_run(
     automation: &AutomationRow,
     sample: &BusEventRow,
 ) -> DryRunResult {
+    dry_run_with_id(ctx, automation, sample, None)
+}
+
+/// Like [`dry_run`], but lets the caller supply the run id. When
+/// `client_run_id` is `Some`, the FlowChannelHub publishes events
+/// under that id so SPA SSE subscribers can correlate (audit fix
+/// #8). When `None`, falls back to the legacy `dry-{uuid}` mint.
+pub fn dry_run_with_id(
+    ctx: &ExecutorContext,
+    automation: &AutomationRow,
+    sample: &BusEventRow,
+    client_run_id: Option<String>,
+) -> DryRunResult {
     let event_ctx = event_context(sample);
     let mut state: HashMap<String, serde_json::Value> = HashMap::new();
     state.insert("event".to_string(), event_ctx);
     let mut traces: Vec<StepTrace> = Vec::new();
-    let dry_run_id = format!("dry-{}", uuid::Uuid::new_v4());
+    let dry_run_id =
+        client_run_id.unwrap_or_else(|| format!("dry-{}", uuid::Uuid::new_v4()));
     let outcome = execute_graph(
         &automation.definition,
         &mut state,
