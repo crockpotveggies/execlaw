@@ -62,10 +62,15 @@ pub struct ExecutorContext {
     pub plugin_host: Option<PluginHost>,
     /// M6 — live event hub. Executor publishes `FlowChannelEvent`
     /// frames during graph execution; the SPA subscribes by `run_id`.
-    /// Tests that don't subscribe still get publishes (they go to a
-    /// channel with no listeners and are dropped — no panic, no
-    /// backpressure on the executor).
     pub flow_channel: crate::flow_channel::FlowChannelHub,
+    /// M6 — UiEvent broadcast bus, forwarded into the ReplyRouter
+    /// so the `chat_append` handler can publish
+    /// `UiEvent::ChatMessageOutbound` to live SPA subscribers.
+    pub events: Option<crate::events::EventBus>,
+    /// M6 — event-log HMAC key, forwarded into the ReplyRouter so
+    /// chat replies persist into `state_events` with the proper
+    /// HMAC chain.
+    pub event_log_hmac_key: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 impl ExecutorContext {
@@ -75,11 +80,26 @@ impl ExecutorContext {
             pool,
             plugin_host,
             flow_channel: crate::flow_channel::FlowChannelHub::new(),
+            events: None,
+            event_log_hmac_key: None,
         }
     }
 
     pub fn with_flow_channel(mut self, hub: crate::flow_channel::FlowChannelHub) -> Self {
         self.flow_channel = hub;
+        self
+    }
+
+    pub fn with_events(mut self, events: crate::events::EventBus) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    pub fn with_event_log_hmac_key(
+        mut self,
+        key: Option<std::sync::Arc<Vec<u8>>>,
+    ) -> Self {
+        self.event_log_hmac_key = key;
         self
     }
 }
@@ -545,8 +565,12 @@ fn execute_send_reply(
         _ => envelope.clone(),
     };
 
-    let router_ctx =
+    let mut router_ctx =
         crate::reply_router::RouterCtx::new(ctx.db.clone(), ctx.plugin_host.clone());
+    if let Some(events) = ctx.events.clone() {
+        router_ctx = router_ctx.with_events(events);
+    }
+    router_ctx = router_ctx.with_event_log_hmac_key(ctx.event_log_hmac_key.clone());
 
     let handle = match tokio::runtime::Handle::try_current() {
         Ok(h) => h,

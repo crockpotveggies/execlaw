@@ -27,7 +27,7 @@ use axum::response::Json;
 use axum::routing::{get, post};
 use axum::Router;
 use execlaw_core::automation_bus::{BusEventKind, Event as BusEvent};
-use execlaw_core::event_envelope::{EventEnvelope, OriginRef, SenderIdentity, TrustClass};
+use execlaw_core::event_envelope::{EventEnvelope, OriginRef, SenderIdentity};
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
@@ -48,18 +48,15 @@ pub fn router() -> Router<AppState> {
 pub struct SubmitPromptRequest {
     /// The operator's typed text.
     pub text: String,
-    /// Existing conversation to append to. Optional: when absent the
-    /// default flow creates a new conversation (TODO slice 7b — for
-    /// now we just include the field in the payload and let the
-    /// AskAgent node ignore it).
-    #[serde(default)]
-    pub conversation_id: Option<String>,
+    /// Conversation to attach to. Required — the reply lands here
+    /// via `OriginRef::ChatAppend` so the SPA's existing per-
+    /// conversation WebSocket subscription receives the
+    /// `UiEvent::ChatMessageOutbound` broadcast and the message
+    /// persists into `state_events`.
+    pub conversation_id: String,
     /// Existing attachment_ids the operator wants to bundle.
     #[serde(default)]
     pub attachment_ids: Vec<String>,
-    /// Web session id for OriginRef. The SPA mints this on chat
-    /// surface mount; reply tokens stream back to the same session.
-    pub session_id: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -89,15 +86,17 @@ pub async fn submit_prompt(
         "conversation_id": req.conversation_id,
         "attachment_ids": req.attachment_ids,
     });
-    // Build the envelope. Identity is "Controller principal" for the
-    // single-user case (slice 7b refines this when we wire per-user
-    // sessions). Reply target = the SPA WebSocket session that
-    // submitted the prompt.
+    // Build the envelope. Reply target = ChatAppend keyed by the
+    // SPA's conversation id; the chat_append handler persists the
+    // model_turn into the event log AND broadcasts
+    // UiEvent::ChatMessageOutbound on the existing per-conversation
+    // WebSocket subscription. Identity defaults to System for now;
+    // slice C resolves the originating operator principal.
     let envelope = EventEnvelope {
-        origin: OriginRef::WebSocketSession {
-            session_id: req.session_id.clone(),
+        origin: OriginRef::ChatAppend {
+            conversation_id: req.conversation_id.clone(),
         },
-        identity: SenderIdentity::System, // TODO slice 7b — resolve the operator's principal
+        identity: SenderIdentity::System,
         correlation_id: event_id.clone(),
         parent_event_id: None,
     };
@@ -118,9 +117,6 @@ pub async fn submit_prompt(
             code: "bus_publish_failed",
             message: format!("{e}"),
         })?;
-    // Suppress unused-warning for TrustClass while envelope identity
-    // resolution is still a TODO.
-    let _ = TrustClass::Controller;
     Ok(Json(SubmitPromptResponse { event_id }))
 }
 
@@ -232,10 +228,8 @@ pub fn ensure_default_web_flow(db: &execlaw_core::Database) -> Result<(), String
     let store = AutomationStore::new(db);
     // Check whether ANY row claims the slot.
     let rows = store.list_all().map_err(|e| format!("list: {e}"))?;
-    if rows
-        .iter()
-        .any(|r| r.name == "Default web prompt flow (shadow)")
-    {
+    const NAME: &str = "Default web prompt flow";
+    if rows.iter().any(|r| r.name == NAME) {
         return Ok(());
     }
     let def: execlaw_core::automations::AutomationDef =
@@ -246,14 +240,14 @@ pub fn ensure_default_web_flow(db: &execlaw_core::Database) -> Result<(), String
         .upsert(
             &AutomationUpsert {
                 id: None,
-                name: "Default web prompt flow (shadow)".into(),
-                enabled: false, // shadow mode — opt-in
+                name: NAME.into(),
+                enabled: true,
                 definition: def,
             },
             now,
         )
         .map_err(|e| format!("upsert default flow: {e}"))?;
-    tracing::info!("M6: seeded default web prompt flow (disabled / shadow mode)");
+    tracing::info!("M6: seeded default web prompt flow (enabled)");
     Ok(())
 }
 

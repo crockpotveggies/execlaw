@@ -1,0 +1,45 @@
+{
+  "trigger": { "kind": "other", "when": null },
+  "nodes": [
+    {
+      "id": "brief",
+      "kind": "AskAgent",
+      "config": {
+        "prompt": "Generate a brief 2-3 sentence pre-meeting summary for an upcoming calendar event. Event details: {{event.payload}}",
+        "attachments": [],
+        "exit_tools": [
+          {
+            "name": "deliver_brief",
+            "description": "Deliver the meeting brief to the operator's Inbox.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "text": { "type": "string" }
+              },
+              "required": ["text"]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "notify",
+      "kind": "Notify",
+      "config": {
+        "title": "Meeting briefing",
+        "detail": "{{brief.args.text}}",
+        "severity": "Info"
+      }
+    },
+    {
+      "id": "end",
+      "kind": "Terminal",
+      "config": {}
+    }
+  ],
+  "edges": [
+    { "from": "trigger", "to": "brief", "when": null },
+    { "from": "brief", "to": "notify", "when": null },
+    { "from": "notify", "to": "end", "when": null }
+  ]
+}

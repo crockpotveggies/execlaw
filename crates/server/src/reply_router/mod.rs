@@ -46,11 +46,36 @@ use execlaw_plugin_host::PluginHost;
 pub struct RouterCtx {
     pub db: Database,
     pub plugin_host: Option<PluginHost>,
+    /// EventBus handle for `UiEvent::*` broadcasts (chat surface
+    /// subscribers). `None` in unit tests that don't render
+    /// outbound chat messages.
+    pub events: Option<crate::events::EventBus>,
+    /// HMAC chaining key for `EventLog::commit_turn`. `None` for
+    /// pre-setup + tests; production loads from the vault.
+    pub event_log_hmac_key: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 impl RouterCtx {
     pub fn new(db: Database, plugin_host: Option<PluginHost>) -> Self {
-        Self { db, plugin_host }
+        Self {
+            db,
+            plugin_host,
+            events: None,
+            event_log_hmac_key: None,
+        }
+    }
+
+    pub fn with_events(mut self, events: crate::events::EventBus) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    pub fn with_event_log_hmac_key(
+        mut self,
+        key: Option<std::sync::Arc<Vec<u8>>>,
+    ) -> Self {
+        self.event_log_hmac_key = key;
+        self
     }
 }
 

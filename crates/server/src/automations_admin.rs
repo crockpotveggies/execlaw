@@ -593,9 +593,13 @@ pub async fn test_run(
     let pool = state.automation_agent_pool.clone();
     let plugin_host = Some(state.plugin_host.clone());
     let flow_channel = state.flow_channel.clone();
+    let events_bus = state.events.clone();
+    let hmac_key = state.event_log_hmac_key.clone();
     let result = tokio::task::spawn_blocking(move || {
         let ctx = automation_runtime::ExecutorContext::new(db, pool, plugin_host)
-            .with_flow_channel(flow_channel);
+            .with_flow_channel(flow_channel)
+            .with_events(events_bus)
+            .with_event_log_hmac_key(hmac_key);
         automation_runtime::dry_run(&ctx, &automation, &event)
     })
     .await

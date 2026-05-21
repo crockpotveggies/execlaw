@@ -1732,6 +1732,80 @@ fn import_m6_registry(
             );
         }
     }
+
+    // M6 — import shipped default automations into `state_automations`
+    // with `source = "plugin:<id>"`. Idempotent: re-running just
+    // updates the existing row in place. Skips on `operator_modified`
+    // so operator edits aren't clobbered on plugin upgrade.
+    if !manifest.default_automations.is_empty() {
+        use execlaw_core::automations::{AutomationDef, AutomationStore, AutomationUpsert};
+        let store = AutomationStore::new(db);
+        let existing_names: Vec<String> = store
+            .list_all()
+            .map(|rows| rows.into_iter().map(|r| r.name).collect())
+            .unwrap_or_default();
+        for d in &manifest.default_automations {
+            // Skip if name already exists — preserve operator edits.
+            if existing_names.iter().any(|n| n == &d.name) {
+                tracing::debug!(
+                    plugin_id,
+                    name = %d.name,
+                    "M6: default automation already in state_automations (skipping)"
+                );
+                continue;
+            }
+            let flow_path = stage_path.join(&d.flow_path);
+            let raw = match std::fs::read_to_string(&flow_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        plugin_id,
+                        name = %d.name,
+                        path = %flow_path.display(),
+                        error = %e,
+                        "M6: default automation flow file missing (skipping)"
+                    );
+                    continue;
+                }
+            };
+            let def: AutomationDef = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        plugin_id,
+                        name = %d.name,
+                        error = %e,
+                        "M6: default automation flow JSON is invalid (skipping)"
+                    );
+                    continue;
+                }
+            };
+            let now = chrono::Utc::now().timestamp_millis();
+            if let Err(e) = store.upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: d.name.clone(),
+                    enabled: d.enabled,
+                    definition: def,
+                },
+                now,
+            ) {
+                warn!(
+                    plugin_id,
+                    name = %d.name,
+                    error = %e,
+                    "M6: default automation upsert failed (install continued)"
+                );
+            } else {
+                tracing::info!(
+                    plugin_id,
+                    name = %d.name,
+                    enabled = d.enabled,
+                    "M6: imported default automation"
+                );
+            }
+        }
+    }
 }
 
 fn resolve_executable(stage: &Path, declared: &str) -> String {

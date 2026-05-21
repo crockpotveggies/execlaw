@@ -1,21 +1,18 @@
 # Automations — event-driven architecture (M6)
 
-This document is the design baseline for the M6 milestone of the
-Automations feature. It supersedes the original architecture sketch
-in `docs/automations.md` §6 for everything event-routing and
-reply-related; that document remains canonical for the M1-M5
-substrate (event bus, automation store, run history, canvas
-editor).
+Branch: `crockpot/event-driven-arch`.
 
 ## TL;DR
 
-Every "thing that happens" in the system — operator typing into
-the web SPA, a WhatsApp message arriving, a calendar webhook
-firing, a scheduled routine running — now flows through the same
-event bus. Operator-authored Automations and plugin-shipped
-default flows route the event to its agent, side effects, and
-(when applicable) reply target. The web UI's chat surface is
-*one consumer* of this architecture, not a separate path.
+Every "thing that happens" in the system — operator typing into the
+web SPA, a WhatsApp message arriving, a calendar webhook firing, a
+scheduled routine running — flows through the same event bus.
+Operator-authored Automations and plugin-shipped default flows route
+the event to its agent, side effects, and (when applicable) reply
+target. Replies fan out per-transport through the `ReplyRouter`'s
+capability-driven degradation matrix and a four-tier fallback ladder
+that lands the work product in the operator Inbox on transport
+failure.
 
 Four moving pieces:
 
@@ -33,7 +30,7 @@ Four moving pieces:
 
 ## Data model
 
-### `EventEnvelope` (core)
+### `EventEnvelope`
 
 ```rust
 pub struct EventEnvelope {
@@ -62,11 +59,10 @@ pub enum SenderIdentity {
 }
 ```
 
-Persistence: `state_bus_events.envelope_json` (migration 0012). Old
-NULL rows decode to `EventEnvelope::system_internal()` so legacy
-events keep flowing through matchers without surprise.
+Persistence: `state_bus_events.envelope_json` (migration 0012). Pre-
+migration rows decode to `EventEnvelope::system_internal()`.
 
-### `ReplyPayload` (core)
+### `ReplyPayload`
 
 ```rust
 pub struct ReplyPayload {
@@ -85,12 +81,7 @@ pub enum ReplyPart {
 }
 ```
 
-Streaming variant (`ReplyParts::Streaming`) is wired into the
-model but the actual per-token delta surface lands in M6 slice 6b
-— for slice 6 only the lifecycle events fire on the per-run
-channel.
-
-### Registry (core)
+### Registry
 
 `state_registered_event_kinds` + `state_registered_reply_handlers`.
 Plugins declare in `plugin.toml`:
@@ -98,25 +89,31 @@ Plugins declare in `plugin.toml`:
 ```toml
 [[bus_events]]
 kind = "whatsapp.message.received"
-description = "Inbound WhatsApp message (DM or group)."
+description = "..."
 expects_reply = true
 default_origin_kind = "plugin_channel"
 
 [[reply_handlers]]
 name = "whatsapp"
-description = "..."
 supports_attachments = true
 supports_markdown = true
 max_attachment_size_bytes = 16777216
 allowed_mime_prefixes = ["image/", "video/", "audio/", "application/pdf"]
+
+[[default_automations]]
+name = "WhatsApp inbound default"
+flow_path = "flows/default.json"
+enabled = true
 ```
 
 Imported into the runtime registry at plugin install + hydrate
 (`crates/plugin-host/src/host.rs::import_m6_registry`). Plugin
 uninstall removes contributions via `EventRegistry::remove_by_plugin`.
-Core seeds its own built-ins (web.prompt.submitted, routine.fired,
-scheduled.wakeup, webhook.received + four built-in reply handlers)
-at boot via `register_core_event_kinds`.
+
+Core seeds its own built-ins (`web.prompt.submitted`, `routine.fired`,
+`scheduled.wakeup`, `webhook.received` + four built-in reply handlers
+`web_socket_session` / `chat_append` / `alert` / `drop`) at boot via
+`register_core_event_kinds`.
 
 ## Flow chart
 
@@ -125,7 +122,7 @@ at boot via `register_core_event_kinds`.
             │  Sources of events (all use the same envelope)     │
             │                                                    │
             │   POST /api/web/prompt    plugin webhooks    routine
-            │   (web SPA chat input)    (channel plugins)  schedules
+            │   (flow-driven prompts)   (channel plugins)  schedules
             └────────────────────┬────────────────────────────────┘
                                  │
                                  ▼
@@ -145,16 +142,18 @@ at boot via `register_core_event_kinds`.
                                   │ no                       │
                                   ▼                          │
                 ┌────────────────────────────────────┐       │
-                │  Channel default flow              │       │
+                │  Plugin/core default flow          │       │
                 │  (source = 'plugin:<id>' or 'core',│       │
-                │   editable = forks to operator)    │       │
+                │   imported from manifest at        │       │
+                │   install / hydrate)               │       │
                 └─────────────────┬──────────────────┘       │
                                   │                          │
                                   ├──────────────────────────┘
                                   ▼
                 ┌─────────────────────────────────────┐
                 │  ExecutorContext { db, pool,        │
-                │   plugin_host, flow_channel }       │
+                │   plugin_host, flow_channel,        │
+                │   events, event_log_hmac_key }      │
                 │                                     │
                 │   walks the graph, publishes        │
                 │   FlowChannelEvent per node start/  │
@@ -179,24 +178,20 @@ at boot via `register_core_event_kinds`.
                                                   └────────────────────────────┘
 ```
 
-## ReplyRouter degradation matrix
+## ReplyRouter
 
-Per-cell mapping for the most-common parts × transports. The router
-implements one helper per cell in `degrade.rs`; the tier ladder in
-`tiers.rs` composes them.
+### Degradation matrix
 
 | Part            | web (ws) | WhatsApp | Signal | SMS | Email | Alert | Voice | ChatAppend |
 |---|---|---|---|---|---|---|---|---|
 | `Attachment`    | inline   | attach   | attach | URL+text | attach | URL in detail | "I sent a file" | inline |
 | `Artifact`      | inline   | attach   | attach | URL+text | attach | URL in detail | "I sent a chart" | inline |
-| `Chart` (spec)  | inline   | text caption (TODO raster) | text caption | URL to PNG | text caption | URL | spoken caption | inline |
+| `Chart` (spec)  | inline   | text caption | text caption | URL to PNG | text caption | URL | spoken caption | inline |
 | `Table`         | card     | text rows (≤10) | text rows (≤10) | "table: N rows" | HTML table | flattened | summarized | card |
 | `Card`          | card     | flattened text | flattened text | flattened | HTML | k:v in detail | "title: …" | card |
 | `ExternalFile`  | download chip | fetch→attach if ≤max | fetch→attach | URL+text | attach | URL in detail | "file: <name>" | download chip |
 
-## Fallback tiers
-
-When the resolved handler refuses delivery, the router descends:
+### Fallback tiers
 
 1. **Tier 1 — Full** — every part packed per the degrade matrix.
 2. **Tier 2 — Attachments-only** — drop tables/cards/charts, keep
@@ -209,8 +204,23 @@ When the resolved handler refuses delivery, the router descends:
    payload there with a banner explaining the original target
    failed, fire a Warning alert so the operator notices.
 
-Each tier failure carries the underlying error forward in
-`RouteResult` so the flow trace records WHY a tier failed.
+### Built-in reply handlers
+
+- **`web_socket_session`** — placeholder; chat surface uses
+  `ChatAppend` instead. Reserved for future per-session non-chat
+  surfaces.
+- **`chat_append`** — appends a `ModelTurn` event into the
+  conversation's event log via `EventLog::commit_turn` (with HMAC
+  chaining if a key is wired) AND broadcasts
+  `UiEvent::ChatMessageOutbound` on the live event bus so SPA
+  subscribers see the reply.
+- **`alert`** — inserts a `Firing` row into `state_alerts` via
+  `AlertStore::insert_firing` (Info severity by default, title
+  truncated from `prepared.text`).
+- **`drop`** — silent no-op.
+- **plugin-channel handlers** — resolved by name in the
+  registry; the router calls `plugin_host.call_tool("<name>.send_reply",
+  { text, parts, origin })`.
 
 ## Streaming
 
@@ -222,8 +232,8 @@ pub enum FlowChannelEvent {
     NodeStarted { run_id, node_id, node_kind },
     NodeFinished { run_id, node_id, output, ms, error },
     AgentTurnStarted { run_id, node_id },
-    AgentTextDelta { run_id, node_id, index, text },     // slice 6b
-    AgentToolCallDelta { run_id, node_id, ... },         // slice 6b
+    AgentTextDelta { run_id, node_id, index, text },
+    AgentToolCallDelta { run_id, node_id, ... },
     AgentTurnFinished { run_id, node_id, exit_tool, args },
     ReplyRouted { run_id, node_id, outcome },
     RunFinished { run_id, outcome },
@@ -232,69 +242,74 @@ pub enum FlowChannelEvent {
 
 SPA subscribes via `GET /api/automations/flow-runs/{run_id}/events`
 (SSE). The endpoint converts each `FlowChannelEvent` to a typed
-`event:` frame with the variant tag as the event name + the JSON
-payload as the data.
+`event:` frame.
 
-Per-token streaming integration with the inference layer is the
-slice 6b follow-up. The Anthropic SDK already emits
-`text_delta` frames; piping them into the sink + emitting
-`AgentTextDelta` events is mechanical once we touch the invoker.
+Per-token streaming integration with the inference layer is a
+follow-up — the lifecycle events fire today; the per-token deltas
+need `runner-local::TurnExecutor` to expose a callback path that
+feeds the sink.
 
-## What's done in slices 1-10
+## What ships in this branch
 
-- ✅ Event envelope + reply payload data model (slice 1)
-- ✅ Manifest schema extensions + registry storage (slice 2)
-- ✅ Operator Inbox thread (`ConversationKind::OperatorHome`) (slice 3)
+- ✅ Event envelope + reply payload data model
+- ✅ Manifest schema extensions (`[[bus_events]]`,
+  `[[reply_handlers]]`, `[[default_automations]]`) + registry
+  storage + install/hydrate/uninstall import
+- ✅ Operator Inbox thread (`ConversationKind::OperatorHome`)
 - ✅ ReplyRouter with capability-driven degradation + 4-tier
-  fallback ladder + ChatAppendHome auto-mint (slice 4)
+  fallback ladder + ChatAppendHome auto-mint
+  - ✅ `chat_append` handler appends a ModelTurn into the event log
+    + broadcasts `UiEvent::ChatMessageOutbound`
+  - ✅ `alert` handler inserts via `AlertStore`
+  - ✅ `drop` no-op
+  - ✅ Plugin-channel dispatch via `plugin_host.call_tool`
 - ✅ `SendReply` node + validator gates + envelope threading
-  through `execute_graph` (slice 5)
+  through `execute_graph`
 - ✅ `FlowChannelHub` broadcast bus + lifecycle events + SSE
-  subscription endpoint (slice 6)
+  subscription endpoint
 - ✅ `POST /api/web/prompt` entrypoint + default web flow seeded
-  in shadow mode (slice 7)
-- ✅ Plugin manifests declare `bus_events` + `reply_handlers` for
-  whatsapp, signal, google-apps (gmail + calendar) (slice 8)
-- ✅ Registry inspection API + SPA client (slice 9)
+  enabled
+- ✅ Plugin manifests for whatsapp, signal, google-apps declare
+  bus_events, reply_handlers, AND default_automations (with JSON
+  flow files shipped at `plugins/<id>/flows/`)
+- ✅ Plugin install imports `[[default_automations]]` flow JSONs
+  into `state_automations` (operator edits preserved on upgrade —
+  if a row with the same name already exists we skip the upsert)
+- ✅ Registry inspection API + SPA TypeScript client
 
-## What's deferred (with explicit follow-up notes in commits)
+## What's NOT in this branch (deliberate follow-ups)
 
-1. **Slice 6b — per-token AskAgent streaming.** The
-   `AgentTextDelta` event variant is in the enum and the SSE
-   endpoint will fan it out, but the inference invoker still
-   returns a buffered final exit-tool call. Wiring requires
-   touching `crates/runner-local::TurnExecutor`'s callback path.
-2. **Slice 7b — actual chat-surface swap.** `POST /api/web/prompt`
-   exists and publishes; the default flow runs in shadow mode
-   (disabled). The existing `send_message` / `dispatch_external_turn`
-   path is untouched. Operator-by-operator opt-in + dual-run
-   comparison harness lands when we trust the shadow runs.
-3. **Slice 7c — `web_socket_session` reply handler wiring.** The
-   handler stub returns `Ok` so the tier ladder doesn't hang.
-   Actual `UiEvent::*` push happens when slice 6b lands.
-4. **Slice 7d — `chat_append` reply handler wiring.** Same shape
-   as 7c — stub returns Ok, real append needs a new `EventKind`
-   variant (`SystemMsg` or `AutomationMsg`).
-5. **Slice 8b — plugin default flows ship as JSON.** Manifests
-   declare `[[bus_events]]` + `[[reply_handlers]]` today; the
-   `[[default_automations]]` section is parsed but not imported
-   into `state_automations` yet. Lands alongside Phase 6 of the
-   channel-migration plan.
-6. **Slice 9b — SPA UI for registry inspector / default flows
-   tab / live trace renderer.** API endpoints + TypeScript client
-   exist; rendering them in `AutomationsPage.tsx` is the
-   follow-up.
-7. **Chart server-side rasterization.** Vega-Lite specs render
-   inline on the web transport; raster fallback to PNG for
-   poor-transport channels currently emits a text caption ("📊
-   <caption> (rendered chart available in the web UI)"). Adding
-   `vl-convert-rs` to the control plane container brings full
-   server-side raster (~40 MB dep weight) — flagged as a separate
-   architectural choice.
-8. **Phase 5/6/7 of the migration plan** — the irreversible chat
-   path replacement + per-channel migration + delete of
-   `send_message` — remains a deliberate next-session task. M6's
-   branch is fully reviewable + shippable as-is in shadow mode.
+These have explicit notes in their commits and don't block the
+architecture from being usable:
+
+1. **Per-token AskAgent streaming** — `AgentTextDelta` events fire
+   at turn boundaries today; per-token deltas require touching
+   `crates/runner-local::TurnExecutor`'s callback path. Mechanical
+   when we touch the invoker.
+2. **Full chat-surface migration** — the SPA composer still hits
+   `POST /api/chats/:cid/messages` because the existing chat path
+   has features (skill_names, incognito, prior_messages,
+   timezone, group context, cold contact handling, voice
+   integration) that haven't been reimplemented in the M6 flow
+   path. The two paths *coexist* — the legacy one for the chat
+   surface, the M6 one for automations and operator-authored
+   flows. As each chat feature gets a flow-path equivalent, that
+   feature migrates.
+3. **Plugin Rhai bindings for `host_publish_event`** — channel
+   plugins (whatsapp, signal) inbound paths still call
+   `dispatch_external_turn` directly. The M6 path is ready for
+   them; adding a `host_publish_event(kind, payload, envelope)`
+   Rhai binding + each plugin's `main.rhai` migration is the
+   plugin-side cutover sprint.
+4. **`web_socket_session` reply handler** — placeholder no-op.
+   Chat replies use `ChatAppend`. Reserved for future per-session
+   non-chat surfaces (e.g., a flow-trace renderer that wants to
+   push events to ONE SPA session).
+5. **Chart server-side rasterization** — Vega specs render inline
+   on the web transport. Adding `vl-convert-rs` (~40 MB Deno
+   bundle) brings server-side raster for poor-transport channels;
+   today they get a caption line + a URL pointing at the SPA's
+   inline renderer.
 
 ## Where to find the code
 
@@ -305,38 +320,34 @@ slice 6b follow-up. The Anthropic SDK already emits
 | Event registry storage | `crates/core/src/event_registry.rs` |
 | Operator Inbox helper | `crates/core/src/operator_home.rs` |
 | Migration | `crates/core/migrations/0012_event_envelope_and_registry.sql` |
-| Manifest sections | `crates/plugin-sdk/src/manifest.rs` (BusEventDecl, ReplyHandlerDecl, DefaultAutomationDecl) |
+| Manifest sections | `crates/plugin-sdk/src/manifest.rs` |
 | Manifest registry import | `crates/plugin-host/src/host.rs::import_m6_registry` |
 | Reply router | `crates/server/src/reply_router/` |
 | Flow channel hub | `crates/server/src/flow_channel.rs` |
 | SendReply node executor | `crates/server/src/automation_runtime.rs::execute_send_reply` |
 | Web prompt entrypoint | `crates/server/src/web_prompt.rs` |
-| Chart theme presets | `crates/core/src/chart_themes/{execlaw_dark,execlaw_light}.json` |
-| Registry inspection HTTP | `crates/server/src/automations_admin.rs` (list_registered_*) |
+| Chart theme presets | `crates/core/src/chart_themes/` |
+| Registry inspection HTTP | `crates/server/src/automations_admin.rs` |
+| Plugin default flows | `plugins/whatsapp/flows/default.json`, `plugins/signal/flows/default.json`, `plugins/google-apps/flows/calendar_briefing.json` |
 
-## How to verify in the morning
+## How to verify
 
 ```sh
-# Should show 1058+ server lib tests, 636+ core lib tests
 cargo test --workspace --lib
-
-# SPA: 479 tests
 cd web && npx vitest run
 
-# Boot the server
 cargo run --bin execlaw -- serve
 
-# Verify the registry seeded
+# Registry seeded?
 curl http://localhost:3031/api/admin/automations/registered-events
 curl http://localhost:3031/api/admin/automations/registered-reply-handlers
 curl http://localhost:3031/api/admin/automations/default-flows
 
-# Submit a web prompt (replace SESSION with anything for now)
+# Submit a web-prompt-driven flow run (replace with a real conv id)
 curl -X POST http://localhost:3031/api/web/prompt \
   -H 'content-type: application/json' \
-  -d '{"text": "hello", "session_id": "test-1"}'
-```
+  -d '{"text": "hello", "conversation_id": "<your-conv-id>"}'
 
-The default web flow is disabled in shadow mode by default — see
-the disabled toggle at `/automations` and flip it manually to
-opt-in once you're ready to A/B against the existing chat path.
+# Subscribe to the run's events
+curl -N http://localhost:3031/api/automations/flow-runs/<run_id>/events
+```

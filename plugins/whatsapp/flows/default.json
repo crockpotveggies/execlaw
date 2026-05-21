@@ -1,0 +1,44 @@
+{
+  "trigger": { "kind": "other", "when": null },
+  "nodes": [
+    {
+      "id": "ask",
+      "kind": "AskAgent",
+      "config": {
+        "prompt": "{{event.payload.text}}",
+        "attachments": [],
+        "exit_tools": [
+          {
+            "name": "respond",
+            "description": "Final reply to the WhatsApp message. `text` is rendered as the outbound message body.",
+            "args_schema": {
+              "type": "object",
+              "properties": {
+                "text": { "type": "string" }
+              },
+              "required": ["text"]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "reply",
+      "kind": "SendReply",
+      "config": {
+        "source": "from_agent",
+        "from_node": "ask"
+      }
+    },
+    {
+      "id": "end",
+      "kind": "Terminal",
+      "config": {}
+    }
+  ],
+  "edges": [
+    { "from": "trigger", "to": "ask", "when": null },
+    { "from": "ask", "to": "reply", "when": null },
+    { "from": "reply", "to": "end", "when": null }
+  ]
+}

@@ -1897,7 +1897,9 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                     automation_agent_pool.clone(),
                     Some(plugin_host.clone()),
                 )
-                .with_flow_channel(flow_channel.clone()),
+                .with_flow_channel(flow_channel.clone())
+                .with_events(events.clone())
+                .with_event_log_hmac_key(hmac_key.clone()),
             ),
             automation_bus_stop.clone(),
         );

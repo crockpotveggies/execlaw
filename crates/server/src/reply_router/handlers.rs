@@ -62,30 +62,83 @@ pub async fn send(
     }
 }
 
-/// TODO(slice 6) — stream the prepared deltas via `UiEvent::*` to the
-/// SPA. For now we mark the reply as accepted so the tier ladder
-/// completes; slice 6 wires the actual SSE push.
+/// WebSocketSession handler — broadcast a generic `UiEvent::ChatTokenDelta`
+/// or `ChatMessageOutbound` on the events bus. Used by flow-runs that
+/// don't target a specific conversation (e.g., the /flow-runs/:id SSE
+/// stream picks up the FlowChannelEvent path directly, not this
+/// handler). For the chat surface use `OriginRef::ChatAppend` instead.
 async fn send_web_socket(
     _ctx: &super::RouterCtx,
     _session_id: &str,
     _prepared: &PreparedReply,
 ) -> Result<String, SendError> {
+    // M6 — there's no per-session UiEvent variant today. Web-prompt
+    // path uses ChatAppend (which DOES broadcast UiEvent for the
+    // conversation). Leaving this as a clean no-op so flows that
+    // happen to set OriginRef::WebSocketSession (e.g., admin-test
+    // scratch flows) don't error.
     Ok(String::new())
 }
 
-/// TODO(slice 7) — append the prepared reply as a system-authored
-/// message into the chat. The append must:
-///   1. Mint an `EventRecord` of `kind = "system_msg"` (a new
-///      `EventKind` variant — TODO).
-///   2. Stamp `sender_principal_id = "system"`.
-///   3. Carry the prepared parts as inline attachments / cards.
-/// For now we return Ok so the fallback ladder doesn't hang.
+/// chat_append — append a model_turn event into the conversation's
+/// event log AND broadcast `UiEvent::ChatMessageOutbound` so live SPA
+/// subscribers see the reply. Equivalent of the existing
+/// `chats::send_message` reply path's commit step.
 async fn send_chat_append(
-    _ctx: &super::RouterCtx,
-    _conversation_id: &str,
-    _prepared: &PreparedReply,
+    ctx: &super::RouterCtx,
+    conversation_id: &str,
+    prepared: &PreparedReply,
 ) -> Result<String, SendError> {
-    Ok(String::new())
+    use execlaw_core::events::{EventKind, EventLog, PendingEvent};
+    use execlaw_core::ids::ConversationId;
+
+    let cid = ConversationId::from_string(conversation_id.to_owned());
+    let log = EventLog::new(&ctx.db);
+    let log = match &ctx.event_log_hmac_key {
+        Some(k) => log.with_hmac_key((**k).clone()),
+        None => log,
+    };
+
+    // Minimal model_turn payload — just text + a constant model
+    // marker. Future enhancement: carry attachments + finish_reason
+    // from PreparedReply.parts.
+    #[derive(serde::Serialize)]
+    struct Payload<'a> {
+        model: &'a str,
+        text: &'a str,
+        finish_reason: &'a str,
+        channel_origin: Option<&'a str>,
+    }
+    let payload = Payload {
+        model: "execlaw.flow",
+        text: &prepared.text,
+        finish_reason: "stop",
+        channel_origin: Some("web"),
+    };
+    let pending = PendingEvent::encode(EventKind::ModelTurn, &payload, Some("agent".into()))
+        .map_err(|e| SendError::Permanent(format!("encode model_turn: {e}")))?;
+    let latest = log
+        .last_seq(&cid)
+        .map_err(|e| SendError::Transient(format!("last_seq: {e}")))?;
+    let written = log
+        .commit_turn(&cid, latest, vec![pending])
+        .map_err(|e| SendError::Transient(format!("commit_turn: {e}")))?;
+    let assistant_seq = written
+        .iter()
+        .find(|e| e.kind == EventKind::ModelTurn)
+        .map(|e| e.seq.0)
+        .unwrap_or(latest.0 + 1);
+
+    // Broadcast to live SPA subscribers.
+    if let Some(events) = &ctx.events {
+        events.publish(crate::events::UiEvent::ChatMessageOutbound {
+            conversation_id: conversation_id.to_owned(),
+            seq: assistant_seq,
+            text: prepared.text.clone(),
+        });
+    }
+
+    Ok(format!("chat:{conversation_id}:{assistant_seq}"))
 }
 
 /// Fire an alert from the prepared text. Real implementation — used
