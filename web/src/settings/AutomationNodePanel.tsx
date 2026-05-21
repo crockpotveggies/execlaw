@@ -14,6 +14,7 @@ import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
 import type {
     AutomationDef,
+    EdgeDef,
     ExitToolDef,
     NodeDef,
     RegisteredEventKind,
@@ -978,6 +979,144 @@ export function TriggerPanel({
                 The trigger and the End sentinel are structural — every
                 flow has exactly one of each. Drag operator nodes from
                 the palette and wire them between trigger and End.
+            </div>
+        </div>
+    );
+}
+
+/**
+ * Side panel for editing an edge's `when` clause (audit fix #3).
+ * Edges previously had no canvas-side editor — operators had to drop
+ * into the JSON view to gate a branch on the upstream AskAgent's
+ * exit-tool name. This surfaces that field directly.
+ *
+ * The `when` clause is a Rhai bool expression evaluated against the
+ * same scope as trigger filters (`event.*`) plus the per-node state
+ * keys (e.g. `agent1.outcome` when `agent1` is an upstream AskAgent
+ * node). Empty/whitespace text persists as `null` — the runtime
+ * treats null as "always taken".
+ */
+export function EdgePanel({
+    edgeId,
+    edge,
+    onWhenChange,
+    onClose,
+}: {
+    edgeId: string;
+    edge: EdgeDef;
+    /** Replace the edge's `when` clause. Pass `null` to clear it. */
+    onWhenChange: (edgeId: string, whenExpr: string | null) => void;
+    onClose: () => void;
+}) {
+    // Draft state — local mutation flushes back to the canonical def
+    // on blur so each keystroke doesn't churn the AutomationDef object
+    // (which would re-render the whole canvas + re-seed ReactFlow).
+    const [draft, setDraft] = useState<string>(edge.when ?? "");
+    const commit = () => {
+        const trimmed = draft.trim();
+        const next = trimmed === "" ? null : draft;
+        if (next !== edge.when) {
+            onWhenChange(edgeId, next);
+        }
+    };
+    return (
+        <div
+            className="execlaw-automation-edge-panel border rounded shadow-sm"
+            style={{
+                position: "absolute",
+                top: 12,
+                right: 12,
+                width: 380,
+                maxHeight: "calc(100% - 24px)",
+                overflowY: "auto",
+                zIndex: 10,
+                padding: 12,
+                background: "#161b22",
+                borderColor: "#30363d",
+                color: "#e6edf3",
+                boxShadow: "0 4px 12px rgba(0, 0, 0, 0.45)",
+            }}
+            data-testid="edge-panel"
+            onKeyDown={(e) => e.stopPropagation()}
+        >
+            <div className="d-flex justify-content-between align-items-start mb-2">
+                <div>
+                    <div className="text-muted small">Edge</div>
+                    <div
+                        className="h6 mb-0 font-monospace"
+                        data-testid="edge-panel-route"
+                    >
+                        {edge.from} → {edge.to}
+                    </div>
+                </div>
+                <Button
+                    variant="link"
+                    size="sm"
+                    onClick={onClose}
+                    aria-label="Close panel"
+                    data-testid="edge-panel-close"
+                >
+                    <i className="bi bi-x-lg" aria-hidden />
+                </Button>
+            </div>
+
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">
+                    When (Rhai bool, optional)
+                </Form.Label>
+                <Form.Control
+                    as="textarea"
+                    rows={3}
+                    value={draft}
+                    onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                        setDraft(e.target.value)
+                    }
+                    onBlur={commit}
+                    onKeyDown={(e) => {
+                        // Ctrl/Cmd+Enter commits without leaving the
+                        // panel — useful for quick iteration on a
+                        // branch condition.
+                        if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+                            e.preventDefault();
+                            commit();
+                        }
+                    }}
+                    placeholder={
+                        edge.from === "trigger"
+                            ? 'event.payload.zone == "driveway"'
+                            : `${edge.from}.outcome == "notify"`
+                    }
+                    spellCheck={false}
+                    className="font-monospace small"
+                    data-testid="edge-panel-when"
+                />
+                <div className="small text-muted mt-1">
+                    Falsy or expression error → this edge isn't taken.
+                    Leave blank for an unconditional edge. Scope
+                    exposes <code>event.*</code> plus each upstream
+                    node's output as <code>{`{node_id}.field`}</code>.
+                </div>
+            </Form.Group>
+
+            <Button
+                variant="outline-secondary"
+                size="sm"
+                onClick={() => {
+                    setDraft("");
+                    onWhenChange(edgeId, null);
+                }}
+                disabled={!edge.when && draft === ""}
+                data-testid="edge-panel-clear"
+            >
+                <i className="bi bi-eraser me-1" aria-hidden />
+                Clear condition
+            </Button>
+
+            <div className="small text-muted mt-3">
+                Multiple outgoing edges from a Branch node each get
+                their own <code>when</code>; the first matching edge
+                wins. From a non-Branch node, an unconditional edge is
+                taken always.
             </div>
         </div>
     );

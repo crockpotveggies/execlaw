@@ -29,6 +29,7 @@ import OverlayTrigger from "react-bootstrap/OverlayTrigger";
 import Tooltip from "react-bootstrap/Tooltip";
 import {
     AutomationNodePanel,
+    EdgePanel,
     TriggerPanel,
 } from "./AutomationNodePanel";
 import {
@@ -176,6 +177,7 @@ function buildGraph(
     def: AutomationDef,
     selectedNodeId: string | null,
     triggerSelected: boolean,
+    selectedEdgeId: string | null = null,
 ): { nodes: Node[]; edges: Edge[] } {
     const triggerNode: Node = {
         id: TRIGGER_NODE_ID,
@@ -220,20 +222,30 @@ function buildGraph(
     };
     const nodes: Node[] = [triggerNode, ...typedNodes, endNode];
 
-    const edges: Edge[] = def.edges.map((e, i) => ({
-        id: `e-${i}-${e.from}-${e.to}`,
-        source: e.from === "trigger" ? TRIGGER_NODE_ID : e.from,
-        target: e.to === END_SENTINEL ? END_NODE_ID : e.to,
-        label: e.when ?? undefined,
-        // Edge labels: light text on a dark pill so `when` clauses
-        // stay readable on the dark canvas.
-        labelStyle: { fontSize: 11, fill: "#e6edf3" },
-        labelBgStyle: { fill: "#1f2630", fillOpacity: 0.85 },
-        // Stroke uses `$text-muted` so edges are visible but don't
-        // outshout the node tiles.
-        style: { stroke: "#7d8590", strokeWidth: 1.5 },
-        animated: e.when !== null && e.when !== undefined,
-    }));
+    const edges: Edge[] = def.edges.map((e, i) => {
+        const id = `e-${i}-${e.from}-${e.to}`;
+        const isSelected = id === selectedEdgeId;
+        return {
+            id,
+            source: e.from === "trigger" ? TRIGGER_NODE_ID : e.from,
+            target: e.to === END_SENTINEL ? END_NODE_ID : e.to,
+            label: e.when ?? undefined,
+            // Edge labels: light text on a dark pill so `when` clauses
+            // stay readable on the dark canvas.
+            labelStyle: { fontSize: 11, fill: "#e6edf3" },
+            labelBgStyle: { fill: "#1f2630", fillOpacity: 0.85 },
+            // Stroke uses `$text-muted` so edges are visible but don't
+            // outshout the node tiles. Selected edges adopt the
+            // controller-blue accent so the operator sees which edge
+            // the side-panel applies to.
+            style: {
+                stroke: isSelected ? "#4493f8" : "#7d8590",
+                strokeWidth: isSelected ? 2.5 : 1.5,
+            },
+            selected: isSelected,
+            animated: e.when !== null && e.when !== undefined,
+        };
+    });
     return { nodes, edges };
 }
 
@@ -271,6 +283,25 @@ export function withRemovedEdge(def: AutomationDef, edgeId: string): AutomationD
             return `e-${i}-${e.from}-${e.to}` !== edgeId;
         }),
     };
+}
+
+/// Replace an edge's `when` clause by canvas-edge-id. Used by the
+/// EdgePanel for audit fix #3. `whenExpr` empty/whitespace -> stored
+/// as `null` (unconditional). The id is the canvas-side
+/// `e-{index}-{from}-{to}` synthetic id so the lookup is just an
+/// index match. */
+export function withUpdatedEdge(
+    def: AutomationDef,
+    edgeId: string,
+    whenExpr: string | null,
+): AutomationDef {
+    const idx = def.edges.findIndex((e, i) => `e-${i}-${e.from}-${e.to}` === edgeId);
+    if (idx < 0) return def;
+    const trimmed = whenExpr?.trim() ?? "";
+    const nextWhen = trimmed === "" ? null : whenExpr;
+    const next = [...def.edges];
+    next[idx] = { ...next[idx], when: nextWhen };
+    return { ...def, edges: next };
 }
 
 export function withAddedEdge(
@@ -404,6 +435,11 @@ function CanvasInner({ definition, onChange }: Props) {
     // editor) and isn't in `def.nodes`. Tracked separately so a single
     // boolean tells us "is the trigger panel open?".
     const [triggerSelected, setTriggerSelected] = useState(false);
+    // Canvas-edge-id (the synthetic `e-{i}-{from}-{to}` string) of the
+    // edge whose side panel is open. Null means no edge selected.
+    // Mutually exclusive with selectedNodeId / triggerSelected — the
+    // click handlers clear the other two when an edge is selected.
+    const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
     const editable = !!onChange;
 
     // Visual node/edge state owned by ReactFlow. We let the lib drive
@@ -414,7 +450,7 @@ function CanvasInner({ definition, onChange }: Props) {
     // visuals when the parent's `definition` changes for an external
     // reason (palette drop, delete, rename, save-and-reload).
     const initial = useMemo(
-        () => buildGraph(definition, selectedNodeId, triggerSelected),
+        () => buildGraph(definition, selectedNodeId, triggerSelected, selectedEdgeId),
         // eslint-disable-next-line react-hooks/exhaustive-deps
         [],
     );
@@ -426,10 +462,22 @@ function CanvasInner({ definition, onChange }: Props) {
     // calls `onChange`, but by then ReactFlow's internal position is
     // already where we want it, so the re-seed is a no-op visually).
     useEffect(() => {
-        const built = buildGraph(definition, selectedNodeId, triggerSelected);
+        const built = buildGraph(
+            definition,
+            selectedNodeId,
+            triggerSelected,
+            selectedEdgeId,
+        );
         setNodes(built.nodes);
         setEdges(built.edges);
-    }, [definition, selectedNodeId, triggerSelected, setNodes, setEdges]);
+    }, [
+        definition,
+        selectedNodeId,
+        triggerSelected,
+        selectedEdgeId,
+        setNodes,
+        setEdges,
+    ]);
 
     // Position updates: ReactFlow fires `position` changes during the
     // drag (intermediate, `dragging: true`) AND on dragstop
@@ -463,15 +511,18 @@ function CanvasInner({ definition, onChange }: Props) {
                     // END sentinel has no config; everyone else opens
                     // a panel — the trigger gets its own panel
                     // (kind + when), operator nodes get the per-kind
-                    // panel.
+                    // panel. Selecting any node also clears edge
+                    // selection so the panel slot stays single-tenant.
                     if (ch.selected && ch.id === END_NODE_ID) {
                         // no-op — End has no editable state.
                     } else if (ch.selected && ch.id === TRIGGER_NODE_ID) {
                         setTriggerSelected(true);
                         setSelectedNodeId(null);
+                        setSelectedEdgeId(null);
                     } else if (ch.selected) {
                         setSelectedNodeId(ch.id);
                         setTriggerSelected(false);
+                        setSelectedEdgeId(null);
                     } else if (!ch.selected && ch.id === TRIGGER_NODE_ID) {
                         setTriggerSelected(false);
                     } else if (!ch.selected && selectedNodeId === ch.id) {
@@ -490,10 +541,23 @@ function CanvasInner({ definition, onChange }: Props) {
             for (const ch of changes) {
                 if (ch.type === "remove") {
                     onChange(withRemovedEdge(definition, ch.id));
+                    if (selectedEdgeId === ch.id) setSelectedEdgeId(null);
+                }
+                if (ch.type === "select") {
+                    if (ch.selected) {
+                        setSelectedEdgeId(ch.id);
+                        // Edges, nodes, and the trigger sentinel are
+                        // mutually exclusive in the panel slot — only
+                        // one panel visible at a time.
+                        setSelectedNodeId(null);
+                        setTriggerSelected(false);
+                    } else if (selectedEdgeId === ch.id) {
+                        setSelectedEdgeId(null);
+                    }
                 }
             }
         },
-        [definition, onChange, onEdgesChangeXY],
+        [definition, onChange, onEdgesChangeXY, selectedEdgeId],
     );
 
     const onConnect = useCallback(
@@ -558,6 +622,28 @@ function CanvasInner({ definition, onChange }: Props) {
         },
         [definition, onChange],
     );
+
+    const onEdgeWhenChange = useCallback(
+        (edgeId: string, whenExpr: string | null) => {
+            if (!onChange) return;
+            onChange(withUpdatedEdge(definition, edgeId, whenExpr));
+        },
+        [definition, onChange],
+    );
+
+    /** The currently-selected edge resolved against `definition.edges`.
+     *  Maps the canvas-edge-id back to the raw `EdgeDef` so the panel
+     *  can show `from`, `to`, and the current `when`. */
+    const selectedEdge = useMemo(() => {
+        if (!selectedEdgeId) return null;
+        for (let i = 0; i < definition.edges.length; i += 1) {
+            const e = definition.edges[i];
+            if (`e-${i}-${e.from}-${e.to}` === selectedEdgeId) {
+                return { id: selectedEdgeId, def: e };
+            }
+        }
+        return null;
+    }, [definition, selectedEdgeId]);
 
     const onRename = useCallback(
         (oldId: string, newId: string) => {
@@ -636,6 +722,14 @@ function CanvasInner({ definition, onChange }: Props) {
                     trigger={definition.trigger}
                     onChange={onTriggerChange}
                     onClose={() => setTriggerSelected(false)}
+                />
+            )}
+            {editable && selectedEdge && (
+                <EdgePanel
+                    edgeId={selectedEdge.id}
+                    edge={selectedEdge.def}
+                    onWhenChange={onEdgeWhenChange}
+                    onClose={() => setSelectedEdgeId(null)}
                 />
             )}
         </div>
