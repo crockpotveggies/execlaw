@@ -203,17 +203,12 @@ pub fn default_web_flow_json() -> serde_json::Value {
                     "source": "from_agent",
                     "from_node": "ask"
                 }
-            },
-            {
-                "id": "end",
-                "kind": "Terminal",
-                "config": {}
             }
         ],
         "edges": [
             {"from": "trigger", "to": "ask", "when": null},
             {"from": "ask", "to": "reply", "when": null},
-            {"from": "reply", "to": "end", "when": null}
+            {"from": "reply", "to": "END", "when": null}
         ]
     })
 }
@@ -271,11 +266,14 @@ mod tests {
         let v = default_web_flow_json();
         let def: execlaw_core::automations::AutomationDef =
             serde_json::from_value(v).expect("default flow must parse");
-        assert_eq!(def.nodes.len(), 3);
+        // Two operator nodes + three edges (trigger→ask→reply→END).
+        // The END sentinel is NOT a node — it's the END_SENTINEL
+        // string used as an edge target.
+        assert_eq!(def.nodes.len(), 2);
         assert_eq!(def.edges.len(), 3);
         assert!(def.nodes.iter().any(|n| n.id == "ask"));
         assert!(def.nodes.iter().any(|n| n.id == "reply"));
-        assert!(def.nodes.iter().any(|n| n.id == "end"));
+        assert!(def.edges.iter().any(|e| e.to == "END"));
     }
 
     #[test]

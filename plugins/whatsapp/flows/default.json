@@ -29,16 +29,11 @@
         "source": "from_agent",
         "from_node": "ask"
       }
-    },
-    {
-      "id": "end",
-      "kind": "Terminal",
-      "config": {}
     }
   ],
   "edges": [
     { "from": "trigger", "to": "ask", "when": null },
     { "from": "ask", "to": "reply", "when": null },
-    { "from": "reply", "to": "end", "when": null }
+    { "from": "reply", "to": "END", "when": null }
   ]
 }

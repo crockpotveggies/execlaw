@@ -39,6 +39,10 @@ interface KindStyle {
 const STYLES: Record<string, KindStyle> = {
     // $accent (controller blue)
     Trigger: { bg: "rgba(68, 147, 248, 0.18)", border: "#4493f8", icon: "bi-lightning-charge-fill" },
+    // muted dark gray — the End sentinel reads as "structure", not
+    // a content node. Distinct from Terminal so the operator can
+    // tell them apart at a glance.
+    End: { bg: "rgba(125, 133, 144, 0.10)", border: "#7d8590", icon: "bi-flag-fill" },
     // $warning (amber)
     Filter: { bg: "rgba(210, 153, 34, 0.18)", border: "#d29922", icon: "bi-funnel" },
     // $success (green)
@@ -126,6 +130,22 @@ export function TriggerNode(props: NodeProps) {
             <NodeHeader kind="Trigger" label={data.label} />
             <NodeDetail detail={data.detail} />
             <Handle type="source" position={Position.Bottom} />
+        </div>
+    );
+}
+
+/// The flow's synthetic terminal sentinel. Like the Trigger it's
+/// not in `def.nodes` — operators can't delete or rename it; they
+/// route their final node's outgoing edge into the End sentinel and
+/// the runtime treats that as the flow's success terminus.
+export function EndNode(props: NodeProps) {
+    const data = props.data as unknown as CanvasNodeData;
+    return (
+        <div style={nodeShellStyle("End", !!data.selected)}>
+            <Handle type="target" position={Position.Top} />
+            <NodeHeader kind="End" label={data.label} />
+            <NodeDetail detail={data.detail} />
+            {/* No source handle — the flow stops here. */}
         </div>
     );
 }
@@ -229,6 +249,7 @@ export function SendReplyNode(props: NodeProps) {
 /** Map ReactFlow `type` string → React component for `nodeTypes`. */
 export const NODE_TYPES = {
     Trigger: TriggerNode,
+    End: EndNode,
     Filter: FilterNode,
     Transform: TransformNode,
     Branch: BranchNode,

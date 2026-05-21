@@ -30,16 +30,11 @@
         "detail": "{{brief.args.text}}",
         "severity": "Info"
       }
-    },
-    {
-      "id": "end",
-      "kind": "Terminal",
-      "config": {}
     }
   ],
   "edges": [
     { "from": "trigger", "to": "brief", "when": null },
     { "from": "brief", "to": "notify", "when": null },
-    { "from": "notify", "to": "end", "when": null }
+    { "from": "notify", "to": "END", "when": null }
   ]
 }

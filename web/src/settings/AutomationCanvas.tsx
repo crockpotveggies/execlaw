@@ -43,6 +43,14 @@ import type {
 } from "../api/automations";
 
 const TRIGGER_NODE_ID = "__trigger__";
+/// Synthetic terminal sentinel. Mirrors `__trigger__` — it's not in
+/// `def.nodes`, it represents the END_SENTINEL string ("END") that
+/// edges use as their `to`. Undeletable, draggable for layout only.
+/// Operators can still drop explicit `Terminal` nodes from the
+/// palette for branch-specific terminations (e.g., "this branch
+/// ends here without reaching the global end").
+const END_NODE_ID = "__end__";
+const END_SENTINEL = "END";
 const X_CENTER = 240;
 const ROW_HEIGHT = 100;
 
@@ -98,6 +106,33 @@ function defaultPosition(
     const idx = row.indexOf(nodeId);
     const offset = (idx - (row.length - 1) / 2) * 220;
     return { x: X_CENTER + offset, y: rank * ROW_HEIGHT };
+}
+
+/// Position for the END sentinel — one rank below the lowest node
+/// reachable from the trigger. Defaults to two ranks below the
+/// trigger on empty flows so the sentinel doesn't overlap.
+function defaultPositionForEnd(def: AutomationDef): { x: number; y: number } {
+    // Reuse the BFS in `defaultPosition` by computing ranks the
+    // same way for every operator node, then placing END one rank
+    // below the max.
+    const ranks = new Map<string, number>();
+    ranks.set("trigger", 0);
+    const queue: Array<{ id: string; depth: number }> = [
+        { id: "trigger", depth: 0 },
+    ];
+    while (queue.length > 0) {
+        const { id, depth } = queue.shift()!;
+        for (const e of def.edges) {
+            if (e.from === id) {
+                if (!ranks.has(e.to) || ranks.get(e.to)! > depth + 1) {
+                    ranks.set(e.to, depth + 1);
+                    queue.push({ id: e.to, depth: depth + 1 });
+                }
+            }
+        }
+    }
+    const maxRank = Math.max(0, ...ranks.values());
+    return { x: X_CENTER, y: (maxRank + 1) * ROW_HEIGHT };
 }
 
 function shorten(s: string | undefined): string {
@@ -163,12 +198,27 @@ function buildGraph(
         draggable: true,
         selected: selectedNodeId === n.id,
     }));
-    const nodes: Node[] = [triggerNode, ...typedNodes];
+    // The END sentinel — synthetic, undeletable, mirrors the trigger
+    // sentinel at the bottom of the flow. Its position defaults to
+    // a row just below the last operator node so simple linear flows
+    // read top-to-bottom.
+    const endNode: Node = {
+        id: END_NODE_ID,
+        position: defaultPositionForEnd(def),
+        data: {
+            label: "End",
+            detail: "Flow ends successfully here",
+            sentinel: "end",
+        } satisfies CanvasNodeData,
+        type: "End",
+        draggable: true,
+    };
+    const nodes: Node[] = [triggerNode, ...typedNodes, endNode];
 
     const edges: Edge[] = def.edges.map((e, i) => ({
         id: `e-${i}-${e.from}-${e.to}`,
         source: e.from === "trigger" ? TRIGGER_NODE_ID : e.from,
-        target: e.to,
+        target: e.to === END_SENTINEL ? END_NODE_ID : e.to,
         label: e.when ?? undefined,
         // Edge labels: light text on a dark pill so `when` clauses
         // stay readable on the dark canvas.
@@ -196,7 +246,11 @@ export function withUpdatedPosition(
 }
 
 export function withRemovedNode(def: AutomationDef, id: string): AutomationDef {
+    // Both sentinels — trigger and end — are structural; they
+    // can't be removed from a flow because every flow has a
+    // trigger and an end.
     if (id === TRIGGER_NODE_ID || id === "trigger") return def;
+    if (id === END_NODE_ID || id === END_SENTINEL) return def;
     return {
         ...def,
         nodes: def.nodes.filter((n) => n.id !== id),
@@ -220,16 +274,33 @@ export function withAddedEdge(
     to: string,
 ): AutomationDef {
     const normalizedFrom = from === TRIGGER_NODE_ID ? "trigger" : from;
+    // Edges that target the synthetic END sentinel persist as
+    // `to: "END"` — the runtime's END_SENTINEL constant.
+    const normalizedTo = to === END_NODE_ID ? END_SENTINEL : to;
+    // The END sentinel has no outgoing edges by design — no source
+    // handle in the UI. Defensive guard for imports / malformed
+    // calls.
+    if (
+        normalizedFrom === END_SENTINEL ||
+        normalizedFrom === END_NODE_ID ||
+        from === END_NODE_ID
+    ) {
+        return def;
+    }
     // Reject duplicates and self-loops.
-    if (normalizedFrom === to) return def;
-    if (def.edges.some((e) => e.from === normalizedFrom && e.to === to)) {
+    if (normalizedFrom === normalizedTo) return def;
+    if (
+        def.edges.some(
+            (e) => e.from === normalizedFrom && e.to === normalizedTo,
+        )
+    ) {
         return def;
     }
     return {
         ...def,
         edges: [
             ...def.edges,
-            { from: normalizedFrom, to, when: null },
+            { from: normalizedFrom, to: normalizedTo, when: null },
         ],
     };
 }
@@ -351,15 +422,29 @@ function CanvasInner({ definition, onChange }: Props) {
             if (!onChange) return;
             for (const ch of changes) {
                 if (ch.type === "position" && ch.dragging === false && ch.position) {
+                    // Sentinels aren't in `def.nodes` so don't try to
+                    // persist their positions (they'd get added back
+                    // at the BFS default on next render anyway).
+                    if (ch.id === END_NODE_ID) continue;
                     const nodeId = ch.id === TRIGGER_NODE_ID ? "trigger" : ch.id;
                     onChange(withUpdatedPosition(definition, nodeId, ch.position));
                 }
                 if (ch.type === "remove") {
+                    // Sentinels reject deletion in `withRemovedNode`;
+                    // skip the panel-state side effect too so the UI
+                    // doesn't blink.
+                    if (ch.id === TRIGGER_NODE_ID || ch.id === END_NODE_ID) continue;
                     onChange(withRemovedNode(definition, ch.id));
                     if (selectedNodeId === ch.id) setSelectedNodeId(null);
                 }
                 if (ch.type === "select") {
-                    if (ch.selected && ch.id !== TRIGGER_NODE_ID) {
+                    // Neither sentinel has config to edit — don't
+                    // open the side panel for them.
+                    if (
+                        ch.selected &&
+                        ch.id !== TRIGGER_NODE_ID &&
+                        ch.id !== END_NODE_ID
+                    ) {
                         setSelectedNodeId(ch.id);
                     } else if (!ch.selected && selectedNodeId === ch.id) {
                         setSelectedNodeId(null);
