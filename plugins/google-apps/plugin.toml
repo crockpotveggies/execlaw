@@ -327,3 +327,37 @@ latency = "low"
 [runtime]
 tier = "script"
 source = "main.rhai"
+
+# ===== M6 event-driven architecture =================================
+
+[[bus_events]]
+kind = "calendar.event.starting_soon"
+description = "A calendar event is starting within the configured lookahead window (default 15 min)."
+expects_reply = false
+
+[[bus_events]]
+kind = "calendar.event.created"
+description = "A new calendar event was created (manually or via tool)."
+expects_reply = false
+
+[[bus_events]]
+kind = "calendar.event.updated"
+description = "An existing calendar event was modified."
+expects_reply = false
+
+[[bus_events]]
+kind = "gmail.message.received"
+description = "Inbound Gmail message (matches a filter or labelchange)."
+expects_reply = true
+default_origin_kind = "plugin_channel"
+
+[[reply_handlers]]
+name = "gmail"
+description = "Send a reply email via the Gmail API."
+supports_streaming = false
+supports_attachments = true
+supports_markdown = true
+max_attachment_size_bytes = 26214400
+max_attachments_per_message = 25
+max_text_length = 102400
+allowed_mime_prefixes = ["image/", "application/pdf", "text/", "application/"]

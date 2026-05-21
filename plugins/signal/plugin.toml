@@ -178,3 +178,28 @@ entry = "ui/panel.js"
 [runtime]
 tier = "script"
 source = "main.rhai"
+
+# ===== M6 event-driven architecture =================================
+
+[[bus_events]]
+kind = "signal.message.received"
+description = "Inbound Signal message (DM or group)."
+expects_reply = true
+default_origin_kind = "plugin_channel"
+
+[[bus_events]]
+kind = "signal.cold_contact.arrived"
+description = "Message arrived from a sender not yet in the principal table (cold contact)."
+expects_reply = true
+default_origin_kind = "plugin_channel"
+
+[[reply_handlers]]
+name = "signal"
+description = "Send agent text back to the originating Signal conversation via signal-cli."
+supports_streaming = false
+supports_attachments = true
+supports_markdown = false
+max_attachment_size_bytes = 104857600
+max_attachments_per_message = 32
+max_text_length = 4096
+allowed_mime_prefixes = ["image/", "video/", "audio/", "application/pdf", "text/"]

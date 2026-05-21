@@ -198,3 +198,27 @@ entry = "ui/panel.js"
 [runtime]
 tier = "script"
 source = "main.rhai"
+
+# ===== M6 event-driven architecture =================================
+
+[[bus_events]]
+kind = "whatsapp.message.received"
+description = "Inbound WhatsApp message (DM or group)."
+expects_reply = true
+default_origin_kind = "plugin_channel"
+
+[[bus_events]]
+kind = "whatsapp.delivery.failed"
+description = "WhatsApp reported a delivery failure for a previously sent message."
+expects_reply = false
+
+[[reply_handlers]]
+name = "whatsapp"
+description = "Send agent text back to the originating WhatsApp chat via the wuzapi sidecar."
+supports_streaming = false
+supports_attachments = true
+supports_markdown = true
+max_attachment_size_bytes = 16777216
+max_attachments_per_message = 1
+max_text_length = 4096
+allowed_mime_prefixes = ["image/", "video/", "audio/", "application/pdf"]
