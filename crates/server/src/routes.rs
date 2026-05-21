@@ -795,6 +795,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::research_admin::research_admin_router())
         .merge(crate::oauth_admin::oauth_admin_router())
         .merge(crate::plugin_settings_admin::plugin_settings_admin_router())
+        .merge(crate::python_sandbox_admin::python_sandbox_admin_router())
         .merge(crate::setup_preflight::setup_preflight_router())
         .merge(crate::docs::docs_router())
         .with_state(state)

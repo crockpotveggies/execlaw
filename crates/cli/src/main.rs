@@ -2078,6 +2078,29 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         tokio::spawn(async move { sup.run(stop).await });
     }
 
+    // 2026-05-20 — register native (non-plugin) sidecars BEFORE
+    // the supervisor's reconcile loop starts. The supervisor
+    // iterates `HookRegistry::sidecars()` on each pass; anything
+    // registered after the first reconcile would have to wait
+    // for the next tick. Currently the only native sidecar is
+    // python-sandbox's kernel-gateway (formerly a plugin sidecar,
+    // migrated to native in 2026-05-20). Returns false silently
+    // if the feature is disabled in `config_python_sandbox` or
+    // Docker is unreachable — operator sees no log on a fresh
+    // install with the feature off (default).
+    {
+        let now = chrono::Utc::now().timestamp();
+        let docker_available = docker_ctrl.is_some();
+        if let Err(e) = execlaw_server::python_sandbox::register_native_sidecar_if_enabled(
+            state.plugin_host.registry(),
+            &db,
+            docker_available,
+            now,
+        ) {
+            tracing::warn!(?e, "python_sandbox: native sidecar registration failed");
+        }
+    }
+
     // Phase 2b — sidecar supervisor's reconcile loop. Same
     // start-only-if-Some pattern as backend_supervisor; on a
     // Docker-less host this is a no-op and the SPA's Sidecars
@@ -2109,27 +2132,29 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             plugin_host.fire_on_enable_for_all().await;
 
-            // 2026-05-18 — Phase 8 wiring for the python-sandbox
-            // plugin. Constructs the PythonSandboxService against
-            // the kernel-gateway sidecar's published port and
-            // registers the four python.* tools as host-implemented
-            // builtins.
+            // 2026-05-20 — Phase 8 wiring for the python-sandbox
+            // NATIVE feature (formerly a plugin). Constructs the
+            // PythonSandboxService against the kernel-gateway
+            // sidecar's published port and registers the four
+            // python.* tools as builtins.
             //
-            // 2026-05-20 — gated on plugin install state INSIDE
-            // `wire_python_sandbox`. When the plugin isn't installed,
-            // the helper is a DEBUG-level silent no-op; the host
-            // logs nothing about python.* on a fresh boot with no
-            // plugin (per encapsulation rule). When the plugin IS
-            // installed but the sidecar isn't healthy, the helper
-            // WARNs — operator opted in, they want a breadcrumb.
+            // Gated INSIDE `wire_python_sandbox` on the native
+            // `config_python_sandbox.enabled` flag:
+            //   * Disabled (default on fresh install) → silent
+            //     no-op at DEBUG. Host logs nothing about
+            //     python.*.
+            //   * Enabled, sidecar not yet healthy → WARN.
+            //     Operator opted in; surfacing the issue is the
+            //     right UX.
+            //   * Enabled, sidecar healthy → wire normally, INFO.
             //
-            // Service is held in a `static` so its OutputWatcher
-            // (notify OS thread + tokio timer) stays alive for the
-            // server's lifetime. Drop happens on process exit.
+            // Service is held in the server-crate static so its
+            // OutputWatcher (notify OS thread + tokio timer)
+            // stays alive for the server's lifetime. Drop happens
+            // on process exit.
             if let Some(sup) = state_for_wire.sidecar_supervisor.as_ref() {
                 let now = chrono::Utc::now().timestamp();
                 match execlaw_server::python_sandbox::wire_python_sandbox(
-                    &plugin_host,
                     sup,
                     plugin_host.registry(),
                     &db_for_wire,
@@ -2139,21 +2164,12 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
                 .await
                 {
                     Ok(Some(svc)) => {
-                        // Stash in the server-crate's process-wide
-                        // OnceLock so:
-                        //   1. Drop doesn't run mid-server (anchor
-                        //      for the OutputWatcher's threads).
-                        //   2. Request handlers can reach it via
-                        //      `python_sandbox::service()` — the
-                        //      delete-thread handler uses this to
-                        //      clean up `/work/<convo>/` on
-                        //      conversation delete.
                         execlaw_server::python_sandbox::set_service(svc);
                     }
                     Ok(None) => {
-                        // wire helper already logged the reason (or
-                        // logged nothing, if the plugin isn't
-                        // installed — silent by design).
+                        // wire helper already logged the reason
+                        // (or logged nothing, if the feature is
+                        // disabled — silent by design).
                     }
                     Err(e) => {
                         tracing::warn!(

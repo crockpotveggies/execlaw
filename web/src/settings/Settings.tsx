@@ -26,6 +26,7 @@ import { BackendsPage } from "./BackendsPage";
 import { UserPage } from "./UserPage";
 import { ToolsPage } from "./ToolsPage";
 import { McpServersPage } from "./McpServersPage";
+import { PythonSandboxPage } from "./PythonSandboxPage";
 import { RunnersPage } from "./RunnersPage";
 import { SidecarsPage } from "./SidecarsPage";
 import { ResearchPage } from "./ResearchPage";
@@ -68,6 +69,15 @@ const TABS: ReadonlyArray<{ to: string; icon: string; label: string }> = [
     { to: "/settings/search", icon: "bi-search", label: "Search" },
     { to: "/settings/plugins", icon: "bi-plug", label: "Plugins" },
     { to: "/settings/tools", icon: "bi-wrench-adjustable", label: "Tools" },
+    // Python sandbox — native feature (was a plugin until
+    // 2026-05-20). Lives between Tools and MCP because operators
+    // reach for it when wiring data-analysis workflows, alongside
+    // the other agent-capability surfaces.
+    {
+        to: "/settings/python-sandbox",
+        icon: "bi-filetype-py",
+        label: "Python sandbox",
+    },
     { to: "/settings/mcp", icon: "bi-broadcast", label: "MCP" },
     // Hardware now lives at the bottom of the Backends page.
     { to: "/settings/backends", icon: "bi-cpu-fill", label: "Backends" },
@@ -219,6 +229,10 @@ export function Settings() {
                             }
                         />
                         <Route path="tools" element={<ToolsPage />} />
+                        <Route
+                            path="python-sandbox"
+                            element={<PythonSandboxPage />}
+                        />
                         <Route path="mcp" element={<McpServersPage />} />
                         <Route path="backends" element={<BackendsPage />} />
                         <Route path="inference" element={<InferencePage />} />

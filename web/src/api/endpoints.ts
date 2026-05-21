@@ -3109,6 +3109,59 @@ export async function updateGeneralSettings(
     );
 }
 
+// ---- /api/admin/python-sandbox --------------------------------------
+//
+// 2026-05-20 — native feature config (formerly the python-sandbox
+// plugin's settings panel). GET returns the config row + live
+// sidecar status + Docker availability so the Settings page can
+// disable the enable toggle when Docker isn't reachable.
+
+export interface PythonSandboxConfigView {
+    enabled: boolean;
+    idle_timeout_seconds: number;
+    max_output_bytes: number;
+    updated_at: number;
+}
+
+export interface SidecarStatusView {
+    status: string;
+    rpc_url: string | null;
+    restart_attempts: number;
+}
+
+export interface PythonSandboxStatusResponse {
+    config: PythonSandboxConfigView;
+    docker_available: boolean;
+    sidecar: SidecarStatusView | null;
+}
+
+export interface UpdatePythonSandboxRequest {
+    enabled?: boolean;
+    idle_timeout_seconds?: number;
+    max_output_bytes?: number;
+}
+
+export async function getPythonSandbox(
+    tokenAccessor: () => string | null,
+): Promise<PythonSandboxStatusResponse> {
+    return apiFetch<PythonSandboxStatusResponse>(
+        "/api/admin/python-sandbox",
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function updatePythonSandbox(
+    body: UpdatePythonSandboxRequest,
+    tokenAccessor: () => string | null,
+): Promise<PythonSandboxConfigView> {
+    return apiFetch<PythonSandboxConfigView>(
+        "/api/admin/python-sandbox",
+        { method: "PUT", body },
+        tokenAccessor,
+    );
+}
+
 // ---- /api/admin/factory-reset ---------------------------------------
 
 export interface FactoryResetResponse {

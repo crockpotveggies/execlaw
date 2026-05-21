@@ -68,7 +68,7 @@ pub use tools::{
     PythonExecuteTool, PythonInterruptTool, PythonListFilesTool, PythonResetTool,
     python_sandbox_tools,
 };
-pub use wiring::{WireError, wire_python_sandbox};
+pub use wiring::{WireError, register_native_sidecar_if_enabled, wire_python_sandbox};
 
 // ----------------------------------------------------------------
 // Process-wide service handle. 2026-05-18.

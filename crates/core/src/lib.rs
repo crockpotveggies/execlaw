@@ -48,6 +48,7 @@ pub mod outbox;
 pub mod personality;
 pub mod principal;
 pub mod principal_groups;
+pub mod python_sandbox_config;
 pub mod refresh_tokens;
 pub mod research;
 pub mod retention;

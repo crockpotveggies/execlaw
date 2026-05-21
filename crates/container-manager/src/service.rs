@@ -433,8 +433,8 @@ impl ServiceController for BollardServiceController {
 
         // --- 2. Pull the image — but first check if it's already
         // present locally. Locally-built images (e.g. the
-        // python-sandbox sidecar built from
-        // `plugins/python-sandbox/Dockerfile`) live ONLY on the
+        // python-sandbox kernel-gateway sidecar built from
+        // `docker/python-sandbox/Dockerfile`) live ONLY on the
         // operator's host and don't exist on any public registry.
         // Without this short-circuit, every spawn attempt fails
         // with `Docker responded with status code 404: pull access

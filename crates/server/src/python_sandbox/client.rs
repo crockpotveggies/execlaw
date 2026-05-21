@@ -675,7 +675,7 @@ mod tests {
         }
     }
 
-    /// Live integration: parity with `plugins/python-sandbox/smoke_execute.py`.
+    /// Live integration: parity with `docker/python-sandbox/smoke_execute.py`.
     /// Executes the same four scenarios through the Rust client and
     /// asserts the exact ExecuteResult shape.
     ///

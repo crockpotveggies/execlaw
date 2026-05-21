@@ -211,8 +211,7 @@ pub struct BundledPlugin {
     pub version: Option<String>,
     pub description: Option<String>,
     /// Size of the ZIP on disk, in bytes. Surfaced so the SPA can
-    /// render `python-sandbox 0.1.0 · 15 KB` without a second HEAD
-    /// round-trip.
+    /// render `signal 0.5.0 · 19 KB` without a second HEAD round-trip.
     pub size_bytes: u64,
     /// `true` when a plugin with this `id` is already installed
     /// (regardless of version). Drives the SPA's button label:

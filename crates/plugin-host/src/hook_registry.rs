@@ -704,6 +704,35 @@ impl HookRegistry {
         Ok(())
     }
 
+    /// 2026-05-20 — register a sidecar owned by NATIVE host code
+    /// rather than a plugin manifest. Used by the python-sandbox
+    /// feature (formerly a plugin, now native) so its
+    /// kernel-gateway container goes through the same
+    /// SidecarSupervisor reconcile machinery as plugin-supplied
+    /// sidecars.
+    ///
+    /// The `plugin_id` field on the returned `RegisteredSidecar`
+    /// is a synthetic identifier (caller's choice — typically
+    /// `"execlaw"` or the feature name). The supervisor uses it
+    /// only for container naming and bookkeeping; nothing reads
+    /// it as a true plugin id, so collisions with installed
+    /// plugin ids are still rejected at the unique-name level.
+    ///
+    /// Returns Err if a sidecar with the same `name` is already
+    /// registered (either by another native registration or by
+    /// an enabled plugin's manifest).
+    pub fn register_native_sidecar(&self, sidecar: RegisteredSidecar) -> Result<(), String> {
+        let mut w = self.inner.write().unwrap();
+        if w.sidecars_by_name.contains_key(&sidecar.name) {
+            return Err(format!(
+                "sidecar '{}' is already registered",
+                sidecar.name
+            ));
+        }
+        w.sidecars_by_name.insert(sidecar.name.clone(), sidecar);
+        Ok(())
+    }
+
     /// Look up a built-in by name. `None` if no built-in owns this
     /// name (it might be a plugin tool — use [`Self::tool`] for that).
     pub fn builtin(&self, name: &str) -> Option<Arc<dyn ToolImpl>> {

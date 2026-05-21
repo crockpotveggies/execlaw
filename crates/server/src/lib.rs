@@ -61,6 +61,7 @@ pub mod plugin_settings_admin;
 pub mod plugin_webhook_routes;
 pub mod plugins;
 pub mod principal_admit;
+pub mod python_sandbox_admin;
 /// **Plugin-implementation surface, NOT a public API.** Holds the
 /// host-side Rust code that backs the `python-sandbox` plugin's
 /// `host_implemented = true` tools. Lives here (rather than inside
