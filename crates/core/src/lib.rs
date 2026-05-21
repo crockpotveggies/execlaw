@@ -47,6 +47,7 @@ pub mod memory;
 pub mod memory_lifecycle;
 pub mod migrations;
 pub mod oauth;
+pub mod operator_home;
 pub mod outbox;
 pub mod personality;
 pub mod principal;

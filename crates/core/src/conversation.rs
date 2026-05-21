@@ -26,6 +26,14 @@ pub enum ConversationKind {
     GroupWithControllerAbsent,
     ExternalWithOutsider,
     MixedTrust,
+    /// M6 — singleton operator "Inbox" thread. Auto-minted on first
+    /// ReplyRouter delivery failure (or on first explicit
+    /// `ChatAppend(operator_home)` target). One per operator, pinned
+    /// at the top of the sidebar, excluded from auto-archive
+    /// retention. Accepts: failure cards, briefings, Notify outputs,
+    /// system-authored summaries. Operator can chat in it normally —
+    /// replies go through the default web flow like any other thread.
+    OperatorHome,
 }
 
 impl ConversationKind {
@@ -85,6 +93,7 @@ impl ConversationKind {
             ConversationKind::GroupWithControllerAbsent => "GroupWithControllerAbsent",
             ConversationKind::ExternalWithOutsider => "ExternalWithOutsider",
             ConversationKind::MixedTrust => "MixedTrust",
+            ConversationKind::OperatorHome => "OperatorHome",
         }
     }
 
@@ -95,6 +104,7 @@ impl ConversationKind {
             "GroupWithControllerAbsent" => Some(Self::GroupWithControllerAbsent),
             "ExternalWithOutsider" => Some(Self::ExternalWithOutsider),
             "MixedTrust" => Some(Self::MixedTrust),
+            "OperatorHome" => Some(Self::OperatorHome),
             _ => None,
         }
     }
