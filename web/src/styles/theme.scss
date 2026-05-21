@@ -2933,46 +2933,90 @@ body {
 // theme any future flow chart elsewhere in the app.
 // =====================================================================
 .execlaw-automation-canvas {
-    // Pane + pattern colors. The dots pattern is the only visible
-    // backdrop element under nodes so it has to read as a faint
-    // texture, not a contrast point.
-    --xy-background-color-default: #{$bg-deep};
-    --xy-background-pattern-dots-color-default: #{rgba($text-muted, 0.18)};
-    --xy-background-pattern-lines-color-default: #{rgba($border-subtle, 0.4)};
-    --xy-background-pattern-cross-color-default: #{rgba($border-subtle, 0.4)};
+    // The vendor stylesheet defines `--xy-*-default` *on* the inner
+    // `.react-flow` element itself (light-mode palette there;
+    // separate dark palette on `.react-flow.dark`). CSS variables
+    // inherit from ancestors, but a same-name redefinition on the
+    // matched element wins, so overriding the `-default` variant on
+    // our wrapper would lose to the lib's own `.react-flow` block.
+    //
+    // The lib reads each color via `var(--xy-foo, var(--xy-foo-default))`
+    // — i.e. the unsuffixed name first, with the `-default` as the
+    // fallback. The lib never sets the unsuffixed variant anywhere,
+    // so setting THOSE on our wrapper inherits cleanly into every
+    // descendant without contest.
+    --xy-background-color: #{$bg-deep};
+    --xy-background-pattern-dots-color: #{rgba($text-muted, 0.25)};
+    --xy-background-pattern-lines-color: #{rgba($border-subtle, 0.4)};
+    --xy-background-pattern-cross-color: #{rgba($border-subtle, 0.4)};
 
-    // Edges. Selected edges get the accent color so the operator can
-    // see which one is highlighted for delete-on-backspace.
-    --xy-edge-stroke-default: #{$text-muted};
-    --xy-edge-stroke-selected-default: #{$accent};
-    --xy-connectionline-stroke-default: #{rgba($accent, 0.7)};
+    --xy-edge-stroke: #{$text-muted};
+    --xy-edge-stroke-selected: #{$accent};
+    --xy-connectionline-stroke: #{rgba($accent, 0.7)};
 
-    // Connection handles (the little dots on the top/bottom of each
-    // node where the operator drags to draw an edge).
-    --xy-handle-background-color-default: #{$accent};
-    --xy-handle-border-color-default: #{$bg-surface};
+    --xy-handle-background-color: #{$accent};
+    --xy-handle-border-color: #{$bg-surface};
 
-    // Selection rubber-band overlay (drag-to-select).
-    --xy-selection-background-color-default: #{rgba($accent, 0.12)};
-    --xy-selection-border-default: 1px dotted #{rgba($accent, 0.8)};
+    --xy-selection-background-color: #{rgba($accent, 0.12)};
+    --xy-selection-border: 1px dotted #{rgba($accent, 0.8)};
 
-    // Controls toolbar (zoom in/out/fit buttons, bottom-left).
-    --xy-controls-button-background-color-default: #{$bg-elev};
-    --xy-controls-button-background-color-hover-default: #{$bg-surface};
-    --xy-controls-button-color-default: #{$text-primary};
-    --xy-controls-button-color-hover-default: #{$text-primary};
-    --xy-controls-button-border-color-default: #{$border-subtle};
-    --xy-controls-box-shadow-default: #{$shadow-soft};
+    --xy-controls-button-background-color: #{$bg-elev};
+    --xy-controls-button-background-color-hover: #{$bg-surface};
+    --xy-controls-button-color: #{$text-primary};
+    --xy-controls-button-color-hover: #{$text-primary};
+    --xy-controls-button-border-color: #{$border-subtle};
 
-    // MiniMap (bottom-right by default).
-    --xy-minimap-background-color-default: #{$bg-surface};
-    --xy-minimap-mask-background-color-default: #{rgba($bg-deep, 0.6)};
-    --xy-minimap-mask-stroke-color-default: #{$border-subtle};
-    --xy-minimap-node-background-color-default: #{$bg-elev};
-    --xy-minimap-node-stroke-color-default: #{$border-subtle};
+    --xy-minimap-background-color: #{$bg-surface};
+    --xy-minimap-mask-background-color: #{rgba($bg-deep, 0.6)};
+    --xy-minimap-mask-stroke-color: #{$border-subtle};
+    --xy-minimap-node-background-color: #{$bg-elev};
+    --xy-minimap-node-stroke-color: #{$border-subtle};
 
-    // Attribution chip (the "react flow" link in the corner).
-    --xy-attribution-background-color-default: #{rgba($bg-surface, 0.5)};
+    --xy-attribution-background-color: #{rgba($bg-surface, 0.5)};
+    --xy-edge-label-background-color: #{$bg-elev};
+    --xy-edge-label-color: #{$text-primary};
+
+    // Belt-and-suspenders: some vendor selectors set `background`
+    // (not `background-color`) directly. Force-paint here so the
+    // controls toolbar + minimap don't appear as bare white panels
+    // even if a future lib upgrade tightens its selector specificity.
+    .react-flow__controls,
+    .react-flow__controls-button {
+        background: $bg-elev;
+        border-color: $border-subtle;
+        color: $text-primary;
+        box-shadow: $shadow-soft;
+        fill: $text-primary;
+
+        svg {
+            fill: $text-primary;
+        }
+
+        &:hover {
+            background: $bg-surface;
+            color: $text-primary;
+        }
+    }
+
+    .react-flow__minimap {
+        background-color: $bg-surface;
+        border: 1px solid $border-subtle;
+        border-radius: $radius-pill;
+        overflow: hidden;
+    }
+
+    .react-flow__minimap-mask {
+        fill: rgba($bg-deep, 0.55);
+    }
+
+    .react-flow__attribution {
+        background: rgba($bg-surface, 0.5);
+        color: $text-muted;
+
+        a {
+            color: $text-muted;
+        }
+    }
 
     // Defensive cursor — we set `grab` inline on the node shell but
     // the library's `.react-flow__node` rule sometimes ships
